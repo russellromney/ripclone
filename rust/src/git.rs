@@ -1995,7 +1995,14 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // therefore never pass `--depth`: a depth-limited fetch would re-shallow an
     // already-complete mirror. depth=1 ("head") clones are still cheap — they're
     // a content-addressed subset built at pack time, not a shallower mirror.
-    if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev)) {
+    // A full object id can use the narrow historical fetch when the caller
+    // supplied a concrete branch. For `branch == HEAD`, a fresh bare repo must
+    // discover and retain the upstream default branch; otherwise `git init
+    // --bare` leaves HEAD on the platform default (often `master`) and the
+    // historical artifact is published under the wrong branch key. Keep that
+    // first-operation compatibility path on the full mirror fetch. Ordinary
+    // admitted work uses `sync_bare_mirror_admitted` and remains exact-only.
+    if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev) && branch != "HEAD") {
         sync_bare_mirror_rev(
             mirror_dir.as_ref(),
             &url,
@@ -2804,6 +2811,30 @@ mod tests {
             resolve_commit(&mirror, "other").is_err(),
             "rev sync must not fetch unrelated branches"
         );
+    }
+
+    #[test]
+    fn sync_bare_mirror_full_sha_at_head_preserves_upstream_default_branch() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("head-rev.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let commit = crate::test_fixture::commit(&src, &[("README.md", b"hi")]);
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/head-rev");
+        let mirror = base.path().join("mirror-head-rev.git");
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", Some(&commit), None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(default_branch(&mirror).unwrap(), "main");
+        assert_eq!(resolve_commit(&mirror, "HEAD").unwrap(), commit);
+        assert_eq!(resolve_commit(&mirror, &commit).unwrap(), commit);
     }
 
     #[test]
