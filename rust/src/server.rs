@@ -5807,6 +5807,12 @@ async fn webhook_dispatch_delete(
     }
     state.ref_store.invalidate(&repo_id, branch).await;
     invalidate_ref_response_cache(state, &repo_id, branch);
+    // The webhook is authoritative for the moving branch. Force the next
+    // unpinned read to refresh its mirror so `git fetch --prune` removes the
+    // deleted upstream ref instead of resolving a stale local copy. Immutable
+    // commit-keyed metadata remains available to callers that already pinned.
+    invalidate_mirror_fresh(state, &format!("{}/{branch}", repo_id.storage_key()));
+    invalidate_mirror_fresh(state, &format!("{}/HEAD", repo_id.storage_key()));
     info!(
         "webhook: cleaned up deleted branch {}@{branch}",
         repo_id.storage_key()

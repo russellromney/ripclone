@@ -531,6 +531,12 @@ async fn gitea_webhook_branch_delete_cleans_up_ref() {
         clone_branch_full_for_provider(&server, "gitea", "acme/hook", "feature", "2").await;
     assert_eq!(read(&c, "feat.txt"), "f\n", "feature branch was built");
 
+    // Delete the actual upstream ref before delivering its webhook. This keeps
+    // the fixture faithful to a provider delete event and proves a stale local
+    // mirror plus retained immutable artifacts cannot resurrect the branch.
+    git(&origin.work, &["push", "-q", origin.bare_str(), ":feature"]);
+    git(&origin.bare, &["update-server-info"]);
+
     // Gitea delete event carries the short branch name + ref_type.
     let body = br#"{"ref":"feature","ref_type":"branch","repository":{"full_name":"acme/hook","default_branch":"main"}}"#.to_vec();
     let resp = reqwest::Client::new()

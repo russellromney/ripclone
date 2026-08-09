@@ -2045,7 +2045,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         // Persist gc-off before fetching, so legacy mirrors (created before this
         // was set) are covered and the fetch we are about to run cannot auto-gc.
         disable_auto_gc(mirror_dir.as_ref())?;
-        let mut args: Vec<&str> = vec!["fetch"];
+        let mut args: Vec<&str> = vec!["fetch", "--prune"];
         if is_shallow {
             args.push("--unshallow");
         }
