@@ -21,7 +21,7 @@ use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
 use ripclone::ref_store::{CachingRefStore, RefStore, S3RefStore};
 use ripclone::remote_gc::{GcConfig, RemoteGc};
-use ripclone::server::{ServerState, build_app, run_server};
+use ripclone::server::{AdmissionTestProbe, ServerState, build_app, run_server};
 use ripclone::storage::{S3Storage, StorageBackend};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -1340,7 +1340,39 @@ async fn seed_shallow_s3_fixture(
         .save_branch(&repo_id, &default_branch, &info)
         .await
         .expect("publish S3 default-branch fixture");
+    // This tightly scoped fixture represents an exact row created by the
+    // retained historical `sync --at` compatibility lane. Ordinary sync
+    // production code did not create it and must not create another one.
+    s3_refs
+        .save_branch(&repo_id, &format!("{default_branch}#{pinned}"), &info)
+        .await
+        .expect("publish historical exact S3 A fixture");
     (pinned, s3_refs, info, fixture)
+}
+
+async fn publish_moving_s3_row(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    previous: &ripclone::RefInfo,
+    commit: &str,
+) -> ripclone::RefInfo {
+    let info = ripclone::RefInfo {
+        commit: commit.to_string(),
+        default_branch: previous.default_branch.clone(),
+        build_status: Some("building".to_string()),
+        synced_at: Some(previous.synced_at.unwrap_or(0).saturating_add(1)),
+        generation: Some(previous.generation.unwrap_or(0).saturating_add(1)),
+        ..Default::default()
+    };
+    ref_store
+        .save_branch(repo_id, "HEAD", &info)
+        .await
+        .expect("publish moving S3 HEAD row");
+    ref_store
+        .save_branch(repo_id, &info.default_branch, &info)
+        .await
+        .expect("publish moving S3 default-branch row");
+    info
 }
 
 /// Cleanup client with the same timeout/retry posture as production S3Storage.
@@ -2100,7 +2132,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         "A",
     );
     origin.publish();
-    let (pinned, _exact_store, exact_a, _fixture) =
+    let (pinned, exact_store, exact_a, _fixture) =
         seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
     assert!(
         exact_a.packs.len() >= 2,
@@ -2119,6 +2151,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     )
     .await;
     let selected_pack = exact_a.packs[expiring_pack_index].pack.clone();
+    let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
 
     unsafe {
@@ -2135,6 +2168,9 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         std::env::set_var("RIPCLONE_TEST_PACK_WORKER_PROCEED", &writer_proceed);
         std::env::set_var("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED", &cleanup_entered);
     }
+    let admission_probe = Arc::new(AdmissionTestProbe::default());
+    let _admission_probe_guard =
+        ripclone::server::install_admission_test_probe(Arc::clone(&admission_probe));
     let short_pack_url = make_s3_storage(&direct_env, &prefix)
         .expect("selected pack signing storage")
         .signed_url(
@@ -2189,6 +2225,11 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
+    origin.publish();
+    let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
+    assert_ne!(pinned, newer);
+    let moving_b = publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
     // The one-second presign is already expired when ready metadata makes it
     // observable. The proxy waits for pack zero's real install worker before
     // forwarding pack one's request to MinIO.
@@ -2353,6 +2394,22 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
             .all(|header| !header.to_ascii_lowercase().contains("authorization:")),
         "artifact-host requests must not carry Ripclone authorization: {headers:?}"
     );
+    assert_eq!(admission_probe.tip_probes.load(Ordering::SeqCst), 0);
+    assert_eq!(admission_probe.enqueue_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(admission_probe.exact_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(admission_probe.builder_entries.load(Ordering::SeqCst), 0);
+    for key in ["HEAD", moving_b.default_branch.as_str()] {
+        let after = exact_store
+            .load_branch(&repo_id, key)
+            .await
+            .expect("load moving B after pinned refresh")
+            .expect("moving B remains present");
+        assert_eq!(
+            serde_json::to_value(after).expect("serialize moving B after refresh"),
+            serde_json::to_value(&moving_b).expect("serialize expected moving B"),
+            "pinned A refresh must not mutate moving B at {key}"
+        );
+    }
     proxy.shutdown().await;
     ref_trace.shutdown().await;
 
@@ -2403,7 +2460,7 @@ async fn revoked_authorization_blocks_pinned_refresh() {
     guard.track_repo("acme", &repo);
     origin.commit(&[("value.txt", "A\n"), ("stable.txt", "stable\n")], "A");
     origin.publish();
-    let (pinned, _exact_store, exact_a, _fixture) =
+    let (pinned, exact_store, exact_a, _fixture) =
         seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
     assert!(
         !exact_a.packs.is_empty(),
@@ -2418,12 +2475,17 @@ async fn revoked_authorization_blocks_pinned_refresh() {
         exact_a.packs[0].pack.clone(),
     )
     .await;
+    let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
 
     unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
         std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
     }
+    let admission_probe = Arc::new(AdmissionTestProbe::default());
+    let _admission_probe_guard =
+        ripclone::server::install_admission_test_probe(Arc::clone(&admission_probe));
     let short_pack_url = make_s3_storage(&direct_env, &prefix)
         .expect("selected pack signing storage")
         .signed_url(&exact_a.packs[0].pack, Duration::from_secs(1))
@@ -2463,6 +2525,11 @@ async fn revoked_authorization_blocks_pinned_refresh() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
+    origin.publish();
+    let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
+    assert_ne!(pinned, newer);
+    let moving_b = publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
     initial_pinned_proceed
         .send(())
         .expect("release initial exact-A metadata request");
@@ -2503,6 +2570,7 @@ async fn revoked_authorization_blocks_pinned_refresh() {
 
     let output = wait_child_output(child).await;
     unsafe {
+        std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
     }
@@ -2542,6 +2610,22 @@ async fn revoked_authorization_blocks_pinned_refresh() {
         signed_requests_before_denial,
         "denied authorization must not mint or issue another signed artifact request"
     );
+    assert_eq!(admission_probe.tip_probes.load(Ordering::SeqCst), 0);
+    assert_eq!(admission_probe.enqueue_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(admission_probe.exact_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(admission_probe.builder_entries.load(Ordering::SeqCst), 0);
+    for key in ["HEAD", moving_b.default_branch.as_str()] {
+        let after = exact_store
+            .load_branch(&repo_id, key)
+            .await
+            .expect("load moving B after denied refresh")
+            .expect("moving B remains present");
+        assert_eq!(
+            serde_json::to_value(after).expect("serialize moving B after denial"),
+            serde_json::to_value(&moving_b).expect("serialize expected moving B"),
+            "denied pinned A refresh must not mutate moving B at {key}"
+        );
+    }
     let refs = ref_trace.refs();
     assert!(!refs[0].contains("pinned="), "first request is moving");
     assert!(
@@ -2575,13 +2659,13 @@ async fn status_reports_bytes_from_s3() {
     let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
-    let repo = format!("billings3-{suffix}");
+    let repo = format!("storage-accounting-s3-{suffix}");
     let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
     let server = start_s3_server(&env, &prefix).await;
 
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
-    origin.commit(&[("a.txt", "bill me\n")], "c1");
+    origin.commit(&[("a.txt", "account for me\n")], "c1");
     origin.publish();
 
     add_acme_repo(&server, &repo).await;
@@ -2871,7 +2955,7 @@ async fn warm_ttl_marks_evicted_ref_cold() {
 
 #[ignore = "requires S3 credentials"]
 #[tokio::test]
-async fn public_fork_status_is_free_on_s3() {
+async fn public_fork_status_has_zero_unique_byte_allocation_on_s3() {
     let env = match s3_env() {
         Some(e) => e,
         None => {
