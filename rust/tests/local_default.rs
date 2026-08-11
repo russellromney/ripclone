@@ -12,8 +12,6 @@ mod e2e_added_repos;
 mod e2e_agent_fleet;
 #[path = "suites/local_default/e2e_async_build.rs"]
 mod e2e_async_build;
-#[path = "suites/local_default/e2e_billing.rs"]
-mod e2e_billing;
 #[path = "suites/local_default/e2e_config_global_and_overrides.rs"]
 mod e2e_config_global_and_overrides;
 #[path = "suites/local_default/e2e_config_legacy_token_migration.rs"]
@@ -26,3 +24,5 @@ mod e2e_matrix_twophase_full;
 mod e2e_multi_provider;
 #[path = "suites/local_default/e2e_repo_config.rs"]
 mod e2e_repo_config;
+#[path = "suites/local_default/e2e_storage_accounting.rs"]
+mod e2e_storage_accounting;

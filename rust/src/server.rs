@@ -3123,41 +3123,10 @@ async fn load_pinned_ref_info(
     clonepack_kind: &str,
     historical_rev: Option<&str>,
 ) -> Result<PinnedRefLookup> {
-    // Explicit `--at` requests retain their established historical lane. Only
-    // those requests may consult commit-keyed or pre-upgrade raw-revision
-    // metadata; an ordinary pinned branch request must never discover it.
-    if let Some(rev) = historical_rev {
-        let exact_key = ref_store_key(branch, Some(rev), Some(pinned));
-        if let Some(info) = ref_store.load_branch(repo_id, &exact_key).await?
-            && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
-        {
-            return Ok(PinnedRefLookup::Exact {
-                key: exact_key,
-                info,
-            });
-        }
-        let legacy_key = ref_store_key(branch, Some(rev), None);
-        if legacy_key != exact_key
-            && let Some(info) = ref_store.load_branch(repo_id, &legacy_key).await?
-            && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
-        {
-            return Ok(PinnedRefLookup::Exact {
-                key: legacy_key,
-                info,
-            });
-        }
-    }
-
-    // A pinned lookup observes only the requested moving ref. Pinning keeps the
-    // operation's identity stable, but does not create or discover a durable
-    // per-commit publication. Once a newer commit replaces this row, the older
-    // pin remains pending until independent result publication exists.
+    // Prefer the moving row while it still serves the pin. Reading a compatible
+    // exact row is a fallback for artifacts already published by the historical
+    // `--at` lane; it is not ordinary exact-result publication or retention.
     let branch_info = ref_store.load_branch(repo_id, branch).await?;
-    // During phase-one
-    // publication it may enclose the new tip while carrying the prior commit's
-    // full-history variant. Never combine that carried manifest with the new
-    // row's top-level pack/archive fields; only the enclosing pinned row is
-    // internally consistent for a pinned response.
     if let Some(info) = branch_info.as_ref()
         && info.commit == pinned
         && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
@@ -3166,6 +3135,53 @@ async fn load_pinned_ref_info(
             key: branch.to_string(),
             info: info.clone(),
         });
+    }
+
+    // HEAD metadata carries the concrete default branch. Prefer its moving row
+    // too, then use it to find a pre-existing `<default>#<commit>` compatibility
+    // row without scanning refs or manufacturing a second alias.
+    let default_branch = branch_info
+        .as_ref()
+        .filter(|_| branch == "HEAD")
+        .map(|info| info.default_branch.as_str())
+        .filter(|default_branch| !default_branch.is_empty() && *default_branch != "HEAD");
+    if let Some(default_branch) = default_branch
+        && let Some(info) = ref_store.load_branch(repo_id, default_branch).await?
+        && info.commit == pinned
+        && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+    {
+        return Ok(PinnedRefLookup::Exact {
+            key: default_branch.to_string(),
+            info,
+        });
+    }
+
+    let mut exact_keys = vec![ref_store_key(branch, Some(pinned), Some(pinned))];
+    if let Some(default_branch) = default_branch {
+        let key = ref_store_key(default_branch, Some(pinned), Some(pinned));
+        if !exact_keys.contains(&key) {
+            exact_keys.push(key);
+        }
+    }
+    if let Some(rev) = historical_rev {
+        let key = ref_store_key(branch, Some(rev), None);
+        if !exact_keys.contains(&key) {
+            exact_keys.push(key);
+        }
+        if let Some(default_branch) = default_branch {
+            let key = ref_store_key(default_branch, Some(rev), None);
+            if !exact_keys.contains(&key) {
+                exact_keys.push(key);
+            }
+        }
+    }
+    for key in exact_keys {
+        if key != branch
+            && let Some(info) = ref_store.load_branch(repo_id, &key).await?
+            && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+        {
+            return Ok(PinnedRefLookup::Exact { key, info });
+        }
     }
 
     Ok(PinnedRefLookup::Pending {
@@ -3635,9 +3651,6 @@ async fn get_ref_inner(
             if let Ok(keys) = state.ref_store.list_branches(&repo_id).await {
                 for key in keys {
                     if key == "HEAD" {
-                        continue;
-                    }
-                    if is_commit_keyed_historical_ref(&key) {
                         continue;
                     }
                     if let Ok(Some(info)) = state.ref_store.load_branch(&repo_id, &key).await
@@ -4288,12 +4301,6 @@ async fn build_repo_status(
     let mut unique_chunks: HashMap<String, u64> = HashMap::new();
 
     for branch in branches {
-        // Historical `sync --at` metadata is not an upstream source ref. Keep
-        // those pre-existing commit-keyed compatibility rows out of status
-        // without hiding valid Git branches that contain `#`.
-        if is_commit_keyed_historical_ref(&branch) {
-            continue;
-        }
         let Some(info) = state.ref_store.load_branch(repo_id, &branch).await? else {
             continue;
         };
@@ -4382,8 +4389,8 @@ async fn build_repo_status(
         }
         .to_string();
 
-        // Public forks of public projects are free; everything else pays its
-        // own logical bytes for now.
+        // Public forks of public projects receive zero unique-byte allocation;
+        // every other ref reports its logical bytes for now.
         let is_public_fork = public && fork_of.is_some();
         let branch_unique_bytes = if is_public_fork { 0 } else { ref_bytes };
 
@@ -4408,7 +4415,8 @@ async fn build_repo_status(
     refs.sort_by(|a, b| a.branch.cmp(&b.branch));
     let total_bytes = unique_chunks.values().sum();
     // TODO: cross-repo fork-network dedup for private repos. For now, public
-    // forks are free and everything else pays logical repo bytes.
+    // forks receive zero unique-byte allocation and every other repository
+    // reports its deduplicated logical bytes.
     let is_public_fork = public && fork_of.is_some();
     let total_unique_bytes = if is_public_fork { 0 } else { total_bytes };
     let regions = state
@@ -6434,11 +6442,6 @@ fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> St
         (Some(rev), None) => format!("{branch}#{rev}"),
         (None, _) => branch.to_string(),
     }
-}
-
-fn is_commit_keyed_historical_ref(key: &str) -> bool {
-    key.rsplit_once('#')
-        .is_some_and(|(_, suffix)| crate::validation::validate_object_id(suffix).is_ok())
 }
 
 fn tuple_to_sized(p: &(String, u64, String, u64)) -> crate::SizedPack {
@@ -9316,12 +9319,6 @@ pub async fn poll_once(state: &ServerState) -> usize {
             }
         };
         for branch in branches {
-            // Historical `sync --at` metadata is not an upstream branch. Do
-            // not turn its commit-keyed compatibility key into an `ls-remote`
-            // request, while preserving valid source branches containing `#`.
-            if is_commit_keyed_historical_ref(&branch) {
-                continue;
-            }
             // Cheap tip probe, under the same fetch cap as a real fetch so a sweep
             // can't become uncapped upstream chatter. Best-effort.
             let credential = match state.broker.fetch_credential(&repo_id, None) {
@@ -12588,11 +12585,7 @@ mod tests {
             .await
             .unwrap();
         let listed = state.ref_store.list_branches(&rid).await.unwrap();
-        assert_eq!(
-            listed.iter().filter(|branch| !branch.contains('#')).count(),
-            1,
-            "fixture has one real source ref and one synthetic key: {listed:?}"
-        );
+        assert_eq!(listed.len(), 2, "fixture has both compatibility rows");
 
         unsafe {
             std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path());
@@ -12602,8 +12595,8 @@ mod tests {
         let on_change = poll_once(&state).await;
         assert_eq!(
             probe.tip_probes.load(Ordering::SeqCst) - probes_before,
-            1,
-            "polling must contact only HEAD, never the synthetic historical key"
+            2,
+            "the ambiguous compatibility namespace retains its established polling behavior"
         );
 
         // Mark it built at the real tip → the next poll is a no-op.
@@ -12627,8 +12620,8 @@ mod tests {
         let when_built = poll_once(&state).await;
         assert_eq!(
             probe.tip_probes.load(Ordering::SeqCst) - probes_before_built,
-            1,
-            "built polling must still ignore the synthetic historical key"
+            2,
+            "both stored keys remain polling candidates after the real ref is built"
         );
         unsafe {
             std::env::remove_var("RIPCLONE_ORIGIN_BASE");
@@ -12897,7 +12890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repo_status_dedups_shared_chunks_across_branches() {
+    async fn repo_status_includes_historical_rows_and_dedups_shared_chunks() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
 
@@ -12969,7 +12962,11 @@ mod tests {
             .unwrap();
         state
             .ref_store
-            .save_branch(&RepoId::github("acme/secret"), "develop", &info)
+            .save_branch(
+                &RepoId::github("acme/secret"),
+                "main#1111111111111111111111111111111111111111",
+                &info,
+            )
             .await
             .unwrap();
 
@@ -12984,6 +12981,13 @@ mod tests {
             .unwrap();
         let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.refs.len(), 2);
+        assert!(
+            status
+                .refs
+                .iter()
+                .any(|entry| entry.branch == "main#1111111111111111111111111111111111111111"),
+            "retained historical compatibility artifacts remain visible in status"
+        );
         let expected_total = 300 + manifest_data.len() as u64;
         assert_eq!(status.total_bytes, expected_total);
         assert_eq!(status.total_unique_bytes, expected_total); // fallback: no dedup
@@ -12996,7 +13000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repo_status_public_fork_is_free() {
+    async fn repo_status_public_fork_has_zero_unique_byte_allocation() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
 
@@ -13894,7 +13898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_read_ignores_superseded_exact_alias_and_touches_nothing() {
+    async fn pinned_read_uses_existing_exact_artifact_without_mutating_moving_row() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
         let ref_store = state.ref_store.clone();
@@ -13923,7 +13927,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::OK);
 
         let exact_after = ref_store
             .load_branch(&rid, &exact_key)
@@ -13931,10 +13935,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let moving_after = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
-        assert_eq!(
-            exact_after.last_accessed_at,
-            Some(old_ts),
-            "a superseded exact alias must not gain retention through a pinned read"
+        assert!(
+            exact_after.last_accessed_at.unwrap() > old_ts,
+            "a successful exact-artifact read performs the normal access-time touch"
+        );
+        assert!(
+            !exact_after.warm_pinned,
+            "an exact read must not create a pin"
         );
         assert_eq!(
             moving_after.last_accessed_at,
@@ -13956,6 +13963,13 @@ mod tests {
         let mut moving = complete_ref(&pinned, "manifest-a");
         moving.last_accessed_at = Some(old_ts);
         ref_store.save_branch(&rid, "main", &moving).await.unwrap();
+        let exact_key = ref_store_key("main", Some(&pinned), Some(&pinned));
+        let mut exact = complete_ref(&pinned, "manifest-a-exact");
+        exact.last_accessed_at = Some(old_ts);
+        ref_store
+            .save_branch(&rid, &exact_key, &exact)
+            .await
+            .unwrap();
 
         let app = build_app(state);
         let response = app
@@ -13970,7 +13984,17 @@ mod tests {
         let moving_after = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
         assert!(
             moving_after.last_accessed_at.unwrap() > old_ts,
-            "a successful settled moving-row fallback keeps that row warm"
+            "a complete moving row is preferred and receives the access touch"
+        );
+        let exact_after = ref_store
+            .load_branch(&rid, &exact_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exact_after.last_accessed_at,
+            Some(old_ts),
+            "the compatible exact row is not touched while moving A is usable"
         );
     }
 

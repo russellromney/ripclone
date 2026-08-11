@@ -4,6 +4,8 @@
 use crate::common;
 
 use common::*;
+use ripclone::provider::RepoId;
+use ripclone::ref_store::{FileRefStore, RefStore};
 
 /// Helper: GET /v1/repos/{provider}/{owner}/{repo}/status with optional query params.
 async fn get_status(
@@ -54,15 +56,15 @@ async fn status_reports_zero_for_unsynced_repo() {
 async fn status_reports_nonzero_bytes_after_sync() {
     init(false);
     let server = start_server().await;
-    let origin = make_origin("acme", "billing");
+    let origin = make_origin("acme", "storage-accounting");
     origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
     // Wait for the full clonepack to publish (phase 2) so all artifacts are
     // accounted for in the byte totals.
-    sync_until_manifest(&server, "acme", "billing").await;
+    sync_until_manifest(&server, "acme", "storage-accounting").await;
 
-    let status = get_status(&server, "acme", "billing", None).await;
+    let status = get_status(&server, "acme", "storage-accounting", None).await;
     // Ordinary publication persists only the resolved moving branch (`main`)
     // and the literal `HEAD` selector used by other processes. Immutable job
     // identity must not become a public synthetic branch.
@@ -83,6 +85,61 @@ async fn status_reports_nonzero_bytes_after_sync() {
     // HEAD and main share the same artifacts, so the repo total dedups them.
     assert_eq!(status["total_bytes"], status["total_unique_bytes"]);
     assert!(status["regions"][0]["unique_bytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "historical-storage-accounting");
+    origin.commit(&[("a.txt", "shared artifact bytes\n")], "c1");
+    origin.publish();
+    sync_until_manifest(&server, "acme", "historical-storage-accounting").await;
+
+    let before = get_status(&server, "acme", "historical-storage-accounting", None).await;
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/historical-storage-accounting");
+    let info = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load moving main")
+        .expect("moving main exists");
+    let historical_key = format!("main#{}", info.commit);
+    // Represent the retained explicit `sync --at` compatibility lane. The
+    // ordinary sync above must not have created this row.
+    assert!(
+        store
+            .load_branch(&repo_id, &historical_key)
+            .await
+            .expect("check ordinary exact row")
+            .is_none()
+    );
+    store
+        .save_branch(&repo_id, &historical_key, &info)
+        .await
+        .expect("seed retained historical row");
+
+    let after = get_status(&server, "acme", "historical-storage-accounting", None).await;
+    let refs = after["refs"].as_array().expect("status refs");
+    let moving = refs
+        .iter()
+        .find(|entry| entry["branch"] == "main")
+        .expect("moving main status");
+    let historical = refs
+        .iter()
+        .find(|entry| entry["branch"] == historical_key)
+        .expect("historical status");
+    assert_eq!(historical["commit"], info.commit);
+    assert_eq!(historical["bytes"], moving["bytes"]);
+    assert_eq!(
+        after["total_bytes"], before["total_bytes"],
+        "shared manifests/chunks are counted once in the reachable hash union"
+    );
+    assert_eq!(after["total_unique_bytes"], before["total_unique_bytes"]);
+    assert_eq!(
+        after["regions"][0]["unique_bytes"],
+        before["regions"][0]["unique_bytes"]
+    );
 }
 
 #[tokio::test]
@@ -175,27 +232,27 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
 }
 
 #[tokio::test]
-async fn status_public_fork_is_free() {
+async fn status_public_fork_has_zero_unique_byte_allocation() {
     init(false);
     let server = start_server().await;
-    let origin = make_origin("acme", "forkbilling");
+    let origin = make_origin("acme", "fork-storage-accounting");
     origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
     let client = server.client();
     client
-        .add_repo("acme/forkbilling")
+        .add_repo("acme/fork-storage-accounting")
         .await
-        .expect("add forkbilling");
+        .expect("add fork storage-accounting fixture");
     client
-        .sync_repo("acme/forkbilling", None)
+        .sync_repo("acme/fork-storage-accounting", None)
         .await
         .expect("sync");
 
     let status = get_status(
         &server,
         "acme",
-        "forkbilling",
+        "fork-storage-accounting",
         Some("public=true&fork_of=upstream/repo"),
     )
     .await;

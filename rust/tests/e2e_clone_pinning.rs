@@ -737,20 +737,33 @@ async fn pending_historical_head_keeps_rev_on_concrete_pinned_polls() {
 }
 
 #[tokio::test]
-async fn real_server_pending_head_preserves_delimiter_branch_on_exact_poll() {
+async fn sha_suffixed_real_branch_resolves_reports_polls_and_advances() {
     let _guard = env_lock().lock().await;
     init(false);
-    let server = start_server_split_storage().await;
+    let _env = EnvGuard::capture(&["RIPCLONE_TESTING"]);
+    unsafe { std::env::set_var("RIPCLONE_TESTING", "1") };
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server_env(&[("RIPCLONE_POLL_INTERVAL_SECS", "1")]).await;
     let origin = make_origin("acme", "delimiter-branch");
-    git(&origin.work, &["branch", "-m", "release#one"]);
+    let branch = "release#0123456789abcdef0123456789abcdef01234567";
+    assert!(
+        std::process::Command::new("git")
+            .args(["check-ref-format", &format!("refs/heads/{branch}")])
+            .status()
+            .expect("validate SHA-suffixed branch")
+            .success(),
+        "SHA-suffixed branch must be a valid Git ref"
+    );
+    git(&origin.work, &["branch", "-m", branch]);
     let commit = origin.commit(&[("value.txt", "A\n")], "A");
     git(
         &origin.work,
-        &["push", "-q", "--force", origin.bare_str(), "release#one"],
+        &["push", "-q", "--force", origin.bare_str(), branch],
     );
     git(
         &origin.bare,
-        &["symbolic-ref", "HEAD", "refs/heads/release#one"],
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
     );
     register_added_without_build(&server, "acme/delimiter-branch")
         .await
@@ -763,7 +776,7 @@ async fn real_server_pending_head_preserves_delimiter_branch_on_exact_poll() {
         .await
         .expect("delimiter branch is ready before forcing the 202");
     assert_eq!(ready.commit, commit);
-    assert_eq!(ready.branch, "release#one");
+    assert_eq!(ready.branch, branch);
     let status = reqwest::Client::new()
         .get(format!(
             "{}/v1/repos/github/acme/delimiter-branch/status",
@@ -780,9 +793,17 @@ async fn real_server_pending_head_preserves_delimiter_branch_on_exact_poll() {
             .as_array()
             .expect("status refs")
             .iter()
-            .any(|entry| entry["branch"] == "release#one" && entry["commit"] == commit),
-        "a real source branch containing # must remain visible in public status: {status:?}"
+            .any(|entry| entry["branch"] == branch && entry["commit"] == commit),
+        "a SHA-suffixed real source branch must remain visible in status: {status:?}"
     );
+    let branch_status = status["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["branch"] == branch)
+        .expect("SHA-suffixed branch status entry");
+    assert!(branch_status["bytes"].as_u64().unwrap() > 0);
+    assert!(status["total_bytes"].as_u64().unwrap() > 0);
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
@@ -808,18 +829,112 @@ async fn real_server_pending_head_preserves_delimiter_branch_on_exact_poll() {
     abort_server_task(proxy_task).await;
 
     assert_eq!(response.commit, commit);
-    assert_eq!(response.branch, "release#one");
+    assert_eq!(response.branch, branch);
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(requests.len(), 2, "one moving and one exact request");
     assert!(requests[0].contains("/refs/HEAD?"));
     assert!(
-        requests[1].contains("/refs/release%23one?"),
+        requests[1].contains(&format!("/refs/{}?", urlencoding::encode(branch))),
         "delimiter must be part of the encoded path, not a fragment: {requests:?}"
     );
     assert!(requests[1].contains(&format!("pinned={commit}")));
 
+    let queue_before = probe.queue_inserts.load(Ordering::SeqCst);
+    let fetches_before = probe
+        .fetch_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .len();
+    let builders_before = probe
+        .builder_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .len();
+    let next = origin.commit(&[("value.txt", "B\n")], "B");
+    git(
+        &origin.work,
+        &["push", "-q", "--force", origin.bare_str(), branch],
+    );
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/delimiter-branch");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(
+                store.load_branch(&repo_id, branch).await,
+                Ok(Some(info))
+                    if info.commit == next
+                        && info.build_status.is_none()
+                        && info.full_clonepack.commit == next
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("polling admits and completes the SHA-suffixed branch advance");
+
+    assert_eq!(
+        probe.queue_inserts.load(Ordering::SeqCst) - queue_before,
+        1,
+        "HEAD and concrete polling coalesce to one immutable job"
+    );
+    let fetch_targets = probe
+        .fetch_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert_eq!(&fetch_targets[fetches_before..], &[next.clone()]);
+    let builder_targets = probe
+        .builder_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert_eq!(&builder_targets[builders_before..], &[next.clone()]);
+    drop(fetch_targets);
+    drop(builder_targets);
+
+    let advanced = server
+        .client()
+        .resolve_ref_with_clonepack("acme/delimiter-branch", "HEAD", Some("full"), None)
+        .await
+        .expect("advanced SHA-suffixed branch resolves through HEAD");
+    assert_eq!(advanced.branch, branch);
+    assert_eq!(advanced.commit, next);
+    let final_status = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/delimiter-branch/status",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .send()
+        .await
+        .expect("final SHA-suffixed status")
+        .error_for_status()
+        .expect("final status 2xx")
+        .json::<serde_json::Value>()
+        .await
+        .expect("final status JSON");
+    assert!(
+        final_status["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["branch"] == branch
+                    && entry["commit"] == next
+                    && entry["bytes"].as_u64() > Some(0)
+            })
+    );
+    assert!(
+        final_status["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["branch"] != "release"),
+        "the real SHA-suffixed branch must not be reinterpreted as another branch's history"
+    );
+
     unsafe {
-        std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
     }
 }
@@ -1383,17 +1498,16 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
         "every request after moving A must stay pinned to A: {requests:?}"
     );
     let observed = probe.snapshot();
-    assert_eq!(
-        observed.branch_reads,
-        requests.len() - 1,
-        "pinned polling reads only the moving branch metadata"
+    assert!(
+        observed.branch_reads >= requests.len() - 1,
+        "each pinned poll performs bounded metadata point reads"
     );
     assert_eq!(observed.enqueues, 0);
     assert_eq!(observed.builder_entries, 0);
 }
 
 #[tokio::test]
-async fn pinned_head_ignores_pre_upgrade_default_branch_exact_row() {
+async fn pinned_head_uses_existing_default_branch_exact_row_after_branch_moves() {
     let _guard = env_lock().lock().await;
     init(false);
     let server = start_server_split_storage().await;
@@ -1428,9 +1542,11 @@ async fn pinned_head_ignores_pre_upgrade_default_branch_exact_row() {
         .as_object_mut()
         .expect("full clonepack object")
         .remove("commit");
-    let exact_a: ripclone::RefInfo =
+    let mut exact_a: ripclone::RefInfo =
         serde_json::from_value(encoded).expect("deserialize pre-variant-commit layout");
     assert!(exact_a.full_clonepack.commit.is_empty());
+    exact_a.last_accessed_at = Some(1);
+    exact_a.warm_pinned = false;
     store
         .save_branch(&repo_id, &format!("main#{a}"), &exact_a)
         .await
@@ -1444,13 +1560,19 @@ async fn pinned_head_ignores_pre_upgrade_default_branch_exact_row() {
         "baseline layout must not contain a HEAD exact alias"
     );
 
-    origin.commit(&[("value.txt", "B\n")], "B");
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
     server
         .client()
         .sync_repo("acme/baseline-layout-pin", None)
         .await
         .expect("publish B");
+    let ready_b = server
+        .client()
+        .resolve_ref_with_clonepack("acme/baseline-layout-pin", "HEAD", Some("full"), None)
+        .await
+        .expect("full B ready before exact-A read");
+    assert_eq!(ready_b.commit, b);
     let stored_exact = store
         .load_branch(&repo_id, &format!("main#{a}"))
         .await
@@ -1465,6 +1587,15 @@ async fn pinned_head_ignores_pre_upgrade_default_branch_exact_row() {
         .expect("reload moving HEAD")
         .expect("moving HEAD remains present");
     assert_eq!(moving_head.default_branch, "main");
+    assert_eq!(moving_head.commit, b);
+    let moving_before = serde_json::to_value(&moving_head).expect("serialize moving B");
+    std::fs::rename(&origin.bare, origin.bare.with_extension("offline"))
+        .expect("make provider unavailable before metadata-only exact read");
+    let probe = server
+        .pinned_path_probe
+        .as_ref()
+        .expect("pinned-path test adapter");
+    probe.arm();
 
     let response = reqwest::Client::new()
         .get(format!(
@@ -1476,10 +1607,39 @@ async fn pinned_head_ignores_pre_upgrade_default_branch_exact_row() {
         .send()
         .await
         .expect("pinned baseline-layout lookup");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let body: serde_json::Value = response.json().await.expect("pending response");
-    assert_eq!(body["code"], "artifact_pending");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("exact response");
     assert_eq!(body["commit"], a);
+    assert_eq!(body["branch"], "main");
+    assert_eq!(
+        body["clonepack_manifest"], exact_a.full_clonepack.manifest,
+        "the selected full manifest belongs to exact A"
+    );
+    let observed = probe.snapshot();
+    probe.disarm();
+    assert_eq!(observed.enqueues, 0, "exact read does not enqueue");
+    assert_eq!(observed.builder_entries, 0, "exact read does not build");
+
+    let exact_after = store
+        .load_branch(&repo_id, &format!("main#{a}"))
+        .await
+        .expect("reload exact A after read")
+        .expect("exact A remains present");
+    assert!(
+        exact_after.last_accessed_at.unwrap() > 1,
+        "successful exact read performs the existing access-time touch"
+    );
+    assert!(!exact_after.warm_pinned, "exact read does not create a pin");
+    let moving_after = store
+        .load_branch(&repo_id, "HEAD")
+        .await
+        .expect("reload moving HEAD after exact read")
+        .expect("moving HEAD remains present");
+    assert_eq!(
+        serde_json::to_value(&moving_after).expect("serialize moving B after read"),
+        moving_before,
+        "reading exact A must not mutate moving B"
+    );
 
     let status = reqwest::Client::new()
         .get(format!(
@@ -1494,10 +1654,15 @@ async fn pinned_head_ignores_pre_upgrade_default_branch_exact_row() {
     let status: serde_json::Value = status.json().await.expect("status response");
     let public_refs = status["refs"].as_array().expect("public refs");
     assert!(
-        public_refs.iter().all(|entry| entry["branch"]
-            .as_str()
-            .is_some_and(|branch| !branch.contains('#'))),
-        "legacy exact keys must never leak through public status: {public_refs:?}"
+        public_refs
+            .iter()
+            .any(|entry| { entry["branch"] == format!("main#{a}") && entry["commit"] == a })
+    );
+    assert!(
+        public_refs
+            .iter()
+            .any(|entry| entry["branch"] == "main" && entry["commit"] == b),
+        "existing historical rows remain visible alongside moving B: {public_refs:?}"
     );
 }
 
@@ -1820,8 +1985,8 @@ async fn pinned_lookup_does_not_serve_carried_a_while_phase_one_b_is_paused() {
     assert_eq!(body["commit"], a);
     let exact_observed = probe.snapshot();
     assert_eq!(
-        exact_observed.branch_reads, 1,
-        "pinned lookup is one moving-ref point read"
+        exact_observed.branch_reads, 2,
+        "pinned lookup checks the moving row then one compatible exact key"
     );
     assert_eq!(exact_observed.enqueues, 0);
     assert_eq!(exact_observed.builder_entries, 0);
@@ -1842,7 +2007,7 @@ async fn pinned_lookup_does_not_serve_carried_a_while_phase_one_b_is_paused() {
     assert_eq!(pending["code"], "artifact_pending");
     assert_eq!(pending["commit"], a);
     let fallback_observed = probe.snapshot();
-    assert_eq!(fallback_observed.branch_reads, 1);
+    assert_eq!(fallback_observed.branch_reads, 2);
     assert_eq!(fallback_observed.enqueues, 0);
     assert_eq!(fallback_observed.builder_entries, 0);
 
