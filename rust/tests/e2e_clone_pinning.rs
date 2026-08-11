@@ -830,7 +830,7 @@ async fn sha_suffixed_real_branch_resolves_reports_polls_and_advances() {
 
     assert_eq!(response.commit, commit);
     assert_eq!(response.branch, branch);
-    let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+    let requests = requests.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(requests.len(), 2, "one moving and one exact request");
     assert!(requests[0].contains("/refs/HEAD?"));
     assert!(
@@ -883,15 +883,15 @@ async fn sha_suffixed_real_branch_resolves_reports_polls_and_advances() {
     let fetch_targets = probe
         .fetch_targets
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    assert_eq!(&fetch_targets[fetches_before..], &[next.clone()]);
+        .unwrap_or_else(|error| error.into_inner())[fetches_before..]
+        .to_vec();
+    assert_eq!(fetch_targets.as_slice(), std::slice::from_ref(&next));
     let builder_targets = probe
         .builder_targets
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    assert_eq!(&builder_targets[builders_before..], &[next.clone()]);
-    drop(fetch_targets);
-    drop(builder_targets);
+        .unwrap_or_else(|error| error.into_inner())[builders_before..]
+        .to_vec();
+    assert_eq!(builder_targets.as_slice(), std::slice::from_ref(&next));
 
     let advanced = server
         .client()
