@@ -1349,8 +1349,8 @@ impl Client {
             }
             // Keep the explicit historical selector on pinned readiness polls.
             // This is what distinguishes the established `sync --at` result
-            // lane from an ordinary branch pin; ordinary pins never gain access
-            // to commit-keyed historical metadata.
+            // lane from an ordinary branch pin. Ordinary pins may reuse an
+            // already-existing exact artifact, but never create historical work.
             if let Some(r) = rev {
                 q.push(format!("rev={}", urlencoding::encode(r)));
             }

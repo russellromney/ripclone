@@ -1498,9 +1498,10 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
         "every request after moving A must stay pinned to A: {requests:?}"
     );
     let observed = probe.snapshot();
-    assert!(
-        observed.branch_reads >= requests.len() - 1,
-        "each pinned poll performs bounded metadata point reads"
+    assert_eq!(
+        observed.branch_reads,
+        2 * (requests.len() - 1),
+        "each concrete-branch pinned miss performs exactly the moving-row and exact-row point reads"
     );
     assert_eq!(observed.enqueues, 0);
     assert_eq!(observed.builder_entries, 0);
@@ -1617,6 +1618,10 @@ async fn pinned_head_uses_existing_default_branch_exact_row_after_branch_moves()
     );
     let observed = probe.snapshot();
     probe.disarm();
+    assert_eq!(
+        observed.branch_reads, 4,
+        "HEAD exact-row fallback reads HEAD, its concrete moving branch, HEAD#A, and main#A exactly once"
+    );
     assert_eq!(observed.enqueues, 0, "exact read does not enqueue");
     assert_eq!(observed.builder_entries, 0, "exact read does not build");
 

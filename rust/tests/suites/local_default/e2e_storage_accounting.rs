@@ -4,6 +4,8 @@
 use crate::common;
 
 use common::*;
+use prost::Message;
+use ripclone::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex};
 use ripclone::provider::RepoId;
 use ripclone::ref_store::{FileRefStore, RefStore};
 
@@ -114,8 +116,39 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
             .expect("check ordinary exact row")
             .is_none()
     );
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open local storage");
+    let moving_manifest_bytes = storage
+        .get(&info.full_clonepack.manifest)
+        .expect("read moving full manifest");
+    let mut historical_manifest = ClonepackManifest::decode(moving_manifest_bytes.as_slice())
+        .expect("decode moving full manifest");
+    assert!(
+        historical_manifest.metadata_chunk.is_some()
+            || !historical_manifest.archive_chunks.is_empty()
+            || !historical_manifest.head_blobs_chunks.is_empty()
+            || !historical_manifest.packs.is_empty(),
+        "historical fixture must retain at least one shared chunk"
+    );
+    let historical_only_bytes = b"historical-only-artifact-bytes".repeat(97);
+    let historical_only_hash = ripclone::cas::hash(&historical_only_bytes);
+    storage
+        .put(&historical_only_hash, &historical_only_bytes)
+        .expect("store historical-only chunk");
+    historical_manifest.archive_chunks.push(ChunkRef {
+        hash: hash_from_hex(&historical_only_hash).expect("decode historical-only hash"),
+        len: historical_only_bytes.len() as u64,
+    });
+    let historical_manifest_bytes = historical_manifest.encode_to_vec();
+    let historical_manifest_hash = ripclone::cas::hash(&historical_manifest_bytes);
+    storage
+        .put(&historical_manifest_hash, &historical_manifest_bytes)
+        .expect("store historical-only manifest");
+
+    let mut historical_info = info.clone();
+    historical_info.full_clonepack.manifest = historical_manifest_hash.clone();
+    historical_info.clonepack_manifest = historical_manifest_hash;
     store
-        .save_branch(&repo_id, &historical_key, &info)
+        .save_branch(&repo_id, &historical_key, &historical_info)
         .await
         .expect("seed retained historical row");
 
@@ -130,15 +163,26 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
         .find(|entry| entry["branch"] == historical_key)
         .expect("historical status");
     assert_eq!(historical["commit"], info.commit);
-    assert_eq!(historical["bytes"], moving["bytes"]);
-    assert_eq!(
-        after["total_bytes"], before["total_bytes"],
-        "shared manifests/chunks are counted once in the reachable hash union"
+    assert!(
+        historical["bytes"].as_u64().unwrap() > moving["bytes"].as_u64().unwrap(),
+        "the historical row includes its unique manifest and chunk"
     );
-    assert_eq!(after["total_unique_bytes"], before["total_unique_bytes"]);
+    let expected_delta =
+        historical_manifest_bytes.len() as u64 + historical_only_bytes.len() as u64;
+    let expected_total = before["total_bytes"].as_u64().unwrap() + expected_delta;
     assert_eq!(
-        after["regions"][0]["unique_bytes"],
-        before["regions"][0]["unique_bytes"]
+        after["total_bytes"].as_u64().unwrap(),
+        expected_total,
+        "shared hashes count once while the historical-only manifest and chunk increase the union"
+    );
+    assert_eq!(
+        after["total_unique_bytes"].as_u64().unwrap(),
+        expected_total
+    );
+    assert_eq!(
+        after["regions"][0]["unique_bytes"].as_u64().unwrap(),
+        expected_total,
+        "regional accounting uses the same deduplicated reachable-hash union"
     );
 }
 

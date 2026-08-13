@@ -3125,7 +3125,7 @@ async fn load_pinned_ref_info(
 ) -> Result<PinnedRefLookup> {
     // Prefer the moving row while it still serves the pin. Reading a compatible
     // exact row is a fallback for artifacts already published by the historical
-    // `--at` lane; it is not ordinary exact-result publication or retention.
+    // `--at` lane; it creates no ordinary publication or permanent pin/retention.
     let branch_info = ref_store.load_branch(repo_id, branch).await?;
     if let Some(info) = branch_info.as_ref()
         && info.commit == pinned
