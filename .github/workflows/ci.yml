@@ -41,6 +41,8 @@ jobs:
               - 'rust/**'
               - 'tests/fly/Dockerfile*'
               - 'scripts/fly_client_test.sh'
+              - 'scripts/e2e_full_topup_minio.sh'
+              - 'scripts/e2e_full_topup_gitea.sh'
               - '.github/workflows/ci.yml'
             bench:
               - 'rust/**'
@@ -311,23 +313,13 @@ jobs:
           chmod +x "$S3GC_TEST_BIN" "$CARGO_BIN_EXE_ripclone"
           bash scripts/ci.sh s3gc "${{ matrix.test }}"
 
-  # Real multi-provider + server-side-token path against a live Gitea.
-  # Prebuilt e2e_gitea_provider from ci-build — no cargo on this runner.
-  gitea:
+  # Real signed base-A artifact download and stale pinned-B refresh against
+  # digest-pinned MinIO. Runs the one focused ignored fixture test exactly.
+  full-topup-minio:
     needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
-    services:
-      gitea:
-        image: gitea/gitea:latest
-        env:
-          GITEA__security__INSTALL_LOCK: "true"
-          GITEA__database__DB_TYPE: sqlite3
-          GITEA__server__ROOT_URL: http://127.0.0.1:3000/
-          GITEA__server__HTTP_PORT: "3000"
-          GITEA__service__DISABLE_REGISTRATION: "true"
-        ports:
-          - 3000:3000
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v7
       - name: Download ci artifacts
@@ -335,42 +327,37 @@ jobs:
         with:
           name: ci-artifacts
           path: bin
-      - name: Wait for Gitea, create admin + access token
-        run: |
-          set -euo pipefail
-          for i in {1..60}; do
-            if curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null; then
-              break
-            fi
-            sleep 0.5
-          done
-          curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null
-          cid="$(docker ps --filter ancestor=gitea/gitea:latest --format '{{.ID}}' | head -n1)"
-          test -n "$cid"
-          docker exec -u git "$cid" gitea admin user create \
-            --admin --username ci --password ci-password-123 \
-            --email ci@example.com --must-change-password=false
-          token="$(curl -sf -X POST \
-            -H 'Content-Type: application/json' \
-            -u ci:ci-password-123 \
-            -d '{"name":"ripclone-ci","scopes":["write:repository","write:user","read:repository","read:user"]}' \
-            http://127.0.0.1:3000/api/v1/users/ci/tokens | jq -r .sha1)"
-          test -n "$token" && test "$token" != "null"
-          curl -sf -H "Authorization: token $token" \
-            http://127.0.0.1:3000/api/v1/user >/dev/null
-          echo "RIPCLONE_GITEA_URL=http://127.0.0.1:3000" >> "$GITHUB_ENV"
-          echo "RIPCLONE_GITEA_USER=ci" >> "$GITHUB_ENV"
-          echo "::add-mask::$token"
-          echo "RIPCLONE_GITEA_TOKEN=$token" >> "$GITHUB_ENV"
-      - name: Gitea provider + server-side-token e2e
+      - name: Digest-pinned MinIO Full top-up e2e
         env:
           CI_ARTIFACTS: ${{ github.workspace }}/bin
-          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
-          CARGO_BIN_EXE_ripclone-server: ${{ github.workspace }}/bin/ripclone-server
+          RIPCLONE_BIN_DIR: ${{ github.workspace }}/bin
+        run: |
+          set -euo pipefail
+          chmod +x bin/* scripts/e2e_full_topup_minio.sh
+          bash scripts/e2e_full_topup_minio.sh
+
+  # Real multi-provider + server-side-token path against a live Gitea.
+  # Prebuilt e2e_gitea_provider from ci-build — no cargo on this runner.
+  gitea:
+    needs: [changes, ci-build]
+    if: ${{ needs.changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download ci artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-artifacts
+          path: bin
+      - name: Digest-pinned Gitea provider + Full top-up e2e
+        env:
+          CI_ARTIFACTS: ${{ github.workspace }}/bin
+          RIPCLONE_BIN_DIR: ${{ github.workspace }}/bin
+          RIPCLONE_REQUIRE_GITEA: "1"
         run: |
           set -euo pipefail
           chmod +x bin/*
-          bash scripts/ci.sh gitea
+          bash scripts/e2e_full_topup_gitea.sh
 
   # Benchmark-harness smoke — prebuilt bins from ci-build.
   benchmark:

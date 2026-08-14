@@ -43,6 +43,7 @@ pick_lib_test_exe() {
 BINS=(ripclone ripclone-server ripclone-worker ripclone-dispatcher git-remote-ripclone writer_bench)
 
 TESTS=(
+  e2e_full_topup
   e2e_gitea_provider
   e2e_worker_postgres
   e2e_worker_mysql

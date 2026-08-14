@@ -24,6 +24,22 @@ fn write_legacy_config(home: &std::path::Path, server_url: &str, token: &str) {
     std::fs::write(dir.join("config.json"), json).unwrap();
 }
 
+fn legacy_config_command(bin: &str, cwd: &std::path::Path, home: &std::path::Path) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .current_dir(cwd)
+        .env("HOME", home)
+        // The shared test setup and parallel server fixtures use these variables.
+        // Remove them from this child so only the legacy+new config files can
+        // provide its server and token.
+        .env_remove("RIPCLONE_CONFIG")
+        .env_remove("RIPCLONE_PROVIDERS")
+        .env_remove("RIPCLONE_SERVER")
+        .env_remove("RIPCLONE_SERVER_TOKEN")
+        .env_remove("RIPCLONE_SERVER_TOKEN_HASH");
+    command
+}
+
 #[tokio::test]
 async fn legacy_config_json_token_still_authenticates() {
     setup(false);
@@ -46,13 +62,9 @@ async fn legacy_config_json_token_still_authenticates() {
         let home_path = home_path.clone();
         let cwd_path = cwd_path.clone();
         move || {
-            Command::new(&bin)
+            legacy_config_command(&bin, &cwd_path, &home_path)
                 .arg("add")
                 .arg("acme/migrate")
-                .current_dir(&cwd_path)
-                .env("HOME", &home_path)
-                // Intentionally do NOT set RIPCLONE_SERVER or RIPCLONE_SERVER_TOKEN.
-                // The CLI must read both from the legacy+new config files.
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .output()
@@ -70,13 +82,9 @@ async fn legacy_config_json_token_still_authenticates() {
     );
 
     let output = tokio::task::spawn_blocking(move || {
-        Command::new(ripclone_bin())
+        legacy_config_command(&ripclone_bin(), &cwd_path, &home_path)
             .arg("sync")
             .arg("acme/migrate")
-            .current_dir(&cwd_path)
-            .env("HOME", &home_path)
-            // Intentionally do NOT set RIPCLONE_SERVER or RIPCLONE_SERVER_TOKEN.
-            // The CLI must read both from the legacy+new config files.
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()

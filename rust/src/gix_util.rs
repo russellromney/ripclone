@@ -163,14 +163,22 @@ pub fn last_commits<P: AsRef<Path>>(
         .context("iterate rev-walk")
 }
 
-/// Return the immediate parent of `commit`, if any.
+/// Return the immediate parent of `commit` only when it has exactly one.
+///
+/// Roots and merges deliberately return `None`: callers use this value as an
+/// unambiguous direct-parent relationship, not as a first-parent hint.
 pub fn parent_commit<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<Option<String>> {
     let repo = open_repo(repo_path)?;
     let id = repo
         .rev_parse_single(commit)
         .with_context(|| format!("resolving commit '{}'", commit))?;
     let commit_obj = repo.find_commit(id).context("find commit")?;
-    Ok(commit_obj.parent_ids().next().map(|pid| pid.to_string()))
+    let mut parents = commit_obj.parent_ids();
+    let first = parents.next().map(|pid| pid.to_string());
+    Ok(match (first, parents.next()) {
+        (Some(parent), None) => Some(parent),
+        _ => None,
+    })
 }
 
 /// List every object reachable from `commit`, optionally limiting the number of

@@ -284,6 +284,12 @@ async fn three_materialize_surfaces_are_distinct() {
     };
 
     assert_ok("add", &run(&["add", "acme/surfaces"]).await);
+    let ready = sync_until_archive_ready(&server, "acme", "surfaces").await;
+    assert_eq!(
+        ready.commit,
+        git(&origin.work, &["rev-parse", "HEAD"]),
+        "surface comparison starts from the fully published tip"
+    );
 
     // 1. editable → real git repo with full history and a working tree.
     assert_ok(

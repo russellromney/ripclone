@@ -1172,11 +1172,13 @@ async fn main() -> Result<()> {
             verify_upstream,
         } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let local_provider = provider_instance(&provider, &provider_registry)
+                .with_context(|| format!("provider '{provider}' is not configured locally"))?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
                     .await?;
             let mut client = client
-                .with_provider(&provider)
+                .with_provider_instance(local_provider)
                 .with_upstream_token_opt(upstream_token.clone());
             if no_metrics {
                 client = client.with_metrics_disabled();

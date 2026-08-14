@@ -135,15 +135,24 @@ async fn force_push_to_non_ancestor_stays_correct() {
     );
     assert_eq!(git(&d, &["status", "--porcelain"]), "", "status clean");
 
-    // depth=0 never fails during the Option-A gap and upgrades to the divergent
-    // tip. The commit count stays 2 across the force-push (c1→c2 vs c1→c3'), so we
-    // poll on the NEW content (a.txt=3) rather than the count. Every successful
-    // clone in the window must be a complete, fsck-clean repo — never a broken one.
+    // A divergent force-push has no safe direct-parent Full base, so depth=0 may
+    // return the typed pending result until Full(c3') lands. The commit count
+    // stays 2 across the force-push (c1→c2 vs c1→c3'), so poll on the NEW content
+    // (a.txt=3) rather than the count. Every successful clone in the window must
+    // be a complete, fsck-clean repo — never a stale or broken one.
     let mut upgraded = false;
     for _ in 0..160 {
-        let (_g, d) = clone_only(&server, "acme", "fpush", 0, CloneMode::Editable)
-            .await
-            .expect("depth=0 must not fail during the gap (option A)");
+        let (_g, d) = match clone_only(&server, "acme", "fpush", 0, CloneMode::Editable).await {
+            Ok(clone) => clone,
+            Err(error) => {
+                assert!(
+                    format!("{error:#}").contains("full artifact is still pending"),
+                    "depth=0 returned an unexpected error during the force-push gap: {error:#}"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
         assert!(
             git_ok(&d, &["fsck", "--connectivity-only", "HEAD"]),
             "every depth=0 clone in the window is complete"
