@@ -84,6 +84,10 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 ## Benchmark harness
 
 - **`benchmark/fly_shaped_benchmark.sh`** now prints the resolved commit in its header instead of `commit=latest`, and prefers `RIPCLONE_SERVER_TOKEN`.
+- Repository admission and artifact readiness now happen explicitly outside
+  clone timing. The harness can select benchmark modes or shallow-only
+  readiness and verifies every editable result is clean at the one resolved
+  commit.
 - Documentation and example workflow updated to use `RIPCLONE_SERVER_TOKEN` consistently.
 
 ## Sync / ref-store correctness
@@ -397,6 +401,10 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 
 - **Rate limiting** (`rust/src/rate_limit.rs`)
   - Token-bucket rate limiter keyed by auth header or `anonymous`.
+  - Authenticated content-addressed artifact GETs do not consume the
+    control-plane request bucket: one clone can legitimately fetch many
+    immutable chunks. Anonymous artifact traffic and all control endpoints
+    remain rate-limited.
   - Env tunables: `RIPCLONE_RATE_LIMIT_BURST` (default 60) and
     `RIPCLONE_RATE_LIMIT_PER_SEC` (default 10.0).
   - Returns `429 Too Many Requests` with a `Retry-After` header when the bucket
