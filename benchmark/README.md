@@ -35,6 +35,12 @@ This directory contains standalone benchmarks and verification scripts. They ass
   fast-moving branch from invalidating later rates.
 
 - **`fly_shaped_benchmark.sh`** — single-rate helper used by `run_shaped_sweep.sh`.
+  It adds the repository and waits for the requested artifacts before starting
+  any clone timer. Set `BENCH_MODES` to a space-separated subset of `full`,
+  `depth1`, `files`, `git-full`, and `git-depth1`. For a shallow-only run, set
+  `RIPCLONE_BENCH_READY_CLONEPACK=shallow` so readiness does not wait for the
+  background full-history build. Every editable result is checked against the
+  one resolved commit and must have a clean worktree.
 - **`sync_latency.sh`** — B4 sync-latency and storage-amplification harness.
   By default it starts a local release server; set `RIPCLONE_URL` for the Fly
   server and `CLIENT_APP=ripclone-client-dev` to run `/sync` POSTs and
@@ -146,6 +152,9 @@ Most scripts read:
   Fly-to-Fly `/sync` POSTs and readiness probes.
 - `BENCH_REF` — tag/commit/branch to sync and benchmark (default: repo default branch).
 - `GIT_REF` — branch/tag that the native `git clone` baseline should check out, used when `BENCH_REF` is a commit SHA.
+- `BENCH_MODES` — space-separated benchmark modes to run (default: all five).
+- `RIPCLONE_BENCH_READY_CLONEPACK` — `full` (default) or `shallow`; controls
+  the pre-timing readiness gate.
 - `SHAPED` — set to `0` to disable traffic shaping.
 - `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads.
 - `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — extraction parallelism.

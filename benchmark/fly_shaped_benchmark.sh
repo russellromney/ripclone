@@ -9,6 +9,10 @@ set -euo pipefail
 #   ./benchmark/fly_shaped_benchmark.sh <owner/repo> <rate_mbps> [runs] [target_dir]
 #
 # Set RIPCLONE_BENCH_PROVIDER for non-GitHub provider routes.
+# Set BENCH_MODES to a space-separated subset of full, depth1, files,
+# git-full, and git-depth1. The default remains the complete matrix. Set
+# RIPCLONE_BENCH_READY_CLONEPACK=shallow for a depth-one-only run so readiness
+# does not wait for background full-history artifacts.
 #
 # Compared modes (each run uses a fresh dir with the client cache disabled):
 #   * ripclone full (depth=0)
@@ -21,6 +25,27 @@ REPO="${1:?owner/repo required}"
 RATE_MBPS="${2:?rate in Mbps required}"
 RUNS="${3:-3}"
 TARGET="${4:-/data}"
+BENCH_MODES="${BENCH_MODES:-full depth1 files git-full git-depth1}"
+READY_CLONEPACK="${RIPCLONE_BENCH_READY_CLONEPACK:-full}"
+
+case "$READY_CLONEPACK" in
+  full|shallow) ;;
+  *) echo "error: RIPCLONE_BENCH_READY_CLONEPACK must be full or shallow" >&2; exit 2 ;;
+esac
+
+mode_enabled() {
+  case " $BENCH_MODES " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+for mode in $BENCH_MODES; do
+  case "$mode" in
+    full|depth1|files|git-full|git-depth1) ;;
+    *) echo "error: unknown BENCH_MODES entry: $mode" >&2; exit 2 ;;
+  esac
+done
 
 SERVER_URL="${RIPCLONE_URL:-https://ripclone-server-dev.fly.dev}"
 TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}"
@@ -182,10 +207,12 @@ head_ref_json() {
   curl -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/$branch" 2>/dev/null
 }
 
-probe_full_clone() {
+probe_ready_clone() {
   local dir="$TARGET/probe.$$"
   rm -rf "$dir"
-  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth 0 --dir "$dir" >/dev/null 2>&1; then
+  local depth=0
+  if [ "$READY_CLONEPACK" = "shallow" ]; then depth=1; fi
+  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth "$depth" --dir "$dir" >/dev/null 2>&1; then
     rm -rf "$dir"
     return 0
   else
@@ -198,10 +225,10 @@ wait_for_artifacts() {
   local timeout="${1:-1200}"
   local start end
   start=$(now_ms)
-  echo "  waiting for full clonepack artifacts to be consistent ..."
+  echo "  waiting for $READY_CLONEPACK clonepack artifacts to be consistent ..."
   while true; do
-    if probe_full_clone; then
-      echo "  artifacts ready (full clone succeeded)"
+    if probe_ready_clone; then
+      echo "  artifacts ready ($READY_CLONEPACK clone succeeded)"
       return 0
     fi
     end=$(now_ms)
@@ -224,7 +251,7 @@ wait_for_ref_ready() {
   local pinned="${3:-}"
   local start end
   start=$(now_ms)
-  echo "  waiting for full clonepack artifacts to be consistent ..." >&2
+  echo "  waiting for $READY_CLONEPACK clonepack artifacts to be consistent ..." >&2
   while true; do
     local out commit ready status tmp
     if [ -n "$pinned" ]; then
@@ -233,7 +260,7 @@ wait_for_ref_ready() {
       status=$(curl -sS -o "$tmp" -w '%{http_code}' \
         -H "$(auth_header)" \
         -H 'x-ripclone-protocol: 2' \
-        "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/${branch#refs/}?clonepack=full&pinned=$pinned") || status="000"
+        "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/${branch#refs/}?clonepack=$READY_CLONEPACK&pinned=$pinned") || status="000"
       out="$(cat "$tmp")"
       rm -f "$tmp"
       if [ "$status" = "200" ]; then
@@ -250,14 +277,22 @@ wait_for_ref_ready() {
         return 1
       fi
     else
-      out="$(head_ref_json "$branch" || true)"
+      if [ "$READY_CLONEPACK" = "shallow" ]; then
+        out="$(curl -fsS \
+          -H "$(auth_header)" \
+          -H 'x-ripclone-protocol: 2' \
+          "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/${branch#refs/}?clonepack=shallow" \
+          2>/dev/null || true)"
+      else
+        out="$(head_ref_json "$branch" || true)"
+      fi
       commit="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))' 2>/dev/null || true)"
       # A full editable clone is ready when the server advertises full-history
       # artifacts for the tip. Field names have drifted across server versions,
       # so accept any of them: full_pack (legacy single pack), pack_chunk_urls /
       # idx_bundle_url (older LSM full history), or clonepack_manifest with
       # archive_ready (current). Empty strings count as absent.
-      ready="$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("1" if (d.get("full_pack") or d.get("pack_chunk_urls") or d.get("idx_bundle_url") or (d.get("clonepack_manifest") and d.get("archive_ready"))) else "")' 2>/dev/null || true)"
+      ready="$(printf '%s' "$out" | READY_CLONEPACK="$READY_CLONEPACK" python3 -c 'import os,sys,json; d=json.load(sys.stdin); mode=os.environ["READY_CLONEPACK"]; print("1" if (d.get("clonepack_manifest") and (mode == "shallow" or d.get("archive_ready"))) or (mode == "full" and (d.get("full_pack") or d.get("pack_chunk_urls") or d.get("idx_bundle_url"))) else "")' 2>/dev/null || true)"
       if [ -n "$commit" ] && [ -n "$ready" ]; then
         echo "  artifacts ready for $commit" >&2
         echo "$commit"
@@ -427,6 +462,7 @@ rc_full()  {
   else
     "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 0 --dir "$1"
   fi
+  verify_git_result "$1"
 }
 rc_depth1(){
   if [ -n "$AT_REF" ]; then
@@ -434,6 +470,7 @@ rc_depth1(){
   else
     "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 1 --dir "$1"
   fi
+  verify_git_result "$1"
 }
 rc_files() {
   if [ -n "$AT_REF" ]; then
@@ -441,7 +478,20 @@ rc_files() {
   else
     "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 1 --mode files --dir "$1"
   fi
+  test ! -e "$1/.git"
+  test -n "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit)"
 }
+
+verify_git_result() {
+  local dir="$1" actual
+  actual="$(git -C "$dir" rev-parse HEAD)"
+  if [ -n "${REF:-}" ] && [ "$actual" != "$REF" ]; then
+    echo "error: expected $REF, got $actual" >&2
+    return 1
+  fi
+  test -z "$(git -C "$dir" status --porcelain)"
+}
+
 git_depth1(){
   if [ -n "${GIT_REF:-}" ]; then
     git clone --branch "$GIT_REF" --depth 1 "https://github.com/$REPO.git" "$1"
@@ -451,6 +501,7 @@ git_depth1(){
   else
     git clone --branch "$CLONE_REF" --depth 1 "https://github.com/$REPO.git" "$1"
   fi
+  verify_git_result "$1"
 }
 git_full() {
   if [ -n "${GIT_REF:-}" ]; then
@@ -460,6 +511,7 @@ git_full() {
   else
     git clone --branch "$CLONE_REF" "https://github.com/$REPO.git" "$1"
   fi
+  verify_git_result "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -480,12 +532,14 @@ cleanup() {
 trap cleanup EXIT
 
 # The repo has to be added before the server will answer /refs, /sync or a clone
-# for it. Do it up front, before the first ref lookup below.
+# for it. Admission and the entire artifact-readiness wait happen before any
+# clone timer in run_one starts; build time is reported separately, never
+# included in a clone result.
 ensure_repo_added
 
 warm_server
 
-echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps runs=$RUNS shaped=${SHAPED:-1} host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
+echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps runs=$RUNS modes=[$BENCH_MODES] ready=$READY_CLONEPACK shaped=${SHAPED:-1} host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
 if [ "${SHAPED:-1}" = "1" ]; then
   apply_shape "$RATE_MBPS"
 else
@@ -493,12 +547,18 @@ else
 fi
 
 echo "--- rate=${RATE_MBPS}Mbps ---"
-if [ "${SKIP_RIPCLONE:-0}" != "1" ]; then
+if [ "${SKIP_RIPCLONE:-0}" != "1" ] && mode_enabled full; then
   bench_cmd "ripclone full (depth=0)" rc_full
+fi
+if [ "${SKIP_RIPCLONE:-0}" != "1" ] && mode_enabled depth1; then
   bench_cmd "ripclone depth=1"        rc_depth1
+fi
+if [ "${SKIP_RIPCLONE:-0}" != "1" ] && mode_enabled files; then
   bench_cmd "ripclone files"          rc_files
 fi
-if [ "${SKIP_GIT:-0}" != "1" ]; then
+if [ "${SKIP_GIT:-0}" != "1" ] && mode_enabled git-full; then
   bench_cmd "git clone full"          git_full
+fi
+if [ "${SKIP_GIT:-0}" != "1" ] && mode_enabled git-depth1; then
   bench_cmd "git clone --depth 1"     git_depth1
 fi
