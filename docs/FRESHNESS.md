@@ -1,112 +1,82 @@
 # Post-build freshness re-check
 
-Status: **design.** Build-before-clone works, but a push that lands *during* a
-build isn't built until the next external poke. This closes that window so a
-fast-moving repo's served HEAD is current within one build cycle.
+Status: **implemented.** Ordinary sync admission pins one exact upstream
+commit. A push that lands while a build is running is therefore not folded into
+the already-admitted job: a later exact commit gets its own queued or claimed
+job. The post-build re-check closes the smaller window where no webhook or
+poller event was received during the build.
 
-## The gap
+## The admission model
 
-A build resolves the upstream tip **once**, at the start, and builds that commit.
-A commit that lands after that fetch is invisible to the running build. When the
-build finishes, nothing checks whether the tip moved — it waits for the next
-webhook, poll sweep, or Actions trigger.
+A normal `sync` or `add` performs at most one bounded `git ls-remote`, resolves
+the advertised branch to an exact commit, and admits that commit. The active
+work key is `owner/repo/branch/exact-commit`.
 
-Coalescing makes it sharper. While a build for `A` is in flight, a push of `B`
-*folds into* `A`'s build (we never build the same branch twice at once), so `B`'s
-own webhook does **not** start a `B` build. `B` is simply not built until the next
-poke.
+- A duplicate request for B coalesces while B is queued **or claimed**.
+- A later C is a distinct job, even when B is still running.
+- A validated signed webhook `after` value is already an exact admission and
+  does not perform a second tip probe.
+- A ready unchanged request is read-only after its single probe: it does not
+  enqueue, fetch, or enter the builder.
 
-### Concrete
+## The window the re-check closes
 
-1. Push `A` → build `A` starts (~7s on a big repo).
-2. Push `B` lands at +3s, during `A`'s build → coalesces onto `A`.
-3. `A` finishes; the branch serves `A`. `B` is not built.
-4. `B` is built only when the next poll/webhook/Actions poke arrives.
+Suppose A is admitted and starts building. If B lands after A's admission:
 
-For that window, clients get a commit that is one behind the real tip.
+1. A continues to build the exact commit A.
+2. A webhook, poller, or API request can independently admit B while A is
+   queued or claimed.
+3. A publishes only its own exact artifacts. B remains separate work and is
+   fetched and built as B.
+4. If no external event arrives, the post-build re-check performs one bounded
+   tip probe and admits the exact current tip if it differs from A.
 
-## Design: re-check the tip after a build, build the latest if it moved
+This means the branch can temporarily serve A while B is pending, but it does
+not silently turn A's immutable job into B or lose B's admission.
 
-When a build finishes and publishes, do a cheap `git ls-remote` of the branch. If
-the upstream tip is no longer the commit we just built, trigger one more build —
-of the *current* tip. Repeat until caught up, with a bound.
+## Bounded re-check
 
-Where, in `process_build_job` (server.rs), after `do_sync` succeeds and the ref is
-published, for a tip build only (`at_rev` is `None`):
+After an ordinary exact build publishes, the worker performs one bounded
+`ls-remote` under the upstream fetch cap. If the observed exact commit equals
+the one just built, it stops. Otherwise it enqueues that exact commit with the
+same active-key coalescing rules. A rev-pinned `sync --at REV` never enters this
+path.
 
-1. `ls_remote_commit(provider, repo_id, branch)` under the fetch cap (one
-   round-trip, no objects).
-2. If the tip equals the commit just built, or is already built (the commit-keyed
-   reuse check), stop.
-3. Otherwise `trigger_build(repo_id, branch)` — the same fire-and-forget enqueue
-   the webhook and poller use. It coalesces, so if something already started the
-   build, this is a no-op.
+The chain is bounded by `RIPCLONE_RECHECK_MAX` consecutive re-triggers (default
+3; `0` disables it). Once the bound is reached, the periodic poller remains the
+backstop. The re-check is not a debounce, tip cache, probe single-flight, or
+latest-only supersession mechanism: already admitted exact jobs remain jobs.
 
-This is the immediate catch-up; the periodic poller stays as the backstop, and
-webhooks/Actions remain the prompt path. Together: event-driven, immediate
-re-check, and periodic sweep.
+## Ordering and workers
 
-### Bursts collapse for free
+Fetch-time ordering and the existing ordered ref-store write prevent an older
+build from moving the served branch backward when builds finish out of order.
+Workers exact-fetch and resolve the admitted commit even if the upstream branch
+has advanced. The same exact target is transported through the local queue,
+supported SQL queues, the dispatcher, standalone workers, and authenticated API
+worker endpoints.
 
-`trigger_build` always builds the *current* tip, not each intermediate commit. So
-if `B`, `C`, `D` all land during `A`'s build, the post-build re-check sees the tip
-is `D` and builds `D`, skipping `B` and `C`. No timer-debounce is needed to
-collapse a burst — building the latest does it.
+## Cross-process behavior
 
-### Bounding the re-check (no livelock)
+`process_build_job` is shared by the in-process and standalone workers. The
+re-check enqueues the exact observed target into the configured queue, so a
+shared SQL queue can hand it to any worker. Local queue durability remains the
+existing process-lifetime boundary.
 
-A repo that pushes faster than it builds would re-trigger forever. That's still
-*useful* work (each build is a real newer commit), but it can pin a worker on one
-repo. Bound it:
-
-- Carry a small re-check counter through the chain (e.g. via the build job).
-- After `RIPCLONE_RECHECK_MAX` consecutive re-triggers (default ~3), stop and let
-  the periodic poller pick up the remainder.
-
-Because each build is the latest tip, the repo lags by at most one build, not by
-the number of pushes — the cap only limits how aggressively one repo monopolizes
-a worker, not correctness.
-
-## What it does not change
-
-- **Coalescing stays.** We still never run two builds for the same branch at once;
-  the re-check runs *after* a build completes, then enqueues (and coalesces).
-- **Ordering stays correct.** The newer tip's build publishes with a fetch-time
-  stamp and `save_ordered` ensures it wins; an out-of-order finish can't regress
-  the branch.
-- **No tight loop.** The re-check fires once per completed build, gated by the
-  cap, and only when the tip actually moved.
-
-## Cross-process
-
-`process_build_job` runs in the in-process worker and the standalone worker
-alike, and `trigger_build` enqueues to whichever queue is configured (in-process
-channel or the shared SQL queue). So the re-check works the same on a single box
-and across farmed-out workers — the re-trigger lands on the shared queue and any
-worker picks it up.
-
-## Optional later: settle window (debounce)
-
-If a repo's builds are so cheap and frequent that back-to-back re-builds waste
-resources, add a short settle delay before the re-check builds: wait `N` ms, then
-build the latest tip. Default off — the burst-collapse above already covers the
-common case.
-
-## Config
+## Configuration
 
 | Env | Meaning |
 |---|---|
-| `RIPCLONE_RECHECK_MAX` | Max consecutive post-build re-triggers before deferring to the poller (default ~3, 0 = off). |
+| `RIPCLONE_RECHECK_MAX` | Maximum consecutive post-build exact re-triggers (default 3; `0` disables). |
 | `RIPCLONE_POLL_INTERVAL_SECS` | Existing periodic backstop; unchanged. |
+| `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` | Bound for each ordinary tip probe; the process is killed and reaped on timeout. |
 
 ## Testing
 
-- Build `A`; before asserting, advance the origin to `B`; the post-build re-check
-  builds `B` with no external poke; a clone then gets `B`. (Simulate the
-  mid-build push by advancing the origin between the sync and the re-check.)
-- Burst: advance the origin through `B`, `C`, `D` during `A`'s build window; after
-  it settles, the served tip is `D` and only `D` (not `B`/`C`) was built beyond
-  `A`.
-- Cap: a repo whose tip keeps moving stops re-triggering after the cap and the
-  poller catches the rest — no infinite rebuild loop.
-- A re-check that finds the tip unchanged does nothing (no extra build).
+The deterministic `e2e_sync_admission` target uses barriers and operation
+counters, not sleeps or tiny-build timing assumptions. It proves duplicate B
+admission before and after claim, distinct C admission, exact B fetch/build
+targets, an older webhook that cannot regress the served ref, a ready no-op with
+no mutation, a signed webhook with no probe, and a killed/reaped bounded probe
+with no source work. The supported queue and worker targets cover SQL transport
+and standalone/API-worker paths.

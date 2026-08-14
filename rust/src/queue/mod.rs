@@ -44,10 +44,17 @@ pub use sqlite_db::SqliteDb;
 pub struct BuildJob {
     pub repo_id: RepoId,
     pub branch: String,
-    /// Optional build-commit override (see `SyncRequest.rev`). Only honored on
-    /// the in-process [`LocalJobQueue`]; the cross-process [`SqlJobQueue`] builds
-    /// the branch tip (rev is not persisted).
+    /// Historical build-commit override (see `SyncRequest.rev`). This remains a
+    /// separate lane from ordinary tip admission and is intentionally not
+    /// persisted by the cross-process queue.
     pub rev: Option<String>,
+    /// Exact commit admitted for an ordinary branch-tip sync. A normal tip job
+    /// must carry a validated full object id; `None` is reserved for the
+    /// historical `rev` lane and for rows written before this field existed.
+    pub admitted_commit: Option<String>,
+    /// Trusted concrete upstream default branch learned alongside a HEAD tip
+    /// admission. This is publication metadata, not part of the active key.
+    pub admitted_default_branch: Option<String>,
     /// Upstream credential (Tier-B passthrough) for the mirror fetch. The
     /// in-process [`LocalJobQueue`] carries it directly; [`SqlJobQueue`] stores
     /// an obfuscated copy long enough for a cross-process worker to claim the
@@ -109,12 +116,21 @@ impl fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 impl BuildJob {
-    /// Coalescing key: concurrent syncs for the same key collapse to one build.
-    /// Uses the repo's storage key plus the branch, so it is stable across
-    /// processes. Slash-joined (not NUL-joined): some SQL engines (Postgres)
-    /// reject `\0` in TEXT columns.
+    /// Coalescing key: active work is immutable and therefore keyed by repo,
+    /// branch, and the exact admitted target. Historical `rev` work remains a
+    /// distinct lane. The unit-separator is accepted by all supported SQL text
+    /// columns (unlike NUL) and keeps the key unambiguous for valid branch names.
     pub fn key(&self) -> String {
-        format!("{}/{}", self.repo_id.storage_key(), self.branch)
+        let target = match (&self.rev, &self.admitted_commit) {
+            (Some(rev), _) => format!("rev:{rev}"),
+            (None, Some(commit)) => format!("tip:{commit}"),
+            (None, None) => "legacy".to_string(),
+        };
+        format!(
+            "{}\x1f{}\x1f{target}",
+            self.repo_id.storage_key(),
+            self.branch
+        )
     }
 }
 

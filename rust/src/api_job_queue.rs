@@ -54,6 +54,12 @@ pub struct ClaimedJobWire {
     pub provider: String,
     pub path: String,
     pub branch: String,
+    /// Exact commit admitted for ordinary tip work. Missing means a historical
+    /// rev lane or a legacy row; workers reject legacy rows before source work.
+    #[serde(default)]
+    pub admitted_commit: Option<String>,
+    #[serde(default)]
+    pub admitted_default_branch: Option<String>,
     #[serde(default)]
     pub credential: Option<String>,
 }
@@ -282,6 +288,8 @@ impl WorkerQueue for ApiJobQueue {
             provider: j.provider,
             path: j.path,
             branch: j.branch,
+            admitted_commit: j.admitted_commit,
+            admitted_default_branch: j.admitted_default_branch,
             credential: j.credential.map(|c| SecretString::new(c.into())),
         }))
     }

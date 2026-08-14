@@ -57,6 +57,8 @@ fn job(path: &str) -> BuildJob {
         repo_id: RepoId::github(path),
         branch: "main".into(),
         rev: None,
+        admitted_commit: Some("1111111111111111111111111111111111111111".into()),
+        admitted_default_branch: None,
         credential: None,
         recheck: 0,
         size_bytes: Some(100),

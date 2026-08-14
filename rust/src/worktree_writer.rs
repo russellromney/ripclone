@@ -14,6 +14,11 @@ pub(crate) const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
 #[cfg(target_os = "linux")]
 const IO_URING_MIN_BATCH_FILES: usize = 2;
 
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_fd_safe_writer_concurrency(requested: usize) -> usize {
+    linux_uring::fd_safe_writer_concurrency(requested)
+}
+
 // Process-wide write-phase timing counters. These let a caller (notably the
 // `writer_bench` binary) split the worktree-write cost into three buckets that
 // the per-clone benchmark conflates inside `write_ms`:
@@ -886,11 +891,14 @@ mod linux_uring {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const QUEUE_DEPTH: u32 = 4096;
-    const MAX_BATCH_FILES: usize = 512;
+    // A direct-descriptor window temporarily owns one open file per entry.
+    // Keep the window well below the common Linux soft RLIMIT_NOFILE of 1024;
+    // several pack-parser threads can each have windows in flight at once.
+    const MAX_BATCH_FILES: usize = 64;
     /// Largest per-ring overlap depth a writer can request. Each in-flight
     /// window owns its own fixed-file slot range, so the registered slot
     /// table holds this many `MAX_BATCH_FILES`-sized ranges.
-    const MAX_INFLIGHT_WINDOWS: usize = 4;
+    const MAX_INFLIGHT_WINDOWS: usize = 2;
     const REGISTERED_FILE_SLOTS: usize = MAX_BATCH_FILES * MAX_INFLIGHT_WINDOWS;
     /// Completion-queue capacity. A window submits up to four ops per file
     /// (open/write/statx/close); with `MAX_INFLIGHT_WINDOWS` windows un-harvested
@@ -912,6 +920,41 @@ mod linux_uring {
     /// herd of repeated ring-creation attempts that would each fail.
     static IO_URING_RUNTIME_DISABLED: AtomicBool = AtomicBool::new(false);
     static IO_URING_DISABLED_LOG: Once = Once::new();
+
+    pub(super) fn fd_safe_writer_concurrency(requested: usize) -> usize {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid writable rlimit and getrlimit initializes
+        // it synchronously before returning.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return requested.max(1);
+        }
+        fd_safe_writer_concurrency_for_limit(requested, limit.rlim_cur as usize)
+    }
+
+    fn fd_safe_writer_concurrency_for_limit(requested: usize, soft_limit: usize) -> usize {
+        // HTTP downloads, temp files, Git, and the runtime need descriptors too.
+        // Reserve 256 where possible, then divide the remainder by the maximum
+        // direct descriptors one parser thread can keep in flight.
+        const RESERVED_FDS: usize = 256;
+        let per_writer = REGISTERED_FILE_SLOTS;
+        let usable = soft_limit.saturating_sub(RESERVED_FDS);
+        requested.max(1).min((usable / per_writer).max(1))
+    }
+
+    #[cfg(test)]
+    mod fd_budget_tests {
+        use super::fd_safe_writer_concurrency_for_limit;
+
+        #[test]
+        fn parser_threads_leave_descriptors_for_http_git_and_runtime() {
+            assert_eq!(fd_safe_writer_concurrency_for_limit(8, 1024), 6);
+            assert_eq!(fd_safe_writer_concurrency_for_limit(64, 256), 1);
+            assert_eq!(fd_safe_writer_concurrency_for_limit(4, 65_536), 4);
+        }
+    }
 
     #[cfg(test)]
     pub(super) fn set_runtime_disabled_for_test(disabled: bool) {

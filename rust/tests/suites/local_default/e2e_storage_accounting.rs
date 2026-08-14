@@ -4,6 +4,10 @@
 use crate::common;
 
 use common::*;
+use prost::Message;
+use ripclone::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex};
+use ripclone::provider::RepoId;
+use ripclone::ref_store::{FileRefStore, RefStore};
 
 /// Helper: GET /v1/repos/{provider}/{owner}/{repo}/status with optional query params.
 async fn get_status(
@@ -54,31 +58,132 @@ async fn status_reports_zero_for_unsynced_repo() {
 async fn status_reports_nonzero_bytes_after_sync() {
     init(false);
     let server = start_server().await;
-    let origin = make_origin("acme", "billing");
+    let origin = make_origin("acme", "storage-accounting");
     origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
     // Wait for the full clonepack to publish (phase 2) so all artifacts are
     // accounted for in the byte totals.
-    sync_until_manifest(&server, "acme", "billing").await;
+    sync_until_manifest(&server, "acme", "storage-accounting").await;
 
-    let status = get_status(&server, "acme", "billing", None).await;
-    // The async build persists the ref under both the resolved branch (`main`)
-    // and the literal `HEAD` alias (so any process can resolve `/sync HEAD` from
-    // the shared metadata store), so two ref rows appear for the one commit.
+    let status = get_status(&server, "acme", "storage-accounting", None).await;
+    // Ordinary publication persists only the resolved moving branch (`main`)
+    // and the literal `HEAD` selector used by other processes. Immutable job
+    // identity must not become a public synthetic branch.
     let refs = status["refs"].as_array().unwrap();
-    assert_eq!(refs.len(), 2, "HEAD alias + resolved branch");
+    assert_eq!(refs.len(), 2, "HEAD plus the moving source branch");
     let branch = refs
         .iter()
         .find(|r| r["branch"] == "main")
         .expect("resolved main ref present");
+    assert!(
+        refs.iter()
+            .all(|r| !r["branch"].as_str().expect("branch string").contains('#')),
+        "public status must contain only real source refs"
+    );
     assert!(branch["bytes"].as_u64().unwrap() > 0);
     assert_eq!(branch["bytes"], branch["unique_bytes"]);
     assert!(status["total_bytes"].as_u64().unwrap() > 0);
-    // The HEAD alias and `main` share the same artifacts, so the repo total
-    // dedups them.
+    // HEAD and main share the same artifacts, so the repo total dedups them.
     assert_eq!(status["total_bytes"], status["total_unique_bytes"]);
     assert!(status["regions"][0]["unique_bytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "historical-storage-accounting");
+    origin.commit(&[("a.txt", "shared artifact bytes\n")], "c1");
+    origin.publish();
+    sync_until_manifest(&server, "acme", "historical-storage-accounting").await;
+
+    let before = get_status(&server, "acme", "historical-storage-accounting", None).await;
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/historical-storage-accounting");
+    let info = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load moving main")
+        .expect("moving main exists");
+    let historical_key = format!("main#{}", info.commit);
+    // Represent the retained explicit `sync --at` compatibility lane. The
+    // ordinary sync above must not have created this row.
+    assert!(
+        store
+            .load_branch(&repo_id, &historical_key)
+            .await
+            .expect("check ordinary exact row")
+            .is_none()
+    );
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open local storage");
+    let moving_manifest_bytes = storage
+        .get(&info.full_clonepack.manifest)
+        .expect("read moving full manifest");
+    let mut historical_manifest = ClonepackManifest::decode(moving_manifest_bytes.as_slice())
+        .expect("decode moving full manifest");
+    assert!(
+        historical_manifest.metadata_chunk.is_some()
+            || !historical_manifest.archive_chunks.is_empty()
+            || !historical_manifest.head_blobs_chunks.is_empty()
+            || !historical_manifest.packs.is_empty(),
+        "historical fixture must retain at least one shared chunk"
+    );
+    let historical_only_bytes = b"historical-only-artifact-bytes".repeat(97);
+    let historical_only_hash = ripclone::cas::hash(&historical_only_bytes);
+    storage
+        .put(&historical_only_hash, &historical_only_bytes)
+        .expect("store historical-only chunk");
+    historical_manifest.archive_chunks.push(ChunkRef {
+        hash: hash_from_hex(&historical_only_hash).expect("decode historical-only hash"),
+        len: historical_only_bytes.len() as u64,
+    });
+    let historical_manifest_bytes = historical_manifest.encode_to_vec();
+    let historical_manifest_hash = ripclone::cas::hash(&historical_manifest_bytes);
+    storage
+        .put(&historical_manifest_hash, &historical_manifest_bytes)
+        .expect("store historical-only manifest");
+
+    let mut historical_info = info.clone();
+    historical_info.full_clonepack.manifest = historical_manifest_hash.clone();
+    historical_info.clonepack_manifest = historical_manifest_hash;
+    store
+        .save_branch(&repo_id, &historical_key, &historical_info)
+        .await
+        .expect("seed retained historical row");
+
+    let after = get_status(&server, "acme", "historical-storage-accounting", None).await;
+    let refs = after["refs"].as_array().expect("status refs");
+    let moving = refs
+        .iter()
+        .find(|entry| entry["branch"] == "main")
+        .expect("moving main status");
+    let historical = refs
+        .iter()
+        .find(|entry| entry["branch"] == historical_key)
+        .expect("historical status");
+    assert_eq!(historical["commit"], info.commit);
+    assert!(
+        historical["bytes"].as_u64().unwrap() > moving["bytes"].as_u64().unwrap(),
+        "the historical row includes its unique manifest and chunk"
+    );
+    let expected_delta =
+        historical_manifest_bytes.len() as u64 + historical_only_bytes.len() as u64;
+    let expected_total = before["total_bytes"].as_u64().unwrap() + expected_delta;
+    assert_eq!(
+        after["total_bytes"].as_u64().unwrap(),
+        expected_total,
+        "shared hashes count once while the historical-only manifest and chunk increase the union"
+    );
+    assert_eq!(
+        after["total_unique_bytes"].as_u64().unwrap(),
+        expected_total
+    );
+    assert_eq!(
+        after["regions"][0]["unique_bytes"].as_u64().unwrap(),
+        expected_total,
+        "regional accounting uses the same deduplicated reachable-hash union"
+    );
 }
 
 #[tokio::test]
@@ -94,7 +199,7 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
         .add_repo("acme/synctiming")
         .await
         .expect("add synctiming");
-    origin.commit(&[("README.md", "sync timings\nupdated\n")], "c2");
+    let c2 = origin.commit(&[("README.md", "sync timings\nupdated\n")], "c2");
     origin.publish();
     let client = reqwest::Client::new();
     let before_metrics = client
@@ -109,7 +214,13 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
         .expect("metrics text");
     let before_publish_p1 =
         prometheus_value(&before_metrics, "ripclone_sync_publish_p1_ms_total").unwrap_or(0);
-    let sync_url = format!("{}/v1/repos/github/acme/synctiming/sync", server.url);
+    // Ordinary `/sync` now returns exact admission before build timing data
+    // exists. Exercise the unchanged explicit-revision ready payload for this
+    // phase-timing/metrics regression.
+    let sync_url = format!(
+        "{}/v1/repos/github/acme/synctiming/sync?rev={c2}",
+        server.url
+    );
     let sync_resp = client
         .post(&sync_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -165,27 +276,27 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
 }
 
 #[tokio::test]
-async fn status_public_fork_is_free() {
+async fn status_public_fork_has_zero_unique_byte_allocation() {
     init(false);
     let server = start_server().await;
-    let origin = make_origin("acme", "forkbilling");
+    let origin = make_origin("acme", "fork-storage-accounting");
     origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
     let client = server.client();
     client
-        .add_repo("acme/forkbilling")
+        .add_repo("acme/fork-storage-accounting")
         .await
-        .expect("add forkbilling");
+        .expect("add fork storage-accounting fixture");
     client
-        .sync_repo("acme/forkbilling", None)
+        .sync_repo("acme/fork-storage-accounting", None)
         .await
         .expect("sync");
 
     let status = get_status(
         &server,
         "acme",
-        "forkbilling",
+        "fork-storage-accounting",
         Some("public=true&fork_of=upstream/repo"),
     )
     .await;

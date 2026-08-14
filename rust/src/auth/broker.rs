@@ -411,7 +411,7 @@ pub fn broker_from_env(registry: ProviderRegistry) -> Result<Arc<dyn CredentialB
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::provider::ProviderInstanceId;
     use secrecy::ExposeSecret;
@@ -441,7 +441,7 @@ mod tests {
     }
 
     // A throwaway RSA keypair generated only for these tests — not a real key.
-    const TEST_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+    pub(crate) const TEST_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
 MIIEpQIBAAKCAQEAr3mQr1jPDpJqNqW2YF/lpwN40lfIF1kT61h0VS3DjLG2MNvX
 sfBgX0IFUGGTdo1o4k21BJVo4gkwoxLIumgTo7VrhBJ/pMl1IZnZb980tcKTZiKB
 92J0DBPKtfI0RPNbZ7h0mr8LMMDyfzfayUM+4teYz5z+YKioV2heaNkrkIorqX+R
@@ -469,7 +469,7 @@ kWa3FUnFbwk4JxH8b2cJrqzGm+P7FqVkU8QA7D2lM1uQi3O1m0+MkrZR+n3YX6wK
 LOZt7DfvAu4PlbF59QuMzx+kr0jacDA5zM8Ehg7ShrJCAs9d49a9fPk=
 -----END RSA PRIVATE KEY-----";
 
-    const TEST_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----
+    pub(crate) const TEST_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr3mQr1jPDpJqNqW2YF/l
 pwN40lfIF1kT61h0VS3DjLG2MNvXsfBgX0IFUGGTdo1o4k21BJVo4gkwoxLIumgT
 o7VrhBJ/pMl1IZnZb980tcKTZiKB92J0DBPKtfI0RPNbZ7h0mr8LMMDyfzfayUM+

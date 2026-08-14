@@ -68,7 +68,7 @@ use ripclone::queue::{
     BuildError, BuildJob, JobQueueRef, JobState, WorkerQueueRef, make_worker_id,
     validate_heartbeat_timing, worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
 };
-use ripclone::server::{ServerState, mark_branch_build_failed, process_build_job};
+use ripclone::server::{ServerState, mark_admitted_build_failed, process_build_job};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -252,6 +252,42 @@ async fn main() -> Result<()> {
                     repo_id.storage_key(),
                     claimed.branch
                 );
+                let Some(admitted_commit) = claimed.admitted_commit.clone() else {
+                    let error = BuildError::permanent(
+                        "legacy queued job has no admitted commit; resubmit sync",
+                    );
+                    match queue.ack(job_id, &worker_id, Err(error)).await {
+                        Ok(_) => {
+                            if let Some(ref cur) = current_job {
+                                cur.store(-1, Ordering::Relaxed);
+                            }
+                            jobs_done += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("failed to settle legacy job {job_id}: {e:#}");
+                            break;
+                        }
+                    }
+                };
+                if let Err(e) = ripclone::validation::validate_object_id(&admitted_commit) {
+                    let error = BuildError::permanent(format!(
+                        "queued job has invalid admitted commit: {e}"
+                    ));
+                    match queue.ack(job_id, &worker_id, Err(error)).await {
+                        Ok(_) => {
+                            if let Some(ref cur) = current_job {
+                                cur.store(-1, Ordering::Relaxed);
+                            }
+                            jobs_done += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("failed to settle invalid job {job_id}: {e:#}");
+                            break;
+                        }
+                    }
+                }
                 // Prefer the per-job upstream credential the enqueuer persisted
                 // (the cloud's per-request X-Upstream-Token, for a private repo
                 // the worker has no standing credential for); fall back to the
@@ -263,10 +299,13 @@ async fn main() -> Result<()> {
                         format!("fetch credential for queued job {}", repo_id.storage_key())
                     })?;
                 let branch = claimed.branch.clone();
+                let terminal_commit = admitted_commit.clone();
                 let job = BuildJob {
                     repo_id: repo_id.clone(),
                     branch: branch.clone(),
                     rev: None,
+                    admitted_commit: Some(admitted_commit),
+                    admitted_default_branch: claimed.admitted_default_branch,
                     credential,
                     // The SQL queue does not persist the re-check counter; a
                     // cross-process worker starts each claimed job fresh and the
@@ -299,8 +338,14 @@ async fn main() -> Result<()> {
                         // is the case that still needs a terminal write.
                         if maybe_retryable_msg.is_some()
                             && let Ok(JobState::Failed(err)) = queue.job_status(job_id).await
-                            && let Err(e) =
-                                mark_branch_build_failed(&state, &repo_id, &branch, &err).await
+                            && let Err(e) = mark_admitted_build_failed(
+                                &state,
+                                &repo_id,
+                                &branch,
+                                &terminal_commit,
+                                &err,
+                            )
+                            .await
                         {
                             error!(
                                 "failed to mark {}@{} terminal after dead-letter: {e:#}",

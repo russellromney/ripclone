@@ -10,7 +10,10 @@
 mod common;
 
 use common::*;
+use ripclone::backends;
 use ripclone::mode::CloneMode;
+use ripclone::queue::BuildError;
+use secrecy::ExposeSecret;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -84,6 +87,7 @@ async fn worker_farm_out_libsql_against_real_sqld() {
         // sqld runs without auth here; the backend requires a non-empty token.
         std::env::set_var("RIPCLONE_QUEUE_DB_TOKEN", "dev");
         std::env::set_var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "10");
+        std::env::set_var("RIPCLONE_QUEUE_RETRY_BACKOFF_MS", "0");
         // Also drive the METADATA store over the same libsql server — this is the
         // only runtime coverage of the libsql metadata adapter (it's otherwise
         // remote-only and compile-checked), and exercises queue + metadata on
@@ -98,31 +102,88 @@ async fn worker_farm_out_libsql_against_real_sqld() {
     init(false);
 
     let server = start_server().await;
-    let _worker = spawn_worker(&server.cas_dir, &server.repo_root);
 
-    // Positive: a published repo is built by the worker (over libsql) and clones.
+    // Admit B before a worker exists, then claim it through the real libsql
+    // adapter. The duplicate must coalesce against the claimed exact row.
     let origin = make_origin("acme", "lq");
-    origin.commit(&[("a.txt", "via-libsql\n")], "c1");
+    let commit_b = origin.commit(&[("a.txt", "via-libsql-b\n")], "b");
     origin.publish();
-
-    server
-        .client()
-        .add_repo("acme/lq")
+    register_added_without_build(&server, "acme/lq")
         .await
-        .expect("add libsql farm-out repo");
+        .expect("register libsql farm-out repo");
+    let admitted_b = server
+        .client()
+        .with_upstream_token("first-libsql-credential")
+        .admit_sync_repo("acme/lq", None)
+        .await
+        .expect("admit libsql B");
+    assert!(admitted_b.accepted);
+    assert_eq!(admitted_b.commit, commit_b);
+
+    let probe_queue = backends::connect_sql_queue()
+        .await
+        .expect("connect libsql lifecycle probe");
+    let claimed_b = claim_exact_sql_job(&probe_queue, "libsql-lifecycle-probe", &commit_b).await;
+    assert_eq!(
+        claimed_b.admitted_commit.as_deref(),
+        Some(commit_b.as_str())
+    );
+    assert_eq!(
+        claimed_b
+            .credential
+            .as_ref()
+            .map(|credential| credential.expose_secret()),
+        Some("first-libsql-credential")
+    );
+
+    let duplicate_b = server
+        .client()
+        .with_upstream_token("claimed-duplicate-decoy")
+        .admit_sync_repo("acme/lq", None)
+        .await
+        .expect("duplicate claimed B admission");
+    assert_eq!(duplicate_b.commit, commit_b);
+    assert_eq!(duplicate_b.status, "coalesced");
+    eprintln!("libsql active_rows_B=1 claimed_rows=1 queued_rows=0 credential_owner=first");
+
+    let commit_c = origin.commit(&[("a.txt", "via-libsql-c\n")], "c");
+    origin.publish();
+    let admitted_c = server
+        .client()
+        .admit_sync_repo("acme/lq", None)
+        .await
+        .expect("admit distinct libsql C");
+    assert!(admitted_c.accepted);
+    assert_eq!(admitted_c.commit, commit_c);
+    assert_eq!(admitted_c.status, "queued");
+
+    assert!(
+        probe_queue
+            .ack(
+                claimed_b.id,
+                "libsql-lifecycle-probe",
+                Err(BuildError::retryable("release B for real worker")),
+            )
+            .await
+            .expect("requeue B")
+    );
+
+    // The real worker builds the requeued exact B and distinct C; the ordinary
+    // branch settles at C.
+    let _worker = spawn_worker(&server.cas_dir, &server.repo_root);
     let resp = server
         .client()
         .sync_repo("acme/lq", None)
         .await
         .expect("libsql farm-out sync should succeed against real sqld");
-    assert!(!resp.commit.is_empty());
+    assert_eq!(resp.commit, commit_c);
 
     let (_g, c) = clone_only(&server, "acme", "lq", 0, CloneMode::Editable)
         .await
         .expect("clone after libsql farm-out build");
     assert_eq!(
         std::fs::read_to_string(c.join("a.txt")).unwrap(),
-        "via-libsql\n"
+        "via-libsql-c\n"
     );
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
 

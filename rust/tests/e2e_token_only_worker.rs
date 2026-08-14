@@ -20,8 +20,9 @@ use ripclone::queue::{BuildJob, JobQueue, JobState, SqlJobQueue};
 use ripclone::ref_store::RefStore;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -42,6 +43,17 @@ fn spawn_token_only_worker(
     server_url: &str,
     job_token: &str,
 ) -> WorkerProc {
+    spawn_token_only_worker_with(cas_dir, repo_root, server_url, job_token, &[], &[])
+}
+
+fn spawn_token_only_worker_with(
+    cas_dir: &Path,
+    repo_root: &Path,
+    server_url: &str,
+    job_token: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> WorkerProc {
     let report_url = format!("{server_url}/v1/refs");
     let mut cmd = Command::new(cargo_bin("ripclone-worker"));
     cmd.arg("--cas-dir")
@@ -50,6 +62,7 @@ fn spawn_token_only_worker(
         .arg(repo_root)
         .arg("--idle-poll-ms")
         .arg("100")
+        .args(extra_args)
         .env_remove("RIPCLONE_IDLE_EXIT_SECS")
         .env_remove("RIPCLONE_MAX_JOBS")
         // Queue over HTTP.
@@ -62,6 +75,9 @@ fn spawn_token_only_worker(
         .env("RIPCLONE_METADATA_JOB_TOKEN", job_token)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     // The farm-out contract: not one DB credential on the worker.
     for k in DB_CRED_KEYS {
         cmd.env_remove(k);
@@ -81,6 +97,31 @@ fn spawn_token_only_worker(
     }
     let child = cmd.spawn().expect("spawn token-only ripclone-worker");
     WorkerProc::from_child(child)
+}
+
+async fn wait_for_exact_full(
+    store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    commit: &str,
+) -> ripclone::RefInfo {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(info) = store
+            .load_build(repo_id, commit)
+            .await
+            .expect("load exact API-worker build")
+            && info.commit == commit
+            && matches!(info.build_status.as_deref(), None | Some("done"))
+            && !info.full_clonepack.manifest.is_empty()
+        {
+            return info;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exact Full({commit}) did not settle through the API worker"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn setup_sqlite_queue_and_meta() -> (tempfile::TempDir, tempfile::TempDir, String, String) {
@@ -124,6 +165,8 @@ async fn enqueue_job(path: &str) -> (SqlJobQueue, i64) {
             repo_id: RepoId::github(path),
             branch: "main".into(),
             rev: None,
+            admitted_commit: Some("1111111111111111111111111111111111111111".into()),
+            admitted_default_branch: None,
             credential: None,
             recheck: 0,
             size_bytes: None,
@@ -172,6 +215,218 @@ async fn token_only_worker_claims_builds_acks_over_api() {
     assert_eq!(stored.commit, commit);
     // (The spawn helper already asserted the child's env carries no DB creds.)
     worker.kill_now();
+}
+
+/// One complete immutable API-worker journey: public admissions race credentials
+/// and a moving branch, while the real worker owns no database/provider secret
+/// and can obtain the exact source identity only from its authenticated claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_worker_preserves_first_credential_and_exact_commit_after_tip_moves() {
+    let _guard = SERIAL.lock().await;
+    let (_q, _m, queue_url, meta_url) = setup_sqlite_queue_and_meta();
+
+    const T1: &str = "credential-one";
+    const T2: &str = "credential-two-decoy";
+    let origin = make_http_origin_with_alternate_discovery_auth(
+        "acme/api-immutable",
+        &format!("token {T1}"),
+        &format!("token {T2}"),
+    );
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+
+    let isolated = tempfile::tempdir().expect("isolated API-worker config");
+    let server_config = isolated.path().join("server-config-missing.toml");
+    let providers = serde_json::json!({
+        "providers": [{
+            "id": "credential-http",
+            "kind": "generic",
+            "host": origin.url,
+            "auth_template": "token {token}",
+        }]
+    })
+    .to_string();
+    let server = start_server_env(&[
+        ("RIPCLONE_CONFIG", server_config.to_str().unwrap()),
+        ("RIPCLONE_PROVIDERS", &providers),
+    ])
+    .await;
+    register_added_without_build_for_provider(&server, "credential-http", "acme/api-immutable")
+        .await
+        .expect("register private API-worker fixture");
+
+    let first_client = server.client_with_provider("credential-http", Some(T1));
+    let started = Instant::now();
+    let first = first_client
+        .admit_sync_repo("acme/api-immutable", None)
+        .await
+        .expect("admit B with T1");
+    let first_elapsed = started.elapsed();
+    assert!(first.accepted);
+    assert_eq!(first.commit, b);
+    assert!(
+        first_elapsed < Duration::from_secs(5),
+        "public B admission waited without a worker: {:?}",
+        first_elapsed
+    );
+
+    let duplicate = server
+        .client_with_provider("credential-http", Some(T2))
+        .admit_sync_repo("acme/api-immutable", None)
+        .await
+        .expect("duplicate B with discovery-only T2");
+    assert_eq!(duplicate.commit, b);
+    assert_eq!(duplicate.status, "coalesced");
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::from_str(&queue_url)
+                .expect("parse queue database path"),
+        )
+        .await
+        .expect("open queue database");
+    let active_b: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE admitted_commit = ? AND status IN ('queued', 'claimed')",
+    )
+    .bind(&b)
+    .fetch_one(&pool)
+    .await
+    .expect("count active B rows");
+    assert_eq!(active_b, 1, "duplicate B must share one active SQL row");
+
+    // C is visible before the worker's first source request. A moving-tip
+    // worker would now build C; only the claimed admitted_commit can build B.
+    let c = origin.commit(&[("value.txt", "C\n")], "C");
+    origin.publish();
+
+    let decoy_queue = isolated.path().join("worker-must-not-open-queue.db");
+    let decoy_meta = isolated.path().join("worker-must-not-open-meta.db");
+    let worker_config = isolated.path().join("worker-config-missing.toml");
+    // Put realistic decoy DB coordinates in the inherited process environment.
+    // `spawn_token_only_worker_with` must remove all four keys from the child;
+    // if that security boundary regresses, these files become observable.
+    unsafe {
+        std::env::set_var("RIPCLONE_QUEUE_DB_URL", &decoy_queue);
+        std::env::set_var("RIPCLONE_QUEUE_DB_TOKEN", "decoy-queue-token");
+        std::env::set_var("RIPCLONE_METADATA_DB_URL", &decoy_meta);
+        std::env::set_var("RIPCLONE_METADATA_DB_TOKEN", "decoy-meta-token");
+    }
+    let worker_repo = tempfile::tempdir().expect("isolated worker scratch");
+    let token = mint_token(Duration::from_secs(3600));
+    let mut worker = spawn_token_only_worker_with(
+        &server.cas_dir,
+        worker_repo.path(),
+        &server.url,
+        &token,
+        &[],
+        &[
+            ("RIPCLONE_CONFIG", worker_config.to_str().unwrap()),
+            ("RIPCLONE_PROVIDERS", &providers),
+        ],
+    );
+    unsafe {
+        std::env::remove_var("RIPCLONE_QUEUE_DB_URL");
+        std::env::remove_var("RIPCLONE_QUEUE_DB_TOKEN");
+        std::env::remove_var("RIPCLONE_METADATA_DB_URL");
+        std::env::remove_var("RIPCLONE_METADATA_DB_TOKEN");
+    }
+
+    let store = open_meta_store(&meta_url).await;
+    let repo_id = RepoId {
+        provider: ripclone::provider::ProviderInstanceId::new("credential-http"),
+        path: "acme/api-immutable".to_string(),
+    };
+    let full_b = wait_for_exact_full(&store, &repo_id, &b).await;
+    assert_eq!(full_b.commit, b);
+    let full_b_manifest = full_b.full_clonepack.manifest.clone();
+    assert!(server.cas_path(&full_b_manifest).exists());
+
+    let log_after_b = origin.auth_log_text();
+    let mut t2_discovery = 0;
+    let mut t2_object_requests = 0;
+    let mut t1_object_requests = 0;
+    for line in log_after_b.lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let path = fields[2].split('?').next().unwrap_or(fields[2]);
+        let discovery = path.ends_with("/info/refs") || path.ends_with("/HEAD");
+        match fields[3] {
+            "token credential-two-decoy" if discovery => t2_discovery += 1,
+            "token credential-two-decoy" => t2_object_requests += 1,
+            "token credential-one" if !discovery => t1_object_requests += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        t2_discovery > 0,
+        "T2 did not perform its real admission probe"
+    );
+    assert_eq!(
+        t2_object_requests, 0,
+        "coalescing replaced T1 with T2 for source acquisition:\n{log_after_b}"
+    );
+    assert!(
+        t1_object_requests > 0,
+        "B worker did not fetch protected objects with T1:\n{log_after_b}"
+    );
+    assert!(!decoy_queue.exists(), "API worker opened decoy queue DB");
+    assert!(!decoy_meta.exists(), "API worker opened decoy metadata DB");
+
+    let admitted_c = first_client
+        .admit_sync_repo("acme/api-immutable", None)
+        .await
+        .expect("admit C separately");
+    assert!(admitted_c.accepted);
+    assert_eq!(admitted_c.commit, c);
+    let full_c = wait_for_exact_full(&store, &repo_id, &c).await;
+    assert_eq!(full_c.commit, c);
+    let ordinary = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load ordinary branch")
+        .expect("ordinary branch exists");
+    assert_eq!(ordinary.commit, c, "ordinary branch must settle at C");
+
+    let branches = store
+        .list_branches(&repo_id)
+        .await
+        .expect("list API-worker publication refs");
+    assert!(
+        branches.iter().all(|branch| !branch.contains('#')),
+        "ordinary API-worker jobs must not create exact-ref aliases: {branches:?}"
+    );
+    assert!(
+        server.cas_path(&full_b_manifest).exists(),
+        "superseded B bytes may remain in CAS until ordinary retention reclaims them"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE admitted_commit IN (?, ?)")
+        .bind(&b)
+        .bind(&c)
+        .fetch_one(&pool)
+        .await
+        .expect("count immutable API-worker rows");
+    assert_eq!(rows, 2, "B and C require exactly two durable jobs");
+    let unfinished: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE admitted_commit IN (?, ?) AND status != 'done'",
+    )
+    .bind(&b)
+    .bind(&c)
+    .fetch_one(&pool)
+    .await
+    .expect("count unfinished immutable API-worker rows");
+    assert_eq!(unfinished, 0);
+    assert!(!decoy_queue.exists());
+    assert!(!decoy_meta.exists());
+    println!(
+        "API_WORKER_IMMUTABLE_EVIDENCE B={b} C={c} admission_ms={} active_B_after_duplicate=1 durable_jobs={rows} T1_object_requests={t1_object_requests} T2_discovery_requests={t2_discovery} T2_object_requests={t2_object_requests} synthetic_aliases=0 decoy_databases_touched=false ordinary_tip={}",
+        first_elapsed.as_millis(),
+        ordinary.commit
+    );
+    worker.kill_now();
+    pool.close().await;
 }
 
 /// NEGATIVE: claim / ack / heartbeat with a missing / garbage / wrong-secret
@@ -377,6 +632,8 @@ async fn claim_returns_one_job_no_foreign_credential() {
             repo_id: RepoId::github("acme/plain"),
             branch: "main".into(),
             rev: None,
+            admitted_commit: Some("2222222222222222222222222222222222222222".into()),
+            admitted_default_branch: None,
             credential: None,
             recheck: 0,
             size_bytes: None,
@@ -390,6 +647,8 @@ async fn claim_returns_one_job_no_foreign_credential() {
             repo_id: RepoId::github("acme/secret"),
             branch: "main".into(),
             rev: None,
+            admitted_commit: Some("3333333333333333333333333333333333333333".into()),
+            admitted_default_branch: None,
             credential: Some(secrecy::SecretString::new(
                 "SUPER-SECRET-UPSTREAM".to_string().into(),
             )),
@@ -424,6 +683,11 @@ async fn claim_returns_one_job_no_foreign_credential() {
     // FIFO: job A (the plain one) is claimed first. Its credential must be null —
     // the other job's secret is never attached.
     assert_eq!(job["id"].as_i64(), Some(a));
+    assert_eq!(
+        job["admitted_commit"].as_str(),
+        Some("2222222222222222222222222222222222222222"),
+        "API worker claim must transport the exact admitted commit"
+    );
     assert!(
         job.get("credential").map(|c| c.is_null()).unwrap_or(true),
         "the plain job must not carry another job's credential: {job}"
@@ -433,4 +697,80 @@ async fn claim_returns_one_job_no_foreign_credential() {
         !body.to_string().contains("SUPER-SECRET-UPSTREAM"),
         "claim must never leak another job's credential"
     );
+}
+
+/// NEGATIVE: an active legacy row reaches a real API worker, is rejected before
+/// credential/provider/source work, and is permanently settled rather than
+/// guessed from the branch's current tip.
+#[tokio::test]
+async fn api_worker_rejects_legacy_job_before_source_work() {
+    let _guard = SERIAL.lock().await;
+    let (_q, _m, queue_url, _meta_url) = setup_sqlite_queue_and_meta();
+    let server = start_server().await;
+
+    // Simulate an active row written by the pre-admission schema. Use an
+    // unknown provider as a decoy: if the worker resolves provider/source state
+    // before checking admitted_commit, the observed failure will be different.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::from_str(&queue_url)
+                .expect("parse queue database path"),
+        )
+        .await
+        .expect("open queue database");
+    sqlx::query(
+        "INSERT INTO jobs (key, provider, path, branch, status, created_at, attempts, size_class)
+         VALUES (?, ?, ?, ?, 'queued', ?, 0, 0)",
+    )
+    .bind("legacy-api-row")
+    .bind("provider-that-is-not-configured")
+    .bind("acme/legacy-api")
+    .bind("main")
+    .bind(1_i64)
+    .execute(&pool)
+    .await
+    .expect("insert legacy active row");
+    pool.close().await;
+
+    let token = mint_token(Duration::from_secs(3600));
+    let mut worker =
+        spawn_token_only_worker(&server.cas_dir, &server.repo_root, &server.url, &token);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (status, error) = loop {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::from_str(&queue_url)
+                    .expect("parse queue database path"),
+            )
+            .await
+            .expect("reopen queue database");
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM jobs WHERE key = 'legacy-api-row'")
+                .fetch_one(&pool)
+                .await
+                .expect("read legacy row");
+        pool.close().await;
+        if row.0 == "failed" {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "API worker did not settle the legacy row before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(status, "failed");
+    assert_eq!(
+        error.as_deref(),
+        Some("legacy queued job has no admitted commit; resubmit sync")
+    );
+    assert!(
+        !server
+            .repo_root
+            .join("provider-that-is-not-configured_acme%2Flegacy-api.git")
+            .exists(),
+        "legacy rejection must happen before mirror/source mutation"
+    );
+    worker.kill_now();
 }

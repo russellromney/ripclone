@@ -227,7 +227,8 @@ done
         // files. Seeing argv.txt alone is not sufficient because the script
         // creates it before it writes argv.txt.env.
         let env_out = PathBuf::from(format!("{}.env", out.display()));
-        for _ in 0..50 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             let argv_ready = std::fs::metadata(&out)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false);
@@ -240,6 +241,10 @@ done
             if argv_ready && env_ready {
                 break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "recorder child did not flush argv and environment within 10 seconds"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 

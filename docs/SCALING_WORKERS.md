@@ -12,9 +12,9 @@ doesn't care what started it or where it runs.
 
 ## Queue backends
 
-The queue holds pending build jobs. All build policy (coalesce, debounce,
-fairness, rate-limit, publish guard) lives at the enqueue/queue seam, so it is
-identical no matter which backend you pick. Set it with `RIPCLONE_QUEUE` (see
+The queue holds pending build jobs. Admission and active-key coalescing live at
+the enqueue/queue seam, so they are identical no matter which backend you pick.
+Fairness, rate limits, and publication ordering remain separate concerns. Set it with `RIPCLONE_QUEUE` (see
 [`BACKENDS.md`](BACKENDS.md) for the full config).
 
 | Backend | When | Workers |
@@ -22,8 +22,10 @@ identical no matter which backend you pick. Set it with `RIPCLONE_QUEUE` (see
 | `local` (in-process) | single binary, no extra infra | the server's own in-process worker |
 | SQL (`sqlite` / `libsql` / Postgres / MySQL) | scale out across machines | run N `ripclone-worker` processes against the shared queue |
 
-Coalescing means at most one active job per `owner/repo/branch`, and a worker
-drains everything it can claim, so a burst of pushes needs few workers.
+Coalescing means at most one active ordinary job per
+`owner/repo/branch/exact-commit`. A duplicate B is folded into B while it is
+queued or claimed; a later C remains a separate job so a burst of pushes does
+not replace immutable work.
 
 Crash safety is built into the claim: a dead worker's claimed job is reclaimed
 after `RIPCLONE_QUEUE_STALE_SECS` (default 1800 — set it above your longest
@@ -57,6 +59,23 @@ Relevant environment knobs (shared by server and workers):
 To scale up, start more `ripclone-worker` processes pointed at the same queue and
 storage. To scale down, stop workers — in-flight jobs are reclaimed by the stale
 timeout and picked up by whoever is left.
+
+## Upgrading the queue safely
+
+The queue stores the admitted commit on new ordinary jobs. The active uniqueness
+constraint covers both queued and claimed exact keys on SQLite, libSQL,
+PostgreSQL, and MySQL. A pre-upgrade active row has no knowable target; startup
+settles it with a permanent `legacy active job has no admitted commit; resubmit
+sync` failure rather than guessing the current branch tip. A standalone worker
+also rejects such a row before credentials, provider access, mirror mutation, or
+builder entry.
+
+Drain or stop old direct workers before starting the new server/workers. Old
+workers do not understand the admitted-commit field, so mixed direct-worker
+operation is not supported during this upgrade. Completed history rows are kept;
+only unsafe active legacy rows are settled. `RIPCLONE_QUEUE=local` remains an
+in-memory, process-lifetime boundary and does not become durable through this
+upgrade.
 
 ## Run your own trigger
 

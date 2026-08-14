@@ -50,6 +50,8 @@ impl QueueDb for PostgresDb {
                 claimed_at BIGINT,
                 finished_at BIGINT,
                 error TEXT,
+                admitted_commit TEXT,
+                admitted_default_branch TEXT,
                 credential TEXT,
                 attempts BIGINT NOT NULL DEFAULT 0,
                 size_class BIGINT NOT NULL DEFAULT 0
@@ -63,6 +65,14 @@ impl QueueDb for PostgresDb {
             .execute(&self.pool)
             .await
             .context("add credential column")?;
+        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS admitted_commit TEXT")
+            .execute(&self.pool)
+            .await
+            .context("add admitted_commit column")?;
+        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS admitted_default_branch TEXT")
+            .execute(&self.pool)
+            .await
+            .context("add admitted_default_branch column")?;
         // Migrate a legacy table for the attempts column (dead-letter bound).
         sqlx::raw_sql(
             "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempts BIGINT NOT NULL DEFAULT 0",
@@ -78,25 +88,31 @@ impl QueueDb for PostgresDb {
         .await
         .context("add size_class column")?;
         sqlx::raw_sql(
+            "UPDATE jobs
+             SET status = 'failed', finished_at = EXTRACT(EPOCH FROM NOW())::bigint,
+                 error = 'legacy active job has no admitted commit; resubmit sync',
+                 worker_id = NULL, credential = NULL
+             WHERE status IN ('queued', 'claimed')
+               AND (admitted_commit IS NULL OR admitted_commit = '')",
+        )
+        .execute(&self.pool)
+        .await
+        .context("settle legacy active jobs")?;
+        sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
         )
         .execute(&self.pool)
         .await
         .context("create status index")?;
-        // Coalescing backstop: at most one *queued* job per key (a claimed build
-        // can coexist with a queued one, so a push mid-build still gets queued).
-        let _ = sqlx::raw_sql("DROP INDEX IF EXISTS idx_jobs_active_key")
-            .execute(&self.pool)
-            .await;
-        if let Err(e) = sqlx::raw_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_queued_key
-             ON jobs(key) WHERE status = 'queued'",
+        // Monotonic v3 migration: use a versioned name and never remove an
+        // existing uniqueness backstop during concurrent process startup.
+        sqlx::raw_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_identity_v3
+             ON jobs(key) WHERE status IN ('queued', 'claimed')",
         )
         .execute(&self.pool)
         .await
-        {
-            tracing::warn!("postgres: active-key index unsupported ({e}); coalescing best-effort");
-        }
+        .context("create active-key uniqueness index")?;
         sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_provider_path_finished
              ON jobs(provider, path, finished_at)",
@@ -108,11 +124,13 @@ impl QueueDb for PostgresDb {
     }
 
     async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
-        sqlx::query_scalar("SELECT id FROM jobs WHERE key = $1 AND status = 'queued' LIMIT 1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .context("query active job")
+        sqlx::query_scalar(
+            "SELECT id FROM jobs WHERE key = $1 AND status IN ('queued', 'claimed') LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("query active job")
     }
 
     async fn insert_job(
@@ -121,19 +139,23 @@ impl QueueDb for PostgresDb {
         provider: &str,
         path: &str,
         branch: &str,
+        admitted_commit: Option<&str>,
+        admitted_default_branch: Option<&str>,
         credential: Option<&str>,
         _size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
         // size_class is blessed-backend only (sqlite/libsql); postgres lags.
         sqlx::query_scalar(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
-             VALUES ($1, $2, $3, $4, 'queued', $5, $6) RETURNING id",
+            "INSERT INTO jobs (key, provider, path, branch, admitted_commit, admitted_default_branch, status, credential, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7, $8) RETURNING id",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
+        .bind(admitted_commit)
+        .bind(admitted_default_branch)
         .bind(credential)
         .bind(created_at)
         .fetch_one(&self.pool)
@@ -166,7 +188,9 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
-        // Under-cap with a newer queued sibling → superseded (unique key).
+        // Compatibility cleanup for a legacy same-key sibling state. New
+        // immutable active-key rows cannot create it because the uniqueness
+        // constraint covers both queued and claimed rows.
         sqlx::query(
             "UPDATE jobs SET status = 'failed', finished_at = $1, error = $2,
                  worker_id = NULL, credential = NULL
@@ -233,18 +257,31 @@ impl QueueDb for PostgresDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, Option<String>)>> {
-        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .context("fetch job fields")?;
+    ) -> Result<
+        Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+    > {
+        let row = sqlx::query(
+            "SELECT provider, path, branch, admitted_commit, admitted_default_branch, credential FROM jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetch job fields")?;
         match row {
             Some(row) => Ok(Some((
                 row.try_get(0)?,
                 row.try_get(1)?,
                 row.try_get(2)?,
                 row.try_get(3)?,
+                row.try_get(4)?,
+                row.try_get(5)?,
             ))),
             None => Ok(None),
         }

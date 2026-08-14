@@ -36,6 +36,8 @@ pub struct OidcVerifier {
     client: reqwest::Client,
     audience: String,
     cache: RwLock<Option<CachedJwks>>,
+    #[cfg(test)]
+    test_key: Option<(String, DecodingKey)>,
 }
 
 impl OidcVerifier {
@@ -48,6 +50,21 @@ impl OidcVerifier {
             client,
             audience,
             cache: RwLock::new(None),
+            #[cfg(test)]
+            test_key: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(audience: String, kid: &str, public_key_pem: &[u8]) -> Arc<Self> {
+        Arc::new(Self {
+            client: reqwest::Client::new(),
+            audience,
+            cache: RwLock::new(None),
+            test_key: Some((
+                kid.to_string(),
+                DecodingKey::from_rsa_pem(public_key_pem).expect("test OIDC public key"),
+            )),
         })
     }
 
@@ -56,15 +73,30 @@ impl OidcVerifier {
         let header = decode_header(token).context("decode OIDC token header")?;
         let kid = header.kid.context("OIDC token header missing kid")?;
 
+        #[cfg(test)]
+        if let Some((test_kid, key)) = self.test_key.as_ref() {
+            anyhow::ensure!(&kid == test_kid, "OIDC signing key {kid} not found");
+            return self.verify_with_key(token, owner, repo, key);
+        }
+
         let jwk = self.find_or_refresh_jwk(&kid).await?;
         let key = DecodingKey::from_jwk(&jwk).context("build decoding key from JWKS")?;
+        self.verify_with_key(token, owner, repo, &key)
+    }
 
+    fn verify_with_key(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        key: &DecodingKey,
+    ) -> Result<OidcClaims> {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[GITHUB_ISSUER]);
         validation.set_audience(&[&self.audience]);
         validation.leeway = LEEWAY_SECS;
 
-        let token_data = decode::<OidcClaims>(token, &key, &validation)
+        let token_data = decode::<OidcClaims>(token, key, &validation)
             .context("verify OIDC token signature/claims")?;
         let claims = token_data.claims;
 

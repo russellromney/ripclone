@@ -1,28 +1,24 @@
-# Webhooks — provider-agnostic push → warm
+# Webhooks — provider-agnostic push → exact admission
 
 ## Why
 
-Today `ripclone-server` only warms a repo when something calls `POST
-…/{owner}/{repo}/sync` — manually, or from a CI Action you have to write.
-Self-hosters get no automatic warming on push.
-
-This adds a built-in **webhook receiver**: a provider push hits the server, we
-verify it, normalize it, and enqueue a sync — so the next clone is already warm.
-No CI Action, no glue.
+A provider push hits the built-in receiver, which verifies and normalizes the
+payload, validates its exact `after` commit, and admits that immutable target.
+The response is fast; artifact construction remains asynchronous.
 
 ## Where it sits
 
 A webhook is a thin **front door**. Everything heavy already exists — the build
-queue, the worker, storage, the metadata store. The receiver does three things:
-**verify → normalize → enqueue**.
+queue, the worker, storage, and metadata store. The receiver does four things:
+**verify → normalize → validate exact after → enqueue**.
 
 ```
 provider push ─▶ POST /webhooks/{provider}
                    │  verify signature (over the RAW body)
                    │  normalize payload → CanonicalEvent
                    ▼
-                 enqueue sync (state.build_queue)  ──▶ worker ──▶ clonepack
-                   ▲                                    (StaticBroker cred, #55)
+                 enqueue exact (state.build_queue) ──▶ worker ──▶ clonepack
+                   ▲                                      (configured cred)
                    └─ the SAME enqueue path `/sync` uses
 ```
 
@@ -33,9 +29,11 @@ So this is mostly routing + per-provider parsing, not new build logic.
 `POST /webhooks/{provider}` — provider-scoped, mirroring `/v1/repos/{provider}/…`.
 `{provider}` selects a configured `ProviderInstance` (`rust/src/provider.rs`).
 
-- Respond **2xx fast** (providers time out ~10s); the build runs async on the
-  queue. `200 {"ok":true}` accepted, `401` bad signature, `503` if no secret is
-  configured for that provider, `200 {"ignored":…}` for events we don't act on.
+- Respond **2xx fast** (providers time out ~10s); the exact commit build runs
+  asynchronously on the queue. `200 {"ok":true}` means the event was accepted
+  or coalesced, not that artifacts are ready. `401` is a bad signature, `503`
+  means no secret is configured for that provider, and `200 {"ignored":…}` is
+  used for events we deliberately do not act on.
 - Register in the axum router in `rust/src/server.rs` (~line 506, next to the
   `dispatch_*` routes). The handler needs the **raw body** for the HMAC, so take
   `Request<Body>` like the `dispatch_*` handlers and read the bytes *before*
@@ -90,10 +88,11 @@ Per provider instance:
   `ProviderInstance` config). **No secret ⇒ the endpoint returns 503.** Never
   process an unverified webhook — this matches the rest of the server's
   fail-closed posture.
-- **Upstream credential** — the existing `StaticBroker` token for that provider
+- **Upstream credential** — the existing broker token for that provider
   (`rust/src/auth/broker.rs`). The webhook carries no token, so private clones use
-  the server's configured credential, and the job carries it through the queue
-  (#55) so the worker can clone a private repo.
+  the server's configured credential. For SQL farm-out the selected job carries
+  that credential through the existing queue transport; it is not merged with a
+  later commit's credential.
 - **Repo allowlist (optional)** — `RIPCLONE_WEBHOOK_ALLOWLIST`, comma-separated.
   Only enqueue for listed repos; unset ⇒ allow all (single-tenant trust, with a
   loud startup log). Entries use the **natural key**: `owner/repo` for GitHub,
@@ -120,11 +119,13 @@ Per provider instance:
 
 ## Action
 
-- **Push** to a synced ref → enqueue a sync for `(provider, owner, repo, ref)`
-  with the configured credential. **Reuse the shared enqueue path**: the webhook
-  calls `trigger_build(state, repo, branch)` — the same fire-and-forget enqueue
-  used by `/build` and the poll loop, which coalesces against an in-flight `/sync`
-  build. Do **not** duplicate build logic.
+- **Push** to an eligible ref → validate `after` as a full object ID and enqueue
+  `(provider, owner, repo, branch, after)` with the configured credential.
+  **Reuse the shared exact enqueue path**: the webhook calls the same admission
+  function used by `/v1/build` and the poll loop. It performs zero additional
+  `ls-remote` probes, coalesces exact duplicates in queued/claimed/embedded
+  Full work, and keeps a later commit as a separate job. Do **not** duplicate
+  build logic.
 - **Branch delete** (`after` all-zeros / `deleted: true`) → clean up that ref's
   metadata; do not try to build a ref that no longer exists.
 - **Ping** → `200`. **Other** → ignore.
@@ -164,12 +165,13 @@ that are already built) rebuilds on every push, and the set survives restarts.
 Authenticated with the server token (the same `RIPCLONE_SERVER_TOKEN` that gates
 `/build`):
 
-- `POST   /v1/repos/{provider}/{owner}/{repo}/add` — add the repo (and build it now)
+- `POST   /v1/repos/{provider}/{owner}/{repo}/add` — add the repo and admit its first exact build
 - `DELETE /v1/repos/{provider}/{owner}/{repo}/add` — remove it
 
-`add` is idempotent (re-adding is a no-op) and enqueues an initial build so the
-first clone is already warm. There is no separate `track`/`untrack`/`tracked`
-verb — adding a repo is what makes it both cloneable and warm-on-push.
+`add` is idempotent and admits an initial exact build. Its HTTP response and CLI
+return after ready detection or queue acceptance; `202` does not mean the first
+clonepack is complete. There is no separate `track`/`untrack`/`tracked` verb —
+adding a repo is what makes it both cloneable and warm-on-push.
 
 ### CLI
 
@@ -221,8 +223,9 @@ Phase 1 (GitHub) is implemented:
       lookup, verify, parse, dispatch. Registered under `rate_limited`, *not*
       behind `auth_middleware` (the HMAC is the auth). `/v1/webhooks/github` is a
       back-compat alias into the same receiver.
-- [x] Enqueue via the shared `trigger_build` path (also used by `/build` and the
-      poll loop), which coalesces with `/sync` — no duplicated build logic.
+- [x] Admit the validated exact `after` through the shared trigger path (also
+      used by `/v1/build` and the poll loop), with no second tip probe and no
+      duplicated build logic.
 - [x] Config: per-provider webhook secret (`RIPCLONE_WEBHOOK_SECRET_<ID>`, with
       legacy `RIPCLONE_WEBHOOK_SECRET` honored for github) + `StaticBroker`
       credential for private clones + optional `RIPCLONE_WEBHOOK_ALLOWLIST` +

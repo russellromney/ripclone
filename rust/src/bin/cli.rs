@@ -91,9 +91,14 @@ enum Commands {
         #[arg(long, default_value = "90")]
         ttl_days: u64,
     },
-    /// Make a repo available to clone on the server.
-    Add { repo: String },
-    /// Sync a repo on the server.
+    /// Make a repo available and admit its exact first build; returns fast.
+    Add {
+        repo: String,
+        /// Wait for the admitted commit's Full artifacts before returning.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Admit the exact branch tip for a background sync; returns fast unless --at is used.
     Sync {
         repo: String,
         /// Git history depth to mirror. 1 gives a shallow clonepack; 0 means no
@@ -105,6 +110,9 @@ enum Commands {
         /// Lets you exercise the incremental path without upstream advancing.
         #[arg(long)]
         at: Option<String>,
+        /// Wait for the admitted commit's Full artifacts before returning.
+        #[arg(long)]
+        wait: bool,
     },
     /// Clone a repo using a snapshot and a background sidecar.
     Clone {
@@ -1133,7 +1141,7 @@ async fn main() -> Result<()> {
                 );
             }
         },
-        Commands::Add { repo } => {
+        Commands::Add { repo, wait } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
@@ -1141,10 +1149,27 @@ async fn main() -> Result<()> {
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
-            let info = client.add_repo(&repo_path).await?;
-            println!("added {} at {}", repo_path, info.commit);
+            if wait {
+                let info = client.add_repo(&repo_path).await?;
+                println!("added {} at {}", repo_path, info.commit);
+            } else {
+                let admission = client.admit_add_repo(&repo_path).await?;
+                if admission.accepted {
+                    println!("added {}; accepted {}", repo_path, admission.commit);
+                } else {
+                    println!(
+                        "added {}; already current at {}",
+                        repo_path, admission.commit
+                    );
+                }
+            }
         }
-        Commands::Sync { repo, depth, at } => {
+        Commands::Sync {
+            repo,
+            depth,
+            at,
+            wait,
+        } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
@@ -1153,10 +1178,20 @@ async fn main() -> Result<()> {
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
             let depth = depth.or(config.clone.depth);
-            let info = client
-                .sync_repo_at(&repo_path, at.as_deref(), depth)
-                .await?;
-            println!("synced {} to {}", repo_path, info.commit);
+            if let Some(at) = at.as_deref() {
+                let info = client.sync_repo_at(&repo_path, Some(at), depth).await?;
+                println!("synced {} to {}", repo_path, info.commit);
+            } else if wait {
+                let info = client.sync_repo(&repo_path, depth).await?;
+                println!("synced {} to {}", repo_path, info.commit);
+            } else {
+                let admission = client.admit_sync_repo(&repo_path, depth).await?;
+                if admission.accepted {
+                    println!("accepted {}", admission.commit);
+                } else {
+                    println!("already current at {}", admission.commit);
+                }
+            }
         }
         Commands::Clone {
             repo,
@@ -1700,29 +1735,21 @@ async fn observe_upstream_for_verification(
                 provider: provider.id.clone(),
                 path: repo_path.to_string(),
             };
-            let provider = provider.clone();
-            let branch = branch.to_string();
-            upstream_tip = match tokio::task::spawn_blocking(move || {
-                ripclone::git::ls_remote_commit(&provider, &repo_id, &branch, None)
-            })
+            upstream_tip = match ripclone::git::ls_remote_commit_async(
+                &provider, &repo_id, branch, None,
+            )
             .await
             {
-                Ok(Ok(Some(sha))) => Some(sha),
-                Ok(Ok(None)) => {
+                Ok(Some(sha)) => Some(sha),
+                Ok(None) => {
                     eprintln!(
                         "warning: --verify-upstream skipped (private upstream without credential); the ripclone server remains in the trust base for this clone"
                     );
                     return Ok(None);
                 }
-                Ok(Err(e)) => {
-                    eprintln!(
-                        "warning: --verify-upstream skipped (upstream probe failed: {e:#}); the ripclone server remains in the trust base for this clone"
-                    );
-                    return Ok(None);
-                }
                 Err(e) => {
                     eprintln!(
-                        "warning: --verify-upstream skipped (upstream probe task failed: {e}); the ripclone server remains in the trust base for this clone"
+                        "warning: --verify-upstream skipped (upstream probe failed: {e:#}); the ripclone server remains in the trust base for this clone"
                     );
                     return Ok(None);
                 }
@@ -1739,25 +1766,21 @@ async fn observe_upstream_for_verification(
                 path: repo_path.to_string(),
             };
             let credential = upstream_token.map(|t| SecretString::new(t.to_owned().into()));
-            let provider = provider.clone();
-            let branch_owned = branch.to_string();
-            match tokio::task::spawn_blocking(move || {
-                ripclone::git::ls_remote_commit(
-                    &provider,
-                    &repo_id,
-                    &branch_owned,
-                    credential.as_ref(),
-                )
-            })
+            match ripclone::git::ls_remote_commit_async(
+                &provider,
+                &repo_id,
+                branch,
+                credential.as_ref(),
+            )
             .await
             {
-                Ok(Ok(Some(sha))) => sha,
-                Ok(Ok(None)) => {
+                Ok(Some(sha)) => sha,
+                Ok(None) => {
                     anyhow::bail!(
                         "upstream verification failed: ref '{branch}' not found on upstream host"
                     );
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if requested == VerifyUpstream::Auto {
                         eprintln!(
                             "warning: --verify-upstream skipped (upstream unreachable: {e:#}); \
@@ -1768,9 +1791,6 @@ async fn observe_upstream_for_verification(
                     anyhow::bail!(
                         "upstream verification failed: could not reach upstream host: {e:#}"
                     );
-                }
-                Err(e) => {
-                    anyhow::bail!("upstream verification failed: ls-remote task failed: {e}");
                 }
             }
         }

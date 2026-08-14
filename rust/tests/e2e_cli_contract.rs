@@ -1,0 +1,562 @@
+//! Operator-facing contracts for the optimized `ripclone` CLI binary.
+
+mod common;
+
+use async_trait::async_trait;
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Response, StatusCode};
+use axum::routing::any;
+use common::*;
+use ripclone::provider::{ProviderConfig, ProviderRegistry, RepoId};
+use ripclone::queue::{BuildJob, EnqueueOutcome, Enqueued, JobQueue};
+use ripclone::ref_store::{FileRefStore, RefStore};
+use ripclone::server::{AdmissionTestProbe, RateLimiter, ServerState, build_app};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Output;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+#[derive(Clone, Copy)]
+enum QueueFailure {
+    Full,
+    Unavailable,
+}
+
+struct RejectingQueue {
+    failure: QueueFailure,
+    attempts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl JobQueue for RejectingQueue {
+    async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<Enqueued> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        match self.failure {
+            QueueFailure::Full => Ok(Enqueued {
+                outcome: EnqueueOutcome::Full,
+                job_id: None,
+            }),
+            QueueFailure::Unavailable => anyhow::bail!("forced queue outage; retry shortly"),
+        }
+    }
+
+    async fn depth(&self) -> usize {
+        0
+    }
+}
+
+fn generic_registry(id: &str, host: &str, token: &str) -> ProviderRegistry {
+    let mut registry = ProviderRegistry::new();
+    registry
+        .merge_one(ProviderConfig {
+            id: id.to_string(),
+            kind: Some("generic".to_string()),
+            host: Some(host.to_string()),
+            token: Some(token.to_string()),
+            auth_template: Some("token {token}".to_string()),
+            auth_header_name: None,
+        })
+        .expect("configure CLI contract provider");
+    registry
+}
+
+async fn start_server_with_queue(
+    provider_registry: ProviderRegistry,
+    build_queue: Arc<dyn JobQueue>,
+) -> Server {
+    let dir = tempfile::tempdir().expect("CLI contract server dir");
+    let cas_dir = dir.path().join("cas");
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
+    let storage = ripclone::storage::local(&cas_dir).unwrap();
+    let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+    let metrics = ripclone::metrics::Metrics::new();
+    let retention = Arc::new(
+        ripclone::retention::Retention::new(cas.clone(), metrics.clone())
+            .expect("CLI contract retention"),
+    );
+    let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
+        ripclone::auth::broker::StaticBroker::new(provider_registry.clone()),
+    );
+    let state = ServerState {
+        cas,
+        repo_config: Arc::new(ripclone::repo_config::RepoConfigStore::new(storage.clone())),
+        storage,
+        repo_root: repo_root.clone(),
+        ref_store,
+        provider_registry,
+        broker,
+        token_hash: Some(hex::encode(Sha256::digest(TOKEN.as_bytes()))),
+        jwt: None,
+        metrics,
+        rate_limiter: RateLimiter::new(1_000_000, 1_000_000.0),
+        retention,
+        build_queue,
+        worker_queue: None,
+        build_queue_depth: Arc::new(AtomicUsize::new(0)),
+        build_waiters: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        oidc_verifier: None,
+        webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
+        sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        mirror_fresh_ttl: Duration::from_secs(60),
+        ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
+        fail_first_fetches: 0,
+        artifact_barrier: None,
+        readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+        access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
+        require_repo_auth: false,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind CLI contract server");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            build_app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    Server {
+        url: format!("http://127.0.0.1:{port}"),
+        storage_dir: cas_dir.clone(),
+        cas_dir,
+        repo_root,
+        pinned_path_probe: None,
+        _dir: dir,
+    }
+}
+
+fn cli_binary() -> PathBuf {
+    std::env::var_os("RIPCLONE_TEST_CLI_BIN")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_ripclone"))
+        .map(PathBuf::from)
+        .expect("RIPCLONE_TEST_CLI_BIN or CARGO_BIN_EXE_ripclone")
+}
+
+async fn run_cli(
+    server: &str,
+    cwd: &Path,
+    home: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (Output, Duration) {
+    let started = Instant::now();
+    let mut command = tokio::process::Command::new(cli_binary());
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("RIPCLONE_SERVER", server)
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .env("RIPCLONE_TESTING", "1")
+        .env("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2")
+        .env("RIPCLONE_TEST_REF_POLL_MS", "50")
+        .env("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "2")
+        .env("RIPCLONE_TEST_SYNC_POLL_MS", "50")
+        .kill_on_drop(true);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(8), command.output())
+        .await
+        .expect("release CLI remained bounded")
+        .expect("spawn release CLI");
+    (output, started.elapsed())
+}
+
+fn output_text(output: &Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn snapshot_files(root: &Path) -> Vec<(PathBuf, u64, u128, String)> {
+    fn visit(root: &Path, path: &Path, rows: &mut Vec<(PathBuf, u64, u128, String)>) {
+        if !path.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(path).expect("snapshot read_dir") {
+            let entry = entry.expect("snapshot entry");
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).expect("snapshot metadata");
+            if metadata.is_dir() {
+                visit(root, &path, rows);
+            } else if metadata.is_file() {
+                let bytes = std::fs::read(&path).expect("snapshot bytes");
+                let modified = metadata
+                    .modified()
+                    .unwrap_or(UNIX_EPOCH)
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                rows.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    metadata.len(),
+                    modified,
+                    hex::encode(Sha256::digest(bytes)),
+                ));
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    visit(root, root, &mut rows);
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+async fn pending_metadata_server(commit: &str) -> String {
+    let commit = commit.to_string();
+    let app = Router::new().fallback(any(move || {
+        let commit = commit.clone();
+        async move {
+            Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .header("content-type", "application/json")
+                .header("content-location", "main")
+                .body(Body::from(
+                    serde_json::json!({
+                        "code": "artifact_pending",
+                        "commit": commit,
+                        "top_up_supported": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind pending metadata server");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    url
+}
+
+fn hanging_origin() -> (
+    String,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Receiver<bool>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind hanging origin");
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept hanging Git request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap();
+        accepted_tx.send(()).unwrap();
+        let mut buffer = [0_u8; 4096];
+        let closed = loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break true,
+                Ok(_) => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break false;
+                }
+                Err(_) => break true,
+            }
+        };
+        closed_tx.send(closed).unwrap();
+    });
+    (format!("http://{address}"), accepted_rx, closed_rx)
+}
+
+fn git_processes_for(origin: &str) -> Vec<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "command="])
+        .output()
+        .expect("list processes");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains("git ls-remote") && line.contains(origin))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_cli_sync_clone_failure_and_cleanup_contract() {
+    setup(false);
+    // Enables the production-boundary counters in this one-test executable.
+    unsafe { std::env::set_var("RIPCLONE_TESTING", "1") };
+    let probe = Arc::new(AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let home = tempfile::tempdir().expect("CLI home");
+    let work = tempfile::tempdir().expect("CLI work");
+
+    // Ready sync: one real provider probe, clear output, and no durable writes.
+    let origin = make_http_origin_with_auth("acme/cli-ready", "token cli-token");
+    let b = origin.commit(&[("README.md", "ready B\n")], "B");
+    origin.publish();
+    let providers_json = serde_json::json!({
+        "providers": [{
+            "id": "cli-http", "kind": "generic", "host": origin.url,
+            "token": "cli-token", "auth_template": "token {token}"
+        }]
+    })
+    .to_string();
+    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_json)]).await;
+    register_added_without_build_for_provider(&server, "cli-http", "acme/cli-ready")
+        .await
+        .expect("register ready CLI repo");
+    server
+        .client_with_provider("cli-http", Some("cli-token"))
+        .sync_repo("acme/cli-ready", None)
+        .await
+        .expect("publish ready B");
+    let durable_before = (
+        snapshot_files(&server.cas_dir),
+        snapshot_files(&server.repo_root),
+    );
+    origin.clear_auth_log();
+    let before = (
+        probe.tip_probes.load(Ordering::SeqCst),
+        probe.queue_inserts.load(Ordering::SeqCst),
+        probe.exact_fetches.load(Ordering::SeqCst),
+        probe.builder_entries.load(Ordering::SeqCst),
+        probe.ref_store_writes.load(Ordering::SeqCst),
+        probe.artifact_uploads.load(Ordering::SeqCst),
+    );
+    let (ready, ready_elapsed) = run_cli(
+        &server.url,
+        work.path(),
+        home.path(),
+        &["--provider", "cli-http", "sync", "acme/cli-ready"],
+        &[("RIPCLONE_PROVIDERS", &providers_json)],
+    )
+    .await;
+    assert!(ready.status.success(), "{}", output_text(&ready));
+    assert!(
+        output_text(&ready).contains(&format!("already current at {b}")),
+        "{}",
+        output_text(&ready)
+    );
+    assert!(ready_elapsed < Duration::from_secs(5));
+    assert_eq!(probe.tip_probes.load(Ordering::SeqCst), before.0 + 1);
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), before.1);
+    assert_eq!(probe.exact_fetches.load(Ordering::SeqCst), before.2);
+    assert_eq!(probe.builder_entries.load(Ordering::SeqCst), before.3);
+    assert_eq!(probe.ref_store_writes.load(Ordering::SeqCst), before.4);
+    assert_eq!(probe.artifact_uploads.load(Ordering::SeqCst), before.5);
+    assert_eq!(
+        (
+            snapshot_files(&server.cas_dir),
+            snapshot_files(&server.repo_root)
+        ),
+        durable_before,
+        "ready CLI sync mutated durable state"
+    );
+    let ready_log = origin.auth_log_text();
+    assert!(!ready_log.is_empty());
+    assert!(
+        ready_log.lines().all(|line| {
+            let path = line.split('\t').nth(2).unwrap_or("");
+            path.contains("/info/refs") || path.ends_with("/HEAD")
+        }),
+        "ready sync transferred objects:\n{ready_log}"
+    );
+
+    // Queue full and queue outage: both are prompt, retryable-looking failures
+    // with one enqueue attempt and no build/ref/artifact side effect.
+    for (suffix, failure, needle) in [
+        ("full", QueueFailure::Full, "build queue full"),
+        ("outage", QueueFailure::Unavailable, "forced queue outage"),
+    ] {
+        let path = format!("acme/cli-queue-{suffix}");
+        let queue_origin = make_http_origin_with_auth(&path, "token cli-token");
+        queue_origin.commit(&[("value.txt", "queued\n")], suffix);
+        queue_origin.publish();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let queue: Arc<dyn JobQueue> = Arc::new(RejectingQueue {
+            failure,
+            attempts: Arc::clone(&attempts),
+        });
+        let queue_server = start_server_with_queue(
+            generic_registry("cli-http", &queue_origin.url, "cli-token"),
+            queue,
+        )
+        .await;
+        register_added_without_build_for_provider(&queue_server, "cli-http", &path)
+            .await
+            .expect("register queue failure repo");
+        let queue_providers = serde_json::json!({
+            "providers": [{
+                "id": "cli-http", "kind": "generic", "host": queue_origin.url,
+                "token": "cli-token", "auth_template": "token {token}"
+            }]
+        })
+        .to_string();
+        let (output, elapsed) = run_cli(
+            &queue_server.url,
+            work.path(),
+            home.path(),
+            &["--provider", "cli-http", "sync", &path],
+            &[("RIPCLONE_PROVIDERS", &queue_providers)],
+        )
+        .await;
+        let text = output_text(&output);
+        assert!(
+            !output.status.success(),
+            "queue failure unexpectedly succeeded: {text}"
+        );
+        assert!(text.contains(needle), "missing {needle:?}: {text}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "queue failure took {elapsed:?}"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(snapshot_files(&queue_server.cas_dir).is_empty());
+        assert!(
+            FileRefStore::new(&queue_server.repo_root)
+                .load_branch(
+                    &RepoId {
+                        provider: ripclone::provider::ProviderInstanceId::new("cli-http"),
+                        path: path.clone(),
+                    },
+                    "main",
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // A Full clone with no safe base names its immutable pin and removes every
+    // target-adjacent staging directory on bounded exhaustion.
+    let pending_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let pending_server = pending_metadata_server(pending_b).await;
+    let target = work.path().join("pending-target");
+    let before_entries = std::fs::read_dir(work.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let (pending, pending_elapsed) = run_cli(
+        &pending_server,
+        work.path(),
+        home.path(),
+        &[
+            "--provider",
+            "github",
+            "--token",
+            "unused",
+            "clone",
+            "acme/pending",
+            target.to_str().unwrap(),
+            "--mode",
+            "editable",
+        ],
+        &[],
+    )
+    .await;
+    let pending_text = output_text(&pending);
+    assert!(
+        !pending.status.success(),
+        "pending clone succeeded: {pending_text}"
+    );
+    assert!(pending_text.contains(pending_b), "{pending_text}");
+    assert!(
+        pending_text.to_ascii_lowercase().contains("pending"),
+        "{pending_text}"
+    );
+    assert!(pending_elapsed < Duration::from_secs(3));
+    assert!(!target.exists());
+    let after_entries = std::fs::read_dir(work.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after_entries, before_entries,
+        "pending clone leaked staging"
+    );
+
+    // An unresponsive provider is bounded by the admission timeout, closes its
+    // connection, never reaches the queue, and leaves no Git process behind.
+    let (hanging_url, accepted, closed) = hanging_origin();
+    let timeout_attempts = Arc::new(AtomicUsize::new(0));
+    let timeout_queue: Arc<dyn JobQueue> = Arc::new(RejectingQueue {
+        failure: QueueFailure::Unavailable,
+        attempts: Arc::clone(&timeout_attempts),
+    });
+    let timeout_server = start_server_with_queue(
+        generic_registry("hanging", &hanging_url, "hang-token"),
+        timeout_queue,
+    )
+    .await;
+    register_added_without_build_for_provider(&timeout_server, "hanging", "acme/timeout")
+        .await
+        .expect("register timeout repo");
+    let timeout_providers = serde_json::json!({
+        "providers": [{
+            "id": "hanging", "kind": "generic", "host": hanging_url,
+            "token": "hang-token", "auth_template": "token {token}"
+        }]
+    })
+    .to_string();
+    assert!(git_processes_for(&hanging_url).is_empty());
+    unsafe { std::env::set_var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", "1") };
+    let (timed_out, timeout_elapsed) = run_cli(
+        &timeout_server.url,
+        work.path(),
+        home.path(),
+        &["--provider", "hanging", "sync", "acme/timeout"],
+        &[("RIPCLONE_PROVIDERS", &timeout_providers)],
+    )
+    .await;
+    unsafe { std::env::remove_var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS") };
+    let timeout_text = output_text(&timed_out);
+    assert!(
+        !timed_out.status.success(),
+        "timeout sync succeeded: {timeout_text}"
+    );
+    assert!(
+        timeout_text.to_ascii_lowercase().contains("timed out"),
+        "{timeout_text}"
+    );
+    assert!(
+        timeout_elapsed < Duration::from_secs(4),
+        "timeout took {timeout_elapsed:?}"
+    );
+    accepted
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Git reached hanging origin");
+    assert!(
+        closed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hanging origin observed cancellation"),
+        "timed-out Git connection remained open"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        git_processes_for(&hanging_url).is_empty(),
+        "timed-out git ls-remote survived: {:?}",
+        git_processes_for(&hanging_url)
+    );
+    assert_eq!(timeout_attempts.load(Ordering::SeqCst), 0);
+    assert!(snapshot_files(&timeout_server.cas_dir).is_empty());
+
+    println!(
+        "CLI_CONTRACT_EVIDENCE ready_ms={} queue_paths=2 pending_ms={} timeout_ms={} timeout_queue_attempts=0",
+        ready_elapsed.as_millis(),
+        pending_elapsed.as_millis(),
+        timeout_elapsed.as_millis()
+    );
+}

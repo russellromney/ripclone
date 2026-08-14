@@ -3,10 +3,11 @@
 //! atomic conditional claim). For multi-machine use the remote `libsql` backend.
 
 use super::sql::{
+    ADD_ADMITTED_COMMIT_COLUMN_SQL, ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL,
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
+    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL, QueueDb,
+    SETTLE_LEGACY_ACTIVE_SQL, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -51,6 +52,12 @@ impl QueueDb for SqliteDb {
         let _ = sqlx::raw_sql(ADD_CREDENTIAL_COLUMN_SQL)
             .execute(&self.pool)
             .await;
+        let _ = sqlx::raw_sql(ADD_ADMITTED_COMMIT_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::raw_sql(ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = sqlx::raw_sql(ADD_ATTEMPTS_COLUMN_SQL)
             .execute(&self.pool)
@@ -60,19 +67,18 @@ impl QueueDb for SqliteDb {
         let _ = sqlx::raw_sql(ADD_SIZE_CLASS_COLUMN_SQL)
             .execute(&self.pool)
             .await;
+        sqlx::raw_sql(SETTLE_LEGACY_ACTIVE_SQL)
+            .execute(&self.pool)
+            .await
+            .context("settle legacy active jobs")?;
         sqlx::raw_sql(CREATE_STATUS_INDEX_SQL)
             .execute(&self.pool)
             .await
             .context("create status index")?;
-        let _ = sqlx::raw_sql(DROP_LEGACY_ACTIVE_KEY_INDEX_SQL)
-            .execute(&self.pool)
-            .await;
-        if let Err(e) = sqlx::raw_sql(CREATE_ACTIVE_KEY_INDEX_SQL)
+        sqlx::raw_sql(CREATE_ACTIVE_KEY_INDEX_SQL)
             .execute(&self.pool)
             .await
-        {
-            tracing::warn!("sqlite: active-key index unsupported ({e}); coalescing best-effort");
-        }
+            .context("create active-key uniqueness index")?;
         sqlx::raw_sql(CREATE_HISTORY_INDEX_SQL)
             .execute(&self.pool)
             .await
@@ -90,11 +96,13 @@ impl QueueDb for SqliteDb {
     }
 
     async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
-        sqlx::query_scalar("SELECT id FROM jobs WHERE key = ? AND status = 'queued' LIMIT 1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .context("query active job")
+        sqlx::query_scalar(
+            "SELECT id FROM jobs WHERE key = ? AND status IN ('queued', 'claimed') LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("query active job")
     }
 
     async fn insert_job(
@@ -103,18 +111,22 @@ impl QueueDb for SqliteDb {
         provider: &str,
         path: &str,
         branch: &str,
+        admitted_commit: Option<&str>,
+        admitted_default_branch: Option<&str>,
         credential: Option<&str>,
         size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
         let res = sqlx::query(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
+            "INSERT INTO jobs (key, provider, path, branch, admitted_commit, admitted_default_branch, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
+        .bind(admitted_commit)
+        .bind(admitted_default_branch)
         .bind(credential)
         .bind(size_class)
         .bind(created_at)
@@ -158,10 +170,11 @@ impl QueueDb for SqliteDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
-        // Under-cap but a newer job is already queued for the same key: the
-        // unique queued-key index forbids requeue. Terminalise as superseded
-        // (the newer job builds the tip). Nested FROM avoids SQLite's
-        // "table is locked" when updating from a same-table subquery.
+        // Compatibility cleanup for a legacy same-key sibling state. New
+        // immutable active-key rows cannot create this state because the
+        // uniqueness constraint covers both queued and claimed rows. Nested
+        // FROM avoids SQLite's "table is locked" when updating from a
+        // same-table subquery.
         sqlx::query(
             "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
                  worker_id = NULL, credential = NULL
@@ -242,18 +255,31 @@ impl QueueDb for SqliteDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, Option<String>)>> {
-        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .context("fetch job fields")?;
+    ) -> Result<
+        Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+    > {
+        let row = sqlx::query(
+            "SELECT provider, path, branch, admitted_commit, admitted_default_branch, credential FROM jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetch job fields")?;
         match row {
             Some(row) => Ok(Some((
                 row.try_get(0)?,
                 row.try_get(1)?,
                 row.try_get(2)?,
                 row.try_get(3)?,
+                row.try_get(4)?,
+                row.try_get(5)?,
             ))),
             None => Ok(None),
         }
@@ -298,7 +324,7 @@ impl QueueDb for SqliteDb {
 
     async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool> {
         // Requeue only when no sibling is already queued for this key (the
-        // unique idx_jobs_queued_key would reject a second queued row).
+        // active-key uniqueness constraint would reject a second queued row).
         let res = sqlx::query(
             "UPDATE jobs SET status = 'queued', worker_id = NULL, error = ?
              WHERE id = ? AND worker_id = ? AND status = 'claimed'

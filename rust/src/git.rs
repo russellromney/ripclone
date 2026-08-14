@@ -2,7 +2,7 @@ use crate::provider::{ProviderInstance, RepoId};
 use anyhow::{Context, Result, bail};
 use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
@@ -1366,12 +1366,15 @@ fn upstream_auth_header(
 
 fn upstream_git_error(
     op: &'static str,
-    url: &str,
+    _url: &str,
     auth_header: Option<(String, String)>,
     stderr: &[u8],
 ) -> anyhow::Error {
     let detail = sanitize_git_stderr(stderr, auth_header.as_ref());
-    let retryable = upstream_failure_is_retryable(url, auth_header);
+    // Classify the result of this Git operation. Never issue a second provider
+    // request to guess whether the first one was retryable: admission owns one
+    // bounded ls-remote process and its result is the whole probe boundary.
+    let retryable = upstream_failure_is_retryable(stderr);
     anyhow::Error::new(UpstreamGitError::with_detail(op, retryable, detail))
 }
 
@@ -1410,103 +1413,491 @@ fn sanitize_git_stderr(stderr: &[u8], auth_header: Option<&(String, String)>) ->
     }
 }
 
-fn upstream_failure_is_retryable(url: &str, auth_header: Option<(String, String)>) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return false;
-    }
-
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    else {
-        return true;
-    };
-    let mut req = client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "ripclone");
-    if let Some((name, value)) = auth_header
-        && let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-            reqwest::header::HeaderValue::from_str(&value),
-        )
+fn upstream_failure_is_retryable(stderr: &[u8]) -> bool {
+    let detail = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    let statuses: Vec<u16> = detail
+        .split("returned error: ")
+        .skip(1)
+        .filter_map(|suffix| suffix.get(..3))
+        .filter_map(|status| status.parse::<u16>().ok())
+        .collect();
+    if statuses
+        .iter()
+        .any(|status| *status == 408 || *status == 429 || (500..600).contains(status))
     {
-        req = req.header(name, value);
+        return true;
+    }
+    if statuses.iter().any(|status| (400..500).contains(status)) {
+        return false;
     }
 
-    match req.send() {
-        Ok(resp) => {
-            let status = resp.status();
-            status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status == reqwest::StatusCode::REQUEST_TIMEOUT
-                || status.is_server_error()
-        }
-        Err(e) => e.is_timeout() || e.is_connect(),
+    // These are target/authentication failures for which replaying the same
+    // immutable job cannot help. Keep this list deliberately narrower than the
+    // transport list below: an unfamiliar curl/TLS failure should retain the
+    // queue's bounded retry behavior rather than becoming terminal.
+    if [
+        "authentication failed",
+        "invalid username or password",
+        "could not read username",
+        "repository not found",
+        "does not appear to be a git repository",
+        "not our ref",
+        "unadvertised object",
+        "couldn't find remote ref",
+        "remote ref does not exist",
+        "invalid refspec",
+        "invalid ref name",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
+    {
+        return false;
     }
+
+    if [
+        "operation timed out",
+        "connection timed out",
+        "connection reset",
+        "failed to connect",
+        "could not resolve host",
+        "couldn't connect to server",
+        "remote end hung up unexpectedly",
+        "http/2 stream",
+        "internal_error",
+        "tls connection was non-properly terminated",
+        "tls connection terminated unexpectedly",
+        "empty reply from server",
+        "failure receiving data from the peer",
+        "recv failure",
+        "ssl_error_syscall",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
+    {
+        return true;
+    }
+
+    // The removed provider re-probe treated any request-level failure without
+    // an HTTP response as retryable. Preserve that conservative behavior from
+    // the one Git result: bounded queue attempts still cap an unknown failure.
+    true
 }
 
 /// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
 /// reference-advertisement round-trip with **no object transfer**. Returns the
-/// hex commit SHA, or `None` if the ref is absent upstream. Used as a cheap
-/// pre-check so a `/sync` of an unchanged repo can no-op without a full fetch.
-///
-/// Best-effort by contract: callers treat an `Err` (network blip, host down) as
-/// "unknown" and fall through to the normal fetch+build — never as a failure.
+/// hex commit SHA, or `None` if the ref is absent upstream. Individual callers
+/// decide whether an upstream error is best-effort (legacy worker checks) or
+/// fail-closed (ordinary immutable admission).
 pub fn ls_remote_commit(
     provider: &ProviderInstance,
     repo_id: &RepoId,
     ref_name: &str,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<Option<String>> {
+    Ok(ls_remote_tip(provider, repo_id, ref_name, credential)?.map(|tip| tip.commit))
+}
+
+/// Cancellation-owned async form of [`ls_remote_commit`].
+pub async fn ls_remote_commit_async(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<Option<String>> {
+    Ok(ls_remote_tip_async(provider, repo_id, ref_name, credential)
+        .await?
+        .map(|tip| tip.commit))
+}
+
+/// The exact tip returned by one `ls-remote` advertisement. `default_branch` is
+/// populated whenever the server advertises a symbolic `HEAD`, including when
+/// the requested ref is a concrete branch. Both identities come from the same
+/// bounded Git process/provider advertisement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTip {
+    pub commit: String,
+    pub default_branch: Option<String>,
+}
+
+/// Resolve a remote ref with an owned timeout. The child is placed in its own
+/// process group, stdout/stderr are drained concurrently, and a timeout kills
+/// the group and waits for the direct child before returning. Callers can rely
+/// on this being one bounded, killed, and reaped probe rather than a detached
+/// `spawn_blocking(Command::output())` task.
+pub fn ls_remote_tip(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<Option<RemoteTip>> {
+    let timeout = std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(30));
+    ls_remote_tip_with_timeout(provider, repo_id, ref_name, credential, timeout)
+}
+
+/// Resolve a remote ref without detaching the Git process from the calling
+/// future. The child owns a fresh process group. Timeout and arbitrary future
+/// cancellation kill that whole group; a reaper always waits for the direct
+/// child. Temporary files drain output without pipe backpressure or helper
+/// descendants keeping a pipe open.
+pub async fn ls_remote_tip_async(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<Option<RemoteTip>> {
+    let timeout = std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(30));
+    ls_remote_tip_async_with_timeout(provider, repo_id, ref_name, credential, timeout).await
+}
+
+/// Testable cancellation-owned form of [`ls_remote_tip_async`].
+pub async fn ls_remote_tip_async_with_timeout(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+    timeout: Duration,
+) -> Result<Option<RemoteTip>> {
+    let (url, git_args, auth_header, queries, requested_remote_ref) =
+        prepare_ls_remote(provider, repo_id, ref_name, credential)?;
+    if url.is_empty() {
+        return Ok(None);
+    }
+    let mut stdout = tempfile::tempfile().context("create ls-remote stdout file")?;
+    let child_stdout = stdout.try_clone().context("clone ls-remote stdout file")?;
+    let mut stderr = tempfile::tempfile().context("create ls-remote stderr file")?;
+    let child_stderr = stderr.try_clone().context("clone ls-remote stderr file")?;
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(&git_args)
+        .args(["ls-remote", "--symref", "--", &url])
+        .args(&queries)
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr));
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let child = command.spawn().context("spawn git ls-remote")?;
+    let mut managed = ManagedLsRemoteChild::new(child);
+    let status = match tokio::time::timeout(timeout, managed.child_mut().wait()).await {
+        Ok(status) => status.context("wait for git ls-remote")?,
+        Err(_) => {
+            managed.terminate();
+            let reap = managed.child_mut().wait().await;
+            managed.child.take();
+            reap.context("reap timed-out git ls-remote")?;
+            anyhow::bail!("git ls-remote timed out after {timeout:?}");
+        }
+    };
+    // The direct Git process can exit before an HTTP helper. Terminate any
+    // residual group member before releasing ownership, then mark the already-
+    // waited direct child as consumed so Drop does not schedule another wait.
+    managed.terminate();
+    managed.child.take();
+
+    stdout.rewind().context("rewind ls-remote stdout")?;
+    let mut stdout_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .context("read ls-remote stdout")?;
+    stderr.rewind().context("rewind ls-remote stderr")?;
+    let mut stderr_bytes = Vec::new();
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .context("read ls-remote stderr")?;
+    if !status.success() {
+        return Err(upstream_git_error(
+            "ls-remote",
+            &url,
+            auth_header,
+            &stderr_bytes,
+        ));
+    }
+    parse_ls_remote_output(&stdout_bytes, &requested_remote_ref)
+}
+
+struct ManagedLsRemoteChild {
+    child: Option<tokio::process::Child>,
+    process_group: Option<i32>,
+}
+
+impl ManagedLsRemoteChild {
+    fn new(child: tokio::process::Child) -> Self {
+        Self {
+            process_group: child.id().map(|pid| pid as i32),
+            child: Some(child),
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("managed ls-remote child present")
+    }
+
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.process_group {
+            // SAFETY: the child starts a new process group whose id is its pid.
+            // ESRCH only means every group member already exited.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl Drop for ManagedLsRemoteChild {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        self.terminate();
+        let mut child = self.child.take().expect("managed child checked above");
+        // A dropped request future cannot await cleanup itself. Keep ownership
+        // in the runtime until wait(2) observes the direct child; the process
+        // group was synchronously killed above, so descendants cannot outlive
+        // this cancellation boundary.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
+fn prepare_ls_remote(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<(
+    String,
+    Vec<String>,
+    Option<(String, String)>,
+    Vec<String>,
+    String,
+)> {
     crate::validation::validate_repo_path(provider, repo_id)
         .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
     if ref_name != "HEAD" {
         crate::validation::validate_git_rev(ref_name)
-            .with_context(|| format!("invalid ref: {}", ref_name))?;
-        // `validate_git_rev` permits glob metacharacters that a real refname can't
-        // contain. In a `refs/heads/<name>` refspec they'd make ls-remote match a
-        // *pattern*, so the first-line parse below could return some other ref's
-        // SHA. Such a name has no build to reuse anyway — skip the probe.
+            .with_context(|| format!("invalid ref: {ref_name}"))?;
         if ref_name.contains(['*', '?', '[']) {
-            return Ok(None);
+            return Ok((String::new(), Vec::new(), None, Vec::new(), String::new()));
         }
     }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
     let auth_header = upstream_auth_header(provider, credential);
-    // A bare branch name maps to refs/heads/<name>; a full ref (refs/heads/... or
-    // refs/tags/...) is passed through unchanged; HEAD is queried directly.
-    let query = if ref_name == "HEAD" {
+    let requested_remote_ref = if ref_name == "HEAD" {
         "HEAD".to_string()
     } else if ref_name.starts_with("refs/") {
         ref_name.to_string()
     } else {
         format!("refs/heads/{ref_name}")
     };
-    let output = Command::new("git")
-        .args(&git_args)
-        .args(["ls-remote", "--", &url, &query])
-        .output()
-        .context("git ls-remote")?;
-    if !output.status.success() {
-        return Err(upstream_git_error(
-            "ls-remote",
-            &url,
-            auth_header,
-            &output.stderr,
-        ));
+    let mut queries = vec![requested_remote_ref.clone()];
+    if requested_remote_ref != "HEAD" {
+        // `ls-remote` obtains one advertisement regardless of the number of
+        // patterns. Ask that same bounded process for symbolic HEAD so a named
+        // branch admission can initialize an exact-only mirror with the
+        // upstream default-branch identity without a second provider request.
+        queries.push("HEAD".to_string());
     }
-    // Output is lines of "<sha>\t<ref>"; take the first ref's SHA.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let sha = stdout
-        .lines()
-        .next()
-        .and_then(|line| line.split('\t').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    Ok(sha)
+    Ok((url, git_args, auth_header, queries, requested_remote_ref))
+}
+
+fn parse_ls_remote_output(stdout: &[u8], requested_remote_ref: &str) -> Result<Option<RemoteTip>> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let mut default_branch = None;
+    let mut commit = None;
+    for line in stdout.lines() {
+        if let Some(symbolic) = line.strip_prefix("ref: refs/heads/")
+            && let Some(branch) = symbolic
+                .strip_suffix("\tHEAD")
+                .or_else(|| symbolic.strip_suffix(" HEAD"))
+            && !branch.is_empty()
+            && crate::validation::validate_git_rev(branch).is_ok()
+        {
+            default_branch = Some(branch.to_string());
+            continue;
+        }
+        if line.starts_with("ref: ") {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed symbolic ref"
+            ));
+        }
+        let Some((sha, remote_ref)) = line.split_once('\t') else {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed advertisement"
+            ));
+        };
+        let sha = sha.trim();
+        if crate::validation::validate_object_id(sha).is_err() {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed object id"
+            ));
+        }
+        if remote_ref.trim() == requested_remote_ref {
+            commit = Some(sha.to_string());
+        }
+    }
+    // A named-ref query also asks for HEAD. Seeing only HEAD means the requested
+    // branch is absent, which is a normal `None`/404 result rather than a
+    // malformed advertisement.
+    Ok(commit.map(|commit| RemoteTip {
+        commit,
+        default_branch,
+    }))
+}
+
+/// Testable form of [`ls_remote_tip`] with an explicit bound.
+pub fn ls_remote_tip_with_timeout(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+    timeout: Duration,
+) -> Result<Option<RemoteTip>> {
+    let (url, git_args, auth_header, queries, requested_remote_ref) =
+        prepare_ls_remote(provider, repo_id, ref_name, credential)?;
+    if url.is_empty() {
+        return Ok(None);
+    }
+    let mut command = Command::new("git");
+    command
+        .args(&git_args)
+        .args(["ls-remote", "--symref", "--", &url])
+        .args(&queries)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().context("spawn git ls-remote")?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = kill_ls_remote_process_group(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("open ls-remote stdout");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = kill_ls_remote_process_group(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("open ls-remote stderr");
+        }
+    };
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::BufReader::new(stdout).read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let kill_error = kill_ls_remote_process_group(&mut child).err();
+                let reap_error = child.wait().err();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                if let Some(kill_error) = kill_error {
+                    return Err(kill_error).context("kill failed ls-remote process group");
+                }
+                if let Some(reap_error) = reap_error {
+                    return Err(reap_error).context("reap failed git ls-remote");
+                }
+                return Err(error).context("poll git ls-remote");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let kill_error = kill_ls_remote_process_group(&mut child).err();
+            let reap_result = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            if let Some(error) = kill_error {
+                return Err(error).context("kill timed-out ls-remote process group");
+            }
+            reap_result.context("reap timed-out git ls-remote")?;
+            anyhow::bail!("git ls-remote timed out after {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // `git` can exit while a helper or descendant still owns an inherited
+    // stdout/stderr pipe. Kill the process group before joining the reader
+    // threads so a normally exiting direct child cannot turn collection into an
+    // unbounded wait.
+    let group_kill_error = kill_ls_remote_process_group(&mut child).err();
+    let (stdout_result, stdout) = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ls-remote stdout reader panicked"))?;
+    stdout_result.context("read ls-remote stdout")?;
+    let (stderr_result, stderr) = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ls-remote stderr reader panicked"))?;
+    stderr_result.context("read ls-remote stderr")?;
+    if let Some(error) = group_kill_error {
+        return Err(error).context("kill ls-remote process group");
+    }
+    if !status.success() {
+        return Err(upstream_git_error("ls-remote", &url, auth_header, &stderr));
+    }
+    parse_ls_remote_output(&stdout, &requested_remote_ref)
+}
+
+fn kill_ls_remote_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        match child.kill() {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Cross-process advisory lock guarding a repo's bare mirror directory.
@@ -1616,7 +2007,18 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // therefore never pass `--depth`: a depth-limited fetch would re-shallow an
     // already-complete mirror. depth=1 ("head") clones are still cheap — they're
     // a content-addressed subset built at pack time, not a shallower mirror.
+    // A full object id always uses the narrow historical fetch. When HEAD is
+    // the selector, obtain its symbolic target through one bounded `ls-remote`
+    // first and retain that identity locally after the exact fetch. This keeps
+    // historical behavior portable without downloading unrelated branches or
+    // tags. Ordinary admitted work uses `sync_bare_mirror_admitted` and gets the
+    // same identity from its existing admission advertisement.
     if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev)) {
+        let default_branch = if branch == "HEAD" {
+            ls_remote_tip(provider, repo_id, "HEAD", credential)?.and_then(|tip| tip.default_branch)
+        } else {
+            None
+        };
         sync_bare_mirror_rev(
             mirror_dir.as_ref(),
             &url,
@@ -1624,7 +2026,11 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             auth_header.clone(),
             branch,
             rev,
+            true,
         )?;
+        if let Some(default_branch) = default_branch.as_deref() {
+            set_bare_default_branch(mirror_dir.as_ref(), default_branch)?;
+        }
     } else if mirror_dir.as_ref().exists() {
         // A `--mirror` clone is configured with `+refs/*:refs/*` (and prunes), so
         // a plain `git fetch origin` advances every branch + HEAD to the latest.
@@ -1639,7 +2045,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         // Persist gc-off before fetching, so legacy mirrors (created before this
         // was set) are covered and the fetch we are about to run cannot auto-gc.
         disable_auto_gc(mirror_dir.as_ref())?;
-        let mut args: Vec<&str> = vec!["fetch"];
+        let mut args: Vec<&str> = vec!["fetch", "--prune"];
         if is_shallow {
             args.push("--unshallow");
         }
@@ -1696,6 +2102,67 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     Ok(())
 }
 
+/// Fetch one admitted immutable commit without consulting or transferring the
+/// moving branch. The object is retained under an internal ref so a subsequent
+/// branch advance or deletion cannot change this job's source acquisition.
+pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
+    mirror_dir: P,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    commit: &str,
+    default_branch: Option<&str>,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<()> {
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
+    crate::validation::validate_object_id(commit)
+        .with_context(|| format!("invalid admitted commit: {commit}"))?;
+    if !is_full_hex_object_id(commit) {
+        bail!("admitted commit must be a full object id: {commit}");
+    }
+
+    let _mirror_lock = MirrorLock::acquire(mirror_dir.as_ref())?;
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    let auth_header = upstream_auth_header(provider, credential);
+    sync_bare_mirror_rev(
+        mirror_dir.as_ref(),
+        &url,
+        &git_args,
+        auth_header,
+        "HEAD",
+        commit,
+        false,
+    )?;
+
+    // An exact-only fetch intentionally does not create the moving branch ref,
+    // but a newly initialized bare repository otherwise keeps Git's platform
+    // default (often `master`) as HEAD. Retain the default branch discovered by
+    // the admission probe so a later historical expression such as `HEAD~2`
+    // resolves against the right branch after the ordinary mirror fetch fills
+    // it. This is a local symbolic-ref update only; it neither fetches nor
+    // publishes the moving branch.
+    if let Some(default_branch) = default_branch.filter(|branch| *branch != "HEAD") {
+        set_bare_default_branch(mirror_dir.as_ref(), default_branch)?;
+    }
+    Ok(())
+}
+
+fn set_bare_default_branch(mirror_dir: &Path, default_branch: &str) -> Result<()> {
+    crate::validation::validate_git_rev(default_branch)
+        .with_context(|| format!("invalid default branch: {default_branch}"))?;
+    let head_ref = format!("refs/heads/{default_branch}");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(mirror_dir.as_os_str())
+        .args(["symbolic-ref", "HEAD", &head_ref])
+        .status()
+        .context("set exact mirror default branch")?;
+    if !status.success() {
+        bail!("setting exact mirror default branch failed");
+    }
+    Ok(())
+}
+
 fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     if !mirror_dir.exists() {
         std::fs::create_dir_all(mirror_dir.parent().unwrap_or(Path::new("")))?;
@@ -1745,6 +2212,7 @@ fn sync_bare_mirror_rev(
     auth_header: Option<(String, String)>,
     branch: &str,
     rev: &str,
+    include_branch: bool,
 ) -> Result<()> {
     ensure_bare_origin(mirror_dir, url)?;
 
@@ -1752,7 +2220,7 @@ fn sync_bare_mirror_rev(
         "{rev}:refs/ripclone/revs/{}",
         rev_internal_ref_name(rev)
     )];
-    if let Some(branch_refspec) = branch_fetch_refspec(branch) {
+    if include_branch && let Some(branch_refspec) = branch_fetch_refspec(branch) {
         refspecs.push(branch_refspec);
     }
 
@@ -1792,9 +2260,7 @@ fn is_full_hex_object_id(rev: &str) -> bool {
 }
 
 fn branch_fetch_refspec(branch: &str) -> Option<String> {
-    if branch == "HEAD"
-        || branch.is_empty()
-        || branch.contains(['*', '?', '[', ':', ' ', '~', '^', '#'])
+    if branch == "HEAD" || branch.is_empty() || branch.contains(['*', '?', '[', ':', ' ', '~', '^'])
     {
         return None;
     }
@@ -1982,47 +2448,42 @@ mod tests {
     use rayon::scope;
     use std::io::Read;
 
-    fn one_response_url(status: &str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let status = status.to_string();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0; 1024];
-            let _ = stream.read(&mut buf);
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-        });
-        format!("http://{addr}/repo.git")
-    }
-
     #[test]
-    fn upstream_probe_retries_only_transient_http_statuses() {
-        for status in [
-            "408 Request Timeout",
-            "429 Too Many Requests",
-            "503 Service Unavailable",
+    fn upstream_failure_classification_uses_the_git_result() {
+        for detail in [
+            "fatal: unable to access: The requested URL returned error: 408",
+            "fatal: unable to access: The requested URL returned error: 429",
+            "fatal: unable to access: The requested URL returned error: 501",
+            "fatal: unable to access: The requested URL returned error: 503",
+            "fatal: unable to access: Failed to connect to host",
+            "fatal: unable to access: Could not resolve host",
+            "RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: INTERNAL_ERROR",
+            "gnutls_handshake() failed: The TLS connection was non-properly terminated",
+            "fatal: unable to access: Empty reply from server",
+            "RPC failed; curl 56 Failure receiving data from the peer",
+            "OpenSSL SSL_read: SSL_ERROR_SYSCALL, errno 54",
+            "an unfamiliar transport failure without an HTTP response",
         ] {
             assert!(
-                upstream_failure_is_retryable(&one_response_url(status), None),
-                "{status} should be retryable"
+                upstream_failure_is_retryable(detail.as_bytes()),
+                "{detail} should be retryable"
             );
         }
 
-        for status in [
-            "200 OK",
-            "302 Found",
-            "400 Bad Request",
-            "401 Unauthorized",
-            "403 Forbidden",
-            "404 Not Found",
+        for detail in [
+            "fatal: unable to access: The requested URL returned error: 400",
+            "fatal: unable to access: The requested URL returned error: 401",
+            "fatal: unable to access: The requested URL returned error: 403",
+            "fatal: unable to access: The requested URL returned error: 404",
+            "fatal: Authentication failed for repository",
+            "fatal: couldn't find remote ref refs/heads/missing",
+            "fatal: invalid refspec 'refs/heads/bad..ref'",
+            "fatal: remote error: upload-pack: not our ref deadbeef",
+            "Server does not allow request for unadvertised object deadbeef",
         ] {
             assert!(
-                !upstream_failure_is_retryable(&one_response_url(status), None),
-                "{status} should be terminal"
+                !upstream_failure_is_retryable(detail.as_bytes()),
+                "{detail} should be terminal"
             );
         }
     }
@@ -2221,6 +2682,52 @@ mod tests {
     }
 
     #[test]
+    fn ls_remote_timeout_kills_reaps_and_closes_the_fixture_connection() {
+        use std::sync::mpsc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("ls-remote connected");
+            accepted_tx.send(()).unwrap();
+            // Do not send an HTTP response. The process-group kill must close the
+            // client socket, which lets this bounded fixture thread return.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.read(&mut buf);
+        });
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", format!("http://{addr}")) };
+        let registry = crate::provider::ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let result = ls_remote_tip_with_timeout(
+            provider,
+            &crate::provider::RepoId::github("acme/timeout"),
+            "HEAD",
+            None,
+            Duration::from_millis(100),
+        );
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bounded ls-remote fixture accepted the request");
+        assert!(
+            result
+                .expect_err("the hanging advertisement must time out")
+                .to_string()
+                .contains("timed out"),
+            "timeout must be surfaced after the child is killed and reaped"
+        );
+        server
+            .join()
+            .expect("the fixture connection closed after process-group kill");
+    }
+
+    #[test]
     fn is_empty_repo_true_until_first_commit() {
         let base = tempfile::tempdir().unwrap();
         let repo_dir = base.path().join("empty.git");
@@ -2328,6 +2835,168 @@ mod tests {
             resolve_commit(&mirror, "other").is_err(),
             "rev sync must not fetch unrelated branches"
         );
+    }
+
+    #[test]
+    fn sync_bare_mirror_full_sha_at_head_preserves_upstream_default_branch() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("head-rev.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let commit = crate::test_fixture::commit(&src, &[("README.md", b"pinned")]);
+        let later = crate::test_fixture::commit(&src, &[("README.md", b"later")]);
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "refs/tags/unrelated", &later])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/head-rev");
+        let mirror = base.path().join("mirror-head-rev.git");
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", Some(&commit), None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(default_branch(&mirror).unwrap(), "main");
+        assert_eq!(resolve_commit(&mirror, &commit).unwrap(), commit);
+        assert!(
+            resolve_commit(&mirror, &later).is_err(),
+            "historical full-SHA sync must not fetch the newer branch tip"
+        );
+        assert!(
+            resolve_commit(&mirror, "refs/tags/unrelated").is_err(),
+            "historical full-SHA sync must not fetch unrelated tags"
+        );
+        assert!(
+            resolve_commit(&mirror, "refs/heads/main").is_err(),
+            "default-branch discovery must not fetch the moving branch"
+        );
+    }
+
+    #[test]
+    fn ls_remote_named_ref_returns_tip_and_default_branch_from_one_advertisement() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("named-tip.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let main = crate::test_fixture::commit(&src, &[("README.md", b"main")]);
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "refs/heads/feature", &main])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/named-tip");
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let tip = ls_remote_tip(provider, &repo_id, "feature", None)
+            .unwrap()
+            .expect("feature advertised");
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(tip.commit, main);
+        assert_eq!(tip.default_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn admitted_fetch_transfers_only_the_pinned_commit_not_the_moving_branch() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let commit_b = crate::test_fixture::commit(&src, &[("README.md", b"B")]);
+        let commit_c = crate::test_fixture::commit(&src, &[("README.md", b"C")]);
+        let mirror = base.path().join("mirror-admitted.git");
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/widget");
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, Some("main"), None)
+            .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
+        assert!(
+            resolve_commit(&mirror, &commit_c).is_err(),
+            "the later branch tip must not be transferred by B's exact fetch"
+        );
+        assert!(
+            resolve_commit(&mirror, "main").is_err(),
+            "an immutable fetch must not update the moving branch ref"
+        );
+        assert_eq!(
+            default_branch(&mirror).unwrap(),
+            "main",
+            "exact admission retains the probed default branch without fetching it"
+        );
+
+        // A later historical sync fills the moving refs. HEAD must then use the
+        // admission-time default branch rather than the bare-init default.
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", Some("HEAD~1"), None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        assert_eq!(resolve_commit(&mirror, "HEAD~1").unwrap(), commit_b);
+        assert_eq!(resolve_commit(&mirror, "HEAD").unwrap(), commit_c);
+    }
+
+    #[test]
+    fn admitted_fetch_survives_branch_deletion_when_commit_remains_available() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("deleted.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let commit_b = crate::test_fixture::commit(&src, &[("README.md", b"B")]);
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "refs/keep/admitted-b", &commit_b])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "-d", "refs/heads/main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let mirror = base.path().join("mirror-deleted.git");
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/deleted");
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, Some("main"), None)
+            .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
+        assert!(resolve_commit(&mirror, "main").is_err());
     }
 
     #[test]

@@ -267,7 +267,7 @@ async fn dead_report_url_job_requeues_not_done() {
     let token = mint_report_token();
 
     let origin = make_origin("acme", "dead-url");
-    origin.commit(&[("a.txt", "x\n")], "c1");
+    let commit = origin.commit(&[("a.txt", "x\n")], "c1");
     origin.publish();
     register_added_without_build(&server, "acme/dead-url")
         .await
@@ -279,6 +279,8 @@ async fn dead_report_url_job_requeues_not_done() {
             repo_id: RepoId::github("acme/dead-url"),
             branch: "main".into(),
             rev: None,
+            admitted_commit: Some(commit),
+            admitted_default_branch: None,
             credential: None,
             recheck: 0,
             size_bytes: None,

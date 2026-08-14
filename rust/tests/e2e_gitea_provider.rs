@@ -396,11 +396,21 @@ async fn gitea_server_side_token_end_to_end() {
 
     let repo_arg = format!("gitea:{}/{}", env.user, repo);
     assert_ripclone_ok(
-        &ripclone(&config_path, &server.url, cwd, &["add", &repo_arg]),
+        &ripclone(
+            &config_path,
+            &server.url,
+            cwd,
+            &["add", &repo_arg, "--wait"],
+        ),
         "add",
     );
     assert_ripclone_ok(
-        &ripclone(&config_path, &server.url, cwd, &["sync", &repo_arg]),
+        &ripclone(
+            &config_path,
+            &server.url,
+            cwd,
+            &["sync", &repo_arg, "--wait"],
+        ),
         "sync",
     );
     let clone_dir = cwd.join("clone1");
@@ -443,7 +453,12 @@ async fn gitea_server_side_token_end_to_end() {
     assert_ne!(updated.0, reference.0, "push must advance HEAD");
 
     assert_ripclone_ok(
-        &ripclone(&config_path, &server.url, cwd, &["sync", &repo_arg]),
+        &ripclone(
+            &config_path,
+            &server.url,
+            cwd,
+            &["sync", &repo_arg, "--wait"],
+        ),
         "sync after update",
     );
     server

@@ -142,17 +142,18 @@ RIPCLONE_METADATA_DB_URL=postgres://user:pass@host:5432/ripclone
 ```
 
 `libsql` is remote-only — for a local SQLite file use `sqlite`. The schema is
-created on first start; no migration step. Put the metadata store on a database
+created on first start and applies additive migrations on startup. Put the metadata store on a database
 your workers can also reach when you farm builds out (below).
 
 ## Build queue & workers (farm-out)
 
-By default the server builds in-process: `/sync` runs the build on the server
-itself. To move that CPU/IO-heavy work onto one or more separate machines, point
-the server and one or more `ripclone-worker` processes at a shared **SQL queue**.
-The server only enqueues; the workers claim, build, and write results to the
-shared storage + metadata store. `/sync` polls the job to completion, so it does
-not care which machine built it.
+By default the server admits ordinary sync work and builds it in-process. To
+move that CPU/IO-heavy work onto one or more separate machines, point the server
+and one or more `ripclone-worker` processes at a shared **SQL queue**. The server
+only enqueues; the workers claim, build, and write results to the shared storage
+and metadata store. `/sync` returns after ready detection or queue acceptance, so
+it does not wait for a worker or care which machine built the target. Readiness-
+oriented library callers poll exact pinned metadata after the first `202`.
 
 Choose the queue with `RIPCLONE_QUEUE`:
 
@@ -203,9 +204,11 @@ Notes:
   and clear it when the job is claimed or finished; otherwise the worker falls
   back to provider config (`RIPCLONE_PROVIDERS` or `config.toml`;
   `RIPCLONE_GITHUB_TOKEN` remains a GitHub-default shortcut).
-- **Async builds are always on.** `/sync` always enqueues onto the bounded build
-  queue, so a build survives client disconnect / HTTP timeout and is
-  rate-bounded under load.
+- **Async builds are always on for changed targets.** Ordinary `/sync` resolves
+  one exact commit, returns `200` for a complete ready hit, or enqueues and
+  returns `202` for changed work. The selected queue survives client disconnect
+  according to its existing durability boundary; the local queue remains
+  process-lifetime in-memory.
 
 Worker tuning and queue housekeeping:
 

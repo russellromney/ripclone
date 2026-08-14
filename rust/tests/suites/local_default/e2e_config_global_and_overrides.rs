@@ -46,6 +46,7 @@ async fn run_ripclone(
             .args(&args)
             .current_dir(&cwd)
             .env("HOME", &home)
+            .env_remove("RIPCLONE_CONFIG")
             .env("RIPCLONE_SERVER", &server_url)
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .stdout(std::process::Stdio::piped())
@@ -88,7 +89,7 @@ async fn global_config_defaults_and_cli_overrides() {
         home.path(),
         cwd.path(),
         &server.url,
-        &["add", "acme/config"],
+        &["add", "acme/config", "--wait"],
     )
     .await;
     assert!(
@@ -104,7 +105,7 @@ async fn global_config_defaults_and_cli_overrides() {
         home.path(),
         cwd.path(),
         &server.url,
-        &["sync", "acme/config"],
+        &["sync", "acme/config", "--wait"],
     )
     .await;
     assert!(

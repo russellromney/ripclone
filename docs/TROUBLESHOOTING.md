@@ -10,7 +10,15 @@ If a Linux binary still fails to load a shared library, the download is corrupt 
 
 ## Clone prints "warming" / hangs, or the server returns `202`
 
-A `202 Accepted` means the artifacts for that commit are still being built. On every push the server builds a depth-1 clonepack first (ready fast) and the full history + archive in the background; while a phase is still building, the ref response carries `build_status` and the server returns `202`. The client retries on its own — this is expected on the **first** clone of a commit that was just pushed, or the first time you clone a repo the server has never synced.
+There are two different `202` cases. A `202` from `sync` or `add` means the
+exact branch commit was admitted or coalesced into background work; those
+commands return without waiting for the build. Compatibility library methods
+poll the pinned commit's metadata after that first `202`, so they do not repeat
+a moving-tip POST. A `202` from a clone/ref request means the artifacts for the
+requested commit are still being built. On every push the server builds a
+depth-1 clonepack first (ready fast) and the full history + archive in the
+background; while a phase is still building, the ref response carries
+`build_status` and the server returns `202`.
 
 - A depth-1 or `files` clone is ready as soon as phase 1 finishes.
 - A full editable clone (`--depth 0`) waits for the history build.

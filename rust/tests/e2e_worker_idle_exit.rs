@@ -34,11 +34,14 @@ fn setup_sqlite_queue() -> tempfile::TempDir {
 
 async fn enqueue(path: &str) -> (SqlJobQueue, i64) {
     let queue = backends::connect_sql_queue().await.expect("queue");
+    let admitted_commit = origin_tip(path);
     let enq = queue
         .enqueue(BuildJob {
             repo_id: RepoId::github(path),
             branch: "main".into(),
             rev: None,
+            admitted_commit: Some(admitted_commit),
+            admitted_default_branch: None,
             credential: None,
             recheck: 0,
             size_bytes: None,
@@ -49,11 +52,14 @@ async fn enqueue(path: &str) -> (SqlJobQueue, i64) {
 }
 
 async fn enqueue_on(queue: &SqlJobQueue, path: &str) -> i64 {
+    let admitted_commit = origin_tip(path);
     let enq = queue
         .enqueue(BuildJob {
             repo_id: RepoId::github(path),
             branch: "main".into(),
             rev: None,
+            admitted_commit: Some(admitted_commit),
+            admitted_default_branch: None,
             credential: None,
             recheck: 0,
             size_bytes: None,
@@ -85,6 +91,16 @@ fn publish_origin(owner: &str, repo: &str, file: &str, body: &str) -> Origin {
     origin.commit(&[(file, body)], "c1");
     origin.publish();
     origin
+}
+
+fn origin_tip(path: &str) -> String {
+    let (owner, repo) = path
+        .split_once('/')
+        .expect("worker lifecycle fixture repo path must be owner/repo");
+    git(
+        &origin_root().join(owner).join(format!("{repo}.git")),
+        &["rev-parse", "refs/heads/main"],
+    )
 }
 
 /// Drain a job, then idle-exit. Proves the worker leaves after the queue is empty.

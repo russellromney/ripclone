@@ -155,7 +155,7 @@ async fn recheck_builds_tip_that_moved_during_build() {
 
     // Build A. The re-check after it will wait on the barrier.
     let client = server.client();
-    let sync = tokio::spawn(async move { client.sync_repo("acme/fresh1", None).await });
+    let sync = tokio::spawn(async move { client.admit_sync_repo("acme/fresh1", None).await });
 
     // Wait until the first post-build re-check enters the barrier, then advance
     // the upstream tip to B before letting it proceed.
@@ -164,8 +164,8 @@ async fn recheck_builds_tip_that_moved_during_build() {
     origin.publish();
     barrier.release();
 
-    let resp = sync.await.expect("join").expect("sync A");
-    assert_eq!(resp.commit, a, "the synced build is A");
+    let admission = sync.await.expect("join").expect("admit sync A");
+    assert_eq!(admission.commit, a, "the admitted build is A");
 
     // No webhook, no poll: the post-build re-check alone catches up to B.
     wait_until(&server, "acme/fresh1", &b, baseline + 2).await;
@@ -197,7 +197,7 @@ async fn recheck_burst_collapses_to_latest() {
     origin.publish();
 
     let client = server.client();
-    let sync = tokio::spawn(async move { client.sync_repo("acme/fresh2", None).await });
+    let sync = tokio::spawn(async move { client.admit_sync_repo("acme/fresh2", None).await });
 
     barrier.wait_entered().await;
     origin.commit(&[("f", "b\n")], "B");
@@ -206,8 +206,8 @@ async fn recheck_burst_collapses_to_latest() {
     origin.publish();
     barrier.release();
 
-    let resp = sync.await.expect("join").expect("sync A");
-    assert_eq!(resp.commit, a);
+    let admission = sync.await.expect("join").expect("admit sync A");
+    assert_eq!(admission.commit, a);
 
     // The re-check builds the latest tip (D) directly, skipping B and C.
     wait_until(&server, "acme/fresh2", &d, baseline + 2).await;
@@ -239,14 +239,14 @@ async fn recheck_stops_at_cap() {
 
     // Build A (recheck=0). Its re-check (held by the barrier) builds B (recheck=1).
     let client = server.client();
-    let sync = tokio::spawn(async move { client.sync_repo("acme/fresh3", None).await });
+    let sync = tokio::spawn(async move { client.admit_sync_repo("acme/fresh3", None).await });
     barrier.wait_entered().await;
     let b = origin.commit(&[("f", "b\n")], "B");
     origin.publish();
     barrier.release();
 
-    let resp = sync.await.expect("join").expect("sync A");
-    assert_eq!(resp.commit, a);
+    let admission = sync.await.expect("join").expect("admit sync A");
+    assert_eq!(admission.commit, a);
 
     // B builds and catches up. B's own re-check (recheck=1) is now blocked on
     // the barrier, about to hit the cap.

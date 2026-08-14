@@ -220,6 +220,10 @@ phase_real_server() {
   if grep -q 'repo_not_added' "$log"; then cat "$log" >&2; fail "harness hit repo_not_added"; fi
   if grep -q 'FAILED' "$log"; then cat "$log" >&2; fail "a benchmark run failed"; fi
   grep -q 'repo .* is added' "$log" || { cat "$log" >&2; fail "harness never added the repo"; }
+  grep -qE 'artifacts ready for admitted [0-9a-f]{40}' "$log" \
+    || { cat "$log" >&2; fail "harness did not poll the admitted commit"; }
+  grep -qE 'resolved admitted .* -> [0-9a-f]{40}' "$log" \
+    || { cat "$log" >&2; fail "harness did not retain the admitted commit"; }
   grep -qE 'ripclone full \(depth=0\) +median= *[0-9]+ms' "$log" \
     || { cat "$log" >&2; fail "harness produced no timing row"; }
 

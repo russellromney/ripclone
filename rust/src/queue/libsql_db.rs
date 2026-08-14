@@ -4,10 +4,11 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
+    ADD_ADMITTED_COMMIT_COLUMN_SQL, ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL,
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
+    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL, QueueDb,
+    SETTLE_LEGACY_ACTIVE_SQL, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -48,20 +49,24 @@ impl QueueDb for LibsqlDb {
         // Migrate a legacy table to add the credential column (best-effort: errors
         // "duplicate column" on a fresh table, which is fine).
         let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
+        let _ = conn.execute(ADD_ADMITTED_COMMIT_COLUMN_SQL, ()).await;
+        let _ = conn
+            .execute(ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL, ())
+            .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
         // size_class rank: the claim filter (right-sizing) reads it, and
         // stale-reclaim bumps it as an escalation rung. Best-effort migration.
         let _ = conn.execute(ADD_SIZE_CLASS_COLUMN_SQL, ()).await;
+        conn.execute(SETTLE_LEGACY_ACTIVE_SQL, ())
+            .await
+            .context("settle legacy active jobs")?;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
-        let _ = conn.execute(DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, ()).await;
-        if let Err(e) = conn.execute(CREATE_ACTIVE_KEY_INDEX_SQL, ()).await {
-            tracing::warn!(
-                "libsql: partial unique index unsupported ({e}); coalescing is best-effort"
-            );
-        }
+        conn.execute(CREATE_ACTIVE_KEY_INDEX_SQL, ())
+            .await
+            .context("create active-key uniqueness index")?;
         conn.execute(CREATE_HISTORY_INDEX_SQL, ())
             .await
             .context("create history index")?;
@@ -79,7 +84,7 @@ impl QueueDb for LibsqlDb {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT id FROM jobs WHERE key = ? AND status = 'queued' LIMIT 1",
+                "SELECT id FROM jobs WHERE key = ? AND status IN ('queued', 'claimed') LIMIT 1",
                 [key],
             )
             .await
@@ -96,6 +101,8 @@ impl QueueDb for LibsqlDb {
         provider: &str,
         path: &str,
         branch: &str,
+        admitted_commit: Option<&str>,
+        admitted_default_branch: Option<&str>,
         credential: Option<&str>,
         size_class: i64,
         created_at: i64,
@@ -106,9 +113,19 @@ impl QueueDb for LibsqlDb {
             None => libsql::Value::Null,
         };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
-            libsql::params![key, provider, path, branch, cred_val, size_class, created_at],
+            "INSERT INTO jobs (key, provider, path, branch, admitted_commit, admitted_default_branch, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+            libsql::params![
+                key,
+                provider,
+                path,
+                branch,
+                admitted_commit,
+                admitted_default_branch,
+                cred_val,
+                size_class,
+                created_at
+            ],
         )
         .await
         .context("insert job")?;
@@ -144,7 +161,9 @@ impl QueueDb for LibsqlDb {
         )
         .await
         .context("dead-letter stale jobs")?;
-        // Under-cap with a newer queued sibling → superseded (unique key).
+        // Compatibility cleanup for a legacy same-key sibling state. New
+        // immutable active-key rows cannot create it because the uniqueness
+        // constraint covers both queued and claimed rows.
         conn.execute(
             "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
                  worker_id = NULL, credential = NULL
@@ -228,11 +247,20 @@ impl QueueDb for LibsqlDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, Option<String>)>> {
+    ) -> Result<
+        Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+    > {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT provider, path, branch, credential FROM jobs WHERE id = ?",
+                "SELECT provider, path, branch, admitted_commit, admitted_default_branch, credential FROM jobs WHERE id = ?",
                 [id],
             )
             .await
@@ -243,6 +271,8 @@ impl QueueDb for LibsqlDb {
                 row.get::<String>(1)?,
                 row.get::<String>(2)?,
                 row.get::<Option<String>>(3)?,
+                row.get::<Option<String>>(4)?,
+                row.get::<Option<String>>(5)?,
             ))),
             None => Ok(None),
         }

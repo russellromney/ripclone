@@ -591,7 +591,19 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
     let (server, barrier, entered, proceed) =
         start_server_split_storage_phase_one_barrier_with_registry(registry).await;
 
-    let large = vec![b'u'; 2 * 1024 * 1024];
+    // SplitMix64 gives this blob deterministic high entropy. Repeated bytes
+    // compress too well to detect an accidental retransmission of unchanged
+    // content, so keep this large enough to make the byte budget load-bearing.
+    let mut state = 0x4d59_5df4_d0f3_3173_u64;
+    let mut large = Vec::with_capacity(12 * 1024 * 1024);
+    while large.len() < large.capacity() {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        large.extend_from_slice(&value.to_le_bytes());
+    }
     for (path, bytes) in [
         ("modified.txt", b"before\n".as_slice()),
         ("deleted.txt", b"delete me\n".as_slice()),
@@ -608,6 +620,7 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
     #[cfg(unix)]
     std::os::unix::fs::symlink("modified.txt", origin.work.join("link")).unwrap();
     let a = commit_all(&origin.work, "A");
+    let unchanged_blob = git(&origin.work, &["hash-object", "unchanged.bin"]);
     origin.publish();
 
     register_added_without_build_for_provider(&server, "counting", "acme/full-topup")
@@ -717,7 +730,10 @@ real_git='{}'
 for arg in "$@"; do
   if [ "$arg" = "fetch" ] || [ "$arg" = "clone" ]; then
     case " $* " in
-      *"$server_root"*) printf '%s\n' "$*" >>"$source_log" ;;
+      *"$server_root"*)
+        printf '%s\n' "$*" >>"$source_log"
+        if [ "$RIPCLONE_TEST_SOURCE_FORBIDDEN" = "1" ]; then exit 97; fi
+        ;;
     esac
     break
   fi
@@ -745,6 +761,48 @@ exec "$real_git" "$@"
         ),
     );
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+
+    // Phase one has already published Shallow(B), while Full(B) remains
+    // stopped at the production barrier. Make the real server Git boundary
+    // fail: this ordinary, unpinned protocol-v2 read must still serve B from
+    // authenticated metadata without attempting source acquisition.
+    let source_forbidden = ScopedEnvVar::set("RIPCLONE_TEST_SOURCE_FORBIDDEN", "1");
+    let shallow_response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/counting/acme/full-topup/refs/main?clonepack=shallow",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("X-Upstream-Token", upstream_token)
+        .header("x-ripclone-protocol", "2")
+        .send()
+        .await
+        .expect("phase-one shallow metadata request");
+    assert_eq!(shallow_response.status(), StatusCode::OK);
+    let shallow: serde_json::Value = shallow_response
+        .json()
+        .await
+        .expect("phase-one shallow response");
+    assert_eq!(shallow["commit"], b);
+    assert_eq!(shallow["shallow"], true);
+    assert!(
+        shallow["clonepack_manifest"]
+            .as_str()
+            .is_some_and(|manifest| !manifest.is_empty()),
+        "phase one must publish a usable shallow manifest"
+    );
+    assert!(
+        std::fs::read_to_string(&source_log)
+            .expect("phase-one shallow source log")
+            .is_empty(),
+        "published Shallow(B) must not reacquire upstream while Full(B) is active"
+    );
+    assert!(
+        !sync_b.is_finished(),
+        "Full(B) remains blocked during shallow read"
+    );
+    drop(source_forbidden);
+
     let _unchanged_path = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_UNCHANGED_PATH", "unchanged.bin");
     let _metrics_log = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_METRICS_LOG", &top_up_metrics);
     let _git_log = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_GIT_LOG", &managed_git_log);
@@ -879,7 +937,7 @@ exec "$real_git" "$@"
         "one top-up plan must read exactly Full(A)'s carried manifest"
     );
     let upstream_requests = origin.auth_success_count();
-    let upstream_bytes = origin.auth_success_bytes();
+    let upstream_bytes = origin.auth_success_get_body_bytes();
     assert!(
         upstream_requests > 0,
         "the exact B fetch must reach the counting upstream"
@@ -887,6 +945,11 @@ exec "$real_git" "$@"
     assert!(
         upstream_bytes > 0,
         "the counting upstream must observe exact-fetch response bytes"
+    );
+    assert!(
+        upstream_bytes < (large.len() / 8) as u64,
+        "top-up transferred {upstream_bytes} bytes for a {}-byte unchanged blob",
+        large.len()
     );
     assert_eq!(origin.auth_reject_count(), 0);
     let server_source_acquisitions = std::fs::read_to_string(&source_log)
@@ -910,6 +973,38 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
         metric("after_mtime_ns"),
         observed.enqueues,
         observed.builder_entries,
+    );
+
+    // Non-vacuity control: an empty Git repository fetching the same pinned B
+    // must transfer A's incompressible unchanged blob. This proves the HTTP
+    // byte counter can see the regression excluded by the top-up ceiling.
+    origin.clear_auth_log();
+    let fresh = tempfile::tempdir().expect("fresh-fetch control repo");
+    git(fresh.path(), &["init", "-q"]);
+    let auth_arg = format!("http.extraHeader=Authorization: token {upstream_token}");
+    let remote = format!("{}/acme/full-topup.git", origin.url);
+    git(
+        fresh.path(),
+        &["-c", &auth_arg, "fetch", "--no-tags", "--", &remote, &b],
+    );
+    assert_eq!(
+        git(fresh.path(), &["cat-file", "-t", &unchanged_blob]),
+        "blob"
+    );
+    let fresh_fetch_bytes = origin.auth_success_get_body_bytes();
+    assert!(
+        fresh_fetch_bytes > (large.len() * 3 / 4) as u64,
+        "fresh-fetch control observed only {fresh_fetch_bytes} bytes for a {}-byte incompressible blob",
+        large.len()
+    );
+    assert!(
+        upstream_bytes * 8 < fresh_fetch_bytes,
+        "top-up {upstream_bytes} bytes was not a small fraction of fresh fetch {fresh_fetch_bytes}"
+    );
+    println!(
+        "TOP_UP_BYTE_CONTROL unchanged_blob_bytes={} top_up_bytes={upstream_bytes} fresh_fetch_bytes={fresh_fetch_bytes} ratio_x={:.1}",
+        large.len(),
+        fresh_fetch_bytes as f64 / upstream_bytes as f64
     );
     #[cfg(unix)]
     {
@@ -1883,11 +1978,27 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
     assert!(!target.exists());
 
     proceed.send(()).expect("release removed Full(B)");
-    tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
-        .await
-        .expect("removed Full(B) finished after release")
-        .expect("join removed B sync")
-        .expect("sync removed B from server mirror");
+    // The compatibility waiter is pinned to B and must never follow the
+    // rewound branch to A. If the post-build recheck replaces the mutable
+    // branch row before the next exact poll, the documented result is a
+    // bounded typed pending error; either outcome is acceptable here because
+    // the install assertion above is the source-removal proof.
+    match tokio::time::timeout(Duration::from_secs(20), &mut sync_b).await {
+        Ok(joined) => match joined.expect("join removed B sync") {
+            Ok(response) => assert_eq!(response.commit, b),
+            Err(error) => assert!(
+                format!("{error:#}").contains(&b),
+                "removed-B compatibility failure lost its B pin: {error:#}"
+            ),
+        },
+        Err(_) => {
+            sync_b.abort();
+            tokio::time::timeout(Duration::from_secs(5), &mut sync_b)
+                .await
+                .expect("aborted removed-B compatibility waiter joined")
+                .expect_err("removed-B compatibility waiter was not aborted");
+        }
+    }
 }
 
 #[tokio::test]

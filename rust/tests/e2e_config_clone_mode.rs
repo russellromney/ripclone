@@ -89,7 +89,7 @@ async fn project_config_drives_clone_mode_and_default_provider() {
         project.path(),
         &server.url,
         &providers_json,
-        &["add", "acme/http"],
+        &["add", "acme/http", "--wait"],
     )
     .await;
     assert!(
@@ -105,7 +105,7 @@ async fn project_config_drives_clone_mode_and_default_provider() {
         project.path(),
         &server.url,
         &providers_json,
-        &["sync", "acme/http"],
+        &["sync", "acme/http", "--wait"],
     )
     .await;
     assert!(

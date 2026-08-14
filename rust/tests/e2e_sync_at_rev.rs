@@ -84,6 +84,50 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
     assert_eq!(read(&c3d1, "a.txt"), "3\n");
 }
 
+/// A concrete-branch admission still initializes an exact-only mirror. Its
+/// single provider advertisement must retain the upstream symbolic HEAD so a
+/// later historical HEAD~N request resolves through the real default branch,
+/// never Git's platform-specific bare-init default.
+#[tokio::test]
+async fn named_branch_admission_then_head_relative_history_uses_upstream_default() {
+    setup(true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "named-then-history");
+    let old = origin.commit(&[("a.txt", "old\n")], "old");
+    let tip = origin.commit(&[("a.txt", "tip\n")], "tip");
+    origin.publish();
+    git(
+        &origin.work,
+        &[
+            "push",
+            "-q",
+            "--force",
+            origin.bare_str(),
+            "HEAD:refs/heads/feature",
+        ],
+    );
+    register_added_without_build(&server, "acme/named-then-history")
+        .await
+        .expect("register named-branch fixture");
+
+    let client = server.client();
+    let feature = client
+        .sync_branch("acme/named-then-history", "feature")
+        .await
+        .expect("admit and build concrete feature branch");
+    assert_eq!(feature.commit, tip);
+
+    let historical = client
+        .sync_repo_at("acme/named-then-history", Some("HEAD~1"), None)
+        .await
+        .expect("HEAD~1 resolves after named-branch exact admission");
+    assert_eq!(historical.commit, old);
+    let (_guard, target) = clone_full_rev(&server, "named-then-history", "HEAD~1", "1").await;
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), old);
+    assert_eq!(read(&target, "a.txt"), "old\n");
+    assert_repo_usable(&target, "1");
+}
+
 /// Regression (adversarial review): a `sync --at <older rev>` must NOT clobber
 /// the real branch entry that normal tip clients depend on. After a normal tip
 /// sync, an at-rev sync of an OLDER commit, then a plain tip clone must still

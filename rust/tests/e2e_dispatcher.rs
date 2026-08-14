@@ -63,11 +63,18 @@ fn publish_origin(owner: &str, repo: &str, file: &str, body: &str) -> Origin {
 }
 
 async fn enqueue_sized(queue: &SqlJobQueue, path: &str, size_bytes: Option<u64>) -> i64 {
+    let (owner, repo) = path
+        .split_once('/')
+        .expect("dispatcher fixture repo path must be owner/repo");
+    let origin = origin_root().join(owner).join(format!("{repo}.git"));
+    let admitted_commit = git(&origin, &["rev-parse", "refs/heads/main"]);
     let enq = queue
         .enqueue(BuildJob {
             repo_id: RepoId::github(path),
             branch: "main".into(),
             rev: None,
+            admitted_commit: Some(admitted_commit),
+            admitted_default_branch: None,
             credential: None,
             recheck: 0,
             size_bytes,
@@ -978,7 +985,21 @@ async fn dispatcher_reaper_reclaims_dead_worker_on_reconcile() {
         &server.cas_dir,
         &server.repo_root,
     );
-    let worker_env = local_worker_env();
+    // Hold the first worker after its exact fetch and depth-1 publication. This
+    // makes the hard kill deterministic and avoids leaving a child git fetch
+    // half-owned by the killed worker; the recovery worker then exercises the
+    // stale-claim path against an already-admitted mirror.
+    let phase2_barrier = tempfile::tempdir().expect("phase-two barrier dir");
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR", phase2_barrier.path());
+    }
+    let mut worker_env = local_worker_env();
+    worker_env.insert("RIPCLONE_TESTING".into(), "1".into());
+    worker_env.insert(
+        "RIPCLONE_TEST_PHASE2_BARRIER_DIR".into(),
+        phase2_barrier.path().to_string_lossy().into_owned(),
+    );
 
     let _origin = publish_origin("acme", "reaper-a", "a.txt", "a\n");
     let queue = backends::connect_sql_queue().await.expect("queue");
@@ -1000,12 +1021,16 @@ async fn dispatcher_reaper_reclaims_dead_worker_on_reconcile() {
     .expect("first reconcile starts the doomed worker");
     assert_eq!(first.started, 1, "doomed worker must start: {first:?}");
 
-    // Wait for the REAL claim: `depth()` drops to 0 only via the atomic claim
-    // UPDATE in `try_claim`, so this is not a timing guess. Then hard-kill
-    // that exact worker pid — a crash mid-build, no ack, ever.
+    // Wait for the REAL claim and the phase-two barrier: `depth()` drops to 0
+    // only via the atomic claim UPDATE in `try_claim`, while `entered` proves
+    // the exact fetch and depth-1 publication completed. Then hard-kill that
+    // exact worker pid — a crash before ack, ever.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if queue.depth().await == 0 && pidfile.exists() {
+        if queue.depth().await == 0
+            && pidfile.exists()
+            && phase2_barrier.path().join("entered").exists()
+        {
             break;
         }
         assert!(
@@ -1027,6 +1052,12 @@ async fn dispatcher_reaper_reclaims_dead_worker_on_reconcile() {
         "SIGKILL the doomed worker (pid {pid}): {}",
         std::io::Error::last_os_error()
     );
+    std::fs::write(phase2_barrier.path().join("proceed"), b"killed\n")
+        .expect("release phase-two barrier after killing doomed worker");
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
 
     // Confirm the crash landed: row stuck `claimed`, no ack, queue LOOKS idle
     // (nothing `queued`) — exactly the stranded-claim scenario this fix

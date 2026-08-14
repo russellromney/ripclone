@@ -6,11 +6,19 @@ mod common;
 
 use common::*;
 use ripclone::mode::CloneMode;
+use ripclone::provider::RepoId;
+use ripclone::ref_store::{FileRefStore, RefStore};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap()
+}
+
+fn phase2_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 async fn repo_status(server: &Server, owner: &str, repo: &str) -> serde_json::Value {
@@ -181,6 +189,7 @@ async fn two_phase_resync_full_upgrades() {
 
 #[tokio::test]
 async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
+    let _env_guard = phase2_env_lock().lock().await;
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "phase2guard");
@@ -229,10 +238,137 @@ async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
 
     let (_guard, after) = clone_files_when(&server, "acme", "phase2guard", "f", "new\n").await;
     assert_eq!(read(&after, "g"), "new file\n");
+
+    let refs = FileRefStore::new(&server.repo_root)
+        .list_branches(&RepoId::github("acme/phase2guard"))
+        .await
+        .expect("list late-completion refs");
+    assert!(
+        refs.iter().all(|branch| !branch.contains('#')),
+        "late completion must not create a synthetic exact ref: {refs:?}"
+    );
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT");
+        std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS");
+    }
+}
+
+#[tokio::test]
+async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_state() {
+    let _env_guard = phase2_env_lock().lock().await;
+    init(false);
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let server = start_server().await;
+    let origin = make_origin("acme", "phase2fail-fenced");
+    let b = origin.commit(&[("f", "B\n")], "B");
+    origin.publish();
+
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT", &b);
+        std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS", "1500");
+        std::env::set_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT", &b);
+    }
+
+    register_added_without_build(&server, "acme/phase2fail-fenced")
+        .await
+        .expect("add failure-fence repo");
+    server
+        .client()
+        .sync_repo("acme/phase2fail-fenced", None)
+        .await
+        .expect("admit B");
+
+    let c = origin.commit(&[("f", "C\n"), ("c", "current\n")], "C");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/phase2fail-fenced", None)
+        .await
+        .expect("admit C");
+
+    let (_ready_guard, ready) =
+        clone_files_when(&server, "acme", "phase2fail-fenced", "f", "C\n").await;
+    assert_eq!(read(&ready, "c"), "current\n");
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let b_failures = probe
+                .failure_targets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .filter(|(commit, _)| commit == &b)
+                .count();
+            if b_failures >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("initial and one bounded retry of Full(B) both failed");
+    let failures = probe
+        .failure_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    assert_eq!(
+        failures.iter().filter(|(commit, _)| commit == &b).count(),
+        2,
+        "Full(B) must exhaust exactly one retry: {failures:?}"
+    );
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/phase2fail-fenced");
+    let moving = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load final moving ref")
+        .expect("moving ref exists");
+    assert_eq!(moving.commit, c);
+    assert_eq!(moving.full_clonepack.commit, c);
+    assert!(
+        moving.build_status.is_none(),
+        "B failure must not leave C building or failed: {:?}",
+        moving.build_status
+    );
+    let refs = store
+        .list_branches(&repo_id)
+        .await
+        .expect("list failure-fence refs");
+    assert!(
+        refs.iter().all(|branch| !branch.contains('#')),
+        "failed superseded work must not create a hidden exact ref: {refs:?}"
+    );
+
+    let status = repo_status(&server, "acme", "phase2fail-fenced").await;
+    let public_refs = status["refs"].as_array().expect("status refs");
+    assert!(
+        public_refs.iter().all(|entry| {
+            entry["branch"]
+                .as_str()
+                .is_some_and(|branch| !branch.contains('#'))
+                && entry["commit"] == c
+                && entry["history"] == "ready"
+        }),
+        "status must expose only ready C source refs: {public_refs:?}"
+    );
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT");
+        std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS");
+        std::env::remove_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
 }
 
 #[tokio::test]
 async fn failed_phase2_status_recovers_on_resync() {
+    let _env_guard = phase2_env_lock().lock().await;
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "phase2fail");
@@ -306,6 +442,7 @@ async fn failed_phase2_status_recovers_on_resync() {
 /// a following sync rebuilds and recovers the full clone.
 #[tokio::test]
 async fn panicking_phase2_status_recovers_on_resync() {
+    let _env_guard = phase2_env_lock().lock().await;
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "phase2panic");
