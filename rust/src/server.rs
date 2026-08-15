@@ -3144,12 +3144,19 @@ async fn carried_full_top_up_response(
     )
 }
 
-/// Result of a pinned lookup. `Pending` retains the one moving-row snapshot
-/// that established the miss so top-up planning cannot observe a different
-/// publication state than exact selection.
+/// Result of a pinned lookup. `Pending` retains the exact-row snapshot when one
+/// exists, plus the compatible moving-row snapshot used by older layouts, so
+/// top-up planning cannot observe a different publication state than exact
+/// selection.
 enum PinnedRefLookup {
-    Exact { key: String, info: RefInfo },
-    Pending { moving: Option<RefInfo> },
+    Exact {
+        key: String,
+        info: RefInfo,
+    },
+    Pending {
+        moving: Option<RefInfo>,
+        exact: Option<(String, RefInfo)>,
+    },
 }
 
 /// A post-pin lookup performs only a fixed set of repo-scoped point reads.
@@ -3164,39 +3171,14 @@ async fn load_pinned_ref_info(
     clonepack_kind: &str,
     historical_rev: Option<&str>,
 ) -> Result<PinnedRefLookup> {
-    // Prefer the moving row while it still serves the pin. Reading a compatible
-    // exact row is a fallback for artifacts already published by the historical
-    // `--at` lane; it creates no ordinary publication or permanent pin/retention.
     let branch_info = ref_store.load_branch(repo_id, branch).await?;
-    if let Some(info) = branch_info.as_ref()
-        && info.commit == pinned
-        && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
-    {
-        return Ok(PinnedRefLookup::Exact {
-            key: branch.to_string(),
-            info: info.clone(),
-        });
-    }
-
-    // HEAD metadata carries the concrete default branch. Prefer its moving row
-    // too, then use it to find a pre-existing `<default>#<commit>` compatibility
-    // row without scanning refs or manufacturing a second alias.
+    // HEAD metadata carries the concrete default branch. It is a point read used
+    // only to name the concrete exact lane; it never probes the provider.
     let default_branch = branch_info
         .as_ref()
         .filter(|_| branch == "HEAD")
         .map(|info| info.default_branch.as_str())
         .filter(|default_branch| !default_branch.is_empty() && *default_branch != "HEAD");
-    if let Some(default_branch) = default_branch
-        && let Some(info) = ref_store.load_branch(repo_id, default_branch).await?
-        && info.commit == pinned
-        && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
-    {
-        return Ok(PinnedRefLookup::Exact {
-            key: default_branch.to_string(),
-            info,
-        });
-    }
-
     let mut exact_keys = vec![ref_store_key(branch, Some(pinned), Some(pinned))];
     if let Some(default_branch) = default_branch {
         let key = ref_store_key(default_branch, Some(pinned), Some(pinned));
@@ -3216,17 +3198,75 @@ async fn load_pinned_ref_info(
             }
         }
     }
+
+    let mut pending_exact = None;
     for key in exact_keys {
-        if key != branch
-            && let Some(info) = ref_store.load_branch(repo_id, &key).await?
-            && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+        if key == branch {
+            continue;
+        }
+        if let Some(info) = ref_store.load_branch(repo_id, &key).await?
+            && info.commit == pinned
         {
-            return Ok(PinnedRefLookup::Exact { key, info });
+            if exact_ref_info_serves_commit(&info, clonepack_kind, pinned) {
+                return Ok(PinnedRefLookup::Exact { key, info });
+            }
+            if pending_exact.is_none() {
+                pending_exact = Some((key, info));
+            }
         }
     }
 
+    // Older rows may still be available under the moving branch. They are a
+    // compatibility fallback only; an exact row, when present, is authoritative.
+    let default_info = if let Some(default_branch) = default_branch {
+        if default_branch != branch {
+            ref_store.load_branch(repo_id, default_branch).await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if pending_exact.is_none() {
+        if let Some(info) = branch_info.as_ref()
+            && info.commit == pinned
+            && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
+        {
+            return Ok(PinnedRefLookup::Exact {
+                key: branch.to_string(),
+                info: info.clone(),
+            });
+        }
+        if let Some(default_branch) = default_branch
+            && let Some(info) = default_info.as_ref()
+            && info.commit == pinned
+            && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
+        {
+            return Ok(PinnedRefLookup::Exact {
+                key: default_branch.to_string(),
+                info: info.clone(),
+            });
+        }
+    }
+
+    // Keep the moving snapshot that matches the pin when possible. If it does
+    // not match, retaining it is still useful for the exact-B pending response
+    // and is rejected by the top-up identity checks.
+    let moving = branch_info
+        .as_ref()
+        .filter(|info| info.commit == pinned)
+        .cloned()
+        .or_else(|| {
+            default_info
+                .as_ref()
+                .filter(|info| info.commit == pinned)
+                .cloned()
+        })
+        .or(branch_info)
+        .or(default_info);
     Ok(PinnedRefLookup::Pending {
-        moving: branch_info,
+        moving,
+        exact: pending_exact,
     })
 }
 
@@ -3275,6 +3315,14 @@ fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: 
         && info.commit == commit
         && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
         && !ref_info_serves_commit(info, clonepack_kind, commit)
+}
+
+fn pinned_build_active(info: Option<&RefInfo>, clonepack_kind: &str, commit: &str) -> bool {
+    info.is_some_and(|info| {
+        info.commit == commit
+            && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
+            && !exact_ref_info_serves_commit(info, clonepack_kind, commit)
+    })
 }
 
 fn phase_one_shallow_ready_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
@@ -3484,15 +3532,57 @@ async fn get_ref_inner(
         };
         let (served_key, info) = match resolved {
             PinnedRefLookup::Exact { key, info } => (key, info),
-            PinnedRefLookup::Pending { moving } => {
+            PinnedRefLookup::Pending { moving, exact } => {
+                let exact_info = exact.as_ref().map(|(_, info)| info);
+                let pending_info = exact_info.or(moving.as_ref());
+                let response_branch = if branch == "HEAD" {
+                    pending_info
+                        .filter(|info| !info.default_branch.is_empty())
+                        .map(|info| info.default_branch.clone())
+                        .unwrap_or_else(|| branch.clone())
+                } else {
+                    branch.clone()
+                };
+                if params.rev.is_none()
+                    && !pinned_build_active(pending_info, &params.clonepack, pinned)
+                {
+                    let build_branch = response_branch.clone();
+                    let size_bytes = enqueue_size_bytes(&state, &repo_id, &build_branch).await;
+                    let job = BuildJob {
+                        repo_id: repo_id.clone(),
+                        branch: build_branch.clone(),
+                        rev: None,
+                        admitted_commit: Some(pinned.to_string()),
+                        admitted_default_branch: pending_info
+                            .filter(|info| !info.default_branch.is_empty())
+                            .map(|info| info.default_branch.clone()),
+                        credential: credential.clone(),
+                        // Recovery is for the requested commit only. Do not
+                        // launch the moving-tip freshness probe after it finishes.
+                        recheck: recheck_max(),
+                        size_bytes,
+                    };
+                    if let Err(error) = enqueue_direct_build(&state, job).await {
+                        state.metrics.record_error();
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "exact pinned commit {pinned} is unavailable: {error}"
+                                ),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
                 if params.top_up && params.clonepack == "full" {
-                    let base = match moving.as_ref() {
+                    let base = match pending_info {
                         Some(info) => {
                             carried_full_top_up_response(
                                 info,
                                 &repo_id,
                                 &provider,
-                                &branch,
+                                &response_branch,
                                 pinned,
                                 &state.storage,
                                 private,
@@ -3503,13 +3593,13 @@ async fn get_ref_inner(
                     };
                     return artifact_pending_response_with_top_up(
                         pinned,
-                        &branch,
+                        &response_branch,
                         1,
                         Some(true),
                         base,
                     );
                 }
-                return artifact_pending_response(pinned, &branch, 1);
+                return artifact_pending_response(pinned, &response_branch, 1);
             }
         };
         let response_branch = if branch == "HEAD" && !info.default_branch.is_empty() {
@@ -5281,7 +5371,14 @@ async fn trigger_build(
     }
     crate::validation::validate_object_id(&admitted_commit)
         .map_err(|e| format!("invalid admitted commit: {e}"))?;
-    if let Ok(Some(info)) = state.ref_store.load_branch(repo_id, branch).await
+    let exact_key = ref_store_key(branch, Some(&admitted_commit), Some(&admitted_commit));
+    let existing = state
+        .ref_store
+        .load_branch(repo_id, &exact_key)
+        .await
+        .ok()
+        .flatten();
+    if let Some(info) = existing
         && exact_ref_info_serves_commit(&info, "full", &admitted_commit)
         && !info
             .build_status
@@ -5998,6 +6095,7 @@ async fn create_snapshot_inner(
         &lock,
         Some(Phase2FailureAction {
             state: state.clone(),
+            job_branch: branch.clone(),
             credential: credential.clone(),
             admitted_commit: None,
             admitted_default_branch: None,
@@ -6470,13 +6568,10 @@ fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
     }
 }
 
-/// Ref-store key for a build. Rev-targeted builds (sync/clone `--at <rev>`) use
-/// a commit-keyed rolling key (`{branch}#{commit}`) so they never overwrite the
-/// real branch entry and never get stuck reusing a stale/incomplete rev-keyed
-/// build from an older server version. Sequential rev syncs at the same commit
-/// still share this key, so they stay incremental. Tip builds use the branch
-/// directly. This is the pre-existing historical compatibility layout; ordinary
-/// admitted work must never use it.
+/// Ref-store key for a build. Commit-targeted builds use a commit-keyed rolling
+/// key (`{branch}#{commit}`) so they never overwrite another exact result.
+/// Sequential builds at the same commit still share this key, so they stay
+/// incremental. Moving tip rows use the plain branch key for compatibility.
 fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> String {
     match (at_rev, commit) {
         (Some(_), Some(commit)) => format!("{branch}#{commit}"),
@@ -7385,16 +7480,30 @@ async fn do_sync(
 
     // If the caller asked for HEAD, store artifacts under the concrete default
     // branch name so both /refs/HEAD and /refs/<branch> find the same build.
-    let branch = if branch == "HEAD" {
-        default_branch.as_str()
+    // Ordinary admitted work keeps that concrete branch as a compatibility row,
+    // while all build state below uses the exact commit-keyed row.
+    let moving_branch = at_rev.is_none().then(|| {
+        if branch == "HEAD" {
+            default_branch.clone()
+        } else {
+            branch.to_string()
+        }
+    });
+    let storage_branch = moving_branch.as_deref().unwrap_or_else(|| {
+        if branch == "HEAD" {
+            default_branch.as_str()
+        } else {
+            branch
+        }
+    });
+    // Ref-store key. Rev builds and ordinary admitted builds share the existing
+    // commit-keyed rolling lane; only the moving compatibility row stays plain.
+    // The mirror fetch + commit resolution above used the real branch/rev.
+    let ref_key = if admitted_commit.is_some() {
+        ref_store_key(storage_branch, Some(&commit), Some(&commit))
     } else {
-        branch
+        ref_store_key(storage_branch, at_rev, Some(&commit))
     };
-    // Ref-store key. Rev builds use a commit-keyed rolling key so they never
-    // overwrite the real branch entry and never get stuck reusing a stale
-    // rev-keyed build; everything below stores/loads under this key. The mirror
-    // fetch + commit resolution above used the real branch/rev.
-    let ref_key = ref_store_key(branch, at_rev, Some(&commit));
     let branch = ref_key.as_str();
 
     // No-op fast path: if a *completed full* build already exists for exactly
@@ -7465,6 +7574,7 @@ async fn do_sync(
         &mirror_dir,
         repo_id,
         branch,
+        moving_branch.as_deref(),
         &commit,
         parent,
         &default_branch,
@@ -7521,11 +7631,60 @@ struct HeadBuild {
 #[derive(Clone)]
 struct Phase2FailureAction {
     state: ServerState,
+    job_branch: String,
     credential: Option<SecretString>,
     admitted_commit: Option<String>,
     admitted_default_branch: Option<String>,
     retry_recheck: Option<u32>,
     local_active_key: Option<String>,
+}
+
+/// Keep the legacy moving row and HEAD alias useful for unpinned callers after
+/// the exact result is durable. The existing ref-store ordering fence decides
+/// whether a delayed exact build may advance the moving row; a rejected B write
+/// is therefore unable to move C backward.
+async fn publish_compatibility_refs(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    exact_branch: &str,
+    moving_branch: Option<&str>,
+    default_branch: &str,
+    info: &RefInfo,
+) -> Result<()> {
+    let Some(moving_branch) = moving_branch else {
+        return Ok(());
+    };
+    if moving_branch != exact_branch {
+        admission_test_ref_store_write();
+        ref_store
+            .save_branch(repo_id, moving_branch, info)
+            .await
+            .with_context(|| {
+                format!(
+                    "persist moving compatibility ref for {}@{moving_branch}",
+                    repo_id.storage_key()
+                )
+            })?;
+    }
+    if moving_branch == default_branch {
+        ref_store.invalidate(repo_id, moving_branch).await;
+        let current = ref_store.load_branch(repo_id, moving_branch).await?;
+        if let Some(current) = current
+            && current.commit == info.commit
+        {
+            admission_test_ref_store_write();
+            ref_store
+                .save_branch(repo_id, "HEAD", &current)
+                .await
+                .with_context(|| {
+                    format!(
+                        "persist HEAD compatibility ref for {}",
+                        repo_id.storage_key()
+                    )
+                })?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7534,6 +7693,7 @@ async fn build_and_publish_two_phase(
     mirror_dir: &std::path::Path,
     repo_id: &RepoId,
     branch: &str,
+    moving_branch: Option<&str>,
     commit: &str,
     parent: Option<String>,
     default_branch: &str,
@@ -7570,7 +7730,18 @@ async fn build_and_publish_two_phase(
     // would reference objects storage no longer has, so the published manifest
     // would point at deleted packs and the next clone 404s. Treat an evicted prev
     // as absent so the rebuild is cold and re-uploads everything it references.
-    let prev_loaded = ref_store.load_branch(repo_id, branch).await.ok().flatten();
+    let prev_loaded = match ref_store.load_branch(repo_id, branch).await.ok().flatten() {
+        Some(info) => Some(info),
+        None => match moving_branch {
+            Some(moving) if moving != branch => ref_store
+                .load_branch(repo_id, moving)
+                .await
+                .ok()
+                .flatten()
+                .filter(|info| parent.as_deref() == Some(info.commit.as_str())),
+            _ => None,
+        },
+    };
     // Preserve the repo's warm pin across a cold rebuild. The pin is an
     // out-of-band flag an operator or external control plane may set; an evicted
     // `prev` (whose
@@ -7930,6 +8101,15 @@ async fn build_and_publish_two_phase(
         .save_branch(repo_id, branch, &info)
         .await
         .with_context(|| format!("persist depth=1 ref for {}@{branch}", repo_id.storage_key()))?;
+    publish_compatibility_refs(
+        ref_store,
+        repo_id,
+        branch,
+        moving_branch,
+        default_branch,
+        &info,
+    )
+    .await?;
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
     info!(
         "two-phase p1: published depth-1 for {} in {:?} (full history building in background)",
@@ -7948,6 +8128,7 @@ async fn build_and_publish_two_phase(
     let mirror2 = mirror_dir.to_path_buf();
     let repo_id2 = repo_id.clone();
     let branch2 = branch.to_string();
+    let moving_branch2 = moving_branch.map(str::to_string);
     let commit2 = commit.to_string();
     let parent2 = parent.clone();
     let default_branch2 = default_branch.to_string();
@@ -7965,6 +8146,7 @@ async fn build_and_publish_two_phase(
             &mirror2,
             &repo_id2,
             &branch2,
+            moving_branch2.as_deref(),
             &commit2,
             parent2,
             &default_branch2,
@@ -8233,6 +8415,7 @@ async fn build_full_in_background(
     mirror_dir: &std::path::Path,
     repo_id: &RepoId,
     branch: &str,
+    moving_branch: Option<&str>,
     commit: &str,
     parent: Option<String>,
     default_branch: &str,
@@ -8649,15 +8832,15 @@ async fn build_full_in_background(
                 .with_context(|| {
                     format!("persist files ref for {}@{branch}", repo_id.storage_key())
                 })?;
-            if branch == default_branch {
-                admission_test_ref_store_write();
-                ref_store
-                    .save_branch(repo_id, "HEAD", &info)
-                    .await
-                    .with_context(|| {
-                        format!("persist files HEAD alias for {}", repo_id.storage_key())
-                    })?;
-            }
+            publish_compatibility_refs(
+                ref_store,
+                repo_id,
+                branch,
+                moving_branch,
+                default_branch,
+                &info,
+            )
+            .await?;
         }
     }
     settle_storage(
@@ -8764,6 +8947,7 @@ pub async fn process_build_job(
         if job.recheck == 0 && at_rev.is_none() {
             Some(Phase2FailureAction {
                 state: state.clone(),
+                job_branch: branch.clone(),
                 credential: job.credential.clone(),
                 admitted_commit: job.admitted_commit.clone(),
                 admitted_default_branch: job.admitted_default_branch.clone(),
@@ -8773,6 +8957,7 @@ pub async fn process_build_job(
         } else {
             Some(Phase2FailureAction {
                 state: state.clone(),
+                job_branch: branch.clone(),
                 credential: job.credential.clone(),
                 admitted_commit: job.admitted_commit.clone(),
                 admitted_default_branch: job.admitted_default_branch.clone(),
@@ -8793,49 +8978,8 @@ pub async fn process_build_job(
             let info = &result.info;
             state.metrics.record_build_completed(start.elapsed());
             state.metrics.record_sync_phases((&result.phases).into());
-            // Cross-process resolution: a server that didn't run this build has no
-            // local mirror, so it cannot map a requested `HEAD` to the concrete
-            // default branch `do_sync` stored the ref under. Persist the real ref
-            // under the literal `HEAD` key too for ordinary default-branch jobs
-            // (including jobs canonicalized from HEAD) so any process can resolve
-            // `/sync HEAD` from the shared metadata store alone.
-            // Normal admission may already have canonicalized a HEAD request
-            // to its advertised default branch. Preserve the long-standing
-            // literal-HEAD alias for that case too; otherwise a valid default
-            // branch containing a delimiter (for example `release#one`) can
-            // be ready through its concrete path while a subsequent HEAD
-            // metadata read incorrectly reports a cold ref.
-            let should_write_head_alias = at_rev.is_none()
-                && effective_branch != "HEAD"
-                && (branch == "HEAD" || effective_branch == info.default_branch);
-            if should_write_head_alias {
-                state.ref_store.invalidate(repo_id, &effective_branch).await;
-                let head_info = match state
-                    .ref_store
-                    .load_branch(repo_id, &effective_branch)
-                    .await
-                {
-                    Ok(Some(latest)) if latest.commit == info.commit => Some(latest),
-                    _ => None,
-                };
-                if let Some(head_info) = head_info {
-                    admission_test_ref_store_write();
-                    if let Err(e) = state
-                        .ref_store
-                        .save_branch(repo_id, "HEAD", &head_info)
-                        .await
-                    {
-                        warn!(
-                            "failed to write HEAD ref alias for {}: {e}",
-                            repo_id.storage_key()
-                        );
-                    }
-                }
-            }
             if inline_full_history {
-                if let Err(e) =
-                    update_build_status(state, repo_id, &effective_branch, &info.commit, "done")
-                        .await
+                if let Err(e) = update_job_build_status(state, job, &effective_branch, "done").await
                 {
                     error!(
                         "build status update failed for {}@{effective_branch} {}: {e:#}",
@@ -8951,10 +9095,11 @@ pub async fn mark_admitted_build_failed(
     admitted_commit: &str,
     message: &str,
 ) -> Result<()> {
+    let exact_branch = ref_store_key(branch, Some(admitted_commit), Some(admitted_commit));
     let _ = update_build_status(
         state,
         repo_id,
-        branch,
+        &exact_branch,
         admitted_commit,
         &format!("failed: {message}"),
     )
@@ -9082,7 +9227,7 @@ async fn post_build_freshness_recheck(
 ) {
     let max = recheck_max();
     // Disabled, or a rev-pinned build (no moving tip to chase): nothing to do.
-    if max == 0 || job.rev.is_some() {
+    if max == 0 || job.rev.is_some() || job.recheck >= max {
         return;
     }
     let repo_id = &job.repo_id;
@@ -9099,11 +9244,6 @@ async fn post_build_freshness_recheck(
         // Wait for the test to advance the proceed counter past the value we saw
         // on entry. A closed channel means the barrier was torn down; just continue.
         let _ = proceed_rx.wait_for(|v| *v > seen).await;
-    }
-
-    // Stop once the re-check chain hits the cap; the poller picks up any remainder.
-    if job.recheck >= max {
-        return;
     }
 
     let credential = match state.broker.fetch_credential(repo_id, None) {
@@ -9220,10 +9360,10 @@ async fn handle_phase2_failure(
     }
 
     if let Some(recheck) = action.retry_recheck {
-        let size_bytes = enqueue_size_bytes(&action.state, repo_id, branch).await;
+        let size_bytes = enqueue_size_bytes(&action.state, repo_id, &action.job_branch).await;
         let job = BuildJob {
             repo_id: repo_id.clone(),
-            branch: branch.to_string(),
+            branch: action.job_branch,
             rev: None,
             admitted_commit: action.admitted_commit,
             admitted_default_branch: action.admitted_default_branch,
@@ -9472,7 +9612,11 @@ async fn update_job_build_status(
     if job.rev.is_none()
         && let Some(commit) = job.admitted_commit.as_deref()
     {
-        return update_build_status(state, &job.repo_id, branch, commit, status)
+        let exact_branch = ref_store_key(branch, Some(commit), Some(commit));
+        if status == "building" {
+            return update_current_build_status(state, &job.repo_id, &exact_branch, status).await;
+        }
+        return update_build_status(state, &job.repo_id, &exact_branch, commit, status)
             .await
             .map(|updated| updated.then(|| commit.to_string()));
     }
@@ -13494,6 +13638,7 @@ mod tests {
         match lookup {
             PinnedRefLookup::Pending {
                 moving: Some(snapshot),
+                ..
             } => {
                 assert_eq!(snapshot.commit, target);
                 assert_eq!(snapshot.full_clonepack.commit, base);
@@ -14038,7 +14183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_moving_fallback_touches_the_row_it_served() {
+    async fn pinned_exact_read_touches_exact_row_when_moving_is_compatible() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
         let ref_store = state.ref_store.clone();
@@ -14070,25 +14215,24 @@ mod tests {
 
         let moving_after = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
         assert!(
-            moving_after.last_accessed_at.unwrap() > old_ts,
-            "a complete moving row is preferred and receives the access touch"
+            moving_after.last_accessed_at == Some(old_ts),
+            "an exact read must not mutate the moving compatibility row"
         );
         let exact_after = ref_store
             .load_branch(&rid, &exact_key)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            exact_after.last_accessed_at,
-            Some(old_ts),
-            "the compatible exact row is not touched while moving A is usable"
+        assert!(
+            exact_after.last_accessed_at.unwrap() > old_ts,
+            "the exact row that served the pinned read receives the access touch"
         );
     }
 
     #[tokio::test]
     async fn pinned_pending_read_touches_no_candidate_row() {
         let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
+        let state = test_state_draining(&tmp);
         let ref_store = state.ref_store.clone();
         let rid = RepoId::github("acme/widget");
         mark_added(&state, rid.clone()).await;
