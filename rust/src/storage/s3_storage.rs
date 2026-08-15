@@ -2,7 +2,7 @@ use crate::cas::Cas;
 use crate::storage::{HashEntry, StorageBackend};
 use anyhow::{Context, Result};
 use chrono::DateTime;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use s3::{Auth, Client};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ const MULTIPART_UPLOAD_MAX_CONCURRENCY: usize = 8;
 const MULTIPART_UPLOAD_MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MULTIPART_UPLOAD_MAX_PARTS: u64 = 10_000;
 const MULTIPART_UPLOAD_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
+const MULTIPART_UPLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn multipart_upload_concurrency_for_cores(cores: usize) -> usize {
     cores
@@ -224,7 +225,7 @@ impl S3Storage {
         let part_count = len.div_ceil(part_bytes);
 
         let upload = async {
-            let parts = futures::stream::iter(0..part_count)
+            let mut completed = futures::stream::iter(0..part_count)
                 .map(|part_index| {
                     let client = self.client.clone();
                     let bucket = self.bucket.clone();
@@ -269,13 +270,12 @@ impl S3Storage {
                 // backend-wide semaphore above is the authoritative shared
                 // limit across all concurrent artifact uploads.
                 .buffer_unordered(MULTIPART_UPLOAD_MAX_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-
-            let mut completed = Vec::with_capacity(parts.len());
-            for part in parts {
-                completed.push(part?);
-            }
+                // Stop scheduling parts as soon as one upload exhausts its
+                // retry budget. The outer error path aborts the multipart
+                // upload instead of needlessly sending the rest of a large
+                // object first.
+                .try_collect::<Vec<_>>()
+                .await?;
             completed.sort_by_key(|(part_number, _)| *part_number);
             let mut request =
                 self.client
@@ -295,16 +295,22 @@ impl S3Storage {
         .await;
 
         if let Err(error) = upload {
-            let abort = self
-                .client
-                .objects()
-                .abort_multipart_upload(&self.bucket, key, &upload_id)
-                .send()
-                .await;
-            if let Err(abort_error) = abort {
-                tracing::warn!(
+            match tokio::time::timeout(
+                MULTIPART_UPLOAD_CLEANUP_TIMEOUT,
+                self.client
+                    .objects()
+                    .abort_multipart_upload(&self.bucket, key, &upload_id)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(abort_error)) => tracing::warn!(
                     "failed to abort S3 multipart upload {key} ({upload_id}): {abort_error}"
-                );
+                ),
+                Err(_) => {
+                    tracing::warn!("timed out aborting S3 multipart upload {key} ({upload_id})")
+                }
             }
             return Err(error);
         }

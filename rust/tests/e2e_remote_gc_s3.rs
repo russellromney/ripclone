@@ -24,6 +24,7 @@ use ripclone::remote_gc::{GcConfig, RemoteGc};
 use ripclone::server::{AdmissionTestProbe, ServerState, build_app, run_server};
 use ripclone::storage::{S3Storage, StorageBackend};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -152,6 +153,58 @@ fn required_ripclone_bin() -> std::path::PathBuf {
         "selected ripclone reports version"
     );
     binary
+}
+
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn multipart_large_file_completes_and_round_trips_on_s3() {
+    let _server_lock = SERVER_LOCK.lock().await;
+    let env = match s3_env() {
+        Some(env) => env,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let prefix = unique_prefix();
+    let mut cleanup = CleanupGuard::new(env.clone(), prefix.clone());
+    let storage = make_s3_storage(&env, &prefix).expect("storage");
+    let mut source = tempfile::NamedTempFile::new().expect("create multipart fixture");
+    let block: Vec<u8> = (0..1024 * 1024)
+        .map(|index| ((index * 31 + index / 251) % 251) as u8)
+        .collect();
+
+    // Use the production threshold and part size: 129 MiB must upload as two
+    // real parts (128 MiB + 1 MiB) before the completed object is downloaded.
+    const PRODUCTION_PART_BYTES: u64 = 128 * 1024 * 1024;
+    const PRODUCTION_TWO_PART_LEN: u64 = PRODUCTION_PART_BYTES + 1024 * 1024;
+    for _ in 0..129 {
+        source.write_all(&block).expect("write multipart fixture");
+    }
+    source.flush().expect("flush multipart fixture");
+    let (hash, len) = ripclone::cas::hash_file(source.path()).expect("hash multipart fixture");
+    assert_eq!(len, PRODUCTION_TWO_PART_LEN);
+
+    storage
+        .put_file_async(&hash, source.path())
+        .await
+        .expect("multipart upload");
+
+    let get_storage = Arc::clone(&storage);
+    let get_hash = hash.clone();
+    let downloaded = tokio::task::spawn_blocking(move || get_storage.get(&get_hash))
+        .await
+        .expect("join production S3 download")
+        .expect("download completed multipart object through production storage");
+    assert_eq!(downloaded.len() as u64, len);
+    assert_eq!(ripclone::cas::hash(&downloaded), hash);
+    assert_eq!(hex::encode(Sha256::digest(&downloaded)), hash);
+
+    tokio::time::timeout(Duration::from_secs(30), cleanup_prefix(&env, &prefix))
+        .await
+        .expect("multipart cleanup timed out")
+        .expect("cleanup multipart fixture");
+    cleanup.disable();
 }
 
 async fn wait_child_output(child: std::process::Child) -> std::process::Output {
