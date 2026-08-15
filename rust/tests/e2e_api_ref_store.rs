@@ -131,7 +131,7 @@ async fn wait_dead_lettered(queue: &SqlJobQueue, id: i64, timeout: Duration) -> 
 }
 
 /// Worker with api metadata + report URL + job token, no DB creds: build lands
-/// the ref in the server's sqlite via POST /v1/refs.
+/// the authoritative exact ref in the server's sqlite via POST /v1/refs.
 #[tokio::test]
 async fn api_worker_reports_ref_without_db_creds() {
     let _guard = SERIAL.lock().await;
@@ -162,12 +162,15 @@ async fn api_worker_reports_ref_without_db_creds() {
     // worker's ApiRefStore → POST /v1/refs → server's SqlRefStore.
     let store = open_meta_store(&meta_url).await;
     let rid = RepoId::github("acme/api-ref");
+    let exact_key = format!("main#{commit}");
     let stored = store
-        .load_branch(&rid, "main")
+        .load_branch(&rid, &exact_key)
         .await
         .expect("load")
-        .expect("ref must be in sqlite after api report");
+        .expect("exact ref must be in sqlite after api report");
     assert_eq!(stored.commit, commit);
+    assert!(stored.internal_exact_result);
+    assert!(!stored.full_clonepack.manifest.is_empty());
 }
 
 /// Wrong token → endpoint 401, and no row in the metadata DB.
