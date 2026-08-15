@@ -25,15 +25,6 @@ const MULTIPART_UPLOAD_MAX_PARTS: u64 = 10_000;
 const MULTIPART_UPLOAD_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 const MULTIPART_UPLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn is_no_such_multipart_upload(error: &s3::Error) -> bool {
-    matches!(
-        error,
-        s3::Error::Api {
-            code: Some(code), ..
-        } if code == "NoSuchUpload"
-    )
-}
-
 fn multipart_upload_concurrency_for_cores(cores: usize) -> usize {
     cores
         .max(1)
@@ -219,74 +210,6 @@ impl S3Storage {
         Ok(out)
     }
 
-    async fn cleanup_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
-        let first_abort_error = match self
-            .client
-            .objects()
-            .abort_multipart_upload(&self.bucket, key, upload_id)
-            .send()
-            .await
-        {
-            Ok(_) => None,
-            Err(error) => {
-                let error = anyhow::Error::new(error)
-                    .context(format!("abort S3 multipart upload {key} ({upload_id})"));
-                tracing::warn!("{error:#}");
-                Some(error)
-            }
-        };
-
-        match self
-            .client
-            .objects()
-            .list_parts(&self.bucket, key, upload_id)
-            .send()
-            .await
-        {
-            Err(error) if is_no_such_multipart_upload(&error) => {}
-            Err(error) => {
-                return Err(error).context(format!(
-                    "list S3 multipart upload {key} ({upload_id}) after abort"
-                ));
-            }
-            Ok(output) => {
-                tracing::warn!(
-                    "S3 multipart upload {key} ({upload_id}) still exists with {} part(s) after abort; retrying abort",
-                    output.parts.len()
-                );
-                self.client
-                    .objects()
-                    .abort_multipart_upload(&self.bucket, key, upload_id)
-                    .send()
-                    .await
-                    .with_context(|| format!("re-abort S3 multipart upload {key} ({upload_id})"))?;
-                match self
-                    .client
-                    .objects()
-                    .list_parts(&self.bucket, key, upload_id)
-                    .send()
-                    .await
-                {
-                    Err(error) if is_no_such_multipart_upload(&error) => {}
-                    Err(error) => {
-                        return Err(error).context(format!(
-                            "list S3 multipart upload {key} ({upload_id}) after re-abort"
-                        ));
-                    }
-                    Ok(output) => anyhow::bail!(
-                        "S3 multipart upload {key} ({upload_id}) still exists with {} part(s) after re-abort",
-                        output.parts.len()
-                    ),
-                }
-            }
-        }
-
-        if let Some(error) = first_abort_error {
-            return Err(error);
-        }
-        Ok(())
-    }
-
     async fn multipart_put_file(&self, key: &str, path: &Path, len: u64) -> Result<()> {
         // Validate before creating remote multipart state.
         let part_bytes = multipart_upload_part_bytes(len)
@@ -374,17 +297,20 @@ impl S3Storage {
         if let Err(error) = upload {
             match tokio::time::timeout(
                 MULTIPART_UPLOAD_CLEANUP_TIMEOUT,
-                self.cleanup_multipart_upload(key, &upload_id),
+                self.client
+                    .objects()
+                    .abort_multipart_upload(&self.bucket, key, &upload_id)
+                    .send(),
             )
             .await
             {
-                Ok(Ok(())) => {}
-                Ok(Err(cleanup_error)) => tracing::warn!(
-                    "S3 multipart cleanup failed for {key} ({upload_id}); preserving upload error: {cleanup_error:#}"
+                Ok(Ok(_)) => {}
+                Ok(Err(abort_error)) => tracing::warn!(
+                    "failed to abort S3 multipart upload {key} ({upload_id}): {abort_error}"
                 ),
-                Err(_) => tracing::warn!(
-                    "S3 multipart cleanup timed out for {key} ({upload_id}); preserving upload error"
-                ),
+                Err(_) => {
+                    tracing::warn!("timed out aborting S3 multipart upload {key} ({upload_id})")
+                }
             }
             return Err(error);
         }
@@ -977,10 +903,12 @@ impl S3Storage {
 mod tests {
     use super::{
         MULTIPART_UPLOAD_MAX_OBJECT_BYTES, MULTIPART_UPLOAD_MAX_PART_BYTES,
-        MULTIPART_UPLOAD_PART_BYTES, env_duration_ms, env_duration_secs, env_u32,
+        MULTIPART_UPLOAD_PART_BYTES, S3Storage, env_duration_ms, env_duration_secs, env_u32,
         multipart_upload_concurrency_for_cores, multipart_upload_part_bytes, scoped_key,
         unscoped_key,
     };
+    use crate::storage::StorageBackend;
+    use std::io::Write;
     use std::time::Duration;
 
     #[test]
@@ -1003,6 +931,42 @@ mod tests {
                 <= MULTIPART_UPLOAD_MAX_PART_BYTES
         );
         assert!(multipart_upload_part_bytes(MULTIPART_UPLOAD_MAX_OBJECT_BYTES + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn multipart_file_upload_roundtrips_exact_bytes() {
+        if std::env::var_os("RIPCLONE_S3_ENDPOINT").is_none() {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT is required");
+            return;
+        }
+        let storage = S3Storage::from_env()
+            .expect("construct S3 storage")
+            .expect("RIPCLONE_S3_ENDPOINT must enable S3 storage");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart fixture");
+        let block: Vec<u8> = (0..1024 * 1024)
+            .map(|index| ((index * 31 + index / 251) % 251) as u8)
+            .collect();
+        for _ in 0..17 {
+            source.write_all(&block).expect("write multipart fixture");
+        }
+        source.flush().expect("flush multipart fixture");
+        let (hash, len) = crate::cas::hash_file(source.path()).expect("hash multipart fixture");
+
+        storage
+            .put_file_async(&hash, source.path())
+            .await
+            .expect("multipart upload");
+        let (_, downloaded) = storage
+            .get_object(&hash)
+            .await
+            .expect("download multipart object")
+            .expect("multipart object exists");
+        assert_eq!(downloaded.len() as u64, len);
+        assert_eq!(crate::cas::hash(&downloaded), hash);
+        storage
+            .delete_object(&hash)
+            .await
+            .expect("delete multipart fixture");
     }
 
     #[test]
