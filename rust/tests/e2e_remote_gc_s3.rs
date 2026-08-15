@@ -24,6 +24,7 @@ use ripclone::remote_gc::{GcConfig, RemoteGc};
 use ripclone::server::{AdmissionTestProbe, ServerState, build_app, run_server};
 use ripclone::storage::{S3Storage, StorageBackend};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -154,6 +155,86 @@ fn required_ripclone_bin() -> std::path::PathBuf {
     binary
 }
 
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn multipart_large_file_completes_and_failed_upload_aborts_on_s3() {
+    let env = match s3_env() {
+        Some(env) => env,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let prefix = unique_prefix();
+    let storage = make_s3_storage(&env, &prefix).expect("storage");
+    let mut source = tempfile::NamedTempFile::new().expect("create multipart fixture");
+    let block: Vec<u8> = (0..1024 * 1024)
+        .map(|index| ((index * 31 + index / 251) % 251) as u8)
+        .collect();
+
+    // Production starts multipart uploads at 100 MiB with 128 MiB parts. Use
+    // 129 MiB so this exercises at least two real UploadPart requests rather
+    // than a one-part multipart completion.
+    for _ in 0..129 {
+        source.write_all(&block).expect("write multipart fixture");
+    }
+    source.flush().expect("flush multipart fixture");
+    let (hash, len) = ripclone::cas::hash_file(source.path()).expect("hash multipart fixture");
+
+    storage
+        .put_file_async(&hash, source.path())
+        .await
+        .expect("multipart upload");
+    let (_, downloaded) = storage
+        .get_object(&hash)
+        .await
+        .expect("download multipart object")
+        .expect("multipart object exists");
+    assert_eq!(downloaded.len() as u64, len);
+    assert_eq!(ripclone::cas::hash(&downloaded), hash);
+
+    cleanup_prefix(&env, &prefix)
+        .await
+        .expect("cleanup multipart fixture");
+
+    let failed_prefix = unique_prefix();
+    let proxy = start_multipart_failure_proxy(&env.endpoint).await;
+    let cache_dir = tempfile::tempdir().expect("create failed-upload cache");
+    let failed_storage = S3Storage::new(
+        &proxy.url,
+        &env.region,
+        &env.bucket,
+        Some(&failed_prefix),
+        s3::Auth::from_env().expect("S3 auth for failed multipart upload"),
+        Some(cache_dir.path()),
+    )
+    .expect("failed-upload storage");
+    let error = failed_storage
+        .put_file_async(&hash, source.path())
+        .await
+        .expect_err("injected UploadPart failure must fail the object upload");
+    assert!(
+        error.to_string().contains("multipart part"),
+        "failure should identify the multipart part: {error:#}"
+    );
+    assert!(proxy.failed_parts() >= 1, "proxy must reject an UploadPart");
+    assert_eq!(
+        proxy.aborts(),
+        1,
+        "failed multipart upload must issue exactly one abort"
+    );
+    assert!(
+        ripclone::cas::Cas::new(cache_dir.path())
+            .expect("open failed-upload cache")
+            .get(&hash)
+            .is_err(),
+        "local cache must not publish an object whose remote upload failed"
+    );
+    cleanup_prefix(&env, &failed_prefix)
+        .await
+        .expect("cleanup failed multipart fixture");
+}
+
 async fn wait_child_output(child: std::process::Child) -> std::process::Output {
     wait_child_output_bounded(child, Duration::from_secs(60))
         .await
@@ -207,6 +288,116 @@ fn target_host_port(endpoint: &str) -> String {
         .port_or_known_default()
         .expect("endpoint port or known scheme default");
     format!("{host}:{port}")
+}
+
+pub struct MultipartFailureProxy {
+    pub url: String,
+    failed_parts: Arc<AtomicU64>,
+    aborts: Arc<AtomicU64>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl MultipartFailureProxy {
+    fn failed_parts(&self) -> u64 {
+        self.failed_parts.load(Ordering::SeqCst)
+    }
+
+    fn aborts(&self) -> u64 {
+        self.aborts.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for MultipartFailureProxy {
+    fn drop(&mut self) {
+        self._handle.abort();
+    }
+}
+
+fn multipart_request_kind(header: &[u8]) -> Option<&'static str> {
+    let line = std::str::from_utf8(header).ok()?.lines().next()?;
+    let mut fields = line.split_whitespace();
+    let method = fields.next()?;
+    let target = fields.next()?;
+    if !target.contains("uploadId=") {
+        return None;
+    }
+    if method == "PUT" && target.contains("partNumber=") {
+        return Some("part");
+    }
+    if method == "DELETE" {
+        return Some("abort");
+    }
+    None
+}
+
+async fn proxy_one_multipart_connection(
+    mut client: tokio::net::TcpStream,
+    target: String,
+    failed_parts: Arc<AtomicU64>,
+    aborts: Arc<AtomicU64>,
+) {
+    let Some(mut header) = read_request_header(&mut client).await else {
+        return;
+    };
+    if multipart_request_kind(&header) == Some("part") {
+        failed_parts.fetch_add(1, Ordering::SeqCst);
+        let body = b"<Error><Code>InvalidRequest</Code><Message>injected multipart failure</Message></Error>";
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = client.write_all(response.as_bytes()).await;
+        let _ = client.write_all(body).await;
+        return;
+    }
+    if multipart_request_kind(&header) == Some("abort") {
+        aborts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    let Ok(mut backend) = tokio::net::TcpStream::connect(&target).await else {
+        return;
+    };
+    // Inspect one request per client connection. Closing the backend response
+    // makes the pooled S3 client reconnect, so every UploadPart and Abort call
+    // passes through the fault selector above.
+    force_connection_close(&mut header);
+    if backend.write_all(&header).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+}
+
+async fn start_multipart_failure_proxy(target_endpoint: &str) -> MultipartFailureProxy {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind multipart failure proxy");
+    let port = listener.local_addr().expect("proxy local addr").port();
+    let target = target_host_port(target_endpoint);
+    let failed_parts = Arc::new(AtomicU64::new(0));
+    let aborts = Arc::new(AtomicU64::new(0));
+    let task_failed_parts = Arc::clone(&failed_parts);
+    let task_aborts = Arc::clone(&aborts);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                continue;
+            };
+            let target = target.clone();
+            let failed_parts = Arc::clone(&task_failed_parts);
+            let aborts = Arc::clone(&task_aborts);
+            tokio::spawn(async move {
+                proxy_one_multipart_connection(client, target, failed_parts, aborts).await;
+            });
+        }
+    });
+
+    MultipartFailureProxy {
+        url: format!("http://127.0.0.1:{port}"),
+        failed_parts,
+        aborts,
+        _handle: handle,
+    }
 }
 
 /// True when the request bytes look like a presigned S3 GET/HEAD.

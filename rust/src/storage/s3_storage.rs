@@ -2,7 +2,7 @@ use crate::cas::Cas;
 use crate::storage::{HashEntry, StorageBackend};
 use anyhow::{Context, Result};
 use chrono::DateTime;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use s3::{Auth, Client};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -224,7 +224,7 @@ impl S3Storage {
         let part_count = len.div_ceil(part_bytes);
 
         let upload = async {
-            let parts = futures::stream::iter(0..part_count)
+            let mut completed = futures::stream::iter(0..part_count)
                 .map(|part_index| {
                     let client = self.client.clone();
                     let bucket = self.bucket.clone();
@@ -269,13 +269,12 @@ impl S3Storage {
                 // backend-wide semaphore above is the authoritative shared
                 // limit across all concurrent artifact uploads.
                 .buffer_unordered(MULTIPART_UPLOAD_MAX_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-
-            let mut completed = Vec::with_capacity(parts.len());
-            for part in parts {
-                completed.push(part?);
-            }
+                // Stop scheduling parts as soon as one upload exhausts its
+                // retry budget. The outer error path aborts the multipart
+                // upload instead of needlessly sending the rest of a large
+                // object first.
+                .try_collect::<Vec<_>>()
+                .await?;
             completed.sort_by_key(|(part_number, _)| *part_number);
             let mut request =
                 self.client
@@ -897,12 +896,10 @@ impl S3Storage {
 mod tests {
     use super::{
         MULTIPART_UPLOAD_MAX_OBJECT_BYTES, MULTIPART_UPLOAD_MAX_PART_BYTES,
-        MULTIPART_UPLOAD_PART_BYTES, S3Storage, env_duration_ms, env_duration_secs, env_u32,
+        MULTIPART_UPLOAD_PART_BYTES, env_duration_ms, env_duration_secs, env_u32,
         multipart_upload_concurrency_for_cores, multipart_upload_part_bytes, scoped_key,
         unscoped_key,
     };
-    use crate::storage::StorageBackend;
-    use std::io::Write;
     use std::time::Duration;
 
     #[test]
@@ -925,42 +922,6 @@ mod tests {
                 <= MULTIPART_UPLOAD_MAX_PART_BYTES
         );
         assert!(multipart_upload_part_bytes(MULTIPART_UPLOAD_MAX_OBJECT_BYTES + 1).is_err());
-    }
-
-    #[tokio::test]
-    async fn multipart_file_upload_roundtrips_exact_bytes() {
-        if std::env::var_os("RIPCLONE_S3_ENDPOINT").is_none() {
-            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT is required");
-            return;
-        }
-        let storage = S3Storage::from_env()
-            .expect("construct S3 storage")
-            .expect("RIPCLONE_S3_ENDPOINT must enable S3 storage");
-        let mut source = tempfile::NamedTempFile::new().expect("create multipart fixture");
-        let block: Vec<u8> = (0..1024 * 1024)
-            .map(|index| ((index * 31 + index / 251) % 251) as u8)
-            .collect();
-        for _ in 0..17 {
-            source.write_all(&block).expect("write multipart fixture");
-        }
-        source.flush().expect("flush multipart fixture");
-        let (hash, len) = crate::cas::hash_file(source.path()).expect("hash multipart fixture");
-
-        storage
-            .put_file_async(&hash, source.path())
-            .await
-            .expect("multipart upload");
-        let (_, downloaded) = storage
-            .get_object(&hash)
-            .await
-            .expect("download multipart object")
-            .expect("multipart object exists");
-        assert_eq!(downloaded.len() as u64, len);
-        assert_eq!(crate::cas::hash(&downloaded), hash);
-        storage
-            .delete_object(&hash)
-            .await
-            .expect("delete multipart fixture");
     }
 
     #[test]
