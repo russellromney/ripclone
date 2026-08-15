@@ -213,3 +213,6 @@ Most scripts read:
 - `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — extraction parallelism.
 - `RIPCLONE_BLOB_PACK_THREADS` — threads for local pack building in full editable mode.
 - `RIPCLONE_ORIGIN_BASE` — for local/offline runs, set to a `file://` base directory that contains `<owner>/<repo>.git` bare mirrors. The built-in GitHub provider will fetch from these local origins instead of github.com.
+- `BENCH_SOURCE_URL` — optional clone URL for the benchmark's native-Git and
+  exact-tree correctness controls. It defaults to the tested repository on
+  GitHub; local/offline fixtures can point it at their bare origin.

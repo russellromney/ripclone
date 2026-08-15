@@ -54,6 +54,7 @@ RIPCLONE="${RIPCLONE:-ripclone}"
 PROVIDER="${RIPCLONE_BENCH_PROVIDER:-github}"
 
 REPO_NAME="$(basename "$REPO")"
+SOURCE_URL="${BENCH_SOURCE_URL:-https://github.com/$REPO.git}"
 REF_STATE_DIR="$TARGET/shaped_logs/${REPO_NAME}"
 LOG_DIR="$REF_STATE_DIR/${RATE_MBPS}Mbps"
 mkdir -p "$LOG_DIR"
@@ -217,14 +218,6 @@ ensure_repo_added() {
       503)
         echo "  add attempt $attempt: HTTP 503, retrying ..." >&2
         sleep 2 ;;
-      404|405)
-        body="$(cat "$tmp")"
-        if printf '%s' "$body" | grep -q 'unknown provider'; then
-          echo "error: unknown provider '$PROVIDER' for $REPO" >&2
-          rm -f "$tmp"; return 1
-        fi
-        echo "  server has no /add route (pre-added-repos build); continuing" >&2
-        REPO_ADDED=1; rm -f "$tmp"; return 0 ;;
       000)
         echo "  add attempt $attempt: no response from $SERVER_URL, retrying ..." >&2
         sleep 2 ;;
@@ -286,10 +279,10 @@ wait_for_artifacts() {
   done
 }
 
-# Poll /refs/HEAD until the server reports a non-empty full_pack for the current
-# tip. This is only used for legacy/pre-added-repos servers. Current servers
-# pass the exact commit admitted by /add and use the pinned branch below, which
-# cannot drift while the upstream branch moves.
+# Poll the selected source ref until the current server reports the requested
+# clonepack manifest. Normal admission passes the exact commit from /add and
+# uses the pinned branch below, which cannot drift while upstream moves; this
+# unpinned path remains for an explicitly requested BENCH_REF branch or tag.
 wait_for_ref_ready() {
   local branch="${1:-HEAD}"
   local timeout="${2:-1200}"
@@ -332,12 +325,9 @@ wait_for_ref_ready() {
         out="$(head_ref_json "$branch" || true)"
       fi
       commit="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))' 2>/dev/null || true)"
-      # A full editable clone is ready when the server advertises full-history
-      # artifacts for the tip. Field names have drifted across server versions,
-      # so accept any of them: full_pack (legacy single pack), pack_chunk_urls /
-      # idx_bundle_url (older LSM full history), or clonepack_manifest with
-      # archive_ready (current). Empty strings count as absent.
-      ready="$(printf '%s' "$out" | READY_CLONEPACK="$READY_CLONEPACK" python3 -c 'import os,sys,json; d=json.load(sys.stdin); mode=os.environ["READY_CLONEPACK"]; print("1" if (d.get("clonepack_manifest") and (mode == "shallow" or d.get("archive_ready"))) or (mode == "full" and (d.get("full_pack") or d.get("pack_chunk_urls") or d.get("idx_bundle_url"))) else "")' 2>/dev/null || true)"
+      # A full editable clone is ready only when the current metadata contract
+      # advertises its clonepack manifest and full-history archive.
+      ready="$(printf '%s' "$out" | READY_CLONEPACK="$READY_CLONEPACK" python3 -c 'import os,sys,json; d=json.load(sys.stdin); mode=os.environ["READY_CLONEPACK"]; print("1" if d.get("clonepack_manifest") and (mode == "shallow" or d.get("archive_ready")) else "")' 2>/dev/null || true)"
       if [ -n "$commit" ] && [ -n "$ready" ]; then
         echo "  artifacts ready for $commit" >&2
         echo "$commit"
@@ -603,9 +593,9 @@ github_files() {
 prepare_expected_tree() {
   EXPECTED_DIR="$(mktemp -d "$TARGET/ripclone-benchmark-expected.XXXXXX")"
   if [ "$CLONE_REF" != "HEAD" ]; then
-    git clone --quiet --depth 1 --branch "$CLONE_REF" "https://github.com/$REPO.git" "$EXPECTED_DIR"
+    git clone --quiet --depth 1 --branch "$CLONE_REF" "$SOURCE_URL" "$EXPECTED_DIR"
   else
-    git clone --quiet --depth 1 "https://github.com/$REPO.git" "$EXPECTED_DIR"
+    git clone --quiet --depth 1 "$SOURCE_URL" "$EXPECTED_DIR"
   fi
   if [ "$(git -C "$EXPECTED_DIR" rev-parse HEAD)" != "$REF" ]; then
     git -C "$EXPECTED_DIR" fetch --quiet --depth 1 origin "$REF"
@@ -625,29 +615,29 @@ prepare_expected_tree() {
 
 git_depth1(){
   if [ -n "${GIT_REF:-}" ]; then
-    git clone --branch "$GIT_REF" --depth 1 "https://github.com/$REPO.git" "$1"
+    git clone --branch "$GIT_REF" --depth 1 "$SOURCE_URL" "$1"
   elif [ -n "${REF:-}" ]; then
     # Fetch the same immutable commit that admission selected. A branch clone
     # can move during a long sample and would then compare different trees.
     git init --quiet "$1"
-    git -C "$1" remote add origin "https://github.com/$REPO.git"
+    git -C "$1" remote add origin "$SOURCE_URL"
     git -C "$1" fetch --quiet --depth 1 origin "$REF"
     git -C "$1" checkout --quiet --detach FETCH_HEAD
   else
-    git clone --branch "$CLONE_REF" --depth 1 "https://github.com/$REPO.git" "$1"
+    git clone --branch "$CLONE_REF" --depth 1 "$SOURCE_URL" "$1"
   fi
 }
 git_full() {
   if [ -n "${GIT_REF:-}" ]; then
-    git clone --branch "$GIT_REF" "https://github.com/$REPO.git" "$1"
+    git clone --branch "$GIT_REF" "$SOURCE_URL" "$1"
   elif [ -n "${REF:-}" ]; then
-    git clone --no-checkout "https://github.com/$REPO.git" "$1"
+    git clone --no-checkout "$SOURCE_URL" "$1"
     if ! git -C "$1" cat-file -e "$REF^{commit}" 2>/dev/null; then
       git -C "$1" fetch --quiet origin "$REF"
     fi
     git -C "$1" checkout --quiet --detach "$REF"
   else
-    git clone --branch "$CLONE_REF" "https://github.com/$REPO.git" "$1"
+    git clone --branch "$CLONE_REF" "$SOURCE_URL" "$1"
   fi
 }
 
