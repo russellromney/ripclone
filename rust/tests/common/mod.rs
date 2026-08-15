@@ -209,8 +209,9 @@ impl PhaseOnePublishBarrier {
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn after_save(&self, info: &ripclone::RefInfo) {
+    async fn after_save(&self, branch: &str, info: &ripclone::RefInfo) {
         if !self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            || branch.contains('#')
             || info.build_status.as_deref() != Some("full history building")
             || self
                 .consumed
@@ -362,7 +363,7 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
     ) -> anyhow::Result<()> {
         self.inner.save_branch(repo_id, branch, info).await?;
         if let Some(barrier) = &self.phase_one_barrier {
-            barrier.after_save(info).await;
+            barrier.after_save(branch, info).await;
         }
         Ok(())
     }

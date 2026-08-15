@@ -221,7 +221,7 @@ async fn token_only_worker_claims_builds_acks_over_api() {
 /// and a moving branch, while the real worker owns no database/provider secret
 /// and can obtain the exact source identity only from its authenticated claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn api_worker_preserves_first_credential_and_exact_commit_after_tip_moves() {
+async fn api_worker_publishes_exact_result_without_db_secret() {
     let _guard = SERIAL.lock().await;
     let (_q, _m, queue_url, meta_url) = setup_sqlite_queue_and_meta();
 
@@ -394,8 +394,16 @@ async fn api_worker_preserves_first_credential_and_exact_commit_after_tip_moves(
         .await
         .expect("list API-worker publication refs");
     assert!(
-        branches.iter().all(|branch| !branch.contains('#')),
-        "ordinary API-worker jobs must not create exact-ref aliases: {branches:?}"
+        branches.iter().any(|branch| branch == &format!("main#{b}")),
+        "API worker keeps exact B addressable: {branches:?}"
+    );
+    assert!(
+        branches.iter().any(|branch| branch == &format!("main#{c}")),
+        "API worker keeps exact C addressable: {branches:?}"
+    );
+    assert!(
+        branches.iter().all(|branch| !branch.starts_with("HEAD#")),
+        "ordinary API-worker jobs do not create HEAD exact aliases: {branches:?}"
     );
     assert!(
         server.cas_path(&full_b_manifest).exists(),
