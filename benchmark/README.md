@@ -37,10 +37,19 @@ This directory contains standalone benchmarks and verification scripts. They ass
 - **`fly_shaped_benchmark.sh`** — single-rate helper used by `run_shaped_sweep.sh`.
   It adds the repository and waits for the requested artifacts before starting
   any clone timer. Set `BENCH_MODES` to a space-separated subset of `full`,
-  `depth1`, `files`, `git-full`, and `git-depth1`. For a shallow-only run, set
+  `depth1`, `files`, `git-full`, `git-depth1`, and `github-files` (GitHub's
+  extracted source archive). For a shallow-only run, set
   `RIPCLONE_BENCH_READY_CLONEPACK=shallow` so readiness does not wait for the
-  background full-history build. Every editable result is checked against the
-  one resolved commit and must have a clean worktree.
+  background full-history build. The harness reports p50 and nearest-rank p90.
+  Every files/archive result is checked outside the timer against a precomputed
+  exact-tree digest. Every editable result must point at the admitted commit,
+  be clean, and have the requested history depth; its first sample per mode
+  also checks the exact-tree digest and Git connectivity. Set
+  `VERIFY_EVERY_RUN=1` to repeat those expensive deep editable checks on every
+  sample. `RIPCLONE_RUNS` and `NATIVE_RUNS` can override the positional run
+  count independently when a large native control would otherwise dominate a
+  sweep. `SKIP_ADD=1` is
+  available only for a fixture that was explicitly added beforehand.
 - **`sync_latency.sh`** — B4 sync-latency and storage-amplification harness.
   By default it starts a local release server; set `RIPCLONE_URL` for the Fly
   server and `CLIENT_APP=ripclone-client-dev` to run `/sync` POSTs and
@@ -151,8 +160,14 @@ Most scripts read:
 - `CLIENT_APP` — optional Fly client app used by `sync_latency.sh` for
   Fly-to-Fly `/sync` POSTs and readiness probes.
 - `BENCH_REF` — tag/commit/branch to sync and benchmark (default: repo default branch).
-- `GIT_REF` — branch/tag that the native `git clone` baseline should check out, used when `BENCH_REF` is a commit SHA.
-- `BENCH_MODES` — space-separated benchmark modes to run (default: all five).
+- `GIT_REF` — optional stable branch/tag for the native Git baseline. Without
+  it, a SHA-valued `BENCH_REF` is fetched directly so branch movement cannot
+  change the measured tree.
+- `BENCH_MODES` — space-separated benchmark modes to run (default: the five
+  editable-clone modes; add `github-files` for the source-archive control).
+- `SKIP_ADD` — set to `1` only when the repository was explicitly admitted
+  before this invocation; admission is otherwise always performed outside the
+  clone timer.
 - `RIPCLONE_BENCH_READY_CLONEPACK` — `full` (default) or `shallow`; controls
   the pre-timing readiness gate.
 - `SHAPED` — set to `0` to disable traffic shaping.
