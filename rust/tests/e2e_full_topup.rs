@@ -200,7 +200,6 @@ struct MinioAuditProxy {
 struct CloneIdProxy {
     url: String,
     authenticated_pinned_requests: Arc<std::sync::atomic::AtomicUsize>,
-    requests: Arc<std::sync::atomic::AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -215,8 +214,6 @@ struct CloneIdProxyState {
     upstream: String,
     pending_sequence: Arc<std::sync::atomic::AtomicUsize>,
     authenticated_pinned_requests: Arc<std::sync::atomic::AtomicUsize>,
-    force_old_pending: Arc<std::sync::atomic::AtomicUsize>,
-    requests: Arc<std::sync::atomic::AtomicUsize>,
     pinned_pause: Option<Arc<PinnedRequestPause>>,
 }
 
@@ -230,9 +227,6 @@ async fn clone_id_proxy(
     State(state): State<CloneIdProxyState>,
     request: Request<Body>,
 ) -> Response<Body> {
-    state
-        .requests
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let path_query = request
         .uri()
         .path_and_query()
@@ -284,37 +278,12 @@ async fn clone_id_proxy(
         .send()
         .await
         .expect("forward clone-ID proxy request");
-    let mut status = upstream.status();
+    let status = upstream.status();
     let headers = upstream.headers().clone();
-    let mut bytes = upstream
+    let bytes = upstream
         .bytes()
         .await
         .expect("read clone-ID proxy response");
-    let mut content_location = None;
-    if status == StatusCode::OK
-        && state
-            .force_old_pending
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
-    {
-        let ready: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("ready response for old-server proxy");
-        let commit = ready["commit"].as_str().expect("ready commit");
-        content_location = ready["branch"].as_str().map(str::to_string);
-        status = StatusCode::ACCEPTED;
-        bytes = serde_json::to_vec(&serde_json::json!({
-            "code": "artifact_pending",
-            "commit": commit,
-            "status": "building",
-            "queue_depth": 1
-        }))
-        .expect("encode old-server pending")
-        .into();
-    }
     let mut output = Response::builder().status(status);
     for (name, value) in &headers {
         if name != axum::http::header::CONTENT_LENGTH
@@ -331,22 +300,11 @@ async fn clone_id_proxy(
             + 1;
         output = output.header("x-ripclone-clone-id", format!("pending-clone-{sequence}"));
     }
-    if let Some(branch) = content_location {
-        output = output.header(
-            axum::http::header::CONTENT_LOCATION,
-            urlencoding::encode(&branch).into_owned(),
-        );
-    }
     output.body(Body::from(bytes)).expect("clone-ID response")
-}
-
-async fn start_clone_id_proxy(upstream: &str, force_old_pending: usize) -> CloneIdProxy {
-    start_clone_id_proxy_inner(upstream, force_old_pending, None).await
 }
 
 async fn start_clone_id_proxy_inner(
     upstream: &str,
-    force_old_pending: usize,
     pinned_pause: Option<Arc<PinnedRequestPause>>,
 ) -> CloneIdProxy {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -357,13 +315,10 @@ async fn start_clone_id_proxy_inner(
         listener.local_addr().expect("clone-ID proxy address")
     );
     let authenticated_pinned_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let state = CloneIdProxyState {
         upstream: upstream.trim_end_matches('/').to_string(),
         pending_sequence: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         authenticated_pinned_requests: Arc::clone(&authenticated_pinned_requests),
-        force_old_pending: Arc::new(std::sync::atomic::AtomicUsize::new(force_old_pending)),
-        requests: Arc::clone(&requests),
         pinned_pause,
     };
     let task = tokio::spawn(async move {
@@ -379,14 +334,12 @@ async fn start_clone_id_proxy_inner(
     CloneIdProxy {
         url,
         authenticated_pinned_requests,
-        requests,
         task,
     }
 }
 
 async fn start_clone_id_proxy_with_pinned_pause(
     upstream: &str,
-    force_old_pending: usize,
     pause_at: usize,
 ) -> (
     CloneIdProxy,
@@ -401,7 +354,7 @@ async fn start_clone_id_proxy_with_pinned_pause(
         proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
     });
     (
-        start_clone_id_proxy_inner(upstream, force_old_pending, Some(pause)).await,
+        start_clone_id_proxy_inner(upstream, Some(pause)).await,
         entered_rx,
         proceed_tx,
     )
@@ -1565,61 +1518,6 @@ async fn server_named_decoy_is_ignored_for_local_provider_exact_fetch() {
 }
 
 #[tokio::test]
-async fn old_server_pending_shape_keeps_bounded_exact_polling_compatible() {
-    let _guard = env_lock().lock().await;
-    init(false);
-    let server = start_server_split_storage().await;
-    let origin = make_origin("acme", "full-topup-old-server");
-    let a = origin.commit(&[("value.txt", "A\n")], "A");
-    origin.publish();
-    register_added_without_build(&server, "acme/full-topup-old-server")
-        .await
-        .expect("register old-server repo");
-    server
-        .client()
-        .sync_repo("acme/full-topup-old-server", None)
-        .await
-        .expect("publish old-server A");
-    let ready = server
-        .client()
-        .resolve_ref_with_clonepack("acme/full-topup-old-server", "main", Some("full"), None)
-        .await
-        .expect("wait for old-server Full(A)");
-    assert_eq!(ready.commit, a);
-
-    // Rewrite the first ordinary response and the first pinned opt-in response
-    // to the pre-top-up 202 shape. The new client must ignore absent extension
-    // fields, continue its existing bounded exact poll, and preserve identity.
-    let proxy = start_clone_id_proxy(&server.url, 2).await;
-    let output = tempfile::tempdir().unwrap();
-    let target = output.path().join("clone");
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(10),
-        ripclone::client::Client::new_with_token(proxy.url.clone(), Some(token_hash()))
-            .install_repo_with_mode_at(
-                "acme/full-topup-old-server",
-                "HEAD",
-                None,
-                &target,
-                CloneMode::Editable,
-                Some("full"),
-                None,
-            ),
-    )
-    .await
-    .expect("old-server compatibility poll is bounded")
-    .expect("old-server compatibility clone succeeds once exact A is returned");
-    assert_eq!(outcome.commit, a);
-    assert!(outcome.cold);
-    assert_eq!(outcome.clone_id.as_deref(), Some("pending-clone-1"));
-    assert_eq!(git(&target, &["rev-parse", "HEAD"]), a);
-    assert!(
-        proxy.requests.load(std::sync::atomic::Ordering::SeqCst) >= 3,
-        "old-server response must be polled rather than treated as new-server no-base"
-    );
-}
-
-#[tokio::test]
 async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() {
     let _guard = env_lock().lock().await;
     init(false);
@@ -1978,7 +1876,7 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
     assert!(!target.exists());
 
     proceed.send(()).expect("release removed Full(B)");
-    // The compatibility waiter is pinned to B and must never follow the
+    // The readiness waiter is pinned to B and must never follow the
     // rewound branch to A. If the post-build recheck replaces the mutable
     // branch row before the next exact poll, the documented result is a
     // bounded typed pending error; either outcome is acceptable here because
@@ -1988,15 +1886,15 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
             Ok(response) => assert_eq!(response.commit, b),
             Err(error) => assert!(
                 format!("{error:#}").contains(&b),
-                "removed-B compatibility failure lost its B pin: {error:#}"
+                "removed-B readiness failure lost its B pin: {error:#}"
             ),
         },
         Err(_) => {
             sync_b.abort();
             tokio::time::timeout(Duration::from_secs(5), &mut sync_b)
                 .await
-                .expect("aborted removed-B compatibility waiter joined")
-                .expect_err("removed-B compatibility waiter was not aborted");
+                .expect("aborted removed-B readiness waiter joined")
+                .expect_err("removed-B readiness waiter was not aborted");
         }
     }
 }
@@ -2373,7 +2271,7 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
         ScopedEnvVar::set("RIPCLONE_S3_CACHE_DIR", controls.path().join("s3-cache"));
     let server = start_server().await;
     let (clone_proxy, refresh_entered, refresh_proceed) =
-        start_clone_id_proxy_with_pinned_pause(&server.url, 0, 2).await;
+        start_clone_id_proxy_with_pinned_pause(&server.url, 2).await;
     drop(server_cache_dir);
     let origin = make_origin("acme", "full-topup-minio");
     let a = origin.commit(&[("value.txt", "A\n")], "A");

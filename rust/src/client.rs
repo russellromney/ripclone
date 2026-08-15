@@ -41,21 +41,16 @@ struct ServerError {
 struct ArtifactPendingResponse {
     code: String,
     commit: String,
-    #[serde(default)]
     top_up_supported: Option<bool>,
-    #[serde(default)]
     top_up_base: Option<RefResponse>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SyncAcceptedResponse {
     status: String,
-    #[serde(default)]
     queue_depth: usize,
-    #[serde(default)]
-    commit: Option<String>,
-    #[serde(default)]
-    branch: Option<String>,
+    commit: String,
+    branch: String,
 }
 
 /// Result of one ordinary sync/add admission request. A caller that only needs
@@ -1156,8 +1151,8 @@ impl Client {
         {
             headers.insert(reqwest::header::AUTHORIZATION, header_value);
         }
-        // Advertise the wire protocol so the server can reject an incompatible
-        // (too-new) client with an actionable error instead of a confusing 4xx.
+        // Declare the sole wire protocol so an incompatible client/server pair
+        // fails at the boundary with an actionable error.
         if let Ok(pv) = reqwest::header::HeaderValue::from_str(&crate::PROTOCOL_VERSION.to_string())
         {
             headers.insert("x-ripclone-protocol", pv);
@@ -1411,7 +1406,12 @@ impl Client {
                 }
                 polled = true;
                 *cold = true;
-                if requested_top_up && pending.top_up_supported == Some(true) {
+                if requested_top_up {
+                    if pending.top_up_supported != Some(true) {
+                        anyhow::bail!(
+                            "invalid pending response for {repo_path}: pinned Full top-up support was not declared"
+                        );
+                    }
                     let target = pinned.clone().expect("valid 202 establishes a pin");
                     let Some(base_response) = pending.top_up_base else {
                         return Err(anyhow::Error::new(ArtifactPending {
@@ -1455,8 +1455,7 @@ impl Client {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
                 // The first ordinary 202 exists to establish B. Eligible Full
-                // clones immediately make the one pinned opt-in request; only
-                // old servers (missing the new fields) enter the bounded poll.
+                // clones immediately make the one pinned opt-in request.
                 if allow_top_up && !requested_top_up {
                     // This is after the ordinary 202 has established B and
                     // before the first pinned/top_up request.
@@ -1955,10 +1954,8 @@ impl Client {
             .json()
             .await
             .with_context(|| format!("invalid exact {context} admission response"))?;
-        let commit = accepted
-            .commit
-            .context("server accepted sync without an admitted commit")?;
-        let branch = accepted.branch.unwrap_or_else(|| "HEAD".to_string());
+        let commit = accepted.commit;
+        let branch = accepted.branch;
         crate::validation::validate_object_id(&commit)
             .context("server returned invalid admitted commit")?;
         crate::validation::validate_git_rev(&branch)

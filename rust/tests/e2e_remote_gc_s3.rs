@@ -1341,7 +1341,7 @@ async fn seed_shallow_s3_fixture(
         .await
         .expect("publish S3 default-branch fixture");
     // This tightly scoped fixture represents an exact row created by the
-    // retained historical `sync --at` compatibility lane. Ordinary sync
+    // first-class historical `sync --at` exact-result lane. Ordinary sync
     // production code did not create it and must not create another one.
     s3_refs
         .save_branch(&repo_id, &format!(":{default_branch}#{pinned}"), &info)
@@ -1590,6 +1590,7 @@ async fn get_status(
     let resp = client
         .get(&url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("status request");

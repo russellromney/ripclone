@@ -26,6 +26,7 @@ async fn repo_status(server: &Server, owner: &str, repo: &str) -> serde_json::Va
     reqwest::Client::new()
         .get(url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("status request")

@@ -216,7 +216,7 @@ async fn concurrent_builds_during_tip_advancing_fetch_stay_correct() {
 /// The fast-moving-repo case on a SINGLE branch: commits land in quick
 /// succession while sync admissions fire. Each observed exact commit is allowed
 /// to remain its own immutable job, so this test uses the fast admission API for
-/// the churn and reserves the readiness-oriented compatibility call for the
+/// the churn and reserves the blocking readiness call for the
 /// settled final tip. The system must never corrupt and must converge to the
 /// final commit with full, correct history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

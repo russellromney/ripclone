@@ -25,6 +25,7 @@ async fn get_status(
     let resp = client
         .get(&url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("status request")
@@ -107,7 +108,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
         .expect("load moving main")
         .expect("moving main exists");
     let historical_key = format!(":main#{}", info.commit);
-    // Represent the retained explicit `sync --at` compatibility lane. The
+    // Represent the first-class historical `sync --at` exact-result lane. The
     // ordinary sync above must not have created this row.
     assert!(
         store
@@ -224,6 +225,7 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
     let sync_resp = client
         .post(&sync_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("sync request")

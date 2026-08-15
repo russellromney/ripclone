@@ -120,6 +120,7 @@ async fn wait_archive_building(server: &Server, repo: &str, commit: &str) {
         let resp = client
             .get(&url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
             .expect("status request");
@@ -153,6 +154,7 @@ async fn wait_archive_settled(server: &Server, repo: &str, commit: &str) {
         let resp = client
             .get(&url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
             .expect("status request");

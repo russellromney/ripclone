@@ -30,6 +30,7 @@ async fn admin_put(
     reqwest::Client::new()
         .post(admin_url(server, owner, repo, branch))
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .json(&body)
         .send()
         .await
@@ -45,6 +46,7 @@ async fn admin_get(
     reqwest::Client::new()
         .get(admin_url(server, owner, repo, branch))
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("admin get request")

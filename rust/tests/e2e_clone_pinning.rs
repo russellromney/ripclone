@@ -1291,6 +1291,47 @@ async fn malformed_pending_commit_is_a_protocol_error() {
 }
 
 #[tokio::test]
+async fn pinned_top_up_requires_the_current_pending_shape() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2");
+        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+    }
+    let (url, requests, task) = scripted_server(vec![pending(A), pending(A)]).await;
+    let output = tempfile::tempdir().unwrap();
+    let target = output.path().join("clone");
+    let error = Client::new(url)
+        .install_repo_with_mode_at(
+            "acme/demo",
+            "main",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect_err("a pinned Full top-up must declare the current response shape");
+    abort_server_task(task).await;
+    unsafe {
+        std::env::remove_var("RIPCLONE_TESTING");
+        std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
+        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+    }
+    let error = format!("{error:#}");
+    assert!(error.contains("top-up support was not declared"), "{error}");
+    assert!(
+        !target.exists(),
+        "invalid response must not publish a target"
+    );
+    let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains(&format!("pinned={A}")));
+    assert!(requests[1].contains("top_up=true"));
+}
+
+#[tokio::test]
 async fn service_unavailable_switches_to_exact_only_after_a_pin_exists() {
     let _guard = env_lock().lock().await;
     unsafe {
@@ -1442,6 +1483,7 @@ async fn sha_suffixed_real_branch_resolves_reports_polls_and_advances() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("status for delimiter branch");
@@ -1565,6 +1607,7 @@ async fn sha_suffixed_real_branch_resolves_reports_polls_and_advances() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("final SHA-suffixed status")

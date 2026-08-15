@@ -767,8 +767,8 @@ pub struct BuildRequest {
 pub struct BuildResponse {
     pub status: String,
     pub queue_depth: usize,
-    /// Exact admission target for new async sync/build responses. Older pending
-    /// ref responses may omit it because they predate exact admission.
+    /// Exact admission target when this endpoint admits commit-specific work.
+    /// Repository wake-up responses may omit it when no target was admitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1254,16 +1254,24 @@ const MAX_UPLOAD_PACK_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// ~25 MiB; this is comfortably above that and far below the global limit.
 const MAX_WEBHOOK_BODY_BYTES: usize = 25 * 1024 * 1024;
 
-/// Reject a client whose declared wire protocol differs from this server.
-/// There is one implementation, so a version mismatch is an error rather than
-/// a selector for alternate response behavior.
+/// Require the sole current wire protocol on every authenticated API request.
+/// Missing, malformed, and mismatched declarations fail at the boundary.
 async fn protocol_guard(
     headers: HeaderMap,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let Some(header) = headers.get("x-ripclone-protocol") else {
-        return next.run(request).await;
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(ErrorResponse {
+                error: format!(
+                    "missing client protocol; this server requires {}",
+                    crate::PROTOCOL_VERSION
+                ),
+            }),
+        )
+            .into_response();
     };
     let client_proto = match header
         .to_str()
@@ -9648,7 +9656,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     #[test]
-    fn current_protocol_requires_the_requested_clonepack_variant() {
+    fn exact_result_requires_the_requested_clonepack_variant() {
         let full = crate::ClonepackArtifacts {
             commit: "a".repeat(40),
             manifest: "full-manifest".to_string(),
@@ -9694,7 +9702,7 @@ mod tests {
     }
 
     #[test]
-    fn current_protocol_rejects_empty_evicted_and_mismatched_artifacts() {
+    fn exact_result_rejects_empty_evicted_and_mismatched_artifacts() {
         let commit = "a".repeat(40);
         let mut info = RefInfo {
             commit: commit.clone(),
@@ -12619,30 +12627,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_guard_rejects_every_declared_mismatch() {
+    async fn protocol_guard_requires_the_current_version() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
         let app = build_app(state);
-        for mismatch in ["1", "999", "invalid"] {
-            let response = app
-                .clone()
-                .oneshot(protocol_request(
-                    "/v1/repos/acme/secret/status",
-                    Some(mismatch),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
-        }
-        let current = crate::PROTOCOL_VERSION.to_string();
-        for protocol in [Some(current.as_str()), None] {
+        for protocol in [Some("1"), Some("999"), Some("invalid"), None] {
             let response = app
                 .clone()
                 .oneshot(protocol_request("/v1/repos/acme/secret/status", protocol))
                 .await
                 .unwrap();
-            assert_ne!(response.status(), StatusCode::UPGRADE_REQUIRED);
+            assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
         }
+        let current = crate::PROTOCOL_VERSION.to_string();
+        let response = app
+            .oneshot(protocol_request(
+                "/v1/repos/acme/secret/status",
+                Some(&current),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
     #[tokio::test]

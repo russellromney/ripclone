@@ -181,6 +181,7 @@ async fn bearer_token_authorizes_a_protected_route() {
     let ok = reqwest::Client::new()
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
@@ -191,13 +192,19 @@ async fn bearer_token_authorizes_a_protected_route() {
     );
 
     // No credential → 401.
-    let anon = reqwest::Client::new().get(&url).send().await.unwrap();
+    let anon = reqwest::Client::new()
+        .get(&url)
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
 
     // Garbage bearer → 401.
     let bad = reqwest::Client::new()
         .get(&url)
         .header("Authorization", "Bearer not.a.jwt")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
@@ -207,6 +214,7 @@ async fn bearer_token_authorizes_a_protected_route() {
     let legacy = reqwest::Client::new()
         .get(&url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
@@ -224,6 +232,7 @@ async fn content_endpoints_forbid_unauthorized_repo() {
     let cat = client
         .get(format!("{base}/cat?branch=main&path=a.txt"))
         .header("Authorization", auth.clone())
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
@@ -232,6 +241,7 @@ async fn content_endpoints_forbid_unauthorized_repo() {
     let sizes = client
         .get(format!("{base}/sizes?branch=main"))
         .header("Authorization", auth.clone())
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
@@ -240,6 +250,7 @@ async fn content_endpoints_forbid_unauthorized_repo() {
     let hotfiles = client
         .get(format!("{base}/hotfiles?branch=main"))
         .header("Authorization", auth.clone())
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
@@ -248,6 +259,7 @@ async fn content_endpoints_forbid_unauthorized_repo() {
     let snapshot = client
         .post(format!("{base}/snapshot?branch=main"))
         .header("Authorization", auth.clone())
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
@@ -256,6 +268,7 @@ async fn content_endpoints_forbid_unauthorized_repo() {
     let batch = client
         .post(format!("{base}/batch"))
         .header("Authorization", auth)
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .json(&serde_json::json!({
             "branch": "main",
             "paths": ["a.txt"]
@@ -292,6 +305,7 @@ async fn refresh_issues_a_fresh_token() {
     let resp = reqwest::Client::new()
         .post(format!("{}/v1/auth/refresh", server.url))
         .header("Authorization", format!("Bearer {token}"))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
@@ -304,6 +318,7 @@ async fn refresh_issues_a_fresh_token() {
     // Refresh without a valid bearer is rejected by the auth layer.
     let anon = reqwest::Client::new()
         .post(format!("{}/v1/auth/refresh", server.url))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();

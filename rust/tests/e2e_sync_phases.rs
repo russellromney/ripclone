@@ -67,8 +67,8 @@ async fn cold_sync_reports_all_phase_timings() {
     let client = reqwest::Client::new();
     // Ordinary `/sync` is now an admission endpoint and returns 202 before
     // phase timings exist. Keep this timing-specific regression on the
-    // explicitly pinned legacy route whose ready 200 payload still carries
-    // the detailed phase data.
+    // first-class historical exact-revision path, whose ready 200 payload
+    // carries the detailed phase data.
     let sync_url = format!(
         "{}/v1/repos/github/acme/phasescold/sync?rev={c1}",
         server.url
@@ -76,6 +76,7 @@ async fn cold_sync_reports_all_phase_timings() {
     let sync: ripclone::server::SyncResponse = client
         .post(&sync_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("sync request")
@@ -89,7 +90,7 @@ async fn cold_sync_reports_all_phase_timings() {
 }
 
 /// Poll the exact pinned metadata path until the full clonepack manifest is
-/// published (phase 2 done). This is the compatibility wait used after an
+/// published (phase 2 done). This is the readiness wait used after an
 /// accepted ordinary admission; it never repeats the moving `/sync` POST.
 async fn sync_response_until_manifest(
     client: &reqwest::Client,
@@ -145,6 +146,7 @@ async fn incremental_sync_reports_all_phase_timings() {
     let cold: ripclone::server::SyncResponse = client
         .post(&sync_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("sync request")
@@ -170,6 +172,7 @@ async fn incremental_sync_reports_all_phase_timings() {
     let inc: ripclone::server::SyncResponse = client
         .post(&sync_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("sync request")

@@ -12,7 +12,7 @@ If a Linux binary still fails to load a shared library, the download is corrupt 
 
 There are two different `202` cases. A `202` from `sync` or `add` means the
 exact branch commit was admitted or coalesced into background work; those
-commands return without waiting for the build. Compatibility library methods
+commands return without waiting for the build. Blocking library methods
 poll the pinned commit's metadata after that first `202`, so they do not repeat
 a moving-tip POST. A `202` from a clone/ref request means the artifacts for the
 requested commit are still being built. On every push the server builds a
@@ -41,7 +41,7 @@ If clones behave oddly after an upgrade, check that the CLI and the server agree
 ripclone version    # prints CLI + server versions with a compatibility verdict
 ```
 
-A mismatch (old server, new CLI, or vice versa) is the usual cause of missing modes or unexpected `202`/`404` responses — upgrade the lagging side.
+A client/server protocol mismatch is the usual cause of missing modes or unexpected `202`/`404` responses — deploy matching versions.
 
 Also confirm the CLI is talking to the server you think it is. Resolution order is: `--server` > `RIPCLONE_SERVER` env var > saved login config (`~/.config/ripclone/`) > the built-in default server. A stale `RIPCLONE_SERVER` in your environment or an old saved login will silently override the server you meant to use. `ripclone logout` clears the saved login.
 </content>

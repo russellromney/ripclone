@@ -79,8 +79,8 @@ See [WEBHOOKS.md](WEBHOOKS.md) for provider authentication and branch policy.
 
 ## Callers that need readiness
 
-The normal `Client::sync_repo` and `Client::add_repo` methods retain their
-readiness-oriented return values for compatibility. After the first `202`, they
+The normal `Client::sync_repo` and `Client::add_repo` methods provide blocking
+readiness-oriented return values. After the first `202`, they
 poll only the authenticated exact pinned metadata path:
 
 ```text
@@ -88,8 +88,8 @@ GET /v1/repos/<provider>/<repo>/refs/<branch>?pinned=<B>&clonepack=full
 ```
 
 They do not repeat a moving `POST /sync` or `POST /add`, re-resolve the branch,
-or create another job. The CLI `--wait` forms use these same compatibility
-methods; callers that only need admission can use the client's admission
+or create another job. The CLI `--wait` forms use these same readiness methods;
+callers that only need admission can use the client's admission
 methods or the normal CLI commands.
 
 ## `sync --at REV`

@@ -1,6 +1,5 @@
-//! End-to-end coverage for version reporting and protocol enforcement against a
-//! real in-process server (the user-facing surface of the version-reconciliation
-//! work).
+//! End-to-end coverage for version reporting and the sole current wire contract
+//! against a real in-process server.
 
 mod common;
 
@@ -44,25 +43,24 @@ async fn current_protocol_client_can_sync() {
         .expect("a current-protocol client must pass the guard and sync");
 }
 
-/// Any declared wire version other than the current one fails clearly instead
-/// of selecting another implementation.
+/// Missing, malformed, and mismatched wire declarations all fail clearly.
 #[tokio::test]
-async fn server_rejects_mismatched_or_invalid_protocol() {
+async fn server_requires_the_current_protocol() {
     init(false);
     let server = start_server().await;
     let client = reqwest::Client::new();
-    for header in ["1", "999", "not-a-number"] {
-        let resp = client
+    for header in [Some("1"), Some("999"), Some("not-a-number"), None] {
+        let mut request = client
             .get(format!("{}/v1/repos/acme/x/refs/main", server.url))
-            .header("Authorization", format!("Ripclone {}", token_hash()))
-            .header("x-ripclone-protocol", header)
-            .send()
-            .await
-            .unwrap();
+            .header("Authorization", format!("Ripclone {}", token_hash()));
+        if let Some(header) = header {
+            request = request.header("x-ripclone-protocol", header);
+        }
+        let resp = request.send().await.unwrap();
         assert_eq!(
             resp.status().as_u16(),
             426,
-            "protocol header {header:?} must be rejected"
+            "protocol declaration {header:?} must be rejected"
         );
         let body = resp.text().await.unwrap();
         assert!(body.contains("protocol"), "clear mismatch: {body}");
