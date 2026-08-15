@@ -64,5 +64,21 @@ export AWS_SECRET_ACCESS_KEY=minioadmin
 export S3GC_TIMEOUT_SECS="${S3GC_TIMEOUT_SECS:-300}"
 
 echo "multipart MinIO proof: $TEST_NAME"
+set +e
 bash "$ROOT/scripts/ci.sh" s3gc "$TEST_NAME"
+test_status=$?
+set -e
+
+incomplete_uploads=""
+if ! incomplete_uploads="$(timeout 30 docker exec "$CONTAINER" \
+  mc ls --incomplete --recursive "local/$BUCKET" 2>&1)"; then
+  echo "error: failed to inspect MinIO incomplete multipart uploads" >&2
+  test_status=1
+elif [ -n "$incomplete_uploads" ]; then
+  echo "error: MinIO retained incomplete multipart state:" >&2
+  printf '%s\n' "$incomplete_uploads" >&2
+  test_status=1
+fi
+
 echo "MinIO image: $MINIO_IMAGE"
+exit "$test_status"
