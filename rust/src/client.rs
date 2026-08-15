@@ -1819,8 +1819,7 @@ impl Client {
         let metadata_data = self
             .fetch_artifact_with_url(&metadata_hash, info.metadata_chunk_url.as_deref())
             .await?;
-        let metadata =
-            MetadataChunk::decode(metadata_data.as_ref()).context("decode metadata chunk")?;
+        let metadata = MetadataChunk::decode_and_validate(metadata_data.as_ref())?;
         Ok((clonepack, Arc::new(metadata)))
     }
 
@@ -3367,7 +3366,7 @@ impl Client {
                 .fetch_artifact_with_url(&hash, signed_url.as_deref())
                 .await
                 .with_context(|| format!("fetch metadata chunk {hash}"))?;
-            let metadata = MetadataChunk::decode(data.as_ref()).context("decode metadata chunk")?;
+            let metadata = MetadataChunk::decode_and_validate(data.as_ref())?;
             Ok(metadata)
         })
     }

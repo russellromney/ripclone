@@ -5696,7 +5696,7 @@ fn load_metadata_files(
         .get(metadata_hash)
         .or_else(|_| storage.get(metadata_hash))
         .ok()?;
-    let md = crate::clonepack::MetadataChunk::decode(bytes.as_slice()).ok()?;
+    let md = crate::clonepack::MetadataChunk::decode_and_validate(bytes.as_slice()).ok()?;
     Some(md.files)
 }
 
@@ -5869,7 +5869,7 @@ fn archive_chunk_refs(
     archive_chunk_hashes: &[String],
     metadata_chunk: &crate::clonepack::MetadataChunk,
 ) -> Result<Vec<ChunkRef>> {
-    let lengths = crate::clonepack::archive_chunk_lengths(metadata_chunk);
+    let lengths = crate::clonepack::archive_chunk_lengths(metadata_chunk)?;
     if lengths.len() != archive_chunk_hashes.len() {
         anyhow::bail!(
             "archive chunk hash/length mismatch: hashes={} lengths={}",

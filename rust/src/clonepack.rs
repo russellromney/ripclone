@@ -70,10 +70,11 @@ pub fn manifest_pack_idx_bytes(
         .idx
         .as_ref()
         .with_context(|| format!("pack {index} missing idx ref"))?;
-    let off = entry.idx_bundle_offset as usize;
-    let end = off
-        .checked_add(idx_ref.len as usize)
-        .context("idx bundle offset overflow")?;
+    let off = usize::try_from(entry.idx_bundle_offset)
+        .context("idx bundle offset does not fit in usize")?;
+    let len = usize::try_from(idx_ref.len)
+        .context("idx bundle slice length does not fit in usize")?;
+    let end = off.checked_add(len).context("idx bundle offset overflow")?;
     if idx_bundle.get(off..end).is_none() {
         anyhow::bail!("idx {index} slice out of bundle range");
     }
@@ -130,17 +131,24 @@ pub fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
 }
 
 /// Compute the compressed byte length of each archive chunk from the frame table.
-pub fn archive_chunk_lengths(metadata: &MetadataChunk) -> Vec<u64> {
+pub fn archive_chunk_lengths(metadata: &MetadataChunk) -> anyhow::Result<Vec<u64>> {
+    metadata.validate_geometry()?;
     let mut lengths = Vec::new();
     for frame in &metadata.frames {
-        let idx = frame.chunk_index as usize;
-        let end = frame.chunk_offset + frame.compressed_len as u64;
-        if idx >= lengths.len() {
-            lengths.resize(idx + 1, 0);
+        let idx = usize::try_from(frame.chunk_index)
+            .context("archive chunk index does not fit in usize")?;
+        let end = frame
+            .chunk_offset
+            .checked_add(frame.compressed_len as u64)
+            .context("archive chunk length overflow")?;
+        if idx == lengths.len() {
+            lengths.push(0);
+        } else if idx > lengths.len() {
+            anyhow::bail!("archive chunk index {} is not contiguous", idx);
         }
         if end > lengths[idx] {
             lengths[idx] = end;
         }
     }
-    lengths
+    Ok(lengths)
 }

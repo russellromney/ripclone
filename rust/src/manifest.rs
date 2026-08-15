@@ -5,7 +5,7 @@ pub use crate::clonepack::{
 use anyhow::{Context, Result};
 use prost::Message;
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
 pub type Manifest = MetadataChunk;
@@ -35,7 +35,13 @@ impl MetadataChunk {
         reader
             .read_to_end(&mut bytes)
             .context("read metadata chunk")?;
-        let manifest = Self::decode(bytes.as_slice()).context("decode metadata chunk")?;
+        Self::decode_and_validate(&bytes)
+    }
+
+    /// Decode a metadata chunk and validate all geometry before any caller uses
+    /// its offsets or file paths.
+    pub fn decode_and_validate(bytes: &[u8]) -> Result<Self> {
+        let manifest = Self::decode(bytes).context("decode metadata chunk")?;
         manifest.validate_geometry()?;
         Ok(manifest)
     }
@@ -43,6 +49,7 @@ impl MetadataChunk {
     /// Validate frame/file/fragment geometry and reject illegal modes.
     pub fn validate_geometry(&self) -> Result<()> {
         const ALLOWED_MODES: [u32; 3] = [0o100644, 0o100755, 0o120000];
+        let mut paths = HashSet::with_capacity(self.files.len());
 
         for (file_idx, entry) in self.files.iter().enumerate() {
             if !ALLOWED_MODES.contains(&entry.mode) {
@@ -55,7 +62,31 @@ impl MetadataChunk {
             if entry.path.is_empty() {
                 anyhow::bail!("file {} has empty path", file_idx);
             }
-            if entry.fragments.is_empty() {
+            crate::fsutil::validate_relative_path(crate::fsutil::path_from_bytes(&entry.path))
+                .with_context(|| {
+                    format!(
+                        "file {} has unsafe path: {}",
+                        file_idx,
+                        String::from_utf8_lossy(&entry.path)
+                    )
+                })?;
+            if !paths.insert(entry.path.as_slice()) {
+                anyhow::bail!(
+                    "duplicate file path: {}",
+                    String::from_utf8_lossy(&entry.path)
+                );
+            }
+            if entry.blob_sha1.len() != 20 {
+                anyhow::bail!(
+                    "file {} has invalid blob_sha1 length: expected 20, got {}",
+                    String::from_utf8_lossy(&entry.path),
+                    entry.blob_sha1.len()
+                );
+            }
+            // Files-table metadata intentionally omits archive fragments while
+            // the archive is built asynchronously. Once frames exist, every
+            // file must be represented so extraction cannot silently drop it.
+            if entry.fragments.is_empty() && !self.frames.is_empty() {
                 anyhow::bail!(
                     "file {} has no fragments",
                     String::from_utf8_lossy(&entry.path)
@@ -90,15 +121,57 @@ impl MetadataChunk {
             }
         }
 
+        let mut previous_chunk = None;
+        let mut previous_end = 0u64;
         for (frame_idx, frame) in self.frames.iter().enumerate() {
             let end = frame
                 .chunk_offset
                 .checked_add(frame.compressed_len as u64)
                 .ok_or_else(|| anyhow::anyhow!("frame {} compressed bounds overflow", frame_idx))?;
-            // We cannot check against the real chunk length here because the
-            // manifest does not carry archive chunk bytes, but we can at least
-            // ensure the arithmetic did not wrap.
-            let _ = end;
+
+            match previous_chunk {
+                None => {
+                    if frame.chunk_index != 0 || frame.chunk_offset != 0 {
+                        anyhow::bail!(
+                            "first frame must start at archive chunk 0 offset 0, got chunk {} offset {}",
+                            frame.chunk_index,
+                            frame.chunk_offset
+                        );
+                    }
+                }
+                Some(previous) if frame.chunk_index < previous => {
+                    anyhow::bail!(
+                        "frame {} moves archive chunk index backwards from {} to {}",
+                        frame_idx,
+                        previous,
+                        frame.chunk_index
+                    );
+                }
+                Some(previous) if frame.chunk_index == previous => {
+                    if frame.chunk_offset != previous_end {
+                        anyhow::bail!(
+                            "frame {} is not contiguous with archive chunk {}: offset {} != {}",
+                            frame_idx,
+                            frame.chunk_index,
+                            frame.chunk_offset,
+                            previous_end
+                        );
+                    }
+                }
+                Some(previous) => {
+                    if frame.chunk_index != previous.saturating_add(1) || frame.chunk_offset != 0 {
+                        anyhow::bail!(
+                            "frame {} starts a non-contiguous archive chunk: previous {}, current {} offset {}",
+                            frame_idx,
+                            previous,
+                            frame.chunk_index,
+                            frame.chunk_offset
+                        );
+                    }
+                }
+            }
+            previous_chunk = Some(frame.chunk_index);
+            previous_end = end;
         }
 
         Ok(())
@@ -127,19 +200,26 @@ pub fn verify_archive<F>(metadata: &MetadataChunk, mut fetch_chunk: F) -> Result
 where
     F: FnMut(u32) -> Result<Vec<u8>>,
 {
+    metadata.validate_geometry()?;
     let by_frame = metadata.fragments_by_frame();
 
     for (frame_index, frame) in metadata.frames.iter().enumerate() {
         let chunk = fetch_chunk(frame.chunk_index)
             .with_context(|| format!("fetch chunk {}", frame.chunk_index))?;
-        let start = frame.chunk_offset as usize;
-        let end = start + frame.compressed_len as usize;
+        let start = usize::try_from(frame.chunk_offset)
+            .context("frame chunk offset does not fit in usize")?;
+        let compressed_len = usize::try_from(frame.compressed_len)
+            .context("frame compressed length does not fit in usize")?;
+        let end = start
+            .checked_add(compressed_len)
+            .context("frame compressed bounds overflow")?;
         if end > chunk.len() {
             anyhow::bail!("frame {} extends past chunk end", frame_index);
         }
         let raw = zstd::decode_all(&chunk[start..end])
             .with_context(|| format!("decompress frame {}", frame_index))?;
-        if raw.len() != frame.raw_len as usize {
+        let raw_len = usize::try_from(frame.raw_len).context("frame raw length does not fit")?;
+        if raw.len() != raw_len {
             anyhow::bail!(
                 "frame {} raw length mismatch: {} vs {}",
                 frame_index,
@@ -152,16 +232,19 @@ where
             for (file_idx, frag_idx) in pairs {
                 let entry = &metadata.files[*file_idx];
                 let fragment = &entry.fragments[*frag_idx];
-                let off = fragment.frame_offset as usize;
-                let len = fragment.raw_len as usize;
-                if off + len > raw.len() {
+                let off = usize::try_from(fragment.frame_offset)
+                    .context("fragment offset does not fit in usize")?;
+                let len = usize::try_from(fragment.raw_len)
+                    .context("fragment length does not fit in usize")?;
+                let end = off.checked_add(len).context("fragment bounds overflow")?;
+                if end > raw.len() {
                     anyhow::bail!(
                         "fragment for {} extends past frame {}",
                         String::from_utf8_lossy(&entry.path),
                         frame_index
                     );
                 }
-                let content = &raw[off..off + len];
+                let content = &raw[off..end];
                 let hash = Sha1::digest(content);
                 if hash.as_slice() != entry.blob_sha1 {
                     // We can only verify the full file SHA-1 when the file
@@ -271,6 +354,62 @@ mod tests {
         });
 
         verify_archive(&manifest, |_| Ok(compressed.clone())).unwrap();
+    }
+
+    #[test]
+    fn validate_geometry_rejects_non_contiguous_archive_frames() {
+        let mut manifest = MetadataChunk::new();
+        manifest.frames = vec![
+            FrameInfo {
+                chunk_index: 0,
+                chunk_offset: 0,
+                compressed_len: 1,
+                raw_len: 0,
+            },
+            FrameInfo {
+                chunk_index: 1,
+                chunk_offset: 0,
+                compressed_len: 1,
+                raw_len: 0,
+            },
+            FrameInfo {
+                chunk_index: 0,
+                chunk_offset: 1,
+                compressed_len: 1,
+                raw_len: 0,
+            },
+        ];
+
+        let err = manifest.validate_geometry().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("moves archive chunk index backwards")
+        );
+    }
+
+    #[test]
+    fn validate_geometry_rejects_duplicate_paths() {
+        let mut manifest = MetadataChunk::new();
+        manifest.frames.push(FrameInfo {
+            chunk_index: 0,
+            chunk_offset: 0,
+            compressed_len: 0,
+            raw_len: 0,
+        });
+        let file = |path| FileEntry {
+            path,
+            mode: 0o100644,
+            blob_sha1: vec![0; 20],
+            fragments: vec![Fragment {
+                frame_index: 0,
+                frame_offset: 0,
+                raw_len: 0,
+            }],
+        };
+        manifest.files = vec![file(b"same".to_vec()), file(b"same".to_vec())];
+
+        let err = manifest.validate_geometry().unwrap_err();
+        assert!(err.to_string().contains("duplicate file path"));
     }
 
     fn sha1_bytes(data: &[u8]) -> [u8; 20] {

@@ -69,7 +69,7 @@ impl Chunk {
 
 /// Group consecutive frames into chunks whose total compressed size is at most
 /// `chunk_size`. A frame larger than `chunk_size` gets its own chunk.
-fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Vec<Chunk> {
+fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Result<Vec<Chunk>> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     let mut byte_start = 0u64;
@@ -82,38 +82,50 @@ fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Vec<Chunk> {
         // Start a new chunk when crossing into a different archive chunk or when
         // the current frame would not fit.
         if frame_chunk != current_chunk_index
-            || (current_len > 0 && current_len + frame_len > chunk_size)
+            || (current_len > 0
+                && current_len
+                    .checked_add(frame_len)
+                    .ok_or_else(|| anyhow::anyhow!("archive chunk length overflow"))?
+                    > chunk_size)
         {
             let end = i;
+            let byte_end = byte_start
+                .checked_add(current_len)
+                .ok_or_else(|| anyhow::anyhow!("archive chunk offset overflow"))?;
             chunks.push(Chunk {
                 chunk_index: current_chunk_index,
                 start_frame: start,
                 end_frame: end,
                 byte_start,
-                byte_end: byte_start + current_len,
+                byte_end,
             });
             start = i;
             byte_start = frame.chunk_offset;
             current_len = 0;
             current_chunk_index = frame_chunk;
         }
-        current_len += frame_len;
+        current_len = current_len
+            .checked_add(frame_len)
+            .ok_or_else(|| anyhow::anyhow!("archive chunk length overflow"))?;
     }
 
     // Ensure every frame is covered, including zero-length frames produced by
     // empty files. A chunk with zero compressed bytes still carries the empty
     // frames to the writer so the files are created.
     if !frames.is_empty() {
+        let byte_end = byte_start
+            .checked_add(current_len)
+            .ok_or_else(|| anyhow::anyhow!("archive chunk offset overflow"))?;
         chunks.push(Chunk {
             chunk_index: current_chunk_index,
             start_frame: start,
             end_frame: frames.len(),
             byte_start,
-            byte_end: byte_start + current_len,
+            byte_end,
         });
     }
 
-    chunks
+    Ok(chunks)
 }
 
 fn read_archive_manifest(manifest_path: &Path) -> Result<Manifest> {
@@ -150,8 +162,10 @@ pub fn extract_archive(
         dictionary,
         DEFAULT_LOCAL_CHUNK_SIZE,
         move |chunk: &Chunk| {
-            let start = chunk.byte_start as usize;
-            let end = chunk.byte_end as usize;
+            let start = usize::try_from(chunk.byte_start)
+                .context("archive chunk start does not fit in usize")?;
+            let end = usize::try_from(chunk.byte_end)
+                .context("archive chunk end does not fit in usize")?;
             if end > archive.len() {
                 anyhow::bail!("chunk {:?} extends past archive end", chunk);
             }
@@ -182,7 +196,7 @@ where
     F: Fn(&Chunk) -> Result<Vec<u8>> + Send + Sync + 'static,
 {
     let manifest = read_archive_manifest(manifest_path)?;
-    let chunks = compute_chunks(&manifest.frames, chunk_size);
+    let chunks = compute_chunks(&manifest.frames, chunk_size)?;
     let chunk_map: HashMap<usize, Chunk> = chunks.iter().cloned().enumerate().collect();
     let (fetch_threads, write_threads) = archive_thread_counts();
     let queue_depth = (fetch_threads * 2).max(write_threads * 2);
@@ -328,7 +342,7 @@ pub fn extract_archive_from_chunk_receiver(
     chunk_rx: Receiver<(usize, Result<bytes::Bytes>)>,
 ) -> Result<ExtractStats> {
     let manifest = read_archive_manifest(manifest_path)?;
-    let chunks_by_index: HashMap<usize, Chunk> = compute_chunks(&manifest.frames, u64::MAX)
+    let chunks_by_index: HashMap<usize, Chunk> = compute_chunks(&manifest.frames, u64::MAX)?
         .into_iter()
         .map(|chunk| (chunk.chunk_index, chunk))
         .collect();
@@ -803,9 +817,20 @@ pub fn extract_blobs_from_pack_bytes(
         }
         let inflate_start = Instant::now();
         let mut dec = ZlibDecoder::new(&pack[data_start..]);
-        let mut content = Vec::with_capacity(size as usize);
+        // Do not reserve the size advertised by an untrusted pack header: a
+        // tiny malformed pack could otherwise request a multi-gigabyte
+        // allocation before zlib has produced a single byte.
+        let mut content = Vec::new();
         dec.read_to_end(&mut content)
             .with_context(|| format!("inflate pack object {}", i))?;
+        if content.len() as u64 != size {
+            anyhow::bail!(
+                "pack object {} size mismatch: header={} actual={}",
+                i,
+                size,
+                content.len()
+            );
+        }
         crate::perf::record_zlib_inflate(
             inflate_start.elapsed(),
             dec.total_in() as usize,
@@ -875,12 +900,20 @@ fn parse_pack_obj_header(buf: &[u8]) -> Result<(u8, u64, usize)> {
     let mut shift = 4u32;
     let mut cont = b & 0x80 != 0;
     while cont {
+        if shift >= 64 {
+            anyhow::bail!("pack object size varint overflows u64");
+        }
         if i >= buf.len() {
             anyhow::bail!("truncated pack object size varint");
         }
         let b = buf[i];
         i += 1;
-        size |= ((b & 0x7f) as u64) << shift;
+        let part = (b & 0x7f) as u64;
+        let remaining = 64 - shift;
+        if remaining < 7 && part >= (1u64 << remaining) {
+            anyhow::bail!("pack object size varint overflows u64");
+        }
+        size |= part << shift;
         shift += 7;
         cont = b & 0x80 != 0;
     }
@@ -1222,7 +1255,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("invalid blob_sha1 for bad.txt"),
+            err.contains("invalid blob_sha1"),
             "expected malformed blob_sha1 error, got: {}",
             err
         );
@@ -1254,5 +1287,18 @@ mod tests {
         });
 
         assert!(extract_manifest(&manifest, &target, vec![vec![b'y'; 3]]).is_err());
+    }
+
+    #[test]
+    fn rejects_pack_object_size_varint_overflow() {
+        let mut header = vec![0xb0]; // blob object, continuation bit set
+        header.extend(std::iter::repeat_n(0x80, 8));
+        header.push(0x10); // only four bits remain at this position
+
+        let err = parse_pack_obj_header(&header).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u64"),
+            "unexpected error: {err}"
+        );
     }
 }
