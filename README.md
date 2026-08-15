@@ -343,7 +343,7 @@ Compile flags (e.g. building without `zlib-ng`), client tuning knobs (`RIPCLONE_
 
 ## Telemetry
 
-After a successful clone, the CLI sends a single fire-and-forget metrics POST to the configured server. It is advertising-grade telemetry, never authoritative, and never on the clone's critical path: a failure to send cannot change the clone's exit status. The report is skipped entirely when the server does not mint a clone id (self-host / older server), when `--no-metrics` is passed, or when `RIPCLONE_NO_METRICS` is set to any non-empty value.
+After a successful clone, the CLI sends a single fire-and-forget metrics POST to the configured server. It is advertising-grade telemetry, never authoritative, and never on the clone's critical path: a failure to send cannot change the clone's exit status. The report is skipped entirely when the server does not mint a clone id, when `--no-metrics` is passed, or when `RIPCLONE_NO_METRICS` is set to any non-empty value.
 
 The payload contains:
 

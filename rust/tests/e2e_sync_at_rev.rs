@@ -247,16 +247,64 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
         "exact revision sync must not create a moving HEAD row"
     );
 
-    let (_guard, target) = clone_only_at(
-        &server,
-        "acme",
-        "at-exact-only",
-        Some("HEAD~1"),
-        0,
-        CloneMode::Editable,
+    let exact_key = format!("main#{pinned}");
+    let exact = ripclone::ref_store::RefStore::load_branch(&store, &repo_id, &exact_key)
+        .await
+        .expect("load exact-only result")
+        .expect("historical sync publishes its exact result");
+    assert!(exact.internal_exact_result);
+    assert_eq!(exact.default_branch, "main");
+    let branches = ripclone::ref_store::RefStore::list_branches(&store, &repo_id)
+        .await
+        .expect("list exact-only layout");
+    assert_eq!(branches, vec![exact_key.clone()]);
+
+    let status = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/at-exact-only/status",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("exact-only public status");
+    assert_eq!(status.status(), reqwest::StatusCode::OK);
+    let status: serde_json::Value = status.json().await.expect("exact-only status body");
+    assert_eq!(status["refs"], serde_json::json!([]));
+    assert!(
+        status["total_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "internal exact bytes remain in total storage accounting: {status}"
+    );
+
+    // Make symbolic-HEAD detection unavailable so default recovery must use
+    // RefInfo.default_branch. The storage key contains '#', and must never be
+    // interpreted as a source branch or produce main#commit#commit.
+    std::fs::write(
+        server
+            .repo_root
+            .join(repo_id.mirror_dir_name())
+            .join("HEAD"),
+        b"ref: refs/heads/missing\n",
     )
-    .await
-    .expect("one clone operation reaches the rev-only exact row");
+    .expect("hide symbolic default branch");
+    let output = tempfile::tempdir().expect("exact-only clone output");
+    let target = output.path().join("clone");
+    server
+        .client()
+        .install_repo_with_mode_at(
+            "acme/at-exact-only",
+            "HEAD",
+            Some(&pinned),
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("one clone operation reaches the exact-only result without add");
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
     assert_eq!(read(&target, "a.txt"), "old\n");
     assert_repo_usable(&target, "1");

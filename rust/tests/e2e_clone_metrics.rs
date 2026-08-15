@@ -10,7 +10,7 @@
 //! Covered:
 //!   1. A server that returns `X-Ripclone-Clone-Id` ⇒ the CLI POSTs the metric
 //!      with the right body.
-//!   2. No header (self-host / older server) ⇒ no POST at all.
+//!   2. No header ⇒ no POST at all.
 //!   3. A failing metrics endpoint ⇒ the clone still succeeds (report swallows it).
 
 mod common;

@@ -691,14 +691,14 @@ pub struct AddRequest {
 #[derive(Deserialize)]
 pub struct RefQuery {
     /// Clonepack variant to return: "full" (all reachable history) or
-    /// "shallow" (depth=1). Defaults to "full" for backward compatibility.
+    /// "shallow" (depth=1). Defaults to "full".
     #[serde(default = "default_clonepack_kind")]
     pub clonepack: String,
     /// Optional git rev to resolve instead of the branch tip (e.g. "HEAD~5").
     /// Pairs with `sync?rev=...`: clone the artifacts built for that commit.
     #[serde(default)]
     pub rev: Option<String>,
-    /// Exact commit learned from an earlier v2 response in this clone operation.
+    /// Exact commit learned from an earlier response in this clone operation.
     /// Unlike `rev`, this is metadata-only and never contacts the upstream or
     /// schedules work.
     #[serde(default)]
@@ -1099,14 +1099,8 @@ pub struct RefResponse {
     pub shallow: bool,
     /// True once the full clonepack's archive is built. The server publishes an
     /// editable clonepack first and adds the archive a moment later, so a files
-    /// clone waits for this. Editable clones ignore it. Defaults true for older
-    /// servers that always built the archive before publishing.
-    #[serde(default = "default_true")]
+    /// clone waits for this. Editable clones ignore it.
     pub archive_ready: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -3203,6 +3197,15 @@ async fn get_ref_inner(
     headers: HeaderMap,
     state: ServerState,
 ) -> Response {
+    if !matches!(params.clonepack.as_str(), "full" | "shallow") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "clonepack must be full or shallow".to_string(),
+            }),
+        )
+            .into_response();
+    }
     if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&branch)) {
         return resp;
     }
@@ -3459,9 +3462,11 @@ async fn get_ref_inner(
                         continue;
                     }
                     if let Ok(Some(info)) = state.ref_store.load_branch(&repo_id, &key).await
-                        && !info.commit.is_empty()
+                        && !info.default_branch.is_empty()
+                        && info.default_branch != "HEAD"
+                        && validation::validate_git_rev(&info.default_branch).is_ok()
                     {
-                        fallback = Some(key);
+                        fallback = Some(info.default_branch);
                         break;
                     }
                 }
@@ -3504,7 +3509,7 @@ async fn get_ref_inner(
                 .map(|(k, _)| k.clone())
                 .unwrap_or_default();
             let info = resolved.map(|(_, i)| i).unwrap_or_else(|| RefInfo {
-                internal_exact_result: false,
+                internal_exact_result: true,
                 require_matching_commit: false,
                 moving_publication_fence: None,
                 commit: commit.clone(),
@@ -3770,24 +3775,10 @@ fn ref_response(
     private: bool,
 ) -> RefResponse {
     let ttl = ref_signed_url_ttl(private);
-    let artifacts = if clonepack_kind == "shallow" && !info.shallow_clonepack.manifest.is_empty() {
-        &info.shallow_clonepack
-    } else {
-        &info.full_clonepack
-    };
-
-    // Fallback to the legacy top-level fields if the new struct is empty (older
-    // stored refs).
-    let clonepack_manifest = if artifacts.manifest.is_empty() {
-        info.clonepack_manifest.clone()
-    } else {
-        artifacts.manifest.clone()
-    };
-    let metadata_chunk = if artifacts.metadata_chunk.is_empty() {
-        info.metadata_chunk.clone()
-    } else {
-        artifacts.metadata_chunk.clone()
-    };
+    let artifacts = exact_clonepack_artifacts(info, clonepack_kind)
+        .expect("clonepack kind is validated before response construction");
+    let clonepack_manifest = artifacts.manifest.clone();
+    let metadata_chunk = artifacts.metadata_chunk.clone();
 
     let clonepack_manifest_url = signed_url(storage, ttl, &clonepack_manifest);
     let metadata_chunk_url = signed_url(storage, ttl, &metadata_chunk);
@@ -3857,16 +3848,6 @@ fn ref_response(
     // Sign the idx bundle so the client fetches all idx in one GET.
     let idx_bundle_url = signed_url(storage, ttl, &artifacts.idx_bundle);
 
-    // The served commit is the selected variant's commit — which may differ from
-    // RefInfo.commit during two-phase publish (depth=0 serves the previous commit
-    // until the new full history is built). The client writes HEAD to this, so it
-    // must match the installed objects.
-    let served_commit = if artifacts.commit.is_empty() {
-        info.commit.clone()
-    } else {
-        artifacts.commit.clone()
-    };
-
     let (owner, repo) = repo_id
         .github_owner_repo()
         .map(|(o, r)| (o.to_string(), r.to_string()))
@@ -3880,7 +3861,7 @@ fn ref_response(
         origin_url,
         branch,
         default_branch: info.default_branch.clone(),
-        commit: served_commit,
+        commit: artifacts.commit.clone(),
         parent_commit: info.parent_commit.clone(),
         full_pack: info.full_pack.clone(),
         clonepack_manifest,
@@ -4509,6 +4490,85 @@ async fn sync_repo_at_revision(
             Err(resp) => return resp,
         };
 
+    // A retry after phase one resolves entirely from the local mirror and the
+    // exact result row. Full readiness is the selected artifact's identity,
+    // never the presence of a phase-one row or its top-level fields.
+    let resolve_exact_target = || {
+        let effective_branch = if branch == "HEAD" {
+            git::default_branch(&mirror_dir)
+                .ok()
+                .filter(|candidate| !candidate.is_empty())?
+        } else {
+            branch.clone()
+        };
+        let commit = git::resolve_commit(&mirror_dir, &at_rev).ok()?;
+        Some((effective_branch, commit))
+    };
+    if let Some((effective_branch, commit)) = resolve_exact_target() {
+        let exact_key = exact_ref_store_key(&effective_branch, &commit);
+        match state.ref_store.load_branch(&repo_id, &exact_key).await {
+            Ok(Some(info)) if exact_ref_info_serves_commit(&info, "full", &commit) => {
+                if let Err(error) = state
+                    .ref_store
+                    .touch_last_accessed_at(&repo_id, &exact_key, &commit)
+                    .await
+                {
+                    warn!(
+                        "failed to touch historical exact result {}@{}: {error:#}",
+                        repo_id.storage_key(),
+                        exact_key
+                    );
+                }
+                state.metrics.record_sync(start.elapsed());
+                let response = sync_response_without_storage_read(
+                    &repo_id,
+                    &provider,
+                    effective_branch,
+                    &info,
+                    &state.storage,
+                    "full",
+                    private,
+                    "no-op",
+                );
+                return (StatusCode::OK, Json(response)).into_response();
+            }
+            Ok(Some(info)) => {
+                if let Some(failure) = info
+                    .build_status
+                    .as_deref()
+                    .and_then(|status| status.strip_prefix("failed: "))
+                {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(ErrorResponse {
+                            error: format!("exact commit {commit} is unavailable: {failure}"),
+                        }),
+                    )
+                        .into_response();
+                }
+                let active_key = inproc_build_key(&repo_id, &branch, Some(&at_rev));
+                if state.build_waiters.lock().await.contains_key(&active_key) {
+                    return artifact_pending_response(
+                        &commit,
+                        &effective_branch,
+                        state.build_queue.depth().await,
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                state.metrics.record_error();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("exact revision lookup failed: {error:#}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Async build queue: enqueue the build onto the bounded background worker so
     // it survives client disconnect / HTTP timeout (the key win for huge repos)
     // and is rate-bounded under load. Coalesce concurrent `/sync` for the same
@@ -4607,7 +4667,18 @@ async fn sync_repo_at_revision(
                 };
                 let load_key = exact_ref_store_key(&effective_branch, &commit);
                 match state.ref_store.load_branch(&repo_id, &load_key).await {
-                    Ok(Some(info)) => {
+                    Ok(Some(info)) if exact_ref_info_serves_commit(&info, "full", &commit) => {
+                        if let Err(error) = state
+                            .ref_store
+                            .touch_last_accessed_at(&repo_id, &load_key, &commit)
+                            .await
+                        {
+                            warn!(
+                                "failed to touch historical exact result {}@{}: {error:#}",
+                                repo_id.storage_key(),
+                                load_key
+                            );
+                        }
                         state.metrics.record_sync(start.elapsed());
                         let resp = sync_response(
                             &repo_id,
@@ -4621,6 +4692,28 @@ async fn sync_repo_at_revision(
                             build.phases,
                         );
                         (StatusCode::OK, Json(resp)).into_response()
+                    }
+                    Ok(Some(info))
+                        if info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY) =>
+                    {
+                        artifact_pending_response(
+                            &commit,
+                            &effective_branch,
+                            state.build_queue.depth().await,
+                        )
+                    }
+                    Ok(Some(info)) => {
+                        state.metrics.record_error();
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "build finished without an exact Full artifact for {commit}: {}",
+                                    info.build_status.as_deref().unwrap_or("incomplete")
+                                ),
+                            }),
+                        )
+                            .into_response()
                     }
                     _ => (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -7634,7 +7727,7 @@ async fn build_and_publish_two_phase(
     }
 
     let mut info = RefInfo {
-        internal_exact_result: moving_branch.is_some(),
+        internal_exact_result: true,
         require_matching_commit: false,
         moving_publication_fence,
         commit: commit.to_string(),
@@ -10630,7 +10723,12 @@ mod tests {
             clonepack_manifest: "manifest".to_string(),
             metadata_chunk: "metadata".to_string(),
             archive_chunks: vec!["chunk1".to_string(), "chunk2".to_string()],
-            full_clonepack: crate::ClonepackArtifacts::default(),
+            full_clonepack: crate::ClonepackArtifacts {
+                manifest: "exact-manifest".to_string(),
+                metadata_chunk: "exact-metadata".to_string(),
+                commit: "exact-commit".to_string(),
+                ..Default::default()
+            },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_base_commit: String::new(),
@@ -10653,6 +10751,9 @@ mod tests {
             "full",
             false,
         );
+        assert_eq!(resp.commit, "exact-commit");
+        assert_eq!(resp.clonepack_manifest, "exact-manifest");
+        assert_eq!(resp.metadata_chunk, "exact-metadata");
         assert!(resp.clonepack_manifest_url.is_none());
         assert!(resp.metadata_chunk_url.is_none());
         assert!(resp.archive_chunk_urls.is_none());
@@ -10825,6 +10926,7 @@ mod tests {
             .uri(uri)
             .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
             .header("Authorization", auth_header())
+            .header("x-ripclone-protocol", crate::PROTOCOL_VERSION)
             .body(Body::empty())
             .unwrap()
     }
@@ -10835,7 +10937,8 @@ mod tests {
         let mut b = axum::http::Request::builder()
             .method(method)
             .uri(uri)
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("x-ripclone-protocol", crate::PROTOCOL_VERSION);
         if let Some(a) = auth {
             b = b.header("Authorization", a);
         }
@@ -12422,6 +12525,24 @@ mod tests {
         let listed = state.ref_store.list_branches(&rid).await.unwrap();
         assert_eq!(listed.len(), 2, "fixture has a source and an exact row");
 
+        // A repository populated only by `sync --at` must be enumerable for
+        // retention/accounting without turning its exact key into a source ref.
+        let exact_only_rid = RepoId::github("acme/exact-only");
+        mark_added(&state, exact_only_rid.clone()).await;
+        state
+            .ref_store
+            .save_branch(
+                &exact_only_rid,
+                &format!("main#{}", "b".repeat(40)),
+                &RefInfo {
+                    internal_exact_result: true,
+                    default_branch: "main".to_string(),
+                    ..exact_stale
+                },
+            )
+            .await
+            .unwrap();
+
         unsafe {
             std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path());
             std::env::set_var("RIPCLONE_TESTING", "1");
@@ -12431,7 +12552,7 @@ mod tests {
         assert_eq!(
             probe.tip_probes.load(Ordering::SeqCst) - probes_before,
             1,
-            "internal exact results are not provider source refs"
+            "internal exact results, including exact-only repositories, are not provider source refs"
         );
 
         // Mark it built at the real tip → the next poll is a no-op.
@@ -12513,16 +12634,14 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
         }
-        // An absent declaration does not select alternate behavior; the only
-        // implemented request path remains exact-result behavior.
         let current = crate::PROTOCOL_VERSION.to_string();
-        for proto in [Some(current.as_str()), None] {
-            let resp = app
+        for protocol in [Some(current.as_str()), None] {
+            let response = app
                 .clone()
-                .oneshot(protocol_request("/v1/repos/acme/secret/status", proto))
+                .oneshot(protocol_request("/v1/repos/acme/secret/status", protocol))
                 .await
                 .unwrap();
-            assert_ne!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+            assert_ne!(response.status(), StatusCode::UPGRADE_REQUIRED);
         }
     }
 
@@ -14142,7 +14261,8 @@ mod tests {
             .method("POST")
             .uri("/v1/refs")
             .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            .header("x-ripclone-protocol", crate::PROTOCOL_VERSION);
         if let Some(t) = token {
             b = b.header("Authorization", format!("Bearer {t}"));
         }

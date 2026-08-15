@@ -257,14 +257,10 @@ pub struct RefResponse {
     #[serde(default)]
     pub shallow: bool,
     /// True once the full clonepack's archive is built (files mode can clone).
-    /// Defaults true so an older server that always shipped the archive is treated
-    /// as ready.
-    #[serde(default = "ref_archive_ready_default")]
     pub archive_ready: bool,
     /// The hosted server's per-clone id, captured from the `X-Ripclone-Clone-Id`
-    /// response header (not part of the JSON body). `None` for a self-hosted or
-    /// older server that doesn't mint one — in that case the post-clone metrics
-    /// report is skipped entirely.
+    /// response header (not part of the JSON body). `None` when the server does
+    /// not mint one; in that case the post-clone metrics report is skipped.
     #[serde(skip)]
     pub clone_id: Option<String>,
     /// True when resolving this ref required a 202/poll (a cold build) rather
@@ -272,10 +268,6 @@ pub struct RefResponse {
     /// JSON body.
     #[serde(skip)]
     pub cold: bool,
-}
-
-fn ref_archive_ready_default() -> bool {
-    true
 }
 
 fn ref_poll_config() -> (usize, std::time::Duration) {
@@ -860,8 +852,7 @@ pub struct CloneOutcome {
     pub mode: &'static str,
     /// True when the resolve had to poll a cold build (202) before succeeding.
     pub cold: bool,
-    /// The cloud's `X-Ripclone-Clone-Id`. `None` ⇒ self-hosted/older server ⇒
-    /// no metrics report.
+    /// The cloud's `X-Ripclone-Clone-Id`. `None` means no metrics report.
     pub clone_id: Option<String>,
     /// Total bytes downloaded (metadata + pack/archive chunks).
     pub bytes: u64,
@@ -1500,8 +1491,8 @@ impl Client {
             }
             if status == reqwest::StatusCode::OK {
                 // Capture the hosted server's per-clone id from the response
-                // header before the body is consumed. Absent on a self-hosted or
-                // older server, which leaves `clone_id` None.
+                // header before the body is consumed. If absent, `clone_id`
+                // remains `None`.
                 let clone_id = resp
                     .headers()
                     .get("x-ripclone-clone-id")

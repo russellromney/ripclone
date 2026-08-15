@@ -2,6 +2,10 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `internal/ROADMAP.md`.
 
+## One current wire implementation
+
+- **Authenticated API requests have one implementation** (`rust/src/client.rs`, `rust/src/server.rs`): the client declares `PROTOCOL_VERSION`, every declared mismatch returns `426 Upgrade Required`, and no header value selects compatibility behavior. Current ref responses require their complete current fields, including explicit archive readiness. This supersedes the earlier version-reconciliation behavior that accepted declared older protocols.
+
 ## Exact sync admission
 
 - **Ordinary tip sync now admits an immutable commit before queueing** (`rust/src/server.rs`, `rust/src/git.rs`): one bounded `ls-remote` resolves B, a complete ready B returns a mutation-free `200`, and changed work returns `202` with `commit` and `branch` without waiting for the builder. The CLI reports `accepted B` or `already current at B`.
@@ -109,7 +113,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 - **`ripclone --version` and `ripclone-server --version`** now report the build version (they previously errored).
 - **`/v1/version`** (`rust/src/server.rs`): a public, unauthenticated endpoint returning `{ version, protocol }` so a client can check compatibility without credentials.
 - **`ripclone version`** (`rust/src/bin/cli.rs`): prints the CLI's version + protocol, queries the configured server's `/v1/version`, and reports a compatibility verdict. Compatibility is keyed on a new wire **`PROTOCOL_VERSION`** (`rust/src/lib.rs`), not the build version — so the CLI and server can be released on independent cadences as long as their protocol versions match. Bump `PROTOCOL_VERSION` only on a breaking protocol change.
-- **Server enforces the protocol** (`rust/src/client.rs`, `rust/src/server.rs`): the client sends its `PROTOCOL_VERSION` on authenticated requests, and the server rejects a *newer-than-it-understands* client with `426 Upgrade Required` and an actionable message instead of a confusing downstream error. A missing header (legacy client) or an older/equal protocol is allowed, so this never breaks existing clients.
+- **Server enforces the protocol** (`rust/src/client.rs`, `rust/src/server.rs`): the client sends its `PROTOCOL_VERSION` on authenticated requests, and every declared mismatch returns `426 Upgrade Required` with an actionable message. See “One current wire implementation” above for the superseding behavior.
 
 ## Supply chain
 

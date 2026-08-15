@@ -71,6 +71,7 @@ async fn post_sync(
     let response = reqwest::Client::new()
         .post(url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("sync request");
@@ -526,6 +527,7 @@ async fn e2e_sync_admission() {
             server.url
         ))
         .header("Authorization", "Ripclone definitely-wrong")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("unauthorized sync request");
@@ -990,6 +992,7 @@ async fn e2e_sync_admission() {
         reqwest::Client::new()
             .post(cancel_url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
     });
@@ -1344,6 +1347,7 @@ async fn ordinary_build_publishes_exact_commit_result() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("ordinary exact status");
@@ -1359,6 +1363,81 @@ async fn ordinary_build_publishes_exact_commit_result() {
         "internal exact result must not appear as a source branch: {public_refs:?}"
     );
     assert!(status["total_bytes"].as_u64().unwrap() > 0);
+}
+
+/// A historical sync's phase-one row is metadata and shallow readiness only.
+/// Holding phase two at its entry makes the HTTP readiness decision observable:
+/// the first response must be exact pending until Full(commit) is durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn historical_sync_requires_exact_full_before_ready() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.phase2_entry.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    let origin = make_origin("acme", "historical-full-ready");
+    let pinned = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.commit(&[("value.txt", "C\n")], "C");
+    origin.publish();
+    register_added_without_build(&server, "acme/historical-full-ready")
+        .await
+        .expect("register historical readiness fixture");
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/repos/github/acme/historical-full-ready/sync?rev=HEAD~1",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("historical sync phase-one response");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "phase one cannot report exact Full readiness"
+    );
+    let pending: Value = response.json().await.expect("typed exact pending body");
+    assert_eq!(pending["commit"], pinned);
+    assert_eq!(pending["branch"], "main");
+
+    wait_entered(&probe.phase2_entry, 1).await;
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/historical-full-ready");
+    let exact_key = format!("main#{pinned}");
+    let phase_one = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load historical phase-one row")
+        .expect("historical phase-one row is durable");
+    assert!(phase_one.internal_exact_result);
+    assert_eq!(phase_one.commit, pinned);
+    assert_eq!(
+        phase_one.build_status.as_deref(),
+        Some("full history building")
+    );
+    assert!(phase_one.full_clonepack.manifest.is_empty());
+
+    probe.phase2_entry.release();
+    let ready = server
+        .client()
+        .sync_repo_at("acme/historical-full-ready", Some("HEAD~1"), None)
+        .await
+        .expect("historical sync reaches exact Full readiness");
+    assert_eq!(ready.commit, pinned);
+    let exact = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load historical exact result")
+        .expect("historical exact result remains durable");
+    assert_eq!(exact.full_clonepack.commit, pinned);
+    assert!(!exact.full_clonepack.manifest.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
