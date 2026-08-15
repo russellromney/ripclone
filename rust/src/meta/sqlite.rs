@@ -118,23 +118,11 @@ impl MetaDb for SqliteMeta {
         synced_at: Option<i64>,
         generation: Option<i64>,
         require_matching_commit: bool,
+        internal_exact_result: bool,
+        moving_publication_fence: Option<&str>,
     ) -> Result<()> {
-        if require_matching_commit {
-            sqlx::query(
-                "UPDATE refs SET synced_at = ?, generation = ?, data = ?
-                 WHERE repo_key = ? AND branch = ? AND commit_id = ?",
-            )
-            .bind(synced_at)
-            .bind(generation)
-            .bind(data)
-            .bind(repo_key)
-            .bind(branch)
-            .bind(commit_id)
-            .execute(&self.pool)
-            .await
-            .context("save commit-fenced ref")?;
-            return Ok(());
-        }
+        let insert_only = internal_exact_result && require_matching_commit;
+        let expected = moving_publication_fence.unwrap_or(commit_id);
         // The DO UPDATE ... WHERE makes the ordering check atomic with the write:
         // on conflict the row is overwritten only when the new write wins — same
         // commit, a higher-or-equal generation (commit history depth), or, when
@@ -148,12 +136,14 @@ impl MetaDb for SqliteMeta {
                  synced_at = excluded.synced_at,
                  generation = excluded.generation,
                  data = excluded.data
-             WHERE excluded.commit_id = refs.commit_id
-                OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
-                    AND excluded.generation >= refs.generation)
-                OR ((refs.generation IS NULL OR excluded.generation IS NULL)
-                    AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
-                         OR excluded.synced_at >= refs.synced_at))",
+             WHERE ? = 0 AND (
+                (? = 1 AND (excluded.commit_id = refs.commit_id OR refs.commit_id = ?))
+                OR (? = 0 AND (excluded.commit_id = refs.commit_id
+                    OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
+                        AND excluded.generation >= refs.generation)
+                    OR ((refs.generation IS NULL OR excluded.generation IS NULL)
+                        AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
+                             OR excluded.synced_at >= refs.synced_at)))))",
         )
         .bind(repo_key)
         .bind(branch)
@@ -161,6 +151,10 @@ impl MetaDb for SqliteMeta {
         .bind(synced_at)
         .bind(generation)
         .bind(data)
+        .bind(insert_only)
+        .bind(require_matching_commit)
+        .bind(expected)
+        .bind(require_matching_commit)
         .execute(&self.pool)
         .await
         .context("save_ordered ref")?;

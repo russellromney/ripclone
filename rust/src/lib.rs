@@ -228,6 +228,11 @@ pub struct RefInfo {
     /// Stores enforce the check atomically with the write.
     #[serde(default)]
     pub require_matching_commit: bool,
+    /// Commit identity observed in the moving row when this exact result was
+    /// admitted. `Some("")` means the row was absent; `None` makes the result
+    /// exact-only. Moving projections use this as an atomic publication fence.
+    #[serde(default)]
+    pub moving_publication_fence: Option<String>,
     pub commit: String,
     pub parent_commit: Option<String>,
     pub default_branch: String,

@@ -75,6 +75,8 @@ pub trait MetaDb: Send + Sync {
         synced_at: Option<i64>,
         generation: Option<i64>,
         require_matching_commit: bool,
+        internal_exact_result: bool,
+        moving_publication_fence: Option<&str>,
     ) -> Result<()>;
 
     /// Replace the JSON blob only if the row still has both the expected commit
@@ -189,6 +191,8 @@ impl RefStore for SqlRefStore {
                 new_synced,
                 new_generation,
                 info.require_matching_commit,
+                info.internal_exact_result,
+                info.moving_publication_fence.as_deref(),
             )
             .await
     }

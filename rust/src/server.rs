@@ -3191,23 +3191,6 @@ fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: 
         && !ref_info_serves_commit(info, clonepack_kind, commit)
 }
 
-fn pinned_build_active(info: Option<&RefInfo>, clonepack_kind: &str, commit: &str) -> bool {
-    info.is_some_and(|info| {
-        info.commit == commit
-            && matches!(
-                info.build_status.as_deref(),
-                Some("building") | Some(BUILDING_FULL_HISTORY)
-            )
-            && !exact_ref_info_serves_commit(info, clonepack_kind, commit)
-    })
-}
-
-fn phase_one_shallow_ready_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
-    clonepack_kind == "shallow"
-        && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
-        && exact_ref_info_serves_commit(info, clonepack_kind, commit)
-}
-
 /// `build_status` set on a phase-1 row while the full history + archive build
 /// runs in the background.
 pub(crate) const BUILDING_FULL_HISTORY: &str = "full history building";
@@ -3417,9 +3400,7 @@ async fn get_ref_inner(
         let info = match exact_info {
             Some(info) if exact_ref_info_serves_commit(&info, &params.clonepack, pinned) => info,
             pending_info => {
-                if params.rev.is_none()
-                    && !pinned_build_active(pending_info.as_ref(), &params.clonepack, pinned)
-                {
+                if params.rev.is_none() {
                     let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
@@ -3436,7 +3417,7 @@ async fn get_ref_inner(
                         recheck: recheck_max(),
                         size_bytes,
                     };
-                    if let Err(error) = enqueue_direct_build(&state, job).await {
+                    if let Err(error) = enqueue_direct_build(&state, job, false).await {
                         state.metrics.record_error();
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -3507,65 +3488,6 @@ async fn get_ref_inner(
         return (StatusCode::OK, Json(response)).into_response();
     }
 
-    // A phase-one row is already an authenticated, immutable statement of the
-    // admitted target. Serve its published shallow artifact, or report its Full
-    // artifact pending, directly from metadata instead of reacquiring the
-    // moving source merely to discover the same commit. HEAD may still be the
-    // prior alias while phase two is blocked, so follow its stored
-    // default-branch name to the freshly published concrete row.
-    if protocol_v2 && params.rev.is_none() {
-        let mut candidates = vec![branch.clone()];
-        if branch == "HEAD"
-            && let Ok(Some(head)) = state.ref_store.load_branch(&repo_id, "HEAD").await
-            && !head.default_branch.is_empty()
-            && head.default_branch != "HEAD"
-        {
-            candidates.push(head.default_branch);
-        }
-        for candidate in candidates {
-            let Ok(Some(info)) = state.ref_store.load_branch(&repo_id, &candidate).await else {
-                continue;
-            };
-            if info.commit.is_empty() {
-                continue;
-            }
-            let response_branch = if candidate == "HEAD" && !info.default_branch.is_empty() {
-                info.default_branch.clone()
-            } else {
-                candidate.clone()
-            };
-            if phase_one_shallow_ready_for_tip(&info, &params.clonepack, &info.commit) {
-                let response = ref_response(
-                    &repo_id,
-                    &provider,
-                    response_branch,
-                    &info,
-                    &state.storage,
-                    &params.clonepack,
-                    private,
-                );
-                if let Err(e) = state
-                    .ref_store
-                    .touch_last_accessed_at(&repo_id, &candidate, &info.commit)
-                    .await
-                {
-                    warn!(
-                        "failed to touch phase-one shallow {}@{}: {e:#}",
-                        candidate, info.commit
-                    );
-                }
-                return (StatusCode::OK, Json(response)).into_response();
-            }
-            if full_clonepack_pending_for_tip(&info, &params.clonepack, &info.commit) {
-                return artifact_pending_response(
-                    &info.commit,
-                    &response_branch,
-                    state.build_queue_depth.load(Ordering::Relaxed),
-                );
-            }
-        }
-    }
-
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
     // bare mirror directory. Acquiring the lock also means any in-progress sync
     // for this repo has finished by the time we proceed.
@@ -3580,11 +3502,16 @@ async fn get_ref_inner(
     if params.rev.is_none()
         && let Some(resp) = cached_ref_response(&state, &repo_id, &branch, &cache_variant)
     {
-        // A cached hit is still a real access for warm-TTL accounting; bump
-        // last_accessed_at on the branch row this response came from.
+        // Protocol 2 responses are sourced from the exact row, including cache
+        // hits. Never refresh an unrelated moving projection.
+        let served_key = if protocol_v2 {
+            ref_store_key(&resp.branch, Some(&resp.commit), Some(&resp.commit))
+        } else {
+            resp.branch.clone()
+        };
         if let Err(e) = state
             .ref_store
-            .touch_last_accessed_at(&repo_id, &resp.branch, &resp.commit)
+            .touch_last_accessed_at(&repo_id, &served_key, &resp.commit)
             .await
         {
             warn!(
@@ -3704,6 +3631,7 @@ async fn get_ref_inner(
             let info = resolved.map(|(_, i)| i).unwrap_or_else(|| RefInfo {
                 internal_exact_result: false,
                 require_matching_commit: false,
+                moving_publication_fence: None,
                 commit: commit.clone(),
                 parent_commit: None,
                 default_branch: default_branch.clone(),
@@ -3763,6 +3691,20 @@ async fn get_ref_inner(
             };
             let exact_variant_pending =
                 protocol_v2 && !exact_ref_info_serves_commit(&info, &params.clonepack, &commit);
+            if protocol_v2
+                && let Some(failure) = info
+                    .build_status
+                    .as_deref()
+                    .and_then(|status| status.strip_prefix("failed: "))
+            {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse {
+                        error: format!("exact commit {commit} is unavailable: {failure}"),
+                    }),
+                )
+                    .into_response();
+            }
             if (params.rev.is_none()
                 && full_clonepack_pending_for_tip(&info, &params.clonepack, &commit))
                 || pending_for_rev
@@ -3773,7 +3715,7 @@ async fn get_ref_inner(
                 // client that only polls GET will eventually see a 200. A ref that
                 // is simply still building already has a worker on it, so do not
                 // enqueue a duplicate.
-                if is_evicted || evicted_for_rev {
+                if (protocol_v2 && params.rev.is_none()) || is_evicted || evicted_for_rev {
                     // Rebuild under the *originally requested* branch, not the
                     // concrete branch it resolved to. For a plain `HEAD` clone this
                     // keeps the job as `HEAD`, so the completed build refreshes the
@@ -3802,15 +3744,21 @@ async fn get_ref_inner(
                     }
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
-                        branch: branch.clone(),
+                        branch: if protocol_v2 && params.rev.is_none() {
+                            effective_branch.clone()
+                        } else {
+                            branch.clone()
+                        },
                         rev: historical_rev.clone(),
                         admitted_commit: historical_rev.is_none().then(|| commit.clone()),
-                        admitted_default_branch: None,
+                        admitted_default_branch: (protocol_v2 && params.rev.is_none())
+                            .then(|| default_branch.clone()),
                         credential: credential.clone(),
                         recheck: 0,
                         size_bytes,
                     };
-                    if let Err(error) = enqueue_direct_build(&state, job).await {
+                    let moving_authorized = params.rev.is_none();
+                    if let Err(error) = enqueue_direct_build(&state, job, moving_authorized).await {
                         warn!(
                             "failed to enqueue rebuild for evicted {}@{}: {error}",
                             repo_id.storage_key(),
@@ -4619,7 +4567,7 @@ async fn sync_repo_inner(
         recheck: 0,
         size_bytes,
     };
-    let outcome = match enqueue_admitted_build(&state, job).await {
+    let outcome = match enqueue_admitted_build(&state, job, true).await {
         Ok(outcome) => outcome,
         Err(error) => {
             state.metrics.record_error();
@@ -5179,6 +5127,7 @@ fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
 async fn enqueue_admitted_build(
     state: &ServerState,
     job: BuildJob,
+    moving_authorized: bool,
 ) -> Result<EnqueueOutcome, String> {
     if job.rev.is_none() {
         let Some(commit) = job.admitted_commit.as_deref() else {
@@ -5186,6 +5135,7 @@ async fn enqueue_admitted_build(
         };
         crate::validation::validate_object_id(commit)
             .map_err(|e| format!("invalid admitted commit: {e}"))?;
+        prepare_exact_admission(state, &job, moving_authorized).await?;
     }
     let local_key = state.build_queue.inproc_wait().then(|| job.key());
     if let Some(key) = local_key.as_deref() {
@@ -5225,6 +5175,63 @@ async fn enqueue_admitted_build(
     }
 }
 
+/// Persist the moving-row identity at the operation's resolution point before
+/// a worker can publish. The first missing-row admission is insert-only, so a
+/// duplicate cannot replace the fence selected by the active job.
+async fn prepare_exact_admission(
+    state: &ServerState,
+    job: &BuildJob,
+    moving_authorized: bool,
+) -> Result<(), String> {
+    let commit = job
+        .admitted_commit
+        .as_deref()
+        .ok_or_else(|| "ordinary tip build has no admitted commit".to_string())?;
+    let exact_key = ref_store_key(&job.branch, Some(commit), Some(commit));
+    let existing = state
+        .ref_store
+        .load_branch(&job.repo_id, &exact_key)
+        .await
+        .map_err(|e| format!("exact admission lookup failed: {e}"))?;
+    if existing.as_ref().is_some_and(|info| {
+        info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+    }) {
+        return Ok(());
+    }
+    let moving_publication_fence = if moving_authorized {
+        Some(
+            state
+                .ref_store
+                .load_branch(&job.repo_id, &job.branch)
+                .await
+                .map_err(|e| format!("moving admission lookup failed: {e}"))?
+                .map(|info| info.commit)
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+    let evicted = existing.is_some();
+    let pending = RefInfo {
+        internal_exact_result: true,
+        require_matching_commit: !evicted,
+        moving_publication_fence,
+        commit: commit.to_string(),
+        default_branch: job
+            .admitted_default_branch
+            .clone()
+            .unwrap_or_else(|| job.branch.clone()),
+        build_status: evicted.then(|| crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+        warm_pinned: existing.as_ref().is_some_and(|info| info.warm_pinned),
+        ..Default::default()
+    };
+    state
+        .ref_store
+        .save_branch(&job.repo_id, &exact_key, &pending)
+        .await
+        .map_err(|e| format!("exact admission persistence failed: {e}"))
+}
+
 /// Fire-and-forget: enqueue a build for `(repo_id, branch)` at the exact
 /// admitted commit and return immediately — the build runs ahead of any clone
 /// (build-before-clone).
@@ -5241,6 +5248,7 @@ async fn trigger_build(
     branch: &str,
     admitted_commit: String,
     admitted_default_branch: Option<String>,
+    moving_authorized: bool,
 ) -> Result<EnqueueOutcome, String> {
     match state.ref_store.load_added_repo(repo_id).await {
         Ok(Some(_)) => {}
@@ -5284,7 +5292,7 @@ async fn trigger_build(
         size_bytes,
     };
 
-    enqueue_admitted_build(state, job).await
+    enqueue_admitted_build(state, job, moving_authorized).await
 }
 
 /// Query for the admin config endpoints: an optional branch selects a
@@ -5514,6 +5522,7 @@ async fn build_handler(
         &admitted_branch,
         tip.commit.clone(),
         tip.default_branch.clone(),
+        true,
     )
     .await
     {
@@ -5742,6 +5751,7 @@ async fn webhook_dispatch_push(
         &branch,
         after.to_string(),
         event.default_branch.clone(),
+        false,
     )
     .await
     {
@@ -7527,14 +7537,16 @@ async fn publish_moving_refs(
     moving_branch: Option<&str>,
     default_branch: &str,
     info: &RefInfo,
-    require_matching_commit: bool,
 ) -> Result<()> {
     let Some(moving_branch) = moving_branch else {
         return Ok(());
     };
+    if info.moving_publication_fence.is_none() {
+        return Ok(());
+    }
     let mut projection = info.clone();
     projection.internal_exact_result = false;
-    projection.require_matching_commit = require_matching_commit;
+    projection.require_matching_commit = true;
     if moving_branch != exact_branch {
         admission_test_ref_store_write();
         ref_store
@@ -7555,7 +7567,7 @@ async fn publish_moving_refs(
         {
             admission_test_ref_store_write();
             ref_store
-                .save_branch(repo_id, "HEAD", &current)
+                .save_branch(repo_id, "HEAD", &projection)
                 .await
                 .with_context(|| format!("persist HEAD ref for {}", repo_id.storage_key()))?;
         }
@@ -7607,6 +7619,9 @@ async fn build_and_publish_two_phase(
     // would point at deleted packs and the next clone 404s. Treat an evicted prev
     // as absent so the rebuild is cold and re-uploads everything it references.
     let exact_prev = ref_store.load_branch(repo_id, branch).await.ok().flatten();
+    let moving_publication_fence = exact_prev
+        .as_ref()
+        .and_then(|info| info.moving_publication_fence.clone());
     let placeholder_only = exact_prev.as_ref().is_some_and(|info| {
         info.build_status.as_deref() == Some("building")
             && info.full_clonepack.manifest.is_empty()
@@ -7917,6 +7932,7 @@ async fn build_and_publish_two_phase(
     let mut info = RefInfo {
         internal_exact_result: moving_branch.is_some(),
         require_matching_commit: false,
+        moving_publication_fence,
         commit: commit.to_string(),
         parent_commit: parent.clone(),
         default_branch: default_branch.to_string(),
@@ -7993,7 +8009,6 @@ async fn build_and_publish_two_phase(
         moving_branch,
         default_branch,
         &info,
-        false,
     )
     .await?;
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
@@ -8725,7 +8740,6 @@ async fn build_full_in_background(
                 moving_branch,
                 default_branch,
                 &info,
-                true,
             )
             .await?;
         }
@@ -9215,12 +9229,19 @@ async fn enqueue_recheck_build(
             recheck,
             size_bytes,
         },
+        true,
     )
     .await
 }
 
-async fn enqueue_direct_build(state: &ServerState, job: BuildJob) -> Result<(), String> {
-    enqueue_admitted_build(state, job).await.map(|_| ())
+async fn enqueue_direct_build(
+    state: &ServerState,
+    job: BuildJob,
+    moving_authorized: bool,
+) -> Result<(), String> {
+    enqueue_admitted_build(state, job, moving_authorized)
+        .await
+        .map(|_| ())
 }
 
 async fn handle_phase2_failure(
@@ -9258,7 +9279,7 @@ async fn handle_phase2_failure(
             recheck,
             size_bytes,
         };
-        if let Err(e) = enqueue_direct_build(&action.state, job).await {
+        if let Err(e) = enqueue_direct_build(&action.state, job, true).await {
             warn!(
                 "phase-2 retry trigger failed for {}@{branch} {commit}: {e}",
                 repo_id.storage_key()
@@ -9387,6 +9408,12 @@ pub async fn poll_once(state: &ServerState) -> usize {
             }
         };
         for branch in branches {
+            if matches!(
+                state.ref_store.load_branch(&repo_id, &branch).await,
+                Ok(Some(info)) if info.internal_exact_result
+            ) {
+                continue;
+            }
             // Cheap tip probe, under the same fetch cap as a real fetch so a sweep
             // can't become uncapped upstream chatter. Best-effort.
             let credential = match state.broker.fetch_credential(&repo_id, None) {
@@ -9423,6 +9450,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
                 &admitted_branch,
                 tip.commit.clone(),
                 tip.default_branch.clone(),
+                true,
             )
             .await
             {
@@ -10783,8 +10811,8 @@ mod tests {
             "shallow is already exact for the new commit"
         );
         assert!(
-            phase_one_shallow_ready_for_tip(&info, "shallow", new_commit),
-            "phase-one shallow metadata is immediately usable"
+            exact_ref_info_serves_commit(&info, "shallow", new_commit),
+            "the exact phase-one row serves its own shallow artifact"
         );
     }
 
@@ -11397,6 +11425,7 @@ mod tests {
                 recheck: 0,
                 size_bytes: None,
             },
+            true,
         )
         .await
         .expect_err("a full local queue must reject the job");
@@ -12737,13 +12766,17 @@ mod tests {
             .save_branch(&rid, "HEAD", &stale)
             .await
             .unwrap();
+        let exact_stale = RefInfo {
+            internal_exact_result: true,
+            ..stale.clone()
+        };
         state
             .ref_store
-            .save_branch(&rid, &format!("main#{}", "a".repeat(40)), &stale)
+            .save_branch(&rid, &format!("main#{}", "a".repeat(40)), &exact_stale)
             .await
             .unwrap();
         let listed = state.ref_store.list_branches(&rid).await.unwrap();
-        assert_eq!(listed.len(), 2, "fixture has both compatibility rows");
+        assert_eq!(listed.len(), 2, "fixture has a source and an exact row");
 
         unsafe {
             std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path());
@@ -12753,8 +12786,8 @@ mod tests {
         let on_change = poll_once(&state).await;
         assert_eq!(
             probe.tip_probes.load(Ordering::SeqCst) - probes_before,
-            2,
-            "the ambiguous compatibility namespace retains its established polling behavior"
+            1,
+            "internal exact results are not provider source refs"
         );
 
         // Mark it built at the real tip → the next poll is a no-op.
@@ -12778,8 +12811,8 @@ mod tests {
         let when_built = poll_once(&state).await;
         assert_eq!(
             probe.tip_probes.load(Ordering::SeqCst) - probes_before_built,
-            2,
-            "both stored keys remain polling candidates after the real ref is built"
+            1,
+            "only the source ref remains a polling candidate"
         );
         unsafe {
             std::env::remove_var("RIPCLONE_ORIGIN_BASE");
@@ -13702,12 +13735,14 @@ mod tests {
         let (state, mut rx) = test_state_with_queue(&tmp);
         let repo_id = RepoId::github("acme/evicted");
         mark_added(&state, repo_id.clone()).await;
+        let exact_key = ref_store_key("main", Some(&commit), Some(&commit));
         state
             .ref_store
             .save_branch(
                 &repo_id,
-                "main",
+                &exact_key,
                 &RefInfo {
+                    internal_exact_result: true,
                     commit: commit.clone(),
                     build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
                     ..Default::default()
@@ -13790,13 +13825,15 @@ mod tests {
         state.build_queue_depth = Arc::clone(&depth);
         let repo_id = RepoId::github("acme/evicted-full");
         mark_added(&state, repo_id.clone()).await;
+        let exact_key = ref_store_key("main", Some(&commit), Some(&commit));
         state
             .ref_store
             .save_branch(
                 &repo_id,
-                "main",
+                &exact_key,
                 &RefInfo {
-                    commit,
+                    internal_exact_result: true,
+                    commit: commit.clone(),
                     build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
                     ..Default::default()
                 },
@@ -13834,7 +13871,7 @@ mod tests {
         assert_eq!(
             state
                 .ref_store
-                .load_branch(&repo_id, "main")
+                .load_branch(&repo_id, &exact_key)
                 .await
                 .unwrap()
                 .unwrap()
@@ -13881,13 +13918,15 @@ mod tests {
         });
         let repo_id = RepoId::github("acme/evicted-error");
         mark_added(&state, repo_id.clone()).await;
+        let exact_key = ref_store_key("main", Some(&commit), Some(&commit));
         state
             .ref_store
             .save_branch(
                 &repo_id,
-                "main",
+                &exact_key,
                 &RefInfo {
-                    commit,
+                    internal_exact_result: true,
+                    commit: commit.clone(),
                     build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
                     ..Default::default()
                 },
@@ -13915,7 +13954,7 @@ mod tests {
         assert_eq!(
             state
                 .ref_store
-                .load_branch(&repo_id, "main")
+                .load_branch(&repo_id, &exact_key)
                 .await
                 .unwrap()
                 .unwrap()
@@ -13975,7 +14014,9 @@ mod tests {
         mark_added(&state, rid.clone()).await;
 
         let old_ts = 1_000_000u64;
+        let exact_key = ref_store_key("main", Some(&tip), Some(&tip));
         let info = RefInfo {
+            internal_exact_result: true,
             commit: tip.clone(),
             synced_at: Some(old_ts),
             last_accessed_at: Some(old_ts),
@@ -13986,22 +14027,28 @@ mod tests {
             },
             ..Default::default()
         };
-        ref_store.save_branch(&rid, "main", &info).await.unwrap();
+        ref_store
+            .save_branch(&rid, &exact_key, &info)
+            .await
+            .unwrap();
 
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
         let app = build_app(state);
         let response = app
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/acme/widget/refs/main",
-                Some(&auth_header()),
+            .oneshot(protocol_request(
+                "/v1/repos/github/acme/widget/refs/main?clonepack=full",
+                Some("2"),
             ))
             .await
             .unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(response.status(), StatusCode::OK);
-        let updated = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
+        let updated = ref_store
+            .load_branch(&rid, &exact_key)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             updated.last_accessed_at.unwrap() > old_ts,
             "last_accessed_at must advance on a successful ref read"
@@ -14130,7 +14177,9 @@ mod tests {
         mark_added(&state, rid.clone()).await;
 
         let old_ts = 1_000_000u64;
+        let exact_key = ref_store_key("main", Some(&tip), Some(&tip));
         let info = RefInfo {
+            internal_exact_result: true,
             commit: tip.clone(),
             synced_at: Some(old_ts),
             last_accessed_at: Some(old_ts),
@@ -14141,41 +14190,55 @@ mod tests {
             },
             ..Default::default()
         };
-        ref_store.save_branch(&rid, "main", &info).await.unwrap();
+        ref_store
+            .save_branch(&rid, &exact_key, &info)
+            .await
+            .unwrap();
 
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
         let app = build_app(state);
         let first = app
             .clone()
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/acme/widget/refs/main",
-                Some(&auth_header()),
+            .oneshot(protocol_request(
+                "/v1/repos/github/acme/widget/refs/main?clonepack=full",
+                Some("2"),
             ))
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        let after_first = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
+        let after_first = ref_store
+            .load_branch(&rid, &exact_key)
+            .await
+            .unwrap()
+            .unwrap();
         let first_ts = after_first.last_accessed_at.unwrap();
         assert!(first_ts > old_ts);
 
-        // The second request should be a cache hit and still bump
-        // last_accessed_at for warm-TTL accounting.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut aged = after_first;
+        aged.last_accessed_at = Some(old_ts);
+        ref_store
+            .save_branch(&rid, &exact_key, &aged)
+            .await
+            .unwrap();
+        // The second response is cached, but its access refresh still targets
+        // the exact row that supplied the cached artifact.
         let second = app
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/acme/widget/refs/main",
-                Some(&auth_header()),
+            .oneshot(protocol_request(
+                "/v1/repos/github/acme/widget/refs/main?clonepack=full",
+                Some("2"),
             ))
             .await
             .unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(second.status(), StatusCode::OK);
-        let after_second = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
+        let after_second = ref_store
+            .load_branch(&rid, &exact_key)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            after_second.last_accessed_at.unwrap() > first_ts,
+            after_second.last_accessed_at.unwrap() > old_ts,
             "last_accessed_at must advance on a cached ref read"
         );
     }

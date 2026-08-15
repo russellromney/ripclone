@@ -209,9 +209,9 @@ impl PhaseOnePublishBarrier {
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn after_save(&self, branch: &str, info: &ripclone::RefInfo) {
+    async fn after_save(&self, _branch: &str, info: &ripclone::RefInfo) {
         if !self.armed.load(std::sync::atomic::Ordering::SeqCst)
-            || branch.contains('#')
+            || !info.internal_exact_result
             || info.build_status.as_deref() != Some("full history building")
             || self
                 .consumed

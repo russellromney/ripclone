@@ -124,19 +124,12 @@ impl MetaDb for LibsqlMeta {
         synced_at: Option<i64>,
         generation: Option<i64>,
         require_matching_commit: bool,
+        internal_exact_result: bool,
+        moving_publication_fence: Option<&str>,
     ) -> Result<()> {
-        if require_matching_commit {
-            self.conn()
-                .await?
-                .execute(
-                    "UPDATE refs SET synced_at = ?, generation = ?, data = ?
-                     WHERE repo_key = ? AND branch = ? AND commit_id = ?",
-                    libsql::params![synced_at, generation, data, repo_key, branch, commit_id],
-                )
-                .await
-                .context("save commit-fenced ref")?;
-            return Ok(());
-        }
+        let insert_only = i64::from(internal_exact_result && require_matching_commit);
+        let require_match = i64::from(require_matching_commit);
+        let expected = moving_publication_fence.unwrap_or(commit_id);
         // DO UPDATE ... WHERE makes the ordering check atomic with the write;
         // a losing write is a silent no-op. Same policy as the sqlite adapter.
         self.conn()
@@ -149,13 +142,26 @@ impl MetaDb for LibsqlMeta {
                      synced_at = excluded.synced_at,
                      generation = excluded.generation,
                      data = excluded.data
-                 WHERE excluded.commit_id = refs.commit_id
-                    OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
-                        AND excluded.generation >= refs.generation)
-                    OR ((refs.generation IS NULL OR excluded.generation IS NULL)
-                        AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
-                             OR excluded.synced_at >= refs.synced_at))",
-                libsql::params![repo_key, branch, commit_id, synced_at, generation, data],
+                 WHERE ? = 0 AND (
+                    (? = 1 AND (excluded.commit_id = refs.commit_id OR refs.commit_id = ?))
+                    OR (? = 0 AND (excluded.commit_id = refs.commit_id
+                        OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
+                            AND excluded.generation >= refs.generation)
+                        OR ((refs.generation IS NULL OR excluded.generation IS NULL)
+                            AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
+                                 OR excluded.synced_at >= refs.synced_at)))))",
+                libsql::params![
+                    repo_key,
+                    branch,
+                    commit_id,
+                    synced_at,
+                    generation,
+                    data,
+                    insert_only,
+                    require_match,
+                    expected,
+                    require_match
+                ],
             )
             .await
             .context("save_ordered ref")?;

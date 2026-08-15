@@ -232,6 +232,7 @@ async fn api_worker_publishes_exact_result_without_db_secret() {
         &format!("token {T1}"),
         &format!("token {T2}"),
     );
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
 
@@ -294,10 +295,28 @@ async fn api_worker_publishes_exact_result_without_db_secret() {
     .expect("count active B rows");
     assert_eq!(active_b, 1, "duplicate B must share one active SQL row");
 
-    // C is visible before the worker's first source request. A moving-tip
-    // worker would now build C; only the claimed admitted_commit can build B.
-    let c = origin.commit(&[("value.txt", "C\n")], "C");
+    // C diverges from A at the same history depth as B and becomes the moving
+    // row before the API worker can publish B.
+    git(&origin.work, &["reset", "--hard", &a]);
+    let c = origin.commit(&[("value.txt", "C\n")], "C-divergent");
     origin.publish();
+    let store = open_meta_store(&meta_url).await;
+    let repo_id = RepoId {
+        provider: ripclone::provider::ProviderInstanceId::new("credential-http"),
+        path: "acme/api-immutable".to_string(),
+    };
+    let moving_c = ripclone::RefInfo {
+        commit: c.clone(),
+        default_branch: "main".to_string(),
+        generation: Some(2),
+        synced_at: Some(2),
+        ..Default::default()
+    };
+    store
+        .save_branch(&repo_id, "main", &moving_c)
+        .await
+        .expect("install equal-depth moving C before B worker");
+    let moving_c_json = serde_json::to_value(&moving_c).unwrap();
 
     let decoy_queue = isolated.path().join("worker-must-not-open-queue.db");
     let decoy_meta = isolated.path().join("worker-must-not-open-meta.db");
@@ -331,15 +350,15 @@ async fn api_worker_publishes_exact_result_without_db_secret() {
         std::env::remove_var("RIPCLONE_METADATA_DB_TOKEN");
     }
 
-    let store = open_meta_store(&meta_url).await;
-    let repo_id = RepoId {
-        provider: ripclone::provider::ProviderInstanceId::new("credential-http"),
-        path: "acme/api-immutable".to_string(),
-    };
     let full_b = wait_for_exact_full(&store, &repo_id, &b).await;
     assert_eq!(full_b.commit, b);
     let full_b_manifest = full_b.full_clonepack.manifest.clone();
     assert!(server.cas_path(&full_b_manifest).exists());
+    assert_eq!(
+        serde_json::to_value(store.load_branch(&repo_id, "main").await.unwrap().unwrap()).unwrap(),
+        moving_c_json,
+        "late equal-depth B publication through the API cannot mutate moving C"
+    );
 
     let log_after_b = origin.auth_log_text();
     let mut t2_discovery = 0;

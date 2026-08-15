@@ -424,7 +424,7 @@ async fn run_pinned_branch_advance_proof(advance_again: bool) {
     let (server, phase_one, phase_one_entered, phase_one_proceed) =
         start_server_split_storage_phase_one_barrier().await;
     let origin = make_origin("acme", "pinned-advance-proof");
-    origin.commit(&[("value.txt", "A\n")], "A");
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
     register_added_without_build(&server, "acme/pinned-advance-proof")
         .await
@@ -483,7 +483,8 @@ async fn run_pinned_branch_advance_proof(advance_again: bool) {
         .expect("CLI reached the first moving ref response")
         .expect("ref proxy barrier sender alive");
 
-    let c = origin.commit(&[("value.txt", "C\n")], "C");
+    git(&origin.work, &["reset", "--hard", &a]);
+    let c = origin.commit(&[("value.txt", "C\n")], "C-divergent");
     origin.publish();
     let c_admission = server
         .client()
@@ -496,7 +497,7 @@ async fn run_pinned_branch_advance_proof(advance_again: bool) {
         .await
         .expect("C full publication");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&server.repo_root));
     let repo_id = RepoId::github("acme/pinned-advance-proof");
     let mut latest_commit = c.clone();
     let mut moving_before = store
@@ -711,7 +712,7 @@ async fn evicted_pin_rebuilds_b_without_branch_probe() {
         .await
         .expect("publish C");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&server.repo_root));
     let repo_id = RepoId::github("acme/evicted-pin");
     let exact_key = format!("main#{b}");
     let exact_b = store
@@ -719,12 +720,41 @@ async fn evicted_pin_rebuilds_b_without_branch_probe() {
         .await
         .expect("load B before eviction")
         .expect("B exact row before eviction");
-    let mut evicted = exact_b;
-    evicted.build_status = Some("evicted".to_string());
-    store
-        .save_branch(&repo_id, &exact_key, &evicted)
-        .await
-        .expect("mark B exact row evicted");
+    assert!(exact_b.internal_exact_result);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for key in store.list_branches(&repo_id).await.expect("list refs") {
+        let mut info = store.load_branch(&repo_id, &key).await.unwrap().unwrap();
+        info.last_accessed_at = Some(if key == exact_key { 1 } else { now + 3600 });
+        store.save_branch(&repo_id, &key, &info).await.unwrap();
+    }
+    let storage: ripclone::storage::StorageRef = Arc::new(RemoteLocalStorage::new(
+        ripclone::storage::local(&server.storage_dir).unwrap(),
+    ));
+    ripclone::remote_gc::RemoteGc::new(
+        storage,
+        Arc::clone(&store),
+        ripclone::remote_gc::GcConfig {
+            grace_period: Duration::from_secs(0),
+            warm_ttl: Duration::from_secs(1),
+            dry_run: false,
+        },
+    )
+    .run()
+    .await
+    .expect("evict idle ordinary exact B");
+    assert_eq!(
+        store
+            .load_branch(&repo_id, &exact_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .build_status
+            .as_deref(),
+        Some("evicted")
+    );
     let moving_before = store
         .load_branch(&repo_id, "main")
         .await

@@ -89,11 +89,18 @@ pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> b
     if new.commit.is_empty() {
         return false;
     }
+    if new.internal_exact_result && new.require_matching_commit {
+        return existing.is_none();
+    }
     let Some(existing) = existing else {
-        return !new.require_matching_commit;
+        return !new.require_matching_commit || new.moving_publication_fence.as_deref() == Some("");
     };
     if new.require_matching_commit {
-        return existing.commit == new.commit;
+        let expected = new
+            .moving_publication_fence
+            .as_deref()
+            .unwrap_or(new.commit.as_str());
+        return existing.commit == new.commit || existing.commit == expected;
     }
     if existing.commit == new.commit {
         return true;
@@ -1503,21 +1510,25 @@ mod tests {
     }
 
     #[test]
-    fn matching_commit_fence_rejects_divergent_equal_generation_writer() {
+    fn identity_fence_rejects_divergent_equal_generation_writer() {
         let mut current = dummy_ref_info("c");
         current.generation = Some(2);
         let mut delayed = dummy_ref_info("b");
         delayed.generation = Some(2);
         delayed.require_matching_commit = true;
+        delayed.moving_publication_fence = Some("a".to_string());
         assert!(!should_replace_ref(Some(&current), &delayed));
         assert!(!should_replace_ref(None, &delayed));
 
         current.commit = delayed.commit.clone();
         assert!(should_replace_ref(Some(&current), &delayed));
+
+        current.commit = "a".to_string();
+        assert!(should_replace_ref(Some(&current), &delayed));
     }
 
     #[tokio::test]
-    async fn sqlite_matching_commit_fence_is_atomic_with_update() {
+    async fn sqlite_identity_fence_is_atomic_with_update() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("meta.db").to_string_lossy().to_string();
         let store = crate::meta::SqlRefStore::new(Box::new(
@@ -1533,6 +1544,7 @@ mod tests {
         let mut delayed = dummy_ref_info("b");
         delayed.generation = Some(2);
         delayed.require_matching_commit = true;
+        delayed.moving_publication_fence = Some("a".to_string());
         store.save_branch(&repo, "main", &delayed).await.unwrap();
         assert_eq!(
             store
@@ -1545,6 +1557,7 @@ mod tests {
         );
 
         current.require_matching_commit = true;
+        current.moving_publication_fence = Some("b".to_string());
         current.build_status = Some("done".to_string());
         store.save_branch(&repo, "main", &current).await.unwrap();
         assert_eq!(
