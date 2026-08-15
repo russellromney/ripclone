@@ -5,8 +5,8 @@
 //! subgroups, sourcehut `~user/repo`, Launchpad `+git` paths, self-hosted
 //! Gitea/Forgejo, etc.).
 //!
-//! Provider-qualified routes and CLI prefixes identify a configured provider
-//! instance; the bare `owner/repo` shape remains the GitHub default.
+//! Provider-qualified routes identify a configured provider instance; the CLI
+//! accepts bare `owner/repo` input for its configured default provider.
 //!
 //! Phase 3+ handoff notes:
 //! - Add OIDC / `Principal` / `authorize()` integration; `CredentialBroker` is
@@ -24,8 +24,7 @@ use std::net::IpAddr;
 
 pub use crate::provider_config::load_registry;
 
-/// Built-in default instance id. All legacy `{owner}/{repo}` routes resolve to
-/// this instance.
+/// Built-in default instance id used for unqualified CLI input.
 const DEFAULT_PROVIDER_ID: &str = "github";
 
 /// Supported git host kinds. `Gitea` covers Forgejo/Codeberg; `Generic` is a
@@ -408,8 +407,7 @@ impl Default for ProviderRegistry {
 /// `path` is opaque and variable-depth. For the `github` default instance it is
 /// exactly `owner/repo`; for other providers it may contain additional slashes
 /// (subgroups, `~user/repo`, `+git/repo`, etc.). Callers must NOT split `path`
-/// into owner/repo segments except when they know they are dealing with the
-/// legacy GitHub shape.
+/// into owner/repo segments except for the built-in GitHub provider.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RepoId {
     pub provider: ProviderInstanceId,
@@ -458,9 +456,8 @@ impl RepoId {
         format!("{}_{}.git", self.provider.as_str(), escape_path(&self.path))
     }
 
-    /// Convenience accessor for callers that still need the legacy owner/repo
-    /// pair (e.g. tests or legacy helpers). Returns `None` for non-default
-    /// providers or non-legacy paths.
+    /// Return the owner/repo pair for the built-in GitHub provider. Returns
+    /// `None` for other providers or paths without exactly two components.
     pub fn github_owner_repo(&self) -> Option<(&str, &str)> {
         if !self.is_github_default() {
             return None;

@@ -124,7 +124,7 @@ impl BuildJob {
         let target = match (&self.rev, &self.admitted_commit) {
             (Some(rev), _) => format!("rev:{rev}"),
             (None, Some(commit)) => format!("tip:{commit}"),
-            (None, None) => "legacy".to_string(),
+            (None, None) => "invalid-targetless".to_string(),
         };
         format!(
             "{}\x1f{}\x1f{target}",

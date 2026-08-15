@@ -41,6 +41,8 @@ struct ServerError {
 struct ArtifactPendingResponse {
     code: String,
     commit: String,
+    status: String,
+    queue_depth: usize,
     top_up_supported: Option<bool>,
     top_up_base: Option<RefResponse>,
 }
@@ -211,22 +213,16 @@ fn build_http_client(headers: reqwest::header::HeaderMap) -> reqwest::Client {
 pub struct RefResponse {
     pub owner: String,
     pub repo: String,
-    #[serde(default)]
     pub provider: String,
-    #[serde(default)]
     pub host: String,
-    #[serde(default)]
     pub origin_url: String,
     pub branch: String,
     pub default_branch: String,
     pub commit: String,
     pub parent_commit: Option<String>,
-    pub full_pack: String,
-    #[serde(default)]
     pub clonepack_manifest: String,
     #[serde(default)]
     pub clonepack_manifest_url: Option<String>,
-    #[serde(default)]
     pub metadata_chunk: String,
     #[serde(default)]
     pub metadata_chunk_url: Option<String>,
@@ -249,7 +245,6 @@ pub struct RefResponse {
     #[serde(default)]
     pub idx_bundle_url: Option<String>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
-    #[serde(default)]
     pub shallow: bool,
     /// True once the full clonepack's archive is built (files mode can clone).
     pub archive_ready: bool,
@@ -394,19 +389,10 @@ fn record_test_managed_git(command: &str, elapsed: Duration) -> Result<()> {
     .context("record managed top-up Git timing")
 }
 
-/// Return the chunk refs that make up the head-blobs pack, falling back to the
-/// deprecated single-pack field for older manifests.
-#[allow(deprecated)]
 pub(crate) fn head_blobs_chunk_refs(
     clonepack: &ClonepackManifest,
 ) -> Vec<crate::clonepack::ChunkRef> {
-    if !clonepack.head_blobs_chunks.is_empty() {
-        clonepack.head_blobs_chunks.clone()
-    } else if let Some(pack) = &clonepack.head_blobs_pack {
-        vec![pack.clone()]
-    } else {
-        Vec::new()
-    }
+    clonepack.head_blobs_chunks.clone()
 }
 
 /// `(max_attempts, base_backoff_ms)` for artifact downloads, from the
@@ -688,8 +674,8 @@ fn fsync_requested() -> bool {
 }
 
 /// Resolve the directory to fsync after the atomic rename publishes `target`,
-/// so the rename entry itself is durable. A bare relative `--dir` (the README
-/// quickstart uses `--dir bun`) has an empty parent; fall back to the current
+/// so the rename entry itself is durable. A bare relative target directory (the
+/// README quickstart uses `bun`) has an empty parent; fall back to the current
 /// directory — the actual container — exactly as `temp_install_dir` does, so
 /// the post-rename fsync is never silently skipped.
 fn post_rename_fsync_dir(target: &Path) -> &Path {
@@ -815,22 +801,6 @@ fn wait_for_test_pack_worker(pack_index: usize) -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
     std::fs::write(entered, b"released").context("mark pack worker released")
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SnapshotResponse {
-    pub owner: String,
-    pub repo: String,
-    pub branch: String,
-    pub commit: String,
-    pub snapshot_hash: String,
-    pub size: u64,
-    pub hot_files: usize,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct HotfilesResponse {
-    pub files: Vec<String>,
 }
 
 /// What a finished clone learned, for the best-effort post-clone metrics report.
@@ -1214,9 +1184,7 @@ impl Client {
         url.rsplit('/').next().map(|s| s.to_string())
     }
 
-    /// Build a request URL for `repo_path`. GitHub repos keep the legacy
-    /// `/v1/repos/{owner}/{repo}` shape; other providers are routed under
-    /// `/v1/repos/{provider}/{repo_path}`.
+    /// Build a provider-qualified request URL for `repo_path`.
     fn repo_url(&self, repo_path: &str, suffix: &str) -> String {
         format!(
             "{}/v1/repos/{}/{repo_path}{suffix}",
@@ -1373,10 +1341,11 @@ impl Client {
                     .json()
                     .await
                     .with_context(|| format!("invalid pending response for {repo_path}"))?;
-                if pending.code != "artifact_pending" {
+                if pending.code != "artifact_pending" || pending.status != "building" {
                     anyhow::bail!(
-                        "invalid pending response code {:?} for {repo_path}",
-                        pending.code
+                        "invalid pending response for {repo_path}: code={:?}, status={:?}",
+                        pending.code,
+                        pending.status
                     );
                 }
                 crate::validation::validate_object_id(&pending.commit)
@@ -1452,7 +1421,10 @@ impl Client {
                     });
                 }
                 if attempt == 0 {
-                    eprintln!("ripclone: warming {repo_path} — this can take a moment…");
+                    eprintln!(
+                        "ripclone: warming {repo_path} (queue depth {}) — this can take a moment…",
+                        pending.queue_depth
+                    );
                 }
                 // The first ordinary 202 exists to establish B. Eligible Full
                 // clones immediately make the one pinned opt-in request.
@@ -1552,15 +1524,6 @@ impl Client {
         anyhow::bail!("ref lookup did not complete")
     }
 
-    pub async fn fetch_object(&self, sha: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/v1/objects/{}", self.server, sha);
-        let resp = self.send(self.http.get(&url)).await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("object fetch failed: {}", resp.status());
-        }
-        Ok(resp.bytes().await?.to_vec())
-    }
-
     /// Fetch any content-addressed artifact (pack, idx, index, archive, manifest).
     ///
     /// Caches the bytes locally when `RIPCLONE_CACHE_DIR` is set, so repeat
@@ -1627,7 +1590,6 @@ impl Client {
         Ok(data)
     }
 
-    #[allow(deprecated)]
     async fn fetch_validated_manifest(
         &self,
         hash: &str,
@@ -1635,16 +1597,7 @@ impl Client {
         pinned: &str,
     ) -> Result<ClonepackManifest> {
         let decode = |data: &[u8]| -> Result<ClonepackManifest> {
-            let mut manifest =
-                ClonepackManifest::decode(data).context("decode clonepack manifest")?;
-            // Backwards compatibility: older manifests store the head-blobs
-            // pack as one field. Normalize only after the commit binding has
-            // been decoded from the same bytes.
-            if manifest.head_blobs_chunks.is_empty()
-                && let Some(pack) = manifest.head_blobs_pack.take()
-            {
-                manifest.head_blobs_chunks.push(pack);
-            }
+            let manifest = ClonepackManifest::decode(data).context("decode clonepack manifest")?;
             validate_manifest_commit(&manifest, pinned)?;
             Ok(manifest)
         };
@@ -1775,67 +1728,6 @@ impl Client {
         let metadata =
             MetadataChunk::decode(metadata_data.as_ref()).context("decode metadata chunk")?;
         Ok((clonepack, Arc::new(metadata)))
-    }
-
-    pub async fn create_snapshot(
-        &self,
-        repo_path: &str,
-        branch: &str,
-        hot_files: usize,
-    ) -> Result<SnapshotResponse> {
-        let url = self.repo_url(
-            repo_path,
-            &format!("/snapshot?branch={branch}&hot_files={hot_files}"),
-        );
-        let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
-        if !resp.status().is_success() {
-            return Err(server_error("snapshot create failed", resp).await);
-        }
-        Ok(resp.json().await?)
-    }
-
-    pub async fn fetch_snapshot(&self, hash: &str) -> Result<bytes::Bytes> {
-        self.fetch_artifact(hash).await
-    }
-
-    pub async fn hot_files(
-        &self,
-        repo_path: &str,
-        branch: &str,
-        count: usize,
-    ) -> Result<Vec<String>> {
-        let url = self.repo_url(
-            repo_path,
-            &format!("/hotfiles?branch={branch}&count={count}"),
-        );
-        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
-        if !resp.status().is_success() {
-            return Err(server_error("hotfiles failed", resp).await);
-        }
-        let body: HotfilesResponse = resp.json().await?;
-        Ok(body.files)
-    }
-
-    /// Fetch a batch of working-tree files as a tar archive.
-    pub async fn fetch_batch(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        commit: &str,
-        paths: &[String],
-    ) -> Result<Vec<u8>> {
-        let url = format!("{}/v1/repos/{}/{}/batch", self.server, owner, repo);
-        let body = serde_json::json!({
-            "paths": paths,
-            "branch": branch,
-            "commit": commit,
-        });
-        let resp = self.send(self.http.post(&url).json(&body)).await?;
-        if !resp.status().is_success() {
-            return Err(server_error("batch fetch failed", resp).await);
-        }
-        Ok(resp.bytes().await?.to_vec())
     }
 
     pub async fn sync_repo(&self, repo_path: &str, depth: Option<usize>) -> Result<RefResponse> {
@@ -2808,7 +2700,6 @@ impl Client {
     /// a pre-allocated temp pack file at their final offsets. Peak memory is
     /// ~`concurrency * chunk_size`, no bytes are re-hashed, and the pack is
     /// written exactly once.
-    #[allow(deprecated)]
     pub async fn install_prebuilt_blob_pack(
         &self,
         clonepack: &ClonepackManifest,
@@ -3341,7 +3232,6 @@ impl Client {
         Ok(pack_bytes + idx_data.len() as u64)
     }
 
-    #[allow(deprecated)]
     fn spawn_fetch_manifest(
         self,
         hash: String,
@@ -4224,7 +4114,7 @@ impl Client {
                 pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
                 &idx_data,
             )?;
-            info!("wrote legacy head-blobs pack ({} bytes)", pack_data.len());
+            info!("wrote head-closure pack ({} bytes)", pack_data.len());
             (pack_data.len() + idx_data.len()) as u64
         } else if clonepack.packs.iter().any(|p| !p.history_only) {
             self.install_manifest_packs(&clonepack, info, &pack_dir)
@@ -4422,24 +4312,6 @@ impl Client {
         );
         Ok(())
     }
-
-    /// Fetch a single file's content from the server.
-    pub async fn cat_file(&self, repo_path: &str, branch: &str, path: &str) -> Result<Vec<u8>> {
-        self.fetch_file(repo_path, branch, path).await
-    }
-
-    /// Fetch a single file's content from the server by path.
-    pub async fn fetch_file(&self, repo_path: &str, branch: &str, path: &str) -> Result<Vec<u8>> {
-        let url = self.repo_url(
-            repo_path,
-            &format!("/cat?path={}&branch={}", urlencoding::encode(path), branch),
-        );
-        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
-        if !resp.status().is_success() {
-            return Err(server_error("cat failed", resp).await);
-        }
-        Ok(resp.bytes().await?.to_vec())
-    }
 }
 
 /// Try to resolve `branch` in a local repo without contacting the server.
@@ -4532,8 +4404,8 @@ mod tests {
     fn post_rename_fsync_dir_resolves_relative_target_to_cwd() {
         // The post-rename durability fsync makes the atomic rename itself
         // durable (BUILD_OPTIONS: "the target's parent directory after the
-        // atomic rename"). A bare relative `--dir` — the common case, the
-        // README quickstart uses `--dir bun` — has an empty parent. The
+        // atomic rename"). A bare relative target — the common case, the
+        // README quickstart uses `bun` — has an empty parent. The
         // resolver must fall back to the containing directory (cwd `.`) so the
         // fsync runs, not be dropped/skipped (D6).
         assert_eq!(

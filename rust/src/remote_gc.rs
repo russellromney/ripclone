@@ -553,7 +553,6 @@ fn collect_pack_artifact(artifact: &PackArtifact, reachable: &mut HashSet<String
 fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
     add_hash(reachable, &info.skeleton_pack);
     add_hash(reachable, &info.skeleton_idx);
-    add_hash(reachable, &info.head_blobs_pack);
     add_hash(reachable, &info.head_blobs_idx);
     for chunk in &info.head_blobs_chunks {
         add_hash(reachable, chunk);
@@ -571,9 +570,6 @@ fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
     add_hash(reachable, &info.prebuilt_index);
     add_hash(reachable, &info.archive);
     add_hash(reachable, &info.manifest);
-    add_hash(reachable, &info.full_pack);
-    add_hash(reachable, &info.clonepack_manifest);
-    add_hash(reachable, &info.metadata_chunk);
     for chunk in &info.archive_chunks {
         add_hash(reachable, chunk);
     }
@@ -701,16 +697,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
             packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: manifest_hash.clone(),
-            metadata_chunk: metadata_hash,
             archive_chunks: vec![archive_hash],
             full_clonepack: ClonepackArtifacts {
                 manifest: manifest_hash,
@@ -774,8 +766,8 @@ mod tests {
         assert!(!orphan_path.exists(), "orphan should be deleted");
 
         // Reachable objects should still exist.
-        assert!(cas.path(&info.clonepack_manifest).exists());
-        assert!(cas.path(&info.metadata_chunk).exists());
+        assert!(cas.path(&info.full_clonepack.manifest).exists());
+        assert!(cas.path(&info.full_clonepack.metadata_chunk).exists());
         assert!(cas.path(&info.archive_chunks[0]).exists());
     }
 
@@ -1193,16 +1185,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
             packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: String::new(),
-            metadata_chunk: String::new(),
             archive_chunks: Vec::new(),
             full_clonepack: ClonepackArtifacts::default(),
             shallow_clonepack: ClonepackArtifacts::default(),
@@ -1266,7 +1254,7 @@ mod tests {
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
-        let metadata_path = cas.path(&info.metadata_chunk);
+        let metadata_path = cas.path(&info.full_clonepack.metadata_chunk);
         let archive_path = cas.path(&info.archive_chunks[0]);
         assert!(manifest_path.exists());
         assert!(metadata_path.exists());
@@ -1367,7 +1355,7 @@ mod tests {
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
-        let metadata_path = cas.path(&info.metadata_chunk);
+        let metadata_path = cas.path(&info.full_clonepack.metadata_chunk);
         let archive_path = cas.path(&info.archive_chunks[0]);
         assert!(manifest_path.exists());
         assert!(metadata_path.exists());

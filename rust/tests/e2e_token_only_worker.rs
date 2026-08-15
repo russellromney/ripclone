@@ -730,11 +730,11 @@ async fn claim_returns_one_job_no_foreign_credential() {
     );
 }
 
-/// NEGATIVE: an active legacy row reaches a real API worker, is rejected before
+/// NEGATIVE: a malformed targetless row reaches a real API worker, is rejected before
 /// credential/provider/source work, and is permanently settled rather than
 /// guessed from the branch's current tip.
 #[tokio::test]
-async fn api_worker_rejects_legacy_job_before_source_work() {
+async fn api_worker_rejects_targetless_job_before_source_work() {
     let _guard = SERIAL.lock().await;
     let (_q, _m, queue_url, _meta_url) = setup_sqlite_queue_and_meta();
     let server = start_server().await;
@@ -753,14 +753,14 @@ async fn api_worker_rejects_legacy_job_before_source_work() {
         "INSERT INTO jobs (key, provider, path, branch, status, created_at, attempts, size_class)
          VALUES (?, ?, ?, ?, 'queued', ?, 0, 0)",
     )
-    .bind("legacy-api-row")
+    .bind("targetless-api-row")
     .bind("provider-that-is-not-configured")
-    .bind("acme/legacy-api")
+    .bind("acme/targetless-api")
     .bind("main")
     .bind(1_i64)
     .execute(&pool)
     .await
-    .expect("insert legacy active row");
+    .expect("insert targetless active row");
     pool.close().await;
 
     let token = mint_token(Duration::from_secs(3600));
@@ -777,31 +777,31 @@ async fn api_worker_rejects_legacy_job_before_source_work() {
             .await
             .expect("reopen queue database");
         let row: (String, Option<String>) =
-            sqlx::query_as("SELECT status, error FROM jobs WHERE key = 'legacy-api-row'")
+            sqlx::query_as("SELECT status, error FROM jobs WHERE key = 'targetless-api-row'")
                 .fetch_one(&pool)
                 .await
-                .expect("read legacy row");
+                .expect("read targetless row");
         pool.close().await;
         if row.0 == "failed" {
             break row;
         }
         assert!(
             Instant::now() < deadline,
-            "API worker did not settle the legacy row before the deadline"
+            "API worker did not settle the targetless row before the deadline"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert_eq!(status, "failed");
     assert_eq!(
         error.as_deref(),
-        Some("legacy queued job has no admitted commit; resubmit sync")
+        Some("queued job has no admitted commit; resubmit sync")
     );
     assert!(
         !server
             .repo_root
-            .join("provider-that-is-not-configured_acme%2Flegacy-api.git")
+            .join("provider-that-is-not-configured_acme%2Ftargetless-api.git")
             .exists(),
-        "legacy rejection must happen before mirror/source mutation"
+        "targetless rejection must happen before mirror/source mutation"
     );
     worker.kill_now();
 }

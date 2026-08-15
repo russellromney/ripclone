@@ -105,9 +105,8 @@ Per provider instance:
 
 ### Per-provider setup notes
 
-- **GitHub** — set the webhook secret to `RIPCLONE_WEBHOOK_SECRET_GITHUB` (the
-  legacy `RIPCLONE_WEBHOOK_SECRET` is still honored). Point it at
-  `/webhooks/github` (or the back-compat `/v1/webhooks/github`).
+- **GitHub** — set the webhook secret to `RIPCLONE_WEBHOOK_SECRET_GITHUB` and
+  point it at `/webhooks/github`.
 - **GitLab** — use the **Secret token** field (sent verbatim in `X-Gitlab-Token`),
   *not* the newer signing-token scheme (an HMAC `webhook-signature` header), which
   this receiver does not implement — it would be rejected (fail-closed), never
@@ -221,13 +220,11 @@ Phase 1 (GitHub) is implemented:
       `rust/src/webhook/gitea.rs`.
 - [x] `POST /webhooks/{provider}` in `server.rs` — raw-body handler, provider
       lookup, verify, parse, dispatch. Registered under `rate_limited`, *not*
-      behind `auth_middleware` (the HMAC is the auth). `/v1/webhooks/github` is a
-      back-compat alias into the same receiver.
+      behind `auth_middleware` (the HMAC is the auth).
 - [x] Admit the validated exact `after` through the shared trigger path (also
       used by `/v1/build` and the poll loop), with no second tip probe and no
       duplicated build logic.
-- [x] Config: per-provider webhook secret (`RIPCLONE_WEBHOOK_SECRET_<ID>`, with
-      legacy `RIPCLONE_WEBHOOK_SECRET` honored for github) + `StaticBroker`
+- [x] Config: per-provider webhook secret (`RIPCLONE_WEBHOOK_SECRET_<ID>`) + `StaticBroker`
       credential for private clones + optional `RIPCLONE_WEBHOOK_ALLOWLIST` +
       `RIPCLONE_WEBHOOK_WARM_ALL` to warm every pushed branch.
 - [x] Branch-delete cleanup path (`RefStore::delete_branch`, file + S3 + caching

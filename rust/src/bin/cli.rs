@@ -8,7 +8,6 @@ use ripclone::config::ProviderEntry;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
 use ripclone::provider::{ProviderInstance, ProviderKind, ProviderRegistry, RepoId};
-use ripclone::snapshot::extract_snapshot;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
@@ -114,14 +113,11 @@ enum Commands {
         #[arg(long)]
         wait: bool,
     },
-    /// Clone a repo using a snapshot and a background sidecar.
+    /// Clone a repo into a local directory.
     Clone {
         repo: String,
         /// Directory to clone into. If omitted, the repo name is used.
         #[arg(value_name = "DIR", group = "target")]
-        dir_pos: Option<PathBuf>,
-        /// Directory to clone into (back-compat alias for the positional DIR).
-        #[arg(short, long, value_name = "DIR", group = "target", hide = true)]
         dir: Option<PathBuf>,
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
@@ -154,43 +150,10 @@ enum Commands {
         #[arg(long, env = "RIPCLONE_VERIFY_UPSTREAM", default_value = "auto", default_missing_value = "always", value_parser = parse_verify_upstream, num_args = 0..=1)]
         verify_upstream: VerifyUpstream,
     },
-    /// Background sidecar: finish materializing a snapshot clone.
-    #[command(hide = true)]
-    Sidecar {
-        #[arg(short, long, default_value = ".")]
-        dir: PathBuf,
-    },
-    /// Read a file from a skeleton clone.
-    #[command(hide = true)]
-    Cat {
-        repo: String,
-        path: String,
-        #[arg(short, long, default_value = ".")]
-        dir: PathBuf,
-        #[arg(short, long, default_value = "HEAD")]
-        branch: String,
-    },
     /// Manage configured git providers (GitHub, GitLab, Gitea, …).
     Provider {
         #[command(subcommand)]
         action: ProviderAction,
-    },
-    /// Snapshot operations for agent-ready repo skeletons.
-    #[command(hide = true)]
-    Snapshot {
-        #[command(subcommand)]
-        action: SnapshotAction,
-    },
-    /// Prefetch likely files into an existing skeleton clone.
-    #[command(hide = true)]
-    Prefetch {
-        repo: String,
-        #[arg(short, long, default_value = ".")]
-        dir: PathBuf,
-        #[arg(short, long, default_value = "HEAD")]
-        branch: String,
-        #[arg(short, long, default_value = "50")]
-        count: usize,
     },
     /// Build a working-tree archive + manifest for a commit.
     #[command(hide = true)]
@@ -271,26 +234,6 @@ enum Commands {
         sample_bytes: usize,
         #[arg(long, default_value = "/data/repos")]
         repo_root: PathBuf,
-    },
-}
-
-#[derive(Subcommand)]
-enum SnapshotAction {
-    /// Build a snapshot on the server and download it.
-    Create {
-        repo: String,
-        #[arg(short, long, default_value = "HEAD")]
-        branch: String,
-        #[arg(short, long, default_value = "0")]
-        hot_files: usize,
-        #[arg(short, long)]
-        output: PathBuf,
-    },
-    /// Extract a snapshot tarball into a directory and time git status.
-    Extract {
-        input: PathBuf,
-        #[arg(short, long)]
-        dir: PathBuf,
     },
 }
 
@@ -445,9 +388,7 @@ struct DevicePoll {
 /// `ripclone login`: start a device flow, wait for browser approval, save the token.
 #[derive(serde::Deserialize)]
 struct ServerVersion {
-    #[serde(default)]
     version: String,
-    #[serde(default)]
     protocol: u32,
 }
 
@@ -1063,13 +1004,6 @@ async fn main() -> Result<()> {
                 .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
         })
         .or_else(|| {
-            config
-                .token
-                .as_deref()
-                .filter(|t| !t.is_empty())
-                .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
-        })
-        .or_else(|| {
             token_store()
                 .ok()
                 .and_then(|store| store.get("server").ok().flatten())
@@ -1195,7 +1129,6 @@ async fn main() -> Result<()> {
         }
         Commands::Clone {
             repo,
-            dir_pos,
             dir,
             branch,
             mode,
@@ -1223,9 +1156,7 @@ async fn main() -> Result<()> {
                 .next()
                 .unwrap_or(&repo_path)
                 .to_string();
-            let target = dir_pos
-                .or(dir)
-                .unwrap_or_else(|| PathBuf::from(target_name));
+            let target = dir.unwrap_or_else(|| PathBuf::from(target_name));
             // Agent-fleet mode (RIPCLONE_AGENT or the config default) flips the
             // history default to depth-1: agents on giant repos don't want the
             // full 1.3M-commit history that the human default (D8) ships. An
@@ -1306,156 +1237,6 @@ async fn main() -> Result<()> {
             // (self-host), the user passed --no-metrics, or the RIPCLONE_NO_METRICS
             // env var is set. Never able to affect the clone's exit status.
             client.report_clone_metrics(&outcome, total_ms).await;
-        }
-        Commands::Sidecar { dir } => {
-            ripclone::sidecar::run(&dir)
-                .await
-                .with_context(|| format!("sidecar failed in {}", dir.display()))?;
-        }
-        Commands::Cat {
-            repo, path, branch, ..
-        } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
-            let content = client.cat_file(&repo_path, &branch, &path).await?;
-            std::io::stdout().write_all(&content)?;
-        }
-        Commands::Snapshot { action } => match action {
-            SnapshotAction::Create {
-                repo,
-                branch,
-                hot_files,
-                output,
-            } => {
-                let (provider, repo_path) =
-                    resolve_repo(&repo, &default_provider, &provider_registry)?;
-                let client = client.with_provider(&provider);
-                let info = client
-                    .create_snapshot(&repo_path, &branch, hot_files)
-                    .await?;
-                println!(
-                    "snapshot {} for {}@{}: {} bytes, {} hot files",
-                    info.snapshot_hash, repo, branch, info.size, info.hot_files
-                );
-                let data = client.fetch_snapshot(&info.snapshot_hash).await?;
-                std::fs::write(&output, &data)?;
-                println!("wrote {} ({} bytes)", output.display(), data.len());
-            }
-            SnapshotAction::Extract { input, dir } => {
-                let data = std::fs::read(&input)?;
-                let start = std::time::Instant::now();
-                extract_snapshot(&data, &dir)?;
-                let extract_time = start.elapsed();
-                println!(
-                    "extracted {} into {} in {:?}",
-                    input.display(),
-                    dir.display(),
-                    extract_time
-                );
-
-                let start = std::time::Instant::now();
-                let status = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(dir.as_os_str())
-                    .args(["status", "--short"])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .status()
-                    .context("git status")?;
-                let status_time = start.elapsed();
-                println!(
-                    "git status --short: {} in {:?}",
-                    if status.success() { "ok" } else { "failed" },
-                    status_time
-                );
-            }
-        },
-        Commands::Prefetch {
-            repo,
-            dir,
-            branch,
-            count,
-        } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
-            let files = client.hot_files(&repo_path, &branch, count).await?;
-            println!("prefetching {} files into {}", files.len(), dir.display());
-            let start = std::time::Instant::now();
-            for path in &files {
-                let entry = ripclone::git::ls_tree_entry(&dir, "HEAD", path)?;
-                let (mode, _sha) = match entry {
-                    Some(e) => e,
-                    None => {
-                        eprintln!("warning: path not in tree: {}", path);
-                        continue;
-                    }
-                };
-                let content = client.fetch_file(&repo_path, &branch, path).await?;
-                let target = dir.join(path);
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if mode.starts_with("120") {
-                    #[cfg(unix)]
-                    {
-                        let target_str = String::from_utf8_lossy(&content);
-                        if target.exists() {
-                            std::fs::remove_file(&target)?;
-                        }
-                        std::os::unix::fs::symlink(target_str.as_ref(), &target)?;
-                        filetime::set_symlink_file_times(
-                            &target,
-                            filetime::FileTime::from_unix_time(1, 0),
-                            filetime::FileTime::from_unix_time(1, 0),
-                        )?;
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        std::fs::write(&target, &content)?;
-                        filetime::set_file_mtime(
-                            &target,
-                            filetime::FileTime::from_unix_time(1, 0),
-                        )?;
-                    }
-                } else {
-                    std::fs::write(&target, &content)?;
-                    #[cfg(unix)]
-                    if mode == "100755" {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = std::fs::metadata(&target)?.permissions();
-                        perms.set_mode(0o755);
-                        std::fs::set_permissions(&target, perms)?;
-                    }
-                    filetime::set_file_mtime(&target, filetime::FileTime::from_unix_time(1, 0))?;
-                }
-            }
-            // Clear skip-worktree only for files that still have the bit set.
-            // In hot snapshots the files are already non-skip, so clearing would
-            // fail; in cold snapshots they are skipped and must be cleared.
-            let skipped: std::collections::HashSet<String> = files.iter().cloned().collect();
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir.as_os_str())
-                .args(["ls-files", "-v"])
-                .output()
-                .context("git ls-files -v")?;
-            let to_clear: Vec<String> = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| line.starts_with('S'))
-                .filter_map(|line| {
-                    let path = line[2..].to_string();
-                    if skipped.contains(&path) {
-                        Some(path)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !to_clear.is_empty() {
-                ripclone::git::clear_skip_worktree_index(&dir, &to_clear)?;
-            }
-            let elapsed = start.elapsed();
-            println!("prefetched {} files in {:?}", files.len(), elapsed);
         }
         Commands::BuildArchive {
             repo,

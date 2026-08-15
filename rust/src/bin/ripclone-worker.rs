@@ -253,9 +253,8 @@ async fn main() -> Result<()> {
                     claimed.branch
                 );
                 let Some(admitted_commit) = claimed.admitted_commit.clone() else {
-                    let error = BuildError::permanent(
-                        "legacy queued job has no admitted commit; resubmit sync",
-                    );
+                    let error =
+                        BuildError::permanent("queued job has no admitted commit; resubmit sync");
                     match queue.ack(job_id, &worker_id, Err(error)).await {
                         Ok(_) => {
                             if let Some(ref cur) = current_job {
@@ -265,7 +264,7 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         Err(e) => {
-                            error!("failed to settle legacy job {job_id}: {e:#}");
+                            error!("failed to settle targetless job {job_id}: {e:#}");
                             break;
                         }
                     }

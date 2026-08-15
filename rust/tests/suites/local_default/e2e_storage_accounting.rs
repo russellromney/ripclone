@@ -147,7 +147,6 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
 
     let mut historical_info = info.clone();
     historical_info.full_clonepack.manifest = historical_manifest_hash.clone();
-    historical_info.clonepack_manifest = historical_manifest_hash;
     store
         .save_branch(&repo_id, &historical_key, &historical_info)
         .await

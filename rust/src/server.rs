@@ -14,10 +14,9 @@ use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef};
-use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore, migrate_legacy_refs};
+use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
-use crate::snapshot::SnapshotBuilder;
 use crate::storage::StorageRef;
 use crate::validation;
 use crate::webhook::{EventKind, WebhookConfig};
@@ -471,7 +470,7 @@ pub struct ServerState {
     pub worker_queue: Option<Arc<crate::queue::SqlJobQueue>>,
     pub build_queue_depth: Arc<AtomicUsize>,
     /// Waiters for in-flight background builds, keyed by the admitted job key
-    /// (`owner/repo/branch/exact-commit`, or the separate legacy `--at` lane).
+    /// (`owner/repo/branch/exact-commit`).
     /// A `/sync` registers a oneshot here and enqueues a job only if it is the
     /// first waiter for that key (coalescing); the worker signals all waiters
     /// when the build finishes.
@@ -479,8 +478,7 @@ pub struct ServerState {
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     /// Webhook receiver config: per-provider HMAC secret + optional repo
     /// allowlist. A provider with no configured secret returns 503. Reads
-    /// `RIPCLONE_WEBHOOK_SECRET_<provider>` (and the legacy
-    /// `RIPCLONE_WEBHOOK_SECRET` for github).
+    /// `RIPCLONE_WEBHOOK_SECRET_<provider>`.
     pub webhook_config: Arc<WebhookConfig>,
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
@@ -718,43 +716,6 @@ fn default_added_repo_source() -> AddedRepoSource {
 }
 
 #[derive(Deserialize)]
-pub struct CatRequest {
-    pub path: String,
-    #[serde(default = "default_branch_value")]
-    pub branch: String,
-}
-
-#[derive(Deserialize)]
-pub struct SizesRequest {
-    #[serde(default = "default_branch_value")]
-    pub branch: String,
-}
-
-#[derive(Deserialize)]
-pub struct SnapshotRequest {
-    #[serde(default = "default_branch_value")]
-    pub branch: String,
-    #[serde(default = "default_hot_files")]
-    pub hot_files: usize,
-}
-
-#[derive(Deserialize)]
-pub struct HotfilesRequest {
-    #[serde(default = "default_branch_value")]
-    pub branch: String,
-    #[serde(default = "default_hot_files")]
-    pub count: usize,
-}
-
-#[derive(Deserialize)]
-pub struct BatchRequest {
-    pub paths: Vec<String>,
-    #[serde(default = "default_branch_value")]
-    pub branch: String,
-    pub commit: Option<String>,
-}
-
-#[derive(Deserialize)]
 pub struct BuildRequest {
     pub owner: String,
     pub repo: String,
@@ -863,7 +824,7 @@ fn default_branch_value() -> String {
 /// `(RepoId, ProviderInstance)` pair.
 ///
 /// The first path segment MUST be a registered provider instance id; the
-/// remainder is the opaque repo path. There is no legacy fallback: callers
+/// remainder is the opaque repo path. Callers
 /// must address repos as `/v1/repos/{provider}/{path}/...`, even for the
 /// built-in `github` default instance.
 fn resolve_repo_id<'a>(
@@ -942,10 +903,6 @@ async fn seed_added_repos(
     Ok(())
 }
 
-/// Extract an upstream credential token from request headers.
-///
-/// `X-Upstream-Token` is the canonical header; `X-GitHub-Token` is accepted as a
-/// back-compat alias for existing clients and scripts.
 fn unknown_provider_response() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -987,13 +944,8 @@ async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, Re
 fn upstream_token_from_headers(headers: &HeaderMap) -> Option<secrecy::SecretString> {
     headers
         .get("X-Upstream-Token")
-        .or_else(|| headers.get("X-GitHub-Token"))
         .and_then(|v| v.to_str().ok())
         .map(|s| secrecy::SecretString::new(s.to_string().into()))
-}
-
-fn default_hot_files() -> usize {
-    0
 }
 
 /// Validate an `owner` or `repo` path segment. GitHub identifiers are limited
@@ -1061,7 +1013,6 @@ pub struct RefResponse {
     pub default_branch: String,
     pub commit: String,
     pub parent_commit: Option<String>,
-    pub full_pack: String,
     pub clonepack_manifest: String,
     /// Signed URL for the clonepack manifest itself, if the backend supports it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1095,7 +1046,6 @@ pub struct RefResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idx_bundle_url: Option<String>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shallow: bool,
     /// True once the full clonepack's archive is built. The server publishes an
     /// editable clonepack first and adds the archive a moment later, so a files
@@ -1110,17 +1060,6 @@ fn duration_ms(duration: Duration) -> u64 {
 #[derive(Serialize)]
 pub struct ErrorResponse {
     pub error: String,
-}
-
-#[derive(Serialize)]
-pub struct SnapshotResponse {
-    pub owner: String,
-    pub repo: String,
-    pub branch: String,
-    pub commit: String,
-    pub snapshot_hash: String,
-    pub size: u64,
-    pub hot_files: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1168,20 +1107,14 @@ pub struct RegionStorageEntry {
 
 pub fn build_app(state: ServerState) -> Router {
     let protected = Router::new()
-        // Single catch-all route for all repo endpoints. The route handler parses
-        // the legacy 2-segment GitHub form ("owner/repo/refs/main") and the
-        // multi-provider form ("gitlab/group/sub/proj/sync") from the path.
+        // Single catch-all route for all provider-qualified repo endpoints.
         .route("/v1/repos/{*path}", get(dispatch_repos_get))
         .route("/v1/repos/{*path}", post(dispatch_repos_post))
         .route("/v1/repos/{*path}", delete(dispatch_repos_delete))
         // Refresh requires a still-valid session token (the auth layer verifies
         // the Bearer); it mints a fresh one before the current expires.
         .route("/v1/auth/refresh", post(auth_refresh_handler))
-        .route("/v1/packs/{hash}", get(get_pack))
-        .route("/v1/objects/{sha}", get(get_object))
         .route("/v1/artifacts/{hash}", get(get_artifact))
-        .route("/v1/archives/{hash}", get(get_artifact))
-        .route("/v1/manifests/{hash}", get(get_artifact))
         // Per-repo build config (ROADMAP §2a): read/write the repo-level config,
         // or a branch-level override via `?branch=`.
         .route(
@@ -1225,10 +1158,8 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/v1/jobs/heartbeat", post(job_heartbeat_handler))
         // Provider-agnostic push-webhook receiver: authenticated by the provider
         // HMAC over the raw body (not the ripclone bearer token), so it lives
-        // outside the `protected` layer. `/v1/webhooks/github` is the legacy
-        // GitHub-only alias into the same receiver, kept for back-compat.
+        // outside the `protected` layer.
         .route("/webhooks/{provider}", post(webhook_handler))
-        .route("/v1/webhooks/github", post(github_webhook_compat))
         .merge(protected)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1729,16 +1660,7 @@ fn is_authenticated_artifact_get(
         return false;
     }
     let path = request.uri().path();
-    if ![
-        "/v1/packs/",
-        "/v1/objects/",
-        "/v1/artifacts/",
-        "/v1/archives/",
-        "/v1/manifests/",
-    ]
-    .iter()
-    .any(|prefix| path.starts_with(prefix))
-    {
+    if !path.starts_with("/v1/artifacts/") {
         return false;
     }
     let Some(expected) = state.token_hash.as_deref() else {
@@ -2428,81 +2350,6 @@ async fn dispatch_repos_get(
         return repo_status_inner(repo_id, provider.clone(), query, headers, state).await;
     }
 
-    if path.ends_with("/cat") {
-        let repo_path = path.strip_suffix("/cat").unwrap();
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
-        };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        let query = match Query::<CatRequest>::try_from_uri(&uri) {
-            Ok(q) => q.0,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-        return cat_file_inner(repo_id, provider.clone(), query, headers, state).await;
-    }
-
-    if path.ends_with("/sizes") {
-        let repo_path = path.strip_suffix("/sizes").unwrap();
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
-        };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        let query = match Query::<SizesRequest>::try_from_uri(&uri) {
-            Ok(q) => q.0,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-        return file_sizes_inner(repo_id, provider.clone(), query, headers, state).await;
-    }
-
-    if path.ends_with("/hotfiles") {
-        let repo_path = path.strip_suffix("/hotfiles").unwrap();
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
-        };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        let query = match Query::<HotfilesRequest>::try_from_uri(&uri) {
-            Ok(q) => q.0,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-        return get_hotfiles_inner(repo_id, provider.clone(), query, headers, state).await;
-    }
-
     (
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -2517,7 +2364,6 @@ async fn dispatch_repos_post(
     headers: HeaderMap,
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
-    body: Body,
 ) -> impl IntoResponse {
     if path.ends_with("/add") {
         let repo_path = path.strip_suffix("/add").unwrap();
@@ -2569,68 +2415,6 @@ async fn dispatch_repos_post(
             }
         };
         return sync_repo_inner(repo_id, provider.clone(), query, headers, state).await;
-    }
-
-    if path.ends_with("/snapshot") {
-        let repo_path = path.strip_suffix("/snapshot").unwrap();
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
-        };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        let query = match Query::<SnapshotRequest>::try_from_uri(&uri) {
-            Ok(q) => q.0,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-        return create_snapshot_inner(repo_id, provider.clone(), query, headers, state).await;
-    }
-
-    if path.ends_with("/batch") {
-        let repo_path = path.strip_suffix("/batch").unwrap();
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
-        };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
-            Ok(b) => b,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("read body failed: {}", e),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-        let body: BatchRequest = match serde_json::from_slice(&bytes) {
-            Ok(b) => b,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("invalid batch request: {}", e),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-        return batch_files_inner(repo_id, provider.clone(), body, headers, state).await;
     }
 
     (
@@ -3027,7 +2811,6 @@ fn ref_response_from_manifest(
         default_branch: manifest.default_branch.clone(),
         commit: manifest.commit.clone(),
         parent_commit: manifest.parent_commit.clone(),
-        full_pack: String::new(),
         clonepack_manifest: manifest_hash.to_string(),
         clonepack_manifest_url: signed(manifest_hash),
         metadata_chunk_url: signed(&metadata_chunk),
@@ -3525,16 +3308,12 @@ async fn get_ref_inner(
                 default_branch: default_branch.clone(),
                 skeleton_pack: String::new(),
                 skeleton_idx: String::new(),
-                head_blobs_pack: String::new(),
                 head_blobs_idx: String::new(),
                 head_blobs_chunks: Vec::new(),
                 packs: Vec::new(),
                 prebuilt_index: String::new(),
                 archive: String::new(),
                 manifest: String::new(),
-                full_pack: String::new(),
-                clonepack_manifest: String::new(),
-                metadata_chunk: String::new(),
                 archive_chunks: Vec::new(),
                 full_clonepack: crate::ClonepackArtifacts::default(),
                 shallow_clonepack: crate::ClonepackArtifacts::default(),
@@ -3871,7 +3650,6 @@ fn ref_response(
         default_branch: info.default_branch.clone(),
         commit: artifacts.commit.clone(),
         parent_commit: info.parent_commit.clone(),
-        full_pack: info.full_pack.clone(),
         clonepack_manifest,
         clonepack_manifest_url,
         metadata_chunk,
@@ -4117,7 +3895,7 @@ async fn build_repo_status(
         // Evicted refs have no reachable artifacts; do not try to read manifest
         // or pack hashes that the GC phase already deleted.
         if !is_evicted {
-            // Manifest-based clonepack variants (shallow, full, legacy). Each
+            // Manifest-based clonepack variants (shallow and full). Each
             // manifest is itself a stored artifact and references chunks.
             for manifest_hash in manifest_hashes {
                 // Read the manifest from the authoritative storage backend rather
@@ -4162,7 +3940,7 @@ async fn build_repo_status(
             chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
         });
 
-        // Report the primary manifest: prefer full, then shallow, then legacy.
+        // Report the primary manifest: prefer full, then shallow.
         // Evicted refs have no artifacts, so the manifest hash is meaningless.
         let primary_manifest = if is_evicted {
             String::new()
@@ -4171,12 +3949,11 @@ async fn build_repo_status(
         } else if !info.shallow_clonepack.manifest.is_empty() {
             info.shallow_clonepack.manifest.clone()
         } else {
-            info.clonepack_manifest.clone()
+            String::new()
         };
 
         let warm = !is_evicted && ref_bytes > 0;
-        let depth1_ready = !is_evicted
-            && (!info.shallow_clonepack.manifest.is_empty() || !info.clonepack_manifest.is_empty());
+        let depth1_ready = !is_evicted && !info.shallow_clonepack.manifest.is_empty();
         let archive_ready = !is_evicted && !info.archive_chunks.is_empty();
         let history = if is_evicted {
             "cold"
@@ -5384,16 +5161,6 @@ fn webhook_ignored(reason: &'static str) -> Response {
     (StatusCode::OK, Json(WebhookIgnored { ignored: reason })).into_response()
 }
 
-/// `POST /v1/webhooks/github` — legacy alias for the built-in github instance,
-/// kept so deployments created against the original receiver keep working.
-async fn github_webhook_compat(
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-    body: Body,
-) -> Response {
-    handle_webhook(state, "github".to_string(), headers, body).await
-}
-
 /// `POST /webhooks/{provider}` — provider-agnostic webhook receiver.
 async fn webhook_handler(
     Path(provider_id): Path<String>,
@@ -5641,370 +5408,6 @@ async fn webhook_dispatch_delete(
     (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response()
 }
 
-async fn cat_file_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    query: CatRequest,
-    headers: HeaderMap,
-    state: ServerState,
-) -> Response {
-    if let Some(resp) =
-        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
-    {
-        return resp;
-    }
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let path = query.path;
-    let branch = query.branch;
-
-    let result = tokio::task::spawn_blocking(move || {
-        let commit = git::resolve_commit(&mirror_dir, &branch)?;
-        let entry = git::ls_tree_entry(&mirror_dir, &commit, &path)?;
-        let (_, sha) = entry.ok_or_else(|| anyhow::anyhow!("path not found: {}", path))?;
-        git::cat_file(&mirror_dir, &sha)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(data)) => (StatusCode::OK, data).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("cat failed: {}", e),
-            }),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "cat task panicked".to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-async fn file_sizes_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    query: SizesRequest,
-    headers: HeaderMap,
-    state: ServerState,
-) -> Response {
-    if let Some(resp) =
-        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
-    {
-        return resp;
-    }
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let branch = query.branch;
-
-    let result = tokio::task::spawn_blocking(move || {
-        let commit = git::resolve_commit(&mirror_dir, &branch)?;
-        git::ls_tree_sizes(&mirror_dir, &commit)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(map)) => (StatusCode::OK, Json(map)).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("sizes failed: {}", e),
-            }),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "sizes task panicked".to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-async fn create_snapshot_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    query: SnapshotRequest,
-    headers: HeaderMap,
-    state: ServerState,
-) -> Response {
-    if let Some(resp) =
-        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
-    {
-        return resp;
-    }
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let branch = query.branch.clone();
-
-    let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    let repo_config = effective_repo_config(&state, &repo_id, &branch).await;
-    let info = match do_sync(
-        &state.cas,
-        &mirror_dir,
-        &repo_id,
-        &branch,
-        None,
-        None,
-        None,
-        &state.ref_store,
-        // In-process server: phase 2 runs in the background for a fast response.
-        false,
-        &state.storage,
-        &state.retention,
-        &provider,
-        credential.as_ref(),
-        &repo_config,
-        &lock,
-        Some(Phase2FailureAction {
-            state: state.clone(),
-            job_branch: branch.clone(),
-            credential: credential.clone(),
-            admitted_commit: None,
-            admitted_default_branch: None,
-            retry_recheck: Some(1),
-            local_active_key: None,
-        }),
-    )
-    .await
-    {
-        Ok(result) => {
-            state.metrics.record_sync_phases((&result.phases).into());
-            invalidate_ref_response_cache(&state, &repo_id, &branch);
-            result.info
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("sync failed: {}", e),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    let mirror_dir2 = mirror_dir.clone();
-    let cas2 = state.cas.clone();
-    let commit = info.commit.clone();
-    let skeleton_pack = info.skeleton_pack.clone();
-    let hot_files = query.hot_files;
-
-    match tokio::task::spawn_blocking(move || {
-        let builder = SnapshotBuilder::new(&mirror_dir2, &cas2);
-        builder.build(&commit, &skeleton_pack, hot_files)
-    })
-    .await
-    {
-        Ok(Ok(snap)) => {
-            let (resp_owner, resp_repo) = repo_id
-                .github_owner_repo()
-                .map(|(o, r)| (o.to_string(), r.to_string()))
-                .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
-            (
-                StatusCode::OK,
-                Json(SnapshotResponse {
-                    owner: resp_owner,
-                    repo: resp_repo,
-                    branch: query.branch,
-                    commit: snap.commit,
-                    snapshot_hash: snap.hash,
-                    size: snap.size,
-                    hot_files: snap.hot_files,
-                }),
-            )
-                .into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("snapshot build failed: {}", e),
-            }),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "snapshot task panicked".to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_hotfiles_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    query: HotfilesRequest,
-    headers: HeaderMap,
-    state: ServerState,
-) -> Response {
-    if let Some(resp) =
-        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
-    {
-        return resp;
-    }
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let branch = query.branch;
-    let count = query.count;
-
-    let result = tokio::task::spawn_blocking(move || {
-        let commit = git::resolve_commit(&mirror_dir, &branch)?;
-        git::hot_files(&mirror_dir, &commit, count, 5)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(files)) => {
-            (StatusCode::OK, Json(serde_json::json!({ "files": files }))).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("hotfiles failed: {}", e),
-            }),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "hotfiles task panicked".to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-async fn batch_files_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    body: BatchRequest,
-    headers: HeaderMap,
-    state: ServerState,
-) -> Response {
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.branch))
-    {
-        return resp;
-    }
-    if let Some(commit) = &body.commit
-        && let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(commit))
-    {
-        return resp;
-    }
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let branch = body.branch;
-    let commit_hint = body.commit;
-    let paths = body.paths;
-
-    // Defensive ceiling to keep response sizes bounded.
-    const MAX_BATCH: usize = 1000;
-    if paths.len() > MAX_BATCH {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("batch too large: {} > {}", paths.len(), MAX_BATCH),
-            }),
-        )
-            .into_response();
-    }
-
-    let result = tokio::task::spawn_blocking(move || {
-        let commit = match commit_hint {
-            Some(c) => c,
-            None => git::resolve_commit(&mirror_dir, &branch)?,
-        };
-        git::build_path_tar(&mirror_dir, &commit, &paths)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(tar)) => {
-            (StatusCode::OK, [("content-type", "application/x-tar")], tar).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("batch failed: {}", e),
-            }),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "batch task panicked".to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
 fn validate_artifact_hash(hash: &str) -> Option<Response> {
     if let Err(e) = crate::cas::Cas::validate_artifact_id(hash) {
         return Some(
@@ -6018,23 +5421,6 @@ fn validate_artifact_hash(hash: &str) -> Option<Response> {
         );
     }
     None
-}
-
-async fn get_pack(Path(hash): Path<String>, State(state): State<ServerState>) -> impl IntoResponse {
-    if let Some(resp) = validate_artifact_hash(&hash) {
-        return resp;
-    }
-    serve_artifact(hash, state, None).await.into_response()
-}
-
-async fn get_object(
-    Path(sha): Path<String>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = validate_artifact_hash(&sha) {
-        return resp;
-    }
-    serve_artifact(sha, state, None).await.into_response()
 }
 
 /// Test-only fault injection. When the server was started with
@@ -6761,11 +6147,7 @@ async fn clonepack_seed_info(
     if info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS) {
         return None;
     }
-    let manifest = if !info.full_clonepack.manifest.is_empty() {
-        &info.full_clonepack.manifest
-    } else {
-        &info.clonepack_manifest
-    };
+    let manifest = &info.full_clonepack.manifest;
     if manifest.is_empty() {
         None
     } else {
@@ -6782,11 +6164,7 @@ fn seed_bare_mirror_from_clonepack(
     credential: Option<&secrecy::SecretString>,
     info: &RefInfo,
 ) -> Result<u64> {
-    let manifest_hash = if !info.full_clonepack.manifest.is_empty() {
-        &info.full_clonepack.manifest
-    } else {
-        &info.clonepack_manifest
-    };
+    let manifest_hash = &info.full_clonepack.manifest;
     if manifest_hash.is_empty() {
         anyhow::bail!("previous ref has no full clonepack manifest");
     }
@@ -7003,7 +6381,7 @@ async fn do_sync(
     // clonepack is still valid: return it and skip the fetch+build entirely. This
     // is the dominant case for poke-to-check syncs of a fast-moving repo. Only
     // for tip builds (a rev override targets a specific commit, not the tip).
-    // Legacy fallback: any ls-remote error falls through to the normal fetch
+    // Any ls-remote error falls through to the normal fetch
     // below. Ordinary admissions never enter this worker-side probe.
     if at_rev.is_none() && admitted_commit.is_none() {
         // ls-remote is an upstream round-trip, so it lives under the same fetch cap
@@ -7212,7 +6590,7 @@ async fn do_sync(
     // archive is ready, so reusing an archive-pending build is safe.)
     let reusable = if admitted_commit.is_some() {
         // Ordinary immutable jobs publish through a commit fence below. Never
-        // use the legacy cross-build reuse helper here: it authoritatively
+        // use the cross-build reuse helper here: it authoritatively
         // repoints the moving branch, which is correct after a fresh tip probe
         // but unsafe for a delayed signed webhook whose older commit may arrive
         // after C. A same-branch race is still a mutation-free no-op.
@@ -7431,7 +6809,6 @@ async fn build_and_publish_two_phase(
         info.build_status.as_deref() == Some("building")
             && info.full_clonepack.manifest.is_empty()
             && info.shallow_clonepack.manifest.is_empty()
-            && info.clonepack_manifest.is_empty()
     });
     let prev_loaded = match exact_prev {
         Some(info) if !placeholder_only => Some(info),
@@ -7669,14 +7046,6 @@ async fn build_and_publish_two_phase(
         .as_ref()
         .map(|p| p.full_clonepack.clone())
         .unwrap_or_default();
-    let carried_full_manifest = prev
-        .as_ref()
-        .map(|p| p.clonepack_manifest.clone())
-        .unwrap_or_default();
-    let carried_full_pack = prev
-        .as_ref()
-        .map(|p| p.full_pack.clone())
-        .unwrap_or_default();
     let carried_levels = prev
         .as_ref()
         .map(|p| p.history_levels.clone())
@@ -7743,16 +7112,12 @@ async fn build_and_publish_two_phase(
         default_branch: default_branch.to_string(),
         skeleton_pack: shallow_skeleton_pack.clone(),
         skeleton_idx: shallow_skeleton_idx.clone(),
-        head_blobs_pack: String::new(),
         head_blobs_idx: String::new(),
         head_blobs_chunks: Vec::new(),
         packs: pack_artifacts_of(&head_packs),
         prebuilt_index: shallow_prebuilt_index.clone(),
         archive: String::new(),
         manifest: shallow_metadata_hash.clone(),
-        full_pack: carried_full_pack,
-        clonepack_manifest: carried_full_manifest,
-        metadata_chunk: shallow_metadata_hash.clone(),
         archive_chunks: Vec::new(),
         full_clonepack: carried_full,
         shallow_clonepack: crate::ClonepackArtifacts {
@@ -8043,7 +7408,6 @@ fn measure_storage_amplification(
     // idx bundle, and MIDX.
     for hash in [
         &info.manifest,
-        &info.metadata_chunk,
         &info.shallow_clonepack.manifest,
         &info.shallow_clonepack.metadata_chunk,
         &info.shallow_clonepack.skeleton_pack,
@@ -8381,11 +7745,9 @@ async fn build_full_in_background(
             info.skeleton_pack = shallow_skeleton_pack.clone();
             info.skeleton_idx = shallow_skeleton_idx.clone();
             info.prebuilt_index = shallow_prebuilt_index.clone();
-            info.metadata_chunk = shallow_metadata_hash.clone();
             info.manifest = shallow_metadata_hash.clone();
             info.archive = String::new();
             info.archive_chunks = Vec::new();
-            info.clonepack_manifest = editable_clonepack_hash.clone();
             info.full_clonepack = crate::ClonepackArtifacts {
                 manifest: editable_clonepack_hash.clone(),
                 metadata_chunk: shallow_metadata_hash.clone(),
@@ -8507,11 +7869,9 @@ async fn build_full_in_background(
             .await?
             .ok_or_else(|| anyhow::anyhow!("ref vanished before archive publish"))?;
         if info.commit == commit && info.full_clonepack.idx_bundle == full_idx_bundle_hash {
-            info.metadata_chunk = files_metadata_hash.clone();
             info.manifest = files_metadata_hash.clone();
             info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
             info.archive_chunks = archive_chunk_hashes.clone();
-            info.clonepack_manifest = files_clonepack_hash.clone();
             info.full_clonepack.manifest = files_clonepack_hash.clone();
             info.full_clonepack.metadata_chunk = files_metadata_hash.clone();
             info.archive_frames = archive_frames;
@@ -8583,7 +7943,7 @@ pub async fn process_build_job(
     if at_rev.is_none() {
         let Some(admitted) = job.admitted_commit.as_deref() else {
             return Err(BuildError::permanent(
-                "legacy build job has no admitted commit; resubmit sync",
+                "build job has no admitted commit; resubmit sync",
             ));
         };
         if let Err(e) = crate::validation::validate_object_id(admitted) {
@@ -9533,11 +8893,6 @@ pub async fn run_server_with_barrier(
     let remote_gc = RemoteGc::new(b.storage.clone(), b.ref_store.clone(), gc_config);
     remote_gc.spawn(remote_gc_interval);
 
-    let refs_path = repo_root.join(".ripclone-refs.json");
-    if let Err(e) = migrate_legacy_refs(b.ref_store.as_ref(), &refs_path).await {
-        warn!("failed to migrate legacy refs: {}", e);
-    }
-
     let oidc_audience = env::var("RIPCLONE_OIDC_AUDIENCE")
         .ok()
         .filter(|t| !t.is_empty());
@@ -9638,8 +8993,8 @@ pub async fn run_server_with_barrier(
     Ok(())
 }
 
-/// Backward-compatible wrapper: read any test barrier installed via
-/// [`set_test_artifact_barrier`] and run the server with it.
+/// Run the server with any test artifact barrier installed via
+/// [`set_test_artifact_barrier`].
 pub async fn run_server(
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
@@ -9670,7 +9025,6 @@ mod tests {
         let full_only = RefInfo {
             commit: "a".repeat(40),
             full_clonepack: full.clone(),
-            clonepack_manifest: full.manifest.clone(),
             ..Default::default()
         };
         assert!(!exact_ref_info_serves_commit(
@@ -10428,8 +9782,6 @@ mod tests {
         RefInfo {
             commit: commit.to_string(),
             default_branch: "main".to_string(),
-            clonepack_manifest: manifest.to_string(),
-            metadata_chunk: "metadata".to_string(),
             archive_chunks: vec!["archive".to_string()],
             full_clonepack: crate::ClonepackArtifacts {
                 commit: commit.to_string(),
@@ -10484,8 +9836,6 @@ mod tests {
         let info = RefInfo {
             commit: new_commit.to_string(),
             default_branch: "main".to_string(),
-            clonepack_manifest: "old-full".to_string(),
-            metadata_chunk: "old-metadata".to_string(),
             archive_chunks: vec!["old-archive".to_string()],
             full_clonepack: crate::ClonepackArtifacts {
                 commit: old_commit.to_string(),
@@ -10526,8 +9876,6 @@ mod tests {
         let info = RefInfo {
             commit: new_commit.to_string(),
             default_branch: "main".to_string(),
-            clonepack_manifest: "old-full".to_string(),
-            metadata_chunk: "old-metadata".to_string(),
             full_clonepack: crate::ClonepackArtifacts {
                 commit: old_commit.to_string(),
                 manifest: "old-full".to_string(),
@@ -10720,16 +10068,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
             packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: "manifest".to_string(),
-            metadata_chunk: "metadata".to_string(),
             archive_chunks: vec!["chunk1".to_string(), "chunk2".to_string()],
             full_clonepack: crate::ClonepackArtifacts {
                 manifest: "exact-manifest".to_string(),
@@ -10892,7 +10236,6 @@ mod tests {
             default_branch: "main".to_string(),
             commit: "commit1".to_string(),
             parent_commit: None,
-            full_pack: String::new(),
             clonepack_manifest: "manifest".to_string(),
             clonepack_manifest_url: Some("https://example.invalid/manifest".to_string()),
             metadata_chunk: "metadata".to_string(),
@@ -11509,10 +10852,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_active_job_fails_before_source_work() {
+    async fn targetless_active_job_fails_before_source_work() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
-        let repo_id = RepoId::github("acme/legacy");
+        let repo_id = RepoId::github("acme/targetless");
         let job = BuildJob {
             repo_id: repo_id.clone(),
             branch: "main".to_string(),
@@ -11526,15 +10869,15 @@ mod tests {
 
         let error = process_build_job(&state, &job)
             .await
-            .expect_err("a legacy ordinary job must fail closed");
+            .expect_err("a targetless ordinary job must fail closed");
         assert!(!error.is_retryable());
         assert_eq!(
             error.message(),
-            "legacy build job has no admitted commit; resubmit sync"
+            "build job has no admitted commit; resubmit sync"
         );
         assert!(
             !state.repo_root.join(repo_id.mirror_dir_name()).exists(),
-            "legacy rejection must happen before mirror/provider/source work"
+            "targetless rejection must happen before mirror/provider/source work"
         );
         assert!(
             state
@@ -11543,7 +10886,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "legacy rejection must not create metadata"
+            "targetless rejection must not create metadata"
         );
     }
 
@@ -11686,35 +11029,6 @@ mod tests {
         assert_eq!(job.repo_id, RepoId::github("acme/widget"));
         assert_eq!(job.branch, "main");
         assert!(rx.try_recv().is_err(), "exactly one job enqueued");
-    }
-
-    #[tokio::test]
-    async fn webhook_v1_github_alias_still_works() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
-        mark_added(&state, RepoId::github("acme/widget")).await;
-        let app = build_app(state);
-        // The legacy /v1/webhooks/github alias routes into the same receiver.
-        let body = gh_push_body(
-            "acme",
-            "widget",
-            "refs/heads/main",
-            &"1".repeat(40),
-            "main",
-            false,
-        );
-        let sig = gh_sign(WEBHOOK_SECRET, &body);
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/webhooks/github")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .header("X-GitHub-Event", "push")
-            .header("X-Hub-Signature-256", sig)
-            .body(axum::body::Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_ok(), "alias enqueues a build");
     }
 
     #[tokio::test]
@@ -12786,16 +12100,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
             packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),
-            full_pack: String::new(),
-            clonepack_manifest: manifest_hash.clone(),
-            metadata_chunk: "a".repeat(64),
             archive_chunks: vec!["b".repeat(64)],
             full_clonepack: crate::ClonepackArtifacts {
                 manifest: manifest_hash.clone(),
@@ -12884,16 +12194,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
             packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),
-            full_pack: String::new(),
-            clonepack_manifest: manifest_hash.clone(),
-            metadata_chunk: metadata_hash.clone(),
             archive_chunks: vec![archive_hash.clone()],
             full_clonepack: crate::ClonepackArtifacts {
                 manifest: manifest_hash.clone(),
@@ -12993,16 +12299,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
             packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),
-            full_pack: String::new(),
-            clonepack_manifest: manifest_hash.clone(),
-            metadata_chunk: "a".repeat(64),
             archive_chunks: vec!["b".repeat(64)],
             full_clonepack: crate::ClonepackArtifacts {
                 manifest: manifest_hash.clone(),
@@ -13067,16 +12369,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
             packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),
-            full_pack: String::new(),
-            clonepack_manifest: manifest_hash.clone(),
-            metadata_chunk: String::new(),
             archive_chunks: vec![],
             full_clonepack: crate::ClonepackArtifacts {
                 manifest: manifest_hash.clone(),
@@ -13165,16 +12463,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
             packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),
-            full_pack: String::new(),
-            clonepack_manifest: manifest_hash.clone(),
-            metadata_chunk: String::new(),
             archive_chunks: vec![],
             full_clonepack: crate::ClonepackArtifacts {
                 manifest: manifest_hash.clone(),
@@ -13227,16 +12521,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
             packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: String::new(),
-            metadata_chunk: String::new(),
             archive_chunks: vec![],
             full_clonepack: crate::ClonepackArtifacts {
                 manifest: "0000000000000000000000000000000000000000".to_string(),

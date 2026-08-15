@@ -27,7 +27,6 @@ struct RefResponse {
     default_branch: String,
     commit: String,
     parent_commit: Option<String>,
-    full_pack: String,
     clonepack_manifest: String,
     metadata_chunk: String,
 }
@@ -56,7 +55,6 @@ async fn sync_capture(
         default_branch: "main".into(),
         commit: "abc123".into(),
         parent_commit: None,
-        full_pack: "pack".into(),
         clonepack_manifest: "manifest".into(),
         metadata_chunk: "metadata".into(),
     })

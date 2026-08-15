@@ -19,9 +19,9 @@ pub struct AddedRepo {
     pub source: AddedRepoSource,
     /// Upstream repo size from the tiered-add preflight (GitHub `repo.size` in
     /// bytes, etc.). Used to classify the first build into a size class when no
-    /// prior clonepack exists yet. `None` on legacy rows / providers with no
-    /// size signal → first build maps to the largest class.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// prior clonepack exists yet. `None` when a provider has no size signal;
+    /// the first build then maps to the largest class.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_size_bytes: Option<u64>,
 }
 
@@ -347,8 +347,7 @@ impl FileRefStore {
         Ok(true)
     }
 
-    /// Path to the legacy HEAD ref file. Kept for backward compatibility with
-    /// refs created before branch-specific storage.
+    /// Path to the current moving HEAD projection.
     fn path(&self, repo_id: &RepoId) -> PathBuf {
         let key = repo_id.storage_key();
         let (owner, repo) = key
@@ -1271,51 +1270,6 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
     }
 }
 
-/// Migrate the legacy single-file JSON refs store into a `RefStore`.
-///
-/// Entries are keyed by `owner/repo/branch`; we only keep the HEAD entry for
-/// each repo and ignore branch-specific entries.
-pub async fn migrate_legacy_refs(store: &dyn RefStore, legacy_path: &Path) -> Result<usize> {
-    if !legacy_path.exists() {
-        return Ok(0);
-    }
-    info!("migrating legacy refs from {}", legacy_path.display());
-    let data = tokio::fs::read(legacy_path)
-        .await
-        .with_context(|| format!("read legacy refs {}", legacy_path.display()))?;
-    let refs: HashMap<String, RefInfo> = serde_json::from_slice(&data)
-        .with_context(|| format!("parse legacy refs {}", legacy_path.display()))?;
-
-    let mut migrated = 0usize;
-    for (key, info) in refs {
-        // Legacy keys are owner/repo/HEAD or owner/repo/branch. Only migrate
-        // the HEAD entry; branch-specific entries are ignored.
-        if !key.ends_with("/HEAD") {
-            continue;
-        }
-        if let Some((owner_repo, _branch)) = key.rsplit_once('/')
-            && let Some((owner, repo)) = owner_repo.split_once('/')
-        {
-            let repo_id = RepoId::github(format!("{owner}/{repo}"));
-            // Only save if the repo doesn't already have a stored ref.
-            match store.load(&repo_id).await {
-                Ok(None) => {
-                    store.save(&repo_id, &info).await?;
-                    migrated += 1;
-                }
-                Ok(Some(_)) => {
-                    info!("ref store already has {owner}/{repo}; skipping legacy entry");
-                }
-                Err(e) => {
-                    warn!("failed to check ref store for {owner}/{repo}: {e}");
-                }
-            }
-        }
-    }
-    info!("migrated {migrated} repos from legacy refs store");
-    Ok(migrated)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,16 +1282,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
             packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: String::new(),
-            metadata_chunk: String::new(),
             archive_chunks: Vec::new(),
             full_clonepack: crate::ClonepackArtifacts::default(),
             shallow_clonepack: crate::ClonepackArtifacts::default(),
@@ -1628,39 +1578,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_legacy_refs_skips_branch_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(tmp.path()));
-
-        let mut legacy = HashMap::new();
-        legacy.insert(
-            "ripclone/test/HEAD".to_string(),
-            dummy_ref_info("head-commit"),
-        );
-        legacy.insert(
-            "ripclone/test/feature".to_string(),
-            dummy_ref_info("feature-commit"),
-        );
-
-        let legacy_path = tmp.path().join(".ripclone-refs.json");
-        tokio::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap())
-            .await
-            .unwrap();
-
-        let migrated = migrate_legacy_refs(store.as_ref(), &legacy_path)
-            .await
-            .unwrap();
-        assert_eq!(migrated, 1);
-
-        let loaded = store
-            .load(&RepoId::github("ripclone/test"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.commit, "head-commit");
-    }
-
-    #[tokio::test]
     async fn file_ref_store_branch_roundtrip_and_list() {
         let tmp = tempfile::tempdir().unwrap();
         let store = FileRefStore::new(tmp.path());
@@ -1739,20 +1656,6 @@ mod tests {
         store.remove_added_repo(&repo_id).await.unwrap();
         assert!(store.load_added_repo(&repo_id).await.unwrap().is_none());
         assert!(store.list_added_repos().await.unwrap().is_empty());
-    }
-
-    #[test]
-    fn added_repo_legacy_json_defaults_repo_size_bytes() {
-        // Rows written before the size-class preflight field must still parse.
-        let legacy = r#"{
-            "repo_id": {"provider": "github", "path": "o/r"},
-            "added_at": 1,
-            "history_enabled": true,
-            "source": "cli"
-        }"#;
-        let added: AddedRepo = serde_json::from_str(legacy).unwrap();
-        assert_eq!(added.repo_size_bytes, None);
-        assert_eq!(added.repo_id.path, "o/r");
     }
 
     #[tokio::test]

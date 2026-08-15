@@ -210,8 +210,7 @@ Notes:
   with the queued job so a cross-process worker can fetch a repo it has no
   standing token for. SQL queues store that token only as an obfuscated value
   and clear it when the job is claimed or finished; otherwise the worker falls
-  back to provider config (`RIPCLONE_PROVIDERS` or `config.toml`;
-  `RIPCLONE_GITHUB_TOKEN` remains a GitHub-default shortcut).
+  back to provider config (`RIPCLONE_PROVIDERS` or `config.toml`).
 - **Async builds are always on for changed targets.** Ordinary `/sync` resolves
   one exact commit, returns `200` for a complete ready hit, or enqueues and
   returns `202` for changed work. The selected queue survives client disconnect

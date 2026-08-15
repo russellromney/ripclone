@@ -499,7 +499,6 @@ pub async fn replace_full_manifest_commit(
         .put(&hash, &bytes)
         .expect("publish mismatched manifest fixture");
     info.full_clonepack.manifest = hash.clone();
-    info.clonepack_manifest = hash.clone();
     ripclone::ref_store::RefStore::save_branch(&store, &repo_id, "main", &info)
         .await
         .expect("publish mismatched full-manifest ref");
@@ -525,7 +524,7 @@ pub async fn start_server() -> Server {
     start_server_inner(0, &[], None).await
 }
 
-/// Start a server with extra env vars (e.g. `RIPCLONE_WEBHOOK_SECRET`,
+/// Start a server with extra env vars (e.g. `RIPCLONE_WEBHOOK_SECRET_GITHUB`,
 /// `RIPCLONE_POLL_INTERVAL_SECS`) set only during construction, under
 /// `SERVER_START_LOCK`, so they can't leak into a concurrently-starting server.
 pub async fn start_server_env(extra: &[(&str, &str)]) -> Server {

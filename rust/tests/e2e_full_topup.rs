@@ -158,7 +158,7 @@ async fn wait_for_archive_settled(server: &Server, repo: &str, commit: &str) {
         let response = client
             .get(&url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
-            .header("x-ripclone-protocol", "2")
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
             .expect("read-only archive status request");
@@ -727,7 +727,7 @@ exec "$real_git" "$@"
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
         .header("X-Upstream-Token", upstream_token)
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("phase-one shallow metadata request");
@@ -1556,7 +1556,6 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
     let carried = moving.full_clonepack.clone();
     assert_eq!(carried.commit, a);
     moving.full_clonepack = Default::default();
-    moving.clonepack_manifest.clear();
     store
         .save_branch(&repo_id, "main", &moving)
         .await
@@ -1637,7 +1636,7 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
 }
 
 #[tokio::test]
-async fn rolling_upgrade_parent_hint_cannot_top_up_an_unrelated_target() {
+async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
     let _guard = env_lock().lock().await;
     init(false);
     let (server, barrier, entered, proceed) = start_server_split_storage_phase_one_barrier().await;
@@ -1683,13 +1682,13 @@ async fn rolling_upgrade_parent_hint_cannot_top_up_an_unrelated_target() {
     assert_eq!(moving.commit, b);
     assert_eq!(moving.parent_commit.as_deref(), Some(x.as_str()));
     assert_eq!(moving.full_clonepack.commit, a);
-    // Simulate a transient row written by an older binary that reported only a
-    // first-parent-style hint. The fetched commit object remains authoritative.
+    // Corrupt the first-parent-style hint. The fetched commit object remains
+    // authoritative.
     moving.parent_commit = Some(a.clone());
     store
         .save_branch(&repo_id, "main", &moving)
         .await
-        .expect("install rolling-upgrade parent hint");
+        .expect("install malformed parent hint");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -2324,7 +2323,7 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("request MinIO top-up plan");

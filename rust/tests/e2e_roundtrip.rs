@@ -501,18 +501,15 @@ async fn failed_clone_after_temp_dir_leaves_nothing() {
     );
 }
 
-/// RefInfo with LSM levels round-trips through serde, and old records (no
-/// `history_levels`) deserialize to an empty vec (back-compat).
+/// Current RefInfo records preserve LSM levels through serialization.
 #[test]
 fn ref_info_history_levels_serde() {
     use ripclone::{HistoryLevel, RefInfo, SizedPack};
-    let mut info: RefInfo = serde_json::from_str(
-        r#"{"commit":"c","parent_commit":null,"default_branch":"main",
-            "skeleton_pack":"","skeleton_idx":"","head_blobs_pack":"","head_blobs_idx":"",
-            "prebuilt_index":"","archive":"","manifest":"","full_pack":""}"#,
-    )
-    .expect("old RefInfo without history_levels must deserialize");
-    assert!(info.history_levels.is_empty(), "missing field -> empty");
+    let mut info = RefInfo {
+        commit: "c".to_string(),
+        default_branch: "main".to_string(),
+        ..Default::default()
+    };
 
     info.history_levels.push(HistoryLevel {
         tip_commit: "deadbeef".into(),

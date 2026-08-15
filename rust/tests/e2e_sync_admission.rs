@@ -112,7 +112,7 @@ async fn post_webhook(
     .into_bytes();
     let started = Instant::now();
     let response = reqwest::Client::new()
-        .post(format!("{}/v1/webhooks/github", server.url))
+        .post(format!("{}/webhooks/github", server.url))
         .header("X-GitHub-Event", "push")
         .header("X-Hub-Signature-256", sign_webhook(&body))
         .header("content-type", "application/json")
@@ -363,7 +363,7 @@ async fn e2e_sync_admission() {
 
     let probe = Arc::new(AdmissionTestProbe::default());
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
-    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", WEBHOOK_SECRET)]).await;
+    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", WEBHOOK_SECRET)]).await;
     let origin = make_origin("acme", "immutable");
 
     let a = origin.commit(&[("value.txt", "A\n")], "A");
@@ -1166,7 +1166,7 @@ async fn e2e_sync_admission() {
                 server.url
             ))
             .header("Authorization", format!("Ripclone {}", token_hash()))
-            .header("x-ripclone-protocol", "2")
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
             .expect("poll failed exact target");

@@ -60,52 +60,12 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("create jobs table")?;
-        // Migrate a legacy table (created before the credential column).
-        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS credential TEXT")
-            .execute(&self.pool)
-            .await
-            .context("add credential column")?;
-        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS admitted_commit TEXT")
-            .execute(&self.pool)
-            .await
-            .context("add admitted_commit column")?;
-        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS admitted_default_branch TEXT")
-            .execute(&self.pool)
-            .await
-            .context("add admitted_default_branch column")?;
-        // Migrate a legacy table for the attempts column (dead-letter bound).
-        sqlx::raw_sql(
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempts BIGINT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await
-        .context("add attempts column")?;
-        // Stale-reclaim escalation rung (right-sizing / O2 claim filter).
-        sqlx::raw_sql(
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS size_class BIGINT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await
-        .context("add size_class column")?;
-        sqlx::raw_sql(
-            "UPDATE jobs
-             SET status = 'failed', finished_at = EXTRACT(EPOCH FROM NOW())::bigint,
-                 error = 'legacy active job has no admitted commit; resubmit sync',
-                 worker_id = NULL, credential = NULL
-             WHERE status IN ('queued', 'claimed')
-               AND (admitted_commit IS NULL OR admitted_commit = '')",
-        )
-        .execute(&self.pool)
-        .await
-        .context("settle legacy active jobs")?;
         sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
         )
         .execute(&self.pool)
         .await
         .context("create status index")?;
-        // Monotonic v3 migration: use a versioned name and never remove an
-        // existing uniqueness backstop during concurrent process startup.
         sqlx::raw_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_identity_v3
              ON jobs(key) WHERE status IN ('queued', 'claimed')",
@@ -188,9 +148,7 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
-        // Compatibility cleanup for a legacy same-key sibling state. New
-        // immutable active-key rows cannot create it because the uniqueness
-        // constraint covers both queued and claimed rows.
+        // Fail closed if external corruption creates a same-key sibling state.
         sqlx::query(
             "UPDATE jobs SET status = 'failed', finished_at = $1, error = $2,
                  worker_id = NULL, credential = NULL

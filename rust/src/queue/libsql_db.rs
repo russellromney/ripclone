@@ -4,11 +4,9 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
-    ADD_ADMITTED_COMMIT_COLUMN_SQL, ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL,
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
     CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL, QueueDb,
-    SETTLE_LEGACY_ACTIVE_SQL, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
+    SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -46,21 +44,6 @@ impl QueueDb for LibsqlDb {
         conn.execute(CREATE_TABLE_SQL, ())
             .await
             .context("create jobs table")?;
-        // Migrate a legacy table to add the credential column (best-effort: errors
-        // "duplicate column" on a fresh table, which is fine).
-        let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
-        let _ = conn.execute(ADD_ADMITTED_COMMIT_COLUMN_SQL, ()).await;
-        let _ = conn
-            .execute(ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL, ())
-            .await;
-        // Same best-effort migration for the attempts column (dead-letter bound).
-        let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
-        // size_class rank: the claim filter (right-sizing) reads it, and
-        // stale-reclaim bumps it as an escalation rung. Best-effort migration.
-        let _ = conn.execute(ADD_SIZE_CLASS_COLUMN_SQL, ()).await;
-        conn.execute(SETTLE_LEGACY_ACTIVE_SQL, ())
-            .await
-            .context("settle legacy active jobs")?;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
@@ -161,9 +144,7 @@ impl QueueDb for LibsqlDb {
         )
         .await
         .context("dead-letter stale jobs")?;
-        // Compatibility cleanup for a legacy same-key sibling state. New
-        // immutable active-key rows cannot create it because the uniqueness
-        // constraint covers both queued and claimed rows.
+        // Fail closed if external corruption creates a same-key sibling state.
         conn.execute(
             "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
                  worker_id = NULL, credential = NULL

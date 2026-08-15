@@ -5,6 +5,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 ## One current wire implementation
 
 - **Authenticated API requests have one implementation** (`rust/src/client.rs`, `rust/src/server.rs`): the client must declare the current `PROTOCOL_VERSION`; a missing, malformed, or mismatched declaration returns `426 Upgrade Required`. Current ref and pending responses require their complete current fields, including explicit archive readiness and Full top-up support. No request or response shape selects an older implementation.
+- **Removed retired compatibility surfaces**: deleted the snapshot/sidecar CLI and API lane, old artifact URL aliases, config-token migration, old webhook and provider-token aliases, old queue/ref startup migrations, and deprecated manifest readers. Provider-qualified routes and exact commit-keyed artifacts are the sole current API and storage paths.
 
 ## Exact sync admission
 
@@ -12,7 +13,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 - **CLI readiness behavior is explicit** (`rust/src/bin/cli.rs`, `docs/SYNC.md`): normal `add` and `sync` remain fast, while `add --wait` and `sync --wait` poll exact pinned metadata after the first `202` without repeating a moving POST.
 - **Active work is keyed by repository, branch, and exact admitted commit** (`rust/src/queue/`, `rust/src/api_job_queue.rs`): duplicates coalesce while queued, claimed, or in embedded Full work; a later commit remains a separate job. The commit crosses SQL/API-worker/standalone-worker transports, and workers exact-fetch and build it even if the branch moves.
 - **Signed push webhooks use their validated `after` commit directly** (`rust/src/server.rs`): they perform no second tip probe. Readiness-oriented library callers pin the admitted commit and use exact metadata GETs after the first `202`; they do not repeat a moving POST.
-- **Queue upgrades settle unsafe legacy active rows**: rows without a knowable admitted commit fail permanently with `resubmit sync` before source work. Drain or stop old direct workers before starting new writers. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
+- **Malformed targetless ordinary jobs fail closed** before source work. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
 
 ## Cold-history pack and benchmark performance
 

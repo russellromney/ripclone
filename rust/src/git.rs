@@ -1491,7 +1491,7 @@ fn upstream_failure_is_retryable(stderr: &[u8]) -> bool {
 /// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
 /// reference-advertisement round-trip with **no object transfer**. Returns the
 /// hex commit SHA, or `None` if the ref is absent upstream. Individual callers
-/// decide whether an upstream error is best-effort (legacy worker checks) or
+/// decide whether an upstream error is best-effort (historical-revision work) or
 /// fail-closed (ordinary immutable admission).
 pub fn ls_remote_commit(
     provider: &ProviderInstance,
@@ -2042,24 +2042,13 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         // Do NOT fetch an explicit ref like `HEAD` here: that only updates
         // FETCH_HEAD and leaves the mirror's branch refs stale, so a re-sync after
         // a new push would silently keep serving the old commit.
-        //
-        // A leftover shallow mirror (from the old `--depth 50` default) carries a
-        // `shallow` marker file; `--unshallow` completes it (and still fetches all
-        // refs) once, after which plain fetches keep it complete.
-        let is_shallow = mirror_dir.as_ref().join("shallow").exists();
-        // Persist gc-off before fetching, so legacy mirrors (created before this
-        // was set) are covered and the fetch we are about to run cannot auto-gc.
+        // Persist gc-off before fetching so this mutation cannot auto-gc.
         disable_auto_gc(mirror_dir.as_ref())?;
-        let mut args: Vec<&str> = vec!["fetch", "--prune"];
-        if is_shallow {
-            args.push("--unshallow");
-        }
-        args.push("origin");
         let output = Command::new("git")
             .args(&git_args)
             .arg("-C")
             .arg(mirror_dir.as_ref().as_os_str())
-            .args(&args)
+            .args(["fetch", "--prune", "origin"])
             .output()
             .context("git fetch")?;
         if !output.status.success() {
@@ -2300,106 +2289,6 @@ pub fn find_commit_in_git_dir<P: AsRef<Path>>(git_dir: P) -> Result<String> {
         }
     }
     bail!("no commit object found")
-}
-
-/// Return a list of paths likely to be needed by an agent, ordered by priority.
-/// Currently includes top-level tracked files followed by files changed in the
-/// last `commit_count` commits, de-duplicated and capped at `max_count`.
-pub fn hot_files<P: AsRef<Path>>(
-    repo: P,
-    commit: &str,
-    max_count: usize,
-    commit_count: usize,
-) -> Result<Vec<String>> {
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {}", commit))?;
-    let mut paths: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    // 1. Top-level tracked files (skip directories; agents read files).
-    let top = run_git(
-        &repo,
-        &[
-            "ls-tree",
-            "-z",
-            "--format=%(objecttype) %(path)",
-            "--end-of-options",
-            commit,
-        ],
-    )?;
-    for record in top.split('\0').filter(|s| !s.is_empty()) {
-        let mut parts = record.splitn(2, ' ');
-        let obj_type = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("").to_string();
-        if obj_type == "blob" && seen.insert(path.clone()) {
-            paths.push(path);
-        }
-    }
-
-    // 2. Files changed in recent commits.
-    let commits = last_commits(&repo, commit, commit_count)?;
-    for c in commits {
-        crate::validation::validate_object_id(&c)
-            .with_context(|| format!("invalid commit sha: {}", c))?;
-        let out = run_git(
-            &repo,
-            &[
-                "diff-tree",
-                "--no-commit-id",
-                "--name-only",
-                "-r",
-                "-z",
-                "--end-of-options",
-                &c,
-            ],
-        )?;
-        for name in out.split('\0').filter(|s| !s.is_empty()) {
-            let path = name.to_string();
-            if seen.insert(path.clone()) {
-                paths.push(path);
-            }
-        }
-    }
-
-    paths.truncate(max_count);
-    Ok(paths)
-}
-
-/// Build a tar archive containing the requested paths from a commit.
-///
-/// Uses `git archive` so modes and symlinks are preserved exactly. The
-/// returned bytes are a standard `.tar` archive (not compressed) so the client
-/// can stream-extract it directly into the working tree.
-pub fn build_path_tar<P: AsRef<Path>>(repo: P, commit: &str, paths: &[String]) -> Result<Vec<u8>> {
-    if paths.is_empty() {
-        anyhow::bail!("no paths for batch tar");
-    }
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {}", commit))?;
-    for path in paths {
-        if path.contains('\0') {
-            anyhow::bail!("path contains NUL byte: {}", path);
-        }
-    }
-
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(repo.as_ref().as_os_str())
-        .arg("archive")
-        .arg("--format=tar")
-        .arg("--end-of-options")
-        .arg(commit)
-        .arg("--");
-    for path in paths {
-        cmd.arg(path);
-    }
-
-    let output = cmd.output().context("git archive")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git archive failed: {}", stderr);
-    }
-    Ok(output.stdout)
 }
 
 /// Materialize a file in a git dir by fetching its blob from a source repo.

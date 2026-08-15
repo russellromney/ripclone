@@ -66,7 +66,6 @@ lane name such as `small` or `large`), not an env var.
 | **Metadata target** (`api` — token-only farm-out) | `RIPCLONE_METADATA_REPORT_URL` | Yes, when `RIPCLONE_METADATA=api` | — | Absolute `http(s)` URL of the server's `POST /v1/refs` report endpoint. Missing → worker fails at startup. |
 | | `RIPCLONE_METADATA_JOB_TOKEN` | Yes, when `RIPCLONE_QUEUE=api` or `RIPCLONE_METADATA=api` | — | The **one** signed, expiring HMAC bearer (`rcjt1.…`) for all four endpoints (claim/ack/heartbeat/refs); no repo or job scope. Operator-provisioned (`ripclone mint-worker-token`, default 90d) — a Fly machine secret, or forwarded by the dispatcher for exec/http. Sent as `Authorization: Bearer …`. Missing → worker fails at startup. Malformed/expired/wrong-secret → 401, no state change; the worker exits cleanly for respawn. |
 | **Upstream-credential source** | `RIPCLONE_PROVIDERS` | One source required | — | JSON provider registry; supplies instance tokens and auth templates. |
-| | `RIPCLONE_GITHUB_TOKEN` | alt | — | Static GitHub personal/token for the static broker. |
 | | `RIPCLONE_GITHUB_APP_ID` | alt | — | GitHub App broker: app ID. |
 | | `RIPCLONE_GITHUB_APP_INSTALLATION_ID` | Yes, with App ID | — | Installation ID for the app. |
 | | `RIPCLONE_GITHUB_APP_PRIVATE_KEY` | one key var required with App ID | — | Inline PEM private key. |
@@ -102,8 +101,7 @@ Before starting a worker, a provider must set:
    - **Single-box direct SQL (trusted):** `RIPCLONE_QUEUE=sqlite|…` +
      `RIPCLONE_QUEUE_DB_URL` + `RIPCLONE_METADATA=sqlite|…` +
      `RIPCLONE_METADATA_DB_URL` (+ `*_DB_TOKEN` for libsql).
-4. One upstream-credential source (`RIPCLONE_PROVIDERS`, `RIPCLONE_GITHUB_TOKEN`,
-   or GitHub App vars).
+4. One upstream-credential source (`RIPCLONE_PROVIDERS` or GitHub App vars).
 5. Optional: `RIPCLONE_MAX_SIZE_CLASS` and lifecycle flags.
 
 That is the entire provider-facing surface today. No CLI flags, no config

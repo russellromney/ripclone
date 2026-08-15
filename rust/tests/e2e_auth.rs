@@ -210,73 +210,15 @@ async fn bearer_token_authorizes_a_protected_route() {
         .unwrap();
     assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
 
-    // The existing shared-token scheme still works (backward compatible).
-    let legacy = reqwest::Client::new()
+    // The shared server token remains a current authentication mechanism.
+    let shared_token = reqwest::Client::new()
         .get(&url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
         .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .unwrap();
-    assert_eq!(legacy.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn content_endpoints_forbid_unauthorized_repo() {
-    let http_origin = make_http_origin("acme/public");
-    let server = start_repo_auth_server(&http_origin.url).await;
-    let client = reqwest::Client::new();
-    let auth = format!("Ripclone {}", token_hash());
-    let base = format!("{}/v1/repos/localgit/acme/private", server.url);
-
-    let cat = client
-        .get(format!("{base}/cat?branch=main&path=a.txt"))
-        .header("Authorization", auth.clone())
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(cat.status(), StatusCode::FORBIDDEN);
-
-    let sizes = client
-        .get(format!("{base}/sizes?branch=main"))
-        .header("Authorization", auth.clone())
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(sizes.status(), StatusCode::FORBIDDEN);
-
-    let hotfiles = client
-        .get(format!("{base}/hotfiles?branch=main"))
-        .header("Authorization", auth.clone())
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hotfiles.status(), StatusCode::FORBIDDEN);
-
-    let snapshot = client
-        .post(format!("{base}/snapshot?branch=main"))
-        .header("Authorization", auth.clone())
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(snapshot.status(), StatusCode::FORBIDDEN);
-
-    let batch = client
-        .post(format!("{base}/batch"))
-        .header("Authorization", auth)
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .json(&serde_json::json!({
-            "branch": "main",
-            "paths": ["a.txt"]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(batch.status(), StatusCode::FORBIDDEN);
+    assert_eq!(shared_token.status(), StatusCode::OK);
 }
 
 #[tokio::test]

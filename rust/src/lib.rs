@@ -118,10 +118,6 @@ pub mod retention;
 #[doc(hidden)]
 pub mod secure_file;
 pub mod server;
-#[doc(hidden)]
-pub mod sidecar;
-#[doc(hidden)]
-pub mod snapshot;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod statx_compat;
@@ -198,11 +194,9 @@ pub struct ClonepackArtifacts {
     pub skeleton_idx: String,
     pub prebuilt_index: String,
     /// CAS hash of the pre-built multi-pack-index over this variant's packs.
-    /// Empty for older refs (client falls back to building the MIDX itself).
     #[serde(default)]
     pub midx: String,
     /// CAS hash of the concatenated idx bundle for this variant's packs. Empty
-    /// for older refs (client falls back to fetching each idx individually).
     #[serde(default)]
     pub idx_bundle: String,
     /// The commit this variant's clonepack is built for. May differ from
@@ -216,7 +210,7 @@ pub struct ClonepackArtifacts {
 /// Artifact hashes returned by the server for a single ref.
 ///
 /// Every artifact is stored in the CAS and can be fetched by its hash from
-/// `/v1/artifacts/{hash}` (or the `/v1/packs/{hash}` legacy endpoint).
+/// `/v1/artifacts/{hash}`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefInfo {
     /// Internal commit-addressed result rows are retained and garbage-collected
@@ -238,7 +232,6 @@ pub struct RefInfo {
     pub default_branch: String,
     pub skeleton_pack: String,
     pub skeleton_idx: String,
-    pub head_blobs_pack: String,
     pub head_blobs_idx: String,
     /// Content-addressed chunks of the head-blobs pack. The full pack is the
     /// concatenation of these chunks in order. New builds split the pack so the
@@ -253,17 +246,6 @@ pub struct RefInfo {
     pub prebuilt_index: String,
     pub archive: String,
     pub manifest: String,
-    /// Optional full-history pack (empty when not built).
-    pub full_pack: String,
-    /// Clonepack manifest hash (protobuf). Archive chunks are referenced inside it.
-    /// Kept for backward compatibility; use `full_clonepack.manifest`.
-    #[serde(default)]
-    pub clonepack_manifest: String,
-    /// Metadata chunk hash (protobuf). Kept at the top level so the ref endpoint
-    /// can hand out a signed URL for it without re-decoding the manifest.
-    /// Kept for backward compatibility; use `full_clonepack.metadata_chunk`.
-    #[serde(default)]
-    pub metadata_chunk: String,
     /// Archive chunk hashes referenced by the clonepack manifest. Kept for
     /// retention protection and debugging.
     #[serde(default)]

@@ -145,7 +145,6 @@ pub fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
     for hash in [
         &info.full_clonepack.manifest,
         &info.shallow_clonepack.manifest,
-        &info.clonepack_manifest,
     ] {
         if !hash.is_empty() && seen.insert(hash.to_string()) {
             out.push(hash.to_string());

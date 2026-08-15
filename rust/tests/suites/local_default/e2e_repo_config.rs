@@ -69,7 +69,7 @@ async fn admin_config_round_trips_with_branch_override() {
         "acme",
         "cfg",
         None,
-        serde_json::json!({ "compression_level": 9, "hot_files": 12 }),
+        serde_json::json!({ "compression_level": 9, "archive_chunk_size": 12 }),
     )
     .await;
     assert!(
@@ -85,7 +85,7 @@ async fn admin_config_round_trips_with_branch_override() {
         .await
         .unwrap();
     assert_eq!(got["compression_level"], 9);
-    assert_eq!(got["hot_files"], 12);
+    assert_eq!(got["archive_chunk_size"], 12);
 
     // Branch-level override is stored separately.
     let resp = admin_put(

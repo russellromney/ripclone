@@ -67,8 +67,8 @@ pub struct ClaimedJob {
     pub path: String,
     pub branch: String,
     /// Exact ordinary tip commit admitted by the server. `None` identifies a
-    /// historical rev job or a legacy row that must be rejected before source
-    /// work by the worker.
+    /// historical rev job or a malformed row that must be rejected before
+    /// source work by the worker.
     pub admitted_commit: Option<String>,
     /// Concrete upstream default branch learned during HEAD admission, when
     /// available. This does not affect coalescing identity.
@@ -211,8 +211,8 @@ pub trait QueueDb: Send + Sync {
     /// Requeue a retryable build failure while the caller still owns the claim.
     /// Returns false if the claim was reclaimed or otherwise settled first.
     ///
-    /// If a legacy same-key queued sibling exists, requeue may violate the
-    /// active-key constraint; settle the redundant claim terminally with
+    /// If external corruption creates a same-key queued sibling, requeue may
+    /// violate the active-key constraint; settle the redundant claim with
     /// [`SUPERSEDED_BY_NEWER_QUEUED`]. New exact B/C admissions use different
     /// keys and therefore retry independently.
     async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool>;
@@ -813,9 +813,7 @@ impl JobQueue for SqlJobQueue {
     async fn enqueue(&self, job: BuildJob) -> Result<Enqueued> {
         if job.rev.is_none() {
             let Some(commit) = job.admitted_commit.as_deref() else {
-                anyhow::bail!(
-                    "ordinary tip build must carry an admitted commit; legacy jobs cannot be enqueued"
-                );
+                anyhow::bail!("ordinary tip build must carry an admitted commit");
             };
             crate::validation::validate_object_id(commit)
                 .context("validate admitted build commit")?;
@@ -955,9 +953,7 @@ pub(crate) const CREATE_STATUS_INDEX_SQL: &str =
 
 /// Database-enforced coalescing backstop: at most one queued or claimed build
 /// per immutable key. A later admitted commit has a different key and remains
-/// a distinct job. The versioned name makes this a monotonic migration: startup
-/// adds the v3 constraint but never drops either an already-correct constraint
-/// or a legacy queued-only backstop.
+/// a distinct job.
 pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_identity_v3
      ON jobs(key) WHERE status IN ('queued', 'claimed')";
@@ -965,42 +961,6 @@ pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
 /// Index for the build/version history queries over retained `done` jobs
 /// ("what was synced for this repo over time").
 pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_jobs_provider_path_finished ON jobs(provider, path, finished_at)";
-
-/// Migration for a `jobs` table created before the `credential` column existed.
-/// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so it never adds
-/// the column — run this ALTER best-effort (it errors "duplicate column" on a
-/// fresh table, which is ignored). SQLite/libsql have no `ADD COLUMN IF NOT
-/// EXISTS`, hence best-effort; Postgres uses its own `IF NOT EXISTS` form.
-pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN credential TEXT";
-
-/// Migration for the immutable admission column. Active legacy rows are settled
-/// before the active-key index is created; workers never guess their target.
-pub(crate) const ADD_ADMITTED_COMMIT_COLUMN_SQL: &str =
-    "ALTER TABLE jobs ADD COLUMN admitted_commit TEXT";
-
-pub(crate) const ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL: &str =
-    "ALTER TABLE jobs ADD COLUMN admitted_default_branch TEXT";
-
-pub(crate) const SETTLE_LEGACY_ACTIVE_SQL: &str = "UPDATE jobs
-    SET status = 'failed', finished_at = CAST(strftime('%s','now') AS INTEGER),
-        error = 'legacy active job has no admitted commit; resubmit sync',
-        worker_id = NULL, credential = NULL
-    WHERE status IN ('queued', 'claimed')
-      AND (admitted_commit IS NULL OR admitted_commit = '')";
-
-/// Migration for a `jobs` table created before the `attempts` column existed.
-/// Best-effort like [`ADD_CREDENTIAL_COLUMN_SQL`]: errors "duplicate column" on
-/// a fresh/up-to-date table, which is ignored.
-pub(crate) const ADD_ATTEMPTS_COLUMN_SQL: &str =
-    "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0";
-
-/// Migration for a `jobs` table created before the `size_class` column existed.
-/// Blessed backends only (sqlite/libsql). Best-effort like the other ALTERs.
-/// Default 0 = smallest class so legacy rows stay claimable by every worker.
-/// Stale-reclaim bumps this rung so a larger worker can pick the job up next
-/// (claim filter lands in O2).
-pub(crate) const ADD_SIZE_CLASS_COLUMN_SQL: &str =
-    "ALTER TABLE jobs ADD COLUMN size_class INTEGER NOT NULL DEFAULT 0";
 
 /// Worker heartbeat/registry table (dispatcher autoscaler live-count). Blessed
 /// backends only (sqlite/libsql). One row per worker: id, size ceiling, optional
@@ -1017,10 +977,8 @@ pub(crate) const CREATE_WORKERS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS wo
 pub(crate) const CREATE_WORKERS_HEARTBEAT_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_workers_last_heartbeat ON workers(last_heartbeat)";
 
-/// Retained compatibility error for a legacy/repaired queue state where a
-/// claimed row encounters a queued sibling with the same key. New immutable
-/// active-key rows cannot reach that state because the database constraint
-/// covers both statuses.
+/// Fail-closed error for a corrupted queue state where a claimed row encounters
+/// a queued sibling with the same key.
 pub(crate) const SUPERSEDED_BY_NEWER_QUEUED: &str =
     "superseded by newer queued job for the same active key";
 
@@ -1197,69 +1155,6 @@ mod tests {
         assert!(db.finish(id, "w", "done", 3, None).await.unwrap());
         let (_, _, _, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
         assert!(after.is_none(), "credential must be cleared on finish");
-    }
-
-    #[tokio::test]
-    async fn init_migrates_a_legacy_jobs_table_and_is_idempotent() {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("q.db");
-        // A pre-credential `jobs` table, created by hand (no credential column).
-        let url = format!("sqlite://{}?mode=rwc", path.display());
-        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
-        sqlx::raw_sql(
-            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, \
-             provider TEXT NOT NULL, path TEXT NOT NULL, branch TEXT NOT NULL, \
-             status TEXT NOT NULL, worker_id TEXT, created_at INTEGER NOT NULL, \
-             claimed_at INTEGER, finished_at INTEGER, error TEXT)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let legacy_id = sqlx::query(
-            "INSERT INTO jobs (key, provider, path, branch, status, created_at) \
-             VALUES ('legacy-key', 'github', 'o/legacy', 'main', 'queued', 1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
-        pool.close().await;
-
-        let db = SqliteDb::connect(&path.to_string_lossy()).await.unwrap();
-        db.init().await.unwrap(); // adds credential / attempts / size_class columns
-        db.init().await.unwrap(); // idempotent: best-effort ALTER ignores duplicate
-        assert_eq!(
-            db.status(legacy_id).await.unwrap(),
-            Some((
-                "failed".to_string(),
-                Some("legacy active job has no admitted commit; resubmit sync".to_string())
-            )),
-            "legacy active work must settle without guessing a source tip"
-        );
-        // Inserting a credential now works because the column exists.
-        let id = db
-            .insert_job(
-                "k",
-                "github",
-                "o/r",
-                "main",
-                None,
-                None,
-                Some("Y3JlZA=="),
-                0,
-                1,
-            )
-            .await
-            .unwrap();
-        let (_, _, _, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
-        assert_eq!(cred.as_deref(), Some("Y3JlZA=="));
-        // size_class migration is load-bearing for stale-reclaim escalation.
-        assert_eq!(
-            db.job_size_class(id).await.unwrap(),
-            Some(0),
-            "legacy table must gain size_class DEFAULT 0"
-        );
     }
 
     #[tokio::test]

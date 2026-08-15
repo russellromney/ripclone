@@ -566,7 +566,7 @@ async fn run_pinned_branch_advance_proof(advance_again: bool) {
                 server.url
             ))
             .header("Authorization", format!("Ripclone {}", token_hash()))
-            .header("x-ripclone-protocol", "2")
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
             .expect("pinned B poll");
@@ -772,7 +772,7 @@ async fn evicted_pin_rebuilds_b_without_branch_probe() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("evicted exact lookup");
@@ -1187,7 +1187,6 @@ async fn real_server_pending_exhaustion_is_typed_and_leaves_no_target() {
         .commit;
     mutate_stored_refs(&server.repo_root.join(".ripclone-refs"), |info| {
         info.full_clonepack = Default::default();
-        info.clonepack_manifest.clear();
     });
 
     unsafe {
@@ -1898,7 +1897,7 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
     };
     for attempt in 1..=2 {
         let rejected = request().send().await.expect("mismatched lookup");
@@ -2101,7 +2100,6 @@ async fn cancelling_real_clone_waits_for_midx_writer_before_staging_cleanup() {
     storage.put(&hash, &bytes).expect("write no-MIDX manifest");
     info.full_clonepack.manifest = hash.clone();
     info.full_clonepack.midx.clear();
-    info.clonepack_manifest = hash;
     store
         .save_branch(&repo_id, "main", &info)
         .await
@@ -2401,7 +2399,7 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
     let exact_snapshot = reqwest::Client::new()
         .get(&pinned_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -2451,7 +2449,7 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -2467,8 +2465,8 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
         moving_b.full_clonepack.manifest
     );
     assert_ne!(
-        top_up["top_up_base"]["metadata_chunk"], moving_b.metadata_chunk,
-        "the response must not mix B's top-level metadata into carried A"
+        top_up["top_up_base"]["metadata_chunk"], moving_b.shallow_clonepack.metadata_chunk,
+        "the response must not mix B's shallow metadata into carried A"
     );
 
     let probe = server
@@ -2479,7 +2477,7 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
     let response = reqwest::Client::new()
         .get(&pinned_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -2501,7 +2499,7 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
     let pending = reqwest::Client::new()
         .get(&pinned_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -2554,7 +2552,7 @@ async fn pinned_input_is_validated_and_scoped_to_the_authorized_repository() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
     };
     let malformed = request("not-a-sha")
         .send()
@@ -2598,7 +2596,7 @@ async fn exact_lookup_never_substitutes_the_other_clonepack_variant() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
     };
 
     mutate_stored_refs(&ref_root, |info| {

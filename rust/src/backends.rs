@@ -62,8 +62,7 @@ pub struct Backends {
 impl Backends {
     /// Build storage + metadata store + retention from the environment, factored
     /// out so the server and the worker share it. Does **not** start the
-    /// retention sweep loop or migrate legacy refs — those are server-startup
-    /// concerns.
+    /// retention sweep loop; that remains a server-startup concern.
     pub async fn from_env(
         cas_dir: &Path,
         repo_root: &Path,

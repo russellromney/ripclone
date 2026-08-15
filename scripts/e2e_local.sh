@@ -125,14 +125,14 @@ clone_repo() { # owner repo dir [extra cli args...]
   local i
   for i in $(seq 1 80); do
     rm -rf "$3"
-    if "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" --dir "$3" "${@:4}" >/dev/null 2>&1; then
+    if "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" "$3" "${@:4}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5
   done
   # Final attempt without suppression so the real error surfaces under `set -e`.
   rm -rf "$3"
-  "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" --dir "$3" "${@:4}" >/dev/null
+  "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" "$3" "${@:4}" >/dev/null
 }
 # Like clone_repo but also waits out the background full build / brief stale
 # serving on a re-sync: retry until the clone reaches exactly `$4` commits.
@@ -140,7 +140,7 @@ clone_until_count() { # owner repo dir count [extra cli args...]
   local i
   for i in $(seq 1 80); do
     rm -rf "$3"
-    if "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" --dir "$3" "${@:5}" >/dev/null 2>&1 \
+    if "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" "$3" "${@:5}" >/dev/null 2>&1 \
       && [ "$(gitc "$3" rev-list --count HEAD 2>/dev/null)" = "$4" ]; then
       return 0
     fi

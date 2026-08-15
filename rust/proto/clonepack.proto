@@ -47,9 +47,7 @@ message ClonepackManifest {
   repeated ChunkRef head_blobs_chunks = 8;
   ChunkRef head_blobs_idx = 7;
 
-  // Deprecated: kept for compatibility with older manifests. New builds write
-  // `head_blobs_chunks` instead.
-  ChunkRef head_blobs_pack = 6 [deprecated = true];
+  reserved 6;
 
   // The editable clone payload: many small, self-contained git packs (each
   // ~1-2 MB with its own idx). The client downloads them in parallel and, as

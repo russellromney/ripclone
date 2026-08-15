@@ -60,22 +60,11 @@ To scale up, start more `ripclone-worker` processes pointed at the same queue an
 storage. To scale down, stop workers — in-flight jobs are reclaimed by the stale
 timeout and picked up by whoever is left.
 
-## Upgrading the queue safely
-
-The queue stores the admitted commit on new ordinary jobs. The active uniqueness
-constraint covers both queued and claimed exact keys on SQLite, libSQL,
-PostgreSQL, and MySQL. A pre-upgrade active row has no knowable target; startup
-settles it with a permanent `legacy active job has no admitted commit; resubmit
-sync` failure rather than guessing the current branch tip. A standalone worker
-also rejects such a row before credentials, provider access, mirror mutation, or
-builder entry.
-
-Drain or stop old direct workers before starting the new server/workers. Old
-workers do not understand the admitted-commit field, so mixed direct-worker
-operation is not supported during this upgrade. Completed history rows are kept;
-only unsafe active legacy rows are settled. `RIPCLONE_QUEUE=local` remains an
-in-memory, process-lifetime boundary and does not become durable through this
-upgrade.
+The queue stores the admitted commit on every ordinary job. The active
+uniqueness constraint covers both queued and claimed exact keys on SQLite,
+libSQL, PostgreSQL, and MySQL. Workers reject a malformed targetless ordinary
+job before credentials, provider access, mirror mutation, or builder entry.
+`RIPCLONE_QUEUE=local` remains an in-memory, process-lifetime boundary.
 
 ## Run your own trigger
 

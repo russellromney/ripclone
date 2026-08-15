@@ -3,11 +3,9 @@
 //! atomic conditional claim). For multi-machine use the remote `libsql` backend.
 
 use super::sql::{
-    ADD_ADMITTED_COMMIT_COLUMN_SQL, ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL,
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
     CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL, QueueDb,
-    SETTLE_LEGACY_ACTIVE_SQL, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
+    SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -47,30 +45,6 @@ impl QueueDb for SqliteDb {
             .execute(&self.pool)
             .await
             .context("create jobs table")?;
-        // Migrate a legacy table to add the credential column (best-effort: errors
-        // "duplicate column" on a fresh table, which is fine).
-        let _ = sqlx::raw_sql(ADD_CREDENTIAL_COLUMN_SQL)
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::raw_sql(ADD_ADMITTED_COMMIT_COLUMN_SQL)
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::raw_sql(ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL)
-            .execute(&self.pool)
-            .await;
-        // Same best-effort migration for the attempts column (dead-letter bound).
-        let _ = sqlx::raw_sql(ADD_ATTEMPTS_COLUMN_SQL)
-            .execute(&self.pool)
-            .await;
-        // size_class rank: the claim filter (right-sizing) reads it, and
-        // stale-reclaim bumps it as an escalation rung. Best-effort migration.
-        let _ = sqlx::raw_sql(ADD_SIZE_CLASS_COLUMN_SQL)
-            .execute(&self.pool)
-            .await;
-        sqlx::raw_sql(SETTLE_LEGACY_ACTIVE_SQL)
-            .execute(&self.pool)
-            .await
-            .context("settle legacy active jobs")?;
         sqlx::raw_sql(CREATE_STATUS_INDEX_SQL)
             .execute(&self.pool)
             .await
@@ -170,9 +144,8 @@ impl QueueDb for SqliteDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
-        // Compatibility cleanup for a legacy same-key sibling state. New
-        // immutable active-key rows cannot create this state because the
-        // uniqueness constraint covers both queued and claimed rows. Nested
+        // Fail closed if external corruption creates a same-key sibling state.
+        // Nested
         // FROM avoids SQLite's "table is locked" when updating from a
         // same-table subquery.
         sqlx::query(

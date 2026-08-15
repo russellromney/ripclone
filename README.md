@@ -153,7 +153,7 @@ cargo run --release --bin ripclone -- add oven-sh/bun
 Clone it:
 
 ```bash
-cargo run --release --bin ripclone -- clone oven-sh/bun --dir bun
+cargo run --release --bin ripclone -- clone oven-sh/bun bun
 ```
 
 (`add` is the first-run verb — a repo must be added before it can be cloned or
@@ -204,9 +204,9 @@ send it directly.)
 
 Instead of (or alongside) the Actions workflow, point a provider webhook at the server so it builds on every push with nothing added to the consumer repo. Set a per-provider secret, then add a repository/org webhook:
 
-- **Payload URL:** `https://ripclone.example.com/webhooks/github` (`/v1/webhooks/github` is a back-compat alias)
+- **Payload URL:** `https://ripclone.example.com/webhooks/github`
 - **Content type:** `application/json`
-- **Secret:** the value of `RIPCLONE_WEBHOOK_SECRET_GITHUB` (the legacy `RIPCLONE_WEBHOOK_SECRET` is still honored for github)
+- **Secret:** the value of `RIPCLONE_WEBHOOK_SECRET_GITHUB`
 - **Events:** the `push` event.
 
 The server verifies the provider HMAC (`X-Hub-Signature-256`) over the raw body — constant-time, before any parse — validates the full `after` object ID, and admits that exact commit through the same queue `/sync` uses. The webhook does not perform another tip probe and returns before artifact construction completes. Fail-closed: a provider with no configured secret returns `503`; a bad signature `401`. Branch deletes clean up that ref; tags/ping are acknowledged with no build.
@@ -232,7 +232,7 @@ ripclone update
 
 # Clone a repo (public or private) — github is the default provider
 ripclone clone owner/repo
-ripclone clone owner/repo --branch feat/x --dir ./my-dir
+ripclone clone owner/repo ./my-dir --branch feat/x
 
 # Another host: prefix the repo, or pass --provider (see Providers below)
 ripclone clone gitlab:mygroup/project

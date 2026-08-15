@@ -2,18 +2,16 @@
 //!
 //! A `RepoConfig` tells the server how to build a repo's clonepacks: which depth
 //! variants to produce, the zstd compression level, archive/head-blobs chunk
-//! sizes, hot-file count, an optional dictionary, and which clone modes are
-//! enabled. It is stored in the same backend as artifacts (file locally, S3 in
+//! sizes, and an optional dictionary. It is stored in the same backend as artifacts (file locally, S3 in
 //! production) via the storage layer's keyed metadata objects, written live by
 //! the admin endpoint and read fresh on each build — no restart needed.
 //!
 //! Config is read only at build time. The build records the resulting variant
-//! names and enabled modes into the `RefInfo`, so the resolve/clone hot path
-//! never has to read config.
+//! names into the `RefInfo`, so the resolve/clone hot path never has to read config.
 //!
 //! A repo with no stored config uses [`RepoConfig::default`], which reproduces
 //! today's behavior exactly: a `shallow` (depth 1) and a `full` (unlimited)
-//! clonepack, zstd level 6, all modes enabled.
+//! clonepack and zstd level 6.
 
 use crate::provider::RepoId;
 use crate::storage::StorageRef;
@@ -27,9 +25,6 @@ pub const DEFAULT_COMPRESSION_LEVEL: i32 = 6;
 pub const SHALLOW_VARIANT: &str = "shallow";
 /// Name of the built-in unlimited-history variant.
 pub const FULL_VARIANT: &str = "full";
-/// All clone modes the server knows how to serve.
-pub const ALL_MODES: [&str; 4] = ["full", "fast", "hybrid", "skeleton"];
-
 /// One named clonepack depth. `depth: None` means unlimited (full history);
 /// `depth: Some(n)` bounds it to the last `n` commits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,18 +49,12 @@ pub struct RepoConfig {
     /// forward compatibility; dictionary lookup is a follow-up).
     #[serde(default)]
     pub dictionary_id: Option<String>,
-    /// Number of hot files to surface in snapshot/hotfiles responses.
-    #[serde(default)]
-    pub hot_files: Option<usize>,
     /// Target compressed size of each archive chunk, in bytes.
     #[serde(default)]
     pub archive_chunk_size: Option<u64>,
     /// Target size of each head-blobs pack chunk, in bytes.
     #[serde(default)]
     pub head_blobs_chunk_size: Option<u64>,
-    /// Clone modes a client may request. `None` = all modes enabled.
-    #[serde(default)]
-    pub enabled_modes: Option<Vec<String>>,
 }
 
 impl RepoConfig {
@@ -107,14 +96,6 @@ impl RepoConfig {
         self.compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL)
     }
 
-    /// True if `mode` may be served under this config.
-    pub fn mode_enabled(&self, mode: &str) -> bool {
-        match &self.enabled_modes {
-            None => true,
-            Some(modes) => modes.iter().any(|m| m == mode),
-        }
-    }
-
     /// Field-level overlay of `branch` config over `self` (the repo-level
     /// config): each field the branch sets wins; unset branch fields keep the
     /// repo value. This is how branch entries override repo entries.
@@ -130,13 +111,8 @@ impl RepoConfig {
                 .dictionary_id
                 .clone()
                 .or_else(|| self.dictionary_id.clone()),
-            hot_files: branch.hot_files.or(self.hot_files),
             archive_chunk_size: branch.archive_chunk_size.or(self.archive_chunk_size),
             head_blobs_chunk_size: branch.head_blobs_chunk_size.or(self.head_blobs_chunk_size),
-            enabled_modes: branch
-                .enabled_modes
-                .clone()
-                .or_else(|| self.enabled_modes.clone()),
         }
     }
 
@@ -158,20 +134,6 @@ impl RepoConfig {
         if let Some(0) = self.head_blobs_chunk_size {
             anyhow::bail!("head_blobs_chunk_size must be greater than zero");
         }
-        if let Some(modes) = &self.enabled_modes {
-            if modes.is_empty() {
-                anyhow::bail!("enabled_modes must list at least one mode");
-            }
-            for m in modes {
-                if !ALL_MODES.contains(&m.as_str()) {
-                    anyhow::bail!(
-                        "unknown mode {m:?}; valid modes are {}",
-                        ALL_MODES.join(", ")
-                    );
-                }
-            }
-        }
-
         let mut names = std::collections::HashSet::new();
         let mut finite = 0usize;
         let mut unlimited = 0usize;
@@ -316,8 +278,6 @@ mod tests {
             }
         );
         assert_eq!(cfg.compression_level(), DEFAULT_COMPRESSION_LEVEL);
-        assert!(cfg.mode_enabled("full"));
-        assert!(cfg.mode_enabled("skeleton"));
         cfg.validate().unwrap();
     }
 
@@ -325,16 +285,15 @@ mod tests {
     fn branch_overlay_overrides_only_set_fields() {
         let repo = RepoConfig {
             compression_level: Some(9),
-            hot_files: Some(20),
+            archive_chunk_size: Some(20),
             ..Default::default()
         };
         let branch = RepoConfig {
-            hot_files: Some(50),
+            archive_chunk_size: Some(50),
             ..Default::default()
         };
         let merged = repo.overlay(&branch);
-        // Branch overrides hot_files but inherits the repo compression level.
-        assert_eq!(merged.hot_files, Some(50));
+        assert_eq!(merged.archive_chunk_size, Some(50));
         assert_eq!(merged.compression_level, Some(9));
     }
 
@@ -363,22 +322,6 @@ mod tests {
         assert!(
             RepoConfig {
                 compression_level: Some(99),
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            RepoConfig {
-                enabled_modes: Some(vec!["bogus".into()]),
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            RepoConfig {
-                enabled_modes: Some(vec![]),
                 ..Default::default()
             }
             .validate()
@@ -438,16 +381,6 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
-    #[test]
-    fn mode_gating() {
-        let cfg = RepoConfig {
-            enabled_modes: Some(vec!["full".into(), "skeleton".into()]),
-            ..Default::default()
-        };
-        assert!(cfg.mode_enabled("full"));
-        assert!(!cfg.mode_enabled("fast"));
-    }
-
     #[tokio::test]
     async fn store_round_trips_repo_and_branch() {
         let tmp = tempfile::tempdir().unwrap();
@@ -464,7 +397,7 @@ mod tests {
 
         let repo_cfg = RepoConfig {
             compression_level: Some(10),
-            hot_files: Some(7),
+            archive_chunk_size: Some(7),
             ..Default::default()
         };
         store.put_repo(&repo, &repo_cfg).await.unwrap();
@@ -472,7 +405,7 @@ mod tests {
 
         // Branch override merges over the repo config.
         let branch_cfg = RepoConfig {
-            hot_files: Some(99),
+            archive_chunk_size: Some(99),
             ..Default::default()
         };
         store
@@ -480,11 +413,11 @@ mod tests {
             .await
             .unwrap();
         let effective = store.effective(&repo, "release").await.unwrap();
-        assert_eq!(effective.hot_files, Some(99));
+        assert_eq!(effective.archive_chunk_size, Some(99));
         assert_eq!(effective.compression_level, Some(10));
 
         // A different branch with no entry sees only the repo config.
         let other = store.effective(&repo, "main").await.unwrap();
-        assert_eq!(other.hot_files, Some(7));
+        assert_eq!(other.archive_chunk_size, Some(7));
     }
 }

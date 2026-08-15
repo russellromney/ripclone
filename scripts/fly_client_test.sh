@@ -93,7 +93,7 @@ run_clone \
   "ripclone direct-install (overlay)" \
   "/tmp/bun-install" \
   "" \
-  "ripclone --server $SERVER clone $REPO --dir /tmp/bun-install" \
+  "ripclone --server $SERVER clone $REPO /tmp/bun-install" \
   install_overlay_ms \
   install_overlay_cpu
 
@@ -102,7 +102,7 @@ run_clone \
   "ripclone archive-extraction (overlay)" \
   "/tmp/bun-archive" \
   "RIPCLONE_MODE=fast" \
-  "ripclone --server $SERVER clone $REPO --dir /tmp/bun-archive" \
+  "ripclone --server $SERVER clone $REPO /tmp/bun-archive" \
   install_archive_ms \
   install_archive_cpu
 
@@ -111,7 +111,7 @@ run_clone \
   "ripclone direct-install (rootfs)" \
   "/tmp/bun-install-rootfs" \
   "RIPCLONE_NO_OVERLAY=1" \
-  "ripclone --server $SERVER clone $REPO --dir /tmp/bun-install-rootfs" \
+  "ripclone --server $SERVER clone $REPO /tmp/bun-install-rootfs" \
   install_rootfs_ms \
   install_rootfs_cpu
 
