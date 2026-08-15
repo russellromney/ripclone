@@ -4,7 +4,13 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-const HISTORY_REUSE_MAX_PACK_BYTES: u64 = 64 * 1024 * 1024;
+// `git pack-objects --max-pack-size` cannot retain deltas whose bases land in
+// another output pack. Even a 4 GiB split made Linux re-deltify for minutes;
+// 64 MiB more than doubled Bun's cold-history bytes and made the otherwise
+// bitmap-backed build 30x slower. Preserve the source pack's delta graph here.
+// Remote storage handles large files with multipart upload instead of imposing
+// its transport boundary on Git's object representation.
+const HISTORY_REUSE_MAX_PACK_BYTES: Option<u64> = None;
 
 pub struct PackBuilder<'a> {
     repo: PathBuf,
@@ -420,7 +426,7 @@ impl<'a> PackBuilder<'a> {
             commit,
             sealed_tip,
             history_target_raw_bytes,
-            reuse_max_pack_bytes,
+            Some(reuse_max_pack_bytes),
         )
     }
 
@@ -429,7 +435,7 @@ impl<'a> PackBuilder<'a> {
         commit: &str,
         sealed_tip: Option<&str>,
         history_target_raw_bytes: u64,
-        reuse_max_pack_bytes: u64,
+        reuse_max_pack_bytes: Option<u64>,
     ) -> Result<Vec<(String, u64, String, u64)>> {
         // Cold base build (no sealed level yet): reuse the deltas git already has
         // via the mirror's reachability bitmap instead of enumerating ~all
@@ -467,14 +473,15 @@ impl<'a> PackBuilder<'a> {
     }
 
     /// Build the cold full-history packs by reusing existing pack deltas via the
-    /// mirror's bitmap (see `git::pack_objects_reachable_to_prefix`). Output is
-    /// split into download-friendly packs and stored in the CAS. The reachable
-    /// closure includes HEAD's objects (a small duplicate with the depth pack) —
-    /// a deliberate space-for-time trade to avoid an exclusion enumeration.
+    /// mirror's bitmap (see `git::pack_objects_reachable_to_prefix`). Production
+    /// preserves one compact delta graph; the test-only limit can still exercise
+    /// multi-pack collection. The reachable closure includes HEAD's objects (a
+    /// small duplicate with the depth pack) — a deliberate space-for-time trade
+    /// to avoid an exclusion enumeration.
     fn build_history_pack_reuse(
         &self,
         commit: &str,
-        max_pack_bytes: u64,
+        max_pack_bytes: Option<u64>,
     ) -> Result<Vec<(String, u64, String, u64)>> {
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");

@@ -1683,6 +1683,14 @@ async fn rate_limit_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // One logical clone fans out across content-addressed manifests, indexes,
+    // and chunks. Charging those authenticated GETs to the control-plane
+    // request bucket makes a sufficiently large repository rate-limit its own
+    // clone. Authentication still runs in the protected router, and anonymous
+    // artifact traffic remains subject to the normal per-IP limiter.
+    if is_authenticated_artifact_get(&state, &request) {
+        return next.run(request).await;
+    }
     let key = rate_limit_key(request.headers(), addr, trust_forwarded_for());
     if !state.rate_limiter.check(&key) {
         return (
@@ -1694,6 +1702,39 @@ async fn rate_limit_middleware(
             .into_response();
     }
     next.run(request).await
+}
+
+fn is_authenticated_artifact_get(
+    state: &ServerState,
+    request: &axum::http::Request<axum::body::Body>,
+) -> bool {
+    if request.method() != axum::http::Method::GET {
+        return false;
+    }
+    let path = request.uri().path();
+    if ![
+        "/v1/packs/",
+        "/v1/objects/",
+        "/v1/artifacts/",
+        "/v1/archives/",
+        "/v1/manifests/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+    {
+        return false;
+    }
+    let Some(expected) = state.token_hash.as_deref() else {
+        return false;
+    };
+    request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            check_auth_header(value, expected) || check_bearer_token(value, state.jwt.as_deref())
+        })
+        .unwrap_or(false)
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -10781,6 +10822,52 @@ mod tests {
         let kb = rate_limit_key(&HeaderMap::new(), b, false);
         assert_eq!(ka, kb, "same /64 must share a bucket");
         assert_eq!(ka, "2001:db8:ab:cd::/64");
+    }
+
+    #[tokio::test]
+    async fn authenticated_artifact_fanout_does_not_consume_control_plane_rate_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.rate_limiter = RateLimiter::new(1, 0.0);
+
+        let data = b"immutable artifact";
+        let hash = hex::encode(Sha256::digest(data));
+        state.storage.put(&hash, data).unwrap();
+        let app = build_app(state);
+        let artifact_path = format!("/v1/artifacts/{hash}");
+
+        // A logical clone can request many authenticated immutable objects from
+        // one IP. Even a one-token control-plane bucket must not reject them.
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(request_with_auth(
+                    "GET",
+                    &artifact_path,
+                    Some(&auth_header()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), data);
+        }
+
+        // The exemption is narrow: ordinary control-plane requests from the
+        // same IP still consume the configured bucket and then receive 429.
+        let first = app
+            .clone()
+            .oneshot(request_with_auth("GET", "/readyz", None))
+            .await
+            .unwrap();
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+        let second = app
+            .oneshot(request_with_auth("GET", "/readyz", None))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

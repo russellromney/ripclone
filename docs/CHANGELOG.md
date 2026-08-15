@@ -10,6 +10,12 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 - **Signed push webhooks use their validated `after` commit directly** (`rust/src/server.rs`): they perform no second tip probe. Readiness-oriented library callers pin the admitted commit and use exact metadata GETs after the first `202`; they do not repeat a moving POST.
 - **Queue upgrades settle unsafe legacy active rows**: rows without a knowable admitted commit fail permanently with `resubmit sync` before source work. Drain or stop old direct workers before starting new writers. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
 
+## Cold-history pack and benchmark performance
+
+- **Cold full-history builds preserve Git's existing delta graph** (`rust/src/pack.rs`, `rust/src/git.rs`): the bitmap-backed history pack is no longer split with `git pack-objects --max-pack-size`. Splitting forced Git to discard cross-pack deltas, making large repositories substantially larger and slower to build. Local storage keeps the compact pack as one file; large remote uploads are handled by the storage transport.
+- **Large S3-compatible uploads use bounded multipart streaming** (`rust/src/storage/s3_storage.rs`): files at least 100 MiB use 128 MiB parts with one backend-wide, CPU-scaled budget of at most eight uploads in flight, automatically increasing part size to remain within the 10,000-part limit. Failed uploads are aborted, and local cache publication still occurs only after the remote object completes.
+- **The shaped benchmark times cloning, not repository admission** (`benchmark/fly_shaped_benchmark.sh`): add/readiness happens before each sample set, every run is pinned to one resolved commit, validation happens after the timer, failures propagate, and summaries report p50 and nearest-rank p90.
+
 ## Worker heartbeat / registry (D3)
 
 - **`workers` registry table** on the blessed SQL queues (`sqlite` / `libsql`, DDL in the shared `SqlJobQueue` adapter). Each row is `worker_id`, optional `max_size_class` ceiling, optional `current_job`, and `last_heartbeat`. Postgres/MySQL lag: heartbeat/live-count **fail loudly** (never silently report a zero fleet).
@@ -84,6 +90,10 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 ## Benchmark harness
 
 - **`benchmark/fly_shaped_benchmark.sh`** now prints the resolved commit in its header instead of `commit=latest`, and prefers `RIPCLONE_SERVER_TOKEN`.
+- Repository admission and artifact readiness now happen explicitly outside
+  clone timing. The harness can select benchmark modes or shallow-only
+  readiness and verifies every editable result is clean at the one resolved
+  commit.
 - Documentation and example workflow updated to use `RIPCLONE_SERVER_TOKEN` consistently.
 
 ## Sync / ref-store correctness
@@ -397,6 +407,10 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 
 - **Rate limiting** (`rust/src/rate_limit.rs`)
   - Token-bucket rate limiter keyed by auth header or `anonymous`.
+  - Authenticated content-addressed artifact GETs do not consume the
+    control-plane request bucket: one clone can legitimately fetch many
+    immutable chunks. Anonymous artifact traffic and all control endpoints
+    remain rate-limited.
   - Env tunables: `RIPCLONE_RATE_LIMIT_BURST` (default 60) and
     `RIPCLONE_RATE_LIMIT_PER_SEC` (default 10.0).
   - Returns `429 Too Many Requests` with a `Retry-After` header when the bucket

@@ -55,7 +55,6 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 RIPCLONE="${RIPCLONE:-$ROOT_DIR/rust/target/release/ripclone}"
 SERVER="${SERVER:-$ROOT_DIR/rust/target/release/ripclone-server}"
 
-OWNER="$(echo "$REPO" | cut -d/ -f1)"
 NAME="$(echo "$REPO" | cut -d/ -f2)"
 
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
@@ -379,9 +378,7 @@ sync_url() {
 # add after the wipe would let add's own initial build do the cold work and turn
 # the measured sync into a warm one.
 #
-# Waits for 200 so add's build cannot race the wipe. Servers predating the
-# added-repos model have no /add route and answer a plain 404; that is not an
-# error, they need no add.
+# Waits for 200 so add's build cannot race the wipe.
 REMOTE_ADDED=""
 ensure_remote_added() {
   local repo="$1"
@@ -398,12 +395,6 @@ ensure_remote_added() {
       202|503)
         echo "  add attempt $attempt returned $status, retrying ..." >&2
         sleep 2 ;;
-      404|405)
-        if grep -q 'unknown provider' "$out" 2>/dev/null; then
-          echo "error: add returned HTTP $status" >&2; cat "$out" >&2; return 1
-        fi
-        echo "  server has no /add route (pre-added-repos build); continuing" >&2
-        REMOTE_ADDED="$REMOTE_ADDED $repo"; return 0 ;;
       *)
         echo "error: add returned HTTP $status" >&2
         cat "$out" >&2

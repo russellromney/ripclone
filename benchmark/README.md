@@ -35,6 +35,59 @@ This directory contains standalone benchmarks and verification scripts. They ass
   fast-moving branch from invalidating later rates.
 
 - **`fly_shaped_benchmark.sh`** — single-rate helper used by `run_shaped_sweep.sh`.
+  It adds the repository and waits for the requested artifacts before starting
+  any clone timer. Set `BENCH_MODES` to a space-separated subset of `full`,
+  `depth1`, `files`, `git-full`, `git-depth1`, and `github-files` (GitHub's
+  extracted source archive). For a shallow-only run, set
+  `RIPCLONE_BENCH_READY_CLONEPACK=shallow` so readiness does not wait for the
+  background full-history build. The harness reports p50 and nearest-rank p90.
+  Every files/archive result is checked outside the timer against a precomputed
+  exact-tree digest. Every editable result must point at the admitted commit,
+  be clean, and have the requested history depth; its first sample per mode
+  also checks the exact-tree digest and Git connectivity. Set
+  `VERIFY_EVERY_RUN=1` to repeat those expensive deep editable checks on every
+  sample. `RIPCLONE_RUNS` and `NATIVE_RUNS` can override the positional run
+  count independently when a large native control would otherwise dominate a
+  sweep. `SKIP_ADD=1` is
+  available only for a fixture that was explicitly added beforehand.
+- **`reproduce_ec2_matrix.sh`** — exact, cloud-neutral two-host recipe for the
+  realistic Bun, pandas, React, and Linux matrix. It uses the commits recorded
+  by the performance audit, runs ten Ripclone samples per mode, runs ten native
+  controls for the smaller repositories and one for Linux, then repeats the
+  Linux Ripclone modes at 1 and 5 Gbps. Override any `*_REF` or run-count
+  variable to refresh the matrix deliberately.
+
+  Build the release binaries once from the commit under test. On a dedicated
+  server with enough disk, start the local-storage server:
+
+  ```bash
+  export RIPCLONE_SERVER_TOKEN="$(openssl rand -hex 32)"
+  /data/bin/ripclone-server \
+    --host 0.0.0.0 --port 8000 \
+    --cas-dir /data/ripclone-cas --repo-root /data/ripclone-repos
+  ```
+
+  Copy the same raw token, release client, and `benchmark/` directory to a
+  separate Linux client on the same private network. The client needs `git`,
+  `curl`, `perl`, `python3`, `tar`, `nftables`, enough free disk for Linux, and
+  root or `CAP_NET_ADMIN`. Run in `tmux`, `screen`, or a detached service because
+  shaping the whole client also shapes its SSH traffic:
+
+  ```bash
+  export RIPCLONE_URL=http://SERVER_PRIVATE_IP:8000
+  export RIPCLONE_SERVER_TOKEN=the-same-raw-token
+  export RIPCLONE=/data/bin/ripclone
+  export TARGET=/data
+  sudo --preserve-env=RIPCLONE_URL,RIPCLONE_SERVER_TOKEN,RIPCLONE,TARGET \
+    ./benchmark/reproduce_ec2_matrix.sh
+  ```
+
+  Add/admission and artifact readiness happen before each timed sample set.
+  Every sample is pinned and validated as described above. Combined summaries
+  go to `/data/reproducible_ec2_matrix.log`; per-run command and validation logs
+  go to `/data/shaped_logs/<repo>/<rate>Mbps/`. The harness removes its nftables
+  table on exit. Delete the temporary hosts, disks, firewall, and credentials
+  after copying the logs.
 - **`sync_latency.sh`** — B4 sync-latency and storage-amplification harness.
   By default it starts a local release server; set `RIPCLONE_URL` for the Fly
   server and `CLIENT_APP=ripclone-client-dev` to run `/sync` POSTs and
@@ -145,9 +198,21 @@ Most scripts read:
 - `CLIENT_APP` — optional Fly client app used by `sync_latency.sh` for
   Fly-to-Fly `/sync` POSTs and readiness probes.
 - `BENCH_REF` — tag/commit/branch to sync and benchmark (default: repo default branch).
-- `GIT_REF` — branch/tag that the native `git clone` baseline should check out, used when `BENCH_REF` is a commit SHA.
+- `GIT_REF` — optional stable branch/tag for the native Git baseline. Without
+  it, a SHA-valued `BENCH_REF` is fetched directly so branch movement cannot
+  change the measured tree.
+- `BENCH_MODES` — space-separated benchmark modes to run (default: the five
+  editable-clone modes; add `github-files` for the source-archive control).
+- `SKIP_ADD` — set to `1` only when the repository was explicitly admitted
+  before this invocation; admission is otherwise always performed outside the
+  clone timer.
+- `RIPCLONE_BENCH_READY_CLONEPACK` — `full` (default) or `shallow`; controls
+  the pre-timing readiness gate.
 - `SHAPED` — set to `0` to disable traffic shaping.
 - `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads.
 - `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — extraction parallelism.
 - `RIPCLONE_BLOB_PACK_THREADS` — threads for local pack building in full editable mode.
 - `RIPCLONE_ORIGIN_BASE` — for local/offline runs, set to a `file://` base directory that contains `<owner>/<repo>.git` bare mirrors. The built-in GitHub provider will fetch from these local origins instead of github.com.
+- `BENCH_SOURCE_URL` — optional clone URL for the benchmark's native-Git and
+  exact-tree correctness controls. It defaults to the tested repository on
+  GitHub; local/offline fixtures can point it at their bare origin.

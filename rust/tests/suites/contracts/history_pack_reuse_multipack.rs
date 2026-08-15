@@ -1,7 +1,7 @@
 //! Included in the consolidated `contracts` integration-test crate.
 //! The cold full-history build reuses git's existing pack deltas via
-//! `pack-objects --revs` and splits the output with `--max-pack-size`.
-//! That split path — collecting an arbitrary
+//! `pack-objects --revs`. Production deliberately leaves `--max-pack-size`
+//! unset; this compatibility test supplies a limit to exercise collecting an arbitrary
 //! number of `pack-<sha>.{pack,idx}` pairs in `store_packs_from_dir`, ordering
 //! them, and assembling them into one history level — is new code the existing
 //! single-pack fixtures never exercised. This test forces the split and asserts

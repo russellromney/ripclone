@@ -8,15 +8,10 @@ set -euo pipefail
 # against the next deploy. This test runs the real harness end-to-end against a
 # real local ripclone server so a contract change breaks CI instead.
 #
-# Two phases:
-#
-#   1. pre-added-repos server: an HTTP stub with no /add route. The harness must
-#      tolerate the 404 and still warm up, so the currently-deployed benchmark
-#      server keeps working.
-#   2. current server: a real ripclone-server, which enforces the added-repos
-#      gate. The test first proves the gate is live (a sync without an add is
-#      rejected with repo_not_added), then requires the harness to run clean and
-#      produce a timing row. A harness that forgets to `add` fails here.
+# A real current ripclone-server enforces the added-repos gate. The test first
+# proves the gate is live (a sync without an add is rejected with
+# repo_not_added), then requires the harness to run clean and produce a timing
+# row. A harness that forgets to `add` fails here.
 #
 # Runs unshaped (no CAP_NET_ADMIN), one run per mode, no native-git baseline,
 # against a file:// origin — offline and a few seconds of work.
@@ -48,13 +43,11 @@ REPO="$OWNER/$NAME"
 BASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ripclone-bench-smoke.XXXXXX")"
 ORIGIN_ROOT="$BASE_DIR/origins"
 SERVER_PID=""
-STUB_PID=""
 
-# Reap the background server/stub quietly. `wait` after `kill` absorbs the
+# Reap the background server quietly. `wait` after `kill` absorbs the
 # shell's async "Terminated" job notice so it does not clutter CI logs.
 cleanup() {
   if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; fi
-  if [ -n "$STUB_PID" ]; then kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; fi
   rm -rf "$BASE_DIR"
 }
 trap cleanup EXIT
@@ -91,99 +84,8 @@ make_origin() {
   git -C "$bare" symbolic-ref HEAD refs/heads/main
 }
 
-# A stand-in for the deployed benchmark server, which predates the added-repos
-# model: it serves refs and sync but has no /add route, so /add falls through to
-# the router's plain 404.
-write_stub_server() {
-  cat > "$BASE_DIR/stub.py" <<'PY'
-import json, os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-COMMIT = "0" * 39 + "1"
-PREFIX = "/v1/repos/github/bench/tiny"
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_args):
-        pass
-
-    def reply(self, code, payload):
-        body = json.dumps(payload).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def path_only(self):
-        return self.path.split("?", 1)[0]
-
-    def do_GET(self):
-        path = self.path_only()
-        if path == "/healthz":
-            return self.reply(200, {"status": "ok"})
-        if path == PREFIX + "/refs/HEAD":
-            return self.reply(200, {"default_branch": "main", "commit": COMMIT,
-                                    "full_pack": "stub"})
-        if path == PREFIX + "/refs/main":
-            return self.reply(200, {"commit": COMMIT, "full_pack": "stub"})
-        return self.reply(404, {"error": "not found"})
-
-    def do_POST(self):
-        path = self.path_only()
-        if path == PREFIX + "/sync":
-            return self.reply(200, {"commit": COMMIT})
-        # No /add route on this build — exactly what the old router answers.
-        return self.reply(404, {"error": "not found"})
-
-
-ThreadingHTTPServer(("127.0.0.1", int(os.environ["RIPCLONE_STUB_PORT"])),
-                    Handler).serve_forever()
-PY
-}
-
-# ===========================================================================
-# Phase 1 — a server with no /add route (pre-added-repos). The harness must not
-# treat the 404 as fatal.
-# ===========================================================================
-phase_pre_add_server() {
-  echo "==> phase 1: harness against a server with no /add route"
-  local port url log
-  port="$(free_port)"
-  url="http://127.0.0.1:$port"
-
-  write_stub_server
-  RIPCLONE_STUB_PORT="$port" python3 "$BASE_DIR/stub.py" \
-    >"$BASE_DIR/stub.log" 2>&1 &
-  STUB_PID=$!
-  wait_healthy "$url" "$STUB_PID" || { cat "$BASE_DIR/stub.log"; fail "stub server not ready"; }
-
-  log="$BASE_DIR/phase1.log"
-  # Compat check only: the harness must warm up and reach the benchmark header
-  # against a server that has no /add route, so the currently-deployed benchmark
-  # server keeps working. No clones — the stub serves metadata only. This must
-  # pass for BOTH the fixed harness and the old sync-only one (neither is
-  # rejected by a server with no gate), so the B5 regression is caught in phase
-  # 2, not here.
-  if ! env -u BENCH_REF SHAPED=0 RUNS=1 SKIP_GIT=1 SKIP_RIPCLONE=1 \
-      RIPCLONE_URL="$url" RIPCLONE="$CLI_BIN" \
-      bash "$BENCH" "$REPO" 1000 1 "$BASE_DIR/target1" >"$log" 2>&1; then
-    cat "$log" >&2
-    fail "harness must survive a server with no /add route (pre-added-repos deploy)"
-  fi
-  grep -q "repo=$REPO" "$log" || { cat "$log" >&2; fail "harness did not reach the benchmark header"; }
-  pass "harness tolerates a pre-added-repos server (404 on /add)"
-
-  kill "$STUB_PID" 2>/dev/null || true
-  wait "$STUB_PID" 2>/dev/null || true
-  STUB_PID=""
-}
-
-# ===========================================================================
-# Phase 2 — a real server, which enforces the added-repos gate.
-# ===========================================================================
-phase_real_server() {
-  echo "==> phase 2: harness against a real ripclone-server"
+run_current_server() {
+  echo "==> benchmark harness against a real ripclone-server"
   local port url log body
   port="$(free_port)"
   url="http://127.0.0.1:$port"
@@ -204,9 +106,10 @@ phase_real_server() {
     *) fail "server under test does not enforce the added-repos gate; this smoke test cannot catch the regression (got: $body)" ;;
   esac
 
-  log="$BASE_DIR/phase2.log"
+  log="$BASE_DIR/current-server.log"
   if ! env -u BENCH_REF SHAPED=0 RUNS=1 SKIP_GIT=1 \
       RIPCLONE_URL="$url" RIPCLONE="$CLI_BIN" \
+      BENCH_SOURCE_URL="file://$ORIGIN_ROOT/$REPO.git" \
       bash "$BENCH" "$REPO" 1000 1 "$BASE_DIR/target2" >"$log" 2>&1; then
     cat "$log" >&2
     # The harness swallows response bodies, so name the likely cause here.
@@ -224,7 +127,7 @@ phase_real_server() {
     || { cat "$log" >&2; fail "harness did not poll the admitted commit"; }
   grep -qE 'resolved admitted .* -> [0-9a-f]{40}' "$log" \
     || { cat "$log" >&2; fail "harness did not retain the admitted commit"; }
-  grep -qE 'ripclone full \(depth=0\) +median= *[0-9]+ms' "$log" \
+  grep -qE 'ripclone full \(depth=0\) +p50= *[0-9]+ms +p90= *[0-9]+ms' "$log" \
     || { cat "$log" >&2; fail "harness produced no timing row"; }
 
   echo "--- harness output ---"
@@ -233,6 +136,5 @@ phase_real_server() {
 }
 
 make_origin
-phase_pre_add_server
-phase_real_server
+run_current_server
 echo "benchmark_smoke.sh: OK"
