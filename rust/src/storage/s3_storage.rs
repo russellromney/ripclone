@@ -22,6 +22,7 @@ const MULTIPART_UPLOAD_PART_BYTES: u64 = 8 * 1024 * 1024;
 const MULTIPART_UPLOAD_MAX_CONCURRENCY: usize = 8;
 const MULTIPART_UPLOAD_MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MULTIPART_UPLOAD_MAX_PARTS: u64 = 10_000;
+const MULTIPART_UPLOAD_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 
 fn multipart_upload_concurrency_for_cores(cores: usize) -> usize {
     cores
@@ -34,6 +35,17 @@ fn multipart_upload_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|cores| multipart_upload_concurrency_for_cores(cores.get()))
         .unwrap_or(4)
+}
+
+fn multipart_upload_part_bytes(len: u64) -> Result<u64> {
+    if len > MULTIPART_UPLOAD_MAX_OBJECT_BYTES {
+        anyhow::bail!("object exceeds the S3 multipart object-size limit");
+    }
+    let part_bytes = MULTIPART_UPLOAD_PART_BYTES.max(len.div_ceil(MULTIPART_UPLOAD_MAX_PARTS));
+    if part_bytes > MULTIPART_UPLOAD_MAX_PART_BYTES {
+        anyhow::bail!("object exceeds the S3 multipart part-size limit");
+    }
+    Ok(part_bytes)
 }
 
 /// S3-compatible storage backend with an optional local filesystem cache.
@@ -198,6 +210,9 @@ impl S3Storage {
     }
 
     async fn multipart_put_file(&self, key: &str, path: &Path, len: u64) -> Result<()> {
+        // Validate before creating remote multipart state.
+        let part_bytes = multipart_upload_part_bytes(len)
+            .with_context(|| format!("cannot multipart-upload S3 object {key}"))?;
         let created = self
             .client
             .objects()
@@ -206,16 +221,6 @@ impl S3Storage {
             .await
             .with_context(|| format!("start S3 multipart upload {key}"))?;
         let upload_id = created.upload_id;
-        let part_bytes = MULTIPART_UPLOAD_PART_BYTES.max(len.div_ceil(MULTIPART_UPLOAD_MAX_PARTS));
-        if part_bytes > MULTIPART_UPLOAD_MAX_PART_BYTES {
-            let _ = self
-                .client
-                .objects()
-                .abort_multipart_upload(&self.bucket, key, &upload_id)
-                .send()
-                .await;
-            anyhow::bail!("S3 multipart upload {key} exceeds the maximum multipart object size");
-        }
         let part_count = len.div_ceil(part_bytes);
 
         let upload = async {
@@ -891,8 +896,10 @@ impl S3Storage {
 #[cfg(test)]
 mod tests {
     use super::{
-        S3Storage, env_duration_ms, env_duration_secs, env_u32,
-        multipart_upload_concurrency_for_cores, scoped_key, unscoped_key,
+        MULTIPART_UPLOAD_MAX_OBJECT_BYTES, MULTIPART_UPLOAD_MAX_PART_BYTES,
+        MULTIPART_UPLOAD_PART_BYTES, S3Storage, env_duration_ms, env_duration_secs, env_u32,
+        multipart_upload_concurrency_for_cores, multipart_upload_part_bytes, scoped_key,
+        unscoped_key,
     };
     use crate::storage::StorageBackend;
     use std::io::Write;
@@ -905,6 +912,19 @@ mod tests {
         assert_eq!(multipart_upload_concurrency_for_cores(2), 4);
         assert_eq!(multipart_upload_concurrency_for_cores(4), 8);
         assert_eq!(multipart_upload_concurrency_for_cores(128), 8);
+    }
+
+    #[test]
+    fn multipart_part_size_respects_s3_limits() {
+        assert_eq!(
+            multipart_upload_part_bytes(MULTIPART_UPLOAD_PART_BYTES).unwrap(),
+            MULTIPART_UPLOAD_PART_BYTES
+        );
+        assert!(
+            multipart_upload_part_bytes(MULTIPART_UPLOAD_MAX_OBJECT_BYTES).unwrap()
+                <= MULTIPART_UPLOAD_MAX_PART_BYTES
+        );
+        assert!(multipart_upload_part_bytes(MULTIPART_UPLOAD_MAX_OBJECT_BYTES + 1).is_err());
     }
 
     #[tokio::test]
