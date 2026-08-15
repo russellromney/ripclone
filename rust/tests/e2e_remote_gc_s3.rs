@@ -168,7 +168,8 @@ async fn multipart_large_file_completes_and_failed_upload_aborts_on_s3() {
     };
     let prefix = unique_prefix();
     let mut positive_cleanup = CleanupGuard::new(env.clone(), prefix.clone());
-    let positive_proxy = start_multipart_proxy(&env.endpoint, false).await;
+    let positive_proxy =
+        start_multipart_proxy(&env.endpoint, MultipartProxyMode::PassThrough).await;
     let storage = make_s3_storage_at(&positive_proxy.url, &env, &prefix).expect("storage");
     let mut source = tempfile::NamedTempFile::new().expect("create multipart fixture");
     let block: Vec<u8> = (0..1024 * 1024)
@@ -226,16 +227,15 @@ async fn multipart_large_file_completes_and_failed_upload_aborts_on_s3() {
         .expect("cleanup multipart fixture");
     positive_cleanup.disable();
 
-    // Nine parts are deliberately used here: the production window is eight,
-    // so at least one part must remain unscheduled when part 1 fails. The
-    // sparse file keeps this cancellation proof from uploading a gigabyte to
-    // MinIO; the proxy holds the already-running part requests before they
-    // reach the backend.
-    const NEGATIVE_PART_COUNT: u64 = 9;
-    const NEGATIVE_LEN: u64 = PRODUCTION_PART_BYTES * (NEGATIVE_PART_COUNT - 1) + 1;
+    // Two parts are enough to put both the failing part and its peer inside
+    // the production window. The final one-byte part lets the proxy hold a
+    // real MinIO UploadPart request open across the first production abort
+    // without adding another large transfer to the negative proof.
+    const NEGATIVE_PART_COUNT: u64 = 2;
+    const NEGATIVE_LEN: u64 = PRODUCTION_PART_BYTES + 1;
     let failed_prefix = unique_prefix();
     let mut failed_cleanup = CleanupGuard::new(env.clone(), failed_prefix.clone());
-    let proxy = start_multipart_proxy(&env.endpoint, true).await;
+    let proxy = start_multipart_proxy(&env.endpoint, MultipartProxyMode::FailFirstPart).await;
     let mut failed_source = tempfile::NamedTempFile::new().expect("create failed-upload fixture");
     failed_source
         .as_file_mut()
@@ -288,23 +288,7 @@ async fn multipart_large_file_completes_and_failed_upload_aborts_on_s3() {
         failure_observed.elapsed() < Duration::from_secs(10),
         "multipart part failure was not returned promptly"
     );
-    assert!(
-        error.to_string().contains("multipart part"),
-        "failure should identify the multipart part: {error:#}"
-    );
-    assert!(
-        error.downcast_ref::<s3::Error>().is_some(),
-        "multipart failure must retain the concrete s3::Error source: {error:#}"
-    );
-    match error.downcast_ref::<s3::Error>() {
-        Some(s3::Error::Api { code, .. }) => assert_eq!(
-            code.as_deref(),
-            Some("InvalidRequest"),
-            "caller must receive the injected multipart-part API error"
-        ),
-        Some(other) => panic!("injected multipart failure changed error kind: {other:?}"),
-        None => unreachable!("concrete s3::Error was checked above"),
-    }
+    assert_original_multipart_part_error(&error);
     tokio::time::timeout(Duration::from_secs(10), proxy.wait_for_abort())
         .await
         .expect("multipart abort request was not observed promptly");
@@ -317,23 +301,30 @@ async fn multipart_large_file_completes_and_failed_upload_aborts_on_s3() {
         proxy.part_requests() >= 2,
         "failure proof must observe the failed request and an in-flight peer"
     );
-    assert!(
-        proxy.part_requests() < NEGATIVE_PART_COUNT,
-        "parts after the bounded concurrency window must not be scheduled after failure"
+    assert_eq!(
+        proxy.part_requests(),
+        NEGATIVE_PART_COUNT,
+        "only the failed part and the already-running peer may reach the proxy"
     );
     assert!(
         proxy.peer_reached_backend(),
         "at least one concurrent peer UploadPart must reach MinIO before failure is returned"
     );
-    assert_eq!(
-        proxy.aborts(),
-        1,
-        "failed multipart upload must issue exactly one abort"
+    assert!(
+        proxy.peer_completed_after_abort(),
+        "the peer UploadPart must complete at MinIO only after the first abort"
     );
-    assert_eq!(
-        proxy.successful_aborts(),
-        1,
-        "MinIO must accept the abort request for the incomplete upload"
+    assert!(
+        proxy.aborts() >= 1,
+        "failed multipart upload must issue an abort"
+    );
+    assert!(
+        proxy.successful_aborts() >= 1,
+        "MinIO must accept at least one abort request for the incomplete upload"
+    );
+    assert!(
+        proxy.list_parts_requests() >= 1,
+        "production cleanup must inspect multipart state after abort"
     );
     assert_eq!(
         proxy.completes(),
@@ -363,9 +354,27 @@ async fn multipart_large_file_completes_and_failed_upload_aborts_on_s3() {
 
     let cleanup_client = cleanup_s3_client(&env).expect("create multipart cleanup client");
     let failed_key = format!("{failed_prefix}{failed_hash}");
-    assert_multipart_upload_gone(&cleanup_client, &env.bucket, &failed_key, &failed_upload_id)
+    let production_probe =
+        probe_multipart_upload_gone(&cleanup_client, &env.bucket, &failed_key, &failed_upload_id)
+            .await;
+    if let Err(probe_error) = &production_probe {
+        if let Err(cleanup_error) = cleanup_multipart_upload_for_fixture(
+            &cleanup_client,
+            &env.bucket,
+            &failed_key,
+            &failed_upload_id,
+        )
         .await
-        .expect("failed multipart upload must have no residual upload or parts");
+        {
+            eprintln!(
+                "test-only multipart cleanup failed after production proof failure: {cleanup_error:#}"
+            );
+        }
+        eprintln!("production multipart cleanup proof failed: {probe_error:#}");
+    }
+    production_probe.expect(
+        "production multipart cleanup must leave no residual upload or parts on the first probe",
+    );
 
     let direct_storage = make_s3_storage(&env, &failed_prefix).expect("direct failed storage");
     let missing_storage = Arc::clone(&direct_storage);
@@ -394,6 +403,141 @@ async fn multipart_large_file_completes_and_failed_upload_aborts_on_s3() {
     .expect("failed multipart cleanup timed out")
     .expect("cleanup failed multipart fixture");
     failed_cleanup.disable();
+
+    // A failed UploadPart must not wait for the normal S3 retry posture when
+    // the cleanup request itself stalls. This uses the same two-part race but
+    // holds AbortMultipartUpload open at the proxy; production's bounded
+    // cleanup deadline must preserve and return the original typed part error.
+    let stall_prefix = unique_prefix();
+    let mut stall_cleanup = CleanupGuard::new(env.clone(), stall_prefix.clone());
+    let stall_proxy =
+        start_multipart_proxy(&env.endpoint, MultipartProxyMode::FailFirstPartAbortStall).await;
+    let stall_cache_dir = tempfile::tempdir().expect("create abort-stall cache");
+    let stall_storage = Arc::new(
+        S3Storage::new(
+            &stall_proxy.url,
+            &env.region,
+            &env.bucket,
+            Some(&stall_prefix),
+            s3::Auth::from_env().expect("S3 auth for abort-stall upload"),
+            Some(stall_cache_dir.path()),
+        )
+        .expect("abort-stall storage"),
+    );
+    let stall_path = failed_source.path().to_path_buf();
+    let stall_hash = failed_hash.clone();
+    let stall_upload_storage = Arc::clone(&stall_storage);
+    let mut stall_upload_task = tokio::spawn(async move {
+        stall_upload_storage
+            .put_file_async(&stall_hash, &stall_path)
+            .await
+    });
+    const MULTIPART_FAILURE_TOTAL_BOUND: Duration = Duration::from_secs(12);
+    let stall_failure_started = Instant::now();
+    let stall_joined = tokio::time::timeout(MULTIPART_FAILURE_TOTAL_BOUND, async {
+        stall_proxy.wait_for_failure().await;
+        (&mut stall_upload_task).await
+    })
+    .await;
+    let stall_result = match stall_joined {
+        Ok(joined) => joined.expect("abort-stall multipart upload task joined"),
+        Err(_) => {
+            stall_upload_task.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut stall_upload_task).await;
+            panic!("original multipart error exceeded the total abort-stall bound");
+        }
+    };
+    assert!(
+        stall_failure_started.elapsed() <= MULTIPART_FAILURE_TOTAL_BOUND,
+        "abort-stall failure exceeded its total bound"
+    );
+    let stall_error = stall_result.expect_err("abort-stall UploadPart failure must fail upload");
+    assert_original_multipart_part_error(&stall_error);
+    tokio::time::timeout(Duration::from_secs(10), stall_proxy.wait_for_abort())
+        .await
+        .expect("abort-stall proxy did not observe production cleanup");
+    assert_eq!(
+        stall_proxy.part_requests(),
+        NEGATIVE_PART_COUNT,
+        "abort-stall proof must observe only the failed part and its peer"
+    );
+    assert!(
+        stall_proxy.peer_reached_backend(),
+        "abort-stall proof must still reach the real MinIO backend"
+    );
+    assert_eq!(
+        stall_proxy.successful_aborts(),
+        0,
+        "abort-stall proxy must withhold the abort response"
+    );
+    assert_eq!(
+        stall_proxy.completes(),
+        0,
+        "abort-stall UploadPart failure must not complete the object"
+    );
+    assert!(
+        !ripclone::cas::Cas::new(stall_cache_dir.path())
+            .expect("open abort-stall cache")
+            .has(&failed_hash),
+        "abort-stall failure must not publish a local cache object"
+    );
+    let stall_upload_id = stall_proxy
+        .upload_id()
+        .expect("abort-stall proxy must observe the upload id");
+    let stall_proxy_state = Arc::clone(&stall_proxy.state);
+    let stall_part_requests_after_return = stall_proxy.part_requests();
+    stall_proxy
+        .shutdown()
+        .await
+        .expect("abort-stall multipart proxy cleanup");
+    assert_eq!(
+        stall_proxy_state.part_requests.load(Ordering::SeqCst),
+        stall_part_requests_after_return,
+        "abort-stall proof must not receive later UploadPart activity"
+    );
+    let stall_cleanup_client = cleanup_s3_client(&env).expect("create abort-stall cleanup client");
+    let stall_key = format!("{stall_prefix}{failed_hash}");
+    cleanup_multipart_upload_for_fixture(
+        &stall_cleanup_client,
+        &env.bucket,
+        &stall_key,
+        &stall_upload_id,
+    )
+    .await
+    .expect("test-only abort-stall multipart cleanup");
+    probe_multipart_upload_gone(
+        &stall_cleanup_client,
+        &env.bucket,
+        &stall_key,
+        &stall_upload_id,
+    )
+    .await
+    .expect("abort-stall fixture cleanup must remove the incomplete upload");
+    tokio::time::timeout(Duration::from_secs(30), cleanup_prefix(&env, &stall_prefix))
+        .await
+        .expect("abort-stall multipart cleanup timed out")
+        .expect("cleanup abort-stall multipart fixture");
+    stall_cleanup.disable();
+}
+
+fn assert_original_multipart_part_error(error: &anyhow::Error) {
+    assert!(
+        error.to_string().contains("multipart part"),
+        "failure should identify the multipart part: {error:#}"
+    );
+    assert!(
+        error.downcast_ref::<s3::Error>().is_some(),
+        "multipart failure must retain the concrete s3::Error source: {error:#}"
+    );
+    match error.downcast_ref::<s3::Error>() {
+        Some(s3::Error::Api { code, .. }) => assert_eq!(
+            code.as_deref(),
+            Some("InvalidRequest"),
+            "caller must receive the injected multipart-part API error"
+        ),
+        Some(other) => panic!("injected multipart failure changed error kind: {other:?}"),
+        None => unreachable!("concrete s3::Error was checked above"),
+    }
 }
 
 async fn wait_child_output(child: std::process::Child) -> std::process::Output {
@@ -454,26 +598,40 @@ fn target_host_port(endpoint: &str) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MultipartRequestKind {
     Part,
+    ListParts,
     Complete,
     Abort,
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MultipartProxyMode {
+    PassThrough,
+    FailFirstPart,
+    FailFirstPartAbortStall,
+}
+
 struct MultipartFailureState {
     failure_injected: AtomicBool,
     peer_claimed: AtomicBool,
-    peer_complete: AtomicBool,
+    peer_backend_started: AtomicBool,
     peer_reached_backend: AtomicBool,
+    peer_completed_after_abort: AtomicBool,
+    abort_completed: AtomicBool,
     failed_parts: AtomicU64,
     part_requests: AtomicU64,
+    list_parts_requests: AtomicU64,
     successful_parts: AtomicU64,
     completes: AtomicU64,
     aborts: AtomicU64,
     successful_aborts: AtomicU64,
     active_parts: AtomicU64,
     upload_id: std::sync::Mutex<Option<String>>,
+    failure_response_sent: AtomicBool,
     failure_sent: tokio::sync::Notify,
-    peer_complete_notify: tokio::sync::Notify,
+    peer_backend_started_notify: tokio::sync::Notify,
+    peer_completed_after_abort_notify: tokio::sync::Notify,
+    abort_completed_notify: tokio::sync::Notify,
     abort_seen: tokio::sync::Notify,
     parts_idle: tokio::sync::Notify,
 }
@@ -483,28 +641,54 @@ impl MultipartFailureState {
         Self {
             failure_injected: AtomicBool::new(false),
             peer_claimed: AtomicBool::new(false),
-            peer_complete: AtomicBool::new(false),
+            peer_backend_started: AtomicBool::new(false),
             peer_reached_backend: AtomicBool::new(false),
+            peer_completed_after_abort: AtomicBool::new(false),
+            abort_completed: AtomicBool::new(false),
             failed_parts: AtomicU64::new(0),
             part_requests: AtomicU64::new(0),
+            list_parts_requests: AtomicU64::new(0),
             successful_parts: AtomicU64::new(0),
             completes: AtomicU64::new(0),
             aborts: AtomicU64::new(0),
             successful_aborts: AtomicU64::new(0),
             active_parts: AtomicU64::new(0),
             upload_id: std::sync::Mutex::new(None),
+            failure_response_sent: AtomicBool::new(false),
             failure_sent: tokio::sync::Notify::new(),
-            peer_complete_notify: tokio::sync::Notify::new(),
+            peer_backend_started_notify: tokio::sync::Notify::new(),
+            peer_completed_after_abort_notify: tokio::sync::Notify::new(),
+            abort_completed_notify: tokio::sync::Notify::new(),
             abort_seen: tokio::sync::Notify::new(),
             parts_idle: tokio::sync::Notify::new(),
         }
     }
 
-    async fn wait_for_peer(&self) -> bool {
+    async fn wait_for_peer_backend_started(&self) {
         loop {
-            let notified = self.peer_complete_notify.notified();
-            if self.peer_complete.load(Ordering::SeqCst) {
-                return self.peer_reached_backend.load(Ordering::SeqCst);
+            let notified = self.peer_backend_started_notify.notified();
+            if self.peer_backend_started.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_abort_completed(&self) {
+        loop {
+            let notified = self.abort_completed_notify.notified();
+            if self.abort_completed.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_peer_completed_after_abort(&self) {
+        loop {
+            let notified = self.peer_completed_after_abort_notify.notified();
+            if self.peer_completed_after_abort.load(Ordering::SeqCst) {
+                return;
             }
             notified.await;
         }
@@ -522,7 +706,7 @@ impl MultipartFailureProxy {
     async fn wait_for_failure(&self) {
         loop {
             let notified = self.state.failure_sent.notified();
-            if self.state.failed_parts.load(Ordering::SeqCst) != 0 {
+            if self.state.failure_response_sent.load(Ordering::SeqCst) {
                 return;
             }
             notified.await;
@@ -557,12 +741,20 @@ impl MultipartFailureProxy {
         self.state.part_requests.load(Ordering::SeqCst)
     }
 
+    fn list_parts_requests(&self) -> u64 {
+        self.state.list_parts_requests.load(Ordering::SeqCst)
+    }
+
     fn successful_parts(&self) -> u64 {
         self.state.successful_parts.load(Ordering::SeqCst)
     }
 
     fn peer_reached_backend(&self) -> bool {
         self.state.peer_reached_backend.load(Ordering::SeqCst)
+    }
+
+    fn peer_completed_after_abort(&self) -> bool {
+        self.state.peer_completed_after_abort.load(Ordering::SeqCst)
     }
 
     fn completes(&self) -> u64 {
@@ -642,6 +834,9 @@ fn multipart_request_kind(header: &[u8]) -> Option<MultipartRequestKind> {
     if method == "PUT" && target.contains("partNumber=") {
         return Some(MultipartRequestKind::Part);
     }
+    if method == "GET" {
+        return Some(MultipartRequestKind::ListParts);
+    }
     if method == "POST" {
         return Some(MultipartRequestKind::Complete);
     }
@@ -658,11 +853,21 @@ fn multipart_upload_id(header: &[u8]) -> Option<String> {
         .find_map(|(key, value)| (key == "uploadId").then(|| value.into_owned()))
 }
 
+fn multipart_part_number(header: &[u8]) -> Option<u32> {
+    let target = multipart_request_target(header)?;
+    let query = target.split_once('?')?.1;
+    url::form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
+        (key == "partNumber")
+            .then(|| value.parse::<u32>().ok())
+            .flatten()
+    })
+}
+
 async fn proxy_one_multipart_connection(
     mut client: tokio::net::TcpStream,
     target: String,
     state: Arc<MultipartFailureState>,
-    fail_first_part: bool,
+    mode: MultipartProxyMode,
 ) {
     let Some(header) = read_request_header(&mut client).await else {
         return;
@@ -679,14 +884,20 @@ async fn proxy_one_multipart_connection(
                     *observed = Some(upload_id);
                 }
             }
-            let inject_failure =
-                fail_first_part && !state.failure_injected.swap(true, Ordering::SeqCst);
+            let fail_first_part = mode != MultipartProxyMode::PassThrough;
+            let inject_failure = fail_first_part
+                && multipart_part_number(&header) == Some(1)
+                && !state.failure_injected.swap(true, Ordering::SeqCst);
             if inject_failure {
                 state.failed_parts.fetch_add(1, Ordering::SeqCst);
                 if !drain_request_body(&mut client, &header).await {
                     return;
                 }
-                let _ = tokio::time::timeout(Duration::from_secs(10), state.wait_for_peer()).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    state.wait_for_peer_backend_started(),
+                )
+                .await;
                 let body = b"<Error><Code>InvalidRequest</Code><Message>injected multipart part failure</Message></Error>";
                 let response = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -695,6 +906,7 @@ async fn proxy_one_multipart_connection(
                 if client.write_all(response.as_bytes()).await.is_ok()
                     && client.write_all(body).await.is_ok()
                 {
+                    state.failure_response_sent.store(true, Ordering::SeqCst);
                     state.failure_sent.notify_waiters();
                 }
                 return;
@@ -702,13 +914,12 @@ async fn proxy_one_multipart_connection(
 
             if fail_first_part && !state.peer_claimed.swap(true, Ordering::SeqCst) {
                 state.active_parts.fetch_add(1, Ordering::SeqCst);
-                let forwarded = forward_upload_part_connection(client, &target, header).await;
+                let forwarded =
+                    forward_raced_peer_upload_part_connection(client, &target, header, &state)
+                        .await;
                 if forwarded {
                     state.successful_parts.fetch_add(1, Ordering::SeqCst);
-                    state.peer_reached_backend.store(true, Ordering::SeqCst);
                 }
-                state.peer_complete.store(true, Ordering::SeqCst);
-                state.peer_complete_notify.notify_waiters();
                 if state.active_parts.fetch_sub(1, Ordering::SeqCst) == 1 {
                     state.parts_idle.notify_waiters();
                 }
@@ -728,6 +939,17 @@ async fn proxy_one_multipart_connection(
                 state.successful_parts.fetch_add(1, Ordering::SeqCst);
             }
         }
+        Some(MultipartRequestKind::ListParts) => {
+            state.list_parts_requests.fetch_add(1, Ordering::SeqCst);
+            if mode == MultipartProxyMode::FailFirstPart {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    state.wait_for_peer_completed_after_abort(),
+                )
+                .await;
+            }
+            forward_multipart_connection(&mut client, &target, header).await;
+        }
         Some(MultipartRequestKind::Complete) => {
             state.completes.fetch_add(1, Ordering::SeqCst);
             forward_multipart_connection(&mut client, &target, header).await;
@@ -735,8 +957,14 @@ async fn proxy_one_multipart_connection(
         Some(MultipartRequestKind::Abort) => {
             state.aborts.fetch_add(1, Ordering::SeqCst);
             state.abort_seen.notify_waiters();
-            if forward_abort_multipart_connection(&mut client, &target, header).await {
-                state.successful_aborts.fetch_add(1, Ordering::SeqCst);
+            if mode == MultipartProxyMode::FailFirstPartAbortStall {
+                std::future::pending::<()>().await;
+            } else {
+                if forward_abort_multipart_connection(&mut client, &target, header).await {
+                    state.successful_aborts.fetch_add(1, Ordering::SeqCst);
+                }
+                state.abort_completed.store(true, Ordering::SeqCst);
+                state.abort_completed_notify.notify_waiters();
             }
         }
         Some(MultipartRequestKind::Other) | None => {
@@ -763,6 +991,88 @@ async fn forward_multipart_connection(
     tokio::io::copy_bidirectional(client, &mut backend)
         .await
         .is_ok()
+}
+
+async fn forward_raced_peer_upload_part_connection(
+    client: tokio::net::TcpStream,
+    target: &str,
+    mut header: Vec<u8>,
+    state: &MultipartFailureState,
+) -> bool {
+    let Ok(backend) = tokio::net::TcpStream::connect(target).await else {
+        return false;
+    };
+    force_connection_close(&mut header);
+    let Some(end_headers) = header.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let Some(content_length) = request_content_length(&header[..end_headers + 4]) else {
+        return false;
+    };
+    let body_prefix = header.split_off(end_headers + 4);
+    if body_prefix.len() as u64 > content_length {
+        return false;
+    }
+    let (mut client_reader, mut client_writer) = client.into_split();
+    let (mut backend_reader, mut backend_writer) = backend.into_split();
+    if backend_writer.write_all(&header).await.is_err() {
+        return false;
+    }
+
+    state.peer_backend_started.store(true, Ordering::SeqCst);
+    state.peer_reached_backend.store(true, Ordering::SeqCst);
+    state.peer_backend_started_notify.notify_waiters();
+    state.wait_for_abort_completed().await;
+
+    let mut sent = 0u64;
+    if !body_prefix.is_empty() {
+        if backend_writer.write_all(&body_prefix).await.is_err() {
+            return false;
+        }
+        sent = body_prefix.len() as u64;
+    }
+    let mut body = [0u8; 64 * 1024];
+    while sent < content_length {
+        let chunk_len = (content_length - sent).min(body.len() as u64) as usize;
+        let read = match client_reader.read(&mut body[..chunk_len]).await {
+            Ok(0) => {
+                body[..chunk_len].fill(0);
+                if backend_writer.write_all(&body[..chunk_len]).await.is_err() {
+                    return false;
+                }
+                chunk_len
+            }
+            Ok(read) => {
+                if backend_writer.write_all(&body[..read]).await.is_err() {
+                    return false;
+                }
+                read
+            }
+            Err(_) => {
+                body[..chunk_len].fill(0);
+                if backend_writer.write_all(&body[..chunk_len]).await.is_err() {
+                    return false;
+                }
+                chunk_len
+            }
+        };
+        sent += read as u64;
+    }
+    drop(backend_writer);
+
+    let Some(response_header) = read_request_header(&mut backend_reader).await else {
+        return false;
+    };
+    let status_is_success = response_status_is_success(&response_header);
+    let body_copied = tokio::io::copy(&mut backend_reader, &mut tokio::io::sink())
+        .await
+        .is_ok();
+    state
+        .peer_completed_after_abort
+        .store(true, Ordering::SeqCst);
+    state.peer_completed_after_abort_notify.notify_waiters();
+    let _ = client_writer.write_all(&response_header).await;
+    status_is_success && body_copied
 }
 
 async fn forward_upload_part_connection(
@@ -832,11 +1142,11 @@ fn response_status_is_success(response_header: &[u8]) -> bool {
         .is_some_and(|status| (200..300).contains(&status))
 }
 
-async fn drain_request_body(client: &mut tokio::net::TcpStream, header: &[u8]) -> bool {
+fn request_content_length(header: &[u8]) -> Option<u64> {
     let Some(end_headers) = header.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
+        return None;
     };
-    let Some(content_length) = std::str::from_utf8(&header[..end_headers])
+    std::str::from_utf8(&header[..end_headers])
         .ok()
         .and_then(|headers| {
             headers.lines().find_map(|line| {
@@ -846,7 +1156,14 @@ async fn drain_request_body(client: &mut tokio::net::TcpStream, header: &[u8]) -
                     .flatten()
             })
         })
-        .and_then(|length| usize::try_from(length).ok())
+}
+
+async fn drain_request_body(client: &mut tokio::net::TcpStream, header: &[u8]) -> bool {
+    let Some(end_headers) = header.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let Some(content_length) =
+        request_content_length(header).and_then(|length| usize::try_from(length).ok())
     else {
         return false;
     };
@@ -872,7 +1189,7 @@ async fn drain_request_body(client: &mut tokio::net::TcpStream, header: &[u8]) -
 
 async fn start_multipart_proxy(
     target_endpoint: &str,
-    fail_first_part: bool,
+    mode: MultipartProxyMode,
 ) -> MultipartFailureProxy {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -896,7 +1213,7 @@ async fn start_multipart_proxy(
                     let target = target.clone();
                     let state = Arc::clone(&task_state);
                     connections.spawn(async move {
-                        proxy_one_multipart_connection(client, target, state, fail_first_part).await;
+                        proxy_one_multipart_connection(client, target, state, mode).await;
                     });
                 }
                 Some(joined) = connections.join_next(), if !connections.is_empty() => {
@@ -951,15 +1268,14 @@ fn force_connection_close(buf: &mut Vec<u8>) {
 /// Replace the Host header so the S3 backend validates the signature minted for
 /// the direct endpoint, while the client still sends requests to the proxy.
 fn replace_host_header(buf: &mut Vec<u8>, new_host: &str) {
-    let s = match std::str::from_utf8(buf) {
+    let Some(end_headers) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return;
+    };
+    let s = match std::str::from_utf8(&buf[..end_headers]) {
         Ok(s) => s,
         Err(_) => return,
     };
-    let Some(end_headers) = s.find("\r\n\r\n") else {
-        return;
-    };
     let before = &s[..end_headers];
-    let after = &s[end_headers + 4..];
     let new_headers: Vec<String> = before
         .lines()
         .map(|l| {
@@ -970,8 +1286,9 @@ fn replace_host_header(buf: &mut Vec<u8>, new_host: &str) {
             }
         })
         .collect();
-    let new = format!("{}\r\n\r\n{}", new_headers.join("\r\n"), after);
-    *buf = new.into_bytes();
+    let mut new = format!("{}\r\n\r\n", new_headers.join("\r\n")).into_bytes();
+    new.extend_from_slice(&buf[end_headers + 4..]);
+    *buf = new;
 }
 
 /// Read until the HTTP header block is complete.
@@ -2107,13 +2424,13 @@ async fn list_multipart_parts_bounded(
     .context("list multipart parts timed out")
 }
 
-async fn abort_multipart_bounded(
+async fn cleanup_multipart_upload_for_fixture(
     client: &s3::Client,
     bucket: &str,
     key: &str,
     upload_id: &str,
 ) -> Result<()> {
-    tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(5),
         client
             .objects()
@@ -2121,9 +2438,12 @@ async fn abort_multipart_bounded(
             .send(),
     )
     .await
-    .context("abort residual multipart upload timed out")?
-    .context("abort residual multipart upload")?;
-    Ok(())
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) if is_no_such_upload(&error) => Ok(()),
+        Ok(Err(error)) => Err(error).context("abort residual multipart upload"),
+        Err(error) => Err(error).context("abort residual multipart upload timed out"),
+    }
 }
 
 fn is_no_such_upload(error: &s3::Error) -> bool {
@@ -2135,47 +2455,22 @@ fn is_no_such_upload(error: &s3::Error) -> bool {
     )
 }
 
-/// Verify the production abort removed both the upload and its parts. If a
-/// backend exposes residual state, make at most one bounded abort/list/re-abort
-/// cleanup attempt before failing the proof with the remaining state visible.
-async fn assert_multipart_upload_gone(
+/// Probe whether production cleanup removed the upload and all of its parts.
+/// This function is deliberately read-only: a residual result is a proof
+/// failure and must be observed before any test-only fixture cleanup.
+async fn probe_multipart_upload_gone(
     client: &s3::Client,
     bucket: &str,
     key: &str,
     upload_id: &str,
 ) -> Result<()> {
-    let first = list_multipart_parts_bounded(client, bucket, key, upload_id).await?;
-    match first {
-        Err(error) if is_no_such_upload(&error) => return Ok(()),
-        Err(error) => return Err(error).context("list multipart parts after production abort"),
-        Ok(output) => {
-            eprintln!(
-                "multipart proof found residual upload state: {} part(s); aborting",
-                output.parts.len()
-            );
-        }
-    }
-
-    abort_multipart_bounded(client, bucket, key, upload_id).await?;
-    let after_abort = list_multipart_parts_bounded(client, bucket, key, upload_id).await?;
-    match after_abort {
+    match list_multipart_parts_bounded(client, bucket, key, upload_id).await? {
         Err(error) if is_no_such_upload(&error) => Ok(()),
-        Err(error) => Err(error).context("list multipart parts after cleanup abort"),
-        Ok(output) => {
-            eprintln!(
-                "multipart proof still found {} residual part(s); re-aborting once",
-                output.parts.len()
-            );
-            abort_multipart_bounded(client, bucket, key, upload_id).await?;
-            match list_multipart_parts_bounded(client, bucket, key, upload_id).await? {
-                Err(error) if is_no_such_upload(&error) => Ok(()),
-                Err(error) => Err(error).context("list multipart parts after re-abort"),
-                Ok(output) => bail!(
-                    "multipart upload still exists after bounded re-abort with {} part(s)",
-                    output.parts.len()
-                ),
-            }
-        }
+        Err(error) => Err(error).context("list multipart parts after production cleanup"),
+        Ok(output) => bail!(
+            "production cleanup left multipart upload with {} part(s)",
+            output.parts.len()
+        ),
     }
 }
 

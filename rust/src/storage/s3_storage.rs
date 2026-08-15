@@ -23,6 +23,16 @@ const MULTIPART_UPLOAD_MAX_CONCURRENCY: usize = 8;
 const MULTIPART_UPLOAD_MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MULTIPART_UPLOAD_MAX_PARTS: u64 = 10_000;
 const MULTIPART_UPLOAD_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
+const MULTIPART_UPLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn is_no_such_multipart_upload(error: &s3::Error) -> bool {
+    matches!(
+        error,
+        s3::Error::Api {
+            code: Some(code), ..
+        } if code == "NoSuchUpload"
+    )
+}
 
 fn multipart_upload_concurrency_for_cores(cores: usize) -> usize {
     cores
@@ -209,6 +219,74 @@ impl S3Storage {
         Ok(out)
     }
 
+    async fn cleanup_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        let first_abort_error = match self
+            .client
+            .objects()
+            .abort_multipart_upload(&self.bucket, key, upload_id)
+            .send()
+            .await
+        {
+            Ok(_) => None,
+            Err(error) => {
+                let error = anyhow::Error::new(error)
+                    .context(format!("abort S3 multipart upload {key} ({upload_id})"));
+                tracing::warn!("{error:#}");
+                Some(error)
+            }
+        };
+
+        match self
+            .client
+            .objects()
+            .list_parts(&self.bucket, key, upload_id)
+            .send()
+            .await
+        {
+            Err(error) if is_no_such_multipart_upload(&error) => {}
+            Err(error) => {
+                return Err(error).context(format!(
+                    "list S3 multipart upload {key} ({upload_id}) after abort"
+                ));
+            }
+            Ok(output) => {
+                tracing::warn!(
+                    "S3 multipart upload {key} ({upload_id}) still exists with {} part(s) after abort; retrying abort",
+                    output.parts.len()
+                );
+                self.client
+                    .objects()
+                    .abort_multipart_upload(&self.bucket, key, upload_id)
+                    .send()
+                    .await
+                    .with_context(|| format!("re-abort S3 multipart upload {key} ({upload_id})"))?;
+                match self
+                    .client
+                    .objects()
+                    .list_parts(&self.bucket, key, upload_id)
+                    .send()
+                    .await
+                {
+                    Err(error) if is_no_such_multipart_upload(&error) => {}
+                    Err(error) => {
+                        return Err(error).context(format!(
+                            "list S3 multipart upload {key} ({upload_id}) after re-abort"
+                        ));
+                    }
+                    Ok(output) => anyhow::bail!(
+                        "S3 multipart upload {key} ({upload_id}) still exists with {} part(s) after re-abort",
+                        output.parts.len()
+                    ),
+                }
+            }
+        }
+
+        if let Some(error) = first_abort_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn multipart_put_file(&self, key: &str, path: &Path, len: u64) -> Result<()> {
         // Validate before creating remote multipart state.
         let part_bytes = multipart_upload_part_bytes(len)
@@ -294,16 +372,19 @@ impl S3Storage {
         .await;
 
         if let Err(error) = upload {
-            let abort = self
-                .client
-                .objects()
-                .abort_multipart_upload(&self.bucket, key, &upload_id)
-                .send()
-                .await;
-            if let Err(abort_error) = abort {
-                tracing::warn!(
-                    "failed to abort S3 multipart upload {key} ({upload_id}): {abort_error}"
-                );
+            match tokio::time::timeout(
+                MULTIPART_UPLOAD_CLEANUP_TIMEOUT,
+                self.cleanup_multipart_upload(key, &upload_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(cleanup_error)) => tracing::warn!(
+                    "S3 multipart cleanup failed for {key} ({upload_id}); preserving upload error: {cleanup_error:#}"
+                ),
+                Err(_) => tracing::warn!(
+                    "S3 multipart cleanup timed out for {key} ({upload_id}); preserving upload error"
+                ),
             }
             return Err(error);
         }
