@@ -10,6 +10,12 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 - **Signed push webhooks use their validated `after` commit directly** (`rust/src/server.rs`): they perform no second tip probe. Readiness-oriented library callers pin the admitted commit and use exact metadata GETs after the first `202`; they do not repeat a moving POST.
 - **Queue upgrades settle unsafe legacy active rows**: rows without a knowable admitted commit fail permanently with `resubmit sync` before source work. Drain or stop old direct workers before starting new writers. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
 
+## Cold-history pack and benchmark performance
+
+- **Cold full-history builds preserve Git's existing delta graph** (`rust/src/pack.rs`, `rust/src/git.rs`): the bitmap-backed history pack is no longer split with `git pack-objects --max-pack-size`. Splitting forced Git to discard cross-pack deltas, making large repositories substantially larger and slower to build. Local storage keeps the compact pack as one file; large remote uploads are handled by the storage transport.
+- **Large S3-compatible uploads use bounded multipart streaming** (`rust/src/storage/s3_storage.rs`): files at least 100 MiB use 128 MiB parts with one backend-wide, CPU-scaled budget of at most eight uploads in flight, automatically increasing part size to remain within the 10,000-part limit. Failed uploads are aborted, and local cache publication still occurs only after the remote object completes.
+- **The shaped benchmark times cloning, not repository admission** (`benchmark/fly_shaped_benchmark.sh`): add/readiness happens before each sample set, every run is pinned to one resolved commit, validation happens after the timer, failures propagate, and summaries report p50 and nearest-rank p90.
+
 ## Worker heartbeat / registry (D3)
 
 - **`workers` registry table** on the blessed SQL queues (`sqlite` / `libsql`, DDL in the shared `SqlJobQueue` adapter). Each row is `worker_id`, optional `max_size_class` ceiling, optional `current_job`, and `last_heartbeat`. Postgres/MySQL lag: heartbeat/live-count **fail loudly** (never silently report a zero fleet).

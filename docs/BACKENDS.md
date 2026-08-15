@@ -86,6 +86,14 @@ AWS_SECRET_ACCESS_KEY=...
 
 The server will redirect clients to signed URLs so bytes are served directly from the object store rather than proxied through the ripclone server.
 
+Artifact files smaller than 100 MiB use one streaming object PUT. Larger files use
+bounded multipart uploads (128 MiB parts and one backend-wide, CPU-scaled budget
+of at most eight concurrent parts), so a compact multi-gigabyte Git history pack does
+not need to be split into less efficient Git packs or buffered in memory. The uploader
+increases the part size when necessary to stay within the S3 10,000-part limit and
+aborts an incomplete multipart upload when any part fails. The configured provider
+must implement the standard S3 multipart API.
+
 Works with:
 - **Tigris** (current default for the hosted service)
 - **MinIO** (great for on-prem)

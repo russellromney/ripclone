@@ -841,14 +841,15 @@ pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
 /// reachable closure itself; `--use-bitmap-index` answers that from the mirror's
 /// multi-pack-index bitmap (no graph walk) and lets pack-objects copy existing
 /// pack deltas (`--reuse-delta` is on by default) rather than re-deltifying.
-/// `--max-pack-size` splits the output into download-friendly packs. This is the
-/// fast path for the cold full-history build — it makes the cost ~I/O instead of
-/// ~re-deltify, mirroring how `git clone` serves a full clone.
+/// An optional `--max-pack-size` exists for focused compatibility tests. The
+/// production cold-history path leaves it unset: split packs cannot retain
+/// deltas whose bases land in another output pack, turning this I/O-oriented
+/// reuse path back into expensive re-deltification.
 pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     repo: P,
     commit: &str,
     prefix: Q,
-    max_pack_bytes: u64,
+    max_pack_bytes: Option<u64>,
 ) -> Result<()> {
     // `commit` is fed to `pack-objects --revs` via stdin, where each line is a
     // rev-list arg — a `-`-leading or range value would change the packed set.
@@ -864,13 +865,17 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     // Capture rather than inherit: pack-objects prints each output pack's hash to
     // stdout (noise in the server log), and stderr carries the real diagnostic when
     // it fails. We write the packs by base-name, so stdout is not needed.
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo.as_ref())
         .arg("pack-objects")
         .arg("--revs")
-        .arg("--use-bitmap-index")
-        .arg(format!("--max-pack-size={}", max_pack_bytes.max(1)))
+        .arg("--use-bitmap-index");
+    if let Some(max_pack_bytes) = max_pack_bytes {
+        command.arg(format!("--max-pack-size={}", max_pack_bytes.max(1)));
+    }
+    let mut child = command
         .arg(prefix.as_ref())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

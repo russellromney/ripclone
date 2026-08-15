@@ -7,9 +7,34 @@ use s3::{Auth, Client};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 const DELETE_BATCH_SIZE: usize = 1000;
+#[cfg(not(test))]
+const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
+#[cfg(not(test))]
+const MULTIPART_UPLOAD_PART_BYTES: u64 = 128 * 1024 * 1024;
+#[cfg(test)]
+const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(test)]
+const MULTIPART_UPLOAD_PART_BYTES: u64 = 8 * 1024 * 1024;
+const MULTIPART_UPLOAD_MAX_CONCURRENCY: usize = 8;
+const MULTIPART_UPLOAD_MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MULTIPART_UPLOAD_MAX_PARTS: u64 = 10_000;
+
+fn multipart_upload_concurrency_for_cores(cores: usize) -> usize {
+    cores
+        .max(1)
+        .saturating_mul(2)
+        .min(MULTIPART_UPLOAD_MAX_CONCURRENCY)
+}
+
+fn multipart_upload_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| multipart_upload_concurrency_for_cores(cores.get()))
+        .unwrap_or(4)
+}
 
 /// S3-compatible storage backend with an optional local filesystem cache.
 ///
@@ -21,6 +46,7 @@ pub struct S3Storage {
     bucket: String,
     prefix: String,
     cache: Option<Cas>,
+    multipart_upload_slots: tokio::sync::Semaphore,
 }
 
 impl S3Storage {
@@ -74,12 +100,19 @@ impl S3Storage {
             .build()
             .context("create S3 client")?;
         let cache = cache_dir.map(Cas::new).transpose()?;
+        // The server also uploads distinct artifacts concurrently. Keep one
+        // backend-wide multipart budget so those outer tasks cannot each open
+        // an independent window. Parts stream from disk, so this bounds live
+        // transport buffers/connections rather than coupling Git pack size to
+        // machine memory.
+        let multipart_upload_concurrency = multipart_upload_concurrency();
         Ok(Self {
             client,
             region: region.to_string(),
             bucket: bucket.to_string(),
             prefix: prefix.unwrap_or("").to_string(),
             cache,
+            multipart_upload_slots: tokio::sync::Semaphore::new(multipart_upload_concurrency),
         })
     }
 
@@ -162,6 +195,115 @@ impl S3Storage {
             out.extend_from_slice(&chunk);
         }
         Ok(out)
+    }
+
+    async fn multipart_put_file(&self, key: &str, path: &Path, len: u64) -> Result<()> {
+        let created = self
+            .client
+            .objects()
+            .create_multipart_upload(&self.bucket, key)
+            .send()
+            .await
+            .with_context(|| format!("start S3 multipart upload {key}"))?;
+        let upload_id = created.upload_id;
+        let part_bytes = MULTIPART_UPLOAD_PART_BYTES.max(len.div_ceil(MULTIPART_UPLOAD_MAX_PARTS));
+        if part_bytes > MULTIPART_UPLOAD_MAX_PART_BYTES {
+            let _ = self
+                .client
+                .objects()
+                .abort_multipart_upload(&self.bucket, key, &upload_id)
+                .send()
+                .await;
+            anyhow::bail!("S3 multipart upload {key} exceeds the maximum multipart object size");
+        }
+        let part_count = len.div_ceil(part_bytes);
+
+        let upload = async {
+            let parts = futures::stream::iter(0..part_count)
+                .map(|part_index| {
+                    let client = self.client.clone();
+                    let bucket = self.bucket.clone();
+                    let key = key.to_string();
+                    let upload_id = upload_id.clone();
+                    let path = path.to_path_buf();
+                    let multipart_upload_slots = &self.multipart_upload_slots;
+                    async move {
+                        let _slot = multipart_upload_slots
+                            .acquire()
+                            .await
+                            .expect("S3 multipart upload semaphore is never closed");
+                        let offset = part_index * part_bytes;
+                        let part_len = (len - offset).min(part_bytes);
+                        let mut file = tokio::fs::File::open(&path).await.with_context(|| {
+                            format!("open {} for multipart upload", path.display())
+                        })?;
+                        file.seek(std::io::SeekFrom::Start(offset))
+                            .await
+                            .with_context(|| {
+                                format!("seek {} to multipart offset {offset}", path.display())
+                            })?;
+                        let stream = ReaderStream::new(file.take(part_len));
+                        let part_number = u32::try_from(part_index + 1)
+                            .context("S3 multipart part number overflow")?;
+                        let uploaded = client
+                            .objects()
+                            .upload_part(&bucket, &key, &upload_id, part_number)
+                            .body_stream_sized(stream, part_len)
+                            .send()
+                            .await
+                            .with_context(|| {
+                                format!("upload S3 multipart part {part_number} for {key}")
+                            })?;
+                        let etag = uploaded.etag.with_context(|| {
+                            format!("S3 multipart part {part_number} for {key} omitted ETag")
+                        })?;
+                        Ok::<_, anyhow::Error>((part_number, etag))
+                    }
+                })
+                // This local window limits bookkeeping for one file; the
+                // backend-wide semaphore above is the authoritative shared
+                // limit across all concurrent artifact uploads.
+                .buffer_unordered(MULTIPART_UPLOAD_MAX_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+
+            let mut completed = Vec::with_capacity(parts.len());
+            for part in parts {
+                completed.push(part?);
+            }
+            completed.sort_by_key(|(part_number, _)| *part_number);
+            let mut request =
+                self.client
+                    .objects()
+                    .complete_multipart_upload(&self.bucket, key, &upload_id);
+            for (part_number, etag) in completed {
+                request = request
+                    .part(part_number, etag)
+                    .with_context(|| format!("record S3 multipart part {part_number} for {key}"))?;
+            }
+            request
+                .send()
+                .await
+                .with_context(|| format!("complete S3 multipart upload {key}"))?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = upload {
+            let abort = self
+                .client
+                .objects()
+                .abort_multipart_upload(&self.bucket, key, &upload_id)
+                .send()
+                .await;
+            if let Err(abort_error) = abort {
+                tracing::warn!(
+                    "failed to abort S3 multipart upload {key} ({upload_id}): {abort_error}"
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn block_on<F, Fut, T>(&self, make_future: F) -> Result<T>
@@ -372,17 +514,21 @@ impl StorageBackend for S3Storage {
         }
 
         let key = self.key(hash)?;
-        let file = tokio::fs::File::open(path)
-            .await
-            .with_context(|| format!("open {} for S3 upload", path.display()))?;
-        let stream = ReaderStream::new(file);
-        self.client
-            .objects()
-            .put(&self.bucket, &key)
-            .body_stream_sized(stream, len)
-            .send()
-            .await
-            .with_context(|| format!("S3 put_object {key}"))?;
+        if len >= MULTIPART_UPLOAD_THRESHOLD_BYTES {
+            self.multipart_put_file(&key, path, len).await?;
+        } else {
+            let file = tokio::fs::File::open(path)
+                .await
+                .with_context(|| format!("open {} for S3 upload", path.display()))?;
+            let stream = ReaderStream::new(file);
+            self.client
+                .objects()
+                .put(&self.bucket, &key)
+                .body_stream_sized(stream, len)
+                .send()
+                .await
+                .with_context(|| format!("S3 put_object {key}"))?;
+        }
         if let Some(cache) = &self.cache {
             let cache = cache.clone();
             let hash = hash.to_string();
@@ -744,8 +890,58 @@ impl S3Storage {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_duration_ms, env_duration_secs, env_u32, scoped_key, unscoped_key};
+    use super::{
+        S3Storage, env_duration_ms, env_duration_secs, env_u32,
+        multipart_upload_concurrency_for_cores, scoped_key, unscoped_key,
+    };
+    use crate::storage::StorageBackend;
+    use std::io::Write;
     use std::time::Duration;
+
+    #[test]
+    fn multipart_budget_scales_with_machine_and_stays_bounded() {
+        assert_eq!(multipart_upload_concurrency_for_cores(0), 2);
+        assert_eq!(multipart_upload_concurrency_for_cores(1), 2);
+        assert_eq!(multipart_upload_concurrency_for_cores(2), 4);
+        assert_eq!(multipart_upload_concurrency_for_cores(4), 8);
+        assert_eq!(multipart_upload_concurrency_for_cores(128), 8);
+    }
+
+    #[tokio::test]
+    async fn multipart_file_upload_roundtrips_exact_bytes() {
+        if std::env::var_os("RIPCLONE_S3_ENDPOINT").is_none() {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT is required");
+            return;
+        }
+        let storage = S3Storage::from_env()
+            .expect("construct S3 storage")
+            .expect("RIPCLONE_S3_ENDPOINT must enable S3 storage");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart fixture");
+        let block: Vec<u8> = (0..1024 * 1024)
+            .map(|index| ((index * 31 + index / 251) % 251) as u8)
+            .collect();
+        for _ in 0..17 {
+            source.write_all(&block).expect("write multipart fixture");
+        }
+        source.flush().expect("flush multipart fixture");
+        let (hash, len) = crate::cas::hash_file(source.path()).expect("hash multipart fixture");
+
+        storage
+            .put_file_async(&hash, source.path())
+            .await
+            .expect("multipart upload");
+        let (_, downloaded) = storage
+            .get_object(&hash)
+            .await
+            .expect("download multipart object")
+            .expect("multipart object exists");
+        assert_eq!(downloaded.len() as u64, len);
+        assert_eq!(crate::cas::hash(&downloaded), hash);
+        storage
+            .delete_object(&hash)
+            .await
+            .expect("delete multipart fixture");
+    }
 
     #[test]
     fn arbitrary_object_keys_are_scoped_and_listed_as_logical_keys() {
