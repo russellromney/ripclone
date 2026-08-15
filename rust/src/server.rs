@@ -3087,7 +3087,7 @@ async fn carried_full_top_up_response(
     storage: &crate::storage::StorageRef,
     private: bool,
 ) -> Option<RefResponse> {
-    // The caller supplies the same moving-row snapshot that missed exact B.
+    // The caller supplies the same exact-row snapshot that is still building B.
     // Do not read it again here: Full(B) could publish between reads, which
     // would otherwise turn an exact-ready response into a pending top-up miss.
     if info.commit != pinned
@@ -3144,132 +3144,6 @@ async fn carried_full_top_up_response(
     )
 }
 
-/// Result of a pinned lookup. `Pending` retains the exact-row snapshot when one
-/// exists, plus the compatible moving-row snapshot used by older layouts, so
-/// top-up planning cannot observe a different publication state than exact
-/// selection.
-enum PinnedRefLookup {
-    Exact {
-        key: String,
-        info: RefInfo,
-    },
-    Pending {
-        moving: Option<RefInfo>,
-        exact: Option<(String, RefInfo)>,
-    },
-}
-
-/// A post-pin lookup performs only a fixed set of repo-scoped point reads.
-/// Missing exact metadata is a normal pending result: branch publication may
-/// have replaced the only row for this commit, and pinning does not create a
-/// retention lease.
-async fn load_pinned_ref_info(
-    ref_store: &Arc<dyn RefStore>,
-    repo_id: &RepoId,
-    branch: &str,
-    pinned: &str,
-    clonepack_kind: &str,
-    historical_rev: Option<&str>,
-) -> Result<PinnedRefLookup> {
-    let branch_info = ref_store.load_branch(repo_id, branch).await?;
-    // HEAD metadata carries the concrete default branch. It is a point read used
-    // only to name the concrete exact lane; it never probes the provider.
-    let default_branch = branch_info
-        .as_ref()
-        .filter(|_| branch == "HEAD")
-        .map(|info| info.default_branch.as_str())
-        .filter(|default_branch| !default_branch.is_empty() && *default_branch != "HEAD");
-    let mut exact_keys = vec![ref_store_key(branch, Some(pinned), Some(pinned))];
-    if let Some(default_branch) = default_branch {
-        let key = ref_store_key(default_branch, Some(pinned), Some(pinned));
-        if !exact_keys.contains(&key) {
-            exact_keys.push(key);
-        }
-    }
-    if let Some(rev) = historical_rev {
-        let key = ref_store_key(branch, Some(rev), None);
-        if !exact_keys.contains(&key) {
-            exact_keys.push(key);
-        }
-        if let Some(default_branch) = default_branch {
-            let key = ref_store_key(default_branch, Some(rev), None);
-            if !exact_keys.contains(&key) {
-                exact_keys.push(key);
-            }
-        }
-    }
-
-    let mut pending_exact = None;
-    for key in exact_keys {
-        if key == branch {
-            continue;
-        }
-        if let Some(info) = ref_store.load_branch(repo_id, &key).await?
-            && info.commit == pinned
-        {
-            if exact_ref_info_serves_commit(&info, clonepack_kind, pinned) {
-                return Ok(PinnedRefLookup::Exact { key, info });
-            }
-            if pending_exact.is_none() {
-                pending_exact = Some((key, info));
-            }
-        }
-    }
-
-    // Older rows may still be available under the moving branch. They are a
-    // compatibility fallback only; an exact row, when present, is authoritative.
-    let default_info = if let Some(default_branch) = default_branch {
-        if default_branch != branch {
-            ref_store.load_branch(repo_id, default_branch).await?
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    if pending_exact.is_none() {
-        if let Some(info) = branch_info.as_ref()
-            && info.commit == pinned
-            && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
-        {
-            return Ok(PinnedRefLookup::Exact {
-                key: branch.to_string(),
-                info: info.clone(),
-            });
-        }
-        if let Some(default_branch) = default_branch
-            && let Some(info) = default_info.as_ref()
-            && info.commit == pinned
-            && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
-        {
-            return Ok(PinnedRefLookup::Exact {
-                key: default_branch.to_string(),
-                info: info.clone(),
-            });
-        }
-    }
-
-    // Keep the moving snapshot that matches the pin when possible. If it does
-    // not match, retaining it is still useful for the exact-B pending response
-    // and is rejected by the top-up identity checks.
-    let moving = branch_info
-        .as_ref()
-        .filter(|info| info.commit == pinned)
-        .cloned()
-        .or_else(|| {
-            default_info
-                .as_ref()
-                .filter(|info| info.commit == pinned)
-                .cloned()
-        })
-        .or(branch_info)
-        .or(default_info);
-    Ok(PinnedRefLookup::Pending {
-        moving,
-        exact: pending_exact,
-    })
-}
-
 /// Returns true when the commit-keyed historical row, pre-upgrade raw-revision
 /// row, or moving row matches the requested commit and is evicted. Historical
 /// lookups are essential after the branch advances: `main#B` or `main#HEAD~2`
@@ -3320,7 +3194,10 @@ fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: 
 fn pinned_build_active(info: Option<&RefInfo>, clonepack_kind: &str, commit: &str) -> bool {
     info.is_some_and(|info| {
         info.commit == commit
-            && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
+            && matches!(
+                info.build_status.as_deref(),
+                Some("building") | Some(BUILDING_FULL_HISTORY)
+            )
             && !exact_ref_info_serves_commit(info, clonepack_kind, commit)
     })
 }
@@ -3349,13 +3226,14 @@ async fn load_ref_info_for_resolved_commit(
     clonepack_kind: &str,
 ) -> Option<(String, RefInfo)> {
     if rev.is_none() {
+        let exact_key = ref_store_key(effective_branch, Some(commit), Some(commit));
         return ref_store
-            .load_branch(repo_id, effective_branch)
+            .load_branch(repo_id, &exact_key)
             .await
             .ok()
             .flatten()
             .filter(|info| info.commit == commit)
-            .map(|info| (effective_branch.to_string(), info));
+            .map(|info| (exact_key, info));
     }
 
     let mut keys = Vec::new();
@@ -3508,17 +3386,9 @@ async fn get_ref_inner(
         };
 
     if let Some(pinned) = params.pinned.as_deref() {
-        let resolved = match load_pinned_ref_info(
-            &state.ref_store,
-            &repo_id,
-            &branch,
-            pinned,
-            &params.clonepack,
-            params.rev.as_deref(),
-        )
-        .await
-        {
-            Ok(resolved) => resolved,
+        let exact_key = ref_store_key(&branch, Some(pinned), Some(pinned));
+        let exact_info = match state.ref_store.load_branch(&repo_id, &exact_key).await {
+            Ok(info) => info.filter(|info| info.commit == pinned),
             Err(e) => {
                 state.metrics.record_error();
                 return (
@@ -3530,30 +3400,34 @@ async fn get_ref_inner(
                     .into_response();
             }
         };
-        let (served_key, info) = match resolved {
-            PinnedRefLookup::Exact { key, info } => (key, info),
-            PinnedRefLookup::Pending { moving, exact } => {
-                let exact_info = exact.as_ref().map(|(_, info)| info);
-                let pending_info = exact_info.or(moving.as_ref());
-                let response_branch = if branch == "HEAD" {
-                    pending_info
-                        .filter(|info| !info.default_branch.is_empty())
-                        .map(|info| info.default_branch.clone())
-                        .unwrap_or_else(|| branch.clone())
-                } else {
-                    branch.clone()
-                };
+        if let Some(info) = exact_info.as_ref()
+            && let Some(failure) = info
+                .build_status
+                .as_deref()
+                .and_then(|status| status.strip_prefix("failed: "))
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    error: format!("exact pinned commit {pinned} is unavailable: {failure}"),
+                }),
+            )
+                .into_response();
+        }
+        let info = match exact_info {
+            Some(info) if exact_ref_info_serves_commit(&info, &params.clonepack, pinned) => info,
+            pending_info => {
                 if params.rev.is_none()
-                    && !pinned_build_active(pending_info, &params.clonepack, pinned)
+                    && !pinned_build_active(pending_info.as_ref(), &params.clonepack, pinned)
                 {
-                    let build_branch = response_branch.clone();
-                    let size_bytes = enqueue_size_bytes(&state, &repo_id, &build_branch).await;
+                    let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
-                        branch: build_branch.clone(),
+                        branch: branch.clone(),
                         rev: None,
                         admitted_commit: Some(pinned.to_string()),
                         admitted_default_branch: pending_info
+                            .as_ref()
                             .filter(|info| !info.default_branch.is_empty())
                             .map(|info| info.default_branch.clone()),
                         credential: credential.clone(),
@@ -3576,13 +3450,13 @@ async fn get_ref_inner(
                     }
                 }
                 if params.top_up && params.clonepack == "full" {
-                    let base = match pending_info {
+                    let base = match pending_info.as_ref() {
                         Some(info) => {
                             carried_full_top_up_response(
                                 info,
                                 &repo_id,
                                 &provider,
-                                &response_branch,
+                                &branch,
                                 pinned,
                                 &state.storage,
                                 private,
@@ -3593,47 +3467,42 @@ async fn get_ref_inner(
                     };
                     return artifact_pending_response_with_top_up(
                         pinned,
-                        &response_branch,
+                        &branch,
                         1,
                         Some(true),
                         base,
                     );
                 }
-                return artifact_pending_response(pinned, &response_branch, 1);
+                return artifact_pending_response(pinned, &branch, 1);
             }
-        };
-        let response_branch = if branch == "HEAD" && !info.default_branch.is_empty() {
-            info.default_branch.clone()
-        } else {
-            branch.clone()
         };
         let response = ref_response(
             &repo_id,
             &provider,
-            response_branch.clone(),
+            branch.clone(),
             &info,
             &state.storage,
             &params.clonepack,
             private,
         );
         if response.commit != pinned || response.clonepack_manifest.is_empty() {
-            return artifact_pending_response(pinned, &response_branch, 1);
+            return artifact_pending_response(pinned, &branch, 1);
         }
         if let Err(e) = state
             .ref_store
-            .touch_last_accessed_at(&repo_id, &served_key, &info.commit)
+            .touch_last_accessed_at(&repo_id, &exact_key, &info.commit)
             .await
         {
             warn!(
                 "failed to touch last_accessed_at for pinned {}@{}: {e:#}",
-                served_key, info.commit
+                exact_key, info.commit
             );
         }
-        // This exact authenticated read is the compatibility readiness
+        // This exact authenticated read is the readiness
         // boundary for a build that may have completed in another process.
         // Retire any unpinned response cached before admission so the caller's
         // next ordinary HEAD/branch clone cannot fall back to the old commit.
-        invalidate_ref_response_cache(&state, &repo_id, &response_branch);
+        invalidate_ref_response_cache(&state, &repo_id, &branch);
         invalidate_ref_response_cache(&state, &repo_id, "HEAD");
         return (StatusCode::OK, Json(response)).into_response();
     }
@@ -3833,6 +3702,8 @@ async fn get_ref_inner(
                 .map(|(k, _)| k.clone())
                 .unwrap_or_default();
             let info = resolved.map(|(_, i)| i).unwrap_or_else(|| RefInfo {
+                internal_exact_result: false,
+                require_matching_commit: false,
                 commit: commit.clone(),
                 parent_commit: None,
                 default_branch: default_branch.clone(),
@@ -4482,6 +4353,10 @@ async fn build_repo_status(
             }
         }
 
+        if info.internal_exact_result {
+            continue;
+        }
+
         let built_at = info.synced_at.and_then(|secs| {
             chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
         });
@@ -4668,15 +4543,12 @@ async fn sync_repo_inner(
         requested_branch.clone()
     };
 
-    // Admission is intentionally a branch-row read only. In particular, do
+    // Admission is intentionally an exact-row read only. In particular, do
     // not call reuse_existing_build/touch/access-time helpers here: a ready
     // unchanged sync after its one probe has no queue, source, builder, or
     // metadata mutation side effect.
-    let loaded_branch = match state
-        .ref_store
-        .load_branch(&repo_id, &effective_branch)
-        .await
-    {
+    let exact_key = ref_store_key(&effective_branch, Some(&commit), Some(&commit));
+    let loaded_exact = match state.ref_store.load_branch(&repo_id, &exact_key).await {
         Ok(info) => info,
         Err(e) => {
             state.metrics.record_error();
@@ -4689,7 +4561,7 @@ async fn sync_repo_inner(
                 .into_response();
         }
     };
-    let ready = loaded_branch.as_ref().filter(|info| {
+    let ready = loaded_exact.as_ref().filter(|info| {
         exact_ref_info_serves_commit(info, "full", &commit)
             && !info
                 .build_status
@@ -4712,7 +4584,13 @@ async fn sync_repo_inner(
     }
 
     let admitted_branch = effective_branch.clone();
-    let prior_size_bytes = loaded_branch.as_ref().and_then(|info| {
+    let moving_info = state
+        .ref_store
+        .load_branch(&repo_id, &effective_branch)
+        .await
+        .ok()
+        .flatten();
+    let prior_size_bytes = moving_info.as_ref().and_then(|info| {
         let bytes = crate::queue::prior_clonepack_bytes(info);
         (bytes > 0).then_some(bytes)
     });
@@ -6571,7 +6449,7 @@ fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
 /// Ref-store key for a build. Commit-targeted builds use a commit-keyed rolling
 /// key (`{branch}#{commit}`) so they never overwrite another exact result.
 /// Sequential builds at the same commit still share this key, so they stay
-/// incremental. Moving tip rows use the plain branch key for compatibility.
+/// incremental. Moving tip projections use the plain branch key.
 fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> String {
     match (at_rev, commit) {
         (Some(_), Some(commit)) => format!("{branch}#{commit}"),
@@ -7480,7 +7358,7 @@ async fn do_sync(
 
     // If the caller asked for HEAD, store artifacts under the concrete default
     // branch name so both /refs/HEAD and /refs/<branch> find the same build.
-    // Ordinary admitted work keeps that concrete branch as a compatibility row,
+    // Ordinary admitted work keeps that concrete branch as the moving projection,
     // while all build state below uses the exact commit-keyed row.
     let moving_branch = at_rev.is_none().then(|| {
         if branch == "HEAD" {
@@ -7497,7 +7375,7 @@ async fn do_sync(
         }
     });
     // Ref-store key. Rev builds and ordinary admitted builds share the existing
-    // commit-keyed rolling lane; only the moving compatibility row stays plain.
+    // commit-keyed rolling lane; only the moving projection stays plain.
     // The mirror fetch + commit resolution above used the real branch/rev.
     let ref_key = if admitted_commit.is_some() {
         ref_store_key(storage_branch, Some(&commit), Some(&commit))
@@ -7639,29 +7517,32 @@ struct Phase2FailureAction {
     local_active_key: Option<String>,
 }
 
-/// Keep the legacy moving row and HEAD alias useful for unpinned callers after
-/// the exact result is durable. The existing ref-store ordering fence decides
-/// whether a delayed exact build may advance the moving row; a rejected B write
-/// is therefore unable to move C backward.
-async fn publish_compatibility_refs(
+/// Publish the current unpinned branch projection. Completed publications are
+/// commit-fenced atomically so a delayed exact build cannot replace a branch
+/// that has since selected another commit.
+async fn publish_moving_refs(
     ref_store: &Arc<dyn RefStore>,
     repo_id: &RepoId,
     exact_branch: &str,
     moving_branch: Option<&str>,
     default_branch: &str,
     info: &RefInfo,
+    require_matching_commit: bool,
 ) -> Result<()> {
     let Some(moving_branch) = moving_branch else {
         return Ok(());
     };
+    let mut projection = info.clone();
+    projection.internal_exact_result = false;
+    projection.require_matching_commit = require_matching_commit;
     if moving_branch != exact_branch {
         admission_test_ref_store_write();
         ref_store
-            .save_branch(repo_id, moving_branch, info)
+            .save_branch(repo_id, moving_branch, &projection)
             .await
             .with_context(|| {
                 format!(
-                    "persist moving compatibility ref for {}@{moving_branch}",
+                    "persist moving ref for {}@{moving_branch}",
                     repo_id.storage_key()
                 )
             })?;
@@ -7676,12 +7557,7 @@ async fn publish_compatibility_refs(
             ref_store
                 .save_branch(repo_id, "HEAD", &current)
                 .await
-                .with_context(|| {
-                    format!(
-                        "persist HEAD compatibility ref for {}",
-                        repo_id.storage_key()
-                    )
-                })?;
+                .with_context(|| format!("persist HEAD ref for {}", repo_id.storage_key()))?;
         }
     }
     Ok(())
@@ -7730,9 +7606,16 @@ async fn build_and_publish_two_phase(
     // would reference objects storage no longer has, so the published manifest
     // would point at deleted packs and the next clone 404s. Treat an evicted prev
     // as absent so the rebuild is cold and re-uploads everything it references.
-    let prev_loaded = match ref_store.load_branch(repo_id, branch).await.ok().flatten() {
-        Some(info) => Some(info),
-        None => match moving_branch {
+    let exact_prev = ref_store.load_branch(repo_id, branch).await.ok().flatten();
+    let placeholder_only = exact_prev.as_ref().is_some_and(|info| {
+        info.build_status.as_deref() == Some("building")
+            && info.full_clonepack.manifest.is_empty()
+            && info.shallow_clonepack.manifest.is_empty()
+            && info.clonepack_manifest.is_empty()
+    });
+    let prev_loaded = match exact_prev {
+        Some(info) if !placeholder_only => Some(info),
+        _ => match moving_branch {
             Some(moving) if moving != branch => ref_store
                 .load_branch(repo_id, moving)
                 .await
@@ -8032,6 +7915,8 @@ async fn build_and_publish_two_phase(
     }
 
     let mut info = RefInfo {
+        internal_exact_result: moving_branch.is_some(),
+        require_matching_commit: false,
         commit: commit.to_string(),
         parent_commit: parent.clone(),
         default_branch: default_branch.to_string(),
@@ -8101,13 +7986,14 @@ async fn build_and_publish_two_phase(
         .save_branch(repo_id, branch, &info)
         .await
         .with_context(|| format!("persist depth=1 ref for {}@{branch}", repo_id.storage_key()))?;
-    publish_compatibility_refs(
+    publish_moving_refs(
         ref_store,
         repo_id,
         branch,
         moving_branch,
         default_branch,
         &info,
+        false,
     )
     .await?;
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
@@ -8832,13 +8718,14 @@ async fn build_full_in_background(
                 .with_context(|| {
                     format!("persist files ref for {}@{branch}", repo_id.storage_key())
                 })?;
-            publish_compatibility_refs(
+            publish_moving_refs(
                 ref_store,
                 repo_id,
                 branch,
                 moving_branch,
                 default_branch,
                 &info,
+                true,
             )
             .await?;
         }
@@ -8901,7 +8788,10 @@ pub async fn process_build_job(
     let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
         Some(p) => p.clone(),
         None => {
-            if let Err(e) = update_job_build_status(state, job, branch, "error").await {
+            let message = format!("unknown provider {}", repo_id.provider.as_str());
+            if let Err(e) =
+                update_job_build_status(state, job, branch, &format!("failed: {message}")).await
+            {
                 error!(
                     "build status update failed for {}@{branch}: {e:#}",
                     repo_id.storage_key()
@@ -8911,10 +8801,7 @@ pub async fn process_build_job(
                 "unknown provider {} for build job",
                 repo_id.provider.as_str()
             );
-            return Err(BuildError::permanent(format!(
-                "unknown provider {}",
-                repo_id.provider.as_str()
-            )));
+            return Err(BuildError::permanent(message));
         }
     };
     // do_sync holds this per-repo lock only across the mirror-mutating prep and
@@ -9453,8 +9340,8 @@ fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<Bu
                         let _ = s.send(result.clone());
                     }
                 } else if keep_marker {
-                    // Phase 2 owns marker removal; still wake compatibility
-                    // callers that were attached to phase 1.
+                    // Phase 2 owns marker removal; still wake callers that were
+                    // attached to phase 1.
                     if let Some(senders) = state.build_waiters.lock().await.get_mut(&key) {
                         for sender in senders.drain(..) {
                             let _ = sender.send(result.clone());
@@ -9614,6 +9501,46 @@ async fn update_job_build_status(
     {
         let exact_branch = ref_store_key(branch, Some(commit), Some(commit));
         if status == "building" {
+            let existing = state
+                .ref_store
+                .load_branch(&job.repo_id, &exact_branch)
+                .await?;
+            if existing.as_ref().is_some_and(|info| {
+                info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+                    || (!info.full_clonepack.manifest.is_empty()
+                        && info.full_clonepack.commit == commit)
+            }) {
+                return Ok(Some(commit.to_string()));
+            }
+            if existing.is_none() {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs());
+                let pending = RefInfo {
+                    internal_exact_result: true,
+                    commit: commit.to_string(),
+                    default_branch: job
+                        .admitted_default_branch
+                        .clone()
+                        .unwrap_or_else(|| branch.to_string()),
+                    build_status: Some(status.to_string()),
+                    synced_at: now,
+                    last_accessed_at: now,
+                    ..Default::default()
+                };
+                state
+                    .ref_store
+                    .save_branch(&job.repo_id, &exact_branch, &pending)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "create exact build status for {}@{exact_branch} {commit}",
+                            job.repo_id.storage_key()
+                        )
+                    })?;
+                return Ok(Some(commit.to_string()));
+            }
             return update_current_build_status(state, &job.repo_id, &exact_branch, status).await;
         }
         return update_build_status(state, &job.repo_id, &exact_branch, commit, status)
@@ -13604,54 +13531,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pinned_top_up_retains_one_moving_row_snapshot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
-        let repo_id = RepoId::github("acme/widget");
-        let base = "a".repeat(40);
-        let target = "b".repeat(40);
-        let pending = RefInfo {
-            commit: target.clone(),
-            parent_commit: Some(base.clone()),
-            full_clonepack: crate::ClonepackArtifacts {
-                commit: base.clone(),
-                manifest: "0".repeat(64),
-                ..Default::default()
-            },
-            build_status: Some(BUILDING_FULL_HISTORY.to_string()),
-            ..Default::default()
-        };
-        store.save_branch(&repo_id, "main", &pending).await.unwrap();
-
-        let lookup = load_pinned_ref_info(&store, &repo_id, "main", &target, "full", None)
-            .await
-            .unwrap();
-
-        // Simulate phase-two publication after the lookup. The top-up caller
-        // must decide from `lookup`, not re-read this now-exact moving row.
-        let mut exact = pending.clone();
-        exact.full_clonepack.commit = target.clone();
-        exact.build_status = None;
-        store.save_branch(&repo_id, "main", &exact).await.unwrap();
-
-        match lookup {
-            PinnedRefLookup::Pending {
-                moving: Some(snapshot),
-                ..
-            } => {
-                assert_eq!(snapshot.commit, target);
-                assert_eq!(snapshot.full_clonepack.commit, base);
-                assert_eq!(
-                    snapshot.build_status.as_deref(),
-                    Some(BUILDING_FULL_HISTORY),
-                    "top-up planning is linearized at the first moving-row snapshot"
-                );
-            }
-            _ => panic!("pending moving row must be retained for one-snapshot top-up planning"),
-        }
-    }
-
     #[test]
     fn phase_two_barrier_requires_explicit_test_mode() {
         assert!(!explicit_test_mode(None));
@@ -14179,53 +14058,6 @@ mod tests {
             moving_after.last_accessed_at,
             Some(old_ts),
             "a pending pinned lookup must not touch the unrelated moving row"
-        );
-    }
-
-    #[tokio::test]
-    async fn pinned_exact_read_touches_exact_row_when_moving_is_compatible() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-        let ref_store = state.ref_store.clone();
-        let rid = RepoId::github("acme/widget");
-        mark_added(&state, rid.clone()).await;
-
-        let pinned = "a".repeat(40);
-        let old_ts = 1;
-        let mut moving = complete_ref(&pinned, "manifest-a");
-        moving.last_accessed_at = Some(old_ts);
-        ref_store.save_branch(&rid, "main", &moving).await.unwrap();
-        let exact_key = ref_store_key("main", Some(&pinned), Some(&pinned));
-        let mut exact = complete_ref(&pinned, "manifest-a-exact");
-        exact.last_accessed_at = Some(old_ts);
-        ref_store
-            .save_branch(&rid, &exact_key, &exact)
-            .await
-            .unwrap();
-
-        let app = build_app(state);
-        let response = app
-            .oneshot(protocol_request(
-                &format!("/v1/repos/github/acme/widget/refs/main?clonepack=full&pinned={pinned}"),
-                Some("2"),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let moving_after = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
-        assert!(
-            moving_after.last_accessed_at == Some(old_ts),
-            "an exact read must not mutate the moving compatibility row"
-        );
-        let exact_after = ref_store
-            .load_branch(&rid, &exact_key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            exact_after.last_accessed_at.unwrap() > old_ts,
-            "the exact row that served the pinned read receives the access touch"
         );
     }
 

@@ -16,6 +16,7 @@ use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1032,9 +1033,9 @@ async fn e2e_sync_admission() {
         "cancelled resolution admitted work"
     );
 
-    // A compatibility caller performs one moving POST, learns the exact target,
+    // A caller performs one moving POST, learns the exact target,
     // and then waits exclusively through authenticated pinned metadata GETs.
-    let wait_commit = origin.commit(&[("value.txt", "wait\n")], "compatibility wait");
+    let wait_commit = origin.commit(&[("value.txt", "wait\n")], "pinned wait");
     origin.publish();
     reset_probe(&probe);
     probe.phase2_entry.arm();
@@ -1043,12 +1044,12 @@ async fn e2e_sync_admission() {
         wait_client
             .sync_repo("acme/immutable", None)
             .await
-            .expect("compatibility sync becomes ready")
+            .expect("sync becomes ready")
     });
     wait_entered(&probe.phase2_entry, 1).await;
     tokio::time::timeout(Duration::from_secs(10), probe.wait_until_http_trace_len(2))
         .await
-        .expect("compatibility caller reached pinned GET");
+        .expect("caller reached pinned GET");
     let trace = probe.http_trace.lock().unwrap().clone();
     assert_eq!(
         trace.first().map(String::as_str),
@@ -1057,22 +1058,24 @@ async fn e2e_sync_admission() {
     assert_eq!(
         trace.iter().filter(|event| event.contains("/sync")).count(),
         1,
-        "compatibility wait repeated moving sync: {trace:?}"
+        "pinned wait repeated moving sync: {trace:?}"
     );
     assert!(
         trace.iter().skip(1).all(|event| event.starts_with(&format!(
             "GET /v1/repos/{}/refs/main?pinned={wait_commit}&clonepack=full",
             repo_id.storage_key()
         ))),
-        "compatibility wait used an unpinned or mutating follow-up: {trace:?}"
+        "pinned wait used an unpinned or mutating follow-up: {trace:?}"
     );
     probe.phase2_entry.release();
     probe.phase2_entry.disarm();
     let waited = tokio::time::timeout(Duration::from_secs(60), wait_task)
         .await
-        .expect("compatibility wait completed")
-        .expect("compatibility task joined");
+        .expect("pinned wait completed")
+        .expect("pinned task joined");
     assert_eq!(waited.commit, wait_commit);
+    let settled_wait = sync_until_archive_ready(&server, "acme", "immutable").await;
+    assert_eq!(settled_wait.commit, wait_commit);
 
     // Admit an exact target, make only that object unreachable before the
     // claimed worker may fetch, and prove the real local queue/worker reports
@@ -1138,31 +1141,75 @@ async fn e2e_sync_admission() {
         tree_snapshot(&server.storage_dir),
         "unavailable exact job wrote artifacts"
     );
+    let failed_key = format!("main#{unavailable}");
+    let failed = store
+        .load_branch(&repo_id, &failed_key)
+        .await
+        .expect("load failed exact row")
+        .expect("failed exact row exists before publication");
+    assert_eq!(failed.commit, unavailable);
+    assert!(
+        failed
+            .build_status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("failed: ")),
+        "permanent exact failure is terminal: {failed:?}"
+    );
+    let enqueues_before_failed_polls = probe.enqueue_attempts.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/v1/repos/github/acme/immutable/refs/main?clonepack=full&pinned={unavailable}",
+                server.url
+            ))
+            .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("x-ripclone-protocol", "2")
+            .send()
+            .await
+            .expect("poll failed exact target");
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = response.json().await.expect("failed exact response");
+        assert!(body["error"].as_str().unwrap().contains(&unavailable));
+    }
+    assert_eq!(
+        probe.enqueue_attempts.load(Ordering::SeqCst),
+        enqueues_before_failed_polls,
+        "terminal exact failure must not enqueue again"
+    );
 
     // An evicted completed row is not treated as ready and its historical done
     // job does not block one fresh exact admission.
-    let mut evicted = after_unavailable;
+    let evicted_target = origin.commit(&[("value.txt", "evicted\n")], "evicted target");
+    origin.publish();
+    let evicted_key = format!("main#{evicted_target}");
+    let mut evicted = store
+        .load_branch(&repo_id, &format!("main#{wait_commit}"))
+        .await
+        .expect("load exact completed row before eviction")
+        .expect("exact completed row exists");
+    evicted.commit = evicted_target.clone();
+    evicted.full_clonepack.commit = evicted_target.clone();
+    evicted.shallow_clonepack.commit = evicted_target.clone();
     evicted.build_status = Some("evicted".to_string());
     store
-        .save_branch(&repo_id, "main", &evicted)
+        .save_branch(&repo_id, &evicted_key, &evicted)
         .await
-        .expect("mark exact row evicted");
-    let mut evicted_head = store
-        .load_branch(&repo_id, "HEAD")
-        .await
-        .expect("load exact HEAD alias before eviction")
-        .expect("HEAD alias exists");
-    assert_eq!(evicted_head.commit, wait_commit);
-    evicted_head.build_status = Some("evicted".to_string());
-    store
-        .save_branch(&repo_id, "HEAD", &evicted_head)
-        .await
-        .expect("mark exact HEAD alias evicted");
+        .expect("mark exact completed row evicted");
+    assert_eq!(
+        store
+            .load_branch(&repo_id, &evicted_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .build_status
+            .as_deref(),
+        Some("evicted")
+    );
     reset_probe(&probe);
     probe.before_claim.arm();
     let (evicted_status, evicted_body, evicted_elapsed) = post_sync(&server, None).await;
     assert_eq!(evicted_status, reqwest::StatusCode::ACCEPTED);
-    assert_eq!(response_commit(&evicted_body), wait_commit);
+    assert_eq!(response_commit(&evicted_body), evicted_target);
     assert_eq!(
         probe
             .queue_inserts
@@ -1289,6 +1336,27 @@ async fn ordinary_build_publishes_exact_commit_result() {
         branches.iter().all(|branch| branch != &format!("HEAD#{b}")),
         "ordinary exact publication does not create a HEAD#commit alias: {branches:?}"
     );
+    let status = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/ordinary-exact-publish/status",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .send()
+        .await
+        .expect("ordinary exact status");
+    assert_eq!(status.status(), reqwest::StatusCode::OK);
+    let status: serde_json::Value = status.json().await.expect("ordinary exact status body");
+    let public_refs = status["refs"].as_array().expect("public source refs");
+    assert!(
+        public_refs.iter().any(|entry| entry["branch"] == "main"),
+        "moving source branch remains public: {public_refs:?}"
+    );
+    assert!(
+        public_refs.iter().all(|entry| entry["branch"] != exact_key),
+        "internal exact result must not appear as a source branch: {public_refs:?}"
+    );
+    assert!(status["total_bytes"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1302,7 +1370,7 @@ async fn late_b_exact_publish_does_not_mutate_c() {
     let (server, phase_one, phase_one_entered, phase_one_proceed) =
         start_server_split_storage_phase_one_barrier().await;
     let origin = make_origin("acme", "late-exact-publish");
-    origin.commit(&[("value.txt", "A\n")], "A");
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
     register_added_without_build(&server, "acme/late-exact-publish")
         .await
@@ -1325,12 +1393,14 @@ async fn late_b_exact_publish_does_not_mutate_c() {
         .expect("admit B");
     assert!(b_admission.accepted);
     assert_eq!(b_admission.commit, b);
+    let exact_key = format!("main#{b}");
     tokio::time::timeout(Duration::from_secs(20), phase_one_entered)
         .await
         .expect("B phase-one publication entered")
         .expect("phase-one barrier sender alive");
 
-    let c = origin.commit(&[("value.txt", "C\n")], "C");
+    git(&origin.work, &["reset", "--hard", &a]);
+    let c = origin.commit(&[("value.txt", "C\n")], "divergent C");
     origin.publish();
     let c_admission = server
         .client()
@@ -1351,6 +1421,15 @@ async fn late_b_exact_publish_does_not_mutate_c() {
         .expect("load C before delayed B")
         .expect("C moving row");
     assert_eq!(moving_c.commit, c);
+    let exact_b_phase_one = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load held exact B")
+        .expect("held exact B row");
+    assert_eq!(
+        exact_b_phase_one.generation, moving_c.generation,
+        "divergent B and C must have equal history depth"
+    );
     let moving_json = serde_json::to_value(&moving_c).expect("serialize C before delayed B");
     let storage = ripclone::storage::local(&server.storage_dir).expect("open late storage");
     let moving_artifacts = artifact_snapshot(&storage, &moving_c);

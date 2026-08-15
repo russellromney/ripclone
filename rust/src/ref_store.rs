@@ -90,8 +90,11 @@ pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> b
         return false;
     }
     let Some(existing) = existing else {
-        return true;
+        return !new.require_matching_commit;
     };
+    if new.require_matching_commit {
+        return existing.commit == new.commit;
+    }
     if existing.commit == new.commit {
         return true;
     }
@@ -1496,6 +1499,63 @@ mod tests {
         assert!(
             !should_replace_ref(Some(&existing), &empty),
             "an empty commit must not replace a real ref"
+        );
+    }
+
+    #[test]
+    fn matching_commit_fence_rejects_divergent_equal_generation_writer() {
+        let mut current = dummy_ref_info("c");
+        current.generation = Some(2);
+        let mut delayed = dummy_ref_info("b");
+        delayed.generation = Some(2);
+        delayed.require_matching_commit = true;
+        assert!(!should_replace_ref(Some(&current), &delayed));
+        assert!(!should_replace_ref(None, &delayed));
+
+        current.commit = delayed.commit.clone();
+        assert!(should_replace_ref(Some(&current), &delayed));
+    }
+
+    #[tokio::test]
+    async fn sqlite_matching_commit_fence_is_atomic_with_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("meta.db").to_string_lossy().to_string();
+        let store = crate::meta::SqlRefStore::new(Box::new(
+            crate::meta::SqliteMeta::connect(&db).await.unwrap(),
+        ))
+        .await
+        .unwrap();
+        let repo = RepoId::github("o/sql-fence");
+        let mut current = dummy_ref_info("c");
+        current.generation = Some(2);
+        store.save_branch(&repo, "main", &current).await.unwrap();
+
+        let mut delayed = dummy_ref_info("b");
+        delayed.generation = Some(2);
+        delayed.require_matching_commit = true;
+        store.save_branch(&repo, "main", &delayed).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&repo, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "c"
+        );
+
+        current.require_matching_commit = true;
+        current.build_status = Some("done".to_string());
+        store.save_branch(&repo, "main", &current).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&repo, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .build_status
+                .as_deref(),
+            Some("done")
         );
     }
 

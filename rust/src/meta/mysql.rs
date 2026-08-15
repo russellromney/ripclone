@@ -141,6 +141,7 @@ impl MetaDb for MysqlMeta {
         commit_id: &str,
         synced_at: Option<i64>,
         generation: Option<i64>,
+        require_matching_commit: bool,
     ) -> Result<()> {
         // The key columns are VARCHAR (the composite PK can't be TEXT). Reject an
         // over-long key instead of letting MySQL silently truncate it, which would
@@ -148,6 +149,22 @@ impl MetaDb for MysqlMeta {
         check_len("repo_key", repo_key, 512)?;
         check_len("branch", branch, 255)?;
         check_len("commit_id", commit_id, 64)?;
+        if require_matching_commit {
+            sqlx::query(
+                "UPDATE refs SET synced_at = ?, generation = ?, data = ?
+                 WHERE repo_key = ? AND branch = ? AND commit_id = ?",
+            )
+            .bind(synced_at)
+            .bind(generation)
+            .bind(data)
+            .bind(repo_key)
+            .bind(branch)
+            .bind(commit_id)
+            .execute(&self.pool)
+            .await
+            .context("save commit-fenced ref")?;
+            return Ok(());
+        }
         // MySQL's ON DUPLICATE KEY UPDATE has no WHERE clause, so the ordering
         // decision is computed once into the session variable `@ripl` in the
         // first (data) assignment — while the other columns still hold their

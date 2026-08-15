@@ -123,7 +123,20 @@ impl MetaDb for LibsqlMeta {
         commit_id: &str,
         synced_at: Option<i64>,
         generation: Option<i64>,
+        require_matching_commit: bool,
     ) -> Result<()> {
+        if require_matching_commit {
+            self.conn()
+                .await?
+                .execute(
+                    "UPDATE refs SET synced_at = ?, generation = ?, data = ?
+                     WHERE repo_key = ? AND branch = ? AND commit_id = ?",
+                    libsql::params![synced_at, generation, data, repo_key, branch, commit_id],
+                )
+                .await
+                .context("save commit-fenced ref")?;
+            return Ok(());
+        }
         // DO UPDATE ... WHERE makes the ordering check atomic with the write;
         // a losing write is a silent no-op. Same policy as the sqlite adapter.
         self.conn()

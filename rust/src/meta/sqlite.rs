@@ -117,7 +117,24 @@ impl MetaDb for SqliteMeta {
         commit_id: &str,
         synced_at: Option<i64>,
         generation: Option<i64>,
+        require_matching_commit: bool,
     ) -> Result<()> {
+        if require_matching_commit {
+            sqlx::query(
+                "UPDATE refs SET synced_at = ?, generation = ?, data = ?
+                 WHERE repo_key = ? AND branch = ? AND commit_id = ?",
+            )
+            .bind(synced_at)
+            .bind(generation)
+            .bind(data)
+            .bind(repo_key)
+            .bind(branch)
+            .bind(commit_id)
+            .execute(&self.pool)
+            .await
+            .context("save commit-fenced ref")?;
+            return Ok(());
+        }
         // The DO UPDATE ... WHERE makes the ordering check atomic with the write:
         // on conflict the row is overwritten only when the new write wins — same
         // commit, a higher-or-equal generation (commit history depth), or, when

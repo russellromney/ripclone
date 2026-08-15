@@ -219,6 +219,15 @@ pub struct ClonepackArtifacts {
 /// `/v1/artifacts/{hash}` (or the `/v1/packs/{hash}` legacy endpoint).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefInfo {
+    /// Internal commit-addressed result rows are retained and garbage-collected
+    /// like every other ref, but are not source branches in the public status
+    /// model.
+    #[serde(default)]
+    pub internal_exact_result: bool,
+    /// A moving projection carrying this flag may replace only the same commit.
+    /// Stores enforce the check atomically with the write.
+    #[serde(default)]
+    pub require_matching_commit: bool,
     pub commit: String,
     pub parent_commit: Option<String>,
     pub default_branch: String,

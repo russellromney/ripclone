@@ -74,6 +74,7 @@ pub trait MetaDb: Send + Sync {
         commit_id: &str,
         synced_at: Option<i64>,
         generation: Option<i64>,
+        require_matching_commit: bool,
     ) -> Result<()>;
 
     /// Replace the JSON blob only if the row still has both the expected commit
@@ -187,6 +188,7 @@ impl RefStore for SqlRefStore {
                 &info.commit,
                 new_synced,
                 new_generation,
+                info.require_matching_commit,
             )
             .await
     }

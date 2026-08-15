@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -905,7 +905,7 @@ async fn pinned_release_cli_completes_exact_a_after_branch_moves() {
     }
 
     // The spawned CLI captured the bounded polling configuration. Restore the
-    // server-side compatibility client to its normal wait budget before the
+    // server-side sync client to its normal wait budget before the
     // independent B sync.
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
@@ -950,6 +950,187 @@ async fn pinned_release_cli_completes_exact_a_after_branch_moves() {
             .all(|request| request.contains(&format!("pinned={pinned}"))),
         "every post-pin request must name A: {requests:?}"
     );
+}
+
+#[tokio::test]
+async fn exact_ready_commit_bypasses_stale_moving_projection_for_clone_and_sync() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "exact-ready-return");
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/exact-ready-return")
+        .await
+        .expect("register exact-ready fixture");
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    let ready_b = sync_until_archive_ready(&server, "acme", "exact-ready-return").await;
+    assert_eq!(ready_b.commit, b);
+
+    let c = origin.commit(&[("value.txt", "C\n")], "C");
+    origin.publish();
+    let ready_c = sync_until_archive_ready(&server, "acme", "exact-ready-return").await;
+    assert_eq!(ready_c.commit, c);
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/exact-ready-return");
+    let moving_c = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load moving C")
+        .expect("moving C row");
+    assert_eq!(moving_c.commit, c);
+    let moving_c_json = serde_json::to_value(&moving_c).expect("serialize moving C");
+
+    git(&origin.work, &["reset", "--hard", &b]);
+    origin.publish();
+    let _test_env = EnvGuard::capture(&["RIPCLONE_TESTING"]);
+    unsafe { std::env::set_var("RIPCLONE_TESTING", "1") };
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let sync = server
+        .client()
+        .sync_repo("acme/exact-ready-return", None)
+        .await
+        .expect("exact-ready B sync");
+    assert_eq!(sync.commit, b);
+
+    let output_root = tempfile::tempdir().expect("exact-ready output");
+    let target = output_root.path().join("clone");
+    let mut command = std::process::Command::new(selected_cli_binary());
+    command
+        .arg("--server")
+        .arg(&server.url)
+        .arg("clone")
+        .arg("acme/exact-ready-return")
+        .arg(&target)
+        .arg("--depth")
+        .arg("0")
+        .arg("--no-metrics")
+        .arg("--verify-upstream=never")
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .env("RIPCLONE_NO_METRICS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn exact-ready release CLI");
+    let output = wait_child_output_bounded(child, Duration::from_secs(60))
+        .await
+        .expect("exact-ready release CLI completed");
+    assert!(
+        output.status.success(),
+        "exact-ready release clone failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("value.txt")).unwrap(),
+        "B\n"
+    );
+    assert_eq!(probe.tip_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.enqueue_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.exact_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.builder_entries.load(Ordering::SeqCst), 0);
+    let moving_after = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("reload moving C")
+        .expect("moving C remains");
+    assert_eq!(
+        serde_json::to_value(moving_after).expect("serialize moving C after reads"),
+        moving_c_json,
+        "exact-ready B reads do not rewrite moving C"
+    );
+}
+
+#[tokio::test]
+async fn warm_ttl_collects_superseded_exact_result_without_deleting_current_shared_artifacts() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "exact-result-gc");
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/exact-result-gc")
+        .await
+        .expect("register exact GC fixture");
+    assert_eq!(
+        sync_until_archive_ready(&server, "acme", "exact-result-gc")
+            .await
+            .commit,
+        b
+    );
+    let c = origin.commit(&[("value.txt", "C\n")], "C");
+    origin.publish();
+    assert_eq!(
+        sync_until_archive_ready(&server, "acme", "exact-result-gc")
+            .await
+            .commit,
+        c
+    );
+
+    let store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&server.repo_root));
+    let repo_id = RepoId::github("acme/exact-result-gc");
+    let exact_b_key = format!("main#{b}");
+    let exact_b = store
+        .load_branch(&repo_id, &exact_b_key)
+        .await
+        .expect("load exact B")
+        .expect("exact B row");
+    let moving_c = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load moving C")
+        .expect("moving C row");
+    assert!(exact_b.internal_exact_result);
+    assert_eq!(moving_c.commit, c);
+    let mut b_hashes = BTreeSet::new();
+    let mut c_hashes = BTreeSet::new();
+    content_hashes(&serde_json::to_value(&exact_b).unwrap(), &mut b_hashes);
+    content_hashes(&serde_json::to_value(&moving_c).unwrap(), &mut c_hashes);
+    let b_only: Vec<_> = b_hashes.difference(&c_hashes).cloned().collect();
+    let shared: Vec<_> = b_hashes.intersection(&c_hashes).cloned().collect();
+    assert!(!b_only.is_empty(), "B fixture needs exact-only artifacts");
+    assert!(!shared.is_empty(), "B and C fixture needs shared artifacts");
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for key in store.list_branches(&repo_id).await.expect("list GC refs") {
+        let mut info = store.load_branch(&repo_id, &key).await.unwrap().unwrap();
+        info.last_accessed_at = Some(if key == exact_b_key { 1 } else { now + 3600 });
+        store.save_branch(&repo_id, &key, &info).await.unwrap();
+    }
+    let storage: ripclone::storage::StorageRef = Arc::new(RemoteLocalStorage::new(
+        ripclone::storage::local(&server.storage_dir).unwrap(),
+    ));
+    let gc = ripclone::remote_gc::RemoteGc::new(
+        storage,
+        Arc::clone(&store),
+        ripclone::remote_gc::GcConfig {
+            grace_period: Duration::from_secs(0),
+            warm_ttl: Duration::from_secs(1),
+            dry_run: false,
+        },
+    );
+    gc.run().await.expect("collect superseded exact B");
+
+    let exact_b = store
+        .load_branch(&repo_id, &exact_b_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact_b.build_status.as_deref(), Some("evicted"));
+    assert!(
+        b_only
+            .iter()
+            .all(|hash| !server.storage_path(hash).exists())
+    );
+    assert!(shared.iter().all(|hash| server.storage_path(hash).exists()));
+    let moving_c = store.load_branch(&repo_id, "main").await.unwrap().unwrap();
+    assert_eq!(moving_c.commit, c);
+    assert_ne!(moving_c.build_status.as_deref(), Some("evicted"));
 }
 
 #[tokio::test]
@@ -1869,7 +2050,7 @@ async fn overwritten_branch_metadata_keeps_exact_pin_addressable_without_upstrea
         .expect("barrier alive");
 
     // The install has already captured its bounded two-attempt poll config.
-    // Let the independent compatibility sync use its normal build wait, then
+    // Let the independent sync use its normal build wait, then
     // restore the short config before releasing the pinned install.
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
@@ -1945,362 +2126,11 @@ async fn overwritten_branch_metadata_keeps_exact_pin_addressable_without_upstrea
     let observed = probe.snapshot();
     assert_eq!(
         observed.branch_reads,
-        2 * (requests.len() - 1),
-        "each concrete-branch pinned miss performs exactly the moving-row and exact-row point reads"
+        requests.len() - 1,
+        "each concrete-branch pinned lookup performs one exact-row point read"
     );
     assert_eq!(observed.enqueues, 0);
     assert_eq!(observed.builder_entries, 0);
-}
-
-#[tokio::test]
-async fn pinned_head_uses_existing_default_branch_exact_row_after_branch_moves() {
-    let _guard = env_lock().lock().await;
-    init(false);
-    let server = start_server_split_storage().await;
-    let origin = make_origin("acme", "baseline-layout-pin");
-    origin.commit(&[("value.txt", "A\n")], "A");
-    origin.publish();
-    register_added_without_build(&server, "acme/baseline-layout-pin")
-        .await
-        .expect("register repo");
-    server
-        .client()
-        .sync_repo("acme/baseline-layout-pin", None)
-        .await
-        .expect("sync A");
-    let a = server
-        .client()
-        .resolve_ref_with_clonepack("acme/baseline-layout-pin", "HEAD", Some("full"), None)
-        .await
-        .expect("full A ready")
-        .commit;
-
-    let store = FileRefStore::new(&server.repo_root);
-    let repo_id = RepoId::github("acme/baseline-layout-pin");
-    let exact_a = store
-        .load_branch(&repo_id, "HEAD")
-        .await
-        .expect("load A HEAD row")
-        .expect("A HEAD row present");
-    assert_eq!(exact_a.commit, a);
-    let mut encoded = serde_json::to_value(exact_a).expect("serialize baseline-layout row");
-    encoded["full_clonepack"]
-        .as_object_mut()
-        .expect("full clonepack object")
-        .remove("commit");
-    let mut exact_a: ripclone::RefInfo =
-        serde_json::from_value(encoded).expect("deserialize pre-variant-commit layout");
-    assert!(exact_a.full_clonepack.commit.is_empty());
-    exact_a.last_accessed_at = Some(1);
-    exact_a.warm_pinned = false;
-    store
-        .save_branch(&repo_id, &format!("main#{a}"), &exact_a)
-        .await
-        .expect("seed pre-upgrade main exact row");
-    assert!(
-        store
-            .load_branch(&repo_id, &format!("HEAD#{a}"))
-            .await
-            .expect("check duplicate alias")
-            .is_none(),
-        "baseline layout must not contain a HEAD exact alias"
-    );
-
-    let b = origin.commit(&[("value.txt", "B\n")], "B");
-    origin.publish();
-    server
-        .client()
-        .sync_repo("acme/baseline-layout-pin", None)
-        .await
-        .expect("publish B");
-    let ready_b = server
-        .client()
-        .resolve_ref_with_clonepack("acme/baseline-layout-pin", "HEAD", Some("full"), None)
-        .await
-        .expect("full B ready before exact-A read");
-    assert_eq!(ready_b.commit, b);
-    let stored_exact = store
-        .load_branch(&repo_id, &format!("main#{a}"))
-        .await
-        .expect("reload exact A")
-        .expect("exact A remains present");
-    assert_eq!(stored_exact.commit, a);
-    assert!(stored_exact.full_clonepack.commit.is_empty());
-    assert!(!stored_exact.full_clonepack.manifest.is_empty());
-    let moving_head = store
-        .load_branch(&repo_id, "HEAD")
-        .await
-        .expect("reload moving HEAD")
-        .expect("moving HEAD remains present");
-    assert_eq!(moving_head.default_branch, "main");
-    assert_eq!(moving_head.commit, b);
-    let moving_before = serde_json::to_value(&moving_head).expect("serialize moving B");
-    std::fs::rename(&origin.bare, origin.bare.with_extension("offline"))
-        .expect("make provider unavailable before metadata-only exact read");
-    let probe = server
-        .pinned_path_probe
-        .as_ref()
-        .expect("pinned-path test adapter");
-    probe.arm();
-
-    let response = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/repos/github/acme/baseline-layout-pin/refs/HEAD?clonepack=full&pinned={a}",
-            server.url
-        ))
-        .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
-        .send()
-        .await
-        .expect("pinned baseline-layout lookup");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.expect("exact response");
-    assert_eq!(body["commit"], a);
-    assert_eq!(body["branch"], "main");
-    assert_eq!(
-        body["clonepack_manifest"], exact_a.full_clonepack.manifest,
-        "the selected full manifest belongs to exact A"
-    );
-    let observed = probe.snapshot();
-    probe.disarm();
-    assert_eq!(
-        observed.branch_reads, 3,
-        "HEAD exact-row fallback reads HEAD, HEAD#A, and main#A exactly once"
-    );
-    assert_eq!(observed.enqueues, 0, "exact read does not enqueue");
-    assert_eq!(observed.builder_entries, 0, "exact read does not build");
-
-    let exact_after = store
-        .load_branch(&repo_id, &format!("main#{a}"))
-        .await
-        .expect("reload exact A after read")
-        .expect("exact A remains present");
-    assert!(
-        exact_after.last_accessed_at.unwrap() > 1,
-        "successful exact read performs the existing access-time touch"
-    );
-    assert!(!exact_after.warm_pinned, "exact read does not create a pin");
-    let moving_after = store
-        .load_branch(&repo_id, "HEAD")
-        .await
-        .expect("reload moving HEAD after exact read")
-        .expect("moving HEAD remains present");
-    assert_eq!(
-        serde_json::to_value(&moving_after).expect("serialize moving B after read"),
-        moving_before,
-        "reading exact A must not mutate moving B"
-    );
-
-    let status = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/repos/github/acme/baseline-layout-pin/status",
-            server.url
-        ))
-        .header("Authorization", format!("Ripclone {}", token_hash()))
-        .send()
-        .await
-        .expect("public status with legacy exact row");
-    assert_eq!(status.status(), StatusCode::OK);
-    let status: serde_json::Value = status.json().await.expect("status response");
-    let public_refs = status["refs"].as_array().expect("public refs");
-    assert!(
-        public_refs
-            .iter()
-            .any(|entry| { entry["branch"] == format!("main#{a}") && entry["commit"] == a })
-    );
-    assert!(
-        public_refs
-            .iter()
-            .any(|entry| entry["branch"] == "main" && entry["commit"] == b),
-        "existing historical rows remain visible alongside moving B: {public_refs:?}"
-    );
-}
-
-#[tokio::test]
-async fn settled_moving_row_is_identical_after_legacy_variant_round_trip() {
-    let _guard = env_lock().lock().await;
-    init(false);
-    let server = start_server_split_storage().await;
-    let origin = make_origin("acme", "legacy-moving-pin");
-    origin.commit(&[("value.txt", "A\n")], "A");
-    origin.publish();
-    register_added_without_build(&server, "acme/legacy-moving-pin")
-        .await
-        .expect("register repo");
-    server
-        .client()
-        .sync_repo("acme/legacy-moving-pin", None)
-        .await
-        .expect("sync A");
-
-    let store = FileRefStore::new(&server.repo_root);
-    let repo_id = RepoId::github("acme/legacy-moving-pin");
-    let mut settled = None;
-    for _ in 0..200 {
-        if let Ok(Some(info)) = store.load_branch(&repo_id, "main").await
-            && info.build_status.is_none()
-            && !info.full_clonepack.manifest.is_empty()
-        {
-            settled = Some(info);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let settled = settled.expect("moving A publication settled");
-    let a = settled.commit.clone();
-    store
-        .delete_branch(&repo_id, &format!("main#{a}"))
-        .await
-        .expect("remove exact row for legacy compatibility fixture");
-    assert!(
-        store
-            .load_branch(&repo_id, &format!("main#{a}"))
-            .await
-            .expect("check exact row")
-            .is_none(),
-        "fixture must exercise the settled moving-row fallback"
-    );
-    let pinned_url = format!(
-        "{}/v1/repos/github/acme/legacy-moving-pin/refs/main?clonepack=full&pinned={a}",
-        server.url
-    );
-    let request = || {
-        reqwest::Client::new()
-            .get(&pinned_url)
-            .header("Authorization", format!("Ripclone {}", token_hash()))
-            .header("x-ripclone-protocol", "2")
-            .timeout(Duration::from_secs(5))
-    };
-
-    // Count the real source-acquisition boundary without production
-    // instrumentation. The wrapper records mirror clone/fetch commands and
-    // delegates every invocation to the actual Git binary.
-    let source_probe = tempfile::tempdir().expect("source probe");
-    let source_log = source_probe.path().join("source.log");
-    std::fs::write(&source_log, b"").expect("initialize source log");
-    let real_git = String::from_utf8(
-        std::process::Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .expect("locate git")
-            .stdout,
-    )
-    .expect("git path utf8")
-    .trim()
-    .to_string();
-    let wrapper = source_probe.path().join("git");
-    std::fs::write(
-        &wrapper,
-        r#"#!/bin/sh
-for arg in "$@"; do
-  if [ "$arg" = "fetch" ] || [ "$arg" = "clone" ]; then
-    printf '%s\n' "$*" >>"$RIPCLONE_TEST_SOURCE_LOG"
-    if [ "$RIPCLONE_TEST_SOURCE_FORBIDDEN" = "1" ]; then
-      exit 97
-    fi
-    break
-  fi
-done
-exec "$RIPCLONE_TEST_REAL_GIT" "$@"
-"#,
-    )
-    .expect("write source probe");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-            .expect("make source probe executable");
-    }
-    let original_path = std::env::var_os("PATH").unwrap_or_default();
-    let _source_env = EnvGuard::capture(&[
-        "PATH",
-        "RIPCLONE_TEST_REAL_GIT",
-        "RIPCLONE_TEST_SOURCE_LOG",
-        "RIPCLONE_TEST_SOURCE_FORBIDDEN",
-    ]);
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                source_probe.path().display(),
-                original_path.to_string_lossy()
-            ),
-        );
-        std::env::set_var("RIPCLONE_TEST_REAL_GIT", &real_git);
-        std::env::set_var("RIPCLONE_TEST_SOURCE_LOG", &source_log);
-        std::env::set_var("RIPCLONE_TEST_SOURCE_FORBIDDEN", "1");
-    }
-    // Exact metadata reads do not need a mirror. Removing it makes any
-    // accidental source acquisition cross the failing Git adapter instead of
-    // disappearing behind the mirror-freshness cache.
-    std::fs::remove_dir_all(server.repo_root.join(repo_id.mirror_dir_name()))
-        .expect("remove mirror before pinned metadata reads");
-
-    let probe = server
-        .pinned_path_probe
-        .as_ref()
-        .expect("pinned-path test adapter");
-    probe.arm();
-    let before = request().send().await.expect("modern moving-row lookup");
-    assert_eq!(before.status(), StatusCode::OK);
-    let before: serde_json::Value = before.json().await.expect("modern ready response");
-    let before_work = probe.snapshot();
-    assert_eq!(before_work.branch_reads, 2);
-    assert_eq!(before_work.enqueues, 0);
-    assert_eq!(before_work.builder_entries, 0);
-
-    let mut serialized = serde_json::to_value(&settled).expect("serialize settled row");
-    serialized["full_clonepack"]
-        .as_object_mut()
-        .expect("full clonepack object")
-        .remove("commit");
-    let legacy: ripclone::RefInfo =
-        serde_json::from_value(serialized).expect("deserialize omitted variant commit");
-    assert!(legacy.full_clonepack.commit.is_empty());
-    store
-        .save_branch(&repo_id, "main", &legacy)
-        .await
-        .expect("store legacy moving row");
-
-    probe.arm();
-    let after = request().send().await.expect("legacy moving-row lookup");
-    assert_eq!(after.status(), StatusCode::OK);
-    let after: serde_json::Value = after.json().await.expect("legacy ready response");
-    let after_work = probe.snapshot();
-    assert_eq!(after_work.branch_reads, 2);
-    assert_eq!(after_work.enqueues, 0);
-    assert_eq!(after_work.builder_entries, 0);
-    assert!(
-        std::fs::read_to_string(&source_log)
-            .expect("read exact-path source log")
-            .is_empty(),
-        "pinned metadata reads must not enter mirror source acquisition"
-    );
-    assert_eq!(
-        after, before,
-        "omitting the compatible variant commit must not change the exact response"
-    );
-
-    // Non-vacuity control: the same server's ordinary sync path must cross the
-    // wrapped source boundary and produce at least one fetch record.
-    probe.disarm();
-    unsafe {
-        std::env::set_var("RIPCLONE_TEST_SOURCE_FORBIDDEN", "0");
-    }
-    origin.commit(&[("value.txt", "B\n")], "B source control");
-    origin.publish();
-    server
-        .client()
-        .sync_repo("acme/legacy-moving-pin", None)
-        .await
-        .expect("ordinary sync reaches source control");
-    assert!(
-        !std::fs::read_to_string(&source_log)
-            .expect("read source control log")
-            .is_empty(),
-        "source boundary control did not observe mirror acquisition"
-    );
 }
 
 #[tokio::test]
@@ -2437,8 +2267,8 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
     assert_eq!(body["commit"], a);
     let exact_observed = probe.snapshot();
     assert_eq!(
-        exact_observed.branch_reads, 2,
-        "pinned lookup checks the moving row and exact A key"
+        exact_observed.branch_reads, 1,
+        "pinned lookup reads only the exact A key"
     );
     assert_eq!(exact_observed.enqueues, 0);
     assert_eq!(exact_observed.builder_entries, 0);
@@ -2453,14 +2283,14 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
         .timeout(Duration::from_secs(5))
         .send()
         .await
-        .expect("pinned fallback lookup while B phase one is paused");
+        .expect("repeated exact lookup while B phase one is paused");
     assert_eq!(pending.status(), StatusCode::OK);
     let pending: serde_json::Value = pending.json().await.expect("exact A response");
     assert_eq!(pending["commit"], a);
-    let fallback_observed = probe.snapshot();
-    assert_eq!(fallback_observed.branch_reads, 2);
-    assert_eq!(fallback_observed.enqueues, 0);
-    assert_eq!(fallback_observed.builder_entries, 0);
+    let repeated_observed = probe.snapshot();
+    assert_eq!(repeated_observed.branch_reads, 1);
+    assert_eq!(repeated_observed.enqueues, 0);
+    assert_eq!(repeated_observed.builder_entries, 0);
 
     proceed.send(()).expect("release B phase-one publication");
     tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
