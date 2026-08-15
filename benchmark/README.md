@@ -50,6 +50,44 @@ This directory contains standalone benchmarks and verification scripts. They ass
   count independently when a large native control would otherwise dominate a
   sweep. `SKIP_ADD=1` is
   available only for a fixture that was explicitly added beforehand.
+- **`reproduce_ec2_matrix.sh`** — exact, cloud-neutral two-host recipe for the
+  realistic Bun, pandas, React, and Linux matrix. It uses the commits recorded
+  by the performance audit, runs ten Ripclone samples per mode, runs ten native
+  controls for the smaller repositories and one for Linux, then repeats the
+  Linux Ripclone modes at 1 and 5 Gbps. Override any `*_REF` or run-count
+  variable to refresh the matrix deliberately.
+
+  Build the release binaries once from the commit under test. On a dedicated
+  server with enough disk, start the local-storage server:
+
+  ```bash
+  export RIPCLONE_SERVER_TOKEN="$(openssl rand -hex 32)"
+  /data/bin/ripclone-server \
+    --host 0.0.0.0 --port 8000 \
+    --cas-dir /data/ripclone-cas --repo-root /data/ripclone-repos
+  ```
+
+  Copy the same raw token, release client, and `benchmark/` directory to a
+  separate Linux client on the same private network. The client needs `git`,
+  `curl`, `perl`, `python3`, `tar`, `nftables`, enough free disk for Linux, and
+  root or `CAP_NET_ADMIN`. Run in `tmux`, `screen`, or a detached service because
+  shaping the whole client also shapes its SSH traffic:
+
+  ```bash
+  export RIPCLONE_URL=http://SERVER_PRIVATE_IP:8000
+  export RIPCLONE_SERVER_TOKEN=the-same-raw-token
+  export RIPCLONE=/data/bin/ripclone
+  export TARGET=/data
+  sudo --preserve-env=RIPCLONE_URL,RIPCLONE_SERVER_TOKEN,RIPCLONE,TARGET \
+    ./benchmark/reproduce_ec2_matrix.sh
+  ```
+
+  Add/admission and artifact readiness happen before each timed sample set.
+  Every sample is pinned and validated as described above. Combined summaries
+  go to `/data/reproducible_ec2_matrix.log`; per-run command and validation logs
+  go to `/data/shaped_logs/<repo>/<rate>Mbps/`. The harness removes its nftables
+  table on exit. Delete the temporary hosts, disks, firewall, and credentials
+  after copying the logs.
 - **`sync_latency.sh`** — B4 sync-latency and storage-amplification harness.
   By default it starts a local release server; set `RIPCLONE_URL` for the Fly
   server and `CLIENT_APP=ripclone-client-dev` to run `/sync` POSTs and
