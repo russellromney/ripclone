@@ -244,7 +244,7 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
             .await
             .expect("load absent HEAD")
             .is_none(),
-        "fixture must not create a moving HEAD compatibility row"
+        "exact revision sync must not create a moving HEAD row"
     );
 
     let (_guard, target) = clone_only_at(

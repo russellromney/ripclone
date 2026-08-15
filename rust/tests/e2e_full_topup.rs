@@ -764,7 +764,7 @@ exec "$real_git" "$@"
 
     // Phase one has already published Shallow(B), while Full(B) remains
     // stopped at the production barrier. Make the real server Git boundary
-    // fail: this ordinary, unpinned protocol-v2 read must still serve B from
+    // fail: this ordinary, unpinned read must still serve B from
     // authenticated metadata without attempting source acquisition.
     let source_forbidden = ScopedEnvVar::set("RIPCLONE_TEST_SOURCE_FORBIDDEN", "1");
     let shallow_response = reqwest::Client::new()

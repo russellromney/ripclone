@@ -13,7 +13,7 @@ use crate::metrics::{Metrics, SyncPhaseMetrics};
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
-use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
+use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef};
 use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
@@ -845,7 +845,7 @@ pub struct SyncBuildResult {
 }
 
 /// Waiters for in-flight background builds, keyed by the exact admitted job
-/// (`owner/repo/branch/exact-commit`) or by the separate legacy rev lane.
+/// (`owner/repo/branch/exact-commit`) or by the explicit historical rev lane.
 pub type BuildWaiters = Arc<
     tokio::sync::Mutex<
         std::collections::HashMap<
@@ -1260,27 +1260,42 @@ const MAX_UPLOAD_PACK_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// ~25 MiB; this is comfortably above that and far below the global limit.
 const MAX_WEBHOOK_BODY_BYTES: usize = 25 * 1024 * 1024;
 
-/// Reject a client whose wire protocol is newer than this server understands,
-/// with a clear 426 instead of a confusing downstream error. A missing header
-/// (a legacy client) or an older/equal protocol is allowed, so this never breaks
-/// existing clients. Compatibility is keyed on `PROTOCOL_VERSION`, not the build
-/// version.
+/// Reject a client whose declared wire protocol differs from this server.
+/// There is one implementation, so a version mismatch is an error rather than
+/// a selector for alternate response behavior.
 async fn protocol_guard(
     headers: HeaderMap,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if let Some(client_proto) = headers
-        .get("x-ripclone-protocol")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        && client_proto > crate::PROTOCOL_VERSION
+    let Some(header) = headers.get("x-ripclone-protocol") else {
+        return next.run(request).await;
+    };
+    let client_proto = match header
+        .to_str()
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
     {
+        Some(protocol) => protocol,
+        None => {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                Json(ErrorResponse {
+                    error: format!(
+                        "invalid client protocol; this server requires {}",
+                        crate::PROTOCOL_VERSION
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if client_proto != crate::PROTOCOL_VERSION {
         return (
             StatusCode::UPGRADE_REQUIRED,
             Json(ErrorResponse {
                 error: format!(
-                    "client protocol {client_proto} is newer than this server's {}; upgrade the server (or use an older ripclone)",
+                    "client protocol {client_proto} does not match this server's {}; use matching ripclone client and server versions",
                     crate::PROTOCOL_VERSION
                 ),
             }),
@@ -2864,20 +2879,6 @@ fn invalidate_ref_response_cache(state: &ServerState, repo_id: &RepoId, branch: 
     cache.retain(|key, _| !key.starts_with(&prefix));
 }
 
-fn selected_clonepack_artifacts<'a>(
-    info: &'a RefInfo,
-    clonepack_kind: &str,
-) -> &'a crate::ClonepackArtifacts {
-    if clonepack_kind == "shallow" && !info.shallow_clonepack.manifest.is_empty() {
-        &info.shallow_clonepack
-    } else {
-        &info.full_clonepack
-    }
-}
-
-/// Select exactly the variant requested by a v2 client. The legacy selector
-/// above intentionally retains its shallow-to-full and top-level fallbacks for
-/// protocol-v1 callers.
 fn exact_clonepack_artifacts<'a>(
     info: &'a RefInfo,
     clonepack_kind: &str,
@@ -2900,45 +2901,8 @@ fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &s
         exact_clonepack_artifacts(info, clonepack_kind),
         Some(artifacts)
             if !artifacts.manifest.is_empty()
-                && if artifacts.commit.is_empty() {
-                    info.commit == commit
-                } else {
-                    artifacts.commit == commit
-                }
+                && artifacts.commit == commit
     )
-}
-
-fn selected_clonepack_manifest(info: &RefInfo, clonepack_kind: &str) -> String {
-    let artifacts = selected_clonepack_artifacts(info, clonepack_kind);
-    if artifacts.manifest.is_empty() {
-        info.clonepack_manifest.clone()
-    } else {
-        artifacts.manifest.clone()
-    }
-}
-
-fn selected_clonepack_commit(info: &RefInfo, clonepack_kind: &str) -> String {
-    let artifacts = selected_clonepack_artifacts(info, clonepack_kind);
-    if artifacts.commit.is_empty() {
-        info.commit.clone()
-    } else {
-        artifacts.commit.clone()
-    }
-}
-
-fn ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
-    if info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS) {
-        return false;
-    }
-    !selected_clonepack_manifest(info, clonepack_kind).is_empty()
-        && selected_clonepack_commit(info, clonepack_kind) == commit
-}
-
-fn request_protocol(headers: &HeaderMap) -> Option<u32> {
-    headers
-        .get("x-ripclone-protocol")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse().ok())
 }
 
 fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
@@ -3144,51 +3108,34 @@ async fn carried_full_top_up_response(
     )
 }
 
-/// Returns true when the commit-keyed historical row, pre-upgrade raw-revision
-/// row, or moving row matches the requested commit and is evicted. Historical
-/// lookups are essential after the branch advances: `:main#B` or `main#HEAD~2`
-/// may be cold while `main` is a complete C, and a `--at B` caller still needs
-/// a schedulable rebuild.
+/// Returns true when the exact historical row matches the requested commit and
+/// is evicted. Historical lookups remain schedulable after the moving branch
+/// advances, but never read the moving row as an artifact source.
 async fn branch_ref_is_evicted_for_commit(
     ref_store: &Arc<dyn RefStore>,
     repo_id: &RepoId,
     branch: &str,
     commit: &str,
-    raw_rev: Option<&str>,
 ) -> bool {
-    let mut keys = vec![ref_store_key(branch, Some(commit), Some(commit))];
-    if let Some(raw_rev) = raw_rev {
-        let legacy_key = ref_store_key(branch, Some(raw_rev), None);
-        if !keys.contains(&legacy_key) {
-            keys.push(legacy_key);
-        }
-    }
-    if !keys.iter().any(|key| key == branch) {
-        keys.push(branch.to_string());
-    }
-    for key in keys {
-        if matches!(
-            ref_store.load_branch(repo_id, &key).await.ok().flatten(),
-            Some(info)
-                if info.commit == commit
-                    && info.build_status.as_deref()
-                        == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-        ) {
-            return true;
-        }
-    }
-    false
+    let key = exact_ref_store_key(branch, commit);
+    matches!(
+        ref_store.load_branch(repo_id, &key).await.ok().flatten(),
+        Some(info)
+            if info.commit == commit
+                && info.build_status.as_deref()
+                    == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+    )
 }
 
 fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
     // This metadata-only shortcut is exclusively for a phase-one row whose
     // detached Full build is already active. Eviction also counts as pending,
     // but it has no active worker: it must fall through to the source/rebuild
-    // path below so an initial protocol-v2 GET admits work before it pins.
+    // path below so an initial GET admits work before it pins.
     clonepack_kind != "shallow"
         && info.commit == commit
         && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
-        && !ref_info_serves_commit(info, clonepack_kind, commit)
+        && !exact_ref_info_serves_commit(info, clonepack_kind, commit)
 }
 
 /// `build_status` set on a phase-1 row while the full history + archive build
@@ -3204,56 +3151,17 @@ async fn load_ref_info_for_resolved_commit(
     ref_store: &Arc<dyn RefStore>,
     repo_id: &RepoId,
     effective_branch: &str,
-    rev: Option<&str>,
     commit: &str,
     clonepack_kind: &str,
 ) -> Option<(String, RefInfo)> {
-    if rev.is_none() {
-        let exact_key = ref_store_key(effective_branch, Some(commit), Some(commit));
-        return ref_store
-            .load_branch(repo_id, &exact_key)
-            .await
-            .ok()
-            .flatten()
-            .filter(|info| info.commit == commit)
-            .map(|info| (exact_key, info));
-    }
-
-    let mut keys = Vec::new();
-    keys.push(ref_store_key(effective_branch, rev, Some(commit)));
-
-    if let Some(rev) = rev {
-        // Legacy rev-targeted builds were keyed by the raw rev string instead of
-        // the resolved commit. Keep this as an exact-commit compatibility lookup.
-        let legacy_rev_key = ref_store_key(effective_branch, Some(rev), None);
-        if !keys.iter().any(|k| k == &legacy_rev_key) {
-            keys.push(legacy_rev_key);
-        }
-        // Older tip builds (and some historic benchmark artifacts) live under
-        // the plain branch key. They are reusable only when the selected
-        // clonepack variant itself serves the requested commit.
-        if !keys.iter().any(|k| k == effective_branch) {
-            keys.push(effective_branch.to_string());
-        }
-    }
-
-    for key in keys {
-        if let Ok(Some(info)) = ref_store.load_branch(repo_id, &key).await
-            && ref_info_serves_commit(&info, clonepack_kind, commit)
-        {
-            return Some((key, info));
-        }
-    }
-
-    if rev.is_some()
-        && let Ok(Some(info)) = ref_store.load_build(repo_id, commit).await
-        && ref_info_serves_commit(&info, clonepack_kind, commit)
-    {
-        // No branch-specific key to touch; the build belongs to another branch.
-        return Some((String::new(), info));
-    }
-
-    None
+    let exact_key = exact_ref_store_key(effective_branch, commit);
+    ref_store
+        .load_branch(repo_id, &exact_key)
+        .await
+        .ok()
+        .flatten()
+        .filter(|info| exact_ref_info_serves_commit(info, clonepack_kind, commit))
+        .map(|info| (exact_key, info))
 }
 
 /// True when a rev-targeted request has a build in flight for `commit` whose
@@ -3272,7 +3180,6 @@ async fn rev_build_pending_for_commit(
     ref_store: &Arc<dyn RefStore>,
     repo_id: &RepoId,
     effective_branch: &str,
-    rev: &str,
     commit: &str,
     clonepack_kind: &str,
 ) -> bool {
@@ -3282,21 +3189,10 @@ async fn rev_build_pending_for_commit(
     let building = |info: &RefInfo| {
         info.commit == commit
             && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
-            && !ref_info_serves_commit(info, clonepack_kind, commit)
+            && !exact_ref_info_serves_commit(info, clonepack_kind, commit)
     };
-    let keys = [
-        ref_store_key(effective_branch, Some(rev), Some(commit)),
-        ref_store_key(effective_branch, Some(rev), None),
-        effective_branch.to_string(),
-    ];
-    for key in keys {
-        if let Ok(Some(info)) = ref_store.load_branch(repo_id, &key).await
-            && building(&info)
-        {
-            return true;
-        }
-    }
-    matches!(ref_store.load_build(repo_id, commit).await, Ok(Some(info)) if building(&info))
+    let key = exact_ref_store_key(effective_branch, commit);
+    matches!(ref_store.load_branch(repo_id, &key).await, Ok(Some(info)) if building(&info))
 }
 
 async fn get_ref_inner(
@@ -3326,16 +3222,6 @@ async fn get_ref_inner(
             repo_id.storage_key(),
             params.clonepack
         ));
-    }
-    let protocol_v2 = request_protocol(&headers) == Some(2);
-    if params.pinned.is_some() && !protocol_v2 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "pinned ref lookups require ripclone protocol 2".to_string(),
-            }),
-        )
-            .into_response();
     }
     match repo_is_added(&state, &repo_id).await {
         Ok(true) => {}
@@ -3369,7 +3255,7 @@ async fn get_ref_inner(
         };
 
     if let Some(pinned) = params.pinned.as_deref() {
-        let exact_key = ref_store_key(&branch, Some(pinned), Some(pinned));
+        let exact_key = exact_ref_store_key(&branch, pinned);
         let exact_info = match state.ref_store.load_branch(&repo_id, &exact_key).await {
             Ok(info) => info.filter(|info| info.commit == pinned),
             Err(e) => {
@@ -3494,21 +3380,13 @@ async fn get_ref_inner(
     let fresh_key = format!("{}/{}", repo_id.storage_key(), branch);
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
-    let cache_variant = if protocol_v2 {
-        format!("v2:{}", params.clonepack)
-    } else {
-        params.clonepack.clone()
-    };
+    let cache_variant = params.clonepack.clone();
     if params.rev.is_none()
         && let Some(resp) = cached_ref_response(&state, &repo_id, &branch, &cache_variant)
     {
-        // Protocol 2 responses are sourced from the exact row, including cache
-        // hits. Never refresh an unrelated moving projection.
-        let served_key = if protocol_v2 {
-            ref_store_key(&resp.branch, Some(&resp.commit), Some(&resp.commit))
-        } else {
-            resp.branch.clone()
-        };
+        // Cached responses remain sourced from their exact row. Never refresh
+        // an unrelated moving projection.
+        let served_key = exact_ref_store_key(&resp.branch, &resp.commit);
         if let Err(e) = state
             .ref_store
             .touch_last_accessed_at(&repo_id, &served_key, &resp.commit)
@@ -3611,15 +3489,12 @@ async fn get_ref_inner(
         .await
     {
         Ok(Ok(commit)) => {
-            // Load stored artifacts, if any. Rev requests try the commit-keyed
-            // key first, then exact-commit compatibility fallbacks for old
-            // ref-store layouts. Never serve artifacts whose selected clonepack
-            // variant resolves to a different commit.
+            // Load only the exact commit-keyed result. Never source artifacts
+            // from a moving row or another branch/revision key.
             let resolved = load_ref_info_for_resolved_commit(
                 &state.ref_store,
                 &repo_id,
                 &effective_branch,
-                params.rev.as_deref(),
                 &commit,
                 &params.clonepack,
             )
@@ -3667,7 +3542,6 @@ async fn get_ref_inner(
                     &repo_id,
                     &effective_branch,
                     &commit,
-                    params.rev.as_deref(),
                 )
                 .await;
             let is_evicted =
@@ -3676,12 +3550,11 @@ async fn get_ref_inner(
             // too, otherwise the documented `sync --at REV` → `clone --at REV`
             // pairing races the background full-history phase.
             let pending_for_rev = match params.rev.as_deref() {
-                Some(rev) if !evicted_for_rev => {
+                Some(_) if !evicted_for_rev => {
                     rev_build_pending_for_commit(
                         &state.ref_store,
                         &repo_id,
                         &effective_branch,
-                        rev,
                         &commit,
                         &params.clonepack,
                     )
@@ -3690,12 +3563,11 @@ async fn get_ref_inner(
                 _ => false,
             };
             let exact_variant_pending =
-                protocol_v2 && !exact_ref_info_serves_commit(&info, &params.clonepack, &commit);
-            if protocol_v2
-                && let Some(failure) = info
-                    .build_status
-                    .as_deref()
-                    .and_then(|status| status.strip_prefix("failed: "))
+                !exact_ref_info_serves_commit(&info, &params.clonepack, &commit);
+            if let Some(failure) = info
+                .build_status
+                .as_deref()
+                .and_then(|status| status.strip_prefix("failed: "))
             {
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -3715,7 +3587,7 @@ async fn get_ref_inner(
                 // client that only polls GET will eventually see a 200. A ref that
                 // is simply still building already has a worker on it, so do not
                 // enqueue a duplicate.
-                if (protocol_v2 && params.rev.is_none()) || is_evicted || evicted_for_rev {
+                if params.rev.is_none() || is_evicted || evicted_for_rev {
                     // Rebuild under the *originally requested* branch, not the
                     // concrete branch it resolved to. For a plain `HEAD` clone this
                     // keeps the job as `HEAD`, so the completed build refreshes the
@@ -3744,14 +3616,16 @@ async fn get_ref_inner(
                     }
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
-                        branch: if protocol_v2 && params.rev.is_none() {
+                        branch: if params.rev.is_none() {
                             effective_branch.clone()
                         } else {
                             branch.clone()
                         },
                         rev: historical_rev.clone(),
                         admitted_commit: historical_rev.is_none().then(|| commit.clone()),
-                        admitted_default_branch: (protocol_v2 && params.rev.is_none())
+                        admitted_default_branch: params
+                            .rev
+                            .is_none()
                             .then(|| default_branch.clone()),
                         credential: credential.clone(),
                         recheck: 0,
@@ -3772,20 +3646,7 @@ async fn get_ref_inner(
                     }
                 }
                 let queue_depth = state.build_queue_depth.load(Ordering::Relaxed);
-                return if protocol_v2 {
-                    artifact_pending_response(&commit, &effective_branch, queue_depth)
-                } else {
-                    (
-                        StatusCode::ACCEPTED,
-                        Json(BuildResponse {
-                            status: "building".to_string(),
-                            queue_depth,
-                            commit: None,
-                            branch: None,
-                        }),
-                    )
-                        .into_response()
-                };
+                return artifact_pending_response(&commit, &effective_branch, queue_depth);
             }
             // A successful read of an existing ref keeps it warm: atomically bump
             // last_accessed_at without clobbering a concurrent sync's newer data.
@@ -4414,7 +4275,7 @@ async fn sync_repo_inner(
         return resp;
     }
     if params.rev.is_some() {
-        return sync_repo_inner_legacy(repo_id, provider, params, headers, state).await;
+        return sync_repo_at_revision(repo_id, provider, params, headers, state).await;
     }
     let added_repo = match state.ref_store.load_added_repo(&repo_id).await {
         Ok(Some(added)) => added,
@@ -4495,7 +4356,7 @@ async fn sync_repo_inner(
     // not call reuse_existing_build/touch/access-time helpers here: a ready
     // unchanged sync after its one probe has no queue, source, builder, or
     // metadata mutation side effect.
-    let exact_key = ref_store_key(&effective_branch, Some(&commit), Some(&commit));
+    let exact_key = exact_ref_store_key(&effective_branch, &commit);
     let loaded_exact = match state.ref_store.load_branch(&repo_id, &exact_key).await {
         Ok(info) => info,
         Err(e) => {
@@ -4598,9 +4459,8 @@ async fn sync_repo_inner(
         .into_response()
 }
 
-/// Compatibility path for `sync --at REV`. Its moving-selector and readiness
-/// behavior remains the legacy implementation.
-async fn sync_repo_inner_legacy(
+/// First-class exact-revision sync used by `sync --at REV`.
+async fn sync_repo_at_revision(
     repo_id: RepoId,
     provider: ProviderInstance,
     params: SyncRequest,
@@ -4612,9 +4472,16 @@ async fn sync_repo_inner_legacy(
     {
         return resp;
     }
-    if let Some(rev) = params.rev.as_deref()
-        && let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(rev))
-    {
+    let Some(at_rev) = params.rev else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "exact revision is required".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&at_rev)) {
         return resp;
     }
     match repo_is_added(&state, &repo_id).await {
@@ -4625,7 +4492,6 @@ async fn sync_repo_inner_legacy(
     let start = Instant::now();
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = params.branch;
-    let at_rev = params.rev;
 
     let request_token = upstream_token_from_headers(&headers);
     let credential = match state
@@ -4652,12 +4518,22 @@ async fn sync_repo_inner_legacy(
     // than holding the connection until it is reset mid-request.
     let wait = Duration::from_secs(25);
 
-    if state.build_queue.inproc_wait() {
+    if !state.build_queue.inproc_wait() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: "rev override (?rev=) is not supported on the cross-process queue; use the local queue (RIPCLONE_QUEUE=local)"
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    }
+    {
         // In-process queue: coalesce via build_waiters; the same-process
         // worker signals completion on a oneshot. Include the rev override in
         // the coalescing key so syncs for different build commits don't share
         // one build.
-        let key = inproc_build_key(&repo_id, &branch, at_rev.as_deref());
+        let key = inproc_build_key(&repo_id, &branch, Some(&at_rev));
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<SyncBuildResult, BuildError>>();
         let first = {
             let mut w = state.build_waiters.lock().await;
@@ -4678,7 +4554,7 @@ async fn sync_repo_inner_legacy(
             let job = BuildJob {
                 repo_id: repo_id.clone(),
                 branch: branch.clone(),
-                rev: at_rev.clone(),
+                rev: Some(at_rev.clone()),
                 admitted_commit: None,
                 admitted_default_branch: None,
                 credential,
@@ -4715,12 +4591,21 @@ async fn sync_repo_inner_legacy(
                 } else {
                     branch.clone()
                 };
-                let load_key = if let Some(rev) = at_rev.as_deref() {
-                    let commit = git::resolve_commit(&mirror_dir, rev).ok();
-                    ref_store_key(&effective_branch, Some(rev), commit.as_deref())
-                } else {
-                    effective_branch.clone()
+                let commit = match git::resolve_commit(&mirror_dir, &at_rev) {
+                    Ok(commit) => commit,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "build finished but exact revision is missing: {error}"
+                                ),
+                            }),
+                        )
+                            .into_response();
+                    }
                 };
+                let load_key = exact_ref_store_key(&effective_branch, &commit);
                 match state.ref_store.load_branch(&repo_id, &load_key).await {
                     Ok(Some(info)) => {
                         state.metrics.record_sync(start.elapsed());
@@ -4773,176 +4658,6 @@ async fn sync_repo_inner_legacy(
                 }),
             )
                 .into_response(),
-        }
-    } else {
-        // Cross-process queue: enqueue (the queue coalesces by repo/branch)
-        // and poll the job's status, since the build runs in a separate
-        // ripclone-worker.
-        //
-        // The rev override is not carried across the queue (not persisted; the
-        // worker builds the branch tip), so honoring `?rev=` here would build
-        // the wrong commit and then fail to find the `branch#<rev>` ref.
-        // Reject it explicitly rather than mis-build. Use the local queue for
-        // rev-targeted builds.
-        if at_rev.is_some() {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(ErrorResponse {
-                    error: "rev override (?rev=) is not supported on the cross-process \
-                                queue; use the local queue (RIPCLONE_QUEUE=local)"
-                        .to_string(),
-                }),
-            )
-                .into_response();
-        }
-        // The per-request upstream credential rides with the job: the queue
-        // persists it (base64) and the worker uses it for the mirror fetch,
-        // so a private repo the worker has no standing token for still builds.
-        let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
-        let job = BuildJob {
-            repo_id: repo_id.clone(),
-            branch: branch.clone(),
-            rev: at_rev.clone(),
-            admitted_commit: None,
-            admitted_default_branch: None,
-            credential,
-            recheck: 0,
-            size_bytes,
-        };
-        let enq = match state.build_queue.enqueue(job).await {
-            Ok(enq) => enq,
-            Err(e) => {
-                state.metrics.record_error();
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        error: format!("failed to enqueue build: {e}"),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-        // Only count a genuinely new job (not a coalesced duplicate).
-        if enq.outcome == EnqueueOutcome::Enqueued {
-            state.metrics.record_build_queued();
-        }
-        if enq.outcome == EnqueueOutcome::Full {
-            state.metrics.record_build_rejected();
-            state.metrics.record_error();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "build queue full; retry shortly".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        // The SQL queue always returns a job id to poll; treat its absence as
-        // an internal error rather than spinning to the deadline.
-        let Some(job_id) = enq.job_id else {
-            state.metrics.record_error();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "queue returned no job id".to_string(),
-                }),
-            )
-                .into_response();
-        };
-        let deadline = Instant::now() + wait;
-        let mut consecutive_errors = 0u32;
-        loop {
-            match state.build_queue.job_status(job_id).await {
-                Ok(JobState::Done) => {
-                    // The build ran in another process, so this server's ref
-                    // caches may be stale — drop them before reading.
-                    let effective_branch = if branch == "HEAD" {
-                        git::default_branch(&mirror_dir)
-                            .ok()
-                            .filter(|b| !b.is_empty())
-                            .unwrap_or_else(|| branch.clone())
-                    } else {
-                        branch.clone()
-                    };
-                    state.ref_store.invalidate(&repo_id, &branch).await;
-                    state
-                        .ref_store
-                        .invalidate(&repo_id, &effective_branch)
-                        .await;
-                    state.ref_store.invalidate(&repo_id, "HEAD").await;
-                    invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
-                    invalidate_ref_response_cache(&state, &repo_id, "HEAD");
-                    let load_key = ref_store_key(&effective_branch, at_rev.as_deref(), None);
-                    match state.ref_store.load_branch(&repo_id, &load_key).await {
-                        // Guard on a non-empty commit: a HEAD row can exist as
-                        // a build_status placeholder (empty commit). Never
-                        // return that as a successful ref.
-                        Ok(Some(info)) if !info.commit.is_empty() => {
-                            state.metrics.record_sync(start.elapsed());
-                            let resp = sync_response(
-                                &repo_id,
-                                &provider,
-                                effective_branch,
-                                &info,
-                                &state.storage,
-                                "full",
-                                private,
-                                "built",
-                                SyncPhases::default(),
-                            );
-                            return (StatusCode::OK, Json(resp)).into_response();
-                        }
-                        _ => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ErrorResponse {
-                                    error: "build finished but ref missing".to_string(),
-                                }),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-                Ok(JobState::Failed(e)) => {
-                    state.metrics.record_error();
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("sync failed: {e}"),
-                        }),
-                    )
-                        .into_response();
-                }
-                Ok(_) => consecutive_errors = 0,
-                Err(e) => {
-                    // Don't mask a persistent queue outage as backpressure.
-                    consecutive_errors += 1;
-                    warn!("queue job_status poll failed ({consecutive_errors}): {e}");
-                    if consecutive_errors >= 5 {
-                        state.metrics.record_error();
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(ErrorResponse {
-                                error: format!("build queue unavailable: {e}"),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                return (
-                    StatusCode::ACCEPTED,
-                    Json(BuildResponse {
-                        status: "building".to_string(),
-                        queue_depth: state.build_queue.depth().await,
-                        commit: None,
-                        branch: None,
-                    }),
-                )
-                    .into_response();
-            }
-            tokio::time::sleep(Duration::from_millis(400)).await;
         }
     }
 }
@@ -5025,7 +4740,7 @@ async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Respons
     (StatusCode::NO_CONTENT, Body::empty()).into_response()
 }
 
-/// Compatibility coalescing key for the historical `rev` lane.
+/// Coalescing key for the historical `rev` lane.
 fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String {
     BuildJob {
         repo_id: repo_id.clone(),
@@ -5187,7 +4902,7 @@ async fn prepare_exact_admission(
         .admitted_commit
         .as_deref()
         .ok_or_else(|| "ordinary tip build has no admitted commit".to_string())?;
-    let exact_key = ref_store_key(&job.branch, Some(commit), Some(commit));
+    let exact_key = exact_ref_store_key(&job.branch, commit);
     let existing = state
         .ref_store
         .load_branch(&job.repo_id, &exact_key)
@@ -5257,7 +4972,7 @@ async fn trigger_build(
     }
     crate::validation::validate_object_id(&admitted_commit)
         .map_err(|e| format!("invalid admitted commit: {e}"))?;
-    let exact_key = ref_store_key(branch, Some(&admitted_commit), Some(&admitted_commit));
+    let exact_key = exact_ref_store_key(branch, &admitted_commit);
     let existing = state
         .ref_store
         .load_branch(repo_id, &exact_key)
@@ -6456,18 +6171,9 @@ fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
     }
 }
 
-/// Ref-store key for a build. Commit-targeted builds use an internal,
-/// commit-keyed namespace (`:{branch}#{commit}`) that cannot collide with a Git
-/// source ref. They therefore never overwrite another exact result or a real
-/// branch whose name ends in `#<commit>`.
-/// Sequential builds at the same commit still share this key, so they stay
-/// incremental. Moving tip projections use the plain branch key.
-fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> String {
-    match (at_rev, commit) {
-        (Some(_), Some(commit)) => crate::ref_store::exact_ref_key(branch, commit),
-        (Some(rev), None) => format!("{branch}#{rev}"),
-        (None, _) => branch.to_string(),
-    }
+/// Commit-keyed artifact row shared by ordinary pins and explicit revisions.
+fn exact_ref_store_key(branch: &str, commit: &str) -> String {
+    crate::ref_store::exact_ref_key(branch, commit)
 }
 
 fn tuple_to_sized(p: &(String, u64, String, u64)) -> crate::SizedPack {
@@ -7389,11 +7095,7 @@ async fn do_sync(
     // Ref-store key. Rev builds and ordinary admitted builds share the existing
     // commit-keyed rolling lane; only the moving projection stays plain.
     // The mirror fetch + commit resolution above used the real branch/rev.
-    let ref_key = if admitted_commit.is_some() {
-        ref_store_key(storage_branch, Some(&commit), Some(&commit))
-    } else {
-        ref_store_key(storage_branch, at_rev, Some(&commit))
-    };
+    let ref_key = exact_ref_store_key(storage_branch, &commit);
     let branch = ref_key.as_str();
 
     // No-op fast path: if a *completed full* build already exists for exactly
@@ -8998,7 +8700,7 @@ pub async fn mark_admitted_build_failed(
     admitted_commit: &str,
     message: &str,
 ) -> Result<()> {
-    let exact_branch = ref_store_key(branch, Some(admitted_commit), Some(admitted_commit));
+    let exact_branch = exact_ref_store_key(branch, admitted_commit);
     let _ = update_build_status(
         state,
         repo_id,
@@ -9529,7 +9231,7 @@ async fn update_job_build_status(
     if job.rev.is_none()
         && let Some(commit) = job.admitted_commit.as_deref()
     {
-        let exact_branch = ref_store_key(branch, Some(commit), Some(commit));
+        let exact_branch = exact_ref_store_key(branch, commit);
         if status == "building" {
             let existing = state
                 .ref_store
@@ -9853,7 +9555,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     #[test]
-    fn protocol_v2_requires_the_requested_clonepack_variant() {
+    fn current_protocol_requires_the_requested_clonepack_variant() {
         let full = crate::ClonepackArtifacts {
             commit: "a".repeat(40),
             manifest: "full-manifest".to_string(),
@@ -9870,10 +9572,6 @@ mod tests {
             clonepack_manifest: full.manifest.clone(),
             ..Default::default()
         };
-        assert!(
-            ref_info_serves_commit(&full_only, "shallow", &"a".repeat(40)),
-            "legacy selector retains shallow-to-full fallback"
-        );
         assert!(!exact_ref_info_serves_commit(
             &full_only,
             "shallow",
@@ -9903,7 +9601,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_rejects_empty_evicted_and_mismatched_artifacts() {
+    fn current_protocol_rejects_empty_evicted_and_mismatched_artifacts() {
         let commit = "a".repeat(40);
         let mut info = RefInfo {
             commit: commit.clone(),
@@ -9925,33 +9623,8 @@ mod tests {
         assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
     }
 
-    #[test]
-    fn omitted_variant_commit_inherits_the_enclosing_ref_commit() {
-        let commit = "a".repeat(40);
-        let info = RefInfo {
-            commit: commit.clone(),
-            full_clonepack: crate::ClonepackArtifacts {
-                commit: commit.clone(),
-                manifest: "legacy-manifest".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut encoded = serde_json::to_value(info).expect("serialize compatibility fixture");
-        encoded["full_clonepack"]
-            .as_object_mut()
-            .expect("full clonepack object")
-            .remove("commit");
-        let decoded: RefInfo =
-            serde_json::from_value(encoded).expect("deserialize legacy ref without commit field");
-
-        assert!(decoded.full_clonepack.commit.is_empty());
-        assert!(exact_ref_info_serves_commit(&decoded, "full", &commit));
-        assert_eq!(selected_clonepack_commit(&decoded, "full"), commit);
-    }
-
     #[tokio::test]
-    async fn protocol_two_pending_body_keeps_the_four_field_shape() {
+    async fn pending_body_keeps_the_four_field_shape() {
         let response = artifact_pending_response(&"a".repeat(40), "rélease/東京", 3);
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
@@ -10668,56 +10341,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rev_ref_lookup_reuses_legacy_plain_branch_only_on_exact_commit() {
+    async fn rev_ref_lookup_reads_only_the_exact_result() {
         let tmp = tempfile::tempdir().unwrap();
         let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
         let repo = RepoId::github("o/r");
         let commit = "1111111111111111111111111111111111111111";
+        let exact_key = exact_ref_store_key("main", commit);
 
         store
-            .save_branch(&repo, "main", &complete_ref(commit, "manifest-main"))
+            .save_branch(&repo, &exact_key, &complete_ref(commit, "manifest-exact"))
+            .await
+            .unwrap();
+        store
+            .save_branch(&repo, "main", &complete_ref(commit, "manifest-moving"))
             .await
             .unwrap();
 
-        let (_, info) =
-            load_ref_info_for_resolved_commit(&store, &repo, "main", Some(commit), commit, "full")
-                .await
-                .expect("legacy plain branch exact-match fallback");
-        assert_eq!(selected_clonepack_manifest(&info, "full"), "manifest-main");
-        assert_eq!(selected_clonepack_commit(&info, "full"), commit);
-    }
-
-    #[tokio::test]
-    async fn rev_ref_lookup_scans_other_refs_but_still_requires_exact_commit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
-        let repo = RepoId::github("o/r");
-        let commit = "2222222222222222222222222222222222222222";
-
-        store
-            .save_branch(&repo, "release", &complete_ref(commit, "manifest-release"))
+        let (key, info) = load_ref_info_for_resolved_commit(&store, &repo, "main", commit, "full")
             .await
-            .unwrap();
+            .expect("exact result");
+        assert_eq!(key, exact_key);
+        assert_eq!(info.full_clonepack.manifest, "manifest-exact");
+        assert_eq!(info.full_clonepack.commit, commit);
 
-        let (_, info) =
-            load_ref_info_for_resolved_commit(&store, &repo, "main", Some(commit), commit, "full")
-                .await
-                .expect("cross-ref exact commit fallback");
-        assert_eq!(
-            selected_clonepack_manifest(&info, "full"),
-            "manifest-release"
+        store.delete_branch(&repo, &exact_key).await.unwrap();
+        let missing =
+            load_ref_info_for_resolved_commit(&store, &repo, "main", commit, "full").await;
+        assert!(
+            missing.is_none(),
+            "moving metadata is not an artifact source"
         );
-
-        let missing = load_ref_info_for_resolved_commit(
-            &store,
-            &repo,
-            "main",
-            Some("3333333333333333333333333333333333333333"),
-            "3333333333333333333333333333333333333333",
-            "full",
-        )
-        .await;
-        assert!(missing.is_none(), "must not serve a different commit");
     }
 
     #[tokio::test]
@@ -10748,36 +10401,21 @@ mod tests {
             build_status: Some("full history building".to_string()),
             ..Default::default()
         };
-        store.save_branch(&repo, "main", &info).await.unwrap();
+        let exact_key = exact_ref_store_key("main", new_commit);
+        store.save_branch(&repo, &exact_key, &info).await.unwrap();
 
-        let full = load_ref_info_for_resolved_commit(
-            &store,
-            &repo,
-            "main",
-            Some(new_commit),
-            new_commit,
-            "full",
-        )
-        .await;
+        let full =
+            load_ref_info_for_resolved_commit(&store, &repo, "main", new_commit, "full").await;
         assert!(
             full.is_none(),
             "rev full lookup must not serve the carried previous full clonepack"
         );
 
-        let (_, shallow) = load_ref_info_for_resolved_commit(
-            &store,
-            &repo,
-            "main",
-            Some(new_commit),
-            new_commit,
-            "shallow",
-        )
-        .await
-        .expect("shallow variant is exact for the requested commit");
-        assert_eq!(
-            selected_clonepack_manifest(&shallow, "shallow"),
-            "new-shallow"
-        );
+        let (_, shallow) =
+            load_ref_info_for_resolved_commit(&store, &repo, "main", new_commit, "shallow")
+                .await
+                .expect("shallow variant is exact for the requested commit");
+        assert_eq!(shallow.shallow_clonepack.manifest, "new-shallow");
     }
 
     #[test]
@@ -12860,21 +12498,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_guard_rejects_newer_client_only() {
+    async fn protocol_guard_rejects_every_declared_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
         let app = build_app(state);
-        // A client advertising a newer protocol than the server -> 426.
-        let too_new = app
-            .clone()
-            .oneshot(protocol_request(
-                "/v1/repos/acme/secret/status",
-                Some("999"),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(too_new.status(), StatusCode::UPGRADE_REQUIRED);
-        // The current protocol, and a missing header (legacy client), are allowed.
+        for mismatch in ["1", "999", "invalid"] {
+            let response = app
+                .clone()
+                .oneshot(protocol_request(
+                    "/v1/repos/acme/secret/status",
+                    Some(mismatch),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        }
+        // An absent declaration does not select alternate behavior; the only
+        // implemented request path remains exact-result behavior.
         let current = crate::PROTOCOL_VERSION.to_string();
         for proto in [Some(current.as_str()), None] {
             let resp = app
@@ -13087,7 +12727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repo_status_includes_historical_rows_and_dedups_shared_chunks() {
+    async fn repo_status_hides_exact_rows_and_dedups_shared_chunks() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
 
@@ -13157,12 +12797,19 @@ mod tests {
             .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
+        let exact_info = RefInfo {
+            internal_exact_result: true,
+            ..info.clone()
+        };
         state
             .ref_store
             .save_branch(
                 &RepoId::github("acme/secret"),
-                "main#1111111111111111111111111111111111111111",
-                &info,
+                &crate::ref_store::exact_ref_key(
+                    "main",
+                    "1111111111111111111111111111111111111111",
+                ),
+                &exact_info,
             )
             .await
             .unwrap();
@@ -13177,14 +12824,8 @@ mod tests {
             .await
             .unwrap();
         let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(status.refs.len(), 2);
-        assert!(
-            status
-                .refs
-                .iter()
-                .any(|entry| entry.branch == "main#1111111111111111111111111111111111111111"),
-            "a real SHA-suffixed source branch remains visible in status"
-        );
+        assert_eq!(status.refs.len(), 1);
+        assert_eq!(status.refs[0].branch, "main");
         let expected_total = 300 + manifest_data.len() as u64;
         assert_eq!(status.total_bytes, expected_total);
         assert_eq!(status.total_unique_bytes, expected_total); // fallback: no dedup
@@ -13516,7 +13157,7 @@ mod tests {
     }
 
     #[test]
-    fn ref_info_serves_commit_rejects_evicted_ref() {
+    fn exact_ref_info_rejects_evicted_ref() {
         let info = RefInfo {
             commit: "commit1".to_string(),
             build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
@@ -13527,7 +13168,7 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(!ref_info_serves_commit(&info, "full", "commit1"));
+        assert!(!exact_ref_info_serves_commit(&info, "full", "commit1"));
     }
 
     #[tokio::test]
@@ -13727,7 +13368,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn protocol_v2_ordinary_evicted_get_enqueues_once_and_becomes_ready() {
+    async fn ordinary_evicted_get_enqueues_once_and_becomes_ready() {
         let _lock = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13741,7 +13382,7 @@ mod tests {
         let (state, mut rx) = test_state_with_queue(&tmp);
         let repo_id = RepoId::github("acme/evicted");
         mark_added(&state, repo_id.clone()).await;
-        let exact_key = ref_store_key("main", Some(&commit), Some(&commit));
+        let exact_key = exact_ref_store_key("main", &commit);
         state
             .ref_store
             .save_branch(
@@ -13776,7 +13417,7 @@ mod tests {
 
         let job = rx
             .try_recv()
-            .expect("initial protocol-v2 GET must admit the evicted ordinary ref");
+            .expect("initial GET must admit the evicted ordinary ref");
         assert_eq!(job.branch, "main");
         assert!(job.rev.is_none());
         assert_eq!(job.admitted_commit.as_deref(), Some(commit.as_str()));
@@ -13801,7 +13442,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn protocol_v2_evicted_get_returns_503_when_local_queue_is_full() {
+    async fn evicted_get_returns_503_when_local_queue_is_full() {
         let _lock = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13831,7 +13472,7 @@ mod tests {
         state.build_queue_depth = Arc::clone(&depth);
         let repo_id = RepoId::github("acme/evicted-full");
         mark_added(&state, repo_id.clone()).await;
-        let exact_key = ref_store_key("main", Some(&commit), Some(&commit));
+        let exact_key = exact_ref_store_key("main", &commit);
         state
             .ref_store
             .save_branch(
@@ -13890,7 +13531,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn protocol_v2_evicted_get_returns_503_when_queue_errors() {
+    async fn evicted_get_returns_503_when_queue_errors() {
         struct ErrorQueue {
             attempts: Arc<AtomicUsize>,
         }
@@ -13924,7 +13565,7 @@ mod tests {
         });
         let repo_id = RepoId::github("acme/evicted-error");
         mark_added(&state, repo_id.clone()).await;
-        let exact_key = ref_store_key("main", Some(&commit), Some(&commit));
+        let exact_key = exact_ref_store_key("main", &commit);
         state
             .ref_store
             .save_branch(
@@ -13972,7 +13613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_ref_is_evicted_for_commit_detects_evicted_head() {
+    async fn branch_ref_is_evicted_for_commit_reads_only_exact_row() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repos");
         std::fs::create_dir_all(&repo_root).unwrap();
@@ -13985,18 +13626,21 @@ mod tests {
             build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
             ..Default::default()
         };
-        ref_store.save_branch(&rid, "main", &evicted).await.unwrap();
+        ref_store
+            .save_branch(&rid, &exact_ref_store_key("main", "abc123"), &evicted)
+            .await
+            .unwrap();
 
         assert!(
-            branch_ref_is_evicted_for_commit(&ref_store, &rid, "main", "abc123", None).await,
+            branch_ref_is_evicted_for_commit(&ref_store, &rid, "main", "abc123").await,
             "must detect evicted ref for matching commit"
         );
         assert!(
-            !branch_ref_is_evicted_for_commit(&ref_store, &rid, "main", "other", None).await,
+            !branch_ref_is_evicted_for_commit(&ref_store, &rid, "main", "other").await,
             "must not flag a different commit"
         );
         assert!(
-            !branch_ref_is_evicted_for_commit(&ref_store, &rid, "feature", "abc123", None).await,
+            !branch_ref_is_evicted_for_commit(&ref_store, &rid, "feature", "abc123").await,
             "must not flag a missing branch"
         );
     }
@@ -14020,7 +13664,7 @@ mod tests {
         mark_added(&state, rid.clone()).await;
 
         let old_ts = 1_000_000u64;
-        let exact_key = ref_store_key("main", Some(&tip), Some(&tip));
+        let exact_key = exact_ref_store_key("main", &tip);
         let info = RefInfo {
             internal_exact_result: true,
             commit: tip.clone(),
@@ -14072,7 +13716,7 @@ mod tests {
         let pinned = "a".repeat(40);
         let newer = "b".repeat(40);
         let old_ts = 1;
-        let exact_key = ref_store_key("main", Some(&pinned), Some(&pinned));
+        let exact_key = exact_ref_store_key("main", &pinned);
         let mut exact = complete_ref(&pinned, "manifest-a");
         exact.last_accessed_at = Some(old_ts);
         let mut moving = complete_ref(&newer, "manifest-b");
@@ -14125,7 +13769,7 @@ mod tests {
         let pinned = "a".repeat(40);
         let other = "b".repeat(40);
         let old_ts = 1;
-        let exact_key = ref_store_key("main", Some(&pinned), Some(&pinned));
+        let exact_key = exact_ref_store_key("main", &pinned);
         let mut mismatched_exact = complete_ref(&other, "manifest-b-exact");
         mismatched_exact.last_accessed_at = Some(old_ts);
         let mut moving = complete_ref(&other, "manifest-b-moving");
@@ -14183,7 +13827,7 @@ mod tests {
         mark_added(&state, rid.clone()).await;
 
         let old_ts = 1_000_000u64;
-        let exact_key = ref_store_key("main", Some(&tip), Some(&tip));
+        let exact_key = exact_ref_store_key("main", &tip);
         let info = RefInfo {
             internal_exact_result: true,
             commit: tip.clone(),
@@ -14251,7 +13895,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn ref_read_for_evicted_rev_enqueues_rebuild() {
+    async fn ref_read_for_evicted_exact_revision_enqueues_rebuild() {
         let _lock = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -14273,9 +13917,10 @@ mod tests {
             last_accessed_at: Some(1),
             ..Default::default()
         };
+        let exact_key = exact_ref_store_key("main", &tip);
         state
             .ref_store
-            .save_branch(&rid, "main", &evicted)
+            .save_branch(&rid, &exact_key, &evicted)
             .await
             .unwrap();
 
@@ -14307,7 +13952,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn evicted_legacy_raw_symbolic_history_is_pinned_and_rebuilds_original_commit() {
+    async fn evicted_symbolic_history_is_pinned_and_rebuilds_original_commit() {
         let _lock = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -14336,7 +13981,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let historical_key = ref_store_key("main", Some("HEAD~2"), None);
+        let historical_key = exact_ref_store_key("main", &b);
         state
             .ref_store
             .save_branch(
@@ -14400,7 +14045,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn evicted_legacy_raw_history_rejects_sql_api_queue_without_insertion() {
+    async fn evicted_history_rejects_sql_api_queue_without_insertion() {
         let _lock = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -14445,7 +14090,7 @@ mod tests {
             .ref_store
             .save_branch(
                 &rid,
-                &ref_store_key("main", Some("HEAD~2"), None),
+                &exact_ref_store_key("main", &b),
                 &RefInfo {
                     commit: b,
                     build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),

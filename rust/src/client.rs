@@ -1383,12 +1383,13 @@ impl Client {
                             })
                     })
                     .transpose()?;
-                let pending: ArtifactPendingResponse = resp.json().await.with_context(|| {
-                    format!("invalid protocol-2 pending response for {repo_path}")
-                })?;
+                let pending: ArtifactPendingResponse = resp
+                    .json()
+                    .await
+                    .with_context(|| format!("invalid pending response for {repo_path}"))?;
                 if pending.code != "artifact_pending" {
                     anyhow::bail!(
-                        "invalid protocol-2 pending response code {:?} for {repo_path}",
+                        "invalid pending response code {:?} for {repo_path}",
                         pending.code
                     );
                 }
@@ -1904,10 +1905,10 @@ impl Client {
         rev: Option<&str>,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
-        if rev.is_some() {
-            self.sync_inner_legacy(repo_path, None, rev, depth).await
+        if let Some(rev) = rev {
+            self.sync_at_revision(repo_path, None, rev, depth).await
         } else {
-            self.sync_inner(repo_path, None, None, depth).await
+            self.sync_repo(repo_path, depth).await
         }
     }
 
@@ -1915,7 +1916,7 @@ impl Client {
     /// own ref + clonepack, so this lets several distinct builds for one repo run
     /// at once (unlike `?rev=`, which the server keys by resolved commit).
     pub async fn sync_branch(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
-        self.sync_inner(repo_path, Some(branch), None, None).await
+        self.sync_inner(repo_path, Some(branch), None).await
     }
 
     async fn admit_sync_request(
@@ -2018,12 +2019,8 @@ impl Client {
         &self,
         repo_path: &str,
         branch: Option<&str>,
-        rev: Option<&str>,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
-        if rev.is_some() {
-            return self.sync_inner_legacy(repo_path, branch, rev, depth).await;
-        }
         let admission = self.admit_sync_request(repo_path, branch, depth).await?;
         if let Some(ready) = admission.ready {
             return Ok(ready);
@@ -2031,11 +2028,11 @@ impl Client {
         self.wait_for_admitted_sync(repo_path, &admission).await
     }
 
-    async fn sync_inner_legacy(
+    async fn sync_at_revision(
         &self,
         repo_path: &str,
         branch: Option<&str>,
-        rev: Option<&str>,
+        rev: &str,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
         let mut url = self.repo_url(repo_path, "/sync");
@@ -2046,9 +2043,7 @@ impl Client {
         if let Some(d) = depth {
             q.push(format!("depth={}", d));
         }
-        if let Some(r) = rev {
-            q.push(format!("rev={}", urlencoding::encode(r)));
-        }
+        q.push(format!("rev={}", urlencoding::encode(rev)));
         if !q.is_empty() {
             url.push('?');
             url.push_str(&q.join("&"));

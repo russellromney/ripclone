@@ -2526,7 +2526,7 @@ async fn pinned_input_is_validated_and_scoped_to_the_authorized_repository() {
 }
 
 #[tokio::test]
-async fn protocol_two_never_substitutes_the_other_clonepack_variant() {
+async fn exact_lookup_never_substitutes_the_other_clonepack_variant() {
     let _guard = env_lock().lock().await;
     init(false);
     let server = start_server_split_storage().await;
