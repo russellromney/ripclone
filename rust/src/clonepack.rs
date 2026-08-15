@@ -15,6 +15,16 @@ impl FileEntry {
     pub fn total_len(&self) -> u64 {
         self.fragments.iter().map(|f| f.raw_len as u64).sum()
     }
+
+    /// Total uncompressed size, rejecting malformed fragment tables that would
+    /// overflow the accounting type.
+    pub fn checked_total_len(&self) -> Result<u64> {
+        self.fragments.iter().try_fold(0u64, |total, fragment| {
+            total
+                .checked_add(u64::from(fragment.raw_len))
+                .context("file fragment length total overflow")
+        })
+    }
 }
 
 /// Convert a hex hash string to raw bytes for protobuf `bytes` fields.
@@ -109,7 +119,12 @@ where
             .with_context(|| format!("write pack {}", name))?;
         std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
             .with_context(|| format!("write idx {}", name))?;
-        total += (pack_bytes.len() + idx_bytes.len()) as u64;
+        let pack_len = u64::try_from(pack_bytes.len()).context("pack length overflows u64")?;
+        let idx_len = u64::try_from(idx_bytes.len()).context("idx length overflows u64")?;
+        total = total
+            .checked_add(pack_len)
+            .and_then(|total| total.checked_add(idx_len))
+            .context("installed pack byte total overflow")?;
     }
     Ok(total)
 }

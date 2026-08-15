@@ -1464,7 +1464,9 @@ impl Client {
                             "invalid pending response for {repo_path}: pinned Full top-up support was not declared"
                         );
                     }
-                    let target = pinned.clone().expect("valid 202 establishes a pin");
+                    let target = pinned
+                        .clone()
+                        .context("pending response did not establish a pinned commit")?;
                     let Some(base_response) = pending.top_up_base else {
                         return Err(anyhow::Error::new(ArtifactPending {
                             commit: target,
@@ -1521,7 +1523,9 @@ impl Client {
                     tokio::time::sleep(poll_delay).await;
                     continue;
                 }
-                let commit = pinned.clone().expect("valid 202 establishes a pin");
+                let commit = pinned
+                    .clone()
+                    .context("pending responses did not establish a pinned commit")?;
                 return Err(anyhow::Error::new(ArtifactPending {
                     commit,
                     mode: pending_mode.to_string(),
@@ -1595,7 +1599,9 @@ impl Client {
                 info.clone_id = first_clone_id.clone();
                 info.cold = *cold;
                 return Ok(InstallPlan::Exact {
-                    target: pinned.clone().expect("ready response establishes a pin"),
+                    target: pinned
+                        .clone()
+                        .context("ready response did not establish a pinned commit")?,
                     artifact: info.commit.clone(),
                     response: info,
                 });
@@ -2471,12 +2477,13 @@ impl Client {
             None
         };
         let overlay_lower = overlay_dirs.as_ref().map(|dirs| dirs.lower.clone());
-        staging
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-            .expect("attempt staging present")
-            .overlay_dirs = overlay_dirs;
+        {
+            let mut staging_state = staging.lock().unwrap_or_else(|e| e.into_inner());
+            staging_state
+                .as_mut()
+                .context("attempt staging state missing")?
+                .overlay_dirs = overlay_dirs;
+        }
 
         // Hold the temp-dir handle for the whole install so any early failure
         // removes the partial directory on drop. After a successful rename onto
@@ -2486,11 +2493,10 @@ impl Client {
         } else {
             let tmp = temp_install_dir(&target)?;
             let path = tmp.path().to_path_buf();
-            staging
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            let mut staging_state = staging.lock().unwrap_or_else(|e| e.into_inner());
+            staging_state
                 .as_mut()
-                .expect("attempt staging present")
+                .context("attempt staging state missing")?
                 .temp_install = Some(tmp);
             path
         };
@@ -2673,13 +2679,14 @@ impl Client {
             self.write_origin_config(&origin_url, &git_dir)?;
         }
 
-        let overlay_dirs = staging
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-            .expect("attempt staging present")
-            .overlay_dirs
-            .take();
+        let overlay_dirs = {
+            let mut staging_state = staging.lock().unwrap_or_else(|e| e.into_inner());
+            staging_state
+                .as_mut()
+                .context("attempt staging state missing")?
+                .overlay_dirs
+                .take()
+        };
         if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
             // Mount succeeded; keep the staging tree (it backs the mount). Any
@@ -2968,10 +2975,10 @@ impl Client {
         }
 
         impl PackBody {
-            fn len(&self) -> usize {
+            fn len(&self) -> u64 {
                 match self {
-                    PackBody::Buffered(bytes) => bytes.len(),
-                    PackBody::TempFile { len, .. } => *len as usize,
+                    PackBody::Buffered(bytes) => bytes.len() as u64,
+                    PackBody::TempFile { len, .. } => *len,
                 }
             }
         }
@@ -3030,7 +3037,12 @@ impl Client {
                 let cleanup = cleanup.clone();
                 async move {
                     let (i, history_only, pack_body, idx_bytes) = res?;
-                    let bytes = (pack_body.len() + idx_bytes.len()) as u64;
+                    let idx_len = u64::try_from(idx_bytes.len())
+                        .context("pack idx length does not fit in u64")?;
+                    let bytes = pack_body
+                        .len()
+                        .checked_add(idx_len)
+                        .context("pack and idx length overflow")?;
                     let fd_permit = if history_only {
                         None
                     } else {
@@ -3303,7 +3315,10 @@ impl Client {
                 }
             })
             .buffer_unordered(concurrency)
-            .try_fold(0u64, |acc, len| async move { Ok(acc + len) })
+            .try_fold(0u64, |acc, len| async move {
+                acc.checked_add(len)
+                    .context("downloaded pack byte count overflow")
+            })
             .await?;
 
         // Git names pack files after the 20-byte SHA-1 trailer at the end of the
@@ -3427,7 +3442,10 @@ impl Client {
                     }
                 })
                 .buffer_unordered(conc)
-                .try_fold(0u64, |acc, len| async move { Ok(acc + len) })
+                .try_fold(0u64, |acc, len| async move {
+                    acc.checked_add(len)
+                        .context("downloaded archive byte count overflow")
+                })
                 .await
         })
     }
@@ -3685,7 +3703,7 @@ impl Client {
             managed
                 .child
                 .as_mut()
-                .expect("managed child present")
+                .context("managed top-up child missing")?
                 .wait(),
         )
         .await
@@ -3696,7 +3714,7 @@ impl Client {
                 let _ = managed
                     .child
                     .as_mut()
-                    .expect("managed child present")
+                    .context("managed top-up child missing during timeout cleanup")?
                     .wait()
                     .await;
                 managed.child.take();
@@ -3895,14 +3913,9 @@ impl Client {
                 let status = std::process::Command::new("git")
                     .arg("-C")
                     .arg(&main_repo)
-                    .args([
-                        "worktree",
-                        "add",
-                        "--no-checkout",
-                        "--detach",
-                        target.to_str().unwrap(),
-                        &commit,
-                    ])
+                    .args(["worktree", "add", "--no-checkout", "--detach"])
+                    .arg(&target)
+                    .arg(&commit)
                     .status()
                     .context("spawn git worktree add")?;
                 if !status.success() {
@@ -4017,20 +4030,44 @@ impl Client {
         if !overlay::is_available() {
             return false;
         }
-        let raw_bytes: u64 = metadata.files.iter().map(|f| f.total_len()).sum();
+        let raw_bytes = match metadata.files.iter().try_fold(0u64, |total, file| {
+            total
+                .checked_add(file.checked_total_len()?)
+                .context("overlay raw file length total overflow")
+        }) {
+            Ok(total) => total,
+            Err(e) => {
+                warn!("overlay staging size calculation overflowed raw file lengths");
+                tracing::debug!(error = %e, "overlay raw size calculation failed");
+                return false;
+            }
+        };
         // Sum the compressed length of every frame; archive chunks contain only
         // frames, so this is the total compressed archive size.
-        let compressed_bytes: u64 = metadata
-            .frames
-            .iter()
-            .map(|f| f.compressed_len as u64)
-            .sum();
+        let compressed_bytes = match metadata.frames.iter().try_fold(0u64, |total, frame| {
+            total.checked_add(u64::from(frame.compressed_len))
+        }) {
+            Some(total) => total,
+            None => {
+                warn!("overlay staging size calculation overflowed compressed frame lengths");
+                return false;
+            }
+        };
 
         // No size threshold: overlay is opt-in (see overlay::is_available), so if
         // the operator asked for it we honor it for any repo, falling back only
         // when there isn't enough tmpfs space or the kernel disallows the mount.
         let margin_mb: u64 = 128;
-        let required = raw_bytes + compressed_bytes + margin_mb * 1024 * 1024;
+        let required = match raw_bytes
+            .checked_add(compressed_bytes)
+            .and_then(|total| total.checked_add(margin_mb * 1024 * 1024))
+        {
+            Some(required) => required,
+            None => {
+                warn!("overlay staging size calculation overflowed total size");
+                return false;
+            }
+        };
         let available = overlay::available_space(staging_dir).unwrap_or(0);
         if available < required {
             warn!(

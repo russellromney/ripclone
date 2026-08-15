@@ -300,7 +300,8 @@ impl Cas {
             .with_context(|| format!("open CAS object {} for range read", hash))?;
         let meta = file.metadata().context("stat CAS object for range read")?;
         let file_len = meta.len();
-        if start >= file_len || len > file_len - start {
+        let end = start.checked_add(len).context("CAS range end overflow")?;
+        if start > file_len || end > file_len {
             anyhow::bail!(
                 "range {}+{} exceeds CAS object {} length {}",
                 start,
@@ -309,13 +310,15 @@ impl Cas {
                 file_len
             );
         }
+        let len = usize::try_from(len).context("CAS range length does not fit in usize")?;
+        let len_u64 = u64::try_from(len).context("CAS range length overflows u64")?;
         file.seek(SeekFrom::Start(start))
             .with_context(|| format!("seek CAS object {}", hash))?;
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = vec![0u8; len];
         let read_start = Instant::now();
         file.read_exact(&mut buf)
             .with_context(|| format!("read range from CAS object {}", hash))?;
-        crate::perf::record_cas_read(read_start.elapsed(), len);
+        crate::perf::record_cas_read(read_start.elapsed(), len_u64);
         Ok(buf)
     }
 
@@ -515,6 +518,21 @@ mod tests {
 
         cas.put_with_hash(&hash, b"correct").unwrap();
         assert_eq!(std::fs::read(&object_path).unwrap(), b"correct");
+    }
+
+    #[test]
+    fn get_range_allows_empty_range_at_object_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(tmp.path()).unwrap();
+        let data = b"range data";
+        let hash = cas.put(data).unwrap();
+
+        assert_eq!(
+            cas.get_range(&hash, data.len() as u64, 0).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert!(cas.get_range(&hash, data.len() as u64 + 1, 0).is_err());
+        assert!(cas.get_range(&hash, u64::MAX, 1).is_err());
     }
 
     #[test]

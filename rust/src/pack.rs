@@ -587,10 +587,11 @@ impl<'a> PackBuilder<'a> {
             return Ok((Vec::new(), 0));
         }
         let sizes = git::object_sizes(&self.repo, oids)?;
-        let total_raw: u64 = oids
-            .iter()
-            .map(|o| sizes.get(o).copied().unwrap_or(0))
-            .sum();
+        let total_raw = oids.iter().try_fold(0u64, |total, oid| {
+            total
+                .checked_add(sizes.get(oid).copied().unwrap_or(0))
+                .context("raw object size total overflow")
+        })?;
 
         // Greedy size-based partitioning. A single object larger than the target
         // gets its own pack (we can't split one object across packs).
@@ -600,12 +601,19 @@ impl<'a> PackBuilder<'a> {
         let mut cur_bytes = 0u64;
         for oid in oids {
             let sz = sizes.get(oid).copied().unwrap_or(0);
-            if !cur.is_empty() && cur_bytes + sz > target {
+            if !cur.is_empty()
+                && cur_bytes
+                    .checked_add(sz)
+                    .context("current pack size overflow")?
+                    > target
+            {
                 batches.push(std::mem::take(&mut cur));
                 cur_bytes = 0;
             }
             cur.push(oid.clone());
-            cur_bytes += sz;
+            cur_bytes = cur_bytes
+                .checked_add(sz)
+                .context("current pack size overflow")?;
         }
         if !cur.is_empty() {
             batches.push(cur);

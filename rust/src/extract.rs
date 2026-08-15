@@ -74,11 +74,17 @@ fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Result<Vec<Chunk>> {
     let mut start = 0usize;
     let mut byte_start = 0u64;
     let mut current_len = 0u64;
-    let mut current_chunk_index = frames.first().map(|f| f.chunk_index as usize).unwrap_or(0);
+    let mut current_chunk_index = frames
+        .first()
+        .map(|f| usize::try_from(f.chunk_index))
+        .transpose()
+        .context("archive chunk index does not fit in usize")?
+        .unwrap_or(0);
 
     for (i, frame) in frames.iter().enumerate() {
-        let frame_len = frame.compressed_len as u64;
-        let frame_chunk = frame.chunk_index as usize;
+        let frame_len = u64::from(frame.compressed_len);
+        let frame_chunk = usize::try_from(frame.chunk_index)
+            .context("archive chunk index does not fit in usize")?;
         // Start a new chunk when crossing into a different archive chunk or when
         // the current frame would not fit.
         if frame_chunk != current_chunk_index
@@ -126,6 +132,43 @@ fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Result<Vec<Chunk>> {
     }
 
     Ok(chunks)
+}
+
+fn slice_archive_frame(
+    bytes: &bytes::Bytes,
+    chunk: &Chunk,
+    frame: &FrameInfo,
+    frame_idx: usize,
+    chunk_idx: usize,
+) -> Result<bytes::Bytes> {
+    let relative_offset = frame
+        .chunk_offset
+        .checked_sub(chunk.byte_start)
+        .with_context(|| {
+            format!(
+                "frame {} starts before archive chunk {} (frame offset={} chunk start={})",
+                frame_idx, chunk_idx, frame.chunk_offset, chunk.byte_start
+            )
+        })?;
+    let offset =
+        usize::try_from(relative_offset).context("archive frame offset does not fit in usize")?;
+    let len = usize::try_from(frame.compressed_len)
+        .context("archive frame length does not fit in usize")?;
+    let end = offset
+        .checked_add(len)
+        .context("archive frame slice end overflow")?;
+    if bytes.get(offset..end).is_none() {
+        anyhow::bail!(
+            "frame {} (offset={} len={}) out of chunk {} bounds (start={} len={})",
+            frame_idx,
+            frame.chunk_offset,
+            frame.compressed_len,
+            chunk_idx,
+            chunk.byte_start,
+            bytes.len()
+        );
+    }
+    Ok(bytes.slice(offset..end))
 }
 
 fn read_archive_manifest(manifest_path: &Path) -> Result<Manifest> {
@@ -284,6 +327,8 @@ fn decompress_frame_recorded(
     idx: usize,
 ) -> Result<Vec<u8>> {
     let start = Instant::now();
+    let raw_len =
+        usize::try_from(frame.raw_len).context("archive frame raw length does not fit in usize")?;
     let raw = if frame.compressed_len == 0 && frame.raw_len == 0 {
         Vec::new()
     } else {
@@ -292,12 +337,12 @@ fn decompress_frame_recorded(
                 let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict)
                     .context("create zstd decompressor with dictionary")?;
                 decompressor
-                    .decompress(compressed, frame.raw_len as usize)
+                    .decompress(compressed, raw_len)
                     .with_context(|| format!("decompress frame {} with dictionary", idx))?
             }
             None => zstd::bulk::Decompressor::new()
                 .context("create zstd decompressor")?
-                .decompress(compressed, frame.raw_len as usize)
+                .decompress(compressed, raw_len)
                 .with_context(|| format!("decompress frame {}", idx))?,
         }
     };
@@ -483,28 +528,9 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                         for frame_idx in chunk.start_frame..chunk.end_frame {
                             let frame = &manifest2.frames[frame_idx];
                             // A corrupted manifest can put chunk_offset below the
-                            // chunk's start or past its end; use checked math so we
-                            // return an error instead of panicking on underflow.
-                            let out = match frame
-                                .chunk_offset
-                                .checked_sub(chunk.byte_start)
-                                .and_then(|off| {
-                                    Some((off, off.checked_add(frame.compressed_len as u64)?))
-                                }) {
-                                Some((off, end)) if end <= bytes.len() as u64 => {
-                                    let off = off as usize;
-                                    Ok(bytes.slice(off..off + frame.compressed_len as usize))
-                                }
-                                _ => Err(anyhow::anyhow!(
-                                    "frame {} (offset={} len={}) out of chunk {} bounds (start={} len={})",
-                                    frame_idx,
-                                    frame.chunk_offset,
-                                    frame.compressed_len,
-                                    idx,
-                                    chunk.byte_start,
-                                    bytes.len()
-                                )),
-                            };
+                            // chunk's start or past its end; validate the complete
+                            // usize range before constructing a zero-copy slice.
+                            let out = slice_archive_frame(&bytes, &chunk, frame, frame_idx, idx);
                             if compressed_tx.send((frame_idx, out)).is_err() {
                                 break;
                             }
@@ -556,7 +582,9 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                         dictionary2.as_deref().map(|d| d.as_slice()),
                         idx,
                     )?);
-                    if raw.len() != frame.raw_len as usize {
+                    let raw_len = usize::try_from(frame.raw_len)
+                        .context("archive frame raw length does not fit in usize")?;
+                    if raw.len() != raw_len {
                         anyhow::bail!(
                             "frame {} raw length mismatch: {} vs {}",
                             idx,
@@ -567,8 +595,12 @@ fn extract_archive_from_chunk_receiver_with_chunks(
 
                     // R2: borrow the frame's fragment-pair list from the shared
                     // map instead of cloning it per frame (the loop only reads it).
-                    let empty = Vec::new();
-                    let pairs = fragments_by_frame2.get(&(idx as u32)).unwrap_or(&empty);
+                    let frame_key = u32::try_from(idx)
+                        .context("archive frame index does not fit in manifest key")?;
+                    let pairs = fragments_by_frame2
+                        .get(&frame_key)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
                     let mut written = 0usize;
                     let mut stats = Vec::new();
                     let mut pending_writes: Vec<OwnedFileWrite> =
@@ -576,16 +608,23 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                     for (file_idx, frag_idx) in pairs {
                         let entry = &manifest2.files[*file_idx];
                         let fragment = &entry.fragments[*frag_idx];
-                        let off = fragment.frame_offset as usize;
-                        let len = fragment.raw_len as usize;
-                        if off + len > raw.len() {
+                        let off = usize::try_from(fragment.frame_offset)
+                            .context("fragment frame offset does not fit in usize")?;
+                        let len = usize::try_from(fragment.raw_len)
+                            .context("fragment raw length does not fit in usize")?;
+                        let end = off
+                            .checked_add(len)
+                            .context("fragment frame slice end overflow")?;
+                        if raw.get(off..end).is_none() {
                             anyhow::bail!(
                                 "fragment for {} extends past frame {}",
                                 String::from_utf8_lossy(&entry.path),
                                 idx
                             );
                         }
-                        let content = &raw[off..off + len];
+                        let content = raw
+                            .get(off..end)
+                            .context("validated fragment range disappeared")?;
 
                         if entry.fragments.len() == 1 {
                             let hash = sha1_digest_recorded(content);
@@ -611,27 +650,63 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                                 }
                             }
                         } else {
-                            let mut guard = pending_files2.lock().unwrap();
-                            let pending = guard.get_mut(file_idx).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "missing pending state for {}",
-                                    String::from_utf8_lossy(&entry.path)
-                                )
-                            })?;
-                            pending.fragments[*frag_idx] = Some(FileSlice {
-                                data: Arc::clone(&raw),
-                                offset: off,
-                                len,
-                            });
-                            pending.remaining -= 1;
-                            if pending.remaining == 0 {
-                                let pending = guard.remove(file_idx).expect("pending file missing");
-                                drop(guard);
+                            let completed = {
+                                let mut guard = pending_files2.lock().map_err(|_| {
+                                    anyhow::anyhow!("pending file state lock poisoned")
+                                })?;
+                                let pending = guard.get_mut(file_idx).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "missing pending state for {}",
+                                        String::from_utf8_lossy(&entry.path)
+                                    )
+                                })?;
+                                let slot =
+                                    pending.fragments.get_mut(*frag_idx).ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "fragment index {} out of range for {}",
+                                            frag_idx,
+                                            String::from_utf8_lossy(&entry.path)
+                                        )
+                                    })?;
+                                if slot.is_some() {
+                                    anyhow::bail!(
+                                        "duplicate fragment {} for {}",
+                                        frag_idx,
+                                        String::from_utf8_lossy(&entry.path)
+                                    );
+                                }
+                                *slot = Some(FileSlice {
+                                    data: Arc::clone(&raw),
+                                    offset: off,
+                                    len,
+                                });
+                                pending.remaining = pending
+                                    .remaining
+                                    .checked_sub(1)
+                                    .context("pending fragment count underflow")?;
+                                if pending.remaining == 0 {
+                                    Some(guard.remove(file_idx).ok_or_else(|| {
+                                        anyhow::anyhow!("pending file missing after completion")
+                                    })?)
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(pending) = completed {
                                 let fragments: Vec<FileSlice> = pending
                                     .fragments
                                     .into_iter()
-                                    .map(|frag| frag.expect("fragment missing"))
-                                    .collect();
+                                    .enumerate()
+                                    .map(|(index, fragment)| {
+                                        fragment.ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "fragment {} missing at completion for {}",
+                                                index,
+                                                String::from_utf8_lossy(&entry.path)
+                                            )
+                                        })
+                                    })
+                                    .collect::<Result<_>>()?;
                                 let hash = sha1_digest_fragments_recorded(&fragments);
                                 if hash.as_slice() != entry.blob_sha1 {
                                     anyhow::bail!(
@@ -717,7 +792,11 @@ fn extract_archive_from_chunk_receiver_with_chunks(
         );
     }
 
-    let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
+    let raw_total = manifest.files.iter().try_fold(0u64, |total, entry| {
+        total
+            .checked_add(entry.checked_total_len()?)
+            .context("archive raw byte total overflow")
+    })?;
 
     if let Some(e) = error {
         return Err(e);
@@ -793,7 +872,8 @@ pub fn extract_blobs_from_pack_bytes(
     if pack.len() < 12 || &pack[0..4] != b"PACK" {
         anyhow::bail!("invalid pack header");
     }
-    let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize;
+    let count = usize::try_from(u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]))
+        .context("pack object count does not fit in usize")?;
     let mut off = 12usize;
     let mut written = 0usize;
     let mut stats = Vec::new();
@@ -805,7 +885,9 @@ pub fn extract_blobs_from_pack_bytes(
         }
         let (obj_type, size, hdr_len) = parse_pack_obj_header(&pack[off..])
             .with_context(|| format!("parse object {} header", i))?;
-        let data_start = off + hdr_len;
+        let data_start = off
+            .checked_add(hdr_len)
+            .context("pack object data offset overflow")?;
         if obj_type == 6 || obj_type == 7 {
             anyhow::bail!(
                 "unexpected delta object (type {}) in undeltified pack",
@@ -823,7 +905,8 @@ pub fn extract_blobs_from_pack_bytes(
         let mut content = Vec::new();
         dec.read_to_end(&mut content)
             .with_context(|| format!("inflate pack object {}", i))?;
-        if content.len() as u64 != size {
+        let content_len = u64::try_from(content.len()).context("pack object length overflow")?;
+        if content_len != size {
             anyhow::bail!(
                 "pack object {} size mismatch: header={} actual={}",
                 i,
@@ -831,12 +914,12 @@ pub fn extract_blobs_from_pack_bytes(
                 content.len()
             );
         }
-        crate::perf::record_zlib_inflate(
-            inflate_start.elapsed(),
-            dec.total_in() as usize,
-            content.len(),
-        );
-        off = data_start + dec.total_in() as usize;
+        let compressed_len = usize::try_from(dec.total_in())
+            .context("compressed pack object length does not fit in usize")?;
+        crate::perf::record_zlib_inflate(inflate_start.elapsed(), compressed_len, content.len());
+        off = data_start
+            .checked_add(compressed_len)
+            .context("pack object end offset overflow")?;
 
         // type 3 == OBJ_BLOB. The manifest keys blobs by the plain sha1 of the
         // raw content (no git "blob <len>\0" header), so match that.

@@ -70,7 +70,10 @@ fn fragments_for(
     start: usize,
     len: usize,
     mut hint: usize,
-) -> (Vec<Fragment>, usize) {
+) -> Result<(Vec<Fragment>, usize)> {
+    if bounds.is_empty() {
+        anyhow::bail!("cannot map file range onto an empty frame table");
+    }
     // Advance past frames that end at or before this file's start.
     while hint < bounds.len() && bounds[hint].1 <= start && len > 0 {
         hint += 1;
@@ -82,16 +85,17 @@ fn fragments_for(
             idx += 1;
         }
         let (frs, _) = bounds[idx];
-        return (
+        return Ok((
             vec![Fragment {
-                frame_index: idx as u32,
-                frame_offset: start.saturating_sub(frs) as u32,
+                frame_index: u32::try_from(idx).context("archive has too many frames")?,
+                frame_offset: u32::try_from(start.saturating_sub(frs))
+                    .context("empty file frame offset is too large")?,
                 raw_len: 0,
             }],
             hint,
-        );
+        ));
     }
-    let end = start + len;
+    let end = start.checked_add(len).context("file range end overflow")?;
     let mut frags = Vec::new();
     let mut k = hint;
     while k < bounds.len() && bounds[k].0 < end {
@@ -100,14 +104,15 @@ fn fragments_for(
         let oe = end.min(fre);
         if oe > os {
             frags.push(Fragment {
-                frame_index: k as u32,
-                frame_offset: (os - frs) as u32,
-                raw_len: (oe - os) as u32,
+                frame_index: u32::try_from(k).context("archive has too many frames")?,
+                frame_offset: u32::try_from(os - frs)
+                    .context("file fragment frame offset is too large")?,
+                raw_len: u32::try_from(oe - os).context("file fragment length is too large")?,
             });
         }
         k += 1;
     }
-    (frags, hint)
+    Ok((frags, hint))
 }
 
 pub struct ArchiveStats {
@@ -245,15 +250,23 @@ impl ArchiveBuilder {
             }
             manifest.frames.push(FrameInfo {
                 chunk_index: u32::try_from(chunks.len()).context("archive has too many chunks")?,
-                chunk_offset: current_chunk.len() as u64,
+                chunk_offset: u64::try_from(current_chunk.len())
+                    .context("archive chunk is too large")?,
                 compressed_len: u32::try_from(compressed.len())
                     .context("compressed archive frame is too large")?,
-                raw_len: u32::try_from(bounds[i].1 - bounds[i].0)
-                    .context("raw archive frame is too large")?,
+                raw_len: u32::try_from(
+                    bounds[i]
+                        .1
+                        .checked_sub(bounds[i].0)
+                        .context("archive frame bounds are inverted")?,
+                )
+                .context("raw archive frame is too large")?,
             });
             current_chunk.extend_from_slice(compressed);
             current_frame_count += 1;
-            if current_chunk.len() as u64 >= target_chunk_size {
+            if u64::try_from(current_chunk.len()).context("archive chunk is too large")?
+                >= target_chunk_size
+            {
                 chunks.push(std::mem::take(&mut current_chunk));
                 current_frame_count = 0;
             }
@@ -262,7 +275,11 @@ impl ArchiveBuilder {
             chunks.push(current_chunk);
         }
 
-        let compressed_total: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let compressed_total = chunks.iter().try_fold(0u64, |total, chunk| {
+            total
+                .checked_add(u64::try_from(chunk.len()).context("archive chunk is too large")?)
+                .context("compressed archive byte total overflow")
+        })?;
         let files = manifest.files.len();
         let frames = manifest.frames.len();
 
@@ -320,9 +337,15 @@ impl ArchiveBuilder {
 
         for chunk in StreamCDC::new(reader, CDC_MIN, CDC_AVG, CDC_MAX) {
             let chunk = chunk.map_err(|e| anyhow::anyhow!("content-defined chunking: {e}"))?;
-            let start = chunk.offset as usize;
-            bounds.push((start, start + chunk.length));
-            batch_bytes += chunk.data.len();
+            let start = usize::try_from(chunk.offset)
+                .context("content-defined frame offset does not fit in usize")?;
+            let end = start
+                .checked_add(chunk.length)
+                .context("content-defined frame bounds overflow")?;
+            bounds.push((start, end));
+            batch_bytes = batch_bytes
+                .checked_add(chunk.data.len())
+                .context("archive compression batch size overflow")?;
             batch.push((bounds.len() - 1, chunk.data));
             if batch_bytes >= STREAM_BATCH_BYTES {
                 flush_batch(&mut batch, &mut outputs, &mut process_batch)?;
@@ -339,7 +362,15 @@ impl ArchiveBuilder {
             return Err(err).context("build archive from tree");
         }
         let (mut files, ranges) = (table.files, table.ranges);
-        let raw_total = ranges.last().map(|&(s, l)| (s + l) as u64).unwrap_or(0);
+        let raw_total = match ranges.last() {
+            Some(&(start, len)) => u64::try_from(
+                start
+                    .checked_add(len)
+                    .context("archive raw byte range overflow")?,
+            )
+            .context("archive raw byte total does not fit in u64")?,
+            None => 0,
+        };
 
         // Empty worktree: synthesize one empty frame so empty-file fragments
         // always have a frame to point at (matches the slice-based chunker).
@@ -358,7 +389,7 @@ impl ArchiveBuilder {
         // are both in increasing stream order).
         let mut hint = 0usize;
         for (i, &(start, len)) in ranges.iter().enumerate() {
-            let (frags, new_hint) = fragments_for(&bounds, start, len, hint);
+            let (frags, new_hint) = fragments_for(&bounds, start, len, hint)?;
             hint = new_hint;
             files[i].fragments = frags;
         }
@@ -1144,7 +1175,7 @@ impl ArchiveBuilder {
             } else {
                 sha1_bytes(&repo.find_blob(*oid)?.data).to_vec()
             };
-            let (frags, new_hint) = fragments_for(&bounds, bstart, blen, hint);
+            let (frags, new_hint) = fragments_for(&bounds, bstart, blen, hint)?;
             hint = new_hint;
             manifest.files.push(FileEntry {
                 path: path.clone(),
@@ -1274,7 +1305,9 @@ impl<'r> TreeBlobReader<'r> {
             });
             t.ranges.push((start, len));
         }
-        self.next_start = start + len;
+        self.next_start = start
+            .checked_add(len)
+            .context("archive file stream offset overflow")?;
         self.cur = content;
         self.pos = 0;
         Ok(true)

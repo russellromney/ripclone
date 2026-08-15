@@ -31,15 +31,17 @@ impl HttpProvider {
     /// or points at a link-local / unspecified host (metadata SSRF guard).
     pub fn new(cfg: HttpProviderConfig) -> Result<Self> {
         validate_dispatch_url(&cfg.url)?;
+        let client = match cfg.client {
+            Some(client) => client,
+            None => reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .context("build HTTP dispatch client")?,
+        };
         Ok(Self {
             url: cfg.url,
             token: cfg.token,
-            client: cfg.client.unwrap_or_else(|| {
-                reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()
-                    .expect("reqwest client")
-            }),
+            client,
         })
     }
 
