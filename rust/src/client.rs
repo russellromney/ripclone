@@ -41,6 +41,8 @@ struct ServerError {
 struct ArtifactPendingResponse {
     code: String,
     commit: String,
+    #[serde(default)]
+    branch: String,
     status: String,
     queue_depth: usize,
     top_up_supported: Option<bool>,
@@ -51,6 +53,13 @@ struct ArtifactPendingResponse {
 struct SyncAcceptedResponse {
     status: String,
     queue_depth: usize,
+    commit: String,
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExactRevisionUnavailableResponse {
+    error: String,
     commit: String,
     branch: String,
 }
@@ -1915,19 +1924,8 @@ impl Client {
         rev: &str,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
-        let mut url = self.repo_url(repo_path, "/sync");
-        let mut q: Vec<String> = Vec::new();
-        if let Some(b) = branch {
-            q.push(format!("branch={}", urlencoding::encode(b)));
-        }
-        if let Some(d) = depth {
-            q.push(format!("depth={}", d));
-        }
-        q.push(format!("rev={}", urlencoding::encode(rev)));
-        if !q.is_empty() {
-            url.push('?');
-            url.push_str(&q.join("&"));
-        }
+        let mut selected_rev = rev.to_string();
+        let mut selected_branch = branch.map(str::to_string);
         // With the async build queue the server may return 202 (build still
         // running) or 503 (queue full). Each POST blocks server-side until its
         // wait window elapses, so we just retry — coalescing means a retry
@@ -1942,19 +1940,61 @@ impl Client {
             .unwrap_or(40);
         let poll = test_sync_poll_interval();
         for attempt in 0..max_attempts {
+            let mut url = self.repo_url(repo_path, "/sync");
+            let mut q: Vec<String> = Vec::new();
+            if let Some(branch) = selected_branch.as_deref() {
+                q.push(format!("branch={}", urlencoding::encode(branch)));
+            }
+            if let Some(depth) = depth {
+                q.push(format!("depth={depth}"));
+            }
+            q.push(format!("rev={}", urlencoding::encode(&selected_rev)));
+            url.push('?');
+            url.push_str(&q.join("&"));
             let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
             let status = resp.status();
             if status == reqwest::StatusCode::OK {
                 return Ok(resp.json().await?);
             }
-            if status == reqwest::StatusCode::ACCEPTED
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
+            if status == reqwest::StatusCode::ACCEPTED {
+                let pending: ArtifactPendingResponse = resp
+                    .json()
+                    .await
+                    .context("decode exact revision pending response")?;
+                if pending.code != "artifact_pending" || pending.status != "building" {
+                    anyhow::bail!("invalid exact revision pending response");
+                }
+                crate::validation::validate_object_id(&pending.commit)
+                    .context("validate exact revision selected by server")?;
+                selected_rev = pending.commit;
+                if !pending.branch.is_empty() {
+                    selected_branch = Some(pending.branch);
+                }
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(poll).await;
                     continue;
                 }
                 anyhow::bail!("sync still building after {max_attempts} attempts");
+            }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                let unavailable: ExactRevisionUnavailableResponse = resp
+                    .json()
+                    .await
+                    .context("decode exact revision queue response")?;
+                crate::validation::validate_object_id(&unavailable.commit)
+                    .context("validate queued exact revision selected by server")?;
+                crate::validation::validate_git_rev(&unavailable.branch)
+                    .context("validate exact revision branch selected by server")?;
+                selected_rev = unavailable.commit;
+                selected_branch = Some(unavailable.branch);
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(poll).await;
+                    continue;
+                }
+                anyhow::bail!(
+                    "sync unavailable after {max_attempts} attempts: {}",
+                    unavailable.error
+                );
             }
             return Err(server_error("sync failed", resp).await);
         }

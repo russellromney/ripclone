@@ -11,6 +11,28 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 /// Clone the full (depth=0) artifacts built for `rev`, polling until phase 2
 /// publishes the full clonepack at the expected commit count.
 async fn clone_full_rev(
@@ -82,6 +104,77 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
         .await
         .expect("depth=1 at tip");
     assert_eq!(read(&c3d1, "a.txt"), "3\n");
+}
+
+/// The first resolution of a symbolic historical selector is the operation's
+/// immutable target. Advancing the mirror while its Full artifact is held must
+/// not make a later retry resolve the selector again.
+#[tokio::test]
+async fn sync_at_symbolic_revision_stays_pinned_while_branch_advances() {
+    setup(true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "at-moving");
+    let selected = origin.commit(&[("value.txt", "A\n")], "A");
+    origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/at-moving")
+        .await
+        .expect("register historical pin fixture");
+
+    let controls = tempfile::tempdir().expect("historical pin controls");
+    let barrier = controls.path().join("phase-two");
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let _barrier = ScopedEnvVar::set("RIPCLONE_TEST_PHASE2_BARRIER_DIR", &barrier);
+    let _target = ScopedEnvVar::set("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT", &selected);
+
+    let historical_client = server.client();
+    let mut historical = tokio::spawn(async move {
+        historical_client
+            .sync_repo_at("acme/at-moving", Some("HEAD~1"), None)
+            .await
+    });
+    for _ in 0..800 {
+        if barrier.join("entered").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(barrier.join("entered"))
+            .expect("historical Full reached barrier")
+            .trim(),
+        selected
+    );
+
+    let advanced = origin.commit(&[("value.txt", "C\n")], "C");
+    origin.publish();
+    let current = server
+        .client()
+        .sync_repo("acme/at-moving", None)
+        .await
+        .expect("advance ordinary branch while historical Full is held");
+    assert_eq!(current.commit, advanced);
+
+    std::fs::write(barrier.join("proceed"), b"release\n").expect("release historical Full");
+    let historical = tokio::time::timeout(Duration::from_secs(30), &mut historical)
+        .await
+        .expect("historical sync completed after release")
+        .expect("historical sync task")
+        .expect("historical sync result");
+    assert_eq!(historical.commit, selected);
+
+    let (_guard, clone) = clone_only_at(
+        &server,
+        "acme",
+        "at-moving",
+        Some(&selected),
+        0,
+        CloneMode::Editable,
+    )
+    .await
+    .expect("clone selected historical commit");
+    assert_eq!(git(&clone, &["rev-parse", "HEAD"]), selected);
+    assert_eq!(read(&clone, "value.txt"), "A\n");
 }
 
 /// A concrete-branch admission still initializes an exact-only mirror. Its

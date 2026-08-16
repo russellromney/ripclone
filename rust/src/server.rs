@@ -740,12 +740,20 @@ pub struct BuildResponse {
 pub struct ArtifactPendingResponse {
     pub code: &'static str,
     pub commit: String,
+    pub branch: String,
     pub status: &'static str,
     pub queue_depth: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_up_supported: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_up_base: Option<RefResponse>,
+}
+
+#[derive(Serialize)]
+pub struct ExactRevisionUnavailableResponse {
+    pub error: String,
+    pub commit: String,
+    pub branch: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2643,6 +2651,7 @@ fn artifact_pending_response_with_top_up(
         Json(ArtifactPendingResponse {
             code: "artifact_pending",
             commit: commit.to_string(),
+            branch: branch.to_string(),
             status: "building",
             queue_depth,
             top_up_supported,
@@ -3475,6 +3484,11 @@ async fn wait_test_phase_two_barrier(commit: &str) -> Result<()> {
     let Some(dir) = std::env::var_os("RIPCLONE_TEST_PHASE2_BARRIER_DIR").map(PathBuf::from) else {
         return Ok(());
     };
+    if let Some(target) = std::env::var_os("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT")
+        && target.to_str() != Some(commit)
+    {
+        return Ok(());
+    }
     std::fs::create_dir_all(&dir).context("create test phase-two barrier directory")?;
     std::fs::write(dir.join("entered"), format!("{commit}\n"))
         .context("signal test phase-two barrier")?;
@@ -4193,7 +4207,7 @@ async fn sync_repo_at_revision(
     }
     let start = Instant::now();
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let branch = params.branch;
+    let mut branch = params.branch;
 
     let request_token = upstream_token_from_headers(&headers);
     let credential = match state
@@ -4210,6 +4224,80 @@ async fn sync_repo_at_revision(
             Ok(p) => p,
             Err(resp) => return resp,
         };
+
+    // Resolve a symbolic historical selector exactly once. Subsequent work and
+    // polls use only the selected object id. A concrete object id with a known
+    // branch can skip this fetch entirely; HEAD on a cold mirror needs one fetch
+    // to recover the concrete default branch used by the exact-result key.
+    let local_default_branch = (branch == "HEAD")
+        .then(|| git::default_branch(&mirror_dir).ok())
+        .flatten()
+        .filter(|candidate| !candidate.is_empty() && candidate != "HEAD");
+    let selector_is_exact = crate::validation::validate_object_id(&at_rev).is_ok();
+    let needs_resolution_fetch =
+        !selector_is_exact || (branch == "HEAD" && local_default_branch.is_none());
+    let selected_commit = if needs_resolution_fetch {
+        let lock = repo_lock(&state.sync_locks, &repo_id).await;
+        let _guard = lock.lock().await;
+        let mirror = mirror_dir.clone();
+        let provider = provider.clone();
+        let repo = repo_id.clone();
+        let fetch_branch = branch.clone();
+        let selector = at_rev.clone();
+        let fetch_credential = credential.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            git::sync_bare_mirror(
+                &mirror,
+                &provider,
+                &repo,
+                &fetch_branch,
+                Some(&selector),
+                fetch_credential.as_ref(),
+            )?;
+            let commit = git::resolve_commit(&mirror, &selector)?;
+            let default_branch = git::default_branch(&mirror)
+                .ok()
+                .filter(|candidate| !candidate.is_empty() && candidate != "HEAD");
+            Ok::<_, anyhow::Error>((commit, default_branch))
+        })
+        .await;
+        match resolved {
+            Ok(Ok((commit, default_branch))) => {
+                if branch == "HEAD" {
+                    branch = default_branch.unwrap_or_else(|| branch.clone());
+                }
+                commit
+            }
+            Ok(Err(error)) => {
+                state.metrics.record_error();
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse {
+                        error: format!("cannot resolve exact revision {at_rev}: {error:#}"),
+                    }),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                state.metrics.record_error();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("exact revision resolution task failed: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        if branch == "HEAD"
+            && let Some(default_branch) = local_default_branch
+        {
+            branch = default_branch;
+        }
+        at_rev.clone()
+    };
+    let at_rev = selected_commit;
 
     // A retry after phase one resolves entirely from the local mirror and the
     // exact result row. Full readiness is the selected artifact's identity,
@@ -4310,11 +4398,34 @@ async fn sync_repo_at_revision(
             .into_response();
     }
     {
+        let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
+        let job = BuildJob {
+            repo_id: repo_id.clone(),
+            branch: branch.clone(),
+            rev: Some(at_rev.clone()),
+            admitted_commit: Some(at_rev.clone()),
+            admitted_default_branch: Some(branch.clone()),
+            credential,
+            recheck: 0,
+            size_bytes,
+        };
+        if let Err(error) = prepare_exact_admission(&state, &job, false).await {
+            state.metrics.record_error();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ExactRevisionUnavailableResponse {
+                    error,
+                    commit: at_rev.clone(),
+                    branch: branch.clone(),
+                }),
+            )
+                .into_response();
+        }
         // In-process queue: coalesce via build_waiters; the same-process
         // worker signals completion on a oneshot. Include the rev override in
         // the coalescing key so syncs for different build commits don't share
         // one build.
-        let key = inproc_build_key(&repo_id, &branch, Some(&at_rev));
+        let key = job.key();
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<SyncBuildResult, BuildError>>();
         let first = {
             let mut w = state.build_waiters.lock().await;
@@ -4331,29 +4442,23 @@ async fn sync_repo_at_revision(
             // it (else the gauge underflows). The local queue owns the
             // build_queue_depth counter (enqueue +1, worker -1).
             state.metrics.record_build_queued();
-            let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
-            let job = BuildJob {
-                repo_id: repo_id.clone(),
-                branch: branch.clone(),
-                rev: Some(at_rev.clone()),
-                admitted_commit: None,
-                admitted_default_branch: None,
-                credential,
-                recheck: 0,
-                size_bytes,
+            let queue_error = match state.build_queue.enqueue(job).await {
+                Ok(enq) if enq.outcome == EnqueueOutcome::Full => {
+                    Some("build queue full; retry shortly".to_string())
+                }
+                Ok(_) => None,
+                Err(error) => Some(format!("build queue unavailable: {error}")),
             };
-            let full = match state.build_queue.enqueue(job).await {
-                Ok(enq) => enq.outcome == EnqueueOutcome::Full,
-                Err(_) => true,
-            };
-            if full {
+            if let Some(error) = queue_error {
                 state.metrics.record_build_rejected();
                 state.build_waiters.lock().await.remove(&key);
                 state.metrics.record_error();
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        error: "build queue full; retry shortly".to_string(),
+                    Json(ExactRevisionUnavailableResponse {
+                        error,
+                        commit: at_rev.clone(),
+                        branch: branch.clone(),
                     }),
                 )
                     .into_response();
@@ -4462,16 +4567,7 @@ async fn sync_repo_at_revision(
                 }),
             )
                 .into_response(),
-            Err(_) => (
-                StatusCode::ACCEPTED,
-                Json(BuildResponse {
-                    status: "building".to_string(),
-                    queue_depth: state.build_queue.depth().await,
-                    commit: None,
-                    branch: None,
-                }),
-            )
-                .into_response(),
+            Err(_) => artifact_pending_response(&at_rev, &branch, state.build_queue.depth().await),
         }
     }
 }
