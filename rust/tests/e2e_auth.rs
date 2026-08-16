@@ -8,11 +8,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::*;
 use reqwest::StatusCode;
 use reqwest::redirect::Policy;
-use ripclone::server::{ArtifactBarrier, RateLimiter, ServerState, build_app};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use ripclone::server::ArtifactBarrier;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn no_redirect_client() -> reqwest::Client {
@@ -28,86 +26,6 @@ fn token_exp(token: &str) -> u64 {
     let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url payload");
     let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("JWT JSON");
     claims["exp"].as_u64().expect("exp claim")
-}
-
-async fn start_repo_auth_server(provider_url: &str) -> Server {
-    let dir = tempfile::tempdir().expect("server dir");
-    let cas_dir = dir.path().join("cas");
-    let repo_root = dir.path().join("repos");
-    std::fs::create_dir_all(&repo_root).unwrap();
-
-    let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
-    let storage = ripclone::storage::local(&cas_dir).unwrap();
-    let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
-        Arc::new(ripclone::ref_store::FileRefStore::new(&repo_root));
-    let metrics = ripclone::metrics::Metrics::new();
-    let retention =
-        Arc::new(ripclone::retention::Retention::new(cas.clone(), metrics.clone()).unwrap());
-    let (local_queue, _rx, depth) = ripclone::queue::LocalJobQueue::new(16);
-    let build_queue: ripclone::queue::JobQueueRef = Arc::new(local_queue);
-    let mut provider_registry = ripclone::provider::ProviderRegistry::new();
-    provider_registry
-        .merge_one(ripclone::provider::ProviderConfig {
-            id: "localgit".to_string(),
-            kind: Some("generic".to_string()),
-            host: Some(provider_url.to_string()),
-            token: None,
-            auth_template: Some("token {token}".to_string()),
-            auth_header_name: None,
-        })
-        .unwrap();
-    let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
-        ripclone::auth::broker::StaticBroker::new(provider_registry.clone()),
-    );
-    let state = ServerState {
-        cas,
-        repo_config: Arc::new(ripclone::repo_config::RepoConfigStore::new(storage.clone())),
-        storage,
-        repo_root: repo_root.clone(),
-        ref_store,
-        provider_registry,
-        broker,
-        token_hash: Some(hex::encode(Sha256::digest(TOKEN.as_bytes()))),
-        jwt: None,
-        metrics,
-        rate_limiter: RateLimiter::new(1000000, 1000000.0),
-        retention,
-        build_queue,
-        worker_queue: None,
-        build_queue_depth: depth,
-        build_waiters: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        oidc_verifier: None,
-        webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
-        sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        mirror_fresh_ttl: Duration::from_secs(60),
-        ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
-        fail_first_fetches: 0,
-        artifact_barrier: None,
-        readyz_cache: Arc::new(std::sync::Mutex::new(None)),
-        access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
-        require_repo_auth: true,
-    };
-
-    let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-    Server {
-        url: format!("http://127.0.0.1:{port}"),
-        storage_dir: cas_dir.clone(),
-        cas_dir,
-        repo_root,
-        pinned_path_probe: None,
-        _dir: dir,
-    }
 }
 
 /// Mint a session token by posting the correct secret with a loopback callback
