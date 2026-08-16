@@ -281,24 +281,6 @@ fn merge(overrides: Config, base: Config) -> Config {
 mod tests {
     use super::*;
 
-    // Changing HOME is otherwise racy under parallel test execution.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_home<F, R>(home: &Path, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let _guard = HOME_LOCK.lock().unwrap();
-        let old = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", home) };
-        let result = f();
-        match old {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        result
-    }
-
     #[test]
     fn project_config_discovered_by_walking_up() {
         let dir = tempfile::tempdir().unwrap();
