@@ -281,6 +281,9 @@ fn merge(overrides: Config, base: Config) -> Config {
 mod tests {
     use super::*;
 
+    // Process environment mutations must not race under parallel tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn project_config_discovered_by_walking_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -480,7 +483,7 @@ machine = "l"
 
     #[test]
     fn agent_mode_env_wins_over_config() {
-        let _guard = HOME_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("RIPCLONE_AGENT");
 
         // Truthy env turns it on regardless of config.
@@ -510,8 +513,7 @@ machine = "l"
 
     #[test]
     fn ripclone_config_env_overrides_home_path() {
-        // Shares the HOME mutation lock so the env order can't race other tests.
-        let _guard = HOME_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("RIPCLONE_CONFIG");
         unsafe { std::env::set_var("RIPCLONE_CONFIG", "/etc/ripclone/config.toml") };
         assert_eq!(
