@@ -1129,24 +1129,16 @@ const MAX_UPLOAD_PACK_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// ~25 MiB; this is comfortably above that and far below the global limit.
 const MAX_WEBHOOK_BODY_BYTES: usize = 25 * 1024 * 1024;
 
-/// Require the sole current wire protocol on every authenticated API request.
-/// Missing, malformed, and mismatched declarations fail at the boundary.
+/// Reject explicit declarations that do not match the sole current wire
+/// protocol. Callers such as vanilla Git and ordinary HTTP integrations do not
+/// declare this private header and use the same implementation.
 async fn protocol_guard(
     headers: HeaderMap,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let Some(header) = headers.get("x-ripclone-protocol") else {
-        return (
-            StatusCode::UPGRADE_REQUIRED,
-            Json(ErrorResponse {
-                error: format!(
-                    "missing client protocol; this server requires {}",
-                    crate::PROTOCOL_VERSION
-                ),
-            }),
-        )
-            .into_response();
+        return next.run(request).await;
     };
     let client_proto = match header
         .to_str()
@@ -11838,11 +11830,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_guard_requires_the_current_version() {
+    async fn protocol_guard_rejects_only_explicit_wrong_versions() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
         let app = build_app(state);
-        for protocol in [Some("1"), Some("999"), Some("invalid"), None] {
+        for protocol in [Some("1"), Some("999"), Some("invalid")] {
             let response = app
                 .clone()
                 .oneshot(protocol_request("/v1/repos/acme/secret/status", protocol))
@@ -11850,10 +11842,19 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
         }
+        let response = app
+            .clone()
+            .oneshot(protocol_request(
+                "/v1/repos/github/acme/secret/status",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UPGRADE_REQUIRED);
         let current = crate::PROTOCOL_VERSION.to_string();
         let response = app
             .oneshot(protocol_request(
-                "/v1/repos/acme/secret/status",
+                "/v1/repos/github/acme/secret/status",
                 Some(&current),
             ))
             .await

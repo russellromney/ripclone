@@ -42,6 +42,7 @@ e2e() {
     export RIPCLONE_BIN_DIR="$ROOT/rust/target/$profile"
   fi
   bash "$ROOT/scripts/e2e_local.sh"
+  bash "$ROOT/scripts/e2e_smart_http.sh"
 }
 
 # Historical flake-guard (ran the suite twice). Kept as an alias of `test` so

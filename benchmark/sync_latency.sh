@@ -149,10 +149,9 @@ wait_for_full_build() {
   while true; do
     probe_dir="$BASE_DIR/probe-depth0.$$"
     rm -rf "$probe_dir"
-    local clone_cmd=("$RIPCLONE" --server "$server_url" clone "$repo" --depth 0)
+    local clone_cmd=("$RIPCLONE" --server "$server_url" clone "$repo" "$probe_dir" --depth 0)
     [ -n "$branch" ] && clone_cmd+=(--branch "$branch")
     [ -n "$rev" ] && clone_cmd+=(--at "$rev")
-    clone_cmd+=(--dir "$probe_dir")
     if run_clone_probe "$probe_dir" "${clone_cmd[@]}"; then
       rm -rf "$probe_dir"
       end=$(now_ms)

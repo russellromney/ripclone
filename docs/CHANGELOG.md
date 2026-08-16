@@ -4,7 +4,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 
 ## One current wire implementation
 
-- **Authenticated API requests have one implementation** (`rust/src/client.rs`, `rust/src/server.rs`): the client must declare the current `PROTOCOL_VERSION`; a missing, malformed, or mismatched declaration returns `426 Upgrade Required`. Current ref and pending responses require their complete current fields, including explicit archive readiness and Full top-up support. No request or response shape selects an older implementation.
+- **Authenticated API requests have one implementation** (`rust/src/client.rs`, `rust/src/server.rs`): the ripclone client declares the current `PROTOCOL_VERSION`; an explicitly malformed or mismatched declaration returns `426 Upgrade Required`. A missing declaration is an unversioned caller of that same implementation, which keeps vanilla Git and ordinary HTTP integrations working. Current ref and pending responses require their complete current fields, including explicit archive readiness and Full top-up support. No request or response shape selects an older implementation.
 - **Removed retired compatibility surfaces**: deleted the snapshot/sidecar CLI and API lane, old artifact URL aliases, config-token migration, old webhook and provider-token aliases, old queue/ref startup migrations, and deprecated manifest readers. Provider-qualified routes and exact commit-keyed artifacts are the sole current API and storage paths.
 
 ## Exact sync admission
@@ -114,7 +114,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 - **`ripclone --version` and `ripclone-server --version`** now report the build version (they previously errored).
 - **`/v1/version`** (`rust/src/server.rs`): a public, unauthenticated endpoint returning `{ version, protocol }` so a client can check compatibility without credentials.
 - **`ripclone version`** (`rust/src/bin/cli.rs`): prints the CLI's version + protocol, queries the configured server's `/v1/version`, and reports a compatibility verdict. Compatibility is keyed on a new wire **`PROTOCOL_VERSION`** (`rust/src/lib.rs`), not the build version — so the CLI and server can be released on independent cadences as long as their protocol versions match. Bump `PROTOCOL_VERSION` only on a breaking protocol change.
-- **Server enforces the protocol** (`rust/src/client.rs`, `rust/src/server.rs`): the client sends its `PROTOCOL_VERSION` on authenticated requests, and a missing, malformed, or mismatched declaration returns `426 Upgrade Required` with an actionable message. See “One current wire implementation” above for the superseding behavior.
+- **Server enforces the protocol** (`rust/src/client.rs`, `rust/src/server.rs`): the client sends its `PROTOCOL_VERSION` on authenticated requests. The former missing-header rejection described here is superseded by “One current wire implementation” above; only an explicit malformed or mismatched declaration returns `426 Upgrade Required`.
 
 ## Supply chain
 
@@ -358,11 +358,11 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 ## Smart-HTTP fallback endpoints
 
 - **Vanilla git compatibility** (`rust/src/server.rs`)
-  - `GET /v1/git/{owner}/{repo}/info/refs?service=git-upload-pack` advertises
+  - `GET /v1/git/github/{owner}/{repo}/info/refs?service=git-upload-pack` advertises
     refs using the local bare mirror.
-  - `POST /v1/git/{owner}/{repo}/git-upload-pack` runs `git upload-pack
+  - `POST /v1/git/github/{owner}/{repo}/git-upload-pack` runs `git upload-pack
     --stateless-rpc` against the mirror so a plain `git clone
-    http://server/v1/git/owner/repo` works without the archive-first path.
+    http://server/v1/git/github/owner/repo` works without the archive-first path.
   - Useful for cold caches or clients that cannot use the remote helper.
 
 - **Validation**

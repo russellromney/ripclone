@@ -250,7 +250,7 @@ probe_ready_clone() {
   rm -rf "$dir"
   local depth=0
   if [ "$READY_CLONEPACK" = "shallow" ]; then depth=1; fi
-  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth "$depth" --dir "$dir" >/dev/null 2>&1; then
+  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$dir" --at "$REF" --depth "$depth" >/dev/null 2>&1; then
     rm -rf "$dir"
     return 0
   else
@@ -516,23 +516,23 @@ bench_cmd() {
 
 rc_full()  {
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 0 --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 0
   else
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 0 --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --depth 0
   fi
 }
 rc_depth1(){
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 1
   else
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 1 --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --depth 1
   fi
 }
 rc_files() {
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --mode files --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --mode files
   else
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 1 --mode files --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --depth 1 --mode files
   fi
 }
 

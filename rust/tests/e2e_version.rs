@@ -43,26 +43,38 @@ async fn current_protocol_client_can_sync() {
         .expect("a current-protocol client must pass the guard and sync");
 }
 
-/// Missing, malformed, and mismatched wire declarations all fail clearly.
+/// Malformed and mismatched explicit wire declarations fail clearly. An absent
+/// declaration is an unversioned caller of the same implementation.
 #[tokio::test]
-async fn server_requires_the_current_protocol() {
+async fn server_rejects_explicit_wrong_protocol() {
     init(false);
     let server = start_server().await;
     let client = reqwest::Client::new();
-    for header in [Some("1"), Some("999"), Some("not-a-number"), None] {
-        let mut request = client
-            .get(format!("{}/v1/repos/acme/x/refs/main", server.url))
+    for header in ["1", "999", "not-a-number"] {
+        let request = client
+            .get(format!("{}/v1/repos/github/acme/x/refs/main", server.url))
             .header("Authorization", format!("Ripclone {}", token_hash()));
-        if let Some(header) = header {
-            request = request.header("x-ripclone-protocol", header);
-        }
+        let request = request.header("x-ripclone-protocol", header);
         let resp = request.send().await.unwrap();
         assert_eq!(
             resp.status().as_u16(),
             426,
-            "protocol declaration {header:?} must be rejected"
+            "protocol declaration {header} must be rejected"
         );
         let body = resp.text().await.unwrap();
         assert!(body.contains("protocol"), "clear mismatch: {body}");
     }
+}
+
+#[tokio::test]
+async fn missing_protocol_header_uses_current_implementation() {
+    init(false);
+    let server = start_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/v1/repos/github/acme/x/status", server.url))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status().as_u16(), 426);
 }

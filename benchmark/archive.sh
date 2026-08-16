@@ -91,7 +91,7 @@ OWNER="$(echo "$REPO" | cut -d/ -f1)"
 NAME="$(echo "$REPO" | cut -d/ -f2)"
 
 # Resolve the ref so we can report artifact sizes.
-ref_json=$(curl -fsS "${CURL_AUTH[@]}" "$SERVER_URL/v1/repos/$OWNER/$NAME/refs/HEAD")
+ref_json=$(curl -fsS "${CURL_AUTH[@]}" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/refs/HEAD")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 
 # CAS objects are stored by hash under CAS_DIR/<first2>/<hash>.
@@ -111,7 +111,7 @@ echo ""
 echo "==> Direct-install clone..."
 install_dir="$BASE_DIR/bun-install"
 install_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$install_dir"
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$install_dir"
 install_end=$(now_ms)
 printf "install=%d ms\n" $((install_end - install_start))
 

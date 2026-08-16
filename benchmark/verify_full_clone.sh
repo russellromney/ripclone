@@ -35,7 +35,7 @@ echo "==> syncing $REPO..."
 "$RIPCLONE" --server "$SERVER_URL" sync "$REPO" > "$BASE_DIR/sync.log" 2>&1
 
 echo "==> cloning $MODE..."
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --mode "$MODE" --dir "$BASE_DIR/$MODE" > "$BASE_DIR/clone.log" 2>&1
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$BASE_DIR/$MODE" --mode "$MODE" > "$BASE_DIR/clone.log" 2>&1
 
 cd "$BASE_DIR/$MODE"
 echo "==> git status"
