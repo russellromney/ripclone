@@ -100,22 +100,15 @@ local-queue support, and keeps its current explicit cross-process limitation.
 It is not ordinary tip admission, and ordinary exact commits are not published
 under the historical `branch#REV` key.
 
-## Queue durability and upgrades
+## Queue durability
 
 SQL acceptance has the durability guarantee of the selected SQL backend. The
 `local` queue remains in-memory and only survives for the server process
 lifetime; accepted local jobs are lost if that process exits.
 
-The queue schema adds a nullable admitted-commit column so completed history is
-preserved. An active pre-upgrade row without a commit has no knowable target:
-the migration settles it with a permanent `resubmit sync` failure, and a worker
-also rejects such a row before credential lookup, provider access, mirror work,
-or builder entry. It is never guessed from the current branch tip.
-
-For a SQL upgrade, drain or stop old direct workers before starting new writers.
-Old workers do not understand the admitted-commit field and this release does
-not provide mixed-binary coordination. Start the server and workers from the
-same release after the migration has completed.
+Every ordinary queued job carries its admitted commit. A malformed targetless
+ordinary row is rejected before credential lookup, provider access, mirror work,
+or builder entry; its target is never guessed from the current branch tip.
 
 ## Availability and errors
 

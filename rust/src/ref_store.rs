@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddedRepo {
@@ -31,7 +31,6 @@ pub enum AddedRepoSource {
     Cli,
     Cloud,
     Api,
-    Migration,
 }
 
 /// Metadata key for an internal exact-commit result.

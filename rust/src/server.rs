@@ -847,62 +847,6 @@ fn resolve_repo_id<'a>(
     ))
 }
 
-fn repo_id_from_natural_key(registry: &ProviderRegistry, key: &str) -> Option<RepoId> {
-    let mut segments = key.split('/');
-    let first = segments.next()?;
-    let rest: Vec<&str> = segments.collect();
-    if rest.is_empty() {
-        return None;
-    }
-    if let Some(provider) = registry.get(first) {
-        return Some(RepoId {
-            provider: provider.id.clone(),
-            path: rest.join("/"),
-        });
-    }
-    let provider = registry.default_provider();
-    Some(RepoId {
-        provider: provider.id.clone(),
-        path: key.to_string(),
-    })
-}
-
-async fn seed_added_repos(
-    ref_store: &Arc<dyn RefStore>,
-    registry: &ProviderRegistry,
-    webhook_config: &WebhookConfig,
-) -> Result<()> {
-    let mut repo_ids = ref_store.list().await?;
-    repo_ids.extend(
-        webhook_config
-            .allowlist_repos()
-            .into_iter()
-            .filter_map(|key| repo_id_from_natural_key(registry, &key)),
-    );
-    repo_ids.sort_by_key(|repo| repo.storage_key());
-    repo_ids.dedup_by_key(|repo| repo.storage_key());
-
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    for repo_id in repo_ids {
-        if ref_store.load_added_repo(&repo_id).await?.is_some() {
-            continue;
-        }
-        ref_store
-            .add_repo(&AddedRepo {
-                repo_id,
-                added_at: now,
-                history_enabled: true,
-                source: AddedRepoSource::Migration,
-                repo_size_bytes: None,
-            })
-            .await?;
-    }
-    Ok(())
-}
-
 fn unknown_provider_response() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -8905,10 +8849,6 @@ pub async fn run_server_with_barrier(
     // before the registry is moved into the state). A push to a configured
     // webhook triggers a build before any clone — no per-repo Actions workflow.
     let webhook_config = Arc::new(WebhookConfig::from_env(&provider_registry));
-    seed_added_repos(&b.ref_store, &provider_registry, &webhook_config)
-        .await
-        .context("seed added repos")?;
-
     // Select the queue backend. The local queue drives an in-process worker; the
     // SQL queues' builds run in separate ripclone-worker processes, so the server
     // only enqueues.
@@ -9637,49 +9577,6 @@ mod tests {
 
     fn auth_header() -> String {
         format!("Ripclone {}", hex::encode(Sha256::digest("secret")))
-    }
-
-    #[tokio::test]
-    async fn seed_added_repos_migrates_refs_and_webhook_allowlist() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-        let built_repo = RepoId::github("acme/built");
-        state
-            .ref_store
-            .save(
-                &built_repo,
-                &RefInfo {
-                    commit: "c1".to_string(),
-                    default_branch: "main".to_string(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let registry = ProviderRegistry::new();
-        let webhook_config = WebhookConfig::with_secret("github", "secret")
-            .with_allowlist(vec!["acme/allowed".to_string()]);
-
-        seed_added_repos(&state.ref_store, &registry, &webhook_config)
-            .await
-            .unwrap();
-
-        assert!(
-            state
-                .ref_store
-                .load_added_repo(&built_repo)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            state
-                .ref_store
-                .load_added_repo(&RepoId::github("acme/allowed"))
-                .await
-                .unwrap()
-                .is_some()
-        );
     }
 
     #[test]

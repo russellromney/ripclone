@@ -200,11 +200,9 @@ On a push, the receiver enqueues a sync only when **both** hold:
 
 So the allowlist is the optional "set it and forget it" restriction, and the
 added-repo set is the "manage it as you go" gate. With no repos added, a push
-warms nothing: **explicit by default.** On startup the server seeds the
-added-repo set from repos it has already built and from the webhook allowlist, so
-existing deployments keep warming without a manual re-add. Branch policy is
-unchanged — an added repo's default branch always warms; other branches warm only
-if already built, unless `RIPCLONE_WEBHOOK_WARM_ALL=1`.
+warms nothing: **explicit by default.** An added repo's default branch always
+warms; other branches warm only if already built, unless
+`RIPCLONE_WEBHOOK_WARM_ALL=1`.
 
 ## Implementation checklist
 

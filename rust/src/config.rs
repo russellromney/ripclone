@@ -320,7 +320,6 @@ mod tests {
                 mode: Some("editable".into()),
             },
             providers: HashMap::new(),
-            token: None,
             ..Default::default()
         };
         let project = Config {
@@ -331,7 +330,6 @@ mod tests {
                 mode: None,
             },
             providers: HashMap::new(),
-            token: None,
             ..Default::default()
         };
         let merged = merge(project, global);
@@ -424,15 +422,8 @@ machine = "l"
                 bucket: Some("my-bucket".into()),
                 ..Default::default()
             },
-            token: Some("should-not-be-saved".into()),
         };
         save_to(&path, &cfg).unwrap();
-
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !text.contains("should-not-be-saved"),
-            "token must not be written to config"
-        );
 
         let loaded = load_from(&path);
         assert_eq!(

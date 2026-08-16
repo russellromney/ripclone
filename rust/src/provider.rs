@@ -384,12 +384,6 @@ impl ProviderRegistry {
         self.tokens.get(id)
     }
 
-    pub(crate) fn set_token(&mut self, id: &str, token: impl Into<String>) {
-        let token: String = token.into();
-        self.tokens
-            .insert(id.to_string(), secrecy::SecretString::new(token.into()));
-    }
-
     /// Iterate over all configured instances.
     pub fn iter(&self) -> impl Iterator<Item = &ProviderInstance> {
         self.providers.values()
