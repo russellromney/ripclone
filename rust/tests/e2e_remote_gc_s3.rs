@@ -1695,7 +1695,11 @@ async fn remote_gc_deletes_orphans_on_s3() {
     let reachable_info = ripclone::RefInfo {
         commit: "reachable".to_string(),
         default_branch: "HEAD".to_string(),
-        metadata_chunk: reachable_hash.clone(),
+        full_clonepack: ripclone::ClonepackArtifacts {
+            commit: "reachable".to_string(),
+            metadata_chunk: reachable_hash.clone(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     ref_store
