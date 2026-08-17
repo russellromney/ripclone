@@ -9622,14 +9622,17 @@ mod tests {
         let full_mirror = tmp.path().join("full-clone-baseline.git");
         git::sync_bare_mirror(&full_mirror, &provider, &repo_id, "main", None, None).unwrap();
         assert_eq!(
-            git_stdout(&seeded_mirror, &["rev-parse", "main^{tree}"]),
+            git_stdout(
+                &seeded_mirror,
+                &["rev-parse", &format!("{}^{{tree}}", second.info.commit)],
+            ),
             git_stdout(&full_mirror, &["rev-parse", "main^{tree}"]),
             "seeded-fetch mirror tree must match full-clone mirror tree"
         );
         // Byte-identical guarantee also requires the resolved branch commit to
         // match, not just its tree (two distinct commits can share a tree).
         assert_eq!(
-            git_stdout(&seeded_mirror, &["rev-parse", "main"]),
+            git_stdout(&seeded_mirror, &["rev-parse", &second.info.commit]),
             git_stdout(&full_mirror, &["rev-parse", "main"]),
             "seeded-fetch mirror commit must match full-clone mirror commit"
         );
@@ -9705,7 +9708,10 @@ mod tests {
         let full_mirror = tmp.path().join("full-clone-corruptseed.git");
         git::sync_bare_mirror(&full_mirror, &provider, &repo_id, "main", None, None).unwrap();
         assert_eq!(
-            git_stdout(&recovered_mirror, &["rev-parse", "main^{tree}"]),
+            git_stdout(
+                &recovered_mirror,
+                &["rev-parse", &format!("{}^{{tree}}", second.info.commit)],
+            ),
             git_stdout(&full_mirror, &["rev-parse", "main^{tree}"]),
             "corrupt-seed fallback tree must match full-clone mirror tree"
         );
@@ -9760,7 +9766,10 @@ mod tests {
         let full_mirror = tmp.path().join("full-clone-seedmiss.git");
         git::sync_bare_mirror(&full_mirror, &provider, &repo_id, "main", None, None).unwrap();
         assert_eq!(
-            git_stdout(&fallback_mirror, &["rev-parse", "main^{tree}"]),
+            git_stdout(
+                &fallback_mirror,
+                &["rev-parse", &format!("{}^{{tree}}", second.info.commit)],
+            ),
             git_stdout(&full_mirror, &["rev-parse", "main^{tree}"]),
             "seed-miss fallback tree must match full-clone mirror tree"
         );
