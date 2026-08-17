@@ -199,10 +199,8 @@ pub struct ClonepackArtifacts {
     /// CAS hash of the concatenated idx bundle for this variant's packs. Empty
     #[serde(default)]
     pub idx_bundle: String,
-    /// The commit this variant's clonepack is built for. May differ from
-    /// `RefInfo.commit` during two-phase publish (depth=0 briefly serves the
-    /// previous commit while the new full history builds). Empty = same as
-    /// `RefInfo.commit`.
+    /// The commit this variant's clonepack is built for. Complete artifacts
+    /// always carry this identity explicitly.
     #[serde(default)]
     pub commit: String,
 }

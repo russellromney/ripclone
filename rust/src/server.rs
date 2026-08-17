@@ -6171,20 +6171,42 @@ async fn clonepack_seed_info(
     repo_id: &RepoId,
     branch: &str,
 ) -> Option<RefInfo> {
-    let info = ref_store
+    let moving = ref_store
         .load_branch(repo_id, branch)
         .await
         .ok()
         .flatten()?;
-    if info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS) {
-        return None;
+    let exact_key = exact_ref_store_key(branch, &moving.commit);
+    let info = ref_store
+        .load_branch(repo_id, &exact_key)
+        .await
+        .ok()
+        .flatten()?;
+    exact_ref_info_serves_commit(&info, "full", &moving.commit).then_some(info)
+}
+
+fn validate_clonepack_seed_identity<'a>(
+    info: &'a RefInfo,
+    manifest: &ClonepackManifest,
+) -> Result<&'a str> {
+    let seed_commit = info.full_clonepack.commit.as_str();
+    if seed_commit.is_empty() {
+        anyhow::bail!("seed clonepack is missing its artifact commit");
     }
-    let manifest = &info.full_clonepack.manifest;
-    if manifest.is_empty() {
-        None
-    } else {
-        Some(info)
+    validation::validate_object_id(seed_commit).context("invalid seed artifact commit")?;
+    if info.commit != seed_commit {
+        anyhow::bail!(
+            "seed exact row commit {} does not match artifact commit {seed_commit}",
+            info.commit
+        );
     }
+    if manifest.commit != seed_commit {
+        anyhow::bail!(
+            "seed manifest commit {} does not match artifact commit {seed_commit}",
+            manifest.commit
+        );
+    }
+    Ok(seed_commit)
 }
 
 fn seed_bare_mirror_from_clonepack(
@@ -6209,6 +6231,7 @@ fn seed_bare_mirror_from_clonepack(
         .with_context(|| format!("fetch seed clonepack manifest {manifest_hash}"))?;
     let manifest =
         ClonepackManifest::decode(manifest_bytes.as_slice()).context("decode seed clonepack")?;
+    let seed_commit = validate_clonepack_seed_identity(info, &manifest)?;
     if manifest.packs.is_empty() {
         anyhow::bail!("seed clonepack has no manifest packs");
     }
@@ -6283,12 +6306,6 @@ fn seed_bare_mirror_from_clonepack(
     }
 
     let bytes = install_manifest_pack_bytes(&tmp.path().join("objects").join("pack"), pack_pairs)?;
-    let seed_commit = if !info.full_clonepack.commit.is_empty() {
-        &info.full_clonepack.commit
-    } else {
-        &info.commit
-    };
-    validation::validate_object_id(seed_commit).context("invalid seed commit")?;
     let seed_branch = if branch == "HEAD" {
         if info.default_branch.is_empty() {
             "main"
@@ -9106,8 +9123,47 @@ mod tests {
         assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
     }
 
+    #[test]
+    fn clonepack_seed_requires_one_explicit_matching_commit() {
+        let commit = "a".repeat(40);
+        let mut info = RefInfo {
+            commit: commit.clone(),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: commit.clone(),
+                manifest: "manifest".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut manifest = ClonepackManifest {
+            commit: commit.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_clonepack_seed_identity(&info, &manifest).unwrap(),
+            commit
+        );
+
+        info.full_clonepack.commit.clear();
+        assert!(
+            validate_clonepack_seed_identity(&info, &manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("missing its artifact commit")
+        );
+
+        info.full_clonepack.commit = commit.clone();
+        manifest.commit = "b".repeat(40);
+        assert!(
+            validate_clonepack_seed_identity(&info, &manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("manifest commit")
+        );
+    }
+
     #[tokio::test]
-    async fn pending_body_keeps_the_four_field_shape() {
+    async fn pending_body_includes_the_selected_branch() {
         let response = artifact_pending_response(&"a".repeat(40), "rélease/東京", 3);
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
@@ -9122,9 +9178,10 @@ mod tests {
             .expect("read pending body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("pending JSON");
         let keys = body.as_object().expect("pending object");
-        assert_eq!(keys.len(), 4);
+        assert_eq!(keys.len(), 5);
         assert_eq!(body["code"], "artifact_pending");
         assert_eq!(body["commit"], "a".repeat(40));
+        assert_eq!(body["branch"], "rélease/東京");
         assert_eq!(body["status"], "building");
         assert_eq!(body["queue_depth"], 3);
     }
@@ -9351,6 +9408,7 @@ mod tests {
     struct CorruptingGetStorage {
         inner: StorageRef,
         target_hash: String,
+        hits: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -9358,6 +9416,7 @@ mod tests {
         fn get(&self, hash: &str) -> Result<Vec<u8>> {
             let mut data = self.inner.get(hash)?;
             if hash == self.target_hash && !data.is_empty() {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Flip a byte: keeps the length (so the size check passes) but
                 // makes the content hash mismatch what the manifest recorded.
                 data[0] ^= 0xff;
@@ -9444,16 +9503,41 @@ mod tests {
         branch: &str,
         provider: &ProviderInstance,
     ) -> SyncBuildResult {
+        let tip = git::ls_remote_tip_async(provider, repo_id, branch, None)
+            .await
+            .unwrap()
+            .expect("test branch tip");
+        let effective_branch = if branch == "HEAD" {
+            tip.default_branch
+                .clone()
+                .filter(|branch| !branch.is_empty())
+                .unwrap_or_else(|| branch.to_string())
+        } else {
+            branch.to_string()
+        };
+        let job = BuildJob {
+            repo_id: repo_id.clone(),
+            branch: effective_branch.clone(),
+            rev: None,
+            admitted_commit: Some(tip.commit.clone()),
+            admitted_default_branch: tip.default_branch.clone(),
+            credential: None,
+            recheck: 0,
+            size_bytes: None,
+        };
+        prepare_exact_admission(state, &job, true)
+            .await
+            .expect("prepare exact test admission");
         let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
         let lock = repo_lock(&state.sync_locks, repo_id).await;
         do_sync(
             &state.cas,
             &mirror_dir,
             repo_id,
-            branch,
+            &effective_branch,
             None,
-            None,
-            None,
+            Some(&tip.commit),
+            tip.default_branch.as_deref(),
             &state.ref_store,
             true,
             &state.storage,
@@ -9528,9 +9612,10 @@ mod tests {
 
         let second = do_sync_for_test(&state, &repo_id, "main", &provider).await;
         assert_eq!(second.info.commit, c2);
-        assert!(
-            seed_hits.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "cold sync should read the prior full clonepack manifest from storage"
+        assert_eq!(
+            seed_hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "cold sync should attempt the prior exact clonepack seed once"
         );
 
         let seeded_mirror = state.repo_root.join(repo_id.mirror_dir_name());
@@ -9599,15 +9684,22 @@ mod tests {
             &[("a.txt", b"2\n"), ("corrupt.txt", b"detect me\n")],
         );
 
+        let seed_attempts = Arc::new(AtomicUsize::new(0));
         state.storage = Arc::new(CorruptingGetStorage {
             inner: state.storage.clone(),
             target_hash: corrupt_pack_hash,
+            hits: seed_attempts.clone(),
         });
 
         // The seed must DETECT the corruption and fall back to a clean full clone,
         // never silently promote a corrupt mirror.
         let second = do_sync_for_test(&state, &repo_id, "main", &provider).await;
         assert_eq!(second.info.commit, c2);
+        assert_eq!(
+            seed_attempts.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "cold sync should attempt and reject the corrupt exact clonepack seed once"
+        );
 
         let recovered_mirror = state.repo_root.join(repo_id.mirror_dir_name());
         let full_mirror = tmp.path().join("full-clone-corruptseed.git");
@@ -9635,7 +9727,7 @@ mod tests {
         crate::test_fixture::commit(&origin, &[("a.txt", b"1\n")]);
 
         let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
+        let mut state = test_state(&tmp);
         let repo_id = RepoId::github("acme/seedmiss");
         let provider = state.provider_registry.get("github").unwrap().clone();
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
@@ -9649,8 +9741,20 @@ mod tests {
             &[("a.txt", b"2\n"), ("fallback.txt", b"full clone\n")],
         );
 
+        let seed_attempts = Arc::new(AtomicUsize::new(0));
+        state.storage = Arc::new(CountingGetStorage {
+            inner: state.storage.clone(),
+            target_hash: seed_manifest,
+            hits: seed_attempts.clone(),
+        });
+
         let second = do_sync_for_test(&state, &repo_id, "main", &provider).await;
         assert_eq!(second.info.commit, c2);
+        assert_eq!(
+            seed_attempts.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "cold sync should attempt the missing exact clonepack seed once"
+        );
 
         let fallback_mirror = state.repo_root.join(repo_id.mirror_dir_name());
         let full_mirror = tmp.path().join("full-clone-seedmiss.git");

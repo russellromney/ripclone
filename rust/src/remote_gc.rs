@@ -706,6 +706,8 @@ mod tests {
             archive_chunks: vec![archive_hash],
             full_clonepack: ClonepackArtifacts {
                 manifest: manifest_hash,
+                metadata_chunk: metadata_hash,
+                commit: "abc".to_string(),
                 ..Default::default()
             },
             shallow_clonepack: ClonepackArtifacts::default(),
