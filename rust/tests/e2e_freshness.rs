@@ -48,10 +48,13 @@ impl RecheckBarrier {
 
     /// Wait until the server has entered the next re-check.
     async fn wait_entered(&mut self) {
-        self.entered_rx
-            .wait_for(|v| *v > self.last_entered)
-            .await
-            .expect("recheck barrier sender not dropped");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.entered_rx.wait_for(|v| *v > self.last_entered),
+        )
+        .await
+        .expect("timed out waiting for re-check barrier")
+        .expect("recheck barrier sender not dropped");
         self.last_entered += 1;
     }
 

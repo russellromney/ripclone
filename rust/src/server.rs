@@ -8342,7 +8342,7 @@ async fn post_build_freshness_recheck(
 ) {
     let max = recheck_max();
     // Disabled, or a rev-pinned build (no moving tip to chase): nothing to do.
-    if max == 0 || job.rev.is_some() || job.recheck >= max {
+    if max == 0 || job.rev.is_some() {
         return;
     }
     let repo_id = &job.repo_id;
@@ -8359,6 +8359,13 @@ async fn post_build_freshness_recheck(
         // Wait for the test to advance the proceed counter past the value we saw
         // on entry. A closed channel means the barrier was torn down; just continue.
         let _ = proceed_rx.wait_for(|v| *v > seen).await;
+    }
+
+    // Stop once the re-check chain hits the cap; the poller picks up any
+    // remainder. The test-only barrier above lets the cap test move the tip
+    // before this decision without permitting a provider probe at the cap.
+    if job.recheck >= max {
+        return;
     }
 
     let credential = match state.broker.fetch_credential(repo_id, None) {
