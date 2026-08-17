@@ -1,4 +1,3 @@
-use anyhow::Context;
 use clap::ValueEnum;
 use std::str::FromStr;
 
