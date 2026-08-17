@@ -64,6 +64,45 @@ struct ExactRevisionUnavailableResponse {
     branch: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncAtPin {
+    commit: String,
+    branch: String,
+}
+
+fn observe_sync_at_identity(
+    pin: &mut Option<SyncAtPin>,
+    commit: &str,
+    branch: &str,
+    response_kind: &str,
+) -> Result<()> {
+    crate::validation::validate_object_id(commit)
+        .with_context(|| format!("validate commit in exact revision {response_kind} response"))?;
+    if branch.is_empty() {
+        anyhow::bail!(
+            "sync integrity error: exact revision {response_kind} response omitted branch"
+        );
+    }
+    crate::validation::validate_git_rev(branch)
+        .with_context(|| format!("validate branch in exact revision {response_kind} response"))?;
+
+    if let Some(expected) = pin {
+        if expected.commit != commit || expected.branch != branch {
+            anyhow::bail!(
+                "sync integrity error: exact revision pin {}@{} changed to {branch}@{commit} in a {response_kind} response",
+                expected.branch,
+                expected.commit
+            );
+        }
+    } else {
+        *pin = Some(SyncAtPin {
+            commit: commit.to_string(),
+            branch: branch.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Result of one ordinary sync/add admission request. A caller that only needs
 /// readiness can use [`Client::sync_repo`] / [`Client::add_repo`], which poll
 /// exact pinned metadata after a 202. CLI and webhook-style callers can use the
@@ -1926,6 +1965,7 @@ impl Client {
     ) -> Result<RefResponse> {
         let mut selected_rev = rev.to_string();
         let mut selected_branch = branch.map(str::to_string);
+        let mut pin = None;
         // With the async build queue the server may return 202 (build still
         // running) or 503 (queue full). Each POST blocks server-side until its
         // wait window elapses, so we just retry — coalescing means a retry
@@ -1954,7 +1994,12 @@ impl Client {
             let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
             let status = resp.status();
             if status == reqwest::StatusCode::OK {
-                return Ok(resp.json().await?);
+                let ready: RefResponse = resp
+                    .json()
+                    .await
+                    .context("decode exact revision ready response")?;
+                observe_sync_at_identity(&mut pin, &ready.commit, &ready.branch, "200")?;
+                return Ok(ready);
             }
             if status == reqwest::StatusCode::ACCEPTED {
                 let pending: ArtifactPendingResponse = resp
@@ -1964,12 +2009,9 @@ impl Client {
                 if pending.code != "artifact_pending" || pending.status != "building" {
                     anyhow::bail!("invalid exact revision pending response");
                 }
-                crate::validation::validate_object_id(&pending.commit)
-                    .context("validate exact revision selected by server")?;
+                observe_sync_at_identity(&mut pin, &pending.commit, &pending.branch, "202")?;
                 selected_rev = pending.commit;
-                if !pending.branch.is_empty() {
-                    selected_branch = Some(pending.branch);
-                }
+                selected_branch = Some(pending.branch);
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(poll).await;
                     continue;
@@ -1981,10 +2023,12 @@ impl Client {
                     .json()
                     .await
                     .context("decode exact revision queue response")?;
-                crate::validation::validate_object_id(&unavailable.commit)
-                    .context("validate queued exact revision selected by server")?;
-                crate::validation::validate_git_rev(&unavailable.branch)
-                    .context("validate exact revision branch selected by server")?;
+                observe_sync_at_identity(
+                    &mut pin,
+                    &unavailable.commit,
+                    &unavailable.branch,
+                    "503",
+                )?;
                 selected_rev = unavailable.commit;
                 selected_branch = Some(unavailable.branch);
                 if attempt + 1 < max_attempts {
@@ -4371,6 +4415,60 @@ fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SYNC_AT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SYNC_AT_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn sync_at_response_sequence_keeps_one_identity_across_all_statuses() {
+        let mut pin = None;
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "503").unwrap();
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "200").unwrap();
+        assert_eq!(
+            pin,
+            Some(SyncAtPin {
+                commit: SYNC_AT_B.to_string(),
+                branch: "main".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn sync_at_response_sequence_rejects_commit_change_on_later_202() {
+        let mut pin = None;
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
+        let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", "202")
+            .expect_err("later pending response must not repin");
+        assert!(format!("{error:#}").contains("sync integrity error"));
+    }
+
+    #[test]
+    fn sync_at_response_sequence_rejects_branch_change_on_later_503() {
+        let mut pin = None;
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
+        let error = observe_sync_at_identity(&mut pin, SYNC_AT_B, "release", "503")
+            .expect_err("queue response must preserve the selected branch");
+        assert!(format!("{error:#}").contains("sync integrity error"));
+    }
+
+    #[test]
+    fn sync_at_response_sequence_rejects_commit_change_on_final_200() {
+        let mut pin = None;
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
+        let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", "200")
+            .expect_err("ready response must preserve the selected commit");
+        assert!(format!("{error:#}").contains("sync integrity error"));
+    }
+
+    #[test]
+    fn sync_at_pending_response_requires_branch_identity() {
+        let mut pin = None;
+        let error = observe_sync_at_identity(&mut pin, SYNC_AT_B, "", "202")
+            .expect_err("pending response without a branch must fail closed");
+        assert!(format!("{error:#}").contains("omitted branch"));
+        assert!(pin.is_none());
+    }
 
     #[test]
     fn access_error_hints_are_actionable() {
