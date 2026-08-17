@@ -228,6 +228,8 @@ async fn pending_metadata_server(commit: &str) -> String {
                     serde_json::json!({
                         "code": "artifact_pending",
                         "commit": commit,
+                        "status": "building",
+                        "queue_depth": 1,
                         "top_up_supported": true
                     })
                     .to_string(),
