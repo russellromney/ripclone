@@ -1869,9 +1869,10 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/guarded-cache");
+    let exact_key = format!("main#{a}");
     let mut valid_a = None;
     for _ in 0..200 {
-        if let Ok(Some(info)) = store.load_branch(&repo_id, "main").await
+        if let Ok(Some(info)) = store.load_branch(&repo_id, &exact_key).await
             && info.build_status.is_none()
             && !info.full_clonepack.manifest.is_empty()
         {
@@ -1886,9 +1887,9 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
     let mut mismatched = valid_a.clone();
     mismatched.full_clonepack.commit = B.to_string();
     store
-        .save_branch(&repo_id, "main", &mismatched)
+        .save_branch(&repo_id, &exact_key, &mismatched)
         .await
-        .expect("publish target-A/artifact-B row");
+        .expect("publish target-A/artifact-B exact row");
 
     let http = reqwest::Client::new();
     let request = || {
@@ -1912,9 +1913,9 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
     }
 
     store
-        .save_branch(&repo_id, "main", &valid_a)
+        .save_branch(&repo_id, &exact_key, &valid_a)
         .await
-        .expect("restore guarded A row");
+        .expect("restore guarded exact A row");
     let ready = request().send().await.expect("guarded lookup");
     assert_eq!(ready.status(), StatusCode::OK);
     let ready: serde_json::Value = ready.json().await.expect("ready A response");
@@ -1924,9 +1925,9 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
     // next lookup is a real response-cache hit and must contain only guarded A,
     // never the earlier rejected target-A/artifact-B snapshot.
     store
-        .save_branch(&repo_id, "main", &mismatched)
+        .save_branch(&repo_id, &exact_key, &mismatched)
         .await
-        .expect("restore mismatched durable row");
+        .expect("restore mismatched durable exact row");
     let cached = request().send().await.expect("cached lookup");
     assert_eq!(cached.status(), StatusCode::OK);
     let cached: serde_json::Value = cached.json().await.expect("cached A response");
@@ -2010,7 +2011,7 @@ async fn cached_mismatched_manifest_is_rejected_on_every_use() {
     assert!(!target.exists());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn worktree_rejects_mismatched_manifest_before_git_registration() {
     let _guard = env_lock().lock().await;
     init(false);
@@ -2087,7 +2088,13 @@ async fn cancelling_real_clone_waits_for_midx_writer_before_staging_cleanup() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let mut info = info.expect("full cancellation fixture settled");
+    let moving = info.expect("full cancellation fixture settled");
+    let exact_key = format!("main#{}", moving.commit);
+    let mut info = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load exact cancellation fixture")
+        .expect("exact cancellation fixture exists");
     let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
     let bytes = storage
         .get(&info.full_clonepack.manifest)
@@ -2101,9 +2108,9 @@ async fn cancelling_real_clone_waits_for_midx_writer_before_staging_cleanup() {
     info.full_clonepack.manifest = hash.clone();
     info.full_clonepack.midx.clear();
     store
-        .save_branch(&repo_id, "main", &info)
+        .save_branch(&repo_id, &exact_key, &info)
         .await
-        .expect("publish no-MIDX fixture");
+        .expect("publish no-MIDX exact fixture");
 
     let root = tempfile::tempdir().expect("cancellation output");
     let wrapper_dir = root.path().join("bin");
@@ -2420,15 +2427,21 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
         .expect("B reached phase-one publication")
         .expect("phase-one barrier alive");
 
-    let moving_b = store
+    let moving_a = store
         .load_branch(&repo_id, "main")
         .await
-        .expect("load paused B")
-        .expect("paused B row");
-    assert_eq!(moving_b.commit, b);
-    assert_eq!(moving_b.full_clonepack.commit, a);
+        .expect("load moving row while B is paused")
+        .expect("moving A row");
+    assert_eq!(moving_a.commit, a, "moving main must not publish B yet");
+    let exact_b = store
+        .load_branch(&repo_id, &format!("main#{b}"))
+        .await
+        .expect("load paused exact B")
+        .expect("paused exact B row");
+    assert_eq!(exact_b.commit, b, "exact B must be durable at the barrier");
+    assert_eq!(exact_b.full_clonepack.commit, a);
     assert_ne!(
-        moving_b
+        exact_b
             .packs
             .iter()
             .map(|pack| pack.pack.as_str())
@@ -2462,10 +2475,10 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
     assert_eq!(top_up["top_up_base"]["commit"], a);
     assert_eq!(
         top_up["top_up_base"]["clonepack_manifest"],
-        moving_b.full_clonepack.manifest
+        exact_b.full_clonepack.manifest
     );
     assert_ne!(
-        top_up["top_up_base"]["metadata_chunk"], moving_b.shallow_clonepack.metadata_chunk,
+        top_up["top_up_base"]["metadata_chunk"], exact_b.shallow_clonepack.metadata_chunk,
         "the response must not mix B's shallow metadata into carried A"
     );
 
@@ -2518,6 +2531,12 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
         .expect("sync B completed after barrier release")
         .expect("join sync B")
         .expect("sync B");
+    let moving_b = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load moving B after release")
+        .expect("moving B row");
+    assert_eq!(moving_b.commit, b);
 }
 
 #[tokio::test]

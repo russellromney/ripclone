@@ -462,9 +462,9 @@ impl Server {
 }
 
 /// Replace only the embedded commit of a published full manifest, then point
-/// the real ref row at those content-addressed bytes. This creates a realistic
-/// response-commit A / manifest-commit B integrity fixture without changing
-/// production code or bypassing the normal artifact endpoint.
+/// the authoritative exact row at those content-addressed bytes. This creates a
+/// realistic response-commit A / manifest-commit B integrity fixture without
+/// changing production code or bypassing the normal artifact endpoint.
 pub async fn replace_full_manifest_commit(
     server: &Server,
     repo_path: &str,
@@ -484,8 +484,13 @@ pub async fn replace_full_manifest_commit(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let mut info = published.expect("full manifest publication settled");
-    let pinned = info.commit.clone();
+    let moving = published.expect("full manifest publication settled");
+    let pinned = moving.commit.clone();
+    let exact_key = format!("main#{pinned}");
+    let mut info = ripclone::ref_store::RefStore::load_branch(&store, &repo_id, &exact_key)
+        .await
+        .expect("load exact full-manifest row")
+        .expect("exact full-manifest row exists");
     let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
     let bytes = storage
         .get(&info.full_clonepack.manifest)
@@ -499,9 +504,9 @@ pub async fn replace_full_manifest_commit(
         .put(&hash, &bytes)
         .expect("publish mismatched manifest fixture");
     info.full_clonepack.manifest = hash.clone();
-    ripclone::ref_store::RefStore::save_branch(&store, &repo_id, "main", &info)
+    ripclone::ref_store::RefStore::save_branch(&store, &repo_id, &exact_key, &info)
         .await
-        .expect("publish mismatched full-manifest ref");
+        .expect("publish mismatched exact full-manifest ref");
     (pinned, hash)
 }
 
