@@ -38,6 +38,7 @@ pub struct DepthSpec {
 /// partial config (e.g. only `compression_level`) merges cleanly over the
 /// defaults; an empty config behaves exactly like today.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     /// Named depth variants to build. Empty = the default `shallow` + `full`.
     #[serde(default)]
@@ -379,6 +380,21 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_removed_configuration_fields() {
+        let hot_files = serde_json::from_str::<RepoConfig>(r#"{"hot_files":["src/**"]}"#)
+            .expect_err("removed hot_files must not be silently ignored");
+        assert!(hot_files.to_string().contains("unknown field `hot_files`"));
+
+        let enabled_modes = serde_json::from_str::<RepoConfig>(r#"{"enabled_modes":["files"]}"#)
+            .expect_err("removed enabled_modes must not be silently ignored");
+        assert!(
+            enabled_modes
+                .to_string()
+                .contains("unknown field `enabled_modes`")
+        );
     }
 
     #[tokio::test]

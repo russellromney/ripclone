@@ -1180,7 +1180,7 @@ async fn main() -> Result<()> {
                      not --depth {depth}"
                 );
             }
-            let mode = resolve_mode(mode, config.clone.mode.as_deref());
+            let mode = resolve_mode(mode, config.clone.mode.as_deref())?;
             // Bridge the --temp flag to the env var the overlay check reads. Set
             // here, before any clone work reads it.
             if temp {
