@@ -29,6 +29,8 @@ struct RefResponse {
     parent_commit: Option<String>,
     clonepack_manifest: String,
     metadata_chunk: String,
+    shallow: bool,
+    archive_ready: bool,
 }
 
 #[derive(Clone, Default)]
@@ -57,6 +59,8 @@ async fn sync_capture(
         parent_commit: None,
         clonepack_manifest: "manifest".into(),
         metadata_chunk: "metadata".into(),
+        shallow: false,
+        archive_ready: true,
     })
 }
 
