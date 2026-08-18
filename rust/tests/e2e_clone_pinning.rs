@@ -126,6 +126,7 @@ fn pending(commit: &str) -> (StatusCode, serde_json::Value) {
         json!({
             "code": "artifact_pending",
             "commit": commit,
+            "branch": "main",
             "status": "building",
             "queue_depth": 1
         }),
@@ -134,6 +135,7 @@ fn pending(commit: &str) -> (StatusCode, serde_json::Value) {
 
 fn pending_on(commit: &str, branch: &str) -> (StatusCode, serde_json::Value) {
     let (status, mut body) = pending(commit);
+    body["branch"] = json!(branch);
     body["__content_location"] = json!(branch);
     (status, body)
 }
@@ -271,6 +273,7 @@ async fn ref_barrier_proxy(
                 serde_json::to_vec(&json!({
                     "code": "artifact_pending",
                     "commit": commit,
+                    "branch": pending_content_location.as_deref(),
                     "status": "building",
                     "queue_depth": 1
                 }))

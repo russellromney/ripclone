@@ -3046,10 +3046,12 @@ async fn get_ref_inner(
                         state.metrics.record_error();
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
-                            Json(ErrorResponse {
+                            Json(ExactRevisionUnavailableResponse {
                                 error: format!(
                                     "exact pinned commit {pinned} is unavailable: {error}"
                                 ),
+                                commit: pinned.to_string(),
+                                branch: branch.clone(),
                             }),
                         )
                             .into_response();
@@ -3377,7 +3379,11 @@ async fn get_ref_inner(
                         );
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
-                            Json(ErrorResponse { error }),
+                            Json(ExactRevisionUnavailableResponse {
+                                error,
+                                commit: commit.clone(),
+                                branch: effective_branch.clone(),
+                            }),
                         )
                             .into_response();
                     }

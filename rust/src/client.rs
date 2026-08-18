@@ -41,7 +41,6 @@ struct ServerError {
 struct ArtifactPendingResponse {
     code: String,
     commit: String,
-    #[serde(default)]
     branch: String,
     status: String,
     queue_depth: usize,
@@ -67,7 +66,12 @@ struct ExactRevisionUnavailableResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SyncAtPin {
     commit: String,
-    branch: String,
+    branch: Option<String>,
+}
+
+fn exact_commit_from_revision(rev: Option<&str>) -> Option<String> {
+    rev.filter(|value| crate::validation::validate_object_id(value).is_ok())
+        .map(str::to_string)
 }
 
 fn observe_sync_at_identity(
@@ -87,18 +91,56 @@ fn observe_sync_at_identity(
         .with_context(|| format!("validate branch in exact revision {response_kind} response"))?;
 
     if let Some(expected) = pin {
-        if expected.commit != commit || expected.branch != branch {
+        if expected.commit != commit
+            || expected
+                .branch
+                .as_deref()
+                .is_some_and(|expected_branch| expected_branch != branch)
+        {
             anyhow::bail!(
                 "sync integrity error: exact revision pin {}@{} changed to {branch}@{commit} in a {response_kind} response",
-                expected.branch,
+                expected.branch.as_deref().unwrap_or("<unresolved>"),
                 expected.commit
             );
+        }
+        if expected.branch.is_none() {
+            expected.branch = Some(branch.to_string());
         }
     } else {
         *pin = Some(SyncAtPin {
             commit: commit.to_string(),
-            branch: branch.to_string(),
+            branch: Some(branch.to_string()),
         });
+    }
+    Ok(())
+}
+
+fn validate_ref_response_identity(
+    expected_commit: Option<&str>,
+    expected_branch: Option<&str>,
+    commit: &str,
+    branch: &str,
+    response_kind: &str,
+    repo_path: &str,
+) -> Result<()> {
+    crate::validation::validate_object_id(commit)
+        .with_context(|| format!("invalid {response_kind} commit for {repo_path}"))?;
+    crate::validation::validate_git_rev(branch)
+        .with_context(|| format!("invalid {response_kind} branch for {repo_path}"))?;
+    if let Some(expected) = expected_commit
+        && commit != expected
+    {
+        anyhow::bail!(
+            "ref integrity error: expected commit {expected} changed to {commit} in a {response_kind} response"
+        );
+    }
+    if let Some(expected) = expected_branch
+        && expected != "HEAD"
+        && branch != expected
+    {
+        anyhow::bail!(
+            "ref integrity error: resolved branch {expected} changed to {branch} in a {response_kind} response"
+        );
     }
     Ok(())
 }
@@ -1285,6 +1327,7 @@ impl Client {
         clonepack: Option<&str>,
         rev: Option<&str>,
     ) -> Result<RefResponse> {
+        let expected_commit = exact_commit_from_revision(rev);
         let mut pinned = None;
         let mut resolved_branch = None;
         let mut clone_id = None;
@@ -1295,6 +1338,7 @@ impl Client {
                 branch,
                 clonepack,
                 rev,
+                expected_commit.as_deref(),
                 &mut pinned,
                 &mut resolved_branch,
                 clonepack.unwrap_or("full"),
@@ -1315,6 +1359,7 @@ impl Client {
         branch: &str,
         clonepack: Option<&str>,
         rev: Option<&str>,
+        expected_commit: Option<&str>,
         pinned: &mut Option<String>,
         resolved_branch: &mut Option<String>,
         pending_mode: &str,
@@ -1334,7 +1379,7 @@ impl Client {
                 branch
             };
             // Branches are wildcard path values, not URL syntax. Re-encode the
-            // concrete branch learned from Content-Location before composing
+            // concrete branch learned from the first response before composing
             // the next request so valid delimiters such as `#` and `%` cannot
             // become a fragment or otherwise change the request target.
             let encoded_branch = urlencoding::encode(request_branch);
@@ -1396,31 +1441,24 @@ impl Client {
                         pending.status
                     );
                 }
-                crate::validation::validate_object_id(&pending.commit)
-                    .with_context(|| format!("invalid pending commit for {repo_path}"))?;
-                if let Some(expected) = pinned.as_deref() {
-                    if pending.commit != expected {
-                        anyhow::bail!(
-                            "ref integrity error: pinned commit {expected} changed to {} in a pending response",
-                            pending.commit
-                        );
-                    }
-                } else {
-                    *pinned = Some(pending.commit.clone());
+                validate_ref_response_identity(
+                    pinned.as_deref().or(expected_commit),
+                    resolved_branch.as_deref(),
+                    &pending.commit,
+                    &pending.branch,
+                    "pending",
+                    repo_path,
+                )?;
+                if let Some(content_location_branch) = pending_branch.as_deref()
+                    && content_location_branch != pending.branch
+                {
+                    anyhow::bail!(
+                        "ref integrity error: pending response branch {} disagrees with Content-Location {content_location_branch}",
+                        pending.branch
+                    );
                 }
-                if let Some(response_branch) = pending_branch.filter(|value| !value.is_empty()) {
-                    crate::validation::validate_git_rev(&response_branch)
-                        .with_context(|| format!("invalid pending branch for {repo_path}"))?;
-                    if let Some(expected) = resolved_branch.as_deref()
-                        && expected != "HEAD"
-                        && response_branch != expected
-                    {
-                        anyhow::bail!(
-                            "ref integrity error: resolved branch {expected} changed to {response_branch} in a pending response"
-                        );
-                    }
-                    *resolved_branch = Some(response_branch);
-                }
+                *pinned = Some(pending.commit.clone());
+                *resolved_branch = Some(pending.branch.clone());
                 polled = true;
                 *cold = true;
                 if requested_top_up {
@@ -1494,6 +1532,24 @@ impl Client {
             }
             if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
                 polled = true;
+                let unavailable = if pinned.is_some() || expected_commit.is_some() {
+                    let unavailable: ExactRevisionUnavailableResponse = resp
+                        .json()
+                        .await
+                        .with_context(|| format!("invalid unavailable response for {repo_path}"))?;
+                    validate_ref_response_identity(
+                        pinned.as_deref().or(expected_commit),
+                        resolved_branch.as_deref(),
+                        &unavailable.commit,
+                        &unavailable.branch,
+                        "503",
+                        repo_path,
+                    )?;
+                    *resolved_branch = Some(unavailable.branch.clone());
+                    Some(unavailable)
+                } else {
+                    None
+                };
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
@@ -1504,6 +1560,13 @@ impl Client {
                 if let Some(commit) = pinned.as_deref() {
                     anyhow::bail!(
                         "ref lookup for pinned commit {commit} remained unavailable after {max_attempts} attempts"
+                    );
+                }
+                if let Some(unavailable) = unavailable {
+                    anyhow::bail!(
+                        "ref lookup for exact commit {} remained unavailable after {max_attempts} attempts: {}",
+                        unavailable.commit,
+                        unavailable.error
                     );
                 }
                 anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
@@ -1521,29 +1584,15 @@ impl Client {
                     *first_clone_id = clone_id;
                 }
                 let mut info: RefResponse = resp.json().await?;
-                crate::validation::validate_object_id(&info.commit)
-                    .with_context(|| format!("invalid ready commit for {repo_path}"))?;
-                crate::validation::validate_git_rev(&info.branch)
-                    .with_context(|| format!("invalid ready branch for {repo_path}"))?;
-                if let Some(expected) = pinned.as_deref() {
-                    if info.commit != expected {
-                        anyhow::bail!(
-                            "ref integrity error: pinned commit {expected} changed to {} in a ready response",
-                            info.commit
-                        );
-                    }
-                } else {
-                    *pinned = Some(info.commit.clone());
-                }
-                if let Some(expected) = resolved_branch.as_deref()
-                    && expected != "HEAD"
-                    && info.branch != expected
-                {
-                    anyhow::bail!(
-                        "ref integrity error: resolved branch {expected} changed to {} in a ready response",
-                        info.branch
-                    );
-                }
+                validate_ref_response_identity(
+                    pinned.as_deref().or(expected_commit),
+                    resolved_branch.as_deref(),
+                    &info.commit,
+                    &info.branch,
+                    "ready",
+                    repo_path,
+                )?;
+                *pinned = Some(info.commit.clone());
                 *resolved_branch = Some(info.branch.clone());
                 *cold |= polled;
                 info.clone_id = first_clone_id.clone();
@@ -1918,7 +1967,7 @@ impl Client {
         let mut pinned = Some(admission.commit.clone());
         // HEAD is a selector, not the concrete metadata key. Let the first
         // exact pinned GET learn the advertised default branch (for example,
-        // `main`) from Content-Location; concrete admissions remain pinned to
+        // `main`) from its response identity; concrete admissions remain pinned to
         // their admitted branch.
         let mut resolved_branch = (admission.branch != "HEAD").then(|| admission.branch.clone());
         let mut clone_id = None;
@@ -1928,6 +1977,7 @@ impl Client {
                 repo_path,
                 &admission.branch,
                 Some("full"),
+                None,
                 None,
                 &mut pinned,
                 &mut resolved_branch,
@@ -1965,7 +2015,10 @@ impl Client {
     ) -> Result<RefResponse> {
         let mut selected_rev = rev.to_string();
         let mut selected_branch = branch.map(str::to_string);
-        let mut pin = None;
+        let mut pin = exact_commit_from_revision(Some(rev)).map(|commit| SyncAtPin {
+            commit,
+            branch: branch.map(str::to_string),
+        });
         // With the async build queue the server may return 202 (build still
         // running) or 503 (queue full). Each POST blocks server-side until its
         // wait window elapses, so we just retry — coalescing means a retry
@@ -2198,6 +2251,7 @@ impl Client {
 
         let mut local_bench = Benchmark::new();
         let bench = bench.unwrap_or(&mut local_bench);
+        let expected_commit = exact_commit_from_revision(rev);
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
@@ -2221,6 +2275,7 @@ impl Client {
                 branch,
                 clonepack,
                 rev,
+                expected_commit.as_deref(),
                 &mut identity.pinned,
                 &mut identity.resolved_branch,
                 metric_mode,
@@ -2276,6 +2331,7 @@ impl Client {
                         branch,
                         clonepack,
                         rev,
+                        expected_commit.as_deref(),
                         &mut identity.pinned,
                         &mut identity.resolved_branch,
                         metric_mode,
@@ -4429,9 +4485,25 @@ mod tests {
             pin,
             Some(SyncAtPin {
                 commit: SYNC_AT_B.to_string(),
-                branch: "main".to_string(),
+                branch: Some("main".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn explicit_sync_sha_rejects_initial_commit_change_for_every_response_status() {
+        for response_kind in ["202", "503", "200"] {
+            let mut pin = exact_commit_from_revision(Some(SYNC_AT_B)).map(|commit| SyncAtPin {
+                commit,
+                branch: None,
+            });
+            let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", response_kind)
+                .expect_err("an explicit SHA must be the initial sync pin");
+            assert!(
+                format!("{error:#}").contains("sync integrity error"),
+                "unexpected {response_kind} error: {error:#}"
+            );
+        }
     }
 
     #[test]

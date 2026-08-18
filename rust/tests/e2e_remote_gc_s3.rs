@@ -502,6 +502,7 @@ async fn ref_trace_forward(
             serde_json::to_vec(&serde_json::json!({
                 "code": "artifact_pending",
                 "commit": commit,
+                "branch": branch,
                 "status": "building",
                 "queue_depth": 1
             }))

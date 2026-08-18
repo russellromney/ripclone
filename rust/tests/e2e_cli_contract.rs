@@ -8,6 +8,8 @@ use axum::body::Body;
 use axum::http::{Response, StatusCode};
 use axum::routing::any;
 use common::*;
+use ripclone::client::Client;
+use ripclone::mode::CloneMode;
 use ripclone::provider::{ProviderConfig, ProviderRegistry, RepoId};
 use ripclone::queue::{BuildJob, EnqueueOutcome, Enqueued, JobQueue};
 use ripclone::ref_store::{FileRefStore, RefStore};
@@ -228,6 +230,7 @@ async fn pending_metadata_server(commit: &str) -> String {
                     serde_json::json!({
                         "code": "artifact_pending",
                         "commit": commit,
+                        "branch": "main",
                         "status": "building",
                         "queue_depth": 1,
                         "top_up_supported": true
@@ -245,6 +248,165 @@ async fn pending_metadata_server(commit: &str) -> String {
         let _ = axum::serve(listener, app).await;
     });
     url
+}
+
+#[derive(Clone, Copy)]
+enum IdentityResponseStatus {
+    Pending,
+    Unavailable,
+    Ready,
+}
+
+async fn identity_response_server(
+    status: IdentityResponseStatus,
+    commit: &str,
+    body_branch: Option<&str>,
+    content_location: Option<&str>,
+) -> String {
+    let commit = commit.to_string();
+    let body_branch = body_branch.map(str::to_string);
+    let content_location = content_location.map(str::to_string);
+    let app = Router::new().fallback(any(move || {
+        let commit = commit.clone();
+        let body_branch = body_branch.clone();
+        let content_location = content_location.clone();
+        async move {
+            let mut body = match status {
+                IdentityResponseStatus::Pending => serde_json::json!({
+                    "code": "artifact_pending",
+                    "commit": commit,
+                    "status": "building",
+                    "queue_depth": 1
+                }),
+                IdentityResponseStatus::Unavailable => serde_json::json!({
+                    "error": "queue unavailable",
+                    "commit": commit
+                }),
+                IdentityResponseStatus::Ready => serde_json::json!({
+                    "owner": "acme",
+                    "repo": "identity",
+                    "provider": "github",
+                    "host": "github.com",
+                    "origin_url": "https://github.com/acme/identity.git",
+                    "default_branch": "main",
+                    "commit": commit,
+                    "parent_commit": null,
+                    "clonepack_manifest": "manifest",
+                    "metadata_chunk": "metadata",
+                    "shallow": false,
+                    "archive_ready": true
+                }),
+            };
+            if let Some(branch) = body_branch {
+                body["branch"] = serde_json::Value::String(branch);
+            }
+            let http_status = match status {
+                IdentityResponseStatus::Pending => StatusCode::ACCEPTED,
+                IdentityResponseStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                IdentityResponseStatus::Ready => StatusCode::OK,
+            };
+            let mut response = Response::builder()
+                .status(http_status)
+                .header("content-type", "application/json");
+            if let Some(location) = content_location {
+                response = response.header("content-location", location);
+            }
+            response.body(Body::from(body.to_string())).unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind identity response server");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    url
+}
+
+#[tokio::test]
+async fn explicit_sha_is_the_initial_sync_and_clone_pin_for_every_response_status() {
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    for status in [
+        IdentityResponseStatus::Pending,
+        IdentityResponseStatus::Unavailable,
+        IdentityResponseStatus::Ready,
+    ] {
+        let server = identity_response_server(status, C, Some("main"), Some("main")).await;
+        let client = Client::new(server);
+        let sync_error = client
+            .sync_repo_at("acme/identity", Some(B), None)
+            .await
+            .expect_err("sync --at B must reject an initial response pinned to C");
+        assert!(
+            format!("{sync_error:#}").contains("integrity error"),
+            "unexpected sync mismatch: {sync_error:#}"
+        );
+
+        let output = tempfile::tempdir().expect("clone identity output");
+        let target = output.path().join("target");
+        let clone_error = client
+            .install_repo_with_mode_at(
+                "acme/identity",
+                "HEAD",
+                Some(B),
+                &target,
+                CloneMode::Editable,
+                None,
+                None,
+            )
+            .await
+            .expect_err("clone --at B must reject an initial response pinned to C");
+        assert!(
+            format!("{clone_error:#}").contains("integrity error"),
+            "unexpected clone mismatch: {clone_error:#}"
+        );
+        assert!(!target.exists());
+    }
+}
+
+#[tokio::test]
+async fn ordinary_clone_requires_pending_body_branch_and_matching_content_location() {
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    for (body_branch, content_location, expected) in [
+        (None, Some("main"), "missing field `branch`"),
+        (
+            Some("main"),
+            Some("release"),
+            "disagrees with Content-Location",
+        ),
+    ] {
+        let server = identity_response_server(
+            IdentityResponseStatus::Pending,
+            B,
+            body_branch,
+            content_location,
+        )
+        .await;
+        let client = Client::new(server);
+        let output = tempfile::tempdir().expect("pending identity output");
+        let target = output.path().join("target");
+        let error = client
+            .install_repo_with_mode_at(
+                "acme/identity",
+                "HEAD",
+                None,
+                &target,
+                CloneMode::Editable,
+                None,
+                None,
+            )
+            .await
+            .expect_err("contradictory pending identity must fail closed");
+        assert!(
+            format!("{error:#}").contains(expected),
+            "expected {expected:?}, got {error:#}"
+        );
+        assert!(!target.exists());
+    }
 }
 
 fn hanging_origin() -> (
