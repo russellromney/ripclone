@@ -72,8 +72,7 @@ async fn enqueue_sized(queue: &SqlJobQueue, path: &str, size_bytes: Option<u64>)
         .enqueue(BuildJob {
             repo_id: RepoId::github(path),
             branch: "main".into(),
-            rev: None,
-            admitted_commit: Some(admitted_commit),
+            admitted_commit,
             admitted_default_branch: None,
             credential: None,
             recheck: 0,

@@ -1878,7 +1878,7 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/guarded-cache");
-    let exact_key = format!("main#{a}");
+    let exact_key = exact_ref_key("main", &a);
     let mut valid_a = None;
     for _ in 0..200 {
         if let Ok(Some(info)) = store.load_branch(&repo_id, &exact_key).await
@@ -2098,7 +2098,7 @@ async fn cancelling_real_clone_waits_for_midx_writer_before_staging_cleanup() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let moving = info.expect("full cancellation fixture settled");
-    let exact_key = format!("main#{}", moving.commit);
+    let exact_key = exact_ref_key("main", &moving.commit);
     let mut info = store
         .load_branch(&repo_id, &exact_key)
         .await
@@ -2443,7 +2443,7 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
         .expect("moving A row");
     assert_eq!(moving_a.commit, a, "moving main must not publish B yet");
     let exact_b = store
-        .load_branch(&repo_id, &format!("main#{b}"))
+        .load_branch(&repo_id, &exact_ref_key("main", &b))
         .await
         .expect("load paused exact B")
         .expect("paused exact B row");

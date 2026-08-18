@@ -1220,12 +1220,7 @@ async fn start_s3_server_authorized(
         while let Some(job) = rx.recv().await {
             let state = worker_state.clone();
             tokio::spawn(async move {
-                let key = format!(
-                    "{}/{}#{}",
-                    job.repo_id.storage_key(),
-                    job.branch,
-                    job.rev.as_deref().unwrap_or("")
-                );
+                let key = job.key();
                 let result = ripclone::server::process_build_job(&state, &job).await;
                 state
                     .build_queue_depth

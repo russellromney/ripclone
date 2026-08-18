@@ -13,7 +13,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 - **CLI readiness behavior is explicit** (`rust/src/bin/cli.rs`, `docs/SYNC.md`): normal `add` and `sync` remain fast, while `add --wait` and `sync --wait` poll exact pinned metadata after the first `202` without repeating a moving POST.
 - **Active work is keyed by repository, branch, and exact admitted commit** (`rust/src/queue/`, `rust/src/api_job_queue.rs`): duplicates coalesce while queued, claimed, or in embedded Full work; a later commit remains a separate job. The commit crosses SQL/API-worker/standalone-worker transports, and workers exact-fetch and build it even if the branch moves.
 - **Signed push webhooks use their validated `after` commit directly** (`rust/src/server.rs`): they perform no second tip probe. Readiness-oriented library callers pin the admitted commit and use exact metadata GETs after the first `202`; they do not repeat a moving POST.
-- **Malformed targetless ordinary jobs fail closed** before source work. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
+- **Every job has one required admitted SHA** and fails closed if that identity is malformed. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
 
 ## Cold-history pack and benchmark performance
 
@@ -105,8 +105,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 
 - **Per-stage phase-1 sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, HEAD packs, skeleton build, files table, prebuilt index, phase-1 upload, and ref publish. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with phase timings and per-artifact-class storage amplification for each build.
 - **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under the internal `:{branch}#{commit}` namespace instead of `{branch}#{rev}`. The leading `:` cannot occur in a Git ref, so exact results cannot collide with real source branches. Different revs that resolve to the same commit share a build.
-- **Commit-keyed reuse for file and S3 metadata stores** (`rust/src/ref_store.rs`): `RefStore::load_build` is now implemented for `FileRefStore` and `S3RefStore`, so a sync of branch `bar` can reuse a completed build of branch `foo` at the same commit instead of rebuilding.
-- **Don't reuse completed builds that lack a files archive** (`rust/src/server.rs`): `reuse_existing_build` no longer returns a full clonepack whose archive chunks are empty (unless archive generation is still in progress), which previously left files-mode clones polling forever.
+- **Exact results are branch scoped** (`rust/src/ref_store.rs`): each branch and commit owns one internal result; workers do not republish a different branch's stored build.
 - **git index-pack fallback** (`rust/src/git.rs`): when gix fails to index a pack containing ref deltas (e.g. `oven-sh/bun`), ripclone falls back to the stock `git index-pack` subprocess.
 
 ## Version reconciliation (CLI ↔ server)
@@ -137,7 +136,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 - **Standalone `ripclone-worker` binary** (`rust/src/bin/ripclone-worker.rs`): claims jobs from a SQL queue and runs the same build as the in-process worker, so sync work can be farmed out to other processes/machines. Current `/sync` admission returns after ready detection or queue acceptance; readiness-oriented clients poll exact pinned metadata. Per-request credentials may ride with their selected queue job and are cleared when it is settled; otherwise the worker resolves them from provider config. One scratch `--repo-root` per worker.
 - **Pluggable metadata store** (`RIPCLONE_METADATA` = `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql`), decoupled from storage; unset follows storage (S3 if configured, else file). A `MetaDb` adapter + `SqlRefStore` implementing `RefStore` over one `repo_key` (`RepoId::storage_key`) + branch row (`rust/src/meta/`), with the same save-ordering policy as the S3 store and a `health()` probe. Holds pointers only — never file bytes.
 - **Shared backend wiring** (`rust/src/backends.rs`): `Backends::from_env` + queue/metadata selection, used by both the server and the worker so they configure identically.
-- Cross-process correctness: the server invalidates its ref caches after a worker build, and a HEAD sync resolves from the metadata store alone (a `HEAD` ref alias) so a server without the local mirror never returns an empty ref. `?rev=` builds are rejected on the cross-process queue (use the local queue). Real-DB tested on Postgres/MySQL (`scripts/test-queue-sql.sh`) and a local `sqld` for libsql, plus a diskless (separate-`repo_root`) farm-out e2e. See `docs/BACKENDS.md`.
+- Cross-process correctness: the server invalidates its ref caches after a worker build, and a HEAD sync resolves from the metadata store alone (a `HEAD` ref alias) so a server without the local mirror never returns an empty ref. Explicit revisions use the same admitted-SHA queue as ordinary requests. Real-DB tested on Postgres/MySQL (`scripts/test-queue-sql.sh`) and a local `sqld` for libsql, plus a diskless (separate-`repo_root`) farm-out e2e. See `docs/BACKENDS.md`.
 
 ## Multi-provider auth (Phases 1 & 2)
 

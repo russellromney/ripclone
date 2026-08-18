@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
-use ripclone::ref_store::{FileRefStore, RefStore};
+use ripclone::ref_store::{FileRefStore, RefStore, exact_ref_key};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -240,13 +240,26 @@ async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
     let (_guard, after) = clone_files_when(&server, "acme", "phase2guard", "f", "new\n").await;
     assert_eq!(read(&after, "g"), "new file\n");
 
-    let refs = FileRefStore::new(&server.repo_root)
-        .list_branches(&RepoId::github("acme/phase2guard"))
-        .await
-        .expect("list late-completion refs");
-    assert!(
-        refs.iter().all(|branch| !branch.contains('#')),
-        "late completion must not create a synthetic exact ref: {refs:?}"
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/phase2guard");
+    for commit in [&old, &new] {
+        let exact = store
+            .load_branch(&repo_id, &exact_ref_key("main", commit))
+            .await
+            .expect("load exact result")
+            .expect("ordinary result remains addressable");
+        assert!(exact.internal_exact_result);
+        assert_eq!(&exact.commit, commit);
+    }
+    assert_eq!(
+        store
+            .load_branch(&repo_id, "main")
+            .await
+            .unwrap()
+            .unwrap()
+            .commit,
+        new,
+        "late B completion must leave moving main at C"
     );
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT");
@@ -279,7 +292,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         .expect("add failure-fence repo");
     server
         .client()
-        .sync_repo("acme/phase2fail-fenced", None)
+        .admit_sync_repo("acme/phase2fail-fenced", None)
         .await
         .expect("admit B");
 
@@ -287,7 +300,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
     origin.publish();
     server
         .client()
-        .sync_repo("acme/phase2fail-fenced", None)
+        .admit_sync_repo("acme/phase2fail-fenced", None)
         .await
         .expect("admit C");
 
@@ -337,14 +350,26 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         "B failure must not leave C building or failed: {:?}",
         moving.build_status
     );
-    let refs = store
-        .list_branches(&repo_id)
+    let exact_b = store
+        .load_branch(&repo_id, &exact_ref_key("main", &b))
         .await
-        .expect("list failure-fence refs");
+        .expect("load exact B")
+        .expect("failed exact B remains terminal and addressable");
+    assert!(exact_b.internal_exact_result);
+    assert_eq!(exact_b.commit, b);
     assert!(
-        refs.iter().all(|branch| !branch.contains('#')),
-        "failed superseded work must not create a hidden exact ref: {refs:?}"
+        exact_b
+            .build_status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("failed: "))
     );
+    let exact_c = store
+        .load_branch(&repo_id, &exact_ref_key("main", &c))
+        .await
+        .expect("load exact C")
+        .expect("exact C remains addressable");
+    assert!(exact_c.internal_exact_result);
+    assert_eq!(exact_c.full_clonepack.commit, c);
 
     let status = repo_status(&server, "acme", "phase2fail-fenced").await;
     let public_refs = status["refs"].as_array().expect("status refs");
@@ -352,7 +377,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         public_refs.iter().all(|entry| {
             entry["branch"]
                 .as_str()
-                .is_some_and(|branch| !branch.contains('#'))
+                .is_some_and(|branch| branch == "main" || branch == "HEAD")
                 && entry["commit"] == c
                 && entry["history"] == "ready"
         }),

@@ -263,8 +263,6 @@ pub const WORKER_ENV_KEYS: &[&str] = &[
     "RIPCLONE_GITHUB_APP_PRIVATE_KEY",
     "RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH",
     "RIPCLONE_GITHUB_API_BASE",
-    // Reserved token
-    "RIPCLONE_TOKEN",
     // Size-class + lifecycle (optional)
     "RIPCLONE_MAX_SIZE_CLASS",
     "RIPCLONE_IDLE_EXIT_SECS",
@@ -778,8 +776,7 @@ mod tests {
                 path: path.into(),
             },
             branch: "main".into(),
-            rev: None,
-            admitted_commit: Some("1111111111111111111111111111111111111111".into()),
+            admitted_commit: "1111111111111111111111111111111111111111".into(),
             admitted_default_branch: None,
             credential: None,
             recheck: 0,

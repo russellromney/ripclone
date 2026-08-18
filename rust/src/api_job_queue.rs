@@ -54,11 +54,8 @@ pub struct ClaimedJobWire {
     pub provider: String,
     pub path: String,
     pub branch: String,
-    /// Exact commit admitted for ordinary tip work. Missing means historical
-    /// rev work or a malformed ordinary job; workers reject malformed jobs
-    /// before source work.
-    #[serde(default)]
-    pub admitted_commit: Option<String>,
+    /// Exact commit admitted before enqueue.
+    pub admitted_commit: String,
     #[serde(default)]
     pub admitted_default_branch: Option<String>,
     #[serde(default)]

@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="${REPO:-oven-sh/bun}"
 MODE="${MODE:-editable}"
-RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-bench-token}}"
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-token}"
 export RIPCLONE_SERVER_TOKEN
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

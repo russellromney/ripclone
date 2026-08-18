@@ -309,7 +309,7 @@ async fn clone_at_rev_waits_for_the_background_full_build() {
     assert_repo_usable(&dir, "1");
 }
 
-/// A rev-only repository layout has `<default-branch>#<commit>` but no moving
+/// A rev-only repository layout has `:<default-branch>#<commit>` but no moving
 /// `HEAD` row. The first pending response must carry the concrete branch so the
 /// same clone operation can poll that exact key without retrying from `rev`.
 #[tokio::test]
@@ -340,7 +340,7 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
         "exact revision sync must not create a moving HEAD row"
     );
 
-    let exact_key = format!("main#{pinned}");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
     let exact = ripclone::ref_store::RefStore::load_branch(&store, &repo_id, &exact_key)
         .await
         .expect("load exact-only result")
@@ -372,17 +372,6 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
         "internal exact bytes remain in total storage accounting: {status}"
     );
 
-    // Make symbolic-HEAD detection unavailable so default recovery must use
-    // RefInfo.default_branch. The storage key contains '#', and must never be
-    // interpreted as a source branch or produce main#commit#commit.
-    std::fs::write(
-        server
-            .repo_root
-            .join(repo_id.mirror_dir_name())
-            .join("HEAD"),
-        b"ref: refs/heads/missing\n",
-    )
-    .expect("hide symbolic default branch");
     let output = tempfile::tempdir().expect("exact-only clone output");
     let target = output.path().join("clone");
     server
@@ -401,6 +390,38 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
     assert_eq!(read(&target, "a.txt"), "old\n");
     assert_repo_usable(&target, "1");
+
+    // If the mirror can no longer identify HEAD, the internal exact row must
+    // not be promoted into a public default-branch projection.
+    std::fs::write(
+        server
+            .repo_root
+            .join(repo_id.mirror_dir_name())
+            .join("HEAD"),
+        b"ref: refs/heads/missing\n",
+    )
+    .expect("hide symbolic default branch");
+    let unresolved = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/at-exact-only/refs/HEAD?rev={pinned}",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("HEAD fallback request");
+    assert_eq!(
+        unresolved.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let unresolved: serde_json::Value = unresolved.json().await.expect("fallback error body");
+    assert!(
+        unresolved["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("current public default branch")),
+        "exact-only metadata must not select a public branch: {unresolved}"
+    );
 }
 
 #[tokio::test]

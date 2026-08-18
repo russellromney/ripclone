@@ -588,7 +588,7 @@ mod tests {
     use crate::cas::Cas;
     use crate::clonepack::hash_from_hex;
     use crate::provider::RepoId;
-    use crate::ref_store::{CachingRefStore, FileRefStore};
+    use crate::ref_store::{CachingRefStore, FileRefStore, exact_ref_key};
     use crate::storage::{HashEntry, StorageBackend, local};
     use std::time::Duration;
 
@@ -1284,6 +1284,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+    }
+
+    #[tokio::test]
+    async fn warm_ttl_evicts_an_aged_exact_admission_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let repo_id = RepoId::github("o/pending");
+        let commit = "1".repeat(40);
+        let key = exact_ref_key("main", &commit);
+        let old = unix_secs(SystemTime::now()).saturating_sub(10);
+        ref_store
+            .save_branch(
+                &repo_id,
+                &key,
+                &RefInfo {
+                    internal_exact_result: true,
+                    commit: commit.clone(),
+                    default_branch: "main".to_string(),
+                    build_status: Some("building".to_string()),
+                    synced_at: Some(old),
+                    last_accessed_at: Some(old),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        RemoteGc::new(
+            storage,
+            ref_store.clone(),
+            GcConfig {
+                grace_period: Duration::ZERO,
+                warm_ttl: Duration::from_secs(1),
+                dry_run: false,
+            },
+        )
+        .run()
+        .await
+        .unwrap();
+
+        let evicted = ref_store
+            .load_branch(&repo_id, &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evicted.commit, commit);
+        assert!(evicted.internal_exact_result);
+        assert_eq!(evicted.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
     }
 
     #[tokio::test]

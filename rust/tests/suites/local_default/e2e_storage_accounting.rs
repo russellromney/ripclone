@@ -60,7 +60,7 @@ async fn status_reports_nonzero_bytes_after_sync() {
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "storage-accounting");
-    origin.commit(&[("a.txt", "hello world\n")], "c1");
+    let commit = origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
     // Wait for the full clonepack to publish (phase 2) so all artifacts are
@@ -79,8 +79,8 @@ async fn status_reports_nonzero_bytes_after_sync() {
         .expect("resolved main ref present");
     assert!(
         refs.iter()
-            .all(|r| !r["branch"].as_str().expect("branch string").contains('#')),
-        "public status must contain only real source refs"
+            .all(|r| r["branch"] != ripclone::ref_store::exact_ref_key("main", &commit)),
+        "internal exact result must not appear in public status"
     );
     assert!(branch["bytes"].as_u64().unwrap() > 0);
     assert_eq!(branch["bytes"], branch["unique_bytes"]);
@@ -107,16 +107,14 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
         .await
         .expect("load moving main")
         .expect("moving main exists");
-    let historical_key = format!(":main#{}", info.commit);
-    // Represent the first-class historical `sync --at` exact-result lane. The
-    // ordinary sync above must not have created this row.
-    assert!(
-        store
-            .load_branch(&repo_id, &historical_key)
-            .await
-            .expect("check ordinary exact row")
-            .is_none()
-    );
+    let historical_key = ripclone::ref_store::exact_ref_key("main", &info.commit);
+    let ordinary_exact = store
+        .load_branch(&repo_id, &historical_key)
+        .await
+        .expect("load ordinary exact row")
+        .expect("ordinary sync publishes an exact result");
+    assert!(ordinary_exact.internal_exact_result);
+    assert_eq!(ordinary_exact.commit, info.commit);
     let storage = ripclone::storage::local(&server.storage_dir).expect("open local storage");
     let moving_manifest_bytes = storage
         .get(&info.full_clonepack.manifest)
@@ -146,6 +144,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
         .expect("store historical-only manifest");
 
     let mut historical_info = info.clone();
+    historical_info.internal_exact_result = true;
     historical_info.full_clonepack.manifest = historical_manifest_hash.clone();
     store
         .save_branch(&repo_id, &historical_key, &historical_info)
@@ -154,18 +153,10 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
 
     let after = get_status(&server, "acme", "historical-storage-accounting", None).await;
     let refs = after["refs"].as_array().expect("status refs");
-    let moving = refs
-        .iter()
-        .find(|entry| entry["branch"] == "main")
-        .expect("moving main status");
-    let historical = refs
-        .iter()
-        .find(|entry| entry["branch"] == historical_key)
-        .expect("historical status");
-    assert_eq!(historical["commit"], info.commit);
+    assert!(refs.iter().any(|entry| entry["branch"] == "main"));
     assert!(
-        historical["bytes"].as_u64().unwrap() > moving["bytes"].as_u64().unwrap(),
-        "the historical row includes its unique manifest and chunk"
+        refs.iter().all(|entry| entry["branch"] != historical_key),
+        "internal exact rows must not appear as source refs: {refs:?}"
     );
     let expected_delta =
         historical_manifest_bytes.len() as u64 + historical_only_bytes.len() as u64;
@@ -173,7 +164,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
     assert_eq!(
         after["total_bytes"].as_u64().unwrap(),
         expected_total,
-        "shared hashes count once while the historical-only manifest and chunk increase the union"
+        "internal exact artifacts count in the deduplicated union while shared hashes count once"
     );
     assert_eq!(
         after["total_unique_bytes"].as_u64().unwrap(),

@@ -53,10 +53,7 @@ async fn worker_farm_out_mysql() {
         .await
         .expect("connect MySQL lifecycle probe");
     let claimed_b = claim_exact_sql_job(&probe_queue, "mysql-lifecycle-probe", &commit_b).await;
-    assert_eq!(
-        claimed_b.admitted_commit.as_deref(),
-        Some(commit_b.as_str())
-    );
+    assert_eq!(claimed_b.admitted_commit, commit_b);
 
     let duplicate_b = server
         .client()

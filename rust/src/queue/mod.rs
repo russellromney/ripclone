@@ -43,14 +43,11 @@ pub use sqlite_db::SqliteDb;
 #[derive(Clone)]
 pub struct BuildJob {
     pub repo_id: RepoId,
+    /// Concrete result branch selected before enqueue.
     pub branch: String,
-    /// Historical build-commit override (see `SyncRequest.rev`). This remains a
-    /// separate lane from ordinary tip admission and is intentionally not
-    /// persisted by the cross-process queue.
-    pub rev: Option<String>,
-    /// Exact commit admitted for this build. Ordinary and historical jobs both
-    /// carry the validated full object id selected before enqueue.
-    pub admitted_commit: Option<String>,
+    /// Exact commit admitted for this build. Every selector is resolved before
+    /// enqueue, so ordinary and explicit requests for the same result coalesce.
+    pub admitted_commit: String,
     /// Trusted concrete upstream default branch learned alongside a HEAD tip
     /// admission. This is publication metadata, not part of the active key.
     pub admitted_default_branch: Option<String>,
@@ -115,20 +112,15 @@ impl fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 impl BuildJob {
-    /// Coalescing key: active work is immutable and therefore keyed by repo,
-    /// branch, and the exact admitted target. Historical `rev` work remains a
-    /// distinct lane. The unit-separator is accepted by all supported SQL text
-    /// columns (unlike NUL) and keeps the key unambiguous for valid branch names.
+    /// Coalescing key for one immutable exact result. The unit-separator is
+    /// accepted by all supported SQL text columns (unlike NUL) and keeps the
+    /// key unambiguous for valid branch names.
     pub fn key(&self) -> String {
-        let target = match (&self.rev, &self.admitted_commit) {
-            (Some(rev), _) => format!("rev:{rev}"),
-            (None, Some(commit)) => format!("tip:{commit}"),
-            (None, None) => "invalid-targetless".to_string(),
-        };
         format!(
-            "{}\x1f{}\x1f{target}",
+            "{}\x1f{}\x1f{}",
             self.repo_id.storage_key(),
-            self.branch
+            self.branch,
+            self.admitted_commit
         )
     }
 }

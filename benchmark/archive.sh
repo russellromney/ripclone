@@ -19,7 +19,7 @@ for bin in "$RIPCLONE" "$SERVER"; do
   fi
 done
 
-RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}"
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-}"
 if [ -z "$RIPCLONE_SERVER_TOKEN" ]; then
   echo "error: RIPCLONE_SERVER_TOKEN must be set (server is fail-closed)"
   exit 1

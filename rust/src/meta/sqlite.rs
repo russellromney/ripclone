@@ -45,12 +45,6 @@ impl MetaDb for SqliteMeta {
         .execute(&self.pool)
         .await
         .context("create refs table")?;
-        // Index for commit-keyed reuse (get_by_commit). The PK is (repo_key,
-        // branch), so without this a lookup by commit scans the repo's branches.
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_refs_commit ON refs (repo_key, commit_id)")
-            .execute(&self.pool)
-            .await
-            .context("create refs commit index")?;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS added_repos (
                 repo_key TEXT PRIMARY KEY NOT NULL,
@@ -81,27 +75,6 @@ impl MetaDb for SqliteMeta {
             })),
             None => Ok(None),
         }
-    }
-
-    async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>> {
-        let rows = sqlx::query(
-            "SELECT data, commit_id, synced_at FROM refs
-             WHERE repo_key = ? AND commit_id = ?",
-        )
-        .bind(repo_key)
-        .bind(commit)
-        .fetch_all(&self.pool)
-        .await
-        .context("get refs by commit")?;
-        rows.into_iter()
-            .map(|row| -> Result<RefRow> {
-                Ok(RefRow {
-                    data: row.try_get(0)?,
-                    commit_id: row.try_get(1)?,
-                    synced_at: row.try_get(2)?,
-                })
-            })
-            .collect()
     }
 
     async fn save_ordered(

@@ -162,7 +162,7 @@ async fn api_worker_reports_ref_without_db_creds() {
     // worker's ApiRefStore → POST /v1/refs → server's SqlRefStore.
     let store = open_meta_store(&meta_url).await;
     let rid = RepoId::github("acme/api-ref");
-    let exact_key = format!("main#{commit}");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &commit);
     let stored = store
         .load_branch(&rid, &exact_key)
         .await
@@ -281,8 +281,7 @@ async fn dead_report_url_job_requeues_not_done() {
         .enqueue(BuildJob {
             repo_id: RepoId::github("acme/dead-url"),
             branch: "main".into(),
-            rev: None,
-            admitted_commit: Some(commit),
+            admitted_commit: commit,
             admitted_default_branch: None,
             credential: None,
             recheck: 0,

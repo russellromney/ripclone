@@ -80,19 +80,9 @@ fn unbranch_slug(slug: &str) -> Option<String> {
 /// backend's atomic tie-break (the SQL conditional upsert, the S3 ETag CAS);
 /// the file store serializes writes in-process.
 ///
-/// Force-push rewinds: an *older* commit has a lower generation, so this guard
-/// would reject it. Both flavors are handled upstream in the sync path by
-/// clearing generation so the fresh `synced_at` wins:
-/// - a rewind to an *already-built* commit — `reuse_existing_build` re-points
-///   authoritatively;
-/// - a rewind to a commit *never built as a tip* — it is built fresh, and
-///   `build_and_publish_two_phase` re-confirms via `ls-remote` that the freshly
-///   built commit is still the branch tip before clearing generation, so the
-///   confirmed-tip build wins regardless of history depth.
-///
-/// A build that is genuinely stale (upstream moved on during the build, so the
-/// re-check no longer sees it as the tip) keeps its generation and correctly
-/// loses here — recency by observation is only granted to a *confirmed* tip.
+/// Exact rows are immutable commit identities. Moving projections are updated
+/// separately through the store's atomic commit fence, so generation ordering
+/// never decides whether a late exact build may replace a newer branch tip.
 pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> bool {
     if new.commit.is_empty() {
         return false;
@@ -142,17 +132,6 @@ pub trait RefStore: Send + Sync {
 
     /// Load the `RefInfo` for a specific branch.
     async fn load_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RefInfo>>;
-
-    /// Load a *completed full build* for an exact commit, from any branch of this
-    /// repo (commit-keyed reuse). Lets a sync of branch `bar` reuse a clonepack
-    /// branch `foo` already built at the same commit, instead of rebuilding.
-    ///
-    /// Default is `Ok(None)` — stores without an efficient commit index (file,
-    /// S3) simply fall back to the branch-scoped no-op, no regression. Returns a
-    /// `RefInfo` only when its `full_clonepack` is present and matches `commit`.
-    async fn load_build(&self, _repo_id: &RepoId, _commit: &str) -> Result<Option<RefInfo>> {
-        Ok(None)
-    }
 
     /// Save the `RefInfo` for a specific branch.
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()>;
@@ -598,23 +577,6 @@ impl RefStore for FileRefStore {
         Ok(out)
     }
 
-    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // Commit-keyed reuse: scan branch refs for any completed full build at this
-        // commit. This is a cold fallback (only invoked when the requesting branch
-        // lacks a usable build), so a directory scan is acceptable.
-        let branches = self.list_branches(repo_id).await?;
-        for branch in branches {
-            if let Some(info) = self.load_branch(repo_id, &branch).await?
-                && info.full_clonepack.commit == commit
-                && !info.full_clonepack.manifest.is_empty()
-                && !info.archive_chunks.is_empty()
-            {
-                return Ok(Some(info));
-            }
-        }
-        Ok(None)
-    }
-
     async fn health(&self) -> Result<()> {
         // Write+read probe of the ref-store root, off the async worker. Catches
         // an unmounted/removed/read-only/full data volume — not just a missing
@@ -976,32 +938,6 @@ impl RefStore for S3RefStore {
         Ok(out)
     }
 
-    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // Commit-keyed reuse: scan branch refs for any completed full build at this
-        // commit. This is a cold fallback (only invoked when the requesting branch
-        // lacks a usable build), so an S3 list + per-key GET is acceptable.
-        let prefix = self.branch_prefix(repo_id);
-        let keys = self
-            .storage
-            .list_objects(&prefix)
-            .await
-            .context("list S3 ref store for commit-keyed reuse")?;
-        for key in keys {
-            if !key.ends_with(".json") || key == format!("{}HEAD.json", prefix) {
-                continue;
-            }
-            if let Ok(Some((_, data))) = self.storage.get_object(&key).await
-                && let Ok(info) = serde_json::from_slice::<RefInfo>(&data)
-                && info.full_clonepack.commit == commit
-                && !info.full_clonepack.manifest.is_empty()
-                && !info.archive_chunks.is_empty()
-            {
-                return Ok(Some(info));
-            }
-        }
-        Ok(None)
-    }
-
     async fn health(&self) -> Result<()> {
         // Reachability probe with a prefix that matches nothing, bounded by a
         // short timeout. The readiness handler caches the result.
@@ -1130,12 +1066,6 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
             }
         }
         Ok(info)
-    }
-
-    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // Commit-keyed reuse is a cold fallback path; read through to the inner
-        // store rather than maintaining a separate commit cache.
-        self.inner.load_build(repo_id, commit).await
     }
 
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {

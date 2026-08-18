@@ -71,8 +71,7 @@ mod tests {
         BuildJob {
             repo_id: crate::provider::RepoId::github("o/r"),
             branch: "b".into(),
-            rev: None,
-            admitted_commit: Some("1111111111111111111111111111111111111111".into()),
+            admitted_commit: "1111111111111111111111111111111111111111".into(),
             admitted_default_branch: None,
             credential: None,
             recheck: 0,

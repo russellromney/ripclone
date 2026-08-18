@@ -211,7 +211,6 @@ pub struct RefInfo {
     /// Internal commit-addressed result rows are retained and garbage-collected
     /// like every other ref, but are not source branches in the public status
     /// model.
-    #[serde(default)]
     pub internal_exact_result: bool,
     /// A moving projection carrying this flag may replace only the same commit.
     /// Stores enforce the check atomically with the write.
@@ -303,4 +302,24 @@ pub struct RefInfo {
     /// authoritative `synced_at` tie-break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefInfo;
+
+    #[test]
+    fn ref_info_rejects_missing_internal_exact_identity() {
+        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("internal_exact_result");
+
+        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
+        assert!(
+            error.to_string().contains("internal_exact_result"),
+            "missing identity must be named clearly: {error}"
+        );
+    }
 }

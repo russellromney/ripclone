@@ -49,7 +49,7 @@ for mode in $BENCH_MODES; do
 done
 
 SERVER_URL="${RIPCLONE_URL:-https://ripclone-server-dev.fly.dev}"
-TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}"
+TOKEN="${RIPCLONE_SERVER_TOKEN:-}"
 RIPCLONE="${RIPCLONE:-ripclone}"
 PROVIDER="${RIPCLONE_BENCH_PROVIDER:-github}"
 

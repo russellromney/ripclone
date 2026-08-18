@@ -1556,7 +1556,7 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/full-topup-no-base");
-    let exact_key = format!("main#{b}");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let mut exact = store
         .load_branch(&repo_id, &exact_key)
         .await
@@ -1684,7 +1684,7 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/full-topup-unrelated");
-    let exact_key = format!("main#{b}");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let mut exact = store
         .load_branch(&repo_id, &exact_key)
         .await
@@ -1697,7 +1697,7 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
         "an unrelated history must not carry Full(A) automatically"
     );
     let exact_a = store
-        .load_branch(&repo_id, &format!("main#{a}"))
+        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &a))
         .await
         .expect("load exact A")
         .expect("exact A row");
@@ -1792,7 +1792,7 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
     let exact = store
         .load_branch(
             &RepoId::github("acme/full-topup-merge"),
-            &format!("main#{b}"),
+            &ripclone::ref_store::exact_ref_key("main", &b),
         )
         .await
         .expect("load merge B row")

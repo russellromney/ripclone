@@ -124,10 +124,7 @@ async fn worker_farm_out_libsql_against_real_sqld() {
         .await
         .expect("connect libsql lifecycle probe");
     let claimed_b = claim_exact_sql_job(&probe_queue, "libsql-lifecycle-probe", &commit_b).await;
-    assert_eq!(
-        claimed_b.admitted_commit.as_deref(),
-        Some(commit_b.as_str())
-    );
+    assert_eq!(claimed_b.admitted_commit, commit_b);
     assert_eq!(
         claimed_b
             .credential

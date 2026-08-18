@@ -60,10 +60,10 @@ To scale up, start more `ripclone-worker` processes pointed at the same queue an
 storage. To scale down, stop workers — in-flight jobs are reclaimed by the stale
 timeout and picked up by whoever is left.
 
-The queue stores the admitted commit on every ordinary job. The active
+The queue stores the admitted commit on every job. The active
 uniqueness constraint covers both queued and claimed exact keys on SQLite,
-libSQL, PostgreSQL, and MySQL. Workers reject a malformed targetless ordinary
-job before credentials, provider access, mirror mutation, or builder entry.
+libSQL, PostgreSQL, and MySQL. Workers reject a malformed admitted SHA before
+credentials, provider access, mirror mutation, or builder entry.
 `RIPCLONE_QUEUE=local` remains an in-memory, process-lifetime boundary.
 
 ## Run your own trigger

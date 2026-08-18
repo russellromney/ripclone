@@ -41,7 +41,7 @@ admission path. It also returns after ready detection or queue acceptance, not
 after the builder finishes.
 
 The CLI's `add` and `sync` commands are fast by default. A script that needs
-the historical readiness-oriented behavior can pass `--wait`:
+readiness-oriented behavior can pass `--wait`:
 
 ```text
 ripclone add owner/repo --wait
@@ -94,11 +94,11 @@ methods or the normal CLI commands.
 
 ## `sync --at REV`
 
-`sync --at REV` remains the historical path. It may resolve expressions such as
-`HEAD~5` from the mirror, uses its existing commit-keyed ref-store lane and
-local-queue support, and keeps its current explicit cross-process limitation.
-It is not ordinary tip admission, and ordinary exact commits are not published
-under the historical `branch#REV` key.
+`sync --at REV` is a first-class exact-revision request. Symbolic expressions
+such as `HEAD~5` are resolved once before admission; every retry then uses the
+selected object ID. Ordinary and explicit requests for the same branch and
+commit share one queue job and one internal exact result. Exact work is
+available on local and cross-process queues.
 
 ## Queue durability
 
@@ -106,9 +106,9 @@ SQL acceptance has the durability guarantee of the selected SQL backend. The
 `local` queue remains in-memory and only survives for the server process
 lifetime; accepted local jobs are lost if that process exits.
 
-Every ordinary queued job carries its admitted commit. A malformed targetless
-ordinary row is rejected before credential lookup, provider access, mirror work,
-or builder entry; its target is never guessed from the current branch tip.
+Every queued job carries its admitted commit. A malformed job is rejected
+before credential lookup, provider access, mirror work, or builder entry; its
+target is never guessed from the current branch tip.
 
 ## Availability and errors
 

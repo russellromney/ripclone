@@ -71,7 +71,6 @@ lane name such as `small` or `large`), not an env var.
 | | `RIPCLONE_GITHUB_APP_PRIVATE_KEY` | one key var required with App ID | — | Inline PEM private key. |
 | | `RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH` | alt | — | Path to PEM private key file. |
 | | `RIPCLONE_GITHUB_API_BASE` | No | `https://api.github.com` | GitHub Enterprise / test API base. |
-| **Ripclone token** (reserved, not read yet) | `RIPCLONE_TOKEN` | — | — | Reserved name for a future shared ripclone authentication token. Job-report auth uses `RIPCLONE_METADATA_JOB_TOKEN` instead. |
 | **Size-class ceiling** | `RIPCLONE_MAX_SIZE_CLASS` | No | — | Inclusive size-class ceiling this worker may claim. |
 | **Lifecycle flags** | `RIPCLONE_IDLE_EXIT_SECS` | No | — | Exit after the queue has been empty this many seconds (scale-to-zero). |
 | | `RIPCLONE_MAX_JOBS` | No | — | Exit after completing this many jobs (one-shot platforms). |

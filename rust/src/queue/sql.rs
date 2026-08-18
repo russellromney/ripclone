@@ -66,10 +66,8 @@ pub struct ClaimedJob {
     /// Opaque repo path (`owner/repo` for GitHub).
     pub path: String,
     pub branch: String,
-    /// Exact ordinary tip commit admitted by the server. `None` identifies a
-    /// historical rev job or a malformed row that must be rejected before
-    /// source work by the worker.
-    pub admitted_commit: Option<String>,
+    /// Exact commit admitted by the server before enqueue.
+    pub admitted_commit: String,
     /// Concrete upstream default branch learned during HEAD admission, when
     /// available. This does not affect coalescing identity.
     pub admitted_default_branch: Option<String>,
@@ -132,7 +130,7 @@ pub trait QueueDb: Send + Sync {
         provider: &str,
         path: &str,
         branch: &str,
-        admitted_commit: Option<&str>,
+        admitted_commit: &str,
         admitted_default_branch: Option<&str>,
         credential: Option<&str>,
         size_class: i64,
@@ -184,7 +182,7 @@ pub trait QueueDb: Send + Sync {
             String,
             String,
             String,
-            Option<String>,
+            String,
             Option<String>,
             Option<String>,
         )>,
@@ -811,13 +809,8 @@ fn retry_backoff(attempts: i64) -> std::time::Duration {
 #[async_trait]
 impl JobQueue for SqlJobQueue {
     async fn enqueue(&self, job: BuildJob) -> Result<Enqueued> {
-        if job.rev.is_none() {
-            let Some(commit) = job.admitted_commit.as_deref() else {
-                anyhow::bail!("ordinary tip build must carry an admitted commit");
-            };
-            crate::validation::validate_object_id(commit)
-                .context("validate admitted build commit")?;
-        }
+        crate::validation::validate_object_id(&job.admitted_commit)
+            .context("validate admitted build commit")?;
         let key = job.key();
         let size_class = classify_rank(job.size_bytes, &self.size_classes);
         // Best-effort coalesce: fold into an already-active job for this key.
@@ -838,7 +831,7 @@ impl JobQueue for SqlJobQueue {
                 job.repo_id.provider.as_str(),
                 &job.repo_id.path,
                 &job.branch,
-                job.admitted_commit.as_deref(),
+                &job.admitted_commit,
                 job.admitted_default_branch.as_deref(),
                 credential.as_deref(),
                 size_class,
@@ -941,7 +934,7 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     claimed_at INTEGER,
     finished_at INTEGER,
     error TEXT,
-    admitted_commit TEXT,
+    admitted_commit TEXT NOT NULL,
     admitted_default_branch TEXT,
     credential TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -1002,8 +995,7 @@ mod tests {
         BuildJob {
             repo_id: RepoId::github(format!("{owner}/{repo}")),
             branch: branch.into(),
-            rev: None,
-            admitted_commit: Some(commit.into()),
+            admitted_commit: commit.into(),
             admitted_default_branch: None,
             credential: None,
             recheck: 0,
@@ -1064,8 +1056,7 @@ mod tests {
                 "{engine}"
             );
             assert_eq!(
-                claimed.admitted_commit.as_deref(),
-                Some("1111111111111111111111111111111111111111"),
+                claimed.admitted_commit, "1111111111111111111111111111111111111111",
                 "{engine}: exact admission must survive claim"
             );
             assert_eq!(q.depth().await, 0, "{engine}: claimed no longer queued");
@@ -1140,7 +1131,7 @@ mod tests {
                 "github",
                 "o/r",
                 "main",
-                None,
+                "1111111111111111111111111111111111111111",
                 None,
                 Some("dG9rZW4="),
                 0,
@@ -1907,7 +1898,7 @@ mod tests {
                 .await
                 .unwrap();
             let claimed_b = q.claim("immutable-worker").await.unwrap().unwrap();
-            assert_eq!(claimed_b.admitted_commit.as_deref(), Some(b_commit));
+            assert_eq!(claimed_b.admitted_commit, b_commit);
             let duplicate_b = q
                 .enqueue(job_at("o", "r", "immutable", b_commit))
                 .await
@@ -1932,7 +1923,7 @@ mod tests {
                 .await
                 .unwrap();
             let claimed_c = q.claim("immutable-worker").await.unwrap().unwrap();
-            assert_eq!(claimed_c.admitted_commit.as_deref(), Some(c_commit));
+            assert_eq!(claimed_c.admitted_commit, c_commit);
             q.ack(claimed_c.id, "immutable-worker", Ok(()))
                 .await
                 .unwrap();

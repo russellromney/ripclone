@@ -87,7 +87,7 @@ pub async fn claim_exact_sql_job(
             .await
             .expect("claim SQL lifecycle row")
             .expect("expected admitted SQL job in queue");
-        if claimed.admitted_commit.as_deref() == Some(expected_commit) {
+        if claimed.admitted_commit == expected_commit {
             return claimed;
         }
         assert!(
@@ -344,17 +344,6 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         self.inner.load_branch(repo_id, branch).await
     }
 
-    async fn load_build(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
-        if self.probe.is_armed() {
-            panic!("pinned metadata lookup must not scan builds");
-        }
-        self.inner.load_build(repo_id, commit).await
-    }
-
     async fn save_branch(
         &self,
         repo_id: &ripclone::provider::RepoId,
@@ -486,7 +475,7 @@ pub async fn replace_full_manifest_commit(
     }
     let moving = published.expect("full manifest publication settled");
     let pinned = moving.commit.clone();
-    let exact_key = format!("main#{pinned}");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
     let mut info = ripclone::ref_store::RefStore::load_branch(&store, &repo_id, &exact_key)
         .await
         .expect("load exact full-manifest row")
@@ -1012,14 +1001,6 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
         branch: &str,
     ) -> anyhow::Result<Option<ripclone::RefInfo>> {
         self.inner.load_branch(repo_id, branch).await
-    }
-
-    async fn load_build(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
-        self.inner.load_build(repo_id, commit).await
     }
 
     async fn save_branch(
