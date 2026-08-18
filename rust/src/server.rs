@@ -3542,12 +3542,11 @@ fn ref_response(
             .iter()
             .map(|p| signed_url(storage, ttl, &p.pack))
             .collect();
-        let packs = if packs.iter().all(Option::is_none) {
+        if packs.iter().all(Option::is_none) {
             None
         } else {
             Some(packs)
-        };
-        packs
+        }
     };
 
     // Sign the pre-built MIDX for the selected variant so the client installs it

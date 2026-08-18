@@ -37,6 +37,12 @@ ignore = [
   { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name-constraint accept; name-constrained CAs not in our trust path; via libsql rustls 0.22" },
   { id = "RUSTSEC-2026-0104", reason = "webpki CRL-parse panic (DoS); reachable only when parsing attacker CRLs, which we don't; via libsql rustls 0.22" },
 
+  # h2 0.3.27 is pinned by libsql's hyper 0.14 client. The current ripclone HTTP
+  # stack uses fixed h2 0.4.16, but no libsql release (including 0.10-pre) has
+  # moved off hyper 0.14. Remote libSQL endpoints are operator-configured.
+  # Triaged 2026-08-18; remove when libsql adopts hyper 1 / h2 0.4.16+.
+  { id = "RUSTSEC-2026-0258", reason = "h2 empty-DATA-frame DoS remains only via libsql hyper 0.14; no compatible upstream fix; remote endpoint is operator-configured" },
+
   # quick-xml 0.40.1 via s3 0.1.36. No patched s3 release exists; quick-xml 0.41
   # is out but s3's version requirement does not accept it. The crate is only
   # used to parse S3 ListBuckets/ListObjectsV2 responses from operator-configured
