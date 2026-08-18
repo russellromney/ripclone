@@ -717,13 +717,13 @@ exec "$real_git" "$@"
 
     // Phase one has already published Shallow(B), while Full(B) remains
     // stopped at the production barrier. Make the real server Git boundary
-    // fail: this ordinary, unpinned read must still serve B from
+    // fail: this exact pinned read must still serve B from
     // authenticated metadata without attempting source acquisition.
     let source_forbidden = ScopedEnvVar::set("RIPCLONE_TEST_SOURCE_FORBIDDEN", "1");
     let shallow_response = reqwest::Client::new()
         .get(format!(
-            "{}/v1/repos/counting/acme/full-topup/refs/main?clonepack=shallow",
-            server.url
+            "{}/v1/repos/counting/acme/full-topup/refs/main?clonepack=shallow&pinned={b}",
+            server.url,
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
         .header("X-Upstream-Token", upstream_token)
@@ -1547,17 +1547,18 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/full-topup-no-base");
-    let mut moving = store
-        .load_branch(&repo_id, "main")
+    let exact_key = format!("main#{b}");
+    let mut exact = store
+        .load_branch(&repo_id, &exact_key)
         .await
-        .expect("load moving B")
-        .expect("moving B row");
-    assert_eq!(moving.commit, b);
-    let carried = moving.full_clonepack.clone();
+        .expect("load exact B")
+        .expect("exact B row");
+    assert_eq!(exact.commit, b);
+    let carried = exact.full_clonepack.clone();
     assert_eq!(carried.commit, a);
-    moving.full_clonepack = Default::default();
+    exact.full_clonepack = Default::default();
     store
-        .save_branch(&repo_id, "main", &moving)
+        .save_branch(&repo_id, &exact_key, &exact)
         .await
         .expect("remove carried base");
 
@@ -1598,10 +1599,10 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
     let bad_hash = storage
         .put(&bad.encode_to_vec())
         .expect("store bad manifest");
-    moving.full_clonepack = carried;
-    moving.full_clonepack.manifest = bad_hash;
+    exact.full_clonepack = carried;
+    exact.full_clonepack.manifest = bad_hash;
     store
-        .save_branch(&repo_id, "main", &moving)
+        .save_branch(&repo_id, &exact_key, &exact)
         .await
         .expect("install mismatched carried manifest");
     let bad_target = output.path().join("bad-clone");
@@ -1674,19 +1675,20 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/full-topup-unrelated");
-    let mut moving = store
-        .load_branch(&repo_id, "main")
+    let exact_key = format!("main#{b}");
+    let mut exact = store
+        .load_branch(&repo_id, &exact_key)
         .await
-        .expect("load moving B")
-        .expect("moving B row");
-    assert_eq!(moving.commit, b);
-    assert_eq!(moving.parent_commit.as_deref(), Some(x.as_str()));
-    assert_eq!(moving.full_clonepack.commit, a);
+        .expect("load exact B")
+        .expect("exact B row");
+    assert_eq!(exact.commit, b);
+    assert_eq!(exact.parent_commit.as_deref(), Some(x.as_str()));
+    assert_eq!(exact.full_clonepack.commit, a);
     // Corrupt the first-parent-style hint. The fetched commit object remains
     // authoritative.
-    moving.parent_commit = Some(a.clone());
+    exact.parent_commit = Some(a.clone());
     store
-        .save_branch(&repo_id, "main", &moving)
+        .save_branch(&repo_id, &exact_key, &exact)
         .await
         .expect("install malformed parent hint");
 
@@ -1768,17 +1770,17 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
         .expect("merge phase-one barrier alive");
 
     let store = FileRefStore::new(&server.repo_root);
-    let moving = store
-        .load_branch(&RepoId::github("acme/full-topup-merge"), "main")
+    let exact = store
+        .load_branch(
+            &RepoId::github("acme/full-topup-merge"),
+            &format!("main#{b}"),
+        )
         .await
         .expect("load merge B row")
         .expect("merge B row");
-    assert_eq!(moving.commit, b);
-    assert_eq!(moving.full_clonepack.commit, a);
-    assert_eq!(
-        moving.parent_commit, None,
-        "merge B has no safe sole parent"
-    );
+    assert_eq!(exact.commit, b);
+    assert_eq!(exact.full_clonepack.commit, a);
+    assert_eq!(exact.parent_commit, None, "merge B has no safe sole parent");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -1861,7 +1863,7 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
         server.client().install_repo_with_mode_at(
             "acme/full-topup-removed",
             "HEAD",
-            None,
+            Some(&b),
             &target,
             CloneMode::Editable,
             Some("full"),
