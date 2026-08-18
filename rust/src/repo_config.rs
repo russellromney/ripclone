@@ -28,6 +28,7 @@ pub const FULL_VARIANT: &str = "full";
 /// One named clonepack depth. `depth: None` means unlimited (full history);
 /// `depth: Some(n)` bounds it to the last `n` commits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepthSpec {
     pub name: String,
     #[serde(default)]
@@ -395,6 +396,12 @@ mod tests {
                 .to_string()
                 .contains("unknown field `enabled_modes`")
         );
+
+        let nested = serde_json::from_str::<RepoConfig>(
+            r#"{"clonepack_depths":[{"name":"shallow","depth":1,"unexpected":true}]}"#,
+        )
+        .expect_err("nested unknown clonepack fields must not be silently ignored");
+        assert!(nested.to_string().contains("unknown field `unexpected`"));
     }
 
     #[tokio::test]
