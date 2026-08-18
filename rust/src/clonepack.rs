@@ -82,8 +82,8 @@ pub fn manifest_pack_idx_bytes(
         .with_context(|| format!("pack {index} missing idx ref"))?;
     let off = usize::try_from(entry.idx_bundle_offset)
         .context("idx bundle offset does not fit in usize")?;
-    let len = usize::try_from(idx_ref.len)
-        .context("idx bundle slice length does not fit in usize")?;
+    let len =
+        usize::try_from(idx_ref.len).context("idx bundle slice length does not fit in usize")?;
     let end = off.checked_add(len).context("idx bundle offset overflow")?;
     if idx_bundle.get(off..end).is_none() {
         anyhow::bail!("idx {index} slice out of bundle range");
