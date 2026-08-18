@@ -73,12 +73,6 @@ impl MetaDb for MysqlMeta {
                 .await
                 .context("create refs commit index")?;
         }
-        // Add the generation column to a table created before it existed. MySQL 8
-        // has no ADD COLUMN IF NOT EXISTS, so this is best-effort: it errors with
-        // a duplicate-column code on an up-to-date table, which we ignore.
-        let _ = sqlx::raw_sql("ALTER TABLE refs ADD COLUMN generation BIGINT")
-            .execute(&self.pool)
-            .await;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS added_repos (
                 repo_key VARCHAR(512) NOT NULL,

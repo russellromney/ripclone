@@ -53,13 +53,6 @@ impl MetaDb for LibsqlMeta {
             )
             .await
             .context("create refs commit index")?;
-        // Add the generation column to a table created before it existed
-        // (best-effort: errors on an up-to-date table, which is fine).
-        let _ = self
-            .conn()
-            .await?
-            .execute("ALTER TABLE refs ADD COLUMN generation BIGINT", ())
-            .await;
         self.conn()
             .await?
             .execute(

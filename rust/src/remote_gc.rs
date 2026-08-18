@@ -406,7 +406,7 @@ impl RemoteGc {
                 if info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
                     continue;
                 }
-                let last_touch = info.last_accessed_at.or(info.synced_at);
+                let last_touch = info.last_accessed_at;
                 let Some(last_touch) = last_touch else {
                     continue;
                 };

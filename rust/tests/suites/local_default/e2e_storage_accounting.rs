@@ -308,7 +308,7 @@ async fn status_public_fork_has_zero_unique_byte_allocation() {
 }
 
 #[tokio::test]
-async fn status_shape_is_backwards_compatible() {
+async fn status_shape_reports_current_source_refs_and_storage() {
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "compat");

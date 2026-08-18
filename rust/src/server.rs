@@ -984,9 +984,6 @@ pub struct RefResponse {
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pack_chunk_urls: Option<Vec<Option<String>>>,
-    /// Signed URL for each editable pack's idx, ordered to match `manifest.packs`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub midx_url: Option<String>,
@@ -1034,8 +1031,7 @@ pub struct BranchStatusEntry {
     pub build_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_status: Option<String>,
-    /// RFC3339 timestamp of the ref's most recent access (build/reuse). `None`
-    /// for refs written before `last_accessed_at` existed.
+    /// RFC3339 timestamp of the ref's most recent access (build/reuse).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<String>,
     /// True when the ref currently has non-evicted clonepack artifacts.
@@ -2627,6 +2623,8 @@ fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &s
         exact_clonepack_artifacts(info, clonepack_kind),
         Some(artifacts)
             if !artifacts.manifest.is_empty()
+                && !artifacts.metadata_chunk.is_empty()
+                && !artifacts.idx_bundle.is_empty()
                 && artifacts.commit == commit
     )
 }
@@ -2704,10 +2702,9 @@ fn ref_response_from_manifest(
         None => None,
     };
     let mut pack_hashes = Vec::with_capacity(manifest.packs.len());
-    let mut idx_hashes = Vec::with_capacity(manifest.packs.len());
     for entry in &manifest.packs {
         pack_hashes.push(checked_manifest_hash(entry.pack.as_ref()?)?);
-        idx_hashes.push(checked_manifest_hash(entry.idx.as_ref()?)?);
+        checked_manifest_hash(entry.idx.as_ref()?)?;
     }
     if manifest.packs.is_empty() {
         return None;
@@ -2716,20 +2713,16 @@ fn ref_response_from_manifest(
         Some(chunk) => Some(checked_manifest_hash(chunk)?),
         None => None,
     };
-    let idx_bundle = match manifest.idx_bundle.as_ref() {
-        Some(chunk) => Some(checked_manifest_hash(chunk)?),
-        None => None,
-    };
-    if let Some(bundle) = manifest.idx_bundle.as_ref() {
-        for entry in &manifest.packs {
-            let idx = entry.idx.as_ref()?;
-            if entry
-                .idx_bundle_offset
-                .checked_add(idx.len)
-                .is_none_or(|end| end > bundle.len)
-            {
-                return None;
-            }
+    let bundle = manifest.idx_bundle.as_ref()?;
+    let idx_bundle = checked_manifest_hash(bundle)?;
+    for entry in &manifest.packs {
+        let idx = entry.idx.as_ref()?;
+        if entry
+            .idx_bundle_offset
+            .checked_add(idx.len)
+            .is_none_or(|end| end > bundle.len)
+        {
+            return None;
         }
     }
     let ttl = ref_signed_url_ttl(private);
@@ -2760,9 +2753,8 @@ fn ref_response_from_manifest(
         head_blobs_chunk_urls: signed_list(&head_blob_hashes),
         head_blobs_idx_url: head_blobs_idx.as_deref().and_then(signed),
         pack_chunk_urls: signed_list(&pack_hashes),
-        pack_idx_urls: signed_list(&idx_hashes),
         midx_url: midx.as_deref().and_then(signed),
-        idx_bundle_url: idx_bundle.as_deref().and_then(signed),
+        idx_bundle_url: signed(&idx_bundle),
         shallow: false,
         archive_ready: !manifest.archive_chunks.is_empty(),
     })
@@ -3323,14 +3315,8 @@ async fn get_ref_inner(
                 // is simply still building already has a worker on it, so do not
                 // enqueue a duplicate.
                 if params.rev.is_none() || is_evicted || evicted_for_rev {
-                    // Rebuild under the *originally requested* branch, not the
-                    // concrete branch it resolved to. For a plain `HEAD` clone this
-                    // keeps the job as `HEAD`, so the completed build refreshes the
-                    // literal `HEAD` alias ref too (see do_build_job). Enqueuing the
-                    // concrete branch instead leaves the alias frozen at its evicted
-                    // state, so /status keeps reporting a phantom cold `HEAD` ref
-                    // after the repo has been re-warmed by the rebuild. For a
-                    // concrete-branch request this is identical to `effective_branch`.
+                    // Build under the concrete branch selected before admission so
+                    // every status and artifact write addresses branch#commit.
                     let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
                     // Historical eviction stays in the historical lane. It
                     // rebuilds the commit-keyed `branch#commit` row and must
@@ -3545,33 +3531,23 @@ fn ref_response(
     };
     let head_blobs_idx_url = signed_url(storage, ttl, &info.head_blobs_idx);
 
-    // Sign each editable pack + idx so the client fetches them straight from
+    // Sign each editable pack so the client fetches it straight from
     // object storage. `None` entries (e.g. local backend) fall back to the
     // gateway. Ordered to match the manifest's `packs` list.
-    let (pack_chunk_urls, pack_idx_urls) = if info.packs.is_empty() {
-        (None, None)
+    let pack_chunk_urls = if info.packs.is_empty() {
+        None
     } else {
         let packs: Vec<Option<String>> = info
             .packs
             .iter()
             .map(|p| signed_url(storage, ttl, &p.pack))
             .collect();
-        let idxs: Vec<Option<String>> = info
-            .packs
-            .iter()
-            .map(|p| signed_url(storage, ttl, &p.idx))
-            .collect();
         let packs = if packs.iter().all(Option::is_none) {
             None
         } else {
             Some(packs)
         };
-        let idxs = if idxs.iter().all(Option::is_none) {
-            None
-        } else {
-            Some(idxs)
-        };
-        (packs, idxs)
+        packs
     };
 
     // Sign the pre-built MIDX for the selected variant so the client installs it
@@ -3603,7 +3579,6 @@ fn ref_response(
         head_blobs_chunk_urls,
         head_blobs_idx_url,
         pack_chunk_urls,
-        pack_idx_urls,
         midx_url,
         idx_bundle_url,
         shallow: clonepack_kind == "shallow",
@@ -3881,7 +3856,7 @@ async fn build_repo_status(
         let built_at = info.synced_at.and_then(|secs| {
             chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
         });
-        let last_accessed_at = info.last_accessed_at.or(info.synced_at).and_then(|secs| {
+        let last_accessed_at = info.last_accessed_at.and_then(|secs| {
             chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
         });
 
@@ -6229,17 +6204,16 @@ fn seed_bare_mirror_from_clonepack(
 
     git::init_bare_mirror_origin(tmp.path(), provider, repo_id, credential)?;
 
-    let idx_bundle = match manifest.idx_bundle.as_ref() {
-        Some(idx_bundle_ref) => {
-            let hash = hash_to_hex(&idx_bundle_ref.hash);
-            Some(Bytes::from(
-                storage
-                    .get(&hash)
-                    .with_context(|| format!("fetch seed idx bundle {hash}"))?,
-            ))
-        }
-        None => None,
-    };
+    let idx_bundle_ref = manifest
+        .idx_bundle
+        .as_ref()
+        .context("seed clonepack manifest is missing required idx bundle")?;
+    let idx_bundle_hash = hash_to_hex(&idx_bundle_ref.hash);
+    let idx_bundle = Bytes::from(
+        storage
+            .get(&idx_bundle_hash)
+            .with_context(|| format!("fetch seed idx bundle {idx_bundle_hash}"))?,
+    );
 
     let mut pack_pairs = Vec::with_capacity(manifest.packs.len());
     for (i, entry) in manifest.packs.iter().enumerate() {
@@ -6266,23 +6240,7 @@ fn seed_bare_mirror_from_clonepack(
                 "seed pack {i} hash mismatch: expected {pack_hash}, got {actual_pack_hash}"
             );
         }
-        let idx_bytes = if let Some(bundle) = idx_bundle.as_ref() {
-            manifest_pack_idx_bytes(entry, i, Some(bundle), None)?
-        } else {
-            let idx_ref = entry
-                .idx
-                .as_ref()
-                .with_context(|| format!("pack {i} missing idx ref"))?;
-            let idx_hash = hash_to_hex(&idx_ref.hash);
-            manifest_pack_idx_bytes(
-                entry,
-                i,
-                None,
-                Some(Bytes::from(storage.get(&idx_hash).with_context(|| {
-                    format!("fetch seed idx {i} ({idx_hash})")
-                })?)),
-            )?
-        };
+        let idx_bytes = manifest_pack_idx_bytes(entry, i, &idx_bundle)?;
         pack_pairs.push((pack_bytes, idx_bytes));
     }
 
@@ -9045,11 +9003,15 @@ mod tests {
         let full = crate::ClonepackArtifacts {
             commit: "a".repeat(40),
             manifest: "full-manifest".to_string(),
+            metadata_chunk: "full-metadata".to_string(),
+            idx_bundle: "full-idx-bundle".to_string(),
             ..Default::default()
         };
         let shallow = crate::ClonepackArtifacts {
             commit: "a".repeat(40),
             manifest: "shallow-manifest".to_string(),
+            metadata_chunk: "shallow-metadata".to_string(),
+            idx_bundle: "shallow-idx-bundle".to_string(),
             ..Default::default()
         };
         let full_only = RefInfo {
@@ -9093,6 +9055,8 @@ mod tests {
             full_clonepack: crate::ClonepackArtifacts {
                 commit: commit.clone(),
                 manifest: "manifest".to_string(),
+                metadata_chunk: "metadata".to_string(),
+                idx_bundle: "idx-bundle".to_string(),
                 ..Default::default()
             },
             ..Default::default()
@@ -9101,6 +9065,12 @@ mod tests {
         info.full_clonepack.manifest.clear();
         assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
         info.full_clonepack.manifest = "manifest".to_string();
+        info.full_clonepack.metadata_chunk.clear();
+        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
+        info.full_clonepack.metadata_chunk = "metadata".to_string();
+        info.full_clonepack.idx_bundle.clear();
+        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
+        info.full_clonepack.idx_bundle = "idx-bundle".to_string();
         info.full_clonepack.commit = "b".repeat(40);
         assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
         info.full_clonepack.commit = commit.clone();
@@ -10327,7 +10297,6 @@ mod tests {
             head_blobs_chunk_urls: None,
             head_blobs_idx_url: None,
             pack_chunk_urls: None,
-            pack_idx_urls: None,
             midx_url: None,
             idx_bundle_url: None,
             shallow: true,

@@ -149,9 +149,9 @@ RIPCLONE_METADATA_DB_URL=postgres://user:pass@host:5432/ripclone
 # libsql: RIPCLONE_METADATA_DB_URL=libsql://db.turso.io  RIPCLONE_METADATA_DB_TOKEN=...
 ```
 
-`libsql` is remote-only — for a local SQLite file use `sqlite`. The schema is
-created on first start and applies additive migrations on startup. Put the metadata store on a database
-your workers can also reach when you farm builds out (below).
+`libsql` is remote-only — for a local SQLite file use `sqlite`. The current
+schema is created on first start. Put the metadata store on a database your
+workers can also reach when you farm builds out (below).
 
 ## Build queue & workers (farm-out)
 

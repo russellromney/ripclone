@@ -114,11 +114,6 @@ ci_build() {
   bash "$ROOT/scripts/ci-build-artifacts.sh"
 }
 
-# Back-compat alias used by older workflow snippets / local muscle memory.
-s3gc_build() {
-  ci_build
-}
-
 # Run the S3-backed remote GC end-to-end suite against a local MinIO container
 # (or any S3-compatible store pointed at by RIPCLONE_S3_ENDPOINT). This is the
 # only place these #[ignored] tests are executed in CI.

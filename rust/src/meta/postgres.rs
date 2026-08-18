@@ -45,10 +45,6 @@ impl MetaDb for PostgresMeta {
             .execute(&self.pool)
             .await
             .context("create refs commit index")?;
-        sqlx::raw_sql("ALTER TABLE refs ADD COLUMN IF NOT EXISTS generation BIGINT")
-            .execute(&self.pool)
-            .await
-            .context("add generation column")?;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS added_repos (
                 repo_key TEXT PRIMARY KEY NOT NULL,

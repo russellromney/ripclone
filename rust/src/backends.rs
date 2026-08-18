@@ -146,7 +146,7 @@ async fn select_metadata(
     // coerces to Arc<dyn RefStore>.
     let store: Arc<dyn RefStore> = match kind.as_str() {
         "" => {
-            // Backward compatible: metadata follows storage.
+            // By default metadata follows the selected storage backend.
             if let Some(s3) = s3 {
                 info!("metadata store: s3 (default, follows storage)");
                 Arc::new(CachingRefStore::new(S3RefStore::new(s3.clone())))

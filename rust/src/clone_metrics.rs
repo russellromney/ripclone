@@ -52,7 +52,7 @@ impl ClientInfo {
     }
 }
 
-/// The v1 payload POSTed to `/v1/clones/{cloneId}/metrics`. Field names are
+/// The current payload POSTed to `/v1/clones/{cloneId}/metrics`. Field names are
 /// camelCase to match the cloud's `CloneMetricPayload`. Optional fields are
 /// omitted when the CLI cannot measure them cleanly (the cloud treats every
 /// field except the repo identity as optional).

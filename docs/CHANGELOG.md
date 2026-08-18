@@ -231,7 +231,8 @@ Every command in the README and `docs/` was run verbatim against a real server. 
   - `ClonepackManifest` now carries `repeated ChunkRef head_blobs_chunks` (default 8 MB each).
   - `RefInfo` and `RefResponse` carry the chunk hashes and signed URLs.
   - Client `fetch_chunk_refs` downloads chunks concurrently with configurable `RIPCLONE_FETCH_CONCURRENCY`.
-  - Old single-pack manifests are still parsed for compatibility.
+  - Superseded: the single-pack manifest reader was later removed; current
+    manifests use the chunk list exclusively.
 
 - **Fixed `benchmark/remote.sh` manifest parsing**
   - The script no longer stores binary protobuf in a shell variable, which corrupted the data and reported `archive chunks: 1`.

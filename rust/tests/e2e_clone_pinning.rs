@@ -2081,9 +2081,9 @@ async fn cancelling_real_clone_waits_for_midx_writer_before_staging_cleanup() {
         .await
         .expect("sync cancellation fixture");
 
-    // Remove the optional pregenerated MIDX from an otherwise valid manifest
-    // so the public install path deterministically reaches its blocking local
-    // MIDX fallback after all worktree bytes have been staged.
+    // Incremental shallow manifests may omit the pregenerated MIDX when their
+    // base packs are remote. Reproduce that current shape so the public install
+    // path reaches its blocking local MIDX writer after worktree staging.
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/cancel-midx");
     let mut info = None;

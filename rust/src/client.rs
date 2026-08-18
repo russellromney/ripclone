@@ -325,9 +325,6 @@ pub struct RefResponse {
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.
     #[serde(default)]
     pub pack_chunk_urls: Option<Vec<Option<String>>>,
-    /// Signed URL for each editable pack's idx, ordered to match `manifest.packs`.
-    #[serde(default)]
-    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
     #[serde(default)]
     pub midx_url: Option<String>,
@@ -2886,7 +2883,11 @@ impl Client {
         std::fs::create_dir_all(pack_dir)
             .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
 
-        let idx_bundle_task = manifest.idx_bundle.as_ref().map(|bundle_ref| {
+        let bundle_ref = manifest
+            .idx_bundle
+            .as_ref()
+            .context("clonepack manifest is missing required idx bundle")?;
+        let idx_bundle_task = {
             let client = self.clone();
             let bundle_ref = bundle_ref.clone();
             let idx_bundle_url = info.idx_bundle_url.clone();
@@ -2899,7 +2900,7 @@ impl Client {
                 }),
                 cleanup.clone(),
             )
-        });
+        };
         let midx_task = manifest.midx.as_ref().map(|midx_ref| {
             let client = self.clone();
             let midx_ref = midx_ref.clone();
@@ -2945,22 +2946,17 @@ impl Client {
         let download_conc = tuning.editable_download_concurrency;
         let parse_conc = tuning.pack_parse_threads;
 
-        // Signed URLs (one per pack/idx, matching manifest.packs order). Empty
+        // Signed URLs (one per pack, matching manifest.packs order). Empty
         // entries fall back to the gateway by hash; with an object-store backend
         // these point straight at the bucket so bytes bypass the server.
         let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
-        let idx_urls = info.pack_idx_urls.clone().unwrap_or_default();
-
-        // If the manifest ships a single idx bundle, fetch it ONCE and slice each
-        // pack's idx out of it locally — instead of one GET per pack idx (cuts
-        // per-pack round-trips from 2 to 1). Falls back to per-pack idx fetches
-        // for older manifests without a bundle.
-        let idx_bundle: Option<Arc<bytes::Bytes>> = match idx_bundle_task {
-            Some(task) => Some(Arc::new(
-                task.join().await.context("idx bundle fetch task")??,
-            )),
-            None => None,
-        };
+        // Fetch the required bundle once and slice every verified pack idx from it.
+        let idx_bundle = Arc::new(
+            idx_bundle_task
+                .join()
+                .await
+                .context("idx bundle fetch task")??,
+        );
 
         let jobs: Vec<(usize, PackEntry)> = manifest.packs.iter().cloned().enumerate().collect();
 
@@ -2985,7 +2981,6 @@ impl Client {
         let downloads = stream::iter(jobs).map(|(i, entry)| {
             let client = self.clone();
             let pack_url = pack_urls.get(i).and_then(|o| o.clone());
-            let idx_url = idx_urls.get(i).and_then(|o| o.clone());
             let idx_bundle = idx_bundle.clone();
             let history_only = entry.history_only;
             let pack_dir = pack_dir.to_path_buf();
@@ -2994,36 +2989,7 @@ impl Client {
                     .pack
                     .as_ref()
                     .with_context(|| format!("pack {} missing pack ref", i))?;
-                let idx_ref = entry
-                    .idx
-                    .as_ref()
-                    .with_context(|| format!("pack {} missing idx ref", i))?;
-                let idx_bytes = if let Some(bundle) = idx_bundle.as_ref() {
-                    // Slice this pack's idx from the bundle and verify its hash;
-                    // only the pack itself needs a network fetch.
-                    let off = entry.idx_bundle_offset as usize;
-                    let end = off
-                        .checked_add(idx_ref.len as usize)
-                        .context("idx bundle offset overflow")?;
-                    // Zero-copy view into the shared bundle (refcounted Bytes).
-                    if bundle.get(off..end).is_none() {
-                        anyhow::bail!("idx {} slice out of bundle range", i);
-                    }
-                    let slice = bundle.slice(off..end);
-                    let want = hash_to_hex(&idx_ref.hash);
-                    let got = crate::cas::hash(&slice);
-                    if got != want {
-                        anyhow::bail!(
-                            "idx {i} bundle slice hash mismatch: expected {want}, got {got}"
-                        );
-                    }
-                    slice
-                } else {
-                    client
-                        .fetch_chunk_ref(idx_ref, idx_url.as_deref())
-                        .await
-                        .with_context(|| format!("fetch idx {}", i))?
-                };
+                let idx_bytes = manifest_pack_idx_bytes(&entry, i, &idx_bundle)?;
                 let pack_fetch_start = std::time::Instant::now();
                 let pack_body = if history_only {
                     let (file, len) = client
@@ -3194,11 +3160,9 @@ impl Client {
         .context("spawn clear skip-worktree and refresh index stats")??;
 
         // Install the multi-pack-index so git object lookups stay O(log) across
-        // the many installed packs. Prefer the server-pregenerated MIDX (zero
-        // client CPU; it indexes the same `pack-<trailer>` files we just wrote);
-        // fall back to building it locally for older manifests without one. Best
-        // effort either way — without a MIDX the clone is still correct, just
-        // with slower per-object lookups.
+        // the many installed packs. A cold build supplies the prebuilt MIDX;
+        // an incremental shallow build may omit it when base packs are remote,
+        // in which case the client builds it from the installed pack indexes.
         if let Some(midx_task) = midx_task {
             match midx_task
                 .join()
@@ -4114,48 +4078,32 @@ impl Client {
             anyhow::bail!("clonepack has no packs for git-dir install");
         }
 
-        let idx_bundle: Option<Arc<bytes::Bytes>> = match manifest.idx_bundle.as_ref() {
-            Some(b) => Some(Arc::new(
-                self.fetch_chunk_ref(b, info.idx_bundle_url.as_deref())
-                    .await
-                    .context("fetch idx bundle")?,
-            )),
-            None => None,
-        };
+        let bundle_ref = manifest
+            .idx_bundle
+            .as_ref()
+            .context("clonepack manifest is missing required idx bundle")?;
+        let idx_bundle = Arc::new(
+            self.fetch_chunk_ref(bundle_ref, info.idx_bundle_url.as_deref())
+                .await
+                .context("fetch idx bundle")?,
+        );
 
         let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
-        let idx_urls = info.pack_idx_urls.clone().unwrap_or_default();
 
         let downloads = stream::iter(packs.into_iter().enumerate()).map(|(i, entry)| {
             let client = self.clone();
             let pack_url = pack_urls.get(i).and_then(|o| o.clone());
-            let idx_url = idx_urls.get(i).and_then(|o| o.clone());
             let idx_bundle = idx_bundle.clone();
             async move {
                 let pack_ref = entry
                     .pack
                     .as_ref()
                     .with_context(|| format!("pack {} missing pack ref", i))?;
-                let (pack_bytes, idx_bytes) = if let Some(bundle) = idx_bundle.as_ref() {
-                    let pack_bytes = client
-                        .fetch_chunk_ref(pack_ref, pack_url.as_deref())
-                        .await
-                        .with_context(|| format!("fetch pack {}", i))?;
-                    let idx_bytes = manifest_pack_idx_bytes(&entry, i, Some(bundle), None)?;
-                    (pack_bytes, idx_bytes)
-                } else {
-                    let idx_ref = entry
-                        .idx
-                        .as_ref()
-                        .with_context(|| format!("pack {} missing idx ref", i))?;
-                    let (pack_bytes, idx_bytes) = tokio::try_join!(
-                        client.fetch_chunk_ref(pack_ref, pack_url.as_deref()),
-                        client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
-                    )
+                let pack_bytes = client
+                    .fetch_chunk_ref(pack_ref, pack_url.as_deref())
+                    .await
                     .with_context(|| format!("fetch pack {}", i))?;
-                    let idx_bytes = manifest_pack_idx_bytes(&entry, i, None, Some(idx_bytes))?;
-                    (pack_bytes, idx_bytes)
-                };
+                let idx_bytes = manifest_pack_idx_bytes(&entry, i, &idx_bundle)?;
                 Ok::<(bytes::Bytes, bytes::Bytes), anyhow::Error>((pack_bytes, idx_bytes))
             }
         });

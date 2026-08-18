@@ -69,15 +69,16 @@ fn unbranch_slug(slug: &str) -> Option<String> {
 ///   `build_status` flipping to done — must always land), or
 /// - the new commit is at least as deep in git history as the stored one
 ///   (`generation`), or
-/// - (fallback, for refs without a generation) the new `synced_at` is
+/// - (tie-break, when either ref has no generation) the new `synced_at` is
 ///   newer-than-or-equal to the stored one.
 ///
 /// `generation` (the commit's history depth) is the primary signal: recency
 /// follows the commit's place in history, not the builder's clock, so two
 /// builders with skewed clocks still order correctly. `synced_at` is the
-/// fallback for refs written before `generation` existed. A missing value on
-/// either side defers to the backend's atomic tie-break (the SQL conditional
-/// upsert, the S3 ETag CAS); the file store serializes writes in-process.
+/// tie-break for authoritative force-push writes and cases where Git cannot
+/// provide history depth. A missing value on either side defers to the
+/// backend's atomic tie-break (the SQL conditional upsert, the S3 ETag CAS);
+/// the file store serializes writes in-process.
 ///
 /// Force-push rewinds: an *older* commit has a lower generation, so this guard
 /// would reject it. Both flavors are handled upstream in the sync path by

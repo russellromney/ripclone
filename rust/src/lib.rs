@@ -194,14 +194,11 @@ pub struct ClonepackArtifacts {
     pub skeleton_idx: String,
     pub prebuilt_index: String,
     /// CAS hash of the pre-built multi-pack-index over this variant's packs.
-    #[serde(default)]
     pub midx: String,
-    /// CAS hash of the concatenated idx bundle for this variant's packs. Empty
-    #[serde(default)]
+    /// CAS hash of the required concatenated idx bundle for this variant's packs.
     pub idx_bundle: String,
     /// The commit this variant's clonepack is built for. Complete artifacts
     /// always carry this identity explicitly.
-    #[serde(default)]
     pub commit: String,
 }
 
@@ -249,10 +246,8 @@ pub struct RefInfo {
     #[serde(default)]
     pub archive_chunks: Vec<String>,
     /// Full-history clonepack (all reachable commits/trees).
-    #[serde(default)]
     pub full_clonepack: ClonepackArtifacts,
     /// Shallow clonepack (single commit + HEAD trees). Matches `git clone --depth=1`.
-    #[serde(default)]
     pub shallow_clonepack: ClonepackArtifacts,
     /// LSM sealed history levels (oldest first). Empty unless the LSM build is
     /// enabled. Each level is immutable and content-addressed; a sync only builds
@@ -287,13 +282,13 @@ pub struct RefInfo {
     /// full-history/files artifacts finish and surfaced by `/status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_ms: Option<u64>,
-    /// Unix timestamp (seconds) when this ref was last synced. Legacy ordering
-    /// signal, kept as a fallback for refs (or repos) without a `generation`.
+    /// Unix timestamp (seconds) when this ref was last synced. It is the atomic
+    /// ordering tie-break when either side has no Git generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<u64>,
     /// Unix timestamp (seconds) when this ref was last considered "warm".
-    /// The periodic warm-TTL sweep uses this (falling back to `synced_at`) to
-    /// decide when a ref's clonepack artifacts have gone idle.
+    /// The periodic warm-TTL sweep uses this to decide when a ref's clonepack
+    /// artifacts have gone idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<u64>,
     /// When true, the warm-TTL sweep never evicts this ref's artifacts. An
@@ -304,8 +299,8 @@ pub struct RefInfo {
     /// The commit's depth in git history (`git rev-list --count`). This is the
     /// primary ordering signal for "a newer sync never loses": recency follows
     /// the commit's place in history, not the builder's clock, so two builders
-    /// with skewed clocks still order correctly. `None` on refs written before
-    /// this field existed, where callers fall back to `synced_at`.
+    /// with skewed clocks still order correctly. `None` selects the current
+    /// authoritative `synced_at` tie-break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
 }

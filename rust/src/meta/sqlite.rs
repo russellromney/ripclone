@@ -51,11 +51,6 @@ impl MetaDb for SqliteMeta {
             .execute(&self.pool)
             .await
             .context("create refs commit index")?;
-        // Add the generation column to a table created before it existed
-        // (best-effort: errors "duplicate column" on an up-to-date table).
-        let _ = sqlx::raw_sql("ALTER TABLE refs ADD COLUMN generation BIGINT")
-            .execute(&self.pool)
-            .await;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS added_repos (
                 repo_key TEXT PRIMARY KEY NOT NULL,
