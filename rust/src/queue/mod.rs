@@ -48,9 +48,8 @@ pub struct BuildJob {
     /// separate lane from ordinary tip admission and is intentionally not
     /// persisted by the cross-process queue.
     pub rev: Option<String>,
-    /// Exact commit admitted for an ordinary branch-tip sync. A normal tip job
-    /// must carry a validated full object id; `None` is reserved for the
-    /// historical `rev` lane and for rows written before this field existed.
+    /// Exact commit admitted for this build. Ordinary and historical jobs both
+    /// carry the validated full object id selected before enqueue.
     pub admitted_commit: Option<String>,
     /// Trusted concrete upstream default branch learned alongside a HEAD tip
     /// admission. This is publication metadata, not part of the active key.

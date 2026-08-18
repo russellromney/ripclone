@@ -3351,17 +3351,10 @@ async fn get_ref_inner(
                     }
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
-                        branch: if params.rev.is_none() {
-                            effective_branch.clone()
-                        } else {
-                            branch.clone()
-                        },
+                        branch: effective_branch.clone(),
                         rev: historical_rev.clone(),
-                        admitted_commit: historical_rev.is_none().then(|| commit.clone()),
-                        admitted_default_branch: params
-                            .rev
-                            .is_none()
-                            .then(|| default_branch.clone()),
+                        admitted_commit: Some(commit.clone()),
+                        admitted_default_branch: Some(default_branch.clone()),
                         credential: credential.clone(),
                         recheck: 0,
                         size_bytes,
@@ -4312,8 +4305,7 @@ async fn sync_repo_at_revision(
         } else {
             branch.clone()
         };
-        let commit = git::resolve_commit(&mirror_dir, &at_rev).ok()?;
-        Some((effective_branch, commit))
+        Some((effective_branch, at_rev.clone()))
     };
     if let Some((effective_branch, commit)) = resolve_exact_target() {
         let exact_key = exact_ref_store_key(&effective_branch, &commit);
@@ -4479,20 +4471,7 @@ async fn sync_repo_at_revision(
                 } else {
                     branch.clone()
                 };
-                let commit = match git::resolve_commit(&mirror_dir, &at_rev) {
-                    Ok(commit) => commit,
-                    Err(error) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!(
-                                    "build finished but exact revision is missing: {error}"
-                                ),
-                            }),
-                        )
-                            .into_response();
-                    }
-                };
+                let commit = at_rev.clone();
                 let load_key = exact_ref_store_key(&effective_branch, &commit);
                 match state.ref_store.load_branch(&repo_id, &load_key).await {
                     Ok(Some(info)) if exact_ref_info_serves_commit(&info, "full", &commit) => {
@@ -8737,19 +8716,16 @@ async fn update_build_status(
         })
 }
 
-/// Status writes for immutable ordinary jobs are fenced by their admitted
-/// commit. A B job that fails before publication must not mark the previously
-/// served A row (or a later C row) as building/failed. Historical `rev` jobs do
-/// not carry a pre-resolved object identity and retain their existing behavior.
+/// Status writes for every immutable job are fenced by its admitted commit.
+/// A job that fails before publication must update only its exact result, never
+/// a previously served or later moving projection.
 async fn update_job_build_status(
     state: &ServerState,
     job: &BuildJob,
     branch: &str,
     status: &str,
 ) -> Result<Option<String>> {
-    if job.rev.is_none()
-        && let Some(commit) = job.admitted_commit.as_deref()
-    {
+    if let Some(commit) = job.admitted_commit.as_deref() {
         let exact_branch = exact_ref_store_key(branch, commit);
         if status == "building" {
             let existing = state
@@ -10955,6 +10931,99 @@ mod tests {
         assert!(
             state.storage.list_hashes().unwrap().is_empty(),
             "an unavailable exact target must not publish artifacts"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn historical_source_failure_is_terminal_on_exact_row_without_reenqueue() {
+        let _env = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base
+            .path()
+            .join("acme")
+            .join("historical-missing.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let current = crate::test_fixture::commit(&origin, &[("README.md", b"current")]);
+        let missing = "f".repeat(40);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = test_state_with_queue(&tmp);
+        let repo_id = RepoId::github("acme/historical-missing");
+        mark_added(&state, repo_id.clone()).await;
+        state
+            .ref_store
+            .save_branch(
+                &repo_id,
+                "main",
+                &RefInfo {
+                    commit: current.clone(),
+                    build_status: Some("done".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let job = BuildJob {
+            repo_id: repo_id.clone(),
+            branch: "main".to_string(),
+            rev: Some(missing.clone()),
+            admitted_commit: Some(missing.clone()),
+            admitted_default_branch: Some("main".to_string()),
+            credential: None,
+            recheck: 0,
+            size_bytes: None,
+        };
+        prepare_exact_admission(&state, &job, false).await.unwrap();
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
+        process_build_job(&state, &job)
+            .await
+            .expect_err("missing historical object must fail");
+
+        let exact_key = exact_ref_store_key("main", &missing);
+        let failed = state
+            .ref_store
+            .load_branch(&repo_id, &exact_key)
+            .await
+            .unwrap()
+            .expect("terminal exact failure row");
+        assert_eq!(failed.commit, missing);
+        assert!(
+            failed
+                .build_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("failed: "))
+        );
+        let moving = state
+            .ref_store
+            .load_branch(&repo_id, "main")
+            .await
+            .unwrap()
+            .expect("moving projection remains");
+        assert_eq!(moving.commit, current);
+        assert_eq!(moving.build_status.as_deref(), Some("done"));
+        assert!(state.storage.list_hashes().unwrap().is_empty());
+
+        let response = build_app(state)
+            .oneshot(test_request(
+                "POST",
+                &format!("/v1/repos/github/acme/historical-missing/sync?branch=main&rev={missing}"),
+            ))
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains(&missing), "clear exact failure: {body}");
+        assert!(
+            rx.try_recv().is_err(),
+            "terminal failure cannot enqueue again"
         );
     }
 

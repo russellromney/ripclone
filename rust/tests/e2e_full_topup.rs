@@ -521,6 +521,7 @@ fn commit_all(repo: &std::path::Path, message: &str) -> String {
 async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() {
     let _guard = env_lock().lock().await;
     init(false);
+    let _recheck = ScopedEnvVar::set("RIPCLONE_RECHECK_MAX", "0");
     let upstream_token = "full-topup-client-token";
     let origin = make_http_origin_with_auth("acme/full-topup", "token full-topup-client-token");
     let provider = ProviderInstance {
@@ -792,6 +793,14 @@ exec "$real_git" "$@"
         staging_barrier.join("entered").exists(),
         "the client must acquire the carried-A top-up plan before branch movement"
     );
+    let source_acquisitions_after_pin = std::fs::read_to_string(&source_log)
+        .expect("source log after operation pin")
+        .lines()
+        .count();
+    assert_eq!(
+        source_acquisitions_after_pin, 1,
+        "the initial unpinned request resolves the moving branch exactly once"
+    );
     // This is deliberately after the server has issued the carried-A plan and
     // the client has created its private staging root. The production-generated
     // B row remains untouched; exact fetch must not follow the now-advanced C.
@@ -910,8 +919,8 @@ exec "$real_git" "$@"
         .lines()
         .count();
     assert_eq!(
-        server_source_acquisitions, 0,
-        "the pinned top-up metadata request must not acquire server source"
+        server_source_acquisitions, source_acquisitions_after_pin,
+        "no server source acquisition is allowed after the top-up pin exists"
     );
     println!(
         "TOP_UP_EVIDENCE target={b} base={a} manifest={base_manifest} advanced={c} \
@@ -1683,10 +1692,20 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
         .expect("exact B row");
     assert_eq!(exact.commit, b);
     assert_eq!(exact.parent_commit.as_deref(), Some(x.as_str()));
-    assert_eq!(exact.full_clonepack.commit, a);
-    // Corrupt the first-parent-style hint. The fetched commit object remains
-    // authoritative.
+    assert!(
+        exact.full_clonepack.commit.is_empty(),
+        "an unrelated history must not carry Full(A) automatically"
+    );
+    let exact_a = store
+        .load_branch(&repo_id, &format!("main#{a}"))
+        .await
+        .expect("load exact A")
+        .expect("exact A row");
+    assert_eq!(exact_a.full_clonepack.commit, a);
+    // Forge both the first-parent hint and a carried Full(A). The fetched B
+    // commit object remains authoritative and must reject this metadata.
     exact.parent_commit = Some(a.clone());
+    exact.full_clonepack = exact_a.full_clonepack;
     store
         .save_branch(&repo_id, &exact_key, &exact)
         .await
@@ -1779,7 +1798,10 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
         .expect("load merge B row")
         .expect("merge B row");
     assert_eq!(exact.commit, b);
-    assert_eq!(exact.full_clonepack.commit, a);
+    assert!(
+        exact.full_clonepack.commit.is_empty(),
+        "a merge target must not carry an arbitrary first-parent Full artifact"
+    );
     assert_eq!(exact.parent_commit, None, "merge B has no safe sole parent");
 
     let output = tempfile::tempdir().unwrap();
