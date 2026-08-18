@@ -728,12 +728,8 @@ pub struct BuildRequest {
 pub struct BuildResponse {
     pub status: String,
     pub queue_depth: usize,
-    /// Exact admission target when this endpoint admits commit-specific work.
-    /// Repository wake-up responses may omit it when no target was admitted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
+    pub commit: String,
+    pub branch: String,
 }
 
 #[derive(Serialize)]
@@ -4174,8 +4170,8 @@ async fn sync_repo_inner(
             // counter is an informational hint and never performs a second
             // database operation after durable acceptance.
             queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
-            commit: Some(commit),
-            branch: Some(admitted_branch),
+            commit,
+            branch: admitted_branch,
         }),
     )
         .into_response()
@@ -5167,8 +5163,8 @@ async fn build_handler(
                 }
                 .to_string(),
                 queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
-                commit: Some(tip.commit),
-                branch: Some(admitted_branch),
+                commit: tip.commit,
+                branch: admitted_branch,
             }),
         )
             .into_response(),
