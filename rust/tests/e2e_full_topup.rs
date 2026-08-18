@@ -1844,9 +1844,41 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
         .expect("removed B reached phase one")
         .expect("removed phase-one barrier alive");
 
-    // Make the advertised branch point back to A and physically prune B from
-    // the source repository. The client must request B by object ID and fail;
-    // following main would silently publish the wrong commit.
+    let output = tempfile::tempdir().unwrap();
+    let target = output.path().join("clone");
+    let staging_barrier = output.path().join("staging-barrier");
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let _staging_barrier =
+        ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR", &staging_barrier);
+    let install_client = server.client();
+    let target_for_install = target.clone();
+    let mut install = tokio::spawn(async move {
+        install_client
+            .install_repo_with_mode_at(
+                "acme/full-topup-removed",
+                "HEAD",
+                None,
+                &target_for_install,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    for _ in 0..800 {
+        if staging_barrier.join("entered").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        staging_barrier.join("entered").exists(),
+        "ordinary Full clone must acquire the B-from-A top-up plan"
+    );
+
+    // The ordinary clone has pinned B and privately staged Full(A). Rewind the
+    // advertised branch and physically prune B before allowing its exact fetch.
+    // Following main would silently publish A; fetching B must fail instead.
     git(&origin.work, &["reset", "--hard", &a]);
     origin.publish();
     git(&origin.bare, &["reflog", "expire", "--expire=now", "--all"]);
@@ -1856,24 +1888,15 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
         &["cat-file", "-e", &format!("{b}^{{commit}}")]
     ));
 
-    let output = tempfile::tempdir().unwrap();
-    let target = output.path().join("clone");
-    let error = tokio::time::timeout(
-        Duration::from_secs(15),
-        server.client().install_repo_with_mode_at(
-            "acme/full-topup-removed",
-            "HEAD",
-            Some(&b),
-            &target,
-            CloneMode::Editable,
-            Some("full"),
-            None,
-        ),
-    )
-    .await
-    .expect("removed B failure is bounded")
-    .expect_err("removed B must not fall back to current main/A");
-    assert!(format!("{error:#}").contains(&b));
+    std::fs::write(staging_barrier.join("proceed"), b"continue\n").unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(15), &mut install)
+        .await
+        .expect("removed B failure is bounded")
+        .expect("removed B clone task joins")
+        .expect_err("removed B must not fall back to current main/A");
+    let error = format!("{error:#}");
+    assert!(error.contains("exact upstream fetch"), "{error}");
+    assert!(error.contains(&b), "{error}");
     assert!(!target.exists());
 
     proceed.send(()).expect("release removed Full(B)");

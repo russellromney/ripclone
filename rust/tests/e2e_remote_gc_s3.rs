@@ -1636,6 +1636,7 @@ async fn wait_for_full_build(env: &S3Env, prefix: &str, owner: &str, repo: &str)
                 }
                 ref_store.invalidate(&repo_id, branch).await;
                 if let Ok(Some(info)) = ref_store.load_branch(&repo_id, branch).await
+                    && !info.internal_exact_result
                     && info.build_status.is_none()
                     && !info.full_clonepack.manifest.is_empty()
                 {
