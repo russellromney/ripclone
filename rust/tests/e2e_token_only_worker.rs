@@ -413,15 +413,19 @@ async fn api_worker_publishes_exact_result_without_db_secret() {
         .await
         .expect("list API-worker publication refs");
     assert!(
-        branches.iter().any(|branch| branch == &format!("main#{b}")),
+        branches
+            .iter()
+            .any(|branch| branch == &format!(":main#{b}")),
         "API worker keeps exact B addressable: {branches:?}"
     );
     assert!(
-        branches.iter().any(|branch| branch == &format!("main#{c}")),
+        branches
+            .iter()
+            .any(|branch| branch == &format!(":main#{c}")),
         "API worker keeps exact C addressable: {branches:?}"
     );
     assert!(
-        branches.iter().all(|branch| !branch.starts_with("HEAD#")),
+        branches.iter().all(|branch| !branch.starts_with(":HEAD#")),
         "ordinary API-worker jobs do not create HEAD exact aliases: {branches:?}"
     );
     assert!(

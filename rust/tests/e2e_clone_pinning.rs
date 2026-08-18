@@ -14,7 +14,7 @@ use prost::Message;
 use ripclone::client::{ArtifactPending, Client};
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
-use ripclone::ref_store::{FileRefStore, RefStore};
+use ripclone::ref_store::{FileRefStore, RefStore, exact_ref_key};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -655,7 +655,7 @@ async fn run_pinned_branch_advance_proof(advance_again: bool) {
         "late B publication cannot replace the latest artifacts"
     );
     let exact_b = store
-        .load_branch(&repo_id, &format!("main#{b}"))
+        .load_branch(&repo_id, &format!(":main#{b}"))
         .await
         .expect("load exact B result")
         .expect("exact B result remains addressable");
@@ -714,7 +714,7 @@ async fn evicted_pin_rebuilds_b_without_branch_probe() {
 
     let store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&server.repo_root));
     let repo_id = RepoId::github("acme/evicted-pin");
-    let exact_key = format!("main#{b}");
+    let exact_key = format!(":main#{b}");
     let exact_b = store
         .load_branch(&repo_id, &exact_key)
         .await
@@ -884,13 +884,13 @@ async fn pinned_release_cli_completes_exact_a_after_branch_moves() {
     assert!(
         branches
             .iter()
-            .any(|branch| branch == &format!("main#{pinned}")),
+            .any(|branch| branch == &format!(":main#{pinned}")),
         "ordinary sync publishes the exact A result"
     );
     assert!(
         branches
             .iter()
-            .all(|branch| branch != &format!("HEAD#{pinned}")),
+            .all(|branch| branch != &format!(":HEAD#{pinned}")),
         "ordinary sync keeps only the concrete exact key"
     );
 
@@ -1101,7 +1101,7 @@ async fn warm_ttl_collects_superseded_exact_result_without_deleting_current_shar
 
     let store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&server.repo_root));
     let repo_id = RepoId::github("acme/exact-result-gc");
-    let exact_b_key = format!("main#{b}");
+    let exact_b_key = format!(":main#{b}");
     let exact_b = store
         .load_branch(&repo_id, &exact_b_key)
         .await
@@ -1595,6 +1595,155 @@ async fn sha_suffixed_real_branch_resolves_reports_polls_and_advances() {
 
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+    }
+}
+
+#[tokio::test]
+async fn exact_main_b_and_real_main_hash_b_branch_do_not_collide() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "exact-key-collision");
+    let b = origin.commit(&[("value.txt", "main B\n")], "main B");
+    origin.publish();
+    register_added_without_build(&server, "acme/exact-key-collision")
+        .await
+        .expect("register collision fixture");
+    let main = server
+        .client()
+        .sync_branch("acme/exact-key-collision", "main")
+        .await
+        .expect("build main B");
+    assert_eq!(main.commit, b);
+
+    let colliding_branch = format!("main#{b}");
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "check-ref-format",
+                &format!("refs/heads/{colliding_branch}")
+            ])
+            .status()
+            .expect("validate colliding branch")
+            .success()
+    );
+    git(&origin.work, &["checkout", "-q", "-b", &colliding_branch]);
+    let branch_commit = origin.commit(&[("value.txt", "real branch\n")], "real branch");
+    git(
+        &origin.work,
+        &[
+            "push",
+            "-q",
+            "--force",
+            origin.bare_str(),
+            &colliding_branch,
+        ],
+    );
+    git(&origin.work, &["checkout", "-q", "main"]);
+
+    let branch = server
+        .client()
+        .sync_branch("acme/exact-key-collision", &colliding_branch)
+        .await
+        .expect("build real colliding branch");
+    assert_eq!(branch.commit, branch_commit);
+    assert_eq!(branch.branch, colliding_branch);
+
+    let repo_id = RepoId::github("acme/exact-key-collision");
+    let store = FileRefStore::new(&server.repo_root);
+    let exact_main = store
+        .load_branch(&repo_id, &exact_ref_key("main", &b))
+        .await
+        .expect("load exact main B")
+        .expect("exact main B exists");
+    assert_eq!(exact_main.commit, b);
+    assert!(exact_main.internal_exact_result);
+    let public_branch = store
+        .load_branch(&repo_id, &colliding_branch)
+        .await
+        .expect("load real colliding branch")
+        .expect("real colliding branch exists");
+    assert_eq!(public_branch.commit, branch_commit);
+    assert!(!public_branch.internal_exact_result);
+    let exact_branch = store
+        .load_branch(&repo_id, &exact_ref_key(&colliding_branch, &branch_commit))
+        .await
+        .expect("load exact real-branch result")
+        .expect("exact real-branch result exists");
+    assert_eq!(exact_branch.commit, branch_commit);
+    assert!(exact_branch.internal_exact_result);
+
+    let status = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/exact-key-collision/status",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .send()
+        .await
+        .expect("collision status")
+        .error_for_status()
+        .expect("collision status 2xx")
+        .json::<serde_json::Value>()
+        .await
+        .expect("collision status JSON");
+    let public_refs = status["refs"].as_array().expect("public refs");
+    assert!(
+        public_refs
+            .iter()
+            .any(|entry| entry["branch"] == "main" && entry["commit"] == b)
+    );
+    assert!(
+        public_refs.iter().any(|entry| {
+            entry["branch"] == colliding_branch && entry["commit"] == branch_commit
+        })
+    );
+    assert!(public_refs.iter().all(|entry| {
+        !entry["branch"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(':')
+    }));
+
+    let binary = selected_cli_binary();
+    for (branch, expected) in [
+        ("main", "main B\n"),
+        (colliding_branch.as_str(), "real branch\n"),
+    ] {
+        let output = tempfile::tempdir().expect("clone output");
+        let target = output.path().join("clone");
+        let mut command = std::process::Command::new(&binary);
+        command
+            .arg("--server")
+            .arg(&server.url)
+            .arg("clone")
+            .arg("acme/exact-key-collision")
+            .arg(&target)
+            .args([
+                "--branch",
+                branch,
+                "--depth",
+                "0",
+                "--verify-upstream=never",
+                "--no-metrics",
+            ])
+            .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+            .env("RIPCLONE_NO_METRICS", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = spawn_bounded_child(&mut command).expect("spawn collision clone");
+        let output = wait_child_output_bounded(child, Duration::from_secs(30))
+            .await
+            .expect("collision clone completed");
+        assert!(
+            output.status.success(),
+            "clone {branch} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("value.txt")).expect("installed value"),
+            expected
+        );
     }
 }
 
@@ -2189,14 +2338,14 @@ async fn pinned_lookup_serves_exact_a_while_phase_one_b_is_paused() {
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/phase-one-pin");
     let exact_a = store
-        .load_branch(&repo_id, &format!("main#{a}"))
+        .load_branch(&repo_id, &format!(":main#{a}"))
         .await
         .expect("load A")
         .expect("A row");
     assert_eq!(exact_a.commit, a);
     assert!(
         store
-            .load_branch(&repo_id, &format!("main#{a}"))
+            .load_branch(&repo_id, &format!(":main#{a}"))
             .await
             .expect("load exact A")
             .is_some(),

@@ -34,6 +34,14 @@ pub enum AddedRepoSource {
     Migration,
 }
 
+/// Metadata key for an internal exact-commit result.
+///
+/// Git ref names cannot contain `:`, so this namespace cannot collide with a
+/// real source branch even when that branch ends in `#<commit>`.
+pub fn exact_ref_key(branch: &str, commit: &str) -> String {
+    format!(":{branch}#{commit}")
+}
+
 /// Encode a branch name so it is safe to use in a filesystem path or S3 key.
 fn branch_slug(branch: &str) -> String {
     base64::Engine::encode(

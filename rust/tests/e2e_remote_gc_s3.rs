@@ -1344,7 +1344,7 @@ async fn seed_shallow_s3_fixture(
     // retained historical `sync --at` compatibility lane. Ordinary sync
     // production code did not create it and must not create another one.
     s3_refs
-        .save_branch(&repo_id, &format!("{default_branch}#{pinned}"), &info)
+        .save_branch(&repo_id, &format!(":{default_branch}#{pinned}"), &info)
         .await
         .expect("publish historical exact S3 A fixture");
     (pinned, s3_refs, info, fixture)

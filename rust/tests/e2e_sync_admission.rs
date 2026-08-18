@@ -779,7 +779,7 @@ async fn e2e_sync_admission() {
     );
     assert_full_artifacts(&local_storage, &final_ref, &c);
 
-    let exact_b_key = format!("main#{b}");
+    let exact_b_key = format!(":main#{b}");
     let exact_b = store
         .load_branch(&repo_id, &exact_b_key)
         .await
@@ -788,7 +788,7 @@ async fn e2e_sync_admission() {
     assert_full_artifacts(&local_storage, &exact_b, &b);
     assert_eq!(
         store
-            .load_branch(&repo_id, &format!("main#{c}"))
+            .load_branch(&repo_id, &format!(":main#{c}"))
             .await
             .expect("load exact C")
             .expect("exact C remains addressable")
@@ -1141,7 +1141,7 @@ async fn e2e_sync_admission() {
         tree_snapshot(&server.storage_dir),
         "unavailable exact job wrote artifacts"
     );
-    let failed_key = format!("main#{unavailable}");
+    let failed_key = format!(":main#{unavailable}");
     let failed = store
         .load_branch(&repo_id, &failed_key)
         .await
@@ -1181,9 +1181,9 @@ async fn e2e_sync_admission() {
     // job does not block one fresh exact admission.
     let evicted_target = origin.commit(&[("value.txt", "evicted\n")], "evicted target");
     origin.publish();
-    let evicted_key = format!("main#{evicted_target}");
+    let evicted_key = format!(":main#{evicted_target}");
     let mut evicted = store
-        .load_branch(&repo_id, &format!("main#{wait_commit}"))
+        .load_branch(&repo_id, &format!(":main#{wait_commit}"))
         .await
         .expect("load exact completed row before eviction")
         .expect("exact completed row exists");
@@ -1294,7 +1294,7 @@ async fn ordinary_build_publishes_exact_commit_result() {
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = ripclone::provider::RepoId::github("acme/ordinary-exact-publish");
-    let exact_key = format!("main#{b}");
+    let exact_key = format!(":main#{b}");
     let phase_one_exact = store
         .load_branch(&repo_id, &exact_key)
         .await
@@ -1333,7 +1333,9 @@ async fn ordinary_build_publishes_exact_commit_result() {
         .expect("list ordinary exact refs");
     assert!(branches.iter().any(|branch| branch == &exact_key));
     assert!(
-        branches.iter().all(|branch| branch != &format!("HEAD#{b}")),
+        branches
+            .iter()
+            .all(|branch| branch != &format!(":HEAD#{b}")),
         "ordinary exact publication does not create a HEAD#commit alias: {branches:?}"
     );
     let status = reqwest::Client::new()
@@ -1393,7 +1395,7 @@ async fn late_b_exact_publish_does_not_mutate_c() {
         .expect("admit B");
     assert!(b_admission.accepted);
     assert_eq!(b_admission.commit, b);
-    let exact_key = format!("main#{b}");
+    let exact_key = format!(":main#{b}");
     tokio::time::timeout(Duration::from_secs(20), phase_one_entered)
         .await
         .expect("B phase-one publication entered")
@@ -1457,7 +1459,7 @@ async fn late_b_exact_publish_does_not_mutate_c() {
         "late B exact publication leaves C artifacts byte-identical"
     );
     let exact_b = store
-        .load_branch(&repo_id, &format!("main#{b}"))
+        .load_branch(&repo_id, &format!(":main#{b}"))
         .await
         .expect("load delayed exact B")
         .expect("delayed exact B row");

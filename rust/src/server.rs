@@ -3146,7 +3146,7 @@ async fn carried_full_top_up_response(
 
 /// Returns true when the commit-keyed historical row, pre-upgrade raw-revision
 /// row, or moving row matches the requested commit and is evicted. Historical
-/// lookups are essential after the branch advances: `main#B` or `main#HEAD~2`
+/// lookups are essential after the branch advances: `:main#B` or `main#HEAD~2`
 /// may be cold while `main` is a complete C, and a `--at B` caller still needs
 /// a schedulable rebuild.
 async fn branch_ref_is_evicted_for_commit(
@@ -6456,13 +6456,15 @@ fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
     }
 }
 
-/// Ref-store key for a build. Commit-targeted builds use a commit-keyed rolling
-/// key (`{branch}#{commit}`) so they never overwrite another exact result.
+/// Ref-store key for a build. Commit-targeted builds use an internal,
+/// commit-keyed namespace (`:{branch}#{commit}`) that cannot collide with a Git
+/// source ref. They therefore never overwrite another exact result or a real
+/// branch whose name ends in `#<commit>`.
 /// Sequential builds at the same commit still share this key, so they stay
 /// incremental. Moving tip projections use the plain branch key.
 fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> String {
     match (at_rev, commit) {
-        (Some(_), Some(commit)) => format!("{branch}#{commit}"),
+        (Some(_), Some(commit)) => crate::ref_store::exact_ref_key(branch, commit),
         (Some(rev), None) => format!("{branch}#{rev}"),
         (None, _) => branch.to_string(),
     }
@@ -12772,7 +12774,11 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch(&rid, &format!("main#{}", "a".repeat(40)), &exact_stale)
+            .save_branch(
+                &rid,
+                &crate::ref_store::exact_ref_key("main", &"a".repeat(40)),
+                &exact_stale,
+            )
             .await
             .unwrap();
         let listed = state.ref_store.list_branches(&rid).await.unwrap();
@@ -13177,7 +13183,7 @@ mod tests {
                 .refs
                 .iter()
                 .any(|entry| entry.branch == "main#1111111111111111111111111111111111111111"),
-            "retained historical compatibility artifacts remain visible in status"
+            "a real SHA-suffixed source branch remains visible in status"
         );
         let expected_total = 300 + manifest_data.len() as u64;
         assert_eq!(status.total_bytes, expected_total);

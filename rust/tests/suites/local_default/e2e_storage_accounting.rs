@@ -106,7 +106,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
         .await
         .expect("load moving main")
         .expect("moving main exists");
-    let historical_key = format!("main#{}", info.commit);
+    let historical_key = format!(":main#{}", info.commit);
     // Represent the retained explicit `sync --at` compatibility lane. The
     // ordinary sync above must not have created this row.
     assert!(
