@@ -1341,6 +1341,12 @@ async fn service_unavailable_switches_to_exact_only_after_a_pin_exists() {
         std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
     }
     let unavailable = || (StatusCode::SERVICE_UNAVAILABLE, json!({"error": "busy"}));
+    let exact_unavailable = || {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "busy", "commit": A, "branch": "main"}),
+        )
+    };
 
     let (url, pre_pin_requests, pre_pin_task) =
         scripted_server(vec![unavailable(), ready(A)]).await;
@@ -1359,7 +1365,7 @@ async fn service_unavailable_switches_to_exact_only_after_a_pin_exists() {
     }
 
     let (url, post_pin_requests, post_pin_task) =
-        scripted_server(vec![pending(A), unavailable(), ready(A)]).await;
+        scripted_server(vec![pending(A), exact_unavailable(), ready(A)]).await;
     Client::new(url)
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await

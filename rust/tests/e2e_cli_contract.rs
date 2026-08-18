@@ -409,6 +409,38 @@ async fn ordinary_clone_requires_pending_body_branch_and_matching_content_locati
     }
 }
 
+#[tokio::test]
+async fn ordinary_clone_rejects_initial_concrete_branch_change() {
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    for status in [
+        IdentityResponseStatus::Pending,
+        IdentityResponseStatus::Ready,
+    ] {
+        let server = identity_response_server(status, B, Some("main"), Some("main")).await;
+        let client = Client::new(server);
+        let output = tempfile::tempdir().expect("branch identity output");
+        let target = output.path().join("target");
+        let error = client
+            .install_repo_with_mode_at(
+                "acme/identity",
+                "release",
+                None,
+                &target,
+                CloneMode::Editable,
+                None,
+                None,
+            )
+            .await
+            .expect_err("release must reject an initial response for main");
+        assert!(
+            format!("{error:#}").contains("integrity error"),
+            "unexpected branch mismatch: {error:#}"
+        );
+        assert!(!target.exists());
+    }
+}
+
 fn hanging_origin() -> (
     String,
     std::sync::mpsc::Receiver<()>,

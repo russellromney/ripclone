@@ -1443,7 +1443,7 @@ impl Client {
                 }
                 validate_ref_response_identity(
                     pinned.as_deref().or(expected_commit),
-                    resolved_branch.as_deref(),
+                    resolved_branch.as_deref().or(Some(branch)),
                     &pending.commit,
                     &pending.branch,
                     "pending",
@@ -1539,7 +1539,7 @@ impl Client {
                         .with_context(|| format!("invalid unavailable response for {repo_path}"))?;
                     validate_ref_response_identity(
                         pinned.as_deref().or(expected_commit),
-                        resolved_branch.as_deref(),
+                        resolved_branch.as_deref().or(Some(branch)),
                         &unavailable.commit,
                         &unavailable.branch,
                         "503",
@@ -1586,7 +1586,7 @@ impl Client {
                 let mut info: RefResponse = resp.json().await?;
                 validate_ref_response_identity(
                     pinned.as_deref().or(expected_commit),
-                    resolved_branch.as_deref(),
+                    resolved_branch.as_deref().or(Some(branch)),
                     &info.commit,
                     &info.branch,
                     "ready",
