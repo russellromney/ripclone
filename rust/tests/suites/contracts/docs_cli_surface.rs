@@ -1,5 +1,5 @@
 //! Doc-lint: every `ripclone <verb>` the OSS docs tell a user to run must exist.
-//! Included in the consolidated `contracts` integration-test crate.
+//! Included in the bounded `local_cli` integration-test crate.
 //!
 //! The README and `docs/` are the product's front door. A doc that names a verb
 //! the CLI doesn't have is a broken quick start, so this test walks every fenced

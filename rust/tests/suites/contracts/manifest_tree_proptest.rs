@@ -1,5 +1,5 @@
 //! Property and fuzz tests for the manifest → working-tree extraction path.
-//! Included in the consolidated `contracts` integration-test crate.
+//! Included in the bounded `local_cli` integration-test crate.
 //!
 //! The core invariant: given any `MetadataChunk` manifest and archive bytes, the
 //! extractor must either return `Err` or produce a working tree whose file set

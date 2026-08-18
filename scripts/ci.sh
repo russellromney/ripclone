@@ -29,7 +29,10 @@ lint() {
 # staging the full suite there was ~30m cold before integration-test
 # consolidation and is not worth it.
 run_tests() {
-  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked )
+  # Combined harnesses contain existing tests that select backends through
+  # process-global environment variables. Preserve their former cross-file
+  # isolation by running one test at a time inside each bounded harness.
+  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked -- --test-threads=1 )
 }
 
 e2e() {
@@ -79,14 +82,6 @@ gitea() {
 databases() {
   export CARGO_PROFILE="${CARGO_PROFILE:-ci}"
   bash "$ROOT/scripts/test-queue-sql.sh"
-  if [ -n "${CI_ARTIFACTS:-}" ]; then
-    local bin="$CI_ARTIFACTS/e2e_worker_libsql"
-    [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
-    echo "databases: running prebuilt $bin"
-    ( cd "$ROOT/rust" && "$bin" --nocapture )
-  else
-    ( cd "$ROOT/rust" && cargo test --profile "$CARGO_PROFILE" --locked --test e2e_worker_libsql -- --nocapture )
-  fi
 }
 
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
