@@ -1640,11 +1640,13 @@ mod tests {
     #[test]
     fn exact_promotion_preserves_artifacts_published_from_an_older_snapshot() {
         let mut published = dummy_ref_info("b");
+        published.internal_exact_result = true;
         published.full_clonepack.commit = "b".to_string();
         published.full_clonepack.manifest = "manifest".to_string();
         published.last_accessed_at = Some(20);
 
         let mut stale_promotion = dummy_ref_info("b");
+        stale_promotion.internal_exact_result = true;
         stale_promotion.require_matching_commit = false;
         stale_promotion.moving_publication_predecessors =
             vec![INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
