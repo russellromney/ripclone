@@ -6,7 +6,7 @@ REPO="${REPO:-oven-sh/bun}"
 BANDWIDTH="${BANDWIDTH:-250}"
 RTT_MS="${RTT_MS:-50}"
 CORES="${CORES:-4}"
-RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-bench-token}}"
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-token}"
 export RIPCLONE_SERVER_TOKEN
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,7 +49,7 @@ echo "sync=$((sync_end - sync_start)) ms"
 OWNER="$(echo "$REPO" | cut -d/ -f1)"
 NAME="$(echo "$REPO" | cut -d/ -f2)"
 TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
-ref_json=$(curl -fsS -H "Authorization: Ripclone $TOKEN_HASH" "$SERVER_URL/v1/repos/$OWNER/$NAME/refs/HEAD")
+ref_json=$(curl -fsS -H "Authorization: Ripclone $TOKEN_HASH" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/refs/HEAD")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 echo "clonepack manifest: $clonepack_manifest"
 if [ -n "$clonepack_manifest" ]; then
@@ -77,7 +77,7 @@ wait_for_full() {
   echo ""
   echo "==> waiting for full (depth=0) artifacts ..."
   while true; do
-    if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --depth 0 --dir "$BASE_DIR/probe-full" >/dev/null 2>&1; then
+    if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$BASE_DIR/probe-full" --depth 0 >/dev/null 2>&1; then
       rm -rf "$BASE_DIR/probe-full"
       end=$(now_ms)
       echo "full artifacts ready in $((end - start)) ms"
@@ -102,7 +102,7 @@ run_clone() {
   s=$(now_ms)
   # shellcheck disable=SC2086
   RUST_LOG=info RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
-    "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --mode "$mode" $extra_args --dir "$outdir" > "$log" 2>&1
+    "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$outdir" --mode "$mode" $extra_args > "$log" 2>&1
   e=$(now_ms)
   echo "$label=$((e - s)) ms"
   echo "--- top log lines ---"

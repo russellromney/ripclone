@@ -18,7 +18,7 @@ BANDWIDTH="${BANDWIDTH:-250}"
 ITER="${ITER:-3}"
 CORES="${CORES:-4 8}"
 RTTS="${RTTS:-50 125 250}"
-RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-bench-token}}"
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-token}"
 export RIPCLONE_SERVER_TOKEN
 # The server expects the SHA-256 hash of the token in the Authorization header.
 TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
@@ -119,7 +119,7 @@ cas_path() {
   local h="$1"
   echo "$CAS_DIR/${h:0:2}/${h}"
 }
-ref_json=$(curl -fsS -H "$AUTH_HEADER" "$SERVER_URL/v1/repos/$OWNER/$NAME/refs/HEAD")
+ref_json=$(curl -fsS -H "$AUTH_HEADER" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/refs/HEAD")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 
 echo ""
@@ -133,7 +133,7 @@ fi
 echo ""
 echo "==> Warm-up clone (unmeasured, direct server)..."
 warmup_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --mode "$MODE" --dir "$BASE_DIR/warmup" 2>&1 || true
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$BASE_DIR/warmup" --mode "$MODE" 2>&1 || true
 warmup_end=$(now_ms)
 printf "warmup=%d ms\n" $((warmup_end - warmup_start))
 rm -rf "$BASE_DIR/warmup"
@@ -180,7 +180,7 @@ for cores in $CORES; do
       install_dir="$BASE_DIR/install-${cores}-${rtt_ms}-${n}"
       install_start=$(now_ms)
       RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
-        "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --mode "$MODE" --dir "$install_dir" 2>&1
+        "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$install_dir" --mode "$MODE" 2>&1
       install_end=$(now_ms)
       elapsed=$((install_end - install_start))
       total_ms=$((total_ms + elapsed))

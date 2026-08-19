@@ -28,7 +28,6 @@ Internal tuning knobs use code constants at their current defaults.
 
 - `RIPCLONE_CONFIG` - path to the global `config.toml`.
 - `RIPCLONE_PROVIDERS` - JSON provider registry override.
-- `RIPCLONE_GITHUB_TOKEN` - token shortcut for the built-in GitHub provider.
 - `RIPCLONE_SERVER_TOKEN` / `RIPCLONE_SERVER_TOKEN_HASH` - server auth for
   clients and self-hosted servers.
 - `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`,

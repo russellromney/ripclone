@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="${REPO:-oven-sh/bun}"
 MODE="${MODE:-editable}"
-RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-bench-token}}"
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-token}"
 export RIPCLONE_SERVER_TOKEN
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +35,7 @@ echo "==> syncing $REPO..."
 "$RIPCLONE" --server "$SERVER_URL" sync "$REPO" > "$BASE_DIR/sync.log" 2>&1
 
 echo "==> cloning $MODE..."
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --mode "$MODE" --dir "$BASE_DIR/$MODE" > "$BASE_DIR/clone.log" 2>&1
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$BASE_DIR/$MODE" --mode "$MODE" > "$BASE_DIR/clone.log" 2>&1
 
 cd "$BASE_DIR/$MODE"
 echo "==> git status"

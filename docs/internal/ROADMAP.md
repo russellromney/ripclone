@@ -90,7 +90,7 @@ Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `fu
 **Shipped** (`rust/src/repo_config.rs`, admin endpoint + build wiring in `rust/src/server.rs`):
 
 - A `RepoConfigStore` backed by the same storage as artifacts (file for local dev, S3 for production), keyed `owner/repo[/branch]` with branch-level entries overriding repo-level entries (field-level overlay). It is read at build time only — the build records what the resolve path needs into the `RefInfo`, so the clone hot path never reads config. A write is visible to the next build immediately, across processes.
-- The full config schema: `clonepack_depths: Vec<DepthSpec>` (`{ name, depth: Option<usize> }`), `compression_level`, `dictionary_id`, `hot_files`, `archive_chunk_size`, `head_blobs_chunk_size`, `enabled_modes`. Validated on write.
+- The current config schema: `clonepack_depths: Vec<DepthSpec>` (`{ name, depth: Option<usize> }`), `compression_level`, `dictionary_id`, `archive_chunk_size`, and `head_blobs_chunk_size`. Unknown fields are rejected rather than ignored.
 - Admin read/write endpoint: `GET`/`POST /v1/admin/config/{owner}/{repo}` (with `?branch=` for a branch override).
 - The build reads the effective config and applies `compression_level` to the archive build (single-phase and two-phase paths).
 - Default config (none stored) produces `shallow` + `full` exactly like today — unconfigured repos are byte-for-byte unchanged.
@@ -98,7 +98,7 @@ Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `fu
 **Remaining** (needs the multi-variant build):
 
 - Producing arbitrary named depths (e.g. `recent = 50` alongside `shallow` + `full`) requires generalizing the two-phase build engine and the fixed two-slot `RefInfo` (`shallow_clonepack` + `full_clonepack`) to an arbitrary named-clonepack list. The config schema and `validate()` already model this (today `validate()` caps a config to the two structural variants the build can emit); lifting that cap is the follow-up. Until then `clonepack_depths` is accepted and validated but the build emits the default `shallow` + `full`.
-- Wire `dictionary_id`, `archive_chunk_size`, `head_blobs_chunk_size` (the build is already parameterized for these) and surface the config in the CLI. `enabled_modes` needs the resolve endpoint to learn the requested clone mode before it can be enforced server-side.
+- Wire `dictionary_id`, `archive_chunk_size`, and `head_blobs_chunk_size` (the build is already parameterized for these) and surface the config in the CLI.
 
 ### 3. Unified async download/write pipeline ✅
 

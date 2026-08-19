@@ -502,6 +502,7 @@ async fn ref_trace_forward(
             serde_json::to_vec(&serde_json::json!({
                 "code": "artifact_pending",
                 "commit": commit,
+                "branch": branch,
                 "status": "building",
                 "queue_depth": 1
             }))
@@ -1219,12 +1220,7 @@ async fn start_s3_server_authorized(
         while let Some(job) = rx.recv().await {
             let state = worker_state.clone();
             tokio::spawn(async move {
-                let key = format!(
-                    "{}/{}#{}",
-                    job.repo_id.storage_key(),
-                    job.branch,
-                    job.rev.as_deref().unwrap_or("")
-                );
+                let key = job.key();
                 let result = ripclone::server::process_build_job(&state, &job).await;
                 state
                     .build_queue_depth
@@ -1341,7 +1337,7 @@ async fn seed_shallow_s3_fixture(
         .await
         .expect("publish S3 default-branch fixture");
     // This tightly scoped fixture represents an exact row created by the
-    // retained historical `sync --at` compatibility lane. Ordinary sync
+    // first-class historical `sync --at` exact-result lane. Ordinary sync
     // production code did not create it and must not create another one.
     s3_refs
         .save_branch(&repo_id, &format!(":{default_branch}#{pinned}"), &info)
@@ -1590,6 +1586,7 @@ async fn get_status(
     let resp = client
         .get(&url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("status request");
@@ -1634,6 +1631,7 @@ async fn wait_for_full_build(env: &S3Env, prefix: &str, owner: &str, repo: &str)
                 }
                 ref_store.invalidate(&repo_id, branch).await;
                 if let Ok(Some(info)) = ref_store.load_branch(&repo_id, branch).await
+                    && !info.internal_exact_result
                     && info.build_status.is_none()
                     && !info.full_clonepack.manifest.is_empty()
                 {
@@ -1694,7 +1692,11 @@ async fn remote_gc_deletes_orphans_on_s3() {
     let reachable_info = ripclone::RefInfo {
         commit: "reachable".to_string(),
         default_branch: "HEAD".to_string(),
-        metadata_chunk: reachable_hash.clone(),
+        full_clonepack: ripclone::ClonepackArtifacts {
+            commit: "reachable".to_string(),
+            metadata_chunk: reachable_hash.clone(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     ref_store

@@ -37,7 +37,7 @@ fn validate_repo_id_inner(id: &str) -> Result<()> {
 
 /// Validate an opaque repo path for a specific provider instance.
 ///
-/// GitHub keeps the legacy strict segment check; other providers allow the
+/// GitHub uses its strict segment check; other providers allow the
 /// path to contain `/`, `~`, `+`, etc.
 pub fn validate_repo_path(provider: &ProviderInstance, repo_id: &RepoId) -> Result<()> {
     if provider.kind == ProviderKind::GitHub

@@ -62,8 +62,7 @@ pub struct Backends {
 impl Backends {
     /// Build storage + metadata store + retention from the environment, factored
     /// out so the server and the worker share it. Does **not** start the
-    /// retention sweep loop or migrate legacy refs — those are server-startup
-    /// concerns.
+    /// retention sweep loop; that remains a server-startup concern.
     pub async fn from_env(
         cas_dir: &Path,
         repo_root: &Path,
@@ -147,7 +146,7 @@ async fn select_metadata(
     // coerces to Arc<dyn RefStore>.
     let store: Arc<dyn RefStore> = match kind.as_str() {
         "" => {
-            // Backward compatible: metadata follows storage.
+            // By default metadata follows the selected storage backend.
             if let Some(s3) = s3 {
                 info!("metadata store: s3 (default, follows storage)");
                 Arc::new(CachingRefStore::new(S3RefStore::new(s3.clone())))

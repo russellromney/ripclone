@@ -47,9 +47,7 @@ message ClonepackManifest {
   repeated ChunkRef head_blobs_chunks = 8;
   ChunkRef head_blobs_idx = 7;
 
-  // Deprecated: kept for compatibility with older manifests. New builds write
-  // `head_blobs_chunks` instead.
-  ChunkRef head_blobs_pack = 6 [deprecated = true];
+  reserved 6;
 
   // The editable clone payload: many small, self-contained git packs (each
   // ~1-2 MB with its own idx). The client downloads them in parallel and, as
@@ -62,8 +60,8 @@ message ClonepackManifest {
   // server-side using the client's deterministic `pack-<trailer>.{pack,idx}`
   // filenames. The client drops it into `.git/objects/pack/multi-pack-index`
   // so object lookups stay O(log) across many packs without spending CPU on a
-  // client-side `git multi-pack-index write`. Optional: if absent (older
-  // manifests), the client builds the MIDX itself.
+  // client-side `git multi-pack-index write`. Incremental shallow manifests may
+  // omit it when base packs are no longer local; the client builds that MIDX.
   ChunkRef midx = 12;
 
   // All pack idx files concatenated into one content-addressed blob. The idx
@@ -71,8 +69,7 @@ message ClonepackManifest {
   // The client fetches this ONCE and slices each idx out locally, instead of a
   // separate GET per pack idx — cutting per-pack round-trips from 2 to 1 (a big
   // win on high-latency links). Each slice is still verified against
-  // `packs[i].idx.hash`. Optional: if absent (older manifests), the client
-  // fetches each idx individually via its `idx` ref.
+  // `packs[i].idx.hash`. Every current manifest carries this bundle.
   ChunkRef idx_bundle = 13;
 }
 
@@ -84,7 +81,7 @@ message PackEntry {
   // database but NOT hand-parsed for the working tree (the client can't parse
   // deltas, and the worktree comes entirely from the undeltified HEAD-closure
   // packs). Default false = HEAD-closure pack, hand-parsed for the worktree
-  // (also back-compatible with older manifests built before this field).
+  // packs).
   bool history_only = 3;
 
   // Byte offset of this pack's idx within the manifest's `idx_bundle`. The idx

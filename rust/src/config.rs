@@ -38,9 +38,6 @@ pub struct Config {
     pub metadata: MetadataConfig,
     /// Server-side build queue backend (`[queue]`).
     pub queue: QueueConfig,
-    /// Legacy raw server token, only populated when reading old `config.json`.
-    #[serde(skip)]
-    pub token: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -123,17 +120,6 @@ pub fn global_config_path() -> Option<PathBuf> {
     })
 }
 
-/// Path to the legacy global JSON config file.
-pub fn legacy_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        let mut p = PathBuf::from(home);
-        p.push(".config");
-        p.push("ripclone");
-        p.push("config.json");
-        p
-    })
-}
-
 /// Discover a project-level `ripclone.toml` by walking up from `start`.
 pub fn project_config_path(start: &Path) -> Option<PathBuf> {
     let mut dir = if start.is_dir() {
@@ -187,23 +173,12 @@ pub fn load() -> Config {
     merge(project, global)
 }
 
-/// Load the global configuration (TOML, with legacy JSON fallback).
+/// Load the global TOML configuration.
 pub fn load_global() -> Config {
-    let mut cfg = match global_config_path() {
+    match global_config_path() {
         Some(path) if path.exists() => load_from(&path),
         _ => Config::default(),
-    };
-
-    // If no token was found in the new config, fall back to the legacy JSON
-    // file so existing logins keep working after the TOML migration.
-    if cfg.token.is_none()
-        && let Some(path) = legacy_config_path().filter(|p| p.exists())
-    {
-        let legacy = load_legacy_json(&path);
-        cfg.token = legacy.token;
     }
-
-    cfg
 }
 
 fn load_from(path: &Path) -> Config {
@@ -226,23 +201,6 @@ fn try_load_from(path: &Path) -> Result<Config> {
     toml::from_str(&data).with_context(|| format!("parse config {}", path.display()))
 }
 
-fn load_legacy_json(path: &Path) -> Config {
-    #[derive(serde::Deserialize)]
-    struct Legacy {
-        token: Option<String>,
-        server: Option<String>,
-    }
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|data| serde_json::from_str::<Legacy>(&data).ok())
-        .map(|legacy| Config {
-            server: legacy.server,
-            token: legacy.token,
-            ..Config::default()
-        })
-        .unwrap_or_default()
-}
-
 /// Save the global configuration. CLI session tokens are not written; use the
 /// token store for those.
 pub fn save(config: &Config) -> Result<()> {
@@ -254,10 +212,7 @@ fn save_to(path: &Path, config: &Config) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context("create config dir")?;
     }
-    // Strip any transient token before saving.
-    let mut to_save = config.clone();
-    to_save.token = None;
-    let data = toml::to_string_pretty(&to_save).context("serialize config")?;
+    let data = toml::to_string_pretty(config).context("serialize config")?;
     crate::secure_file::with_file_lock(path, || {
         crate::secure_file::write_0600_atomic(path, data.as_bytes())
             .with_context(|| format!("write {}", path.display()))
@@ -319,7 +274,6 @@ fn merge(overrides: Config, base: Config) -> Config {
                 overrides.queue.size_classes
             },
         },
-        token: overrides.token.or(base.token),
     }
 }
 
@@ -327,23 +281,8 @@ fn merge(overrides: Config, base: Config) -> Config {
 mod tests {
     use super::*;
 
-    // Changing HOME is otherwise racy under parallel test execution.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_home<F, R>(home: &Path, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let _guard = HOME_LOCK.lock().unwrap();
-        let old = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", home) };
-        let result = f();
-        match old {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        result
-    }
+    // Process environment mutations must not race under parallel tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn project_config_discovered_by_walking_up() {
@@ -366,7 +305,6 @@ mod tests {
                 mode: Some("editable".into()),
             },
             providers: HashMap::new(),
-            token: None,
             ..Default::default()
         };
         let project = Config {
@@ -377,7 +315,6 @@ mod tests {
                 mode: None,
             },
             providers: HashMap::new(),
-            token: None,
             ..Default::default()
         };
         let merged = merge(project, global);
@@ -470,15 +407,8 @@ machine = "l"
                 bucket: Some("my-bucket".into()),
                 ..Default::default()
             },
-            token: Some("should-not-be-saved".into()),
         };
         save_to(&path, &cfg).unwrap();
-
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !text.contains("should-not-be-saved"),
-            "token must not be written to config"
-        );
 
         let loaded = load_from(&path);
         assert_eq!(
@@ -499,7 +429,6 @@ machine = "l"
         assert_eq!(loaded.metadata.backend.as_deref(), Some("postgres"));
         assert_eq!(loaded.storage.backend.as_deref(), Some("s3"));
         assert_eq!(loaded.storage.bucket.as_deref(), Some("my-bucket"));
-        assert!(loaded.token.is_none());
     }
 
     #[test]
@@ -522,49 +451,6 @@ machine = "l"
         let cfg = try_load_from(&path).unwrap();
         assert!(cfg.server.is_none());
         assert!(cfg.default_provider.is_none());
-    }
-
-    #[test]
-    fn legacy_json_loads_token_and_server() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(
-            &path,
-            r#"{"token":"rc_legacy_token","server":"https://legacy.example.com"}"#,
-        )
-        .unwrap();
-
-        let loaded = load_legacy_json(&path);
-        assert_eq!(loaded.token.as_deref(), Some("rc_legacy_token"));
-        assert_eq!(loaded.server.as_deref(), Some("https://legacy.example.com"));
-    }
-
-    #[test]
-    fn toml_takes_precedence_but_legacy_token_is_merged() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join(".config").join("ripclone");
-        std::fs::create_dir_all(&config_dir).unwrap();
-
-        let toml_path = config_dir.join("config.toml");
-        std::fs::write(
-            &toml_path,
-            r#"server = "https://toml.example.com"
-default_provider = "my-gitea"
-"#,
-        )
-        .unwrap();
-
-        let json_path = config_dir.join("config.json");
-        std::fs::write(
-            &json_path,
-            r#"{"token":"rc_legacy_token","server":"https://legacy.example.com"}"#,
-        )
-        .unwrap();
-
-        let loaded = with_home(dir.path(), load_global);
-        assert_eq!(loaded.server.as_deref(), Some("https://toml.example.com"));
-        assert_eq!(loaded.default_provider.as_deref(), Some("my-gitea"));
-        assert_eq!(loaded.token.as_deref(), Some("rc_legacy_token"));
     }
 
     #[test]
@@ -597,7 +483,7 @@ default_provider = "my-gitea"
 
     #[test]
     fn agent_mode_env_wins_over_config() {
-        let _guard = HOME_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("RIPCLONE_AGENT");
 
         // Truthy env turns it on regardless of config.
@@ -627,8 +513,7 @@ default_provider = "my-gitea"
 
     #[test]
     fn ripclone_config_env_overrides_home_path() {
-        // Shares the HOME mutation lock so the env order can't race other tests.
-        let _guard = HOME_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("RIPCLONE_CONFIG");
         unsafe { std::env::set_var("RIPCLONE_CONFIG", "/etc/ripclone/config.toml") };
         assert_eq!(

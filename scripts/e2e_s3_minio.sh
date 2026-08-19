@@ -109,7 +109,7 @@ printf "sync + upload took %d ms\n" $((sync_end - sync_start))
 echo "==> Direct-install clone via signed-URL redirects..."
 install_dir="$BASE_DIR/bun-install"
 install_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$install_dir"
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$install_dir"
 install_end=$(now_ms)
 printf "install took %d ms\n" $((install_end - install_start))
 

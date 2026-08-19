@@ -26,7 +26,7 @@ curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null || { echo "server did not s
 
 REPO="${REPO:-oven-sh/bun}"
 echo "==> Syncing $REPO..."
-curl -sf -X POST "http://127.0.0.1:$PORT/v1/repos/$REPO/sync" > "$WORKDIR/sync.json"
+curl -sf -X POST "http://127.0.0.1:$PORT/v1/repos/github/$REPO/sync" > "$WORKDIR/sync.json"
 
 echo "==> CAS total"
 du -sh "$WORKDIR/cas"

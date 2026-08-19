@@ -1,5 +1,5 @@
 //! End-to-end test for the `ripclone provider` CLI.
-//! Included in the consolidated `contracts` integration-test crate.
+//! Included in the bounded `local_cli` integration-test crate.
 //!
 //! Uses a temporary $HOME so the provider config is isolated.
 

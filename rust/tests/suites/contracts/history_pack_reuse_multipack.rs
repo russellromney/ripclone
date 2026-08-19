@@ -1,4 +1,4 @@
-//! Included in the consolidated `contracts` integration-test crate.
+//! Included in the bounded `local_cli` integration-test crate.
 //! The cold full-history build reuses git's existing pack deltas via
 //! `pack-objects --revs`. Production deliberately leaves `--max-pack-size`
 //! unset; this compatibility test supplies a limit to exercise collecting an arbitrary
@@ -15,8 +15,8 @@
 //! across packs. The full `git fsck` below still inflates and sha-verifies every
 //! object, so it catches any object the split dropped or corrupted.
 //!
-//! It runs in its own test binary so it can force a tiny split threshold without
-//! making the main suite slower.
+//! It uses an isolated fixture so the tiny split threshold does not affect
+//! other cases in the harness.
 
 use ripclone::cas::Cas;
 use ripclone::pack::PackBuilder;

@@ -1,7 +1,7 @@
 //! End-to-end test that project `ripclone.toml` drives `default_provider` and
 //! `clone.depth` for a `ripclone sync`, even when run from a nested
 //! subdirectory.
-//! Included in the consolidated `contracts` integration-test crate.
+//! Included in the bounded `local_cli` integration-test crate.
 //!
 //! A mock server captures the request path and query; no real upstream or build
 //! is needed.
@@ -27,9 +27,10 @@ struct RefResponse {
     default_branch: String,
     commit: String,
     parent_commit: Option<String>,
-    full_pack: String,
     clonepack_manifest: String,
     metadata_chunk: String,
+    shallow: bool,
+    archive_ready: bool,
 }
 
 #[derive(Clone, Default)]
@@ -56,9 +57,10 @@ async fn sync_capture(
         default_branch: "main".into(),
         commit: "abc123".into(),
         parent_commit: None,
-        full_pack: "pack".into(),
         clonepack_manifest: "manifest".into(),
         metadata_chunk: "metadata".into(),
+        shallow: false,
+        archive_ready: true,
     })
 }
 

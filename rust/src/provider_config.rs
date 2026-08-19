@@ -31,14 +31,6 @@ pub fn load_registry_with_config(config: &crate::config::Config) -> Result<Provi
 
     merge_configs(&mut registry, config.provider_configs())?;
 
-    if registry.token("github").is_none()
-        && let Some(token) = std::env::var("RIPCLONE_GITHUB_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-    {
-        registry.set_token("github", token);
-    }
-
     Ok(registry)
 }
 
@@ -125,52 +117,6 @@ mod tests {
         assert_eq!(
             registry.token("gitlab").unwrap().expose_secret(),
             "gl-token"
-        );
-    }
-
-    #[test]
-    fn github_env_token_fills_default_when_config_has_no_token() {
-        let _guard = lock_env();
-        let old = std::env::var_os("RIPCLONE_GITHUB_TOKEN");
-        unsafe {
-            std::env::set_var("RIPCLONE_GITHUB_TOKEN", "gh-env");
-        }
-
-        let registry = load_registry_with_config(&Config::default()).unwrap();
-        restore_env("RIPCLONE_GITHUB_TOKEN", old);
-
-        assert_eq!(registry.token("github").unwrap().expose_secret(), "gh-env");
-    }
-
-    #[test]
-    fn config_github_token_beats_legacy_env() {
-        let _guard = lock_env();
-        let old = std::env::var_os("RIPCLONE_GITHUB_TOKEN");
-        unsafe {
-            std::env::set_var("RIPCLONE_GITHUB_TOKEN", "gh-env");
-        }
-
-        let mut providers = HashMap::new();
-        providers.insert(
-            "github".to_string(),
-            ProviderEntry {
-                kind: "github".into(),
-                host: None,
-                token: Some("gh-config".into()),
-                auth_template: None,
-                auth_header_name: None,
-            },
-        );
-        let registry = load_registry_with_config(&Config {
-            providers,
-            ..Config::default()
-        })
-        .unwrap();
-        restore_env("RIPCLONE_GITHUB_TOKEN", old);
-
-        assert_eq!(
-            registry.token("github").unwrap().expose_secret(),
-            "gh-config"
         );
     }
 }

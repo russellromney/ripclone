@@ -1,5 +1,5 @@
 //! Integration test for the LSM incremental history build.
-//! Included in the consolidated `contracts` integration-test crate.
+//! Included in the bounded `local_cli` integration-test crate.
 //!
 //! Simulates two syncs of a growing repo: sync 1 seals all history up to commit
 //! C as level 0; sync 2 builds only the tail (C, E]. Installing level 0 + the

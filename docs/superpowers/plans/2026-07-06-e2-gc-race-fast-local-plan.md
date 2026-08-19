@@ -14,7 +14,7 @@
 - Match existing code style and comment density.
 - Node ids go in commit messages, not code comments.
 - Run `cargo fmt --all` and `cargo clippy --all-targets --locked -- -D warnings` before committing.
-- Run only touched tests in DEBUG: `cargo test --test e2e_gc_race` and `cargo test --test e2e_auth` (E4 unchanged).
+- Run only touched tests in DEBUG: `cargo test --test local_server e2e_gc_race::` and `cargo test --test local_cli e2e_auth::` (E4 unchanged).
 - One commit per node; message starts with node id, e.g. "E2: ...".
 
 ---
@@ -255,7 +255,7 @@ Expected: no warnings or errors.
 Run:
 
 ```bash
-cargo test --test e2e_gc_race
+cargo test --test local_server e2e_gc_race::
 ```
 
 Expected: `remote_gc_during_local_clone_is_safe` passes in < 10 s.
@@ -265,7 +265,7 @@ Expected: `remote_gc_during_local_clone_is_safe` passes in < 10 s.
 Run:
 
 ```bash
-cargo test --test e2e_auth expired_bearer_token_fails_clone_cleanly
+cargo test --test local_cli e2e_auth::expired_bearer_token_fails_clone_cleanly
 ```
 
 Expected: passes.

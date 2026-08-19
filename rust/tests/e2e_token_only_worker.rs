@@ -105,9 +105,10 @@ async fn wait_for_exact_full(
     commit: &str,
 ) -> ripclone::RefInfo {
     let deadline = Instant::now() + Duration::from_secs(60);
+    let key = ripclone::ref_store::exact_ref_key("main", commit);
     loop {
         if let Some(info) = store
-            .load_build(repo_id, commit)
+            .load_branch(repo_id, &key)
             .await
             .expect("load exact API-worker build")
             && info.commit == commit
@@ -164,8 +165,7 @@ async fn enqueue_job(path: &str) -> (SqlJobQueue, i64) {
         .enqueue(BuildJob {
             repo_id: RepoId::github(path),
             branch: "main".into(),
-            rev: None,
-            admitted_commit: Some("1111111111111111111111111111111111111111".into()),
+            admitted_commit: "1111111111111111111111111111111111111111".into(),
             admitted_default_branch: None,
             credential: None,
             recheck: 0,
@@ -204,14 +204,11 @@ async fn token_only_worker_claims_builds_acks_over_api() {
         .expect("token-only farm-out sync");
     assert_eq!(resp.commit, commit);
 
-    // The ref reached the server's sqlite metadata: worker → POST /v1/refs.
+    // The authoritative exact result reached the server's sqlite metadata:
+    // worker → POST /v1/refs.
     let store = open_meta_store(&meta_url).await;
     let rid = RepoId::github("acme/tok-only");
-    let stored = store
-        .load_branch(&rid, "main")
-        .await
-        .expect("load")
-        .expect("ref must be in sqlite after api build");
+    let stored = wait_for_exact_full(&store, &rid, &commit).await;
     assert_eq!(stored.commit, commit);
     // (The spawn helper already asserted the child's env carries no DB creds.)
     worker.kill_now();
@@ -637,11 +634,7 @@ async fn expired_token_worker_exits_clean_job_survives() {
     assert_eq!(resp.commit, commit);
 
     let store = open_meta_store(&meta_url).await;
-    let stored = store
-        .load_branch(&RepoId::github("acme/expiry"), "main")
-        .await
-        .expect("load")
-        .expect("ref lands after fresh worker");
+    let stored = wait_for_exact_full(&store, &RepoId::github("acme/expiry"), &commit).await;
     assert_eq!(stored.commit, commit);
     fresh.kill_now();
 }
@@ -662,8 +655,7 @@ async fn claim_returns_one_job_no_foreign_credential() {
         .enqueue(BuildJob {
             repo_id: RepoId::github("acme/plain"),
             branch: "main".into(),
-            rev: None,
-            admitted_commit: Some("2222222222222222222222222222222222222222".into()),
+            admitted_commit: "2222222222222222222222222222222222222222".into(),
             admitted_default_branch: None,
             credential: None,
             recheck: 0,
@@ -677,8 +669,7 @@ async fn claim_returns_one_job_no_foreign_credential() {
         .enqueue(BuildJob {
             repo_id: RepoId::github("acme/secret"),
             branch: "main".into(),
-            rev: None,
-            admitted_commit: Some("3333333333333333333333333333333333333333".into()),
+            admitted_commit: "3333333333333333333333333333333333333333".into(),
             admitted_default_branch: None,
             credential: Some(secrecy::SecretString::new(
                 "SUPER-SECRET-UPSTREAM".to_string().into(),
@@ -728,80 +719,4 @@ async fn claim_returns_one_job_no_foreign_credential() {
         !body.to_string().contains("SUPER-SECRET-UPSTREAM"),
         "claim must never leak another job's credential"
     );
-}
-
-/// NEGATIVE: an active legacy row reaches a real API worker, is rejected before
-/// credential/provider/source work, and is permanently settled rather than
-/// guessed from the branch's current tip.
-#[tokio::test]
-async fn api_worker_rejects_legacy_job_before_source_work() {
-    let _guard = SERIAL.lock().await;
-    let (_q, _m, queue_url, _meta_url) = setup_sqlite_queue_and_meta();
-    let server = start_server().await;
-
-    // Simulate an active row written by the pre-admission schema. Use an
-    // unknown provider as a decoy: if the worker resolves provider/source state
-    // before checking admitted_commit, the observed failure will be different.
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect_with(
-            sqlx::sqlite::SqliteConnectOptions::from_str(&queue_url)
-                .expect("parse queue database path"),
-        )
-        .await
-        .expect("open queue database");
-    sqlx::query(
-        "INSERT INTO jobs (key, provider, path, branch, status, created_at, attempts, size_class)
-         VALUES (?, ?, ?, ?, 'queued', ?, 0, 0)",
-    )
-    .bind("legacy-api-row")
-    .bind("provider-that-is-not-configured")
-    .bind("acme/legacy-api")
-    .bind("main")
-    .bind(1_i64)
-    .execute(&pool)
-    .await
-    .expect("insert legacy active row");
-    pool.close().await;
-
-    let token = mint_token(Duration::from_secs(3600));
-    let mut worker =
-        spawn_token_only_worker(&server.cas_dir, &server.repo_root, &server.url, &token);
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let (status, error) = loop {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::from_str(&queue_url)
-                    .expect("parse queue database path"),
-            )
-            .await
-            .expect("reopen queue database");
-        let row: (String, Option<String>) =
-            sqlx::query_as("SELECT status, error FROM jobs WHERE key = 'legacy-api-row'")
-                .fetch_one(&pool)
-                .await
-                .expect("read legacy row");
-        pool.close().await;
-        if row.0 == "failed" {
-            break row;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "API worker did not settle the legacy row before the deadline"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    assert_eq!(status, "failed");
-    assert_eq!(
-        error.as_deref(),
-        Some("legacy queued job has no admitted commit; resubmit sync")
-    );
-    assert!(
-        !server
-            .repo_root
-            .join("provider-that-is-not-configured_acme%2Flegacy-api.git")
-            .exists(),
-        "legacy rejection must happen before mirror/source mutation"
-    );
-    worker.kill_now();
 }

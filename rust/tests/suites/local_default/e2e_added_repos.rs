@@ -26,6 +26,7 @@ async fn add_registers_builds_and_makes_repo_cloneable() {
     let status: serde_json::Value = reqwest::Client::new()
         .get(format!("{}/v1/repos/github/{repo_path}/status", server.url))
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("status request")
@@ -75,6 +76,7 @@ async fn non_added_repo_ref_and_sync_are_rejected() {
             server.url, origin.owner, origin.repo
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("ref request");

@@ -81,17 +81,14 @@ run_test_bin() {
     local bin="$CI_ARTIFACTS/$name"
     [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
     echo "== e2e: $name (prebuilt) =="
-    "$bin" --nocapture
+    "$bin" --test-threads=1 --nocapture
   else
     echo "== e2e: $name (cargo profile=$PROFILE) =="
-    cargo test --profile "$PROFILE" --locked --test "$name" -- --nocapture
+    cargo test --profile "$PROFILE" --locked --test "$name" -- --test-threads=1 --nocapture
   fi
 }
 
 run_lib_lifecycle
-run_test_bin e2e_worker_postgres
-run_test_bin e2e_worker_mysql
-run_test_bin e2e_metadata_postgres
-run_test_bin e2e_metadata_mysql
+run_test_bin network_databases
 
 echo "== OK =="

@@ -152,14 +152,7 @@ impl WebhookConfig {
         for instance in registry.iter() {
             let id = instance.id.as_str();
             let var = format!("RIPCLONE_WEBHOOK_SECRET_{}", env_suffix(id));
-            let mut value = std::env::var(var).ok();
-            // Back-compat: the original GitHub-only receiver used a single
-            // `RIPCLONE_WEBHOOK_SECRET`. Honor it as the secret for the built-in
-            // `github` instance when the per-provider var isn't set, so existing
-            // deployments keep working.
-            if value.is_none() && id == "github" {
-                value = std::env::var("RIPCLONE_WEBHOOK_SECRET").ok();
-            }
+            let value = std::env::var(var).ok();
             if let Some(secret) = parse_secret(value) {
                 secrets.insert(id.to_string(), secret);
             }

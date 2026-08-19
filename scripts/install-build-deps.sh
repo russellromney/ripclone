@@ -24,6 +24,6 @@ $SUDO apt-get install -y --no-install-recommends \
   mold
 
 # rust/.cargo/config.toml points x86_64-unknown-linux-gnu builds at mold (see
-# that file for why). ~50 integration test binaries link on every Linux job;
-# mold cuts that 3-5x and rust-cache can't touch linking. This has no effect on
+# that file for why). The bounded integration suites still link substantial
+# executables, and rust-cache cannot cache linking. This has no effect on
 # macOS or the musl release target (different target triples).

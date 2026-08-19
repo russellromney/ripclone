@@ -87,7 +87,7 @@ pub async fn claim_exact_sql_job(
             .await
             .expect("claim SQL lifecycle row")
             .expect("expected admitted SQL job in queue");
-        if claimed.admitted_commit.as_deref() == Some(expected_commit) {
+        if claimed.admitted_commit == expected_commit {
             return claimed;
         }
         assert!(
@@ -344,17 +344,6 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         self.inner.load_branch(repo_id, branch).await
     }
 
-    async fn load_build(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
-        if self.probe.is_armed() {
-            panic!("pinned metadata lookup must not scan builds");
-        }
-        self.inner.load_build(repo_id, commit).await
-    }
-
     async fn save_branch(
         &self,
         repo_id: &ripclone::provider::RepoId,
@@ -462,9 +451,9 @@ impl Server {
 }
 
 /// Replace only the embedded commit of a published full manifest, then point
-/// the real ref row at those content-addressed bytes. This creates a realistic
-/// response-commit A / manifest-commit B integrity fixture without changing
-/// production code or bypassing the normal artifact endpoint.
+/// the authoritative exact row at those content-addressed bytes. This creates a
+/// realistic response-commit A / manifest-commit B integrity fixture without
+/// changing production code or bypassing the normal artifact endpoint.
 pub async fn replace_full_manifest_commit(
     server: &Server,
     repo_path: &str,
@@ -484,8 +473,13 @@ pub async fn replace_full_manifest_commit(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let mut info = published.expect("full manifest publication settled");
-    let pinned = info.commit.clone();
+    let moving = published.expect("full manifest publication settled");
+    let pinned = moving.commit.clone();
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
+    let mut info = ripclone::ref_store::RefStore::load_branch(&store, &repo_id, &exact_key)
+        .await
+        .expect("load exact full-manifest row")
+        .expect("exact full-manifest row exists");
     let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
     let bytes = storage
         .get(&info.full_clonepack.manifest)
@@ -499,10 +493,9 @@ pub async fn replace_full_manifest_commit(
         .put(&hash, &bytes)
         .expect("publish mismatched manifest fixture");
     info.full_clonepack.manifest = hash.clone();
-    info.clonepack_manifest = hash.clone();
-    ripclone::ref_store::RefStore::save_branch(&store, &repo_id, "main", &info)
+    ripclone::ref_store::RefStore::save_branch(&store, &repo_id, &exact_key, &info)
         .await
-        .expect("publish mismatched full-manifest ref");
+        .expect("publish mismatched exact full-manifest ref");
     (pinned, hash)
 }
 
@@ -525,7 +518,7 @@ pub async fn start_server() -> Server {
     start_server_inner(0, &[], None).await
 }
 
-/// Start a server with extra env vars (e.g. `RIPCLONE_WEBHOOK_SECRET`,
+/// Start a server with extra env vars (e.g. `RIPCLONE_WEBHOOK_SECRET_GITHUB`,
 /// `RIPCLONE_POLL_INTERVAL_SECS`) set only during construction, under
 /// `SERVER_START_LOCK`, so they can't leak into a concurrently-starting server.
 pub async fn start_server_env(extra: &[(&str, &str)]) -> Server {
@@ -1008,14 +1001,6 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
         branch: &str,
     ) -> anyhow::Result<Option<ripclone::RefInfo>> {
         self.inner.load_branch(repo_id, branch).await
-    }
-
-    async fn load_build(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
-        self.inner.load_build(repo_id, commit).await
     }
 
     async fn save_branch(

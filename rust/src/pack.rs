@@ -106,20 +106,6 @@ impl<'a> PackBuilder<'a> {
         self.pack_and_index(&delta_shas)
     }
 
-    /// Build a packfile + idx containing every blob reachable from `commit`.
-    /// This is the "head-blobs" pack: it gives the client all HEAD content so
-    /// `git diff`, `git show`, and edits work immediately without further
-    /// object downloads.
-    pub fn build_head_blobs_pack(&self, commit: &str) -> Result<(String, String)> {
-        let entries = git::list_tree_entries(&self.repo, commit)?;
-        let blob_shas: Vec<String> = entries
-            .into_iter()
-            .filter(|(_, _, _, obj_type)| obj_type == "blob")
-            .map(|(_, _, sha, _)| sha)
-            .collect();
-        self.pack_and_index(&blob_shas)
-    }
-
     /// Build a ready-to-use `.git/index` from the skeleton pack.
     ///
     /// The index contains every tracked path with `skip-worktree` set and

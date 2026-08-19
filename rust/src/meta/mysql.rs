@@ -56,29 +56,6 @@ impl MetaDb for MysqlMeta {
         .execute(&self.pool)
         .await
         .context("create refs table")?;
-        // Index for commit-keyed reuse (get_by_commit). MySQL has no
-        // `CREATE INDEX IF NOT EXISTS`, so create it only when absent — keeping
-        // init() idempotent.
-        let index_exists: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM information_schema.statistics
-             WHERE table_schema = DATABASE() AND table_name = 'refs'
-               AND index_name = 'idx_refs_commit'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .context("check refs commit index")?;
-        if index_exists == 0 {
-            sqlx::query("CREATE INDEX idx_refs_commit ON refs (repo_key, commit_id)")
-                .execute(&self.pool)
-                .await
-                .context("create refs commit index")?;
-        }
-        // Add the generation column to a table created before it existed. MySQL 8
-        // has no ADD COLUMN IF NOT EXISTS, so this is best-effort: it errors with
-        // a duplicate-column code on an up-to-date table, which we ignore.
-        let _ = sqlx::raw_sql("ALTER TABLE refs ADD COLUMN generation BIGINT")
-            .execute(&self.pool)
-            .await;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS added_repos (
                 repo_key VARCHAR(512) NOT NULL,
@@ -110,27 +87,6 @@ impl MetaDb for MysqlMeta {
             })),
             None => Ok(None),
         }
-    }
-
-    async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>> {
-        let rows = sqlx::query(
-            "SELECT data, commit_id, synced_at FROM refs
-             WHERE repo_key = ? AND commit_id = ?",
-        )
-        .bind(repo_key)
-        .bind(commit)
-        .fetch_all(&self.pool)
-        .await
-        .context("get refs by commit")?;
-        rows.into_iter()
-            .map(|row| -> Result<RefRow> {
-                Ok(RefRow {
-                    data: row.try_get(0)?,
-                    commit_id: row.try_get(1)?,
-                    synced_at: row.try_get(2)?,
-                })
-            })
-            .collect()
     }
 
     async fn save_ordered(

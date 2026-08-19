@@ -11,13 +11,13 @@ pub enum CloneMode {
     /// blobs straight out of it. `git diff`/`show`/`log` and edits/commits all
     /// work. One download of HEAD content, no archive, no local pack rebuild.
     #[default]
-    #[value(name = "editable", alias = "full", alias = "hybrid")]
+    #[value(name = "editable")]
     Editable,
 
     /// Working tree only, materialized from the zstd files artifact. No git
     /// object database, so `git diff`/`show` do not work. Fastest path for CI
     /// jobs that only need the files.
-    #[value(name = "files", alias = "fast")]
+    #[value(name = "files")]
     Files,
 }
 
@@ -55,15 +55,8 @@ impl FromStr for CloneMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            // Current names.
             "editable" => Ok(CloneMode::Editable),
             "files" => Ok(CloneMode::Files),
-            // Deprecated aliases.
-            "full" | "hybrid" => Ok(CloneMode::Editable),
-            "fast" => Ok(CloneMode::Files),
-            "skeleton" => anyhow::bail!(
-                "skeleton mode is no longer exposed; use mount for skeleton-backed access"
-            ),
             other => anyhow::bail!("unknown clone mode: {}", other),
         }
     }
@@ -71,14 +64,25 @@ impl FromStr for CloneMode {
 
 /// Resolve a mode from the CLI argument, the `RIPCLONE_MODE` environment
 /// variable, or a config file value, falling back to `Editable`.
-pub fn resolve_mode(cli: Option<CloneMode>, config: Option<&str>) -> CloneMode {
-    cli.or_else(|| {
-        std::env::var("RIPCLONE_MODE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-    })
-    .or_else(|| config.and_then(|s| s.parse().ok()))
-    .unwrap_or_default()
+pub fn resolve_mode(cli: Option<CloneMode>, config: Option<&str>) -> anyhow::Result<CloneMode> {
+    if let Some(mode) = cli {
+        return Ok(mode);
+    }
+    match std::env::var("RIPCLONE_MODE") {
+        Ok(value) => {
+            return value.parse().map_err(|error| {
+                anyhow::anyhow!("invalid RIPCLONE_MODE value {value:?}: {error}")
+            });
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(anyhow::Error::new(error).context("read RIPCLONE_MODE")),
+    }
+    match config {
+        Some(value) => value
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid clone.mode value {value:?}: {error}")),
+        None => Ok(CloneMode::default()),
+    }
 }
 
 /// Map a requested clone depth to the clonepack variant the server should
@@ -92,4 +96,64 @@ pub fn resolve_mode(cli: Option<CloneMode>, config: Option<&str>) -> CloneMode {
 /// other value as full as a defensive default.
 pub fn clonepack_kind_for_depth(depth: usize) -> &'static str {
     if depth == 1 { "shallow" } else { "full" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_mode_env(value: Option<&str>, test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("RIPCLONE_MODE");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("RIPCLONE_MODE", value),
+                None => std::env::remove_var("RIPCLONE_MODE"),
+            }
+        }
+        test();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("RIPCLONE_MODE", value),
+                None => std::env::remove_var("RIPCLONE_MODE"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_mode_accepts_valid_environment_values() {
+        with_mode_env(Some("files"), || {
+            assert_eq!(resolve_mode(None, None).unwrap(), CloneMode::Files);
+        });
+    }
+
+    #[test]
+    fn resolve_mode_rejects_invalid_environment_values() {
+        with_mode_env(Some("fast"), || {
+            let error = resolve_mode(None, None).expect_err("retired mode must not fall back");
+            assert!(format!("{error:#}").contains("invalid RIPCLONE_MODE"));
+        });
+    }
+
+    #[test]
+    fn resolve_mode_accepts_valid_config_values() {
+        with_mode_env(None, || {
+            assert_eq!(
+                resolve_mode(None, Some("editable")).unwrap(),
+                CloneMode::Editable
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_mode_rejects_invalid_config_values() {
+        with_mode_env(None, || {
+            let error =
+                resolve_mode(None, Some("fast")).expect_err("retired config mode must fail");
+            assert!(format!("{error:#}").contains("invalid clone.mode"));
+        });
+    }
 }

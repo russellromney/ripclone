@@ -193,7 +193,7 @@ not leave it running after a measurement session.
 Most scripts read:
 
 - `REPO` — target repo in `owner/name` form (default `oven-sh/bun`).
-- `RIPCLONE_SERVER_TOKEN` — bearer token for the server. Falls back to the deprecated `RIPCLONE_TOKEN`.
+- `RIPCLONE_SERVER_TOKEN` — bearer token for the server.
 - `RIPCLONE_URL` — server URL for remote/Fly benchmarks.
 - `CLIENT_APP` — optional Fly client app used by `sync_latency.sh` for
   Fly-to-Fly `/sync` POSTs and readiness probes.
