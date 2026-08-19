@@ -204,14 +204,11 @@ async fn token_only_worker_claims_builds_acks_over_api() {
         .expect("token-only farm-out sync");
     assert_eq!(resp.commit, commit);
 
-    // The ref reached the server's sqlite metadata: worker → POST /v1/refs.
+    // The authoritative exact result reached the server's sqlite metadata:
+    // worker → POST /v1/refs.
     let store = open_meta_store(&meta_url).await;
     let rid = RepoId::github("acme/tok-only");
-    let stored = store
-        .load_branch(&rid, "main")
-        .await
-        .expect("load")
-        .expect("ref must be in sqlite after api build");
+    let stored = wait_for_exact_full(&store, &rid, &commit).await;
     assert_eq!(stored.commit, commit);
     // (The spawn helper already asserted the child's env carries no DB creds.)
     worker.kill_now();
@@ -637,11 +634,7 @@ async fn expired_token_worker_exits_clean_job_survives() {
     assert_eq!(resp.commit, commit);
 
     let store = open_meta_store(&meta_url).await;
-    let stored = store
-        .load_branch(&RepoId::github("acme/expiry"), "main")
-        .await
-        .expect("load")
-        .expect("ref lands after fresh worker");
+    let stored = wait_for_exact_full(&store, &RepoId::github("acme/expiry"), &commit).await;
     assert_eq!(stored.commit, commit);
     fresh.kill_now();
 }
