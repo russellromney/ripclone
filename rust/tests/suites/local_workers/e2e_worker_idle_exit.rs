@@ -40,7 +40,6 @@ async fn enqueue(path: &str) -> (SqlJobQueue, i64) {
             admitted_commit,
             admitted_default_branch: None,
             credential: None,
-            recheck: 0,
             size_bytes: None,
         })
         .await
@@ -57,7 +56,6 @@ async fn enqueue_on(queue: &SqlJobQueue, path: &str) -> i64 {
             admitted_commit,
             admitted_default_branch: None,
             credential: None,
-            recheck: 0,
             size_bytes: None,
         })
         .await

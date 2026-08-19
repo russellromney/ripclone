@@ -17,13 +17,9 @@ use async_trait::async_trait;
 use std::time::SystemTime;
 
 pub mod libsql;
-pub mod mysql;
-pub mod postgres;
 pub mod sqlite;
 
 pub use libsql::LibsqlMeta;
-pub use mysql::MysqlMeta;
-pub use postgres::PostgresMeta;
 pub use sqlite::SqliteMeta;
 
 /// One stored ref row, decoded to plain types.
@@ -581,46 +577,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("meta.db").to_string_lossy().to_string();
         let store = SqlRefStore::new(Box::new(SqliteMeta::connect(&path).await.unwrap()))
-            .await
-            .unwrap();
-        exercise(&store).await;
-    }
-
-    #[tokio::test]
-    async fn postgres_refstore_lifecycle() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_PG_URL") else {
-            eprintln!("SKIP postgres_refstore_lifecycle: RIPCLONE_TEST_PG_URL unset");
-            return;
-        };
-        let pool = sqlx::postgres::PgPool::connect(&url)
-            .await
-            .expect("connect pg");
-        sqlx::query("DROP TABLE IF EXISTS refs")
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-        let store = SqlRefStore::new(Box::new(PostgresMeta::connect(&url).await.unwrap()))
-            .await
-            .unwrap();
-        exercise(&store).await;
-    }
-
-    #[tokio::test]
-    async fn mysql_refstore_lifecycle() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
-            eprintln!("SKIP mysql_refstore_lifecycle: RIPCLONE_TEST_MYSQL_URL unset");
-            return;
-        };
-        let pool = sqlx::mysql::MySqlPool::connect(&url)
-            .await
-            .expect("connect mysql");
-        sqlx::query("DROP TABLE IF EXISTS refs")
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-        let store = SqlRefStore::new(Box::new(MysqlMeta::connect(&url).await.unwrap()))
             .await
             .unwrap();
         exercise(&store).await;

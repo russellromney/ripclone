@@ -282,7 +282,6 @@ async fn dead_report_url_job_requeues_not_done() {
             admitted_commit: commit,
             admitted_default_branch: None,
             credential: None,
-            recheck: 0,
             size_bytes: None,
         })
         .await

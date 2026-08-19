@@ -878,10 +878,6 @@ impl JobQueue for SqlJobQueue {
             .map(|n| n as usize)
             .unwrap_or(0)
     }
-
-    fn inproc_wait(&self) -> bool {
-        false
-    }
 }
 
 /// Direct SQL is the trusted single-box worker path: each method forwards to the
@@ -998,7 +994,6 @@ mod tests {
             admitted_commit: commit.into(),
             admitted_default_branch: None,
             credential: None,
-            recheck: 0,
             size_bytes: None,
         }
     }
@@ -1968,123 +1963,6 @@ mod tests {
         let fresh = q.enqueue(job("o", "r", "main")).await.unwrap();
         assert_eq!(fresh.outcome, EnqueueOutcome::Enqueued);
         assert_ne!(fresh.job_id, Some(id));
-    }
-
-    #[tokio::test]
-    async fn postgres_queue_lifecycle() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_PG_URL") else {
-            eprintln!("SKIP postgres_queue_lifecycle: RIPCLONE_TEST_PG_URL unset");
-            return;
-        };
-        let pool = sqlx::postgres::PgPool::connect(&url)
-            .await
-            .expect("connect pg");
-        sqlx::query("DROP TABLE IF EXISTS jobs")
-            .execute(&pool)
-            .await
-            .expect("drop jobs");
-        pool.close().await;
-        let q = Arc::new(
-            SqlJobQueue::new(Box::new(
-                crate::queue::postgres_db::PostgresDb::connect(&url)
-                    .await
-                    .unwrap(),
-            ))
-            .await
-            .unwrap(),
-        );
-        exercise_core(&q).await;
-        let race = job_at("o", "r", "pg-restart", "a".repeat(40).as_str());
-        q.enqueue(race).await.unwrap();
-        let mut tasks = Vec::new();
-        for _ in 0..6 {
-            let url = url.clone();
-            tasks.push(tokio::spawn(async move {
-                SqlJobQueue::new(Box::new(
-                    crate::queue::postgres_db::PostgresDb::connect(&url)
-                        .await
-                        .unwrap(),
-                ))
-                .await
-                .unwrap();
-            }));
-            let q = Arc::clone(&q);
-            tasks.push(tokio::spawn(async move {
-                let duplicate = q
-                    .enqueue(job_at("o", "r", "pg-restart", &"a".repeat(40)))
-                    .await
-                    .unwrap();
-                assert_eq!(duplicate.outcome, EnqueueOutcome::Coalesced);
-            }));
-        }
-        for task in tasks {
-            task.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn mysql_queue_lifecycle() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
-            eprintln!("SKIP mysql_queue_lifecycle: RIPCLONE_TEST_MYSQL_URL unset");
-            return;
-        };
-        let pool = sqlx::mysql::MySqlPool::connect(&url)
-            .await
-            .expect("connect mysql");
-        sqlx::query("DROP TABLE IF EXISTS jobs")
-            .execute(&pool)
-            .await
-            .expect("drop jobs");
-        pool.close().await;
-        let q = Arc::new(
-            SqlJobQueue::new(Box::new(
-                crate::queue::mysql_db::MysqlDb::connect(&url)
-                    .await
-                    .unwrap(),
-            ))
-            .await
-            .unwrap(),
-        );
-        exercise_core(&q).await;
-
-        let upper = q
-            .enqueue(job_at("o", "r", "Feature", &"d".repeat(40)))
-            .await
-            .unwrap();
-        let lower = q
-            .enqueue(job_at("o", "r", "feature", &"d".repeat(40)))
-            .await
-            .unwrap();
-        assert_eq!(upper.outcome, EnqueueOutcome::Enqueued);
-        assert_eq!(lower.outcome, EnqueueOutcome::Enqueued);
-        assert_ne!(upper.job_id, lower.job_id, "Git branch case is significant");
-
-        let race = job_at("o", "r", "mysql-restart", &"e".repeat(40));
-        q.enqueue(race).await.unwrap();
-        let mut tasks = Vec::new();
-        for _ in 0..6 {
-            let url = url.clone();
-            tasks.push(tokio::spawn(async move {
-                SqlJobQueue::new(Box::new(
-                    crate::queue::mysql_db::MysqlDb::connect(&url)
-                        .await
-                        .unwrap(),
-                ))
-                .await
-                .unwrap();
-            }));
-            let q = Arc::clone(&q);
-            tasks.push(tokio::spawn(async move {
-                let duplicate = q
-                    .enqueue(job_at("o", "r", "mysql-restart", &"e".repeat(40)))
-                    .await
-                    .unwrap();
-                assert_eq!(duplicate.outcome, EnqueueOutcome::Coalesced);
-            }));
-        }
-        for task in tasks {
-            task.await.unwrap();
-        }
     }
 
     /// Two-class launch config: small ≤ 100 bytes, large catch-all.

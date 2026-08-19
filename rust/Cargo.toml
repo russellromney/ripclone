@@ -34,10 +34,6 @@ path = "src/bin/writer_bench.rs"
 name = "ripclone-worker"
 path = "src/bin/ripclone-worker.rs"
 
-[[bin]]
-name = "ripclone-dispatcher"
-path = "src/bin/ripclone-dispatcher.rs"
-
 [features]
 default = ["zlib-ng"]
 # Use zlib-ng for faster pack compression/decompression. Disable this feature
@@ -86,13 +82,10 @@ async-trait = "0.1.89"
 # (the GitHub App broker signs JWTs; OIDC verifies them).
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
-# Pluggable SQL queue + metadata backends: sqlite (local), postgres/mysql
-# (network), libsql (remote Turso Cloud).
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "postgres", "mysql"] }
-# remote-only: `remote` + `tls` (hyper + hyper-rustls) WITHOUT `core`, so libsql
-# does NOT bundle SQLite's C library (which would collide with sqlx's bundled
-# SQLite — "Once poisoned"). `tls` supplies the HTTP connector build() requires.
-libsql = { version = "0.9", default-features = false, features = ["remote", "tls"] }
+# Plain local SQLite uses sqlx. Turso embedded replicas use the official libsql
+# driver; both execute the same concrete control schema.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+libsql = "0.9.30"
 gix = "0.85.0"
 gix-pack = "0.72.0"
 rpassword = "7"

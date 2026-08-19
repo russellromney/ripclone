@@ -168,7 +168,6 @@ async fn enqueue_job(path: &str) -> (SqlJobQueue, i64) {
             admitted_commit: "1111111111111111111111111111111111111111".into(),
             admitted_default_branch: None,
             credential: None,
-            recheck: 0,
             size_bytes: None,
         })
         .await
@@ -658,7 +657,6 @@ async fn claim_returns_one_job_no_foreign_credential() {
             admitted_commit: "2222222222222222222222222222222222222222".into(),
             admitted_default_branch: None,
             credential: None,
-            recheck: 0,
             size_bytes: None,
         })
         .await
@@ -674,7 +672,6 @@ async fn claim_returns_one_job_no_foreign_credential() {
             credential: Some(secrecy::SecretString::new(
                 "SUPER-SECRET-UPSTREAM".to_string().into(),
             )),
-            recheck: 0,
             size_bytes: None,
         })
         .await

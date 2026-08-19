@@ -38,6 +38,8 @@ pub struct Config {
     pub metadata: MetadataConfig,
     /// Server-side build queue backend (`[queue]`).
     pub queue: QueueConfig,
+    /// Server-owned SQLite control database (`[control]`).
+    pub control: ControlConfig,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -102,6 +104,16 @@ pub struct QueueConfig {
     /// [`crate::queue::size_class`]). Empty → launch default `small | large`.
     /// Also overridable via `RIPCLONE_SIZE_CLASSES` JSON.
     pub size_classes: Vec<crate::queue::SizeClass>,
+}
+
+/// Server-owned SQLite control database. A Turso URL and token together enable
+/// the embedded-replica mode; otherwise `path` is plain local SQLite.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlConfig {
+    pub path: Option<String>,
+    pub turso_url: Option<String>,
+    pub turso_token: Option<String>,
 }
 
 /// Path to the global config file (`~/.config/ripclone/config.toml`).
@@ -274,6 +286,11 @@ fn merge(overrides: Config, base: Config) -> Config {
                 overrides.queue.size_classes
             },
         },
+        control: ControlConfig {
+            path: overrides.control.path.or(base.control.path),
+            turso_url: overrides.control.turso_url.or(base.control.turso_url),
+            turso_token: overrides.control.turso_token.or(base.control.turso_token),
+        },
     }
 }
 
@@ -407,6 +424,7 @@ machine = "l"
                 bucket: Some("my-bucket".into()),
                 ..Default::default()
             },
+            control: ControlConfig::default(),
         };
         save_to(&path, &cfg).unwrap();
 

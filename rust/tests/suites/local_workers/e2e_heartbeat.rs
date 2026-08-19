@@ -59,7 +59,6 @@ fn job(path: &str) -> BuildJob {
         admitted_commit: "1111111111111111111111111111111111111111".into(),
         admitted_default_branch: None,
         credential: None,
-        recheck: 0,
         size_bytes: Some(100),
     }
 }

@@ -78,12 +78,7 @@ pub mod client;
 pub mod clone_metrics;
 pub mod clonepack;
 pub mod config;
-/// Provider-agnostic compute dispatch (`RIPCLONE_DISPATCH=fly|exec|http|mock`).
-///
-/// The cloud webhook/cron and self-host escape hatches wake workers through
-/// [`dispatch::ComputeProvider`]; nothing outside the module knows the platform.
-#[doc(hidden)]
-pub mod dispatch;
+pub mod control;
 #[doc(hidden)]
 pub mod extract;
 #[doc(hidden)]

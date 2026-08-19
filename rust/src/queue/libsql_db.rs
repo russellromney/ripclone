@@ -1,7 +1,4 @@
-//! [`QueueDb`] backed by the `libsql` crate, connecting to a **remote** Turso
-//! Cloud database over the network — the multi-machine farm-out backend. (Local
-//! files are served by the `sqlite` backend; libsql is built remote-only here so
-//! it doesn't bundle SQLite's C core and collide with sqlx.)
+//! [`QueueDb`] over the server's Turso embedded-replica handle.
 
 use super::sql::{
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
@@ -10,20 +7,16 @@ use super::sql::{
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use libsql::{Builder, Connection, Database};
+use libsql::{Connection, Database};
+use std::sync::Arc;
 
 pub struct LibsqlDb {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl LibsqlDb {
-    /// Connect to a remote Turso Cloud / libsql server.
-    pub async fn connect_remote(url: &str, token: &str) -> Result<Self> {
-        let db = Builder::new_remote(url.to_string(), token.to_string())
-            .build()
-            .await
-            .with_context(|| format!("open libsql remote {url}"))?;
-        Ok(Self { db })
+    pub(crate) fn from_database(db: Arc<Database>) -> Self {
+        Self { db }
     }
 
     async fn conn(&self) -> Result<Connection> {

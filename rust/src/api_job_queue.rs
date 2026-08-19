@@ -134,6 +134,7 @@ pub struct ApiJobQueue {
     job_token: String,
     client: reqwest::Client,
     heartbeat_timeout_secs: i64,
+    max_size_class: Option<String>,
     /// Last known lifecycle per job id, populated on `ack` so a follow-up
     /// `job_status` (the dead-letter check) needs no extra round-trip.
     last_status: Mutex<HashMap<JobId, JobState>>,
@@ -148,6 +149,7 @@ impl std::fmt::Debug for ApiJobQueue {
             .field("base_url", &self.base_url)
             .field("job_token", &"<redacted>")
             .field("heartbeat_timeout_secs", &self.heartbeat_timeout_secs)
+            .field("max_size_class", &self.max_size_class)
             .finish_non_exhaustive()
     }
 }
@@ -208,8 +210,15 @@ impl ApiJobQueue {
             job_token,
             client,
             heartbeat_timeout_secs: heartbeat_timeout_secs.max(1),
+            max_size_class: None,
             last_status: Mutex::new(HashMap::new()),
         })
+    }
+
+    #[must_use]
+    pub fn with_max_size_class(mut self, max_size_class: Option<String>) -> Self {
+        self.max_size_class = max_size_class;
+        self
     }
 
     /// POST `body` to `path` and deserialize the JSON response. Maps transport /
@@ -273,12 +282,9 @@ impl WorkerQueue for ApiJobQueue {
     async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>> {
         // The server applies this worker's ceiling per claim. We don't carry a
         // resolved rank here; the name is enough and the server owns the classes.
-        let max_size_class = std::env::var("RIPCLONE_MAX_SIZE_CLASS")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
         let req = ClaimRequest {
             worker_id: worker_id.to_string(),
-            max_size_class,
+            max_size_class: self.max_size_class.clone(),
         };
         let resp: ClaimResponse = self.post("/v1/jobs/claim", &req).await?;
         Ok(resp.job.map(|j| ClaimedJob {
@@ -379,10 +385,6 @@ impl JobQueue for ApiJobQueue {
 
     async fn depth(&self) -> usize {
         0
-    }
-
-    fn inproc_wait(&self) -> bool {
-        false
     }
 }
 

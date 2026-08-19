@@ -61,8 +61,10 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use ripclone::api_job_queue::ApiJobQueue;
+use ripclone::api_ref_store::ApiRefStore;
 use ripclone::api_ref_store::ApiReportError;
-use ripclone::backends::{self, Backends, WorkerQueueBackend};
+use ripclone::backends::Backends;
 use ripclone::metrics::Metrics;
 use ripclone::queue::{
     BuildError, BuildJob, JobQueueRef, JobState, WorkerQueueRef, make_worker_id,
@@ -153,21 +155,24 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    ripclone::control::validate_removed_environment()?;
+    // Validate the complete token-only API configuration before creating local
+    // paths or initializing artifact storage. Standalone workers have no
+    // control-database mode or credential.
+    let queue = Arc::new(
+        ApiJobQueue::from_env()?
+            .with_max_size_class(args.max_size_class.as_deref().map(str::to_owned)),
+    );
+    let ref_store = Arc::new(ApiRefStore::from_env()?);
+    let queue = queue as WorkerQueueRef;
+    let build_queue = queue.clone() as JobQueueRef;
+
     std::fs::create_dir_all(&args.cas_dir)?;
     std::fs::create_dir_all(&args.repo_root)?;
 
-    // The worker claims through either a direct SQL connection (trusted
-    // single-box) or the token-only HTTP `ApiJobQueue` (farm-out). Both back the
-    // same worker loop via the `WorkerQueue` trait; the api queue also serves as
-    // the `build_queue` (JobQueueRef) for the ServerState.
-    let (queue, build_queue): (WorkerQueueRef, JobQueueRef) =
-        match backends::connect_worker_queue(args.max_size_class.as_deref()).await? {
-            WorkerQueueBackend::Sql(q) => (q.clone() as WorkerQueueRef, q as JobQueueRef),
-            WorkerQueueBackend::Api(q) => (q.clone() as WorkerQueueRef, q as JobQueueRef),
-        };
-
     let metrics = Metrics::new();
-    let b = Backends::from_env(&args.cas_dir, &args.repo_root, &metrics).await?;
+    let b = Backends::from_env_with_ref_store(&args.cas_dir, &args.repo_root, &metrics, ref_store)
+        .await?;
     let state = ServerState::for_worker(b, build_queue, metrics)?;
 
     // Fleet-unique id (host/machine + pid + start nanos). PID-only collides
@@ -179,11 +184,7 @@ async fn main() -> Result<()> {
     let current_job = heartbeat_on.then(|| Arc::new(AtomicI64::new(-1)));
     if heartbeat_on {
         if !queue.supports_worker_registry() {
-            bail!(
-                "RIPCLONE_WORKER_HEARTBEAT is set but RIPCLONE_QUEUE={} does not \
-                 support the workers registry (need sqlite or libsql; postgres/mysql lag)",
-                backends::queue_kind()
-            );
+            bail!("server API does not support worker heartbeats");
         }
         let interval_secs = worker_heartbeat_interval_secs();
         let timeout_secs = queue.heartbeat_timeout_secs();
@@ -203,16 +204,12 @@ async fn main() -> Result<()> {
     }
     match args.max_size_class.as_deref() {
         Some(ceiling) => info!(
-            "ripclone-worker {worker_id} polling {} queue (max-size-class={ceiling}, idle_exit_secs={:?}, max_jobs={:?}, heartbeat={heartbeat_on})",
-            backends::queue_kind(),
-            args.idle_exit_secs,
-            args.max_jobs,
+            "ripclone-worker {worker_id} polling server API (max-size-class={ceiling}, idle_exit_secs={:?}, max_jobs={:?}, heartbeat={heartbeat_on})",
+            args.idle_exit_secs, args.max_jobs,
         ),
         None => info!(
-            "ripclone-worker {worker_id} polling {} queue (idle_exit_secs={:?}, max_jobs={:?}, heartbeat={heartbeat_on})",
-            backends::queue_kind(),
-            args.idle_exit_secs,
-            args.max_jobs,
+            "ripclone-worker {worker_id} polling server API (idle_exit_secs={:?}, max_jobs={:?}, heartbeat={heartbeat_on})",
+            args.idle_exit_secs, args.max_jobs,
         ),
     }
 
@@ -292,7 +289,6 @@ async fn main() -> Result<()> {
                     // The SQL queue does not persist the re-check counter; a
                     // cross-process worker starts each claimed job fresh and the
                     // periodic poller is the freshness backstop here.
-                    recheck: 0,
                     size_bytes: None,
                 };
                 // Isolate the build in its own task so a panic fails just this

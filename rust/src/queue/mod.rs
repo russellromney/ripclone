@@ -1,14 +1,8 @@
-//! Pluggable sync-task queue.
+//! Durable sync-task queue stored in the server-owned control database.
 //!
-//! The server enqueues a [`BuildJob`] when a `/sync` arrives; a worker dequeues
-//! it and runs the build. The default [`LocalJobQueue`] is an in-process channel
-//! (builder and waiter share a process). [`SqlJobQueue`] is a cross-process
-//! queue (a jobs table) so the build can run in a *separate* `ripclone-worker`
-//! process — on another machine, a Fly Machine, a Lambda, etc.
-//!
-//! A worker is stateless: all durable state lives in the `StorageBackend`
-//! (artifacts) and the `RefStore` (metadata). The local bare git mirror is
-//! rebuildable scratch. That is what makes the queue safe to farm out.
+//! The embedded worker claims this table directly through the server's shared
+//! database handle. Standalone workers claim through the authenticated API and
+//! never receive a database credential.
 
 use crate::provider::RepoId;
 use anyhow::Result;
@@ -17,17 +11,11 @@ use std::fmt;
 use std::sync::Arc;
 
 pub mod libsql_db;
-pub mod local;
-pub mod mysql_db;
-pub mod postgres_db;
 pub mod size_class;
 pub mod sql;
 pub mod sqlite_db;
 
 pub use libsql_db::LibsqlDb;
-pub use local::LocalJobQueue;
-pub use mysql_db::MysqlDb;
-pub use postgres_db::PostgresDb;
 pub use size_class::{
     SizeClass, classify_rank, default_size_classes, load_size_classes, prior_clonepack_bytes,
     resolve_job_size_bytes,
@@ -56,14 +44,6 @@ pub struct BuildJob {
     /// an obfuscated copy long enough for a cross-process worker to claim the
     /// job, then clears it on claim or finish.
     pub credential: Option<secrecy::SecretString>,
-    /// How many consecutive post-build freshness re-checks led to this job. The
-    /// post-build re-check stops once this reaches `RIPCLONE_RECHECK_MAX`, so on a
-    /// single box one repo pushing faster than it builds can't pin the worker.
-    /// Only carried in-process; the cross-process [`SqlJobQueue`] does not persist
-    /// it, so there the chain is not capped — but it is
-    /// bounded by the real push rate (each re-trigger builds a genuinely newer tip,
-    /// not a spin) and spread across the worker pool, with the poller as backstop.
-    pub recheck: u32,
     /// Byte size used to classify into a [`size_class`](size_class) rank at
     /// enqueue on the SQL queue. First build → repo size from the tiered-add
     /// preflight; re-sync → prior clonepack byte total. `None` maps to the
@@ -168,9 +148,7 @@ pub trait JobQueue: Send + Sync {
     /// so concurrent `/sync` for the same key produce a single build.
     async fn enqueue(&self, job: BuildJob) -> Result<Enqueued>;
 
-    /// Poll a job's lifecycle. Cross-process queues use this so `/sync` can
-    /// observe completion of a build running in another process. The default
-    /// (used by the in-process queue) reports [`JobState::Unknown`].
+    /// Poll a durable job's lifecycle.
     async fn job_status(&self, _job_id: JobId) -> Result<JobState> {
         Ok(JobState::Unknown)
     }
@@ -178,14 +156,6 @@ pub trait JobQueue: Send + Sync {
     /// Best-effort count of queued (not-yet-running) jobs, for metrics and
     /// backpressure reporting.
     async fn depth(&self) -> usize;
-
-    /// True when build completion is signalled to waiters *in this process*
-    /// (the in-process [`LocalJobQueue`]). When false, `/sync` must observe
-    /// completion by polling [`job_status`](JobQueue::job_status), because the
-    /// build runs in another process.
-    fn inproc_wait(&self) -> bool {
-        false
-    }
 }
 
 pub type JobQueueRef = Arc<dyn JobQueue>;

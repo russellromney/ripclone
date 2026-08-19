@@ -1,22 +1,18 @@
-//! [`MetaDb`] backed by the `libsql` crate, connecting to a **remote** Turso
-//! Cloud database. SQLite-flavored SQL (`?` placeholders, `ON CONFLICT` upsert).
+//! [`MetaDb`] over the server's Turso embedded-replica handle.
 
 use super::{MetaDb, RefRow};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use libsql::{Builder, Connection, Database};
+use libsql::{Connection, Database};
+use std::sync::Arc;
 
 pub struct LibsqlMeta {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl LibsqlMeta {
-    pub async fn connect_remote(url: &str, token: &str) -> Result<Self> {
-        let db = Builder::new_remote(url.to_string(), token.to_string())
-            .build()
-            .await
-            .with_context(|| format!("open libsql remote metadata {url}"))?;
-        Ok(Self { db })
+    pub(crate) fn from_database(db: Arc<Database>) -> Self {
+        Self { db }
     }
 
     async fn conn(&self) -> Result<Connection> {

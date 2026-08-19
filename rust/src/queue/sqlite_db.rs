@@ -19,6 +19,10 @@ pub struct SqliteDb {
 }
 
 impl SqliteDb {
+    pub(crate) fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
     /// Open (creating if needed) a local SQLite database at `path`.
     pub async fn connect(path: &str) -> Result<Self> {
         // Accept either a bare path or a `sqlite:`/`file:` URL.

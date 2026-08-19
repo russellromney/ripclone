@@ -13,6 +13,10 @@ pub struct SqliteMeta {
 }
 
 impl SqliteMeta {
+    pub(crate) fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
     pub async fn connect(path: &str) -> Result<Self> {
         let opts = SqliteConnectOptions::from_str(path)
             .with_context(|| format!("parse sqlite url {path}"))?
