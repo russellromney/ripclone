@@ -328,10 +328,10 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
         .await
         .expect("start rev-only build");
 
-    let store = ripclone::ref_store::FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/at-exact-only");
     assert!(
-        ripclone::ref_store::RefStore::load_branch(&store, &repo_id, "HEAD")
+        ripclone::ref_store::RefStore::load_branch(store.as_ref(), &repo_id, "HEAD")
             .await
             .expect("load absent HEAD")
             .is_none(),
@@ -339,13 +339,13 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
     );
 
     let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
-    let exact = ripclone::ref_store::RefStore::load_branch(&store, &repo_id, &exact_key)
+    let exact = ripclone::ref_store::RefStore::load_branch(store.as_ref(), &repo_id, &exact_key)
         .await
         .expect("load exact-only result")
         .expect("historical sync publishes its exact result");
     assert!(exact.internal_exact_result);
     assert_eq!(exact.default_branch, "main");
-    let branches = ripclone::ref_store::RefStore::list_branches(&store, &repo_id)
+    let branches = ripclone::ref_store::RefStore::list_branches(store.as_ref(), &repo_id)
         .await
         .expect("list exact-only layout");
     assert_eq!(branches, vec![exact_key.clone()]);

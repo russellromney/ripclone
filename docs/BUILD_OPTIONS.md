@@ -47,7 +47,9 @@ This is done efficiently on both writer paths: the Linux io_uring writer batches
 
 > The `worktree` subcommand is **experimental (alpha)** and does not yet run this durability barrier; an interrupt during a worktree materialize may leave a partial tree. Full hardening is tracked separately. See the [three materialize surfaces](../README.md#which-one-do-i-use) for how `clone --mode editable`, `clone --mode files`, and `worktree` differ.
 
-## Server-side backends
+## Server-side state
 
-Server-side backends are configured through environment variables: storage and retention (`RIPCLONE_S3_*`, `RIPCLONE_RETENTION_*`, `RIPCLONE_REMOTE_GC_*`), the metadata store (`RIPCLONE_METADATA*`), and the build queue / farm-out workers (`RIPCLONE_QUEUE*`). See [`BACKENDS.md`](BACKENDS.md) and [`CHANGELOG.md`](CHANGELOG.md) for the full list.
+The server owns one SQLite control database, optionally as a Turso embedded
+replica. Artifact storage remains local or S3-compatible. See
+[`BACKENDS.md`](BACKENDS.md) and [`CONFIG.md`](CONFIG.md).
 </content>

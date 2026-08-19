@@ -17,8 +17,7 @@
 //! Payload is JSON: `{"e":<exp_unix>}`.
 //!
 //! An operator mints one durable token (`ripclone mint-worker-token`) and
-//! provisions it as each farm-out worker's `RIPCLONE_METADATA_JOB_TOKEN` (a Fly
-//! machine secret, or forwarded by the dispatcher for exec/http). The server
+//! provisions it as each standalone worker's `RIPCLONE_METADATA_JOB_TOKEN`. The server
 //! verifies it on every `/v1/refs` and `/v1/jobs/*` request. It is the worker's
 //! whole credential.
 

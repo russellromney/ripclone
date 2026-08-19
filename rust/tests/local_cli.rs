@@ -6,8 +6,6 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "suites/local_cli/config_backends.rs"]
-mod config_backends;
 #[path = "suites/local_cli/e2e_auth.rs"]
 mod e2e_auth;
 #[path = "suites/local_cli/e2e_cli_contract.rs"]

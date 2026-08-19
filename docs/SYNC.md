@@ -14,7 +14,7 @@ default). The result is handled as follows:
 | Result | HTTP behavior |
 | --- | --- |
 | Branch metadata already has a complete, usable build for B | `200` with the normal ref response for B; no queue, mirror, builder, artifact, ref, or access-time mutation |
-| Exact work for `(repo, branch, B)` is already queued, claimed, or in detached Full work | `202` with `commit: B` and no second job |
+| Exact work for `(repo, branch, B)` is already queued or claimed | `202` with `commit: B` and no second job |
 | No active B work exists | One job is accepted with `commit: B`; response is `202` |
 | Ref is absent | `404`; no queue or source work |
 | Probe times out, fails, or returns malformed output | Retryable upstream error; no queue or source work |
@@ -26,8 +26,8 @@ The accepted response is intentionally small and informational:
 ```
 
 `status` may be `queued` or `coalesced`; `queue_depth` is not a job identifier
-and is not a completion promise. `accepted` means the selected queue accepted
-the immutable target, not that artifact construction has finished.
+and is not a completion promise. `accepted` means the control transaction
+committed the immutable target, not that artifact construction has finished.
 
 The normal CLI therefore returns promptly:
 
@@ -54,16 +54,15 @@ metadata path below. It never repeats a moving `POST /add` or `POST /sync`.
 ## Exact identity and workers
 
 Active work is keyed by repository storage key, branch, and full admitted
-commit. Duplicate B requests coalesce while B is queued, claimed, or in the
-embedded worker's detached Full phase. A later C is a different active key and
-gets its own job. SQL queues enforce this across both queued and claimed rows;
-the local queue keeps the same process-lifetime marker.
+commit. Duplicate B requests coalesce while B is queued or claimed. A later C
+is a different active key and gets its own job. The control database enforces
+this across both states.
 
-Every transport carries the admitted commit: the local channel, SQLite, libSQL,
-PostgreSQL, MySQL, API-worker claim response, standalone worker, and dispatcher
-structures. A worker exact-fetches and verifies B before building. It never
-substitutes the current branch tip C. The existing post-build freshness check
-may admit a separately observed exact target after B completes.
+The embedded worker claims directly through the server's control handle. A
+standalone worker receives the same admitted commit through the authenticated
+API, without a database credential. It exact-fetches and verifies B before
+building and never substitutes the current branch tip C. Completion performs no
+new ref probe or enqueue; a later webhook, poll, or user request may admit C.
 
 ## Webhooks, polling, and the API worker
 
@@ -97,14 +96,13 @@ methods or the normal CLI commands.
 `sync --at REV` is a first-class exact-revision request. Symbolic expressions
 such as `HEAD~5` are resolved once before admission; every retry then uses the
 selected object ID. Ordinary and explicit requests for the same branch and
-commit share one queue job and one internal exact result. Exact work is
-available on local and cross-process queues.
+commit share one durable job and one internal exact result.
 
 ## Queue durability
 
-SQL acceptance has the durability guarantee of the selected SQL backend. The
-`local` queue remains in-memory and only survives for the server process
-lifetime; accepted local jobs are lost if that process exits.
+Exact-result creation and job admission commit in one transaction in the
+server-owned SQLite database (or its Turso embedded replica). Accepted jobs
+survive restart; stale claims are recoverable after process death.
 
 Every queued job carries its admitted commit. A malformed job is rejected
 before credential lookup, provider access, mirror work, or builder entry; its
@@ -115,5 +113,5 @@ target is never guessed from the current branch tip.
 Admission does not change clone availability or artifact selection. A ready
 unchanged sync remains a `200` normal ref response. A changed sync can return
 before fetch/build barriers release, and a clone may still receive the existing
-pending response until the requested clonepack is ready. Queue full/unavailable
-responses are `503`; the failed admission leaves no partial active job.
+pending response until the requested clonepack is ready. Database failures are
+`503`; the failed transaction leaves neither a partial exact row nor a job.

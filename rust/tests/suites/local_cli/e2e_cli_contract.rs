@@ -10,7 +10,7 @@ use ripclone::client::Client;
 use ripclone::mode::CloneMode;
 use ripclone::provider::{ProviderConfig, ProviderRegistry, RepoId};
 use ripclone::queue::{BuildJob, EnqueueOutcome, Enqueued, JobQueue};
-use ripclone::ref_store::{FileRefStore, RefStore};
+use ripclone::ref_store::RefStore;
 use ripclone::server::{AdmissionTestProbe, RateLimiter, ServerState, build_app};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -75,7 +75,16 @@ async fn start_server_with_queue(
     std::fs::create_dir_all(&repo_root).unwrap();
     let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
     let storage = ripclone::storage::local(&cas_dir).unwrap();
-    let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+    let control_db = dir.path().join("control.db");
+    let ref_store: Arc<dyn RefStore> = Arc::new(
+        ripclone::meta::SqlRefStore::new(Box::new(
+            ripclone::meta::SqliteMeta::connect(&control_db.to_string_lossy())
+                .await
+                .unwrap(),
+        ))
+        .await
+        .unwrap(),
+    );
     let metrics = ripclone::metrics::Metrics::new();
     let retention = Arc::new(
         ripclone::retention::Retention::new(cas.clone(), metrics.clone())
@@ -98,9 +107,9 @@ async fn start_server_with_queue(
         rate_limiter: RateLimiter::new(1_000_000, 1_000_000.0),
         retention,
         build_queue,
+        control_db: None,
         worker_queue: None,
         build_queue_depth: Arc::new(AtomicUsize::new(0)),
-        build_waiters: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         oidc_verifier: None,
         webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -130,6 +139,7 @@ async fn start_server_with_queue(
         storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
+        control_db,
         pinned_path_probe: None,
         _dir: dir,
     }
@@ -620,7 +630,8 @@ async fn release_cli_sync_clone_failure_and_cleanup_contract() {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(snapshot_files(&queue_server.cas_dir).is_empty());
         assert!(
-            FileRefStore::new(&queue_server.repo_root)
+            server_ref_store(&queue_server)
+                .await
                 .load_branch(
                     &RepoId {
                         provider: ripclone::provider::ProviderInstanceId::new("cli-http"),

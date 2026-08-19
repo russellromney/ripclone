@@ -7,7 +7,6 @@ use common::*;
 use prost::Message;
 use ripclone::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex};
 use ripclone::provider::RepoId;
-use ripclone::ref_store::{FileRefStore, RefStore};
 
 /// Helper: GET /v1/repos/{provider}/{owner}/{repo}/status with optional query params.
 async fn get_status(
@@ -100,7 +99,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
     sync_until_manifest(&server, "acme", "historical-storage-accounting").await;
 
     let before = get_status(&server, "acme", "historical-storage-accounting", None).await;
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/historical-storage-accounting");
     let info = store
         .load_branch(&repo_id, "main")

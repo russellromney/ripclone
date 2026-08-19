@@ -1,13 +1,10 @@
-//! SQL-backed metadata store: makes the ref/metadata layer (`RefStore`)
-//! pluggable onto SQLite / Postgres / MySQL / libsql (Turso Cloud), so operators
-//! can keep ripclone's per-repo/branch `RefInfo` in a database they already run
-//! instead of files or S3.
+//! SQL-backed refs for the server-owned SQLite control database. Plain SQLite
+//! uses sqlx; a Turso embedded replica uses libsql.
 //!
 //! [`MetaDb`] is a tiny per-engine adapter that returns plain Rust types (no
 //! engine types leak); [`SqlRefStore`] holds one and implements the existing
 //! [`RefStore`](crate::ref_store::RefStore) trait, owning the `RefInfo`↔JSON
-//! serialization and the save-ordering policy. The metadata is small (one JSON
-//! row per repo/branch), so this mirrors the file/S3 stores closely.
+//! serialization and the save-ordering policy.
 
 use crate::RefInfo;
 use crate::provider::{RepoId, parse_storage_key};
@@ -35,7 +32,7 @@ pub struct RefRow {
 
 /// Per-engine adapter over a `refs(repo_key, branch, commit_id, synced_at,
 /// data)` table. `repo_key` is the repo's [`RepoId::storage_key`]. Implemented
-/// by `SqliteMeta`, `PostgresMeta`, `MysqlMeta`, `LibsqlMeta`.
+/// by `SqliteMeta` and `LibsqlMeta`.
 #[async_trait]
 pub trait MetaDb: Send + Sync {
     /// Create the `refs` table if absent.
@@ -89,6 +86,9 @@ pub trait MetaDb: Send + Sync {
     /// Branches with a stored ref for this repo.
     async fn list_branches(&self, repo_key: &str) -> Result<Vec<String>>;
 
+    /// Delete one stored ref.
+    async fn delete_ref(&self, repo_key: &str, branch: &str) -> Result<()>;
+
     /// Insert or update added-repo state, keyed by the unified storage key.
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()>;
 
@@ -105,9 +105,7 @@ pub trait MetaDb: Send + Sync {
     async fn health(&self) -> Result<()>;
 }
 
-/// `RefStore` over a [`MetaDb`]. Wrap in
-/// [`CachingRefStore`](crate::ref_store::CachingRefStore) for the read cache,
-/// exactly like the file/S3 stores.
+/// `RefStore` over a [`MetaDb`].
 pub struct SqlRefStore {
     db: Box<dyn MetaDb>,
 }
@@ -374,6 +372,10 @@ impl RefStore for SqlRefStore {
 
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
         self.db.list_branches(&repo_id.storage_key()).await
+    }
+
+    async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
+        self.db.delete_ref(&repo_id.storage_key(), branch).await
     }
 
     async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {

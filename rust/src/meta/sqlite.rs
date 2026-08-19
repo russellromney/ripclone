@@ -179,6 +179,16 @@ impl MetaDb for SqliteMeta {
         rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
     }
 
+    async fn delete_ref(&self, repo_key: &str, branch: &str) -> Result<()> {
+        sqlx::query("DELETE FROM refs WHERE repo_key = ? AND branch = ?")
+            .bind(repo_key)
+            .bind(branch)
+            .execute(&self.pool)
+            .await
+            .context("delete ref")?;
+        Ok(())
+    }
+
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO added_repos (repo_key, data) VALUES (?, ?)

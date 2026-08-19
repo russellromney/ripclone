@@ -25,7 +25,7 @@ lint() {
 # while io_uring is the default writer.
 #
 # This job self-compiles (ci profile + sccache/rust-cache). Fan-out jobs
-# (gitea/databases/s3gc/e2e/…) use prebuilt binaries from ci-build instead;
+# (gitea/s3gc/e2e/…) use prebuilt binaries from ci-build instead;
 # staging the full suite there was ~30m cold before integration-test
 # consolidation and is not worth it.
 run_tests() {
@@ -75,15 +75,6 @@ gitea() {
   fi
 }
 
-# Real network databases for the queue + metadata adapters the default suite can
-# only compile-check: Postgres + MySQL via throwaway docker containers, and
-# libsql against a local `sqld`. Needs docker; the libsql leg also needs `sqld`
-# on PATH (the test auto-skips without it).
-databases() {
-  export CARGO_PROFILE="${CARGO_PROFILE:-ci}"
-  bash "$ROOT/scripts/test-queue-sql.sh"
-}
-
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
 # raw HTTP, so a change to the server's contract (like the B5 added-repos gate)
 # does not recompile them — it silently breaks the harness against the next
@@ -104,7 +95,7 @@ benchmark() {
 }
 
 # Compile-once fan-out: product bins + integration tests for
-# gitea/databases/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
+# gitea/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
 ci_build() {
   bash "$ROOT/scripts/ci-build-artifacts.sh"
 }

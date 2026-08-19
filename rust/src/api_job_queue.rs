@@ -1,12 +1,12 @@
 //! `WorkerQueue` that claims/acks/heartbeats over the server's HTTP API.
 //!
-//! Selected with `RIPCLONE_QUEUE=api`. A farmed-out worker holds only a base URL
+//! A standalone worker holds only a base URL
 //! and a signed, expiring bearer token — never database credentials. It reaches
 //! the queue entirely through the server's `/v1/jobs/*` endpoints; the server
 //! holds the one queue database and performs every state change after checking
 //! the token. This is the queue-side twin of [`ApiRefStore`](crate::api_ref_store)
 //! (metadata over `POST /v1/refs`): together they let a worker run on untrusted
-//! infra with a single token as its whole credential.
+//! infrastructure with a single token as its whole control credential.
 //!
 //! Wire shapes:
 //! - `POST /v1/jobs/claim` — body `{worker_id, max_size_class?}` → `{job?}`
@@ -18,8 +18,7 @@
 //!
 //! A failed claim/ack/heartbeat is never swallowed: network / 5xx / 429 map to a
 //! retryable [`ApiReportError`] (the worker polls again / the job stays queued),
-//! and a 401/403 maps to an *unauthorized* error so the worker exits cleanly and
-//! the dispatcher respawns it with a fresh token.
+//! and a 401/403 maps to an *unauthorized* error so the worker exits cleanly.
 
 use crate::api_ref_store::ApiReportError;
 use crate::queue::{
@@ -163,14 +162,14 @@ impl ApiJobQueue {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .context(
-                "RIPCLONE_QUEUE=api requires RIPCLONE_QUEUE_API_URL \
+                "standalone workers require RIPCLONE_QUEUE_API_URL \
                  (the server base URL that serves POST /v1/jobs/*)",
             )?;
         let job_token = std::env::var("RIPCLONE_METADATA_JOB_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .context(
-                "RIPCLONE_QUEUE=api requires RIPCLONE_METADATA_JOB_TOKEN \
+                "standalone workers require RIPCLONE_METADATA_JOB_TOKEN \
                  (the one signed, expiring bearer token for all worker endpoints)",
             )?;
         let timeout = std::env::var("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS")
@@ -358,17 +357,12 @@ impl WorkerQueue for ApiJobQueue {
     }
 }
 
-/// The api worker's `ServerState.build_queue`. All durable enqueue/coalesce
-/// happens on the server; the only enqueue a worker would attempt is the
-/// post-build freshness re-check, and the server's poll loop is that backstop
-/// for cross-process queues. So `enqueue` fails loudly rather than pretend.
+/// The API worker's `ServerState.build_queue`. All durable enqueue/coalescing
+/// happens on the server, so worker-side enqueue fails loudly.
 #[async_trait]
 impl JobQueue for ApiJobQueue {
     async fn enqueue(&self, _job: BuildJob) -> Result<Enqueued> {
-        bail!(
-            "RIPCLONE_QUEUE=api workers do not enqueue; the server enqueues and its \
-             periodic poll loop is the freshness backstop for cross-process queues"
-        )
+        bail!("standalone API workers do not enqueue; the server owns admission")
     }
 
     async fn job_status(&self, id: JobId) -> Result<JobState> {
@@ -395,8 +389,9 @@ mod tests {
 
     #[test]
     fn from_env_needs_url_and_token() {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_url = std::env::var("RIPCLONE_QUEUE_API_URL").ok();
         let prev_tok = std::env::var("RIPCLONE_METADATA_JOB_TOKEN").ok();
 

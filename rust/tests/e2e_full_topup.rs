@@ -16,7 +16,6 @@ use ripclone::mode::CloneMode;
 use ripclone::provider::{
     ProviderConfig, ProviderInstance, ProviderInstanceId, ProviderKind, ProviderRegistry, RepoId,
 };
-use ripclone::ref_store::{FileRefStore, RefStore};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -521,7 +520,6 @@ fn commit_all(repo: &std::path::Path, message: &str) -> String {
 async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() {
     let _guard = env_lock().lock().await;
     init(false);
-    let _recheck = ScopedEnvVar::set("RIPCLONE_RECHECK_MAX", "0");
     let upstream_token = "full-topup-client-token";
     let origin = make_http_origin_with_auth("acme/full-topup", "token full-topup-client-token");
     let provider = ProviderInstance {
@@ -1265,7 +1263,7 @@ async fn surrogate_stale_carried_default_branch_uses_resolved_b_branch() {
 
     // This is intentionally a surrogate for an upstream default-branch rename:
     // mutate only the carried A manifest after real phase-one publication.
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = RepoId {
         provider: ProviderInstanceId::new("counting"),
         path: "acme/full-topup-stale-default".to_string(),
@@ -1554,7 +1552,7 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
         .expect("B reached phase one")
         .expect("phase-one barrier alive");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/full-topup-no-base");
     let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let mut exact = store
@@ -1682,7 +1680,7 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
         .expect("B reached phase one")
         .expect("phase-one barrier alive");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/full-topup-unrelated");
     let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let mut exact = store
@@ -1788,7 +1786,7 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
         .expect("merge B reached phase one")
         .expect("merge phase-one barrier alive");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let exact = store
         .load_branch(
             &RepoId::github("acme/full-topup-merge"),

@@ -588,9 +588,16 @@ mod tests {
     use crate::cas::Cas;
     use crate::clonepack::hash_from_hex;
     use crate::provider::RepoId;
-    use crate::ref_store::{CachingRefStore, FileRefStore, exact_ref_key};
+    use crate::ref_store::exact_ref_key;
     use crate::storage::{HashEntry, StorageBackend, local};
     use std::time::Duration;
+
+    async fn test_ref_store(root: &std::path::Path) -> Arc<dyn RefStore> {
+        let db = crate::meta::SqliteMeta::connect(&root.join("refs.db").to_string_lossy())
+            .await
+            .unwrap();
+        Arc::new(crate::meta::SqlRefStore::new(Box::new(db)).await.unwrap())
+    }
 
     /// Write the orphan ledger directly, as a prior GC pass would have, so a test
     /// can place an object past (or inside) its grace window deterministically.
@@ -731,7 +738,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         // Build a ref with a manifest that points at metadata + archive chunks.
         let info = make_ref_info_with_manifest(&cas);
@@ -785,7 +792,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let reuse_hash = cas.put(b"reuse-frame").unwrap();
         let mut info = make_ref_info_with_manifest(&cas);
@@ -839,7 +846,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let info = make_ref_info_with_manifest(&cas);
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
@@ -884,7 +891,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let info = make_ref_info_with_manifest(&cas);
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
@@ -940,7 +947,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let repo = RepoId::github("o/r");
         let info = make_ref_info_with_manifest(&cas);
@@ -1019,12 +1026,8 @@ mod tests {
 
         let repo = RepoId::github("o/r");
 
-        // The ref store GC uses, with the production read cache in front.
-        let cached_store: Arc<dyn RefStore> =
-            Arc::new(CachingRefStore::new(FileRefStore::new(&repo_root)));
-        // A second handle to the same durable files, used to land the
-        // "concurrent sync" out-of-band so the cache above goes stale.
-        let durable_store = FileRefStore::new(&repo_root);
+        let cached_store = test_ref_store(&repo_root).await;
+        let durable_store = test_ref_store(&repo_root).await;
 
         // An aged, reused artifact: stored long ago, NOT referenced yet.
         let reused = cas.put(b"reused-pack-bytes").unwrap();
@@ -1033,14 +1036,11 @@ mod tests {
         filetime::set_file_mtime(&reused_path, filetime::FileTime::from_system_time(old)).unwrap();
 
         // v1 of the ref does NOT reference the reused object. Save it through the
-        // cached store so GC's first scan will hit the cache and see v1.
+        // control store before the concurrent update.
         let info_v1 = make_ref_info_with_manifest(&cas);
         cached_store.save(&repo, &info_v1).await.unwrap();
-        // Warm the cache exactly as a prior load would.
-        let _ = cached_store.load(&repo).await.unwrap();
-
         // The "concurrent sync" lands v2 — same commit, now referencing the
-        // reused object — directly on the durable files, leaving the cache stale.
+        // reused object — through a second connection to the control database.
         let mut info_v2 = info_v1.clone();
         info_v2.head_blobs_chunks = vec![reused.clone()];
         durable_store.save(&repo, &info_v2).await.unwrap();
@@ -1083,7 +1083,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let info = make_ref_info_with_manifest(&cas);
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
@@ -1130,7 +1130,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let info = make_ref_info_with_manifest(&cas);
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
@@ -1178,7 +1178,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let pack = dummy_sized_pack(b"history-pack", &cas);
         let info = RefInfo {
@@ -1247,7 +1247,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let mut info = make_ref_info_with_manifest(&cas);
         let now = unix_secs(SystemTime::now());
@@ -1297,7 +1297,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
         let repo_id = RepoId::github("o/pending");
         let commit = "1".repeat(40);
         let key = exact_ref_key("main", &commit);
@@ -1354,7 +1354,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let mut info = make_ref_info_with_manifest(&cas);
         let now = unix_secs(SystemTime::now());
@@ -1404,7 +1404,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         // The ref is already evicted, but the cloud has since pinned the repo.
         let mut info = make_ref_info_with_manifest(&cas);
@@ -1453,7 +1453,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let mut info = make_ref_info_with_manifest(&cas);
         let now = unix_secs(SystemTime::now());
@@ -1503,7 +1503,7 @@ mod tests {
         let storage: StorageRef = Arc::new(TestRemoteStorage {
             inner: local(&cas_root).unwrap(),
         });
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let mut info = make_ref_info_with_manifest(&cas);
         let now = unix_secs(SystemTime::now());

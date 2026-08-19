@@ -19,7 +19,7 @@ for bin in "$RIPCLONE" "$SERVER"; do
   fi
 done
 
-MINIO_IMAGE="minio/minio:latest"
+MINIO_IMAGE="minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
 MINIO_CONTAINER="ripclone-minio-e2e"
 MINIO_API_PORT="${MINIO_API_PORT:-9000}"
 MINIO_CONSOLE_PORT="${MINIO_CONSOLE_PORT:-9001}"

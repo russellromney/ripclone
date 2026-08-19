@@ -188,6 +188,18 @@ impl MetaDb for LibsqlMeta {
         Ok(out)
     }
 
+    async fn delete_ref(&self, repo_key: &str, branch: &str) -> Result<()> {
+        self.conn()
+            .await?
+            .execute(
+                "DELETE FROM refs WHERE repo_key = ? AND branch = ?",
+                libsql::params![repo_key, branch],
+            )
+            .await
+            .context("delete ref")?;
+        Ok(())
+    }
+
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {
         self.conn()
             .await?

@@ -5,7 +5,7 @@
 use crate::common::*;
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
-use ripclone::ref_store::{FileRefStore, RefStore, exact_ref_key};
+use ripclone::ref_store::exact_ref_key;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -238,7 +238,7 @@ async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
     let (_guard, after) = clone_files_when(&server, "acme", "phase2guard", "f", "new\n").await;
     assert_eq!(read(&after, "g"), "new file\n");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/phase2guard");
     for commit in [&old, &new] {
         let exact = store
@@ -334,7 +334,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         "Full(B) must exhaust exactly one retry: {failures:?}"
     );
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/phase2fail-fenced");
     let moving = store
         .load_branch(&repo_id, "main")

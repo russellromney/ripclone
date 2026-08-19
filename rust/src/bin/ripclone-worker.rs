@@ -271,9 +271,6 @@ async fn main() -> Result<()> {
                     admitted_commit,
                     admitted_default_branch: claimed.admitted_default_branch,
                     credential,
-                    // The SQL queue does not persist the re-check counter; a
-                    // cross-process worker starts each claimed job fresh and the
-                    // periodic poller is the freshness backstop here.
                     size_bytes: None,
                 };
                 // Isolate the build in its own task so a panic fails just this
