@@ -62,7 +62,8 @@ impl MetadataChunk {
                 );
             }
             for (frag_idx, fragment) in entry.fragments.iter().enumerate() {
-                let frame_idx = fragment.frame_index as usize;
+                let frame_idx = usize::try_from(fragment.frame_index)
+                    .context("manifest frame index does not fit in usize")?;
                 if frame_idx >= self.frames.len() {
                     anyhow::bail!(
                         "file {} fragment {} references missing frame {}",
@@ -132,14 +133,22 @@ where
     for (frame_index, frame) in metadata.frames.iter().enumerate() {
         let chunk = fetch_chunk(frame.chunk_index)
             .with_context(|| format!("fetch chunk {}", frame.chunk_index))?;
-        let start = frame.chunk_offset as usize;
-        let end = start + frame.compressed_len as usize;
-        if end > chunk.len() {
+        let end = frame
+            .chunk_offset
+            .checked_add(u64::from(frame.compressed_len))
+            .context("archive frame compressed range overflow")?;
+        let chunk_len = u64::try_from(chunk.len()).context("archive chunk is too large")?;
+        if end > chunk_len {
             anyhow::bail!("frame {} extends past chunk end", frame_index);
         }
+        let start = usize::try_from(frame.chunk_offset)
+            .context("archive frame offset does not fit in usize")?;
+        let end = usize::try_from(end).context("archive frame end does not fit in usize")?;
         let raw = zstd::decode_all(&chunk[start..end])
             .with_context(|| format!("decompress frame {}", frame_index))?;
-        if raw.len() != frame.raw_len as usize {
+        let expected_raw_len = usize::try_from(frame.raw_len)
+            .context("archive frame raw length does not fit in usize")?;
+        if raw.len() != expected_raw_len {
             anyhow::bail!(
                 "frame {} raw length mismatch: {} vs {}",
                 frame_index,
@@ -152,16 +161,21 @@ where
             for (file_idx, frag_idx) in pairs {
                 let entry = &metadata.files[*file_idx];
                 let fragment = &entry.fragments[*frag_idx];
-                let off = fragment.frame_offset as usize;
-                let len = fragment.raw_len as usize;
-                if off + len > raw.len() {
+                let off = usize::try_from(fragment.frame_offset)
+                    .context("archive fragment offset does not fit in usize")?;
+                let len = usize::try_from(fragment.raw_len)
+                    .context("archive fragment length does not fit in usize")?;
+                let end = off
+                    .checked_add(len)
+                    .context("archive fragment range overflow")?;
+                if end > raw.len() {
                     anyhow::bail!(
                         "fragment for {} extends past frame {}",
                         String::from_utf8_lossy(&entry.path),
                         frame_index
                     );
                 }
-                let content = &raw[off..off + len];
+                let content = &raw[off..end];
                 let hash = Sha1::digest(content);
                 if hash.as_slice() != entry.blob_sha1 {
                     // We can only verify the full file SHA-1 when the file
@@ -271,6 +285,23 @@ mod tests {
         });
 
         verify_archive(&manifest, |_| Ok(compressed.clone())).unwrap();
+    }
+
+    #[test]
+    fn verify_archive_rejects_overflowing_frame_range() {
+        let mut manifest = MetadataChunk::new();
+        manifest.frames.push(FrameInfo {
+            chunk_index: 0,
+            chunk_offset: u64::MAX,
+            compressed_len: 1,
+            raw_len: 0,
+        });
+
+        let err = verify_archive(&manifest, |_| Ok(Vec::new())).unwrap_err();
+        assert!(
+            err.to_string().contains("compressed range overflow"),
+            "unexpected error: {err}"
+        );
     }
 
     fn sha1_bytes(data: &[u8]) -> [u8; 20] {

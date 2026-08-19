@@ -66,7 +66,9 @@ static TEST_ARTIFACT_BARRIER: StdMutex<Option<ArtifactBarrier>> = StdMutex::new(
 /// guard that clears the slot when dropped, so a panicked test cannot leak the
 /// barrier into the next test in the same binary.
 pub fn set_test_artifact_barrier(barrier: ArtifactBarrier) -> TestArtifactBarrierGuard {
-    *TEST_ARTIFACT_BARRIER.lock().unwrap() = Some(barrier);
+    *TEST_ARTIFACT_BARRIER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(barrier);
     TestArtifactBarrierGuard
 }
 
@@ -75,12 +77,17 @@ pub struct TestArtifactBarrierGuard;
 
 impl Drop for TestArtifactBarrierGuard {
     fn drop(&mut self) {
-        *TEST_ARTIFACT_BARRIER.lock().unwrap() = None;
+        *TEST_ARTIFACT_BARRIER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 }
 
 fn take_test_artifact_barrier() -> Option<ArtifactBarrier> {
-    TEST_ARTIFACT_BARRIER.lock().unwrap().take()
+    TEST_ARTIFACT_BARRIER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
 }
 
 /// Narrow test-only synchronization for the immutable-admission proof. The
@@ -2261,8 +2268,7 @@ async fn dispatch_repos_get(
         .await;
     }
 
-    if path.ends_with("/status") {
-        let repo_path = path.strip_suffix("/status").unwrap();
+    if let Some(repo_path) = path.strip_suffix("/status") {
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -2301,8 +2307,7 @@ async fn dispatch_repos_post(
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
-    if path.ends_with("/add") {
-        let repo_path = path.strip_suffix("/add").unwrap();
+    if let Some(repo_path) = path.strip_suffix("/add") {
         admission_test_http(format!("POST /v1/repos/{repo_path}/add"));
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
@@ -2327,8 +2332,7 @@ async fn dispatch_repos_post(
         return add_repo_inner(repo_id, provider.clone(), query, headers, state).await;
     }
 
-    if path.ends_with("/sync") {
-        let repo_path = path.strip_suffix("/sync").unwrap();
+    if let Some(repo_path) = path.strip_suffix("/sync") {
         admission_test_http(format!("POST /v1/repos/{repo_path}/sync"));
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
@@ -2366,8 +2370,7 @@ async fn dispatch_repos_delete(
     Path(path): Path<String>,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
-    if path.ends_with("/add") {
-        let repo_path = path.strip_suffix("/add").unwrap();
+    if let Some(repo_path) = path.strip_suffix("/add") {
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -2394,8 +2397,7 @@ async fn dispatch_git_get(
     headers: HeaderMap,
     State(state): State<ServerState>,
 ) -> Response {
-    if path.ends_with("/info/refs") {
-        let repo_path = path.strip_suffix("/info/refs").unwrap();
+    if let Some(repo_path) = path.strip_suffix("/info/refs") {
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -2422,8 +2424,7 @@ async fn dispatch_git_post(
     State(state): State<ServerState>,
     body: Body,
 ) -> Response {
-    if path.ends_with("/git-upload-pack") {
-        let repo_path = path.strip_suffix("/git-upload-pack").unwrap();
+    if let Some(repo_path) = path.strip_suffix("/git-upload-pack") {
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -2514,7 +2515,7 @@ fn mirror_is_fresh(state: &ServerState, key: &str) -> bool {
     state
         .mirror_freshness
         .lock()
-        .unwrap()
+        .unwrap_or_else(|error| error.into_inner())
         .get(key)
         .map(|t| t.elapsed() < state.mirror_fresh_ttl)
         .unwrap_or(false)
@@ -2524,7 +2525,10 @@ fn mirror_is_fresh(state: &ServerState, key: &str) -> bool {
 /// the map stays bounded by the set of refs active within the TTL.
 fn stamp_mirror_fresh(state: &ServerState, key: &str) {
     let ttl = state.mirror_fresh_ttl;
-    let mut map = state.mirror_freshness.lock().unwrap();
+    let mut map = state
+        .mirror_freshness
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     map.retain(|_, t| t.elapsed() < ttl);
     map.insert(key.to_string(), Instant::now());
 }

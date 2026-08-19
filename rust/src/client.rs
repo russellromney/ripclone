@@ -3896,14 +3896,9 @@ impl Client {
                 let status = std::process::Command::new("git")
                     .arg("-C")
                     .arg(&main_repo)
-                    .args([
-                        "worktree",
-                        "add",
-                        "--no-checkout",
-                        "--detach",
-                        target.to_str().unwrap(),
-                        &commit,
-                    ])
+                    .args(["worktree", "add", "--no-checkout", "--detach"])
+                    .arg(&target)
+                    .arg(&commit)
                     .status()
                     .context("spawn git worktree add")?;
                 if !status.success() {

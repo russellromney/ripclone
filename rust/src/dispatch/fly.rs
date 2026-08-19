@@ -77,13 +77,14 @@ impl HttpFlyMachinesClient {
             .to_string();
         validate_dispatch_url(&api_base)
             .with_context(|| format!("invalid Fly API base '{api_base}'"))?;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("build Fly Machines HTTP client")?;
         Ok(Self {
             token: token.into(),
             api_base,
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-                .expect("reqwest client"),
+            http,
         })
     }
 }

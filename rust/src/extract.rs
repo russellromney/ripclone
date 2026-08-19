@@ -67,6 +67,31 @@ impl Chunk {
     }
 }
 
+fn checked_buffer_range(
+    start: u64,
+    len: u64,
+    buffer_len: usize,
+    description: &str,
+) -> Result<(usize, usize)> {
+    let end = start
+        .checked_add(len)
+        .with_context(|| format!("{description} range overflow"))?;
+    let buffer_len = u64::try_from(buffer_len).context("buffer is too large")?;
+    if end > buffer_len {
+        anyhow::bail!(
+            "{description} range {}..{} exceeds buffer length {}",
+            start,
+            end,
+            buffer_len
+        );
+    }
+    let start = usize::try_from(start)
+        .with_context(|| format!("{description} start offset {start} does not fit in usize"))?;
+    let end = usize::try_from(end)
+        .with_context(|| format!("{description} end offset {end} does not fit in usize"))?;
+    Ok((start, end))
+}
+
 /// Group consecutive frames into chunks whose total compressed size is at most
 /// `chunk_size`. A frame larger than `chunk_size` gets its own chunk.
 fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Vec<Chunk> {
@@ -150,11 +175,12 @@ pub fn extract_archive(
         dictionary,
         DEFAULT_LOCAL_CHUNK_SIZE,
         move |chunk: &Chunk| {
-            let start = chunk.byte_start as usize;
-            let end = chunk.byte_end as usize;
-            if end > archive.len() {
-                anyhow::bail!("chunk {:?} extends past archive end", chunk);
-            }
+            let (start, end) = checked_buffer_range(
+                chunk.byte_start,
+                chunk.compressed_len(),
+                archive.len(),
+                &format!("archive chunk {chunk:?}"),
+            )?;
             Ok(archive[start..end].to_vec())
         },
     )
@@ -270,6 +296,8 @@ fn decompress_frame_recorded(
     idx: usize,
 ) -> Result<Vec<u8>> {
     let start = Instant::now();
+    let raw_len = usize::try_from(frame.raw_len)
+        .with_context(|| format!("frame {idx} raw length does not fit in usize"))?;
     let raw = if frame.compressed_len == 0 && frame.raw_len == 0 {
         Vec::new()
     } else {
@@ -278,12 +306,12 @@ fn decompress_frame_recorded(
                 let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict)
                     .context("create zstd decompressor with dictionary")?;
                 decompressor
-                    .decompress(compressed, frame.raw_len as usize)
+                    .decompress(compressed, raw_len)
                     .with_context(|| format!("decompress frame {} with dictionary", idx))?
             }
             None => zstd::bulk::Decompressor::new()
                 .context("create zstd decompressor")?
-                .decompress(compressed, frame.raw_len as usize)
+                .decompress(compressed, raw_len)
                 .with_context(|| format!("decompress frame {}", idx))?,
         }
     };
@@ -475,11 +503,21 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                                 .chunk_offset
                                 .checked_sub(chunk.byte_start)
                                 .and_then(|off| {
-                                    Some((off, off.checked_add(frame.compressed_len as u64)?))
+                                    Some((off, off.checked_add(u64::from(frame.compressed_len))?))
                                 }) {
-                                Some((off, end)) if end <= bytes.len() as u64 => {
-                                    let off = off as usize;
-                                    Ok(bytes.slice(off..off + frame.compressed_len as usize))
+                                Some((off, end)) => {
+                                    let len = end.checked_sub(off).ok_or_else(|| {
+                                        anyhow::anyhow!("frame {} range underflow", frame_idx)
+                                    });
+                                    len.and_then(|len| {
+                                        checked_buffer_range(
+                                            off,
+                                            len,
+                                            bytes.len(),
+                                            &format!("frame {frame_idx}"),
+                                        )
+                                        .map(|(start, end)| bytes.slice(start..end))
+                                    })
                                 }
                                 _ => Err(anyhow::anyhow!(
                                     "frame {} (offset={} len={}) out of chunk {} bounds (start={} len={})",
@@ -542,7 +580,9 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                         dictionary2.as_deref().map(|d| d.as_slice()),
                         idx,
                     )?);
-                    if raw.len() != frame.raw_len as usize {
+                    let expected_raw_len = usize::try_from(frame.raw_len)
+                        .with_context(|| format!("frame {idx} raw length does not fit in usize"))?;
+                    if raw.len() != expected_raw_len {
                         anyhow::bail!(
                             "frame {} raw length mismatch: {} vs {}",
                             idx,
@@ -562,16 +602,29 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                     for (file_idx, frag_idx) in pairs {
                         let entry = &manifest2.files[*file_idx];
                         let fragment = &entry.fragments[*frag_idx];
-                        let off = fragment.frame_offset as usize;
-                        let len = fragment.raw_len as usize;
-                        if off + len > raw.len() {
+                        let off = usize::try_from(fragment.frame_offset).with_context(|| {
+                            format!(
+                                "fragment for {} offset does not fit in usize",
+                                String::from_utf8_lossy(&entry.path)
+                            )
+                        })?;
+                        let len = usize::try_from(fragment.raw_len).with_context(|| {
+                            format!(
+                                "fragment for {} length does not fit in usize",
+                                String::from_utf8_lossy(&entry.path)
+                            )
+                        })?;
+                        let end = off
+                            .checked_add(len)
+                            .context("archive fragment range overflow")?;
+                        if end > raw.len() {
                             anyhow::bail!(
                                 "fragment for {} extends past frame {}",
                                 String::from_utf8_lossy(&entry.path),
                                 idx
                             );
                         }
-                        let content = &raw[off..off + len];
+                        let content = &raw[off..end];
 
                         if entry.fragments.len() == 1 {
                             let hash = sha1_digest_recorded(content);
@@ -597,27 +650,50 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                                 }
                             }
                         } else {
-                            let mut guard = pending_files2.lock().unwrap();
+                            let mut guard = pending_files2
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("pending files lock poisoned"))?;
                             let pending = guard.get_mut(file_idx).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "missing pending state for {}",
                                     String::from_utf8_lossy(&entry.path)
                                 )
                             })?;
+                            if pending.fragments[*frag_idx].is_some() {
+                                anyhow::bail!(
+                                    "duplicate fragment {} for {}",
+                                    frag_idx,
+                                    String::from_utf8_lossy(&entry.path)
+                                );
+                            }
                             pending.fragments[*frag_idx] = Some(FileSlice {
                                 data: Arc::clone(&raw),
                                 offset: off,
                                 len,
                             });
-                            pending.remaining -= 1;
+                            pending.remaining = pending
+                                .remaining
+                                .checked_sub(1)
+                                .context("pending fragment count underflow")?;
                             if pending.remaining == 0 {
-                                let pending = guard.remove(file_idx).expect("pending file missing");
+                                let pending = guard.remove(file_idx).ok_or_else(|| {
+                                    anyhow::anyhow!("pending file disappeared while completing")
+                                })?;
                                 drop(guard);
                                 let fragments: Vec<FileSlice> = pending
                                     .fragments
                                     .into_iter()
-                                    .map(|frag| frag.expect("fragment missing"))
-                                    .collect();
+                                    .enumerate()
+                                    .map(|(fragment_idx, frag)| {
+                                        frag.ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "fragment {} missing for {}",
+                                                fragment_idx,
+                                                String::from_utf8_lossy(&entry.path)
+                                            )
+                                        })
+                                    })
+                                    .collect::<Result<_>>()?;
                                 let hash = sha1_digest_fragments_recorded(&fragments);
                                 if hash.as_slice() != entry.blob_sha1 {
                                     anyhow::bail!(
@@ -779,7 +855,8 @@ pub fn extract_blobs_from_pack_bytes(
     if pack.len() < 12 || &pack[0..4] != b"PACK" {
         anyhow::bail!("invalid pack header");
     }
-    let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize;
+    let count = usize::try_from(u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]))
+        .context("pack object count does not fit in usize")?;
     let mut off = 12usize;
     let mut written = 0usize;
     let mut stats = Vec::new();
@@ -791,7 +868,9 @@ pub fn extract_blobs_from_pack_bytes(
         }
         let (obj_type, size, hdr_len) = parse_pack_obj_header(&pack[off..])
             .with_context(|| format!("parse object {} header", i))?;
-        let data_start = off + hdr_len;
+        let data_start = off
+            .checked_add(hdr_len)
+            .context("pack object header length overflow")?;
         if obj_type == 6 || obj_type == 7 {
             anyhow::bail!(
                 "unexpected delta object (type {}) in undeltified pack",
@@ -803,15 +882,21 @@ pub fn extract_blobs_from_pack_bytes(
         }
         let inflate_start = Instant::now();
         let mut dec = ZlibDecoder::new(&pack[data_start..]);
-        let mut content = Vec::with_capacity(size as usize);
+        let capacity = usize::try_from(size)
+            .with_context(|| format!("pack object {} size does not fit in usize", i))?;
+        let mut content = Vec::with_capacity(capacity);
         dec.read_to_end(&mut content)
             .with_context(|| format!("inflate pack object {}", i))?;
         crate::perf::record_zlib_inflate(
             inflate_start.elapsed(),
-            dec.total_in() as usize,
+            usize::try_from(dec.total_in()).context("inflated pack byte count too large")?,
             content.len(),
         );
-        off = data_start + dec.total_in() as usize;
+        off = data_start
+            .checked_add(
+                usize::try_from(dec.total_in()).context("inflated pack byte count too large")?,
+            )
+            .context("pack object data length overflow")?;
 
         // type 3 == OBJ_BLOB. The manifest keys blobs by the plain sha1 of the
         // raw content (no git "blob <len>\0" header), so match that.
@@ -880,8 +965,14 @@ fn parse_pack_obj_header(buf: &[u8]) -> Result<(u8, u64, usize)> {
         }
         let b = buf[i];
         i += 1;
-        size |= ((b & 0x7f) as u64) << shift;
-        shift += 7;
+        let value = u64::from(b & 0x7f);
+        if shift >= 64 || value > (u64::MAX >> shift) {
+            anyhow::bail!("pack object size varint overflow");
+        }
+        size |= value << shift;
+        shift = shift
+            .checked_add(7)
+            .context("pack object size varint shift overflow")?;
         cont = b & 0x80 != 0;
     }
     Ok((obj_type, size, i))
@@ -986,6 +1077,17 @@ mod tests {
 
     fn empty_manifest() -> MetadataChunk {
         MetadataChunk::new()
+    }
+
+    #[test]
+    fn rejects_pack_object_size_varint_overflow() {
+        let header = vec![0x80; 10];
+        let err = parse_pack_obj_header(&header).unwrap_err();
+        assert!(
+            err.to_string().contains("varint")
+                && (err.to_string().contains("overflow") || err.to_string().contains("truncated")),
+            "unexpected error: {err}"
+        );
     }
 
     fn extract_manifest(

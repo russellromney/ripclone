@@ -30,17 +30,16 @@ impl HttpProvider {
     /// Build a provider. Fails loudly if the URL is empty, not absolute http(s),
     /// or points at a link-local / unspecified host (metadata SSRF guard).
     pub fn new(cfg: HttpProviderConfig) -> Result<Self> {
-        validate_dispatch_url(&cfg.url)?;
-        Ok(Self {
-            url: cfg.url,
-            token: cfg.token,
-            client: cfg.client.unwrap_or_else(|| {
-                reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()
-                    .expect("reqwest client")
-            }),
-        })
+        let HttpProviderConfig { url, token, client } = cfg;
+        validate_dispatch_url(&url)?;
+        let client = match client {
+            Some(client) => client,
+            None => reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .context("build HTTP dispatch client")?,
+        };
+        Ok(Self { url, token, client })
     }
 
     /// `RIPCLONE_DISPATCH_URL` required; optional `RIPCLONE_DISPATCH_TOKEN`.
