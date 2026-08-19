@@ -18,6 +18,7 @@ async fn worker_farm_out_postgres() {
         eprintln!("SKIP worker_farm_out_postgres: RIPCLONE_TEST_PG_URL unset");
         return;
     };
+    crate::reset_database_backend_env();
     unsafe {
         std::env::set_var("RIPCLONE_QUEUE", "postgres");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &url);

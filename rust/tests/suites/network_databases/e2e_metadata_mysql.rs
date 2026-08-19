@@ -12,6 +12,7 @@ async fn metadata_mysql_sync_then_clone() {
         eprintln!("SKIP metadata_mysql_sync_then_clone: RIPCLONE_TEST_MYSQL_URL unset");
         return;
     };
+    crate::reset_database_backend_env();
     unsafe {
         std::env::set_var("RIPCLONE_METADATA", "mysql");
         std::env::set_var("RIPCLONE_METADATA_DB_URL", &url);

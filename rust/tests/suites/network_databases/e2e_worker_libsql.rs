@@ -75,6 +75,8 @@ async fn worker_farm_out_libsql_against_real_sqld() {
         return;
     }
 
+    crate::reset_database_backend_env();
+
     let data = tempfile::tempdir().expect("sqld data dir");
     let port = free_port();
     let _sqld = start_sqld(port, data.path());

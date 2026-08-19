@@ -17,6 +17,7 @@ async fn worker_farm_out_mysql() {
         eprintln!("SKIP worker_farm_out_mysql: RIPCLONE_TEST_MYSQL_URL unset");
         return;
     };
+    crate::reset_database_backend_env();
     unsafe {
         std::env::set_var("RIPCLONE_QUEUE", "mysql");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &url);
