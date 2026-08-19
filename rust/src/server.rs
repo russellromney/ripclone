@@ -9514,6 +9514,7 @@ mod tests {
 
     fn complete_ref(commit: &str, manifest: &str) -> RefInfo {
         RefInfo {
+            internal_exact_result: true,
             commit: commit.to_string(),
             default_branch: "main".to_string(),
             archive_chunks: vec!["archive".to_string()],
@@ -9521,6 +9522,7 @@ mod tests {
                 commit: commit.to_string(),
                 manifest: manifest.to_string(),
                 metadata_chunk: "metadata".to_string(),
+                idx_bundle: "idx-bundle".to_string(),
                 ..Default::default()
             },
             ..Default::default()
@@ -9539,10 +9541,9 @@ mod tests {
             .save_branch(&repo, &exact_key, &complete_ref(commit, "manifest-exact"))
             .await
             .unwrap();
-        store
-            .save_branch(&repo, "main", &complete_ref(commit, "manifest-moving"))
-            .await
-            .unwrap();
+        let mut moving = complete_ref(commit, "manifest-moving");
+        moving.internal_exact_result = false;
+        store.save_branch(&repo, "main", &moving).await.unwrap();
 
         let (key, info) = load_ref_info_for_resolved_commit(&store, &repo, "main", commit, "full")
             .await
@@ -9568,6 +9569,7 @@ mod tests {
         let new_commit = "4444444444444444444444444444444444444444";
         let old_commit = "5555555555555555555555555555555555555555";
         let info = RefInfo {
+            internal_exact_result: true,
             commit: new_commit.to_string(),
             default_branch: "main".to_string(),
             archive_chunks: vec!["old-archive".to_string()],
@@ -9581,6 +9583,7 @@ mod tests {
                 commit: new_commit.to_string(),
                 manifest: "new-shallow".to_string(),
                 metadata_chunk: "new-metadata".to_string(),
+                idx_bundle: "new-idx-bundle".to_string(),
                 ..Default::default()
             },
             build_status: Some("full history building".to_string()),
@@ -9608,6 +9611,7 @@ mod tests {
         let new_commit = "6666666666666666666666666666666666666666";
         let old_commit = "7777777777777777777777777777777777777777";
         let info = RefInfo {
+            internal_exact_result: true,
             commit: new_commit.to_string(),
             default_branch: "main".to_string(),
             full_clonepack: crate::ClonepackArtifacts {
@@ -9620,6 +9624,7 @@ mod tests {
                 commit: new_commit.to_string(),
                 manifest: "new-shallow".to_string(),
                 metadata_chunk: "new-metadata".to_string(),
+                idx_bundle: "new-idx-bundle".to_string(),
                 ..Default::default()
             },
             build_status: Some("full history building".to_string()),
@@ -12730,6 +12735,8 @@ mod tests {
             full_clonepack: crate::ClonepackArtifacts {
                 commit: tip.clone(),
                 manifest: "0000000000000000000000000000000000000000".to_string(),
+                metadata_chunk: "1111111111111111111111111111111111111111".to_string(),
+                idx_bundle: "2222222222222222222222222222222222222222".to_string(),
                 ..Default::default()
             },
             ..Default::default()
@@ -12777,6 +12784,7 @@ mod tests {
         let mut exact = complete_ref(&pinned, "manifest-a");
         exact.last_accessed_at = Some(old_ts);
         let mut moving = complete_ref(&newer, "manifest-b");
+        moving.internal_exact_result = false;
         moving.last_accessed_at = Some(old_ts);
         ref_store
             .save_branch(&rid, &exact_key, &exact)
@@ -12830,6 +12838,7 @@ mod tests {
         let mut mismatched_exact = complete_ref(&other, "manifest-b-exact");
         mismatched_exact.last_accessed_at = Some(old_ts);
         let mut moving = complete_ref(&other, "manifest-b-moving");
+        moving.internal_exact_result = false;
         moving.last_accessed_at = Some(old_ts);
         ref_store
             .save_branch(&rid, &exact_key, &mismatched_exact)
@@ -12893,6 +12902,8 @@ mod tests {
             full_clonepack: crate::ClonepackArtifacts {
                 commit: tip.clone(),
                 manifest: "0000000000000000000000000000000000000000".to_string(),
+                metadata_chunk: "1111111111111111111111111111111111111111".to_string(),
+                idx_bundle: "2222222222222222222222222222222222222222".to_string(),
                 ..Default::default()
             },
             ..Default::default()
