@@ -1270,9 +1270,10 @@ mod linux_uring {
                     }
                 }
             }
-            f(writer
-                .as_mut()
-                .expect("thread-local io_uring writer initialized"))
+            let Some(writer) = writer.as_mut() else {
+                anyhow::bail!("thread-local io_uring writer unavailable after initialization");
+            };
+            f(writer)
         })
     }
 
@@ -1597,7 +1598,14 @@ mod linux_uring {
             collect_stats: bool,
         ) -> Result<WriteOutcome> {
             let files = writes.len();
-            let bytes: u64 = writes.iter().map(|write| write.content.len() as u64).sum();
+            let bytes = writes.iter().try_fold(0u64, |total, write| {
+                total
+                    .checked_add(
+                        u64::try_from(write.content.len())
+                            .context("deferred write length does not fit in u64")?,
+                    )
+                    .context("deferred write byte total overflow")
+            })?;
             let in_flight = prepare_in_flight(writes)?;
 
             match self.descriptor_mode {
@@ -1635,10 +1643,9 @@ mod linux_uring {
                     // window is about to reuse.
                     let (prev_written, prev_stats) =
                         if self.pending_windows.len() >= self.max_inflight {
-                            let front = self
-                                .pending_windows
-                                .pop_front()
-                                .expect("pending window present at depth");
+                            let Some(front) = self.pending_windows.pop_front() else {
+                                anyhow::bail!("pending direct-write window missing at depth");
+                            };
                             let written = front.in_flight.len();
                             let stats = self
                                 .harvest_direct_window(front)

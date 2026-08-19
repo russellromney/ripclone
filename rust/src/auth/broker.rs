@@ -223,7 +223,7 @@ impl GitHubAppBroker {
         if let Some(cached) = self
             .cache
             .lock()
-            .expect("broker cache mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&self.installation_id)
             && cached.is_fresh(now)
         {
@@ -234,7 +234,7 @@ impl GitHubAppBroker {
         let token = fresh.token.clone();
         self.cache
             .lock()
-            .expect("broker cache mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(self.installation_id, fresh);
         Ok(token)
     }

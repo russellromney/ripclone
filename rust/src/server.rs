@@ -66,7 +66,9 @@ static TEST_ARTIFACT_BARRIER: StdMutex<Option<ArtifactBarrier>> = StdMutex::new(
 /// guard that clears the slot when dropped, so a panicked test cannot leak the
 /// barrier into the next test in the same binary.
 pub fn set_test_artifact_barrier(barrier: ArtifactBarrier) -> TestArtifactBarrierGuard {
-    *TEST_ARTIFACT_BARRIER.lock().unwrap() = Some(barrier);
+    *TEST_ARTIFACT_BARRIER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(barrier);
     TestArtifactBarrierGuard
 }
 
@@ -75,12 +77,17 @@ pub struct TestArtifactBarrierGuard;
 
 impl Drop for TestArtifactBarrierGuard {
     fn drop(&mut self) {
-        *TEST_ARTIFACT_BARRIER.lock().unwrap() = None;
+        *TEST_ARTIFACT_BARRIER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
 fn take_test_artifact_barrier() -> Option<ArtifactBarrier> {
-    TEST_ARTIFACT_BARRIER.lock().unwrap().take()
+    TEST_ARTIFACT_BARRIER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
 }
 
 /// Narrow test-only synchronization for the immutable-admission proof. The
@@ -2514,7 +2521,7 @@ fn mirror_is_fresh(state: &ServerState, key: &str) -> bool {
     state
         .mirror_freshness
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(key)
         .map(|t| t.elapsed() < state.mirror_fresh_ttl)
         .unwrap_or(false)
@@ -2524,7 +2531,10 @@ fn mirror_is_fresh(state: &ServerState, key: &str) -> bool {
 /// the map stays bounded by the set of refs active within the TTL.
 fn stamp_mirror_fresh(state: &ServerState, key: &str) {
     let ttl = state.mirror_fresh_ttl;
-    let mut map = state.mirror_freshness.lock().unwrap();
+    let mut map = state
+        .mirror_freshness
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     map.retain(|_, t| t.elapsed() < ttl);
     map.insert(key.to_string(), Instant::now());
 }
@@ -5369,11 +5379,19 @@ fn barrier_body(data: Vec<u8>, barrier: ArtifactBarrier) -> Body {
     tokio::spawn(async move {
         let after = barrier.after_bytes.min(data.len());
         let _ = tx.send(Ok(Bytes::from(data[..after].to_vec()))).await;
-        let entered = barrier.entered.lock().unwrap().take();
+        let entered = barrier
+            .entered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(entered) = entered {
             let _ = entered.send(());
         }
-        let proceed = barrier.proceed.lock().unwrap().take();
+        let proceed = barrier
+            .proceed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         let should_continue = if let Some(proceed) = proceed {
             proceed.await.is_ok() && !barrier.close_on_proceed
         } else {
@@ -5696,7 +5714,7 @@ fn load_metadata_files(
         .get(metadata_hash)
         .or_else(|_| storage.get(metadata_hash))
         .ok()?;
-    let md = crate::clonepack::MetadataChunk::decode(bytes.as_slice()).ok()?;
+    let md = crate::clonepack::MetadataChunk::decode_and_validate(bytes.as_slice()).ok()?;
     Some(md.files)
 }
 
@@ -5869,7 +5887,7 @@ fn archive_chunk_refs(
     archive_chunk_hashes: &[String],
     metadata_chunk: &crate::clonepack::MetadataChunk,
 ) -> Result<Vec<ChunkRef>> {
-    let lengths = crate::clonepack::archive_chunk_lengths(metadata_chunk);
+    let lengths = crate::clonepack::archive_chunk_lengths(metadata_chunk)?;
     if lengths.len() != archive_chunk_hashes.len() {
         anyhow::bail!(
             "archive chunk hash/length mismatch: hashes={} lengths={}",
@@ -7950,12 +7968,12 @@ pub fn set_recheck_barrier(
     entered_tx: tokio::sync::watch::Sender<usize>,
     proceed_rx: tokio::sync::watch::Receiver<usize>,
 ) {
-    *RECHECK_BARRIER.lock().unwrap() = Some((entered_tx, proceed_rx));
+    *RECHECK_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) = Some((entered_tx, proceed_rx));
 }
 
 /// Remove the barrier. Safe to call even if no barrier is set.
 pub fn clear_recheck_barrier() {
-    *RECHECK_BARRIER.lock().unwrap() = None;
+    *RECHECK_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// After an ordinary exact build completes, check whether the upstream tip
@@ -7980,7 +7998,10 @@ async fn post_build_freshness_recheck(
     // replaces the old RIPCLONE_TEST_RECHECK_DELAY_MS wall-clock sleep and makes
     // the freshness tests deterministic. Clone the channels out of the static so
     // the mutex guard is not held across the await.
-    let barrier = RECHECK_BARRIER.lock().unwrap().clone();
+    let barrier = RECHECK_BARRIER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if let Some((entered_tx, mut proceed_rx)) = barrier {
         let seen = *proceed_rx.borrow_and_update();
         entered_tx.send_modify(|v| *v += 1);

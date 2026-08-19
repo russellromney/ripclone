@@ -83,7 +83,7 @@ impl HttpFlyMachinesClient {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
-                .expect("reqwest client"),
+                .context("build Fly Machines HTTP client")?,
         })
     }
 }

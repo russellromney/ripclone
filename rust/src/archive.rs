@@ -70,7 +70,10 @@ fn fragments_for(
     start: usize,
     len: usize,
     mut hint: usize,
-) -> (Vec<Fragment>, usize) {
+) -> Result<(Vec<Fragment>, usize)> {
+    if bounds.is_empty() {
+        anyhow::bail!("cannot map file range onto an empty frame table");
+    }
     // Advance past frames that end at or before this file's start.
     while hint < bounds.len() && bounds[hint].1 <= start && len > 0 {
         hint += 1;
@@ -82,16 +85,17 @@ fn fragments_for(
             idx += 1;
         }
         let (frs, _) = bounds[idx];
-        return (
+        return Ok((
             vec![Fragment {
-                frame_index: idx as u32,
-                frame_offset: start.saturating_sub(frs) as u32,
+                frame_index: u32::try_from(idx).context("archive has too many frames")?,
+                frame_offset: u32::try_from(start.saturating_sub(frs))
+                    .context("empty file frame offset is too large")?,
                 raw_len: 0,
             }],
             hint,
-        );
+        ));
     }
-    let end = start + len;
+    let end = start.checked_add(len).context("file range end overflow")?;
     let mut frags = Vec::new();
     let mut k = hint;
     while k < bounds.len() && bounds[k].0 < end {
@@ -100,14 +104,15 @@ fn fragments_for(
         let oe = end.min(fre);
         if oe > os {
             frags.push(Fragment {
-                frame_index: k as u32,
-                frame_offset: (os - frs) as u32,
-                raw_len: (oe - os) as u32,
+                frame_index: u32::try_from(k).context("archive has too many frames")?,
+                frame_offset: u32::try_from(os - frs)
+                    .context("file fragment frame offset is too large")?,
+                raw_len: u32::try_from(oe - os).context("file fragment length is too large")?,
             });
         }
         k += 1;
     }
-    (frags, hint)
+    Ok((frags, hint))
 }
 
 pub struct ArchiveStats {
@@ -162,13 +167,14 @@ impl ArchiveBuilder {
         dictionary: Option<&[u8]>,
     ) -> Result<ArchiveStats> {
         let (manifest, chunks, stats) = self.build_chunks(commit, level, dictionary, u64::MAX)?;
-        if chunks.len() != 1 {
+        if chunks.len() > 1 {
             anyhow::bail!(
-                "expected single archive chunk for file output, got {}",
+                "expected at most one archive chunk for file output, got {}",
                 chunks.len()
             );
         }
-        std::fs::write(archive_path, &chunks[0])
+        let archive = chunks.first().map(Vec::as_slice).unwrap_or_default();
+        std::fs::write(archive_path, archive)
             .with_context(|| format!("write archive {}", archive_path.display()))?;
         let mut manifest_file = File::create(manifest_path)
             .with_context(|| format!("create manifest {}", manifest_path.display()))?;
@@ -190,6 +196,7 @@ impl ArchiveBuilder {
         dictionary: Option<&[u8]>,
         target_chunk_size: u64,
     ) -> Result<(MetadataChunk, Vec<Vec<u8>>, ArchiveStats)> {
+        let target_chunk_size = target_chunk_size.max(1);
         if !self.mirror.exists() {
             anyhow::bail!("mirror not found: {}", self.mirror.display());
         }
@@ -223,28 +230,56 @@ impl ArchiveBuilder {
         // each frame's placement.
         let mut chunks: Vec<Vec<u8>> = Vec::new();
         let mut current_chunk: Vec<u8> = Vec::new();
+        let mut current_frame_count = 0usize;
         for (i, compressed) in compressed_frames.iter().enumerate() {
-            if !current_chunk.is_empty()
-                && current_chunk.len() as u64 + compressed.len() as u64 > target_chunk_size
-            {
+            let would_exceed = if current_chunk.is_empty() {
+                false
+            } else {
+                let current_len =
+                    u64::try_from(current_chunk.len()).context("archive chunk is too large")?;
+                let compressed_len =
+                    u64::try_from(compressed.len()).context("compressed frame is too large")?;
+                current_len
+                    .checked_add(compressed_len)
+                    .context("archive chunk length overflow")?
+                    > target_chunk_size
+            };
+            if would_exceed {
                 chunks.push(std::mem::take(&mut current_chunk));
+                current_frame_count = 0;
             }
             manifest.frames.push(FrameInfo {
-                chunk_index: chunks.len() as u32,
-                chunk_offset: current_chunk.len() as u64,
-                compressed_len: compressed.len() as u32,
-                raw_len: (bounds[i].1 - bounds[i].0) as u32,
+                chunk_index: u32::try_from(chunks.len()).context("archive has too many chunks")?,
+                chunk_offset: u64::try_from(current_chunk.len())
+                    .context("archive chunk is too large")?,
+                compressed_len: u32::try_from(compressed.len())
+                    .context("compressed archive frame is too large")?,
+                raw_len: u32::try_from(
+                    bounds[i]
+                        .1
+                        .checked_sub(bounds[i].0)
+                        .context("archive frame bounds are inverted")?,
+                )
+                .context("raw archive frame is too large")?,
             });
             current_chunk.extend_from_slice(compressed);
-            if current_chunk.len() as u64 >= target_chunk_size {
+            current_frame_count += 1;
+            if u64::try_from(current_chunk.len()).context("archive chunk is too large")?
+                >= target_chunk_size
+            {
                 chunks.push(std::mem::take(&mut current_chunk));
+                current_frame_count = 0;
             }
         }
-        if !current_chunk.is_empty() {
+        if current_frame_count > 0 {
             chunks.push(current_chunk);
         }
 
-        let compressed_total: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let compressed_total = chunks.iter().try_fold(0u64, |total, chunk| {
+            total
+                .checked_add(u64::try_from(chunk.len()).context("archive chunk is too large")?)
+                .context("compressed archive byte total overflow")
+        })?;
         let files = manifest.files.len();
         let frames = manifest.frames.len();
 
@@ -302,9 +337,15 @@ impl ArchiveBuilder {
 
         for chunk in StreamCDC::new(reader, CDC_MIN, CDC_AVG, CDC_MAX) {
             let chunk = chunk.map_err(|e| anyhow::anyhow!("content-defined chunking: {e}"))?;
-            let start = chunk.offset as usize;
-            bounds.push((start, start + chunk.length));
-            batch_bytes += chunk.data.len();
+            let start = usize::try_from(chunk.offset)
+                .context("content-defined frame offset does not fit in usize")?;
+            let end = start
+                .checked_add(chunk.length)
+                .context("content-defined frame bounds overflow")?;
+            bounds.push((start, end));
+            batch_bytes = batch_bytes
+                .checked_add(chunk.data.len())
+                .context("archive compression batch size overflow")?;
             batch.push((bounds.len() - 1, chunk.data));
             if batch_bytes >= STREAM_BATCH_BYTES {
                 flush_batch(&mut batch, &mut outputs, &mut process_batch)?;
@@ -321,11 +362,19 @@ impl ArchiveBuilder {
             return Err(err).context("build archive from tree");
         }
         let (mut files, ranges) = (table.files, table.ranges);
-        let raw_total = ranges.last().map(|&(s, l)| (s + l) as u64).unwrap_or(0);
+        let raw_total = match ranges.last() {
+            Some(&(start, len)) => u64::try_from(
+                start
+                    .checked_add(len)
+                    .context("archive raw byte range overflow")?,
+            )
+            .context("archive raw byte total does not fit in u64")?,
+            None => 0,
+        };
 
         // Empty worktree: synthesize one empty frame so empty-file fragments
         // always have a frame to point at (matches the slice-based chunker).
-        if bounds.is_empty() {
+        if bounds.is_empty() && !files.is_empty() {
             bounds.push((0, 0));
             let res = process_batch(&[(0, &[][..])])?;
             anyhow::ensure!(
@@ -340,7 +389,7 @@ impl ArchiveBuilder {
         // are both in increasing stream order).
         let mut hint = 0usize;
         for (i, &(start, len)) in ranges.iter().enumerate() {
-            let (frags, new_hint) = fragments_for(&bounds, start, len, hint);
+            let (frags, new_hint) = fragments_for(&bounds, start, len, hint)?;
             hint = new_hint;
             files[i].fragments = frags;
         }
@@ -650,6 +699,7 @@ impl ArchiveBuilder {
             .tempfile_in(cas.root())
             .with_context(|| format!("create archive bundle temp in {}", cas.root().display()))?;
         let mut current_len = 0u64;
+        let mut current_frame_count = 0usize;
         let mut current_hasher = sha2::Sha256::new();
         let mut bundled: Vec<FrameInfo> = Vec::with_capacity(frame_infos.len());
         for (i, info) in frame_infos.iter().enumerate() {
@@ -665,7 +715,12 @@ impl ArchiveBuilder {
                     info.compressed_len
                 );
             }
-            if current_len > 0 && current_len + frame_len > target_size {
+            if current_len > 0
+                && current_len
+                    .checked_add(frame_len)
+                    .context("archive bundle length overflow")?
+                    > target_size
+            {
                 bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
                 current = tempfile::Builder::new()
                     .prefix(".archive-bundle.")
@@ -674,6 +729,7 @@ impl ArchiveBuilder {
                         format!("create archive bundle temp in {}", cas.root().display())
                     })?;
                 current_len = 0;
+                current_frame_count = 0;
                 current_hasher = sha2::Sha256::new();
             }
             let chunk_index = bundle_hashes.len() as u32;
@@ -687,8 +743,13 @@ impl ArchiveBuilder {
                 &mut current_hasher,
             )
             .with_context(|| format!("write archive frame {} to bundle", i))?;
-            current_len += written;
-            assembled_bytes += written;
+            current_len = current_len
+                .checked_add(written)
+                .context("archive bundle length overflow")?;
+            current_frame_count += 1;
+            assembled_bytes = assembled_bytes
+                .checked_add(written)
+                .context("archive bundle byte count overflow")?;
             bundled.push(FrameInfo {
                 chunk_index,
                 chunk_offset,
@@ -704,10 +765,11 @@ impl ArchiveBuilder {
                         format!("create archive bundle temp in {}", cas.root().display())
                     })?;
                 current_len = 0;
+                current_frame_count = 0;
                 current_hasher = sha2::Sha256::new();
             }
         }
-        if current_len > 0 {
+        if current_frame_count > 0 {
             bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
         }
         crate::perf::record_archive_bundle_assembly(assembly_start.elapsed(), assembled_bytes);
@@ -1113,7 +1175,7 @@ impl ArchiveBuilder {
             } else {
                 sha1_bytes(&repo.find_blob(*oid)?.data).to_vec()
             };
-            let (frags, new_hint) = fragments_for(&bounds, bstart, blen, hint);
+            let (frags, new_hint) = fragments_for(&bounds, bstart, blen, hint)?;
             hint = new_hint;
             manifest.files.push(FileEntry {
                 path: path.clone(),
@@ -1243,7 +1305,9 @@ impl<'r> TreeBlobReader<'r> {
             });
             t.ranges.push((start, len));
         }
-        self.next_start = start + len;
+        self.next_start = start
+            .checked_add(len)
+            .context("archive file stream offset overflow")?;
         self.cur = content;
         self.pos = 0;
         Ok(true)
@@ -1746,7 +1810,7 @@ mod tests {
                 .unwrap();
         let mut metadata = MetadataChunk::new();
         metadata.frames = bundled_frames.clone();
-        let lengths = crate::clonepack::archive_chunk_lengths(&metadata);
+        let lengths = crate::clonepack::archive_chunk_lengths(&metadata).unwrap();
 
         assert!(
             bundle_hashes.len() > 1,
@@ -2247,6 +2311,39 @@ mod tests {
         assert!(chunks.is_empty());
         assert_eq!(stats.raw_bytes, 0);
         assert!(metadata.files.is_empty());
+    }
+
+    #[test]
+    fn archive_only_empty_files_keeps_an_empty_archive_chunk() {
+        let (tmp, commit) = commit_files(&[("empty.txt", b"")]);
+        let builder = ArchiveBuilder::new(tmp.path());
+
+        let (metadata, chunks, stats) = builder
+            .build_chunks(&commit, 1, None, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.frames, 1);
+        assert_eq!(metadata.frames.len(), 1);
+        assert_eq!(chunks, vec![Vec::<u8>::new()]);
+
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let output = builder
+            .build_into_cas_incremental(
+                &commit,
+                &cas,
+                None,
+                1,
+                None,
+                &std::collections::HashMap::new(),
+                DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
+            .unwrap();
+        assert_eq!(output.download_bundle_hashes.len(), 1);
+        assert_eq!(
+            cas.get(&output.download_bundle_hashes[0]).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     /// Negative: building from a missing mirror must error cleanly.
