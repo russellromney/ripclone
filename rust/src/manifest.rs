@@ -93,7 +93,8 @@ impl MetadataChunk {
                 );
             }
             for (frag_idx, fragment) in entry.fragments.iter().enumerate() {
-                let frame_idx = fragment.frame_index as usize;
+                let frame_idx = usize::try_from(fragment.frame_index)
+                    .context("manifest frame index does not fit in usize")?;
                 if frame_idx >= self.frames.len() {
                     anyhow::bail!(
                         "file {} fragment {} references missing frame {}",

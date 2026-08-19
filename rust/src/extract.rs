@@ -1104,6 +1104,17 @@ mod tests {
         MetadataChunk::new()
     }
 
+    #[test]
+    fn rejects_pack_object_size_varint_with_excess_continuations() {
+        let header = vec![0x80; 10];
+        let err = parse_pack_obj_header(&header).unwrap_err();
+        assert!(
+            err.to_string().contains("varint")
+                && (err.to_string().contains("overflow") || err.to_string().contains("truncated")),
+            "unexpected error: {err}"
+        );
+    }
+
     fn extract_manifest(
         manifest: &MetadataChunk,
         target: &Path,
