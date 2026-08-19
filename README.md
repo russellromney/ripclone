@@ -354,7 +354,7 @@ The payload contains:
 - `cold` — whether the clone waited for a fresh build.
 - `totalMs` — end-to-end clone wall time in milliseconds.
 - `bytes` — total bytes downloaded.
-- `downloadMs` — currently omitted in v1.
+- `downloadMs` — currently omitted because pure download time is not isolated.
 - `client` — `{ os, arch, ripcloneVersion }`.
 
 Self-hosted servers accept and drop this POST at `POST /v1/clones/{cloneId}/metrics` so the CLI never spams its own server with 404s.

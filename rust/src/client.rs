@@ -2805,11 +2805,11 @@ impl Client {
             cold: outcome.cold,
             total_ms,
             bytes: outcome.bytes,
-            // v1 omits downloadMs: the client can't cleanly isolate pure
+            // Omit downloadMs: the client can't cleanly isolate pure
             // chunk-download time from manifest fetch + extraction, and a biased
             // number would skew the cloud's bytes/downloadMs throughput (the
             // headline metric). Better no throughput than a wrong one — the cloud
-            // simply won't compute it. Reinstated when the phase is isolated (v2).
+            // simply won't compute it. It can be reinstated once that phase is isolated.
             download_ms: None,
             client: ClientInfo::current(),
         };

@@ -256,7 +256,7 @@ async fn clone_id_header_triggers_metrics_post_with_correct_body() {
     assert_eq!(body["cold"], false);
     assert_eq!(body["totalMs"], 4242);
     assert!(body["bytes"].as_u64().unwrap() > 0);
-    // v1 always omits downloadMs (pure download time isn't cleanly isolated).
+    // Pure download time is not cleanly isolated, so the field is omitted.
     assert!(body.get("downloadMs").is_none());
     assert!(body["client"]["os"].is_string());
     assert!(body["client"]["arch"].is_string());

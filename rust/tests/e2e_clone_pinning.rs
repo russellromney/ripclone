@@ -153,7 +153,6 @@ fn ready(commit: &str) -> (StatusCode, serde_json::Value) {
             "default_branch": "main",
             "commit": commit,
             "parent_commit": null,
-            "full_pack": "",
             "clonepack_manifest": "manifest",
             "metadata_chunk": "metadata",
             "shallow": false,
