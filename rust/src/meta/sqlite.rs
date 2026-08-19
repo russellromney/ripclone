@@ -119,10 +119,10 @@ impl MetaDb for SqliteMeta {
         generation: Option<i64>,
         require_matching_commit: bool,
         internal_exact_result: bool,
-        moving_publication_fence: Option<&str>,
+        moving_publication_predecessor: Option<&str>,
     ) -> Result<()> {
         let insert_only = internal_exact_result && require_matching_commit;
-        let expected = moving_publication_fence.unwrap_or(commit_id);
+        let expected = moving_publication_predecessor.unwrap_or(commit_id);
         // The DO UPDATE ... WHERE makes the ordering check atomic with the write:
         // on conflict the row is overwritten only when the new write wins — same
         // commit, a higher-or-equal generation (commit history depth), or, when
@@ -161,19 +161,25 @@ impl MetaDb for SqliteMeta {
         Ok(())
     }
 
-    async fn compare_and_swap_data(
+    async fn compare_and_swap_ref(
         &self,
         repo_key: &str,
         branch: &str,
         expected_commit: &str,
         expected_data: &str,
         new_data: &str,
+        new_commit: &str,
+        new_synced_at: Option<i64>,
+        new_generation: Option<i64>,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE refs SET data = ?
+            "UPDATE refs SET data = ?, commit_id = ?, synced_at = ?, generation = ?
              WHERE repo_key = ? AND branch = ? AND commit_id = ? AND data = ?",
         )
         .bind(new_data)
+        .bind(new_commit)
+        .bind(new_synced_at)
+        .bind(new_generation)
         .bind(repo_key)
         .bind(branch)
         .bind(expected_commit)

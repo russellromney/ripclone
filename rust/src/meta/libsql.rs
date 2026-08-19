@@ -125,11 +125,11 @@ impl MetaDb for LibsqlMeta {
         generation: Option<i64>,
         require_matching_commit: bool,
         internal_exact_result: bool,
-        moving_publication_fence: Option<&str>,
+        moving_publication_predecessor: Option<&str>,
     ) -> Result<()> {
         let insert_only = i64::from(internal_exact_result && require_matching_commit);
         let require_match = i64::from(require_matching_commit);
-        let expected = moving_publication_fence.unwrap_or(commit_id);
+        let expected = moving_publication_predecessor.unwrap_or(commit_id);
         // DO UPDATE ... WHERE makes the ordering check atomic with the write;
         // a losing write is a silent no-op. Same policy as the sqlite adapter.
         self.conn()
@@ -168,21 +168,33 @@ impl MetaDb for LibsqlMeta {
         Ok(())
     }
 
-    async fn compare_and_swap_data(
+    async fn compare_and_swap_ref(
         &self,
         repo_key: &str,
         branch: &str,
         expected_commit: &str,
         expected_data: &str,
         new_data: &str,
+        new_commit: &str,
+        new_synced_at: Option<i64>,
+        new_generation: Option<i64>,
     ) -> Result<bool> {
         let changed = self
             .conn()
             .await?
             .execute(
-                "UPDATE refs SET data = ?
+                "UPDATE refs SET data = ?, commit_id = ?, synced_at = ?, generation = ?
                  WHERE repo_key = ? AND branch = ? AND commit_id = ? AND data = ?",
-                libsql::params![new_data, repo_key, branch, expected_commit, expected_data],
+                libsql::params![
+                    new_data,
+                    new_commit,
+                    new_synced_at,
+                    new_generation,
+                    repo_key,
+                    branch,
+                    expected_commit,
+                    expected_data
+                ],
             )
             .await
             .context("compare-and-swap ref data")?;
