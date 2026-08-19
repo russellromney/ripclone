@@ -170,10 +170,6 @@ impl AdmissionTestBarrier {
             let _ = signal.changed().await;
         }
     }
-
-    fn is_armed(&self) -> bool {
-        self.armed.load(Ordering::SeqCst)
-    }
 }
 
 /// Operation counters and barriers used by `e2e_sync_admission`. These are
@@ -318,32 +314,6 @@ fn admission_test_probe() -> Option<Arc<AdmissionTestProbe>> {
 pub async fn admission_test_before_claim() {
     if let Some(probe) = admission_test_probe() {
         probe.before_claim.wait().await;
-    }
-}
-
-/// Receive a local job while allowing a newly armed test gate to interrupt a
-/// worker already parked on an empty channel. This keeps the observable gate on
-/// the real pre-receive side of the local claim boundary.
-async fn admission_test_recv_before_claim(
-    rx: &mut tokio::sync::mpsc::Receiver<BuildJob>,
-) -> Option<BuildJob> {
-    let Some(probe) = admission_test_probe() else {
-        return rx.recv().await;
-    };
-    loop {
-        if probe.before_claim.is_armed() {
-            probe.before_claim.wait().await;
-            return rx.recv().await;
-        }
-        let mut armed = probe.before_claim.subscribe();
-        if probe.before_claim.is_armed() {
-            continue;
-        }
-        tokio::select! {
-            biased;
-            _ = armed.changed() => continue,
-            job = rx.recv() => return job,
-        }
     }
 }
 

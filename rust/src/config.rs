@@ -34,12 +34,14 @@ pub struct Config {
     pub providers: HashMap<String, ProviderEntry>,
     /// Server-side artifact storage backend (`[storage]`).
     pub storage: StorageConfig,
-    /// Server-side metadata (ref) store backend (`[metadata]`).
-    pub metadata: MetadataConfig,
-    /// Server-side build queue backend (`[queue]`).
-    pub queue: QueueConfig,
     /// Server-owned SQLite control database (`[control]`).
     pub control: ControlConfig,
+    /// Captured solely so removed control sections can fail closed before any
+    /// runtime side effect. They are never serialized or interpreted.
+    #[serde(rename = "metadata", skip_serializing)]
+    pub(crate) removed_metadata: Option<toml::Value>,
+    #[serde(rename = "queue", skip_serializing)]
+    pub(crate) removed_queue: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -76,36 +78,6 @@ pub struct StorageConfig {
     pub cache_dir: Option<String>,
 }
 
-/// Server-side metadata (ref) store. `RIPCLONE_METADATA*` env vars override.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MetadataConfig {
-    /// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql` | `api`.
-    /// Unset follows storage (s3 if configured, else file). `api` is worker-only
-    /// (report URL + job token; no DB credentials).
-    pub backend: Option<String>,
-    /// Connection URL for the SQL backends.
-    pub url: Option<String>,
-    /// Auth token for `libsql` (remote), stored as written.
-    pub token: Option<String>,
-}
-
-/// Server-side build queue. `RIPCLONE_QUEUE*` env vars override.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct QueueConfig {
-    /// `local` | `sqlite` | `postgres` | `mysql` | `libsql`. Unset = `local`.
-    pub backend: Option<String>,
-    /// Connection URL for the SQL backends.
-    pub url: Option<String>,
-    /// Auth token for `libsql` (remote), stored as written.
-    pub token: Option<String>,
-    /// Ordered size classes for the SQL queue claim filter (see
-    /// [`crate::queue::size_class`]). Empty → launch default `small | large`.
-    /// Also overridable via `RIPCLONE_SIZE_CLASSES` JSON.
-    pub size_classes: Vec<crate::queue::SizeClass>,
-}
-
 /// Server-owned SQLite control database. A Turso URL and token together enable
 /// the embedded-replica mode; otherwise `path` is plain local SQLite.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -114,6 +86,9 @@ pub struct ControlConfig {
     pub path: Option<String>,
     pub turso_url: Option<String>,
     pub turso_token: Option<String>,
+    /// Ordered worker size classes. Empty uses `small | large`; the
+    /// `RIPCLONE_SIZE_CLASSES` environment override remains supported.
+    pub size_classes: Vec<crate::queue::SizeClass>,
 }
 
 /// Path to the global config file (`~/.config/ripclone/config.toml`).
@@ -271,26 +246,18 @@ fn merge(overrides: Config, base: Config) -> Config {
             prefix: overrides.storage.prefix.or(base.storage.prefix),
             cache_dir: overrides.storage.cache_dir.or(base.storage.cache_dir),
         },
-        metadata: MetadataConfig {
-            backend: overrides.metadata.backend.or(base.metadata.backend),
-            url: overrides.metadata.url.or(base.metadata.url),
-            token: overrides.metadata.token.or(base.metadata.token),
-        },
-        queue: QueueConfig {
-            backend: overrides.queue.backend.or(base.queue.backend),
-            url: overrides.queue.url.or(base.queue.url),
-            token: overrides.queue.token.or(base.queue.token),
-            size_classes: if overrides.queue.size_classes.is_empty() {
-                base.queue.size_classes
-            } else {
-                overrides.queue.size_classes
-            },
-        },
         control: ControlConfig {
             path: overrides.control.path.or(base.control.path),
             turso_url: overrides.control.turso_url.or(base.control.turso_url),
             turso_token: overrides.control.turso_token.or(base.control.turso_token),
+            size_classes: if overrides.control.size_classes.is_empty() {
+                base.control.size_classes
+            } else {
+                overrides.control.size_classes
+            },
         },
+        removed_metadata: overrides.removed_metadata.or(base.removed_metadata),
+        removed_queue: overrides.removed_queue.or(base.removed_queue),
     }
 }
 
@@ -351,21 +318,20 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-[queue]
-backend = "sqlite"
-url = "/tmp/q.db"
+[control]
+path = "/tmp/control.db"
 
-[[queue.size_classes]]
+[[control.size_classes]]
 name = "small"
 max_bytes = 1000
 machine = "s"
 
-[[queue.size_classes]]
+[[control.size_classes]]
 name = "medium"
 max_bytes = 5000
 machine = "m"
 
-[[queue.size_classes]]
+[[control.size_classes]]
 name = "large"
 max_bytes = 18446744073709551615
 machine = "l"
@@ -373,14 +339,14 @@ machine = "l"
         )
         .unwrap();
         let cfg = try_load_from(&path).unwrap();
-        assert_eq!(cfg.queue.size_classes.len(), 3);
-        assert_eq!(cfg.queue.size_classes[0].name, "small");
-        assert_eq!(cfg.queue.size_classes[0].max_bytes, 1000);
-        assert_eq!(cfg.queue.size_classes[1].name, "medium");
-        assert_eq!(cfg.queue.size_classes[2].name, "large");
-        assert_eq!(cfg.queue.size_classes[2].max_bytes, u64::MAX);
-        crate::queue::size_class::validate_size_classes(&cfg.queue.size_classes).unwrap();
-        let loaded = crate::queue::load_size_classes(&cfg.queue.size_classes).unwrap();
+        assert_eq!(cfg.control.size_classes.len(), 3);
+        assert_eq!(cfg.control.size_classes[0].name, "small");
+        assert_eq!(cfg.control.size_classes[0].max_bytes, 1000);
+        assert_eq!(cfg.control.size_classes[1].name, "medium");
+        assert_eq!(cfg.control.size_classes[2].name, "large");
+        assert_eq!(cfg.control.size_classes[2].max_bytes, u64::MAX);
+        crate::queue::size_class::validate_size_classes(&cfg.control.size_classes).unwrap();
+        let loaded = crate::queue::load_size_classes(&cfg.control.size_classes).unwrap();
         assert_eq!(loaded.len(), 3);
     }
 
@@ -408,23 +374,17 @@ machine = "l"
                 mode: Some("editable".into()),
             },
             providers,
-            queue: QueueConfig {
-                backend: Some("postgres".into()),
-                url: Some("postgres://db/ripclone".into()),
-                token: None,
-                size_classes: vec![],
-            },
-            metadata: MetadataConfig {
-                backend: Some("postgres".into()),
-                url: Some("postgres://db/ripclone".into()),
-                token: None,
-            },
             storage: StorageConfig {
                 backend: Some("s3".into()),
                 bucket: Some("my-bucket".into()),
                 ..Default::default()
             },
-            control: ControlConfig::default(),
+            control: ControlConfig {
+                path: Some("/var/lib/ripclone/control.db".into()),
+                ..Default::default()
+            },
+            removed_metadata: None,
+            removed_queue: None,
         };
         save_to(&path, &cfg).unwrap();
 
@@ -442,9 +402,10 @@ machine = "l"
                 .and_then(|entry| entry.token.as_deref()),
             Some("provider-token")
         );
-        assert_eq!(loaded.queue.backend.as_deref(), Some("postgres"));
-        assert_eq!(loaded.queue.url.as_deref(), Some("postgres://db/ripclone"));
-        assert_eq!(loaded.metadata.backend.as_deref(), Some("postgres"));
+        assert_eq!(
+            loaded.control.path.as_deref(),
+            Some("/var/lib/ripclone/control.db")
+        );
         assert_eq!(loaded.storage.backend.as_deref(), Some("s3"));
         assert_eq!(loaded.storage.bucket.as_deref(), Some("my-bucket"));
     }

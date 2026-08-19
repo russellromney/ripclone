@@ -73,7 +73,7 @@ impl ControlSettings {
                 bail!("RIPCLONE_TURSO_AUTH_TOKEN requires RIPCLONE_TURSO_DATABASE_URL")
             }
         };
-        let size_classes = crate::queue::load_size_classes(&config.queue.size_classes)?;
+        let size_classes = crate::queue::load_size_classes(&config.control.size_classes)?;
         Ok(Self {
             path,
             turso,
@@ -125,15 +125,45 @@ pub fn validate_removed_environment() -> Result<()> {
     )
 }
 
+/// Standalone workers are API-only. Reject even otherwise-valid server control
+/// credentials so a deployment cannot accidentally grant database authority.
+pub fn validate_worker_environment() -> Result<()> {
+    validate_removed_environment()?;
+    let config = crate::config::load_global();
+    validate_removed_config(&config)?;
+    if config.control.path.is_some()
+        || config.control.turso_url.is_some()
+        || config.control.turso_token.is_some()
+        || !config.control.size_classes.is_empty()
+    {
+        bail!("standalone workers are API-only; [control] configuration is forbidden");
+    }
+    const SERVER_ONLY: &[&str] = &[
+        "RIPCLONE_CONTROL_DB_PATH",
+        "RIPCLONE_TURSO_DATABASE_URL",
+        "RIPCLONE_TURSO_AUTH_TOKEN",
+    ];
+    let configured: Vec<&str> = SERVER_ONLY
+        .iter()
+        .copied()
+        .filter(|key| std::env::var_os(key).is_some())
+        .collect();
+    if !configured.is_empty() {
+        bail!(
+            "standalone workers are API-only; server control configuration is forbidden: {}",
+            configured.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn validate_removed_config(config: &crate::config::Config) -> Result<()> {
-    let metadata = &config.metadata;
-    if metadata.backend.is_some() || metadata.url.is_some() || metadata.token.is_some() {
+    if config.removed_metadata.is_some() {
         bail!(
             "removed [metadata] configuration is present; refs now live in the server-owned [control] database"
         );
     }
-    let queue = &config.queue;
-    if queue.backend.is_some() || queue.url.is_some() || queue.token.is_some() {
+    if config.removed_queue.is_some() {
         bail!(
             "removed [queue] backend/url/token configuration is present; jobs now live in the server-owned [control] database"
         );
