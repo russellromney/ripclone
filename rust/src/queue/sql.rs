@@ -1,7 +1,6 @@
-//! SQL-backed cross-process queue, shared across two SQLite-compatible engines:
-//! `sqlite` (local file, via `sqlx`) and `libsql` (remote Turso Cloud). The
-//! server `enqueue`s; a separate `ripclone-worker` process `claim`s, builds, and
-//! `ack`s.
+//! Durable jobs in the server-owned control database, shared across plain
+//! SQLite (`sqlx`) and the Turso embedded replica (`libsql`). The server admits
+//! work; embedded workers claim locally and standalone workers use its API.
 //!
 //! [`QueueDb`] is a tiny per-engine adapter that returns plain Rust types (no
 //! engine types leak); [`SqlJobQueue`] holds one and contains all the queue
@@ -31,6 +30,9 @@ use super::{
 use crate::provider::{ProviderInstanceId, RepoId};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default age (seconds) after which a `claimed` job is treated as abandoned (a
@@ -171,6 +173,10 @@ pub trait QueueDb: Send + Sync {
     /// `attempts` counter. Returns true iff this call won the row.
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
 
+    /// Renew a live claim only while `worker_id` still owns it. Returns true
+    /// iff the claimed row was refreshed.
+    async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
+
     /// `(provider, path, branch, admitted_commit, admitted_default_branch,
     /// credential)` for a job id.
     /// `credential` is the stored base64 blob (or `None`).
@@ -226,12 +232,7 @@ pub trait QueueDb: Send + Sync {
     /// Returns `(rank, count)` pairs for ranks that have at least one pending
     /// job, ordered by rank ascending.
     ///
-    /// Blessed backends (sqlite/libsql) implement a real `GROUP BY size_class`.
-    /// Lagging backends (postgres/mysql) approximate: they do not persist the
-    /// enqueue rank reliably, so they report the entire pending depth under a
-    /// single sentinel rank of [`i64::MAX`]. [`SqlJobQueue::pending_by_class`]
-    /// clamps that to the largest configured class so the dispatcher never
-    /// under-sizes a worker on a lagging engine.
+    /// Both control drivers implement a real `GROUP BY size_class`.
     async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>>;
 
     /// Delete `failed` jobs finished before `cutoff` (epoch secs). Returns the
@@ -239,57 +240,26 @@ pub trait QueueDb: Send + Sync {
     /// version-live-at-time-T history and stay small at real commit rates).
     async fn prune_failed(&self, cutoff: i64) -> Result<u64>;
 
-    /// Whether this engine owns a `workers` registry table (sqlite/libsql).
-    /// Lagging backends return false — heartbeat and live-count must fail
-    /// loudly rather than silently report a zero fleet.
-    fn supports_worker_registry(&self) -> bool {
-        false
-    }
-
-    /// Upsert a worker heartbeat row (`workers` registry). Blessed backends
-    /// only (sqlite/libsql). Lagging backends error — never silently no-op.
+    /// Upsert a worker heartbeat row.
     async fn upsert_heartbeat(
         &self,
-        _worker_id: &str,
-        _max_size_class: Option<i64>,
-        _current_job: Option<i64>,
-        _now: i64,
-    ) -> Result<()> {
-        anyhow::bail!(
-            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
-             (postgres/mysql lag the workers table)"
-        )
-    }
+        worker_id: &str,
+        max_size_class: Option<i64>,
+        current_job: Option<i64>,
+        now: i64,
+    ) -> Result<()>;
 
-    /// Count workers with `last_heartbeat >= cutoff`. Blessed backends only.
-    async fn count_live_workers(&self, _cutoff: i64) -> Result<i64> {
-        anyhow::bail!(
-            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
-             (postgres/mysql lag the workers table)"
-        )
-    }
+    /// Count workers with `last_heartbeat >= cutoff`.
+    async fn count_live_workers(&self, cutoff: i64) -> Result<i64>;
 
     /// Count live workers that can claim jobs of rank `min_rank` (inclusive).
     ///
     /// A worker counts when its heartbeat is fresh and either it has no claim
     /// ceiling (`max_size_class IS NULL`) or `max_size_class >= min_rank`.
-    /// Used by the dispatcher so a small-only live worker does not block
-    /// starting a large-capable worker for a large pending job.
-    async fn count_live_workers_capable(&self, _cutoff: i64, _min_rank: i64) -> Result<i64> {
-        anyhow::bail!(
-            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
-             (postgres/mysql lag the workers table)"
-        )
-    }
+    async fn count_live_workers_capable(&self, cutoff: i64, min_rank: i64) -> Result<i64>;
 
-    /// Delete workers with `last_heartbeat < cutoff` (hard age-out). Blessed
-    /// backends only.
-    async fn prune_stale_workers(&self, _cutoff: i64) -> Result<u64> {
-        anyhow::bail!(
-            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
-             (postgres/mysql lag the workers table)"
-        )
-    }
+    /// Delete workers with `last_heartbeat < cutoff` (hard age-out).
+    async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64>;
 }
 
 /// Default retention for `failed` jobs (seconds) before they are pruned. `done`
@@ -307,19 +277,13 @@ pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
 /// `RIPCLONE_WORKER_HEARTBEAT`:
 /// - unset / empty → disabled (self-host default)
 /// - `queue` / `1` / `true` / `yes` / `on` → write to the connected queue DB
-/// - the same value as `RIPCLONE_QUEUE_DB_URL` → same (target is the queue itself)
 /// - anything else → hard error (fail loudly; do not silently ignore)
 pub fn worker_heartbeat_enabled_from_env() -> Result<bool> {
-    worker_heartbeat_enabled(std::env::var("RIPCLONE_WORKER_HEARTBEAT").ok(), || {
-        std::env::var("RIPCLONE_QUEUE_DB_URL").ok()
-    })
+    worker_heartbeat_enabled(std::env::var("RIPCLONE_WORKER_HEARTBEAT").ok())
 }
 
 /// Pure form of [`worker_heartbeat_enabled_from_env`] for tests.
-pub fn worker_heartbeat_enabled(
-    heartbeat_env: Option<String>,
-    queue_url: impl FnOnce() -> Option<String>,
-) -> Result<bool> {
+pub fn worker_heartbeat_enabled(heartbeat_env: Option<String>) -> Result<bool> {
     let Some(raw) = heartbeat_env else {
         return Ok(false);
     };
@@ -331,14 +295,9 @@ pub fn worker_heartbeat_enabled(
     if matches!(lower.as_str(), "queue" | "1" | "true" | "yes" | "on") {
         return Ok(true);
     }
-    if let Some(url) = queue_url()
-        && s == url
-    {
-        return Ok(true);
-    }
     anyhow::bail!(
-        "RIPCLONE_WORKER_HEARTBEAT={s:?}: expected 'queue' (or the queue DSN / \
-         truthy 1|true) to write the workers registry, or leave unset to disable"
+        "RIPCLONE_WORKER_HEARTBEAT={s:?}: expected 'queue' or truthy 1|true to \
+         write the workers registry, or leave unset to disable"
     )
 }
 
@@ -441,6 +400,11 @@ pub struct SqlJobQueue {
     /// How long a heartbeat stays "live" before aging out of
     /// [`Self::live_worker_count`].
     heartbeat_timeout_secs: i64,
+    /// Shared by every clone of the server queue. Empty claim attempts consult
+    /// this coarse deadline before running the write-heavy stale sweep.
+    next_stale_reclaim_at: AtomicI64,
+    #[cfg(test)]
+    stale_reclaim_sweeps: AtomicU64,
 }
 
 impl SqlJobQueue {
@@ -484,6 +448,9 @@ impl SqlJobQueue {
             size_classes,
             max_size_class: None,
             heartbeat_timeout_secs,
+            next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+            #[cfg(test)]
+            stale_reclaim_sweeps: AtomicU64::new(0),
         })
     }
 
@@ -523,17 +490,14 @@ impl SqlJobQueue {
         self.heartbeat_timeout_secs
     }
 
-    /// True when this queue engine has a `workers` registry (sqlite/libsql).
-    /// Postgres/MySQL lag — callers must not treat a zero live-count as "no
-    /// workers" on those backends.
+    /// The one durable jobs table always includes the worker registry.
     pub fn supports_worker_registry(&self) -> bool {
-        self.db.supports_worker_registry()
+        true
     }
 
     /// Write/update this worker's registry row (id, size ceiling, current job).
     /// Always writes when called — the worker process is opt-in via
     /// `RIPCLONE_WORKER_HEARTBEAT` (default off; self-host unchanged).
-    /// Fails loudly on lagging backends that lack the registry table.
     pub async fn heartbeat(&self, worker_id: &str, current_job: Option<i64>) -> Result<()> {
         self.heartbeat_at(worker_id, current_job, now_secs()).await
     }
@@ -546,25 +510,20 @@ impl SqlJobQueue {
         current_job: Option<i64>,
         now: i64,
     ) -> Result<()> {
-        if !self.db.supports_worker_registry() {
-            anyhow::bail!(
-                "worker heartbeat requires RIPCLONE_QUEUE=sqlite|libsql \
-                 (postgres/mysql lag the workers registry)"
-            );
-        }
         if worker_id.is_empty() {
             anyhow::bail!("worker_id must not be empty");
         }
         self.db
             .upsert_heartbeat(worker_id, self.max_size_class, current_job, now)
-            .await
+            .await?;
+        if let Some(job_id) = current_job {
+            self.db.renew_claim(job_id, worker_id, now).await?;
+        }
+        Ok(())
     }
 
     /// How many workers have a fresh heartbeat within the timeout. The
-    /// dispatcher (D2) uses this so multiple replicas see the same live fleet
-    /// size and do not each over-spawn. Also hard-prunes aged-out rows.
-    /// Fails loudly on lagging backends (never returns a silent 0 that would
-    /// cause over-spawn).
+    /// durable registry. Also hard-prunes aged-out rows.
     pub async fn live_worker_count(&self) -> Result<usize> {
         self.live_worker_count_at(now_secs()).await
     }
@@ -573,12 +532,6 @@ impl SqlJobQueue {
     /// `last_heartbeat >= now - timeout` count; older rows are deleted then
     /// excluded.
     pub async fn live_worker_count_at(&self, now: i64) -> Result<usize> {
-        if !self.db.supports_worker_registry() {
-            anyhow::bail!(
-                "live_worker_count requires RIPCLONE_QUEUE=sqlite|libsql \
-                 (postgres/mysql lag the workers registry)"
-            );
-        }
         let cutoff = now - self.heartbeat_timeout_secs;
         // Hard age-out so the table does not grow with dead workers forever.
         // Fail loudly on prune errors — a partial view under-counts the fleet.
@@ -592,8 +545,7 @@ impl SqlJobQueue {
     /// Live workers that can claim jobs of at least `min_rank`.
     ///
     /// Soft age-out + prune, same as [`live_worker_count`]. A worker counts when
-    /// `max_size_class` is NULL (no ceiling) or `>= min_rank`. The dispatcher
-    /// uses this so a small-only fleet does not look "full" for large pending.
+    /// `max_size_class` is NULL (no ceiling) or `>= min_rank`.
     pub async fn live_worker_count_capable(&self, min_rank: i64) -> Result<usize> {
         self.live_worker_count_capable_at(min_rank, now_secs())
             .await
@@ -601,12 +553,6 @@ impl SqlJobQueue {
 
     /// [`live_worker_count_capable`] with an explicit clock (tests).
     pub async fn live_worker_count_capable_at(&self, min_rank: i64, now: i64) -> Result<usize> {
-        if !self.db.supports_worker_registry() {
-            anyhow::bail!(
-                "live_worker_count_capable requires RIPCLONE_QUEUE=sqlite|libsql \
-                 (postgres/mysql lag the workers registry)"
-            );
-        }
         let cutoff = now - self.heartbeat_timeout_secs;
         self.db.prune_stale_workers(cutoff).await.map_err(|e| {
             tracing::error!("prune stale workers: {e:#}");
@@ -618,9 +564,7 @@ impl SqlJobQueue {
     /// Pending (`queued`) job counts by size-class rank.
     ///
     /// Returns `(rank, count)` for ranks with depth > 0, ordered by rank.
-    /// Ranks from the DB are clamped into the configured class range so a
-    /// lagging-backend sentinel (`i64::MAX`) becomes the largest class.
-    /// Used by the dispatcher autoscale loop to size workers to pending work.
+    /// Ranks from the DB are clamped into the configured class range.
     pub async fn pending_by_class(&self) -> Result<Vec<(i64, usize)>> {
         let last = (self.size_classes.len().saturating_sub(1)) as i64;
         let rows = self.db.count_queued_by_size_class().await?;
@@ -632,8 +576,7 @@ impl SqlJobQueue {
             let rank = rank.clamp(0, last);
             out.push((rank, count as usize));
         }
-        // Merge rows that collapsed onto the same clamped rank (e.g. lagging
-        // sentinel + real ranks, or over-range escalation rungs).
+        // Merge rows that collapsed onto the same clamped rank.
         out.sort_by_key(|(r, _)| *r);
         let mut merged: Vec<(i64, usize)> = Vec::with_capacity(out.len());
         for (rank, count) in out {
@@ -666,18 +609,20 @@ impl SqlJobQueue {
     ///
     /// [`claim_capped`](Self::claim_capped) already reclaims before claiming, so
     /// a queue with active claim traffic self-heals on its own. But a job stuck
-    /// `claimed` on an otherwise-idle queue has no claimer to trigger that path:
-    /// nothing is `queued`, so a depth-based dispatcher starts no worker, so
-    /// nobody claims, so nobody reclaims — the job is stranded forever. The
-    /// dispatcher's reconcile loop calls this directly every pass, before
-    /// reading pending depth, so a dead worker's job flips back to `queued` and
-    /// is counted in that same pass.
+    /// `claimed` on an otherwise-idle queue has no claimer to trigger that path.
+    /// Explicit recovery can flip it back to `queued` before reading depth.
     ///
     /// Same reclaim semantics as `claim_capped` — same stale window, same
     /// max-attempts cap, same dead-letter behavior. Only *when* this runs
     /// changes, never *what* it does.
     pub async fn reclaim_stale(&self) -> Result<()> {
-        let now = now_secs();
+        self.reclaim_stale_at(now_secs()).await
+    }
+
+    async fn reclaim_stale_at(&self, now: i64) -> Result<()> {
+        #[cfg(test)]
+        self.stale_reclaim_sweeps
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.db
             .reclaim_stale(
                 now - self.stale_claim_secs,
@@ -689,6 +634,43 @@ impl SqlJobQueue {
                 ),
             )
             .await
+    }
+
+    /// Run at most one stale sweep per shared coarse interval. A zero-second
+    /// test window remains immediate; production intervals are capped at 30s.
+    async fn maybe_reclaim_stale_at(&self, now: i64) -> Result<()> {
+        let next = self.next_stale_reclaim_at.load(AtomicOrdering::Acquire);
+        if now < next {
+            return Ok(());
+        }
+        let interval = if self.stale_claim_secs == 0 {
+            0
+        } else {
+            self.stale_claim_secs.clamp(1, 30)
+        };
+        if self
+            .next_stale_reclaim_at
+            .compare_exchange(
+                next,
+                now.saturating_add(interval),
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.reclaim_stale_at(now).await {
+            self.next_stale_reclaim_at
+                .store(now, AtomicOrdering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn stale_reclaim_sweep_count(&self) -> u64 {
+        self.stale_reclaim_sweeps.load(AtomicOrdering::Relaxed)
     }
 
     /// Resolve a size-class *name* to a rank ceiling using this queue's
@@ -711,12 +693,21 @@ impl SqlJobQueue {
         worker_id: &str,
         ceiling: Option<i64>,
     ) -> Result<Option<ClaimedJob>> {
-        self.reclaim_stale().await?;
+        self.claim_capped_at(worker_id, ceiling, now_secs()).await
+    }
+
+    async fn claim_capped_at(
+        &self,
+        worker_id: &str,
+        ceiling: Option<i64>,
+        now: i64,
+    ) -> Result<Option<ClaimedJob>> {
+        self.maybe_reclaim_stale_at(now).await?;
         for attempt in 0..MAX_CLAIM_ATTEMPTS {
             let Some(id) = self.db.next_queued_id(ceiling).await? else {
                 return Ok(None);
             };
-            if self.db.try_claim(id, worker_id, now_secs()).await? {
+            if self.db.try_claim(id, worker_id, now).await? {
                 let Some((
                     provider,
                     path,
@@ -951,8 +942,8 @@ pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
 /// ("what was synced for this repo over time").
 pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_jobs_provider_path_finished ON jobs(provider, path, finished_at)";
 
-/// Worker heartbeat/registry table (dispatcher autoscaler live-count). Blessed
-/// backends only (sqlite/libsql). One row per worker: id, size ceiling, optional
+/// Durable worker heartbeat/registry table. One row per worker records its id,
+/// size ceiling, optional
 /// current job, last heartbeat. Stale rows age out of
 /// [`SqlJobQueue::live_worker_count`] after the configured timeout.
 pub(crate) const CREATE_WORKERS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS workers (
@@ -1199,6 +1190,8 @@ mod tests {
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+                next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+                stale_reclaim_sweeps: AtomicU64::new(0),
             };
             let reader = make_db(engine, &path).await;
 
@@ -1291,6 +1284,8 @@ mod tests {
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+                next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+                stale_reclaim_sweeps: AtomicU64::new(0),
             };
 
             let first = q
@@ -1368,6 +1363,8 @@ mod tests {
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+                next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+                stale_reclaim_sweeps: AtomicU64::new(0),
             };
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let id = enq.job_id.unwrap();
@@ -1489,6 +1486,8 @@ mod tests {
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+                next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+                stale_reclaim_sweeps: AtomicU64::new(0),
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let first = q.claim("w1").await.unwrap().unwrap();
@@ -1513,6 +1512,8 @@ mod tests {
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+                next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+                stale_reclaim_sweeps: AtomicU64::new(0),
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let _first = q.claim("w1").await.unwrap().unwrap();
@@ -1541,6 +1542,8 @@ mod tests {
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+                next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+                stale_reclaim_sweeps: AtomicU64::new(0),
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let slow = q.claim("w1").await.unwrap().unwrap();
@@ -1590,6 +1593,8 @@ mod tests {
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+                next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+                stale_reclaim_sweeps: AtomicU64::new(0),
             };
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let id = enq.job_id.unwrap();
@@ -1640,6 +1645,8 @@ mod tests {
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+                next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+                stale_reclaim_sweeps: AtomicU64::new(0),
             };
             // Second adapter on the same file for size_class reads.
             let reader = make_db(engine, &path).await;
@@ -1693,6 +1700,8 @@ mod tests {
             size_classes: default_size_classes(),
             max_size_class: None,
             heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+            next_stale_reclaim_at: AtomicI64::new(i64::MIN),
+            stale_reclaim_sweeps: AtomicU64::new(0),
         };
 
         let failed = q.enqueue(job("o", "r", "fail")).await.unwrap();
@@ -1837,15 +1846,6 @@ mod tests {
         .unwrap();
         assert_eq!(index_count, 1, "versioned active index remains installed");
     }
-
-    // ---- Postgres / MySQL: exercised against a real server (env-gated) --------
-    //
-    // These need a live network DB, so they run only when RIPCLONE_TEST_PG_URL /
-    // RIPCLONE_TEST_MYSQL_URL is set (e.g. by scripts/test-queue-sql.sh against
-    // docker). They cover the dialect-sensitive paths: DDL,
-    // `$N` vs `?` placeholders, RETURNING vs last_insert_id, coalescing (partial
-    // index on pg, best-effort on mysql), the conditional-UPDATE claim, and
-    // status/error reads. Single test per engine → no intra-engine concurrency.
 
     /// Full queue lifecycle on a fresh queue: enqueue, coalesce, distinct key,
     /// claim ordering, ack done/failed, drain, and a fresh job after completion.
@@ -2000,6 +2000,13 @@ mod tests {
                 machine: "l".into(),
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn sqlite_exercises_durable_queue_lifecycle() {
+        let mut queues = queues().await;
+        let (_, queue, _dir) = queues.pop().expect("SQLite queue");
+        exercise_core(&queue).await;
     }
 
     async fn queue_classes(
@@ -2223,7 +2230,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_by_class_groups_mixed_size_bytes() {
-        // Per-class pending read for the dispatcher autoscaler: mixed
+        // Per-class pending read: mixed
         // size_bytes → correct ranks, empty when nothing queued.
         let (q, _dir) = queue_classes(two_classes(), None).await;
         assert!(
@@ -2322,6 +2329,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_claimers_share_one_coarse_stale_sweep_deadline() {
+        let (q, _dir) = queue_with_timeout(60).await;
+        let q = q.with_stale_claim_secs(120);
+
+        for slot in 0..8 {
+            assert!(
+                q.claim_capped_at(&format!("idle-{slot}"), None, 1_000)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            q.stale_reclaim_sweep_count(),
+            1,
+            "all idle slots share the first stale sweep"
+        );
+
+        assert!(
+            q.claim_capped_at("idle-later", None, 1_029)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(q.stale_reclaim_sweep_count(), 1);
+        assert!(
+            q.claim_capped_at("idle-next", None, 1_030)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            q.stale_reclaim_sweep_count(),
+            2,
+            "the next sweep runs only when the coarse deadline arrives"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_renews_owned_claim_then_stopped_heartbeat_allows_recovery() {
+        let (q, _dir) = queue_with_timeout(60).await;
+        let q = q.with_stale_claim_secs(60);
+        let id = q
+            .enqueue(job("o", "lease", "main"))
+            .await
+            .unwrap()
+            .job_id
+            .unwrap();
+        let claimed = q
+            .claim_capped_at("full-owner", None, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id);
+
+        // The original lease is logically ancient, but the active Full owner
+        // renews it through the unchanged heartbeat call.
+        q.heartbeat_at("full-owner", Some(id), 2_000).await.unwrap();
+        q.reclaim_stale_at(2_059).await.unwrap();
+        assert!(
+            q.db.next_queued_id(None).await.unwrap().is_none(),
+            "continuing heartbeat keeps the claim owned"
+        );
+
+        // Once heartbeats stop, the same lease crosses the configured bound
+        // and becomes queued for a new owner.
+        q.reclaim_stale_at(2_060).await.unwrap();
+        assert_eq!(q.db.next_queued_id(None).await.unwrap(), Some(id));
+        let recovered = q
+            .claim_capped_at("replacement", None, 2_060)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.id, id);
+    }
+
+    #[tokio::test]
     async fn stale_heartbeat_ages_out_of_live_count() {
         // timeout = 60s: live if last_heartbeat >= now - 60
         let (q, _dir) = queue_with_timeout(60).await;
@@ -2409,7 +2493,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_live_count_readers_agree() {
-        // Two dispatcher-style readers must see the same live fleet size so
+        // Two concurrent readers must see the same live fleet size so
         // they do not each over-spawn.
         let (q, _dir) = queue_with_timeout(60).await;
         let q = Arc::new(q);
@@ -2572,32 +2656,22 @@ mod tests {
 
     #[test]
     fn heartbeat_env_default_disabled() {
-        assert!(!worker_heartbeat_enabled(None, || None).unwrap());
-        assert!(!worker_heartbeat_enabled(Some("".into()), || None).unwrap());
-        assert!(!worker_heartbeat_enabled(Some("  ".into()), || None).unwrap());
+        assert!(!worker_heartbeat_enabled(None).unwrap());
+        assert!(!worker_heartbeat_enabled(Some("".into())).unwrap());
+        assert!(!worker_heartbeat_enabled(Some("  ".into())).unwrap());
     }
 
     #[test]
     fn heartbeat_env_truthy_and_queue_enable() {
-        assert!(worker_heartbeat_enabled(Some("queue".into()), || None).unwrap());
-        assert!(worker_heartbeat_enabled(Some("1".into()), || None).unwrap());
-        assert!(worker_heartbeat_enabled(Some("TRUE".into()), || None).unwrap());
-        assert!(worker_heartbeat_enabled(Some("yes".into()), || None).unwrap());
-        assert!(
-            worker_heartbeat_enabled(Some("sqlite:///tmp/q.db".into()), || Some(
-                "sqlite:///tmp/q.db".into()
-            ))
-            .unwrap(),
-            "matching queue DSN is a valid target"
-        );
+        assert!(worker_heartbeat_enabled(Some("queue".into())).unwrap());
+        assert!(worker_heartbeat_enabled(Some("1".into())).unwrap());
+        assert!(worker_heartbeat_enabled(Some("TRUE".into())).unwrap());
+        assert!(worker_heartbeat_enabled(Some("yes".into())).unwrap());
     }
 
     #[test]
     fn heartbeat_env_unknown_target_fails_loudly() {
-        let err = worker_heartbeat_enabled(Some("redis://elsewhere".into()), || {
-            Some("sqlite:///tmp/q.db".into())
-        })
-        .unwrap_err();
+        let err = worker_heartbeat_enabled(Some("redis://elsewhere".into())).unwrap_err();
         assert!(
             err.to_string().contains("RIPCLONE_WORKER_HEARTBEAT"),
             "got: {err}"
@@ -2664,7 +2738,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_heartbeats_and_live_counts_stay_consistent() {
-        // Stress the "two dispatcher replicas + workers writing" case: many
+        // Stress concurrent readers and workers writing: many
         // concurrent upserts + concurrent live-count readers must agree.
         let (q, _dir) = queue_with_timeout(60).await;
         let q = Arc::new(q);

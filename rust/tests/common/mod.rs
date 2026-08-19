@@ -40,6 +40,7 @@ fn init_env(lsm: bool) {
         // before any caller can construct a server, client, or sync operation.
         unsafe {
             std::env::set_var("RIPCLONE_SERVER_TOKEN", TOKEN);
+            std::env::set_var("RIPCLONE_CONFIG", origin_root().join("missing-config.toml"));
             std::env::set_var("RIPCLONE_NO_CACHE", "1");
             // Tests poll clones aggressively; don't let the default rate limiter
             // (burst 60) throttle them. Test-only — production keeps its limits.
@@ -178,6 +179,7 @@ pub struct Server {
     pub cas_dir: PathBuf,
     pub storage_dir: PathBuf,
     pub repo_root: PathBuf,
+    pub control_db: PathBuf,
     pub pinned_path_probe: Option<Arc<PinnedPathProbe>>,
     pub _dir: TempDir,
 }
@@ -294,10 +296,6 @@ impl ripclone::queue::JobQueue for ProbedJobQueue {
 
     async fn depth(&self) -> usize {
         self.inner.depth().await
-    }
-
-    fn inproc_wait(&self) -> bool {
-        self.inner.inproc_wait()
     }
 }
 
@@ -459,12 +457,11 @@ pub async fn replace_full_manifest_commit(
     repo_path: &str,
     replacement: &str,
 ) -> (String, String) {
-    let store = ripclone::ref_store::FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(server).await;
     let repo_id = ripclone::provider::RepoId::github(repo_path);
     let mut published = None;
     for _ in 0..200 {
-        if let Ok(Some(info)) =
-            ripclone::ref_store::RefStore::load_branch(&store, &repo_id, "main").await
+        if let Ok(Some(info)) = store.load_branch(&repo_id, "main").await
             && info.build_status.is_none()
             && !info.full_clonepack.manifest.is_empty()
         {
@@ -476,7 +473,8 @@ pub async fn replace_full_manifest_commit(
     let moving = published.expect("full manifest publication settled");
     let pinned = moving.commit.clone();
     let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
-    let mut info = ripclone::ref_store::RefStore::load_branch(&store, &repo_id, &exact_key)
+    let mut info = store
+        .load_branch(&repo_id, &exact_key)
         .await
         .expect("load exact full-manifest row")
         .expect("exact full-manifest row exists");
@@ -493,7 +491,8 @@ pub async fn replace_full_manifest_commit(
         .put(&hash, &bytes)
         .expect("publish mismatched manifest fixture");
     info.full_clonepack.manifest = hash.clone();
-    ripclone::ref_store::RefStore::save_branch(&store, &repo_id, &exact_key, &info)
+    store
+        .save_branch(&repo_id, &exact_key, &info)
         .await
         .expect("publish mismatched exact full-manifest ref");
     (pinned, hash)
@@ -652,6 +651,16 @@ async fn start_server_split_storage_inner(
     let storage_dir = dir.path().join("storage");
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).unwrap();
+    let control_db_path = dir.path().join("control.db");
+    let control_db = Arc::new(
+        ripclone::control::ControlDb::open(
+            &control_db_path,
+            None,
+            ripclone::queue::default_size_classes(),
+        )
+        .await
+        .expect("open split-storage control database"),
+    );
 
     let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
     let base_storage: StorageRef = Arc::new(RemoteLocalStorage {
@@ -666,8 +675,7 @@ async fn start_server_split_storage_inner(
     } else {
         base_storage
     };
-    let base_ref_store: Arc<dyn ripclone::ref_store::RefStore> =
-        Arc::new(ripclone::ref_store::FileRefStore::new(&repo_root));
+    let base_ref_store: Arc<dyn ripclone::ref_store::RefStore> = control_db.ref_store();
     let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
         if let Some((fail_after_successes, failures)) = fail_ref {
             Arc::new(FailingRefStore::new(
@@ -679,6 +687,7 @@ async fn start_server_split_storage_inner(
             base_ref_store
         };
     let pinned_path_probe = Arc::new(PinnedPathProbe::default());
+    let worker_count = if phase_one_barrier.is_some() { 2 } else { 1 };
     let ref_store: Arc<dyn ripclone::ref_store::RefStore> = Arc::new(ProbedRefStore {
         inner: ref_store,
         probe: Arc::clone(&pinned_path_probe),
@@ -696,9 +705,9 @@ async fn start_server_split_storage_inner(
         .unwrap()
         .with_ref_store(ref_store.clone(), storage.clone()),
     );
-    let (local_queue, mut rx, depth) = ripclone::queue::LocalJobQueue::new(16);
+    let durable_queue = control_db.queue();
     let build_queue: ripclone::queue::JobQueueRef = Arc::new(ProbedJobQueue {
-        inner: Arc::new(local_queue),
+        inner: durable_queue.clone(),
         probe: Arc::clone(&pinned_path_probe),
     });
     let provider_registry = provider_registry.unwrap_or_default();
@@ -719,9 +728,9 @@ async fn start_server_split_storage_inner(
         rate_limiter: RateLimiter::new(1000000, 1000000.0),
         retention,
         build_queue,
-        worker_queue: None,
-        build_queue_depth: depth,
-        build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        control_db: Some(control_db),
+        worker_queue: Some(durable_queue.clone()),
+        build_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         oidc_verifier: None,
         webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
         sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -736,58 +745,47 @@ async fn start_server_split_storage_inner(
         require_repo_auth: false,
     };
 
-    let worker_state = state.clone();
-    let worker_probe = Arc::clone(&pinned_path_probe);
-    tokio::spawn(async move {
-        loop {
-            ripclone::server::admission_test_before_claim().await;
-            let Some(job) = rx.recv().await else {
-                break;
-            };
-            if worker_probe.is_armed() {
-                worker_probe
-                    .builder_entries
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            let state = worker_state.clone();
-            tokio::spawn(async move {
-                ripclone::server::admission_test_after_claim().await;
-                let key = job.key();
-                let st = state.clone();
-                let result = match tokio::spawn(async move {
-                    ripclone::server::process_build_job(&st, &job).await
-                })
-                .await
-                {
-                    Ok(r) => r,
-                    Err(e) => Err(ripclone::queue::BuildError::retryable(format!(
-                        "build task panicked: {e}"
-                    ))),
+    for slot in 0..worker_count {
+        let worker_state = state.clone();
+        let worker_probe = Arc::clone(&pinned_path_probe);
+        let worker_queue = durable_queue.clone();
+        tokio::spawn(async move {
+            let worker_id = format!("split-storage-{}-{slot}", std::process::id());
+            loop {
+                ripclone::server::admission_test_before_claim().await;
+                let claimed = match worker_queue.claim(&worker_id).await {
+                    Ok(Some(claimed)) => claimed,
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
                 };
-                state
-                    .build_queue_depth
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                let keep_marker = matches!(
-                    &result,
-                    Ok(result)
-                        if result.info.build_status.as_deref()
-                            == Some("full history building")
-                );
-                if !keep_marker && let Some(senders) = state.build_waiters.lock().await.remove(&key)
-                {
-                    for sender in senders {
-                        let _ = sender.send(result.clone());
-                    }
-                } else if keep_marker
-                    && let Some(senders) = state.build_waiters.lock().await.get_mut(&key)
-                {
-                    for sender in senders.drain(..) {
-                        let _ = sender.send(result.clone());
-                    }
+                if worker_probe.is_armed() {
+                    worker_probe
+                        .builder_entries
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-            });
-        }
-    });
+                let state = worker_state.clone();
+                ripclone::server::admission_test_after_claim().await;
+                let job = ripclone::queue::BuildJob {
+                    repo_id: claimed.repo_id(),
+                    branch: claimed.branch,
+                    admitted_commit: claimed.admitted_commit,
+                    admitted_default_branch: claimed.admitted_default_branch,
+                    credential: claimed.credential,
+                    size_bytes: None,
+                };
+                let result = ripclone::server::process_build_job(&state, &job)
+                    .await
+                    .map(|_| ());
+                let _ = worker_queue.ack(claimed.id, &worker_id, result).await;
+            }
+        });
+    }
 
     let app = build_app(state);
     // Choose the port only when the listener is ready to spawn. Selecting it
@@ -809,6 +807,7 @@ async fn start_server_split_storage_inner(
         cas_dir,
         storage_dir,
         repo_root,
+        control_db: control_db_path,
         pinned_path_probe: Some(pinned_path_probe),
         _dir: dir,
     }
@@ -1189,9 +1188,24 @@ async fn start_server_inner(
         storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
+        control_db: dir.path().join("control.db"),
         pinned_path_probe: None,
         _dir: dir,
     }
+}
+
+pub async fn server_ref_store(server: &Server) -> Arc<dyn ripclone::ref_store::RefStore> {
+    use ripclone::meta::{SqlRefStore, SqliteMeta};
+
+    Arc::new(
+        SqlRefStore::new(Box::new(
+            SqliteMeta::connect(&server.control_db.to_string_lossy())
+                .await
+                .expect("open server control refs"),
+        ))
+        .await
+        .expect("initialize server control refs"),
+    )
 }
 
 // ---- local git origin ----------------------------------------------------
@@ -1700,7 +1714,7 @@ async fn register_added_without_build_repo_id(
     server: &Server,
     repo_id: ripclone::provider::RepoId,
 ) -> anyhow::Result<()> {
-    use ripclone::ref_store::{AddedRepo, AddedRepoSource, FileRefStore, RefStore};
+    use ripclone::ref_store::{AddedRepo, AddedRepoSource};
 
     let added = AddedRepo {
         repo_id,
@@ -1712,27 +1726,7 @@ async fn register_added_without_build_repo_id(
         source: AddedRepoSource::Api,
         repo_size_bytes: None,
     };
-    if std::env::var("RIPCLONE_METADATA").ok().as_deref() == Some("sqlite") {
-        use ripclone::meta::{SqlRefStore, SqliteMeta};
-
-        let url = std::env::var("RIPCLONE_METADATA_DB_URL")?;
-        return SqlRefStore::new(Box::new(SqliteMeta::connect(&url).await?))
-            .await?
-            .add_repo(&added)
-            .await;
-    }
-    if std::env::var("RIPCLONE_METADATA").ok().as_deref() == Some("libsql") {
-        use ripclone::meta::{LibsqlMeta, SqlRefStore};
-
-        let url = std::env::var("RIPCLONE_METADATA_DB_URL")?;
-        let token = std::env::var("RIPCLONE_METADATA_DB_TOKEN")?;
-        return SqlRefStore::new(Box::new(LibsqlMeta::connect_remote(&url, &token).await?))
-            .await?
-            .add_repo(&added)
-            .await;
-    }
-
-    FileRefStore::new(&server.repo_root).add_repo(&added).await
+    server_ref_store(server).await.add_repo(&added).await
 }
 
 /// Read a file from a clone (panics if missing).
@@ -2185,9 +2179,8 @@ impl Drop for WorkerProc {
     }
 }
 
-/// Spawn the real `ripclone-worker` binary sharing `cas_dir` + `repo_root` with
-/// the in-process server. It inherits the test process env (RIPCLONE_QUEUE,
-/// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_SERVER_TOKEN, …) but
+/// Spawn the real API worker binary with explicit scratch paths. It inherits
+/// the test process environment but
 /// **clears** lifecycle vars (`RIPCLONE_IDLE_EXIT_SECS`, `RIPCLONE_MAX_JOBS`) so
 /// a developer shell or a prior test cannot force scale-to-zero on a forever
 /// worker under test.
@@ -2228,9 +2221,6 @@ pub fn cargo_bin(name: &str) -> std::path::PathBuf {
         "ripclone-worker" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone-worker")),
         "ripclone" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone")),
         "ripclone-server" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone-server")),
-        "ripclone-dispatcher" => {
-            std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone-dispatcher"))
-        }
         other => panic!("unknown cargo bin {other}; set CARGO_BIN_EXE_{other}"),
     }
 }

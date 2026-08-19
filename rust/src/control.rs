@@ -108,6 +108,8 @@ const REMOVED_ENVIRONMENT: &[&str] = &[
     "RIPCLONE_DISPATCH_TOKEN",
     "RIPCLONE_DISPATCH_URL",
     "RIPCLONE_HEARTBEAT_URL",
+    "RIPCLONE_RECHECK_MAX",
+    "RIPCLONE_REF_CACHE_TTL_SECS",
 ];
 
 pub fn validate_removed_environment() -> Result<()> {
@@ -184,6 +186,9 @@ pub struct ControlDb {
     queue: Arc<SqlJobQueue>,
     path: PathBuf,
     size_classes: Vec<SizeClass>,
+    /// Process-local wake hint for embedded claimers. The jobs table remains
+    /// authoritative; notifications are emitted only after admission commits.
+    admission_notify: Arc<tokio::sync::Notify>,
     _ownership: ControlPathLock,
 }
 
@@ -236,6 +241,7 @@ impl ControlDb {
                     queue,
                     path: path.to_path_buf(),
                     size_classes,
+                    admission_notify: Arc::new(tokio::sync::Notify::new()),
                     _ownership: ownership,
                 })
             }
@@ -271,6 +277,7 @@ impl ControlDb {
                     queue,
                     path: path.to_path_buf(),
                     size_classes,
+                    admission_notify: Arc::new(tokio::sync::Notify::new()),
                     _ownership: ownership,
                 })
             }
@@ -293,6 +300,10 @@ impl ControlDb {
         matches!(self.driver, Driver::Turso(_))
     }
 
+    pub(crate) fn admission_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.admission_notify.clone()
+    }
+
     /// Atomically create/replace the exact pending row, link the temporary
     /// moving-publication fence when supplied, and enqueue or join the durable
     /// job. No worker can observe the job without its exact result row.
@@ -303,7 +314,7 @@ impl ControlDb {
         pending: &crate::RefInfo,
         tail: Option<(&str, &crate::RefInfo)>,
     ) -> Result<Enqueued> {
-        match &self.driver {
+        let result = match &self.driver {
             Driver::Sqlite(pool) => {
                 self.admit_sqlite(pool, job, exact_branch, pending, tail)
                     .await
@@ -312,7 +323,11 @@ impl ControlDb {
                 self.admit_turso(database, job, exact_branch, pending, tail)
                     .await
             }
+        };
+        if result.is_ok() {
+            self.admission_notify.notify_one();
         }
+        result
     }
 
     async fn admit_sqlite(

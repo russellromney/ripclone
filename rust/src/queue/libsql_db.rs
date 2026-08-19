@@ -46,7 +46,7 @@ impl QueueDb for LibsqlDb {
         conn.execute(CREATE_HISTORY_INDEX_SQL, ())
             .await
             .context("create history index")?;
-        // Worker heartbeat/registry for dispatcher live-count (D3).
+        // Durable worker heartbeat registry.
         conn.execute(CREATE_WORKERS_TABLE_SQL, ())
             .await
             .context("create workers table")?;
@@ -218,6 +218,19 @@ impl QueueDb for LibsqlDb {
         Ok(n == 1)
     }
 
+    async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
+        let conn = self.conn().await?;
+        let n = conn
+            .execute(
+                "UPDATE jobs SET claimed_at = ?
+                 WHERE id = ? AND status = 'claimed' AND worker_id = ?",
+                libsql::params![now, id, worker_id],
+            )
+            .await
+            .context("renew job claim")?;
+        Ok(n == 1)
+    }
+
     async fn job_fields(
         &self,
         id: i64,
@@ -374,10 +387,6 @@ impl QueueDb for LibsqlDb {
             )
             .await
             .context("prune failed jobs")
-    }
-
-    fn supports_worker_registry(&self) -> bool {
-        true
     }
 
     async fn upsert_heartbeat(

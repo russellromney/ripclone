@@ -39,16 +39,13 @@ pub struct BuildJob {
     /// Trusted concrete upstream default branch learned alongside a HEAD tip
     /// admission. This is publication metadata, not part of the active key.
     pub admitted_default_branch: Option<String>,
-    /// Upstream credential (Tier-B passthrough) for the mirror fetch. The
-    /// in-process [`LocalJobQueue`] carries it directly; [`SqlJobQueue`] stores
-    /// an obfuscated copy long enough for a cross-process worker to claim the
-    /// job, then clears it on claim or finish.
+    /// Upstream credential (Tier-B passthrough) for the mirror fetch. The jobs
+    /// table stores an obfuscated copy until claim or finish.
     pub credential: Option<secrecy::SecretString>,
     /// Byte size used to classify into a [`size_class`](size_class) rank at
     /// enqueue on the SQL queue. First build → repo size from the tiered-add
     /// preflight; re-sync → prior clonepack byte total. `None` maps to the
     /// largest configured class so a first build is never under-sized.
-    /// The in-process queue ignores this (single-worker, no claim filter).
     pub size_bytes: Option<u64>,
 }
 
@@ -123,8 +120,7 @@ pub type JobId = i64;
 #[derive(Debug, Clone, Copy)]
 pub struct Enqueued {
     pub outcome: EnqueueOutcome,
-    /// Handle to poll via [`JobQueue::job_status`]. `None` for the in-process
-    /// queue, where `/sync` waits on an in-process oneshot instead.
+    /// Durable handle to poll via [`JobQueue::job_status`].
     pub job_id: Option<JobId>,
 }
 
@@ -137,7 +133,7 @@ pub enum JobState {
     Done,
     /// Build failed, with the error message.
     Failed(String),
-    /// The queue can't report on this id (e.g. the in-process queue).
+    /// The database no longer has this retained id.
     Unknown,
 }
 
@@ -174,7 +170,7 @@ pub type JobQueueRef = Arc<dyn JobQueue>;
 /// swallow (a silent success would drop the build result). For the API impl an
 /// expired-token (401) error is flagged via
 /// [`ApiReportError`](crate::api_ref_store::ApiReportError) so the worker exits
-/// cleanly and the dispatcher respawns it with a fresh token.
+/// cleanly without attempting to refresh credentials locally.
 ///
 /// [`JobQueue`] is a supertrait, so `job_status` (used after `ack` to detect a
 /// dead-letter) is inherited from it — not redeclared here. Declaring it on both

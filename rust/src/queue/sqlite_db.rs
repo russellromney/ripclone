@@ -1,6 +1,6 @@
 //! [`QueueDb`] backed by plain SQLite via `sqlx` — the mature, default local
-//! engine. Reliable multi-process access on one host (WAL + busy_timeout + the
-//! atomic conditional claim). For multi-machine use the remote `libsql` backend.
+//! engine. Reliable access on one host (WAL + busy_timeout + the atomic
+//! conditional claim).
 
 use super::sql::{
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
@@ -61,7 +61,7 @@ impl QueueDb for SqliteDb {
             .execute(&self.pool)
             .await
             .context("create history index")?;
-        // Worker heartbeat/registry for dispatcher live-count (D3).
+        // Durable worker heartbeat registry.
         sqlx::raw_sql(CREATE_WORKERS_TABLE_SQL)
             .execute(&self.pool)
             .await
@@ -229,6 +229,20 @@ impl QueueDb for SqliteDb {
         Ok(res.rows_affected() == 1)
     }
 
+    async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE jobs SET claimed_at = ?
+             WHERE id = ? AND status = 'claimed' AND worker_id = ?",
+        )
+        .bind(now)
+        .bind(id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("renew job claim")?;
+        Ok(res.rows_affected() == 1)
+    }
+
     async fn job_fields(
         &self,
         id: i64,
@@ -385,10 +399,6 @@ impl QueueDb for SqliteDb {
             .await
             .context("prune failed jobs")?;
         Ok(res.rows_affected())
-    }
-
-    fn supports_worker_registry(&self) -> bool {
-        true
     }
 
     async fn upsert_heartbeat(
