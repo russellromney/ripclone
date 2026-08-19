@@ -224,15 +224,25 @@ pub struct RefInfo {
     /// model.
     #[serde(default)]
     pub internal_exact_result: bool,
-    /// A moving projection carrying this flag may replace only the same commit.
-    /// Stores enforce the check atomically with the write.
+    /// A moving projection carrying this flag may replace only its own commit or
+    /// one listed in `moving_publication_predecessors`. Stores enforce the check
+    /// atomically with the write.
     #[serde(default)]
     pub require_matching_commit: bool,
-    /// Commit identity observed in the moving row when this exact result was
-    /// admitted. `Some("")` means the row was absent; `None` makes the result
-    /// exact-only. Moving projections use this as an atomic publication fence.
+    /// Earlier ordinary admissions that this exact result may replace in the
+    /// moving projection. The first ordinary admission carries an internal
+    /// non-object bootstrap marker; the chain is empty for explicit-only work.
+    /// Stores compare it atomically with the current moving commit, so later
+    /// admitted work can finish before or after its predecessors without being
+    /// regressed.
     #[serde(default)]
-    pub moving_publication_fence: Option<String>,
+    pub moving_publication_predecessors: Vec<String>,
+    /// Later ordinary admissions linked directly from this exact result. New
+    /// admissions follow this chain from the current moving projection instead
+    /// of scanning stored refs. The chain covers only work admitted before the
+    /// moving projection advances past this result.
+    #[serde(default)]
+    pub moving_admission_successors: Vec<String>,
     pub commit: String,
     pub parent_commit: Option<String>,
     pub default_branch: String,

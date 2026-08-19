@@ -3631,7 +3631,8 @@ async fn get_ref_inner(
             let info = resolved.map(|(_, i)| i).unwrap_or_else(|| RefInfo {
                 internal_exact_result: false,
                 require_matching_commit: false,
-                moving_publication_fence: None,
+                moving_publication_predecessors: Vec::new(),
+                moving_admission_successors: Vec::new(),
                 commit: commit.clone(),
                 parent_commit: None,
                 default_branch: default_branch.clone(),
@@ -5193,29 +5194,52 @@ async fn prepare_exact_admission(
         .load_branch(&job.repo_id, &exact_key)
         .await
         .map_err(|e| format!("exact admission lookup failed: {e}"))?;
-    if existing.as_ref().is_some_and(|info| {
+    let active = existing.as_ref().is_some_and(|info| {
         info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-    }) {
-        return Ok(());
-    }
-    let moving_publication_fence = if moving_authorized {
-        Some(
+    });
+    if active {
+        if moving_authorized
+            && let Some(mut promoted) = existing
+                .as_ref()
+                .filter(|info| info.moving_publication_predecessors.is_empty())
+                .cloned()
+        {
+            let (predecessors, tail) = moving_publication_identity(state, job).await?;
+            link_moving_admission(state, job, tail.as_deref()).await?;
+            promoted.require_matching_commit = false;
+            promoted.moving_publication_predecessors = predecessors;
+            promoted.last_accessed_at = Some(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
             state
                 .ref_store
-                .load_branch(&job.repo_id, &job.branch)
+                .save_branch(&job.repo_id, &exact_key, &promoted)
                 .await
-                .map_err(|e| format!("moving admission lookup failed: {e}"))?
-                .map(|info| info.commit)
-                .unwrap_or_default(),
-        )
-    } else {
-        None
-    };
+                .map_err(|e| format!("exact admission promotion failed: {e}"))?;
+        }
+        return Ok(());
+    }
     let evicted = existing.is_some();
+    let (moving_publication_predecessors, admission_tail) = if evicted {
+        (
+            existing
+                .as_ref()
+                .map(|info| info.moving_publication_predecessors.clone())
+                .unwrap_or_default(),
+            None,
+        )
+    } else if moving_authorized {
+        moving_publication_identity(state, job).await?
+    } else {
+        (Vec::new(), None)
+    };
     let pending = RefInfo {
         internal_exact_result: true,
         require_matching_commit: !evicted,
-        moving_publication_fence,
+        moving_publication_predecessors,
         commit: commit.to_string(),
         default_branch: job
             .admitted_default_branch
@@ -5229,7 +5253,136 @@ async fn prepare_exact_admission(
         .ref_store
         .save_branch(&job.repo_id, &exact_key, &pending)
         .await
-        .map_err(|e| format!("exact admission persistence failed: {e}"))
+        .map_err(|e| format!("exact admission persistence failed: {e}"))?;
+    link_moving_admission(state, job, admission_tail.as_deref()).await
+}
+
+/// Follow only the outstanding ordinary-admission chain from the current
+/// moving projection. The returned commits are exactly the projections the new
+/// admission may replace; `tail` is linked to the new exact result before the
+/// request reports successful queue admission.
+async fn moving_publication_identity(
+    state: &ServerState,
+    job: &BuildJob,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let admitted_commit = job
+        .admitted_commit
+        .as_deref()
+        .ok_or_else(|| "ordinary tip build has no admitted commit".to_string())?;
+    let result_branch = if job.branch == "HEAD" {
+        job.admitted_default_branch
+            .as_deref()
+            .unwrap_or(job.branch.as_str())
+    } else {
+        job.branch.as_str()
+    };
+    let Some(moving) = state
+        .ref_store
+        .load_branch(&job.repo_id, result_branch)
+        .await
+        .map_err(|e| format!("moving admission lookup failed: {e}"))?
+    else {
+        return Ok((
+            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()],
+            None,
+        ));
+    };
+    if moving.commit == admitted_commit {
+        return Ok((moving.moving_publication_predecessors, None));
+    }
+
+    let mut predecessors = vec![moving.commit.clone()];
+    let mut tail = moving.commit;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(tail.clone()) {
+            return Err("ordinary admission chain contains a cycle".to_string());
+        }
+        let key = crate::ref_store::exact_ref_key(result_branch, &tail);
+        let info = state
+            .ref_store
+            .load_branch(&job.repo_id, &key)
+            .await
+            .map_err(|e| format!("ordinary admission chain lookup failed: {e}"))?
+            .ok_or_else(|| format!("ordinary admission chain is missing exact {tail}"))?;
+        let Some(next) = info.moving_admission_successors.last().cloned() else {
+            return Ok((predecessors, Some(tail)));
+        };
+        crate::validation::validate_object_id(&next)
+            .map_err(|e| format!("ordinary admission chain has invalid successor: {e}"))?;
+        if next == admitted_commit {
+            return Ok((predecessors, None));
+        }
+        predecessors.push(next.clone());
+        tail = next;
+    }
+}
+
+async fn link_moving_admission(
+    state: &ServerState,
+    job: &BuildJob,
+    tail: Option<&str>,
+) -> Result<(), String> {
+    let Some(tail) = tail else {
+        return Ok(());
+    };
+    let admitted_commit = job
+        .admitted_commit
+        .as_deref()
+        .ok_or_else(|| "ordinary tip build has no admitted commit".to_string())?;
+    let result_branch = if job.branch == "HEAD" {
+        job.admitted_default_branch
+            .as_deref()
+            .unwrap_or(job.branch.as_str())
+    } else {
+        job.branch.as_str()
+    };
+    let key = crate::ref_store::exact_ref_key(result_branch, tail);
+    let mut info = state
+        .ref_store
+        .load_branch(&job.repo_id, &key)
+        .await
+        .map_err(|e| format!("ordinary admission tail lookup failed: {e}"))?
+        .ok_or_else(|| format!("ordinary admission tail {tail} disappeared"))?;
+    if !info
+        .moving_admission_successors
+        .iter()
+        .any(|successor| successor == admitted_commit)
+    {
+        // The insert-only bit protects creation of this exact row. The row now
+        // exists, so this same-commit metadata update must be allowed to merge.
+        info.require_matching_commit = false;
+        info.moving_admission_successors
+            .push(admitted_commit.to_string());
+        state
+            .ref_store
+            .save_branch(&job.repo_id, &key, &info)
+            .await
+            .map_err(|e| format!("ordinary admission link failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Only the latest ordinary admission should probe for a still-newer tip after
+/// its build completes. A later admission links itself from this exact row
+/// before returning accepted, so this is one direct metadata read.
+async fn exact_result_is_latest_ordinary(state: &ServerState, job: &BuildJob) -> bool {
+    let Some(admitted_commit) = job.admitted_commit.as_deref() else {
+        return false;
+    };
+    let result_branch = if job.branch == "HEAD" {
+        job.admitted_default_branch
+            .as_deref()
+            .unwrap_or(job.branch.as_str())
+    } else {
+        job.branch.as_str()
+    };
+    let exact_key = crate::ref_store::exact_ref_key(result_branch, admitted_commit);
+    let Ok(Some(current)) = state.ref_store.load_branch(&job.repo_id, &exact_key).await else {
+        return false;
+    };
+    !current.moving_publication_predecessors.is_empty()
+        && current.moving_admission_successors.is_empty()
 }
 
 /// Fire-and-forget: enqueue a build for `(repo_id, branch)` at the exact
@@ -7543,12 +7696,16 @@ async fn publish_moving_refs(
     let Some(moving_branch) = moving_branch else {
         return Ok(());
     };
-    if info.moving_publication_fence.is_none() {
+    let Some(exact) = ref_store.load_branch(repo_id, exact_branch).await? else {
+        return Ok(());
+    };
+    if exact.moving_publication_predecessors.is_empty() {
         return Ok(());
     }
     let mut projection = info.clone();
     projection.internal_exact_result = false;
     projection.require_matching_commit = true;
+    projection.moving_publication_predecessors = exact.moving_publication_predecessors;
     if moving_branch != exact_branch {
         admission_test_ref_store_write();
         ref_store
@@ -7621,9 +7778,6 @@ async fn build_and_publish_two_phase(
     // would point at deleted packs and the next clone 404s. Treat an evicted prev
     // as absent so the rebuild is cold and re-uploads everything it references.
     let exact_prev = ref_store.load_branch(repo_id, branch).await.ok().flatten();
-    let moving_publication_fence = exact_prev
-        .as_ref()
-        .and_then(|info| info.moving_publication_fence.clone());
     let placeholder_only = exact_prev.as_ref().is_some_and(|info| {
         info.build_status.as_deref() == Some("building")
             && info.full_clonepack.manifest.is_empty()
@@ -7934,7 +8088,8 @@ async fn build_and_publish_two_phase(
     let mut info = RefInfo {
         internal_exact_result: moving_branch.is_some(),
         require_matching_commit: false,
-        moving_publication_fence,
+        moving_publication_predecessors: Vec::new(),
+        moving_admission_successors: Vec::new(),
         commit: commit.to_string(),
         parent_commit: parent.clone(),
         default_branch: default_branch.to_string(),
@@ -8789,7 +8944,6 @@ pub async fn process_build_job(
             )));
         }
     }
-
     // Mark as building in the shared metadata store.
     if let Err(e) = update_job_build_status(state, job, branch, "building").await {
         error!(
@@ -8930,15 +9084,17 @@ pub async fn process_build_job(
             let recheck_job = job.clone();
             let recheck_provider = provider.clone();
             let recheck_commit = info.commit.clone();
-            tokio::spawn(async move {
-                post_build_freshness_recheck(
-                    &recheck_state,
-                    &recheck_job,
-                    &recheck_provider,
-                    &recheck_commit,
-                )
-                .await;
-            });
+            if exact_result_is_latest_ordinary(state, job).await {
+                tokio::spawn(async move {
+                    post_build_freshness_recheck(
+                        &recheck_state,
+                        &recheck_job,
+                        &recheck_provider,
+                        &recheck_commit,
+                    )
+                    .await;
+                });
+            }
             Ok(result.clone())
         }
         Err(e) => {
@@ -9281,7 +9437,7 @@ async fn handle_phase2_failure(
             recheck,
             size_bytes,
         };
-        if let Err(e) = enqueue_direct_build(&action.state, job, true).await {
+        if let Err(e) = enqueue_direct_build(&action.state, job, false).await {
             warn!(
                 "phase-2 retry trigger failed for {}@{branch} {commit}: {e}",
                 repo_id.storage_key()

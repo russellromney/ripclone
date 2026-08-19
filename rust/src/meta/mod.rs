@@ -175,6 +175,76 @@ impl RefStore for SqlRefStore {
 
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
         let repo_key = repo_id.storage_key();
+
+        // Moving publications may replace any predecessor in their durable
+        // ordinary-admission chain. Enforce that identity fence with the
+        // existing JSON CAS so every SQL backend gets identical semantics
+        // without a schema change or backend-specific dynamic SQL.
+        if info.require_matching_commit && !info.internal_exact_result {
+            for attempt in 0..64 {
+                let Some(row) = self.db.get(&repo_key, branch).await? else {
+                    if crate::ref_store::should_replace_ref(None, info) {
+                        break;
+                    }
+                    return Ok(());
+                };
+                let existing: RefInfo =
+                    serde_json::from_str(&row.data).context("parse stored RefInfo")?;
+                if !crate::ref_store::should_replace_ref(Some(&existing), info) {
+                    return Ok(());
+                }
+                let data = serde_json::to_string(info).context("serialize RefInfo")?;
+                if self
+                    .db
+                    .compare_and_swap_data(&repo_key, branch, &row.commit_id, &row.data, &data)
+                    .await?
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    (attempt.min(10) + 1) as u64,
+                ))
+                .await;
+            }
+            anyhow::bail!(
+                "SQL ref store {repo_key}@{branch}: gave up after repeated moving-publication conflicts"
+            );
+        }
+
+        // Exact artifact saves for one commit merge the admission chain under
+        // CAS. This closes explicit-first/ordinary-second promotion races where
+        // a worker built from an older snapshot would otherwise erase the
+        // promotion while publishing phase one.
+        if info.internal_exact_result {
+            for attempt in 0..64 {
+                let Some(row) = self.db.get(&repo_key, branch).await? else {
+                    break;
+                };
+                if row.commit_id != info.commit {
+                    break;
+                }
+                let existing: RefInfo =
+                    serde_json::from_str(&row.data).context("parse stored RefInfo")?;
+                if !crate::ref_store::should_replace_ref(Some(&existing), info) {
+                    return Ok(());
+                }
+                let merged = crate::ref_store::merge_exact_admission(Some(&existing), info);
+                let data = serde_json::to_string(&merged).context("serialize RefInfo")?;
+                if data == row.data
+                    || self
+                        .db
+                        .compare_and_swap_data(&repo_key, branch, &row.commit_id, &row.data, &data)
+                        .await?
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    (attempt.min(10) + 1) as u64,
+                ))
+                .await;
+            }
+        }
+
         let data = serde_json::to_string(info).context("serialize RefInfo")?;
         let new_synced = info.synced_at.map(|t| t as i64);
         let new_generation = info.generation.map(|g| g as i64);
@@ -192,7 +262,9 @@ impl RefStore for SqlRefStore {
                 new_generation,
                 info.require_matching_commit,
                 info.internal_exact_result,
-                info.moving_publication_fence.as_deref(),
+                info.moving_publication_predecessors
+                    .first()
+                    .map(String::as_str),
             )
             .await
     }

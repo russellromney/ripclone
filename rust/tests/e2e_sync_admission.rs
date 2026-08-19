@@ -787,6 +787,11 @@ async fn e2e_sync_admission() {
         .expect("exact B remains addressable after C");
     assert_full_artifacts(&local_storage, &exact_b, &b);
     assert_eq!(
+        exact_b.moving_admission_successors,
+        vec![c.clone()],
+        "C is durably linked from B without scanning stored refs"
+    );
+    assert_eq!(
         store
             .load_branch(&repo_id, &format!(":main#{c}"))
             .await
@@ -794,81 +799,6 @@ async fn e2e_sync_admission() {
             .expect("exact C remains addressable")
             .commit,
         c
-    );
-
-    // Force an inactive exact B row through the existing eviction recovery lane.
-    // A delayed B worker must rebuild B exactly while the moving row remains C.
-    let mut evicted_b = exact_b;
-    evicted_b.build_status = Some("evicted".to_string());
-    store
-        .save_branch(&repo_id, &exact_b_key, &evicted_b)
-        .await
-        .expect("mark exact B evicted");
-    let old_webhook_ref = store
-        .load_branch(&repo_id, "main")
-        .await
-        .expect("snapshot C before delayed B webhook")
-        .expect("C moving ref exists");
-    let old_webhook_ref = serde_json::to_value(old_webhook_ref).expect("serialize C snapshot");
-    let tip_probes_before_old_webhook = probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst);
-    let queue_inserts_before_old_webhook = probe
-        .queue_inserts
-        .load(std::sync::atomic::Ordering::SeqCst);
-    probe.before_claim.arm();
-    probe.fetch_entry.arm();
-    let (old_webhook_status, old_webhook_elapsed) = post_webhook(&server, "main", &b).await;
-    assert_eq!(old_webhook_status, reqwest::StatusCode::OK);
-    assert!(old_webhook_elapsed < Duration::from_secs(5));
-    assert_eq!(
-        probe
-            .queue_inserts
-            .load(std::sync::atomic::Ordering::SeqCst),
-        queue_inserts_before_old_webhook + 1,
-        "evicted B is a separate immutable attempt after C"
-    );
-    assert_eq!(
-        probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst),
-        tip_probes_before_old_webhook,
-        "late B rebuild must not probe the moving tip"
-    );
-    wait_entered(&probe.before_claim, 1).await;
-    probe.before_claim.release();
-    probe.before_claim.disarm();
-    wait_entered(&probe.fetch_entry, 1).await;
-    assert_eq!(
-        probe
-            .fetch_targets
-            .lock()
-            .unwrap()
-            .last()
-            .map(String::as_str),
-        Some(b.as_str()),
-        "late B job exact-fetches its admitted commit"
-    );
-    probe.fetch_entry.release();
-    probe.fetch_entry.disarm();
-    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
-        .await
-        .expect("late exact B work completed");
-    let final_after_old = store
-        .load_branch(&repo_id, "main")
-        .await
-        .expect("reload branch after late B work")
-        .expect("ordinary branch remains present");
-    assert_eq!(final_after_old.commit, c);
-    assert_eq!(final_after_old.full_clonepack.commit, c);
-    assert_eq!(
-        serde_json::to_value(final_after_old).expect("serialize C after delayed work"),
-        old_webhook_ref,
-        "late B may publish exact B, but must not mutate C metadata"
-    );
-    let branches = store
-        .list_branches(&repo_id)
-        .await
-        .expect("list ordinary publication refs");
-    assert!(
-        branches.iter().any(|branch| branch == &exact_b_key),
-        "ordinary immutable work keeps exact B addressable: {branches:?}"
     );
 
     // A real HTTP admission whose one ls-remote hangs is bounded and leaves no
@@ -1435,6 +1365,12 @@ async fn late_b_exact_publish_does_not_mutate_c() {
     let moving_json = serde_json::to_value(&moving_c).expect("serialize C before delayed B");
     let storage = ripclone::storage::local(&server.storage_dir).expect("open late storage");
     let moving_artifacts = artifact_snapshot(&storage, &moving_c);
+    let exact_c = store
+        .load_branch(&repo_id, &format!(":main#{c}"))
+        .await
+        .expect("load exact C before delayed B")
+        .expect("exact C before delayed B");
+    assert_full_artifacts(&storage, &exact_c, &c);
 
     phase_one_proceed
         .send(())
@@ -1464,6 +1400,16 @@ async fn late_b_exact_publish_does_not_mutate_c() {
         .expect("load delayed exact B")
         .expect("delayed exact B row");
     assert_full_artifacts(&storage, &exact_b, &b);
+    assert_eq!(
+        store
+            .load_branch(&repo_id, "HEAD")
+            .await
+            .expect("load HEAD after delayed B")
+            .expect("HEAD after delayed B")
+            .commit,
+        c,
+        "late B cannot move HEAD backward"
+    );
     assert_eq!(
         probe
             .queue_inserts

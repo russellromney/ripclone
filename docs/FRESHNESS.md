@@ -49,12 +49,19 @@ latest-only supersession mechanism: already admitted exact jobs remain jobs.
 
 ## Ordering and workers
 
-Fetch-time ordering and the existing ordered ref-store write prevent an older
-build from moving the served branch backward when builds finish out of order.
+Each ordinary exact row carries the transitive set of earlier ordinary
+admissions it may replace. The ref store compares that identity chain with the
+current moving projection atomically. If B and then C are admitted while the
+projection is A, B may replace A and C may replace either A or B; B can never
+replace C, regardless of build completion order, history depth, or force-push
+shape. Explicit-only exact work carries no moving-publication authorization.
+Outstanding admissions are linked directly from the current exact result, so
+admission follows only that chain and never lists all repository refs.
+
 Workers exact-fetch and resolve the admitted commit even if the upstream branch
-has advanced. The same exact target is transported through the local queue,
-supported SQL queues, the dispatcher, standalone workers, and authenticated API
-worker endpoints.
+has advanced. The same exact target and durable publication identity are used by
+the local queue, supported SQL queues, the dispatcher, standalone workers, and
+authenticated API worker endpoints.
 
 ## Cross-process behavior
 
