@@ -11,6 +11,10 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+/// Admission-chain marker authorizing the first public projection for a branch.
+/// `:` cannot be a Git object ID, so it cannot collide with a real commit.
+pub(crate) const INITIAL_MOVING_PROJECTION_PREDECESSOR: &str = ":initial";
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddedRepo {
     pub repo_id: RepoId,
@@ -80,9 +84,10 @@ fn unbranch_slug(slug: &str) -> Option<String> {
 /// backend's atomic tie-break (the SQL conditional upsert, the S3 ETag CAS);
 /// the file store serializes writes in-process.
 ///
-/// Exact rows are immutable commit identities. Moving projections are updated
-/// separately through the store's atomic commit fence, so generation ordering
-/// never decides whether a late exact build may replace a newer branch tip.
+/// Exact rows are immutable commit identities. Moving projections carry the
+/// exact admission chain and are updated only when the current commit is in
+/// that chain, so generation ordering never decides whether a late exact build
+/// may replace a newer branch tip.
 pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> bool {
     if new.commit.is_empty() {
         return false;
@@ -91,14 +96,18 @@ pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> b
         return existing.is_none();
     }
     let Some(existing) = existing else {
-        return !new.require_matching_commit || new.moving_publication_fence.as_deref() == Some("");
+        return !new.require_matching_commit
+            || new
+                .moving_publication_predecessors
+                .iter()
+                .any(|commit| commit == INITIAL_MOVING_PROJECTION_PREDECESSOR);
     };
     if new.require_matching_commit {
-        let expected = new
-            .moving_publication_fence
-            .as_deref()
-            .unwrap_or(new.commit.as_str());
-        return existing.commit == new.commit || existing.commit == expected;
+        return existing.commit == new.commit
+            || new
+                .moving_publication_predecessors
+                .iter()
+                .any(|commit| commit == &existing.commit);
     }
     if existing.commit == new.commit {
         return true;
@@ -110,6 +119,60 @@ pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> b
         (Some(existing_ts), Some(new_ts)) => new_ts >= existing_ts,
         _ => true,
     }
+}
+
+/// Preserve ordinary-admission authorization when a worker writes newer
+/// artifact metadata for the same exact commit. This merge happens inside each
+/// store's atomic write/CAS boundary, so an explicit job promoted after claim
+/// cannot have its publication chain erased by a stale worker snapshot.
+pub(crate) fn merge_exact_admission(existing: Option<&RefInfo>, new: &RefInfo) -> RefInfo {
+    let Some(existing) = existing.filter(|existing| {
+        existing.internal_exact_result && new.internal_exact_result && existing.commit == new.commit
+    }) else {
+        return new.clone();
+    };
+    // A promotion is a metadata-only write prepared from an earlier exact-row
+    // snapshot. If artifact publication won the race, retain its current fields
+    // and merge only the newly granted moving-publication identity. Worker
+    // publications use the opposite shape (new artifacts, existing identity).
+    let identity_only = new
+        .moving_publication_predecessors
+        .iter()
+        .any(|commit| !existing.moving_publication_predecessors.contains(commit))
+        || new
+            .moving_admission_successors
+            .iter()
+            .any(|commit| !existing.moving_admission_successors.contains(commit));
+    let mut merged = if identity_only {
+        existing.clone()
+    } else {
+        new.clone()
+    };
+    for predecessor in existing
+        .moving_publication_predecessors
+        .iter()
+        .chain(&new.moving_publication_predecessors)
+    {
+        if !merged.moving_publication_predecessors.contains(predecessor) {
+            merged
+                .moving_publication_predecessors
+                .push(predecessor.clone());
+        }
+    }
+    for successor in existing
+        .moving_admission_successors
+        .iter()
+        .chain(&new.moving_admission_successors)
+    {
+        if !merged.moving_admission_successors.contains(successor) {
+            merged.moving_admission_successors.push(successor.clone());
+        }
+    }
+    merged.require_matching_commit =
+        existing.require_matching_commit && new.require_matching_commit;
+    merged.warm_pinned |= existing.warm_pinned || new.warm_pinned;
+    merged.last_accessed_at = existing.last_accessed_at.max(new.last_accessed_at);
+    merged
 }
 
 /// Abstract store for repo → `RefInfo` mappings.
@@ -246,13 +309,14 @@ impl FileRefStore {
             warn!("ref store {key} already has a newer sync; skipping older write");
             return Ok(());
         }
+        let info = merge_exact_admission(existing.as_ref(), info);
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("create ref store dir {}", parent.display()))?;
         }
-        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
+        let data = serde_json::to_vec_pretty(&info).context("serialize RefInfo")?;
         // Write to a temp file in the same directory and rename for atomicity.
         let tmp_path = path.with_extension("json.tmp");
         tokio::fs::write(&tmp_path, data)
@@ -637,13 +701,12 @@ impl S3RefStore {
     /// fails and we re-read and re-decide. This is what makes branch refs
     /// "newer never loses" instead of last-writer-wins.
     async fn save_keyed(&self, key: &str, info: &RefInfo) -> Result<()> {
-        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
         // Bounded so a pathological hot key can't spin forever. Real S3-backed
         // metadata can see bursts of concurrent first writers, so allow enough
         // conflicts for every contender in the adversarial ordering test to
         // observe the winning ref and stand down.
         for attempt in 0..64 {
-            let if_match = match self.storage.get_object(key).await {
+            let (if_match, existing) = match self.storage.get_object(key).await {
                 Ok(Some((etag, existing_bytes))) => {
                     let existing: RefInfo = serde_json::from_slice(&existing_bytes)
                         .with_context(|| format!("parse existing S3 ref store {key}"))?;
@@ -651,16 +714,23 @@ impl S3RefStore {
                         warn!("S3 ref store {key} already has a newer sync; skipping older write");
                         return Ok(());
                     }
-                    Some(etag)
+                    (Some(etag), Some(existing))
                 }
-                Ok(None) => None,
+                Ok(None) => {
+                    if !should_replace_ref(None, info) {
+                        return Ok(());
+                    }
+                    (None, None)
+                }
                 Err(e) => {
                     warn!(
                         "failed to read existing S3 ref store {key}: {e}; writing unconditionally"
                     );
-                    None
+                    (None, None)
                 }
             };
+            let candidate = merge_exact_admission(existing.as_ref(), info);
+            let data = serde_json::to_vec_pretty(&candidate).context("serialize RefInfo")?;
 
             if self
                 .storage
@@ -1404,7 +1474,7 @@ mod tests {
         let mut delayed = dummy_ref_info("b");
         delayed.generation = Some(2);
         delayed.require_matching_commit = true;
-        delayed.moving_publication_fence = Some("a".to_string());
+        delayed.moving_publication_predecessors = vec!["a".to_string()];
         assert!(!should_replace_ref(Some(&current), &delayed));
         assert!(!should_replace_ref(None, &delayed));
 
@@ -1413,6 +1483,64 @@ mod tests {
 
         current.commit = "a".to_string();
         assert!(should_replace_ref(Some(&current), &delayed));
+    }
+
+    #[test]
+    fn admission_chain_orders_successive_publications_without_generation() {
+        let a = dummy_ref_info("a");
+        let mut b = dummy_ref_info("b");
+        b.require_matching_commit = true;
+        b.moving_publication_predecessors = vec!["a".to_string()];
+        let mut c = dummy_ref_info("c");
+        c.require_matching_commit = true;
+        c.moving_publication_predecessors = vec!["a".to_string(), "b".to_string()];
+
+        assert!(should_replace_ref(Some(&a), &b));
+        assert!(should_replace_ref(Some(&a), &c));
+        assert!(should_replace_ref(Some(&b), &c));
+        assert!(!should_replace_ref(Some(&c), &b));
+    }
+
+    #[test]
+    fn admission_chain_distinguishes_initial_ordinary_from_explicit_only() {
+        let mut ordinary = dummy_ref_info("b");
+        ordinary.require_matching_commit = true;
+        ordinary.moving_publication_predecessors =
+            vec![INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
+        assert!(should_replace_ref(None, &ordinary));
+
+        ordinary.moving_publication_predecessors.clear();
+        assert!(!should_replace_ref(None, &ordinary));
+    }
+
+    #[test]
+    fn exact_promotion_preserves_artifacts_published_from_an_older_snapshot() {
+        let mut published = dummy_ref_info("b");
+        published.full_clonepack.commit = "b".to_string();
+        published.full_clonepack.manifest = "manifest".to_string();
+        published.last_accessed_at = Some(20);
+
+        let mut stale_promotion = dummy_ref_info("b");
+        stale_promotion.require_matching_commit = false;
+        stale_promotion.moving_publication_predecessors =
+            vec![INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
+        stale_promotion.last_accessed_at = Some(10);
+
+        let merged = merge_exact_admission(Some(&published), &stale_promotion);
+        assert_eq!(merged.full_clonepack.commit, "b");
+        assert_eq!(merged.full_clonepack.manifest, "manifest");
+        assert_eq!(merged.last_accessed_at, Some(20));
+        assert_eq!(
+            merged.moving_publication_predecessors,
+            vec![INITIAL_MOVING_PROJECTION_PREDECESSOR]
+        );
+
+        let mut stale_link = merged.clone();
+        stale_link.full_clonepack = Default::default();
+        stale_link.moving_admission_successors.push("c".to_string());
+        let linked = merge_exact_admission(Some(&merged), &stale_link);
+        assert_eq!(linked.full_clonepack.manifest, "manifest");
+        assert_eq!(linked.moving_admission_successors, vec!["c"]);
     }
 
     #[tokio::test]
@@ -1432,7 +1560,7 @@ mod tests {
         let mut delayed = dummy_ref_info("b");
         delayed.generation = Some(2);
         delayed.require_matching_commit = true;
-        delayed.moving_publication_fence = Some("a".to_string());
+        delayed.moving_publication_predecessors = vec!["a".to_string()];
         store.save_branch(&repo, "main", &delayed).await.unwrap();
         assert_eq!(
             store
@@ -1445,7 +1573,7 @@ mod tests {
         );
 
         current.require_matching_commit = true;
-        current.moving_publication_fence = Some("b".to_string());
+        current.moving_publication_predecessors = vec!["b".to_string()];
         current.build_status = Some("done".to_string());
         store.save_branch(&repo, "main", &current).await.unwrap();
         assert_eq!(

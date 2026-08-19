@@ -3256,7 +3256,8 @@ async fn get_ref_inner(
             let info = resolved.map(|(_, i)| i).unwrap_or_else(|| RefInfo {
                 internal_exact_result: true,
                 require_matching_commit: false,
-                moving_publication_fence: None,
+                moving_publication_predecessors: Vec::new(),
+                moving_admission_successors: Vec::new(),
                 commit: commit.clone(),
                 parent_commit: None,
                 default_branch: default_branch.clone(),
@@ -4550,19 +4551,13 @@ async fn prepare_exact_admission(
         if moving_authorized
             && let Some(mut promoted) = existing
                 .as_ref()
-                .filter(|info| info.moving_publication_fence.is_none())
+                .filter(|info| info.moving_publication_predecessors.is_empty())
                 .cloned()
         {
+            let (predecessors, tail) = moving_publication_identity(state, job).await?;
+            link_moving_admission(state, job, tail.as_deref()).await?;
             promoted.require_matching_commit = false;
-            promoted.moving_publication_fence = Some(
-                state
-                    .ref_store
-                    .load_branch(&job.repo_id, &job.branch)
-                    .await
-                    .map_err(|e| format!("moving admission lookup failed: {e}"))?
-                    .map(|info| info.commit)
-                    .unwrap_or_default(),
-            );
+            promoted.moving_publication_predecessors = predecessors;
             promoted.last_accessed_at = Some(
                 SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -4577,24 +4572,24 @@ async fn prepare_exact_admission(
         }
         return Ok(());
     }
-    let moving_publication_fence = if moving_authorized {
-        Some(
-            state
-                .ref_store
-                .load_branch(&job.repo_id, &job.branch)
-                .await
-                .map_err(|e| format!("moving admission lookup failed: {e}"))?
-                .map(|info| info.commit)
-                .unwrap_or_default(),
-        )
-    } else {
-        None
-    };
     let evicted = existing.is_some();
+    let (moving_publication_predecessors, admission_tail) = if evicted {
+        (
+            existing
+                .as_ref()
+                .map(|info| info.moving_publication_predecessors.clone())
+                .unwrap_or_default(),
+            None,
+        )
+    } else if moving_authorized {
+        moving_publication_identity(state, job).await?
+    } else {
+        (Vec::new(), None)
+    };
     let pending = RefInfo {
         internal_exact_result: true,
         require_matching_commit: !evicted,
-        moving_publication_fence,
+        moving_publication_predecessors,
         commit: commit.to_string(),
         default_branch: job
             .admitted_default_branch
@@ -4614,7 +4609,124 @@ async fn prepare_exact_admission(
         .ref_store
         .save_branch(&job.repo_id, &exact_key, &pending)
         .await
-        .map_err(|e| format!("exact admission persistence failed: {e}"))
+        .map_err(|e| format!("exact admission persistence failed: {e}"))?;
+    link_moving_admission(state, job, admission_tail.as_deref()).await
+}
+
+/// Follow only the outstanding ordinary-admission chain from the current
+/// moving projection. The returned commits are exactly the projections the new
+/// admission may replace; `tail` is linked to the new exact result before the
+/// request reports successful queue admission.
+async fn moving_publication_identity(
+    state: &ServerState,
+    job: &BuildJob,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let result_branch = if job.branch == "HEAD" {
+        job.admitted_default_branch
+            .as_deref()
+            .unwrap_or(job.branch.as_str())
+    } else {
+        job.branch.as_str()
+    };
+    let Some(moving) = state
+        .ref_store
+        .load_branch(&job.repo_id, result_branch)
+        .await
+        .map_err(|e| format!("moving admission lookup failed: {e}"))?
+    else {
+        return Ok((
+            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()],
+            None,
+        ));
+    };
+    if moving.commit == job.admitted_commit {
+        return Ok((moving.moving_publication_predecessors, None));
+    }
+
+    let mut predecessors = vec![moving.commit.clone()];
+    let mut tail = moving.commit;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(tail.clone()) {
+            return Err("ordinary admission chain contains a cycle".to_string());
+        }
+        let key = exact_ref_store_key(result_branch, &tail);
+        let info = state
+            .ref_store
+            .load_branch(&job.repo_id, &key)
+            .await
+            .map_err(|e| format!("ordinary admission chain lookup failed: {e}"))?
+            .ok_or_else(|| format!("ordinary admission chain is missing exact {tail}"))?;
+        let Some(next) = info.moving_admission_successors.last().cloned() else {
+            return Ok((predecessors, Some(tail)));
+        };
+        crate::validation::validate_object_id(&next)
+            .map_err(|e| format!("ordinary admission chain has invalid successor: {e}"))?;
+        if next == job.admitted_commit {
+            return Ok((predecessors, None));
+        }
+        predecessors.push(next.clone());
+        tail = next;
+    }
+}
+
+async fn link_moving_admission(
+    state: &ServerState,
+    job: &BuildJob,
+    tail: Option<&str>,
+) -> Result<(), String> {
+    let Some(tail) = tail else {
+        return Ok(());
+    };
+    let result_branch = if job.branch == "HEAD" {
+        job.admitted_default_branch
+            .as_deref()
+            .unwrap_or(job.branch.as_str())
+    } else {
+        job.branch.as_str()
+    };
+    let key = exact_ref_store_key(result_branch, tail);
+    let mut info = state
+        .ref_store
+        .load_branch(&job.repo_id, &key)
+        .await
+        .map_err(|e| format!("ordinary admission tail lookup failed: {e}"))?
+        .ok_or_else(|| format!("ordinary admission tail {tail} disappeared"))?;
+    if !info
+        .moving_admission_successors
+        .contains(&job.admitted_commit)
+    {
+        // The insert-only bit protects creation of this exact row. The row now
+        // exists, so this same-commit metadata update must be allowed to merge.
+        info.require_matching_commit = false;
+        info.moving_admission_successors
+            .push(job.admitted_commit.clone());
+        state
+            .ref_store
+            .save_branch(&job.repo_id, &key, &info)
+            .await
+            .map_err(|e| format!("ordinary admission link failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Only the latest ordinary admission should probe for a still-newer tip after
+/// its build completes. A later admission links itself from this exact row
+/// before returning accepted, so this is one direct metadata read.
+async fn exact_result_is_latest_ordinary(state: &ServerState, job: &BuildJob) -> bool {
+    let result_branch = if job.branch == "HEAD" {
+        job.admitted_default_branch
+            .as_deref()
+            .unwrap_or(job.branch.as_str())
+    } else {
+        job.branch.as_str()
+    };
+    let exact_key = exact_ref_store_key(result_branch, &job.admitted_commit);
+    let Ok(Some(current)) = state.ref_store.load_branch(&job.repo_id, &exact_key).await else {
+        return false;
+    };
+    !current.moving_publication_predecessors.is_empty()
+        && current.moving_admission_successors.is_empty()
 }
 
 /// Fire-and-forget: enqueue a build for `(repo_id, branch)` at the exact
@@ -6053,9 +6165,6 @@ async fn do_sync(
     // separate from the requested/build branch so concrete-branch jobs keep
     // their existing metadata semantics.
     admitted_default_branch: Option<&str>,
-    // Ordinary admissions may publish the current moving projection through
-    // the exact row's identity fence. Explicit revisions publish exact only.
-    moving_authorized: bool,
     ref_store: &Arc<dyn RefStore>,
     // When true, the two-phase build finishes full history inline and only returns
     // once it is durable, instead of detaching it into a background task. An
@@ -6220,20 +6329,14 @@ async fn do_sync(
     // branch name so both /refs/HEAD and /refs/<branch> find the same build.
     // Ordinary admitted work keeps that concrete branch as the moving projection,
     // while all build state below uses the exact commit-keyed row.
-    let moving_branch = moving_authorized.then(|| {
+    let moving_branch = Some({
         if branch == "HEAD" {
             default_branch.clone()
         } else {
             branch.to_string()
         }
     });
-    let storage_branch = moving_branch.as_deref().unwrap_or_else(|| {
-        if branch == "HEAD" {
-            default_branch.as_str()
-        } else {
-            branch
-        }
-    });
+    let storage_branch = moving_branch.as_deref().expect("moving branch is concrete");
     // Ref-store key. Rev builds and ordinary admitted builds share the existing
     // commit-keyed rolling lane; only the moving projection stays plain.
     // The mirror fetch + commit resolution above used the real branch/rev.
@@ -6354,7 +6457,6 @@ struct Phase2FailureAction {
     credential: Option<SecretString>,
     admitted_commit: String,
     admitted_default_branch: Option<String>,
-    moving_authorized: bool,
     retry_recheck: Option<u32>,
     local_active_key: Option<String>,
 }
@@ -6373,12 +6475,16 @@ async fn publish_moving_refs(
     let Some(moving_branch) = moving_branch else {
         return Ok(());
     };
-    if info.moving_publication_fence.is_none() {
+    let Some(exact) = ref_store.load_branch(repo_id, exact_branch).await? else {
+        return Ok(());
+    };
+    if exact.moving_publication_predecessors.is_empty() {
         return Ok(());
     }
     let mut projection = info.clone();
     projection.internal_exact_result = false;
     projection.require_matching_commit = true;
+    projection.moving_publication_predecessors = exact.moving_publication_predecessors;
     if moving_branch != exact_branch {
         admission_test_ref_store_write();
         ref_store
@@ -6444,9 +6550,6 @@ async fn build_and_publish_two_phase(
     // would point at deleted packs and the next clone 404s. Treat an evicted prev
     // as absent so the rebuild is cold and re-uploads everything it references.
     let exact_prev = ref_store.load_branch(repo_id, branch).await.ok().flatten();
-    let moving_publication_fence = exact_prev
-        .as_ref()
-        .and_then(|info| info.moving_publication_fence.clone());
     let placeholder_only = exact_prev.as_ref().is_some_and(|info| {
         info.build_status.as_deref() == Some("building")
             && info.full_clonepack.manifest.is_empty()
@@ -6707,7 +6810,8 @@ async fn build_and_publish_two_phase(
     let mut info = RefInfo {
         internal_exact_result: true,
         require_matching_commit: false,
-        moving_publication_fence,
+        moving_publication_predecessors: Vec::new(),
+        moving_admission_successors: Vec::new(),
         commit: commit.to_string(),
         parent_commit: parent.clone(),
         default_branch: default_branch.to_string(),
@@ -7545,15 +7649,6 @@ pub async fn process_build_job(
             "build job has invalid admitted commit: {e}"
         )));
     }
-    let exact_key = exact_ref_store_key(branch, &job.admitted_commit);
-    let moving_authorized = state
-        .ref_store
-        .load_branch(repo_id, &exact_key)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|info| info.moving_publication_fence.is_some());
-
     // Mark as building in the shared metadata store.
     if let Err(e) = update_job_build_status(state, job, branch, "building").await {
         error!(
@@ -7602,7 +7697,6 @@ pub async fn process_build_job(
         branch,
         &job.admitted_commit,
         job.admitted_default_branch.as_deref(),
-        moving_authorized,
         &state.ref_store,
         inline_full_history,
         &state.storage,
@@ -7618,7 +7712,6 @@ pub async fn process_build_job(
                 credential: job.credential.clone(),
                 admitted_commit: job.admitted_commit.clone(),
                 admitted_default_branch: job.admitted_default_branch.clone(),
-                moving_authorized,
                 retry_recheck: Some(1),
                 local_active_key: state.build_queue.inproc_wait().then(|| job.key()),
             })
@@ -7629,7 +7722,6 @@ pub async fn process_build_job(
                 credential: job.credential.clone(),
                 admitted_commit: job.admitted_commit.clone(),
                 admitted_default_branch: job.admitted_default_branch.clone(),
-                moving_authorized,
                 retry_recheck: None,
                 local_active_key: state.build_queue.inproc_wait().then(|| job.key()),
             })
@@ -7677,7 +7769,7 @@ pub async fn process_build_job(
             let recheck_job = job.clone();
             let recheck_provider = provider.clone();
             let recheck_commit = info.commit.clone();
-            if moving_authorized {
+            if exact_result_is_latest_ordinary(state, job).await {
                 tokio::spawn(async move {
                     post_build_freshness_recheck(
                         &recheck_state,
@@ -8033,7 +8125,7 @@ async fn handle_phase2_failure(
             recheck,
             size_bytes,
         };
-        if let Err(e) = enqueue_direct_build(&action.state, job, action.moving_authorized).await {
+        if let Err(e) = enqueue_direct_build(&action.state, job, false).await {
             warn!(
                 "phase-2 retry trigger failed for {}@{branch} {commit}: {e}",
                 repo_id.storage_key()
@@ -9082,7 +9174,6 @@ mod tests {
             &effective_branch,
             &tip.commit,
             tip.default_branch.as_deref(),
-            true,
             &state.ref_store,
             true,
             &state.storage,
@@ -10381,7 +10472,6 @@ mod tests {
             "main",
             &missing,
             Some("main"),
-            true,
             &state.ref_store,
             true,
             &state.storage,

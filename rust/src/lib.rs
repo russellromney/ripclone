@@ -212,15 +212,22 @@ pub struct RefInfo {
     /// like every other ref, but are not source branches in the public status
     /// model.
     pub internal_exact_result: bool,
-    /// A moving projection carrying this flag may replace only the same commit.
-    /// Stores enforce the check atomically with the write.
-    #[serde(default)]
+    /// A moving projection carrying this flag may replace only its own commit or
+    /// one listed in `moving_publication_predecessors`. Stores enforce the check
+    /// atomically with the write.
     pub require_matching_commit: bool,
-    /// Commit identity observed in the moving row when this exact result was
-    /// admitted. `Some("")` means the row was absent; `None` makes the result
-    /// exact-only. Moving projections use this as an atomic publication fence.
-    #[serde(default)]
-    pub moving_publication_fence: Option<String>,
+    /// Earlier ordinary admissions that this exact result may replace in the
+    /// moving projection. The first ordinary admission carries an internal
+    /// non-object bootstrap marker; the chain is empty for explicit-only work.
+    /// Stores compare it atomically with the current moving commit, so later
+    /// admitted work can finish before or after its predecessors without being
+    /// regressed.
+    pub moving_publication_predecessors: Vec<String>,
+    /// Later ordinary admissions linked directly from this exact result. New
+    /// admissions follow this chain from the current moving projection instead
+    /// of scanning stored refs. The chain covers only work admitted before the
+    /// moving projection advances past this result.
+    pub moving_admission_successors: Vec<String>,
     pub commit: String,
     pub parent_commit: Option<String>,
     pub default_branch: String,
@@ -320,6 +327,38 @@ mod tests {
         assert!(
             error.to_string().contains("internal_exact_result"),
             "missing identity must be named clearly: {error}"
+        );
+    }
+
+    #[test]
+    fn ref_info_rejects_missing_moving_publication_identity() {
+        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("moving_publication_predecessors");
+
+        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("moving_publication_predecessors"),
+            "missing publication identity must be named clearly: {error}"
+        );
+    }
+
+    #[test]
+    fn ref_info_rejects_missing_moving_admission_identity() {
+        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("moving_admission_successors");
+
+        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
+        assert!(
+            error.to_string().contains("moving_admission_successors"),
+            "missing admission identity must be named clearly: {error}"
         );
     }
 }
