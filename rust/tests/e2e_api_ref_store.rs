@@ -162,12 +162,15 @@ async fn api_worker_reports_ref_without_db_creds() {
     // worker's ApiRefStore → POST /v1/refs → server's SqlRefStore.
     let store = open_meta_store(&meta_url).await;
     let rid = RepoId::github("acme/api-ref");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &commit);
     let stored = store
-        .load_branch(&rid, "main")
+        .load_branch(&rid, &exact_key)
         .await
         .expect("load")
-        .expect("ref must be in sqlite after api report");
+        .expect("exact result must be in sqlite after api report");
+    assert!(stored.internal_exact_result);
     assert_eq!(stored.commit, commit);
+    assert_eq!(stored.full_clonepack.commit, commit);
 }
 
 /// Wrong token → endpoint 401, and no row in the metadata DB.
