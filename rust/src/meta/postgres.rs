@@ -81,10 +81,10 @@ impl MetaDb for PostgresMeta {
         generation: Option<i64>,
         require_matching_commit: bool,
         internal_exact_result: bool,
-        moving_publication_fence: Option<&str>,
+        moving_publication_predecessor: Option<&str>,
     ) -> Result<()> {
         let insert_only = internal_exact_result && require_matching_commit;
-        let expected = moving_publication_fence.unwrap_or(commit_id);
+        let expected = moving_publication_predecessor.unwrap_or(commit_id);
         // DO UPDATE ... WHERE makes the ordering check atomic with the write;
         // a losing write is a silent no-op. See the sqlite adapter for the
         // policy, which is identical.
@@ -121,19 +121,25 @@ impl MetaDb for PostgresMeta {
         Ok(())
     }
 
-    async fn compare_and_swap_data(
+    async fn compare_and_swap_ref(
         &self,
         repo_key: &str,
         branch: &str,
         expected_commit: &str,
         expected_data: &str,
         new_data: &str,
+        new_commit: &str,
+        new_synced_at: Option<i64>,
+        new_generation: Option<i64>,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE refs SET data = $1
-             WHERE repo_key = $2 AND branch = $3 AND commit_id = $4 AND data = $5",
+            "UPDATE refs SET data = $1, commit_id = $2, synced_at = $3, generation = $4
+             WHERE repo_key = $5 AND branch = $6 AND commit_id = $7 AND data = $8",
         )
         .bind(new_data)
+        .bind(new_commit)
+        .bind(new_synced_at)
+        .bind(new_generation)
         .bind(repo_key)
         .bind(branch)
         .bind(expected_commit)

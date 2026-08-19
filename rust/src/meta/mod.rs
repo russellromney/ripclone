@@ -70,18 +70,21 @@ pub trait MetaDb: Send + Sync {
         generation: Option<i64>,
         require_matching_commit: bool,
         internal_exact_result: bool,
-        moving_publication_fence: Option<&str>,
+        moving_publication_predecessor: Option<&str>,
     ) -> Result<()>;
 
-    /// Replace the JSON blob only if the row still has both the expected commit
-    /// and the expected current JSON blob.
-    async fn compare_and_swap_data(
+    /// Replace one complete ref row only if it still has both the expected
+    /// commit and expected current JSON blob.
+    async fn compare_and_swap_ref(
         &self,
         repo_key: &str,
         branch: &str,
         expected_commit: &str,
         expected_data: &str,
         new_data: &str,
+        new_commit: &str,
+        new_synced_at: Option<i64>,
+        new_generation: Option<i64>,
     ) -> Result<bool>;
 
     /// Distinct `repo_key`s that have at least one stored ref.
@@ -158,9 +161,11 @@ impl RefStore for SqlRefStore {
         // existing JSON CAS so every SQL backend gets identical semantics
         // without a schema change or backend-specific dynamic SQL.
         if info.require_matching_commit && !info.internal_exact_result {
+            let mut insert_missing = false;
             for attempt in 0..64 {
                 let Some(row) = self.db.get(&repo_key, branch).await? else {
                     if crate::ref_store::should_replace_ref(None, info) {
+                        insert_missing = true;
                         break;
                     }
                     return Ok(());
@@ -171,10 +176,20 @@ impl RefStore for SqlRefStore {
                     return Ok(());
                 }
                 let data = serde_json::to_string(info).context("serialize RefInfo")?;
-                if self
-                    .db
-                    .compare_and_swap_data(&repo_key, branch, &row.commit_id, &row.data, &data)
-                    .await?
+                if data == row.data
+                    || self
+                        .db
+                        .compare_and_swap_ref(
+                            &repo_key,
+                            branch,
+                            &row.commit_id,
+                            &row.data,
+                            &data,
+                            &info.commit,
+                            info.synced_at.map(|value| value as i64),
+                            info.generation.map(|value| value as i64),
+                        )
+                        .await?
                 {
                     return Ok(());
                 }
@@ -183,9 +198,11 @@ impl RefStore for SqlRefStore {
                 ))
                 .await;
             }
-            anyhow::bail!(
-                "SQL ref store {repo_key}@{branch}: gave up after repeated moving-publication conflicts"
-            );
+            if !insert_missing {
+                anyhow::bail!(
+                    "SQL ref store {repo_key}@{branch}: gave up after repeated moving-publication conflicts"
+                );
+            }
         }
 
         // Exact artifact saves for one commit merge the admission chain under
@@ -210,7 +227,16 @@ impl RefStore for SqlRefStore {
                 if data == row.data
                     || self
                         .db
-                        .compare_and_swap_data(&repo_key, branch, &row.commit_id, &row.data, &data)
+                        .compare_and_swap_ref(
+                            &repo_key,
+                            branch,
+                            &row.commit_id,
+                            &row.data,
+                            &data,
+                            &merged.commit,
+                            merged.synced_at.map(|value| value as i64),
+                            merged.generation.map(|value| value as i64),
+                        )
                         .await?
                 {
                     return Ok(());
@@ -273,7 +299,16 @@ impl RefStore for SqlRefStore {
             }
             if self
                 .db
-                .compare_and_swap_data(&repo_key, branch, expected_commit, &row.data, &data)
+                .compare_and_swap_ref(
+                    &repo_key,
+                    branch,
+                    expected_commit,
+                    &row.data,
+                    &data,
+                    &info.commit,
+                    info.synced_at.map(|value| value as i64),
+                    info.generation.map(|value| value as i64),
+                )
                 .await?
             {
                 return Ok(true);
@@ -317,7 +352,16 @@ impl RefStore for SqlRefStore {
             }
             if self
                 .db
-                .compare_and_swap_data(&repo_key, branch, expected_commit, &row.data, &data)
+                .compare_and_swap_ref(
+                    &repo_key,
+                    branch,
+                    expected_commit,
+                    &row.data,
+                    &data,
+                    &info.commit,
+                    info.synced_at.map(|value| value as i64),
+                    info.generation.map(|value| value as i64),
+                )
                 .await?
             {
                 return Ok(true);
@@ -472,6 +516,63 @@ mod tests {
             store.load(&rid).await.unwrap().unwrap().commit,
             "g20",
             "lower generation loses despite a newer wall clock"
+        );
+
+        // Moving publications use the complete admitted predecessor chain,
+        // not generation ordering. Exercise the same SQL CAS on every backend:
+        // C may replace A or B, while a delayed B can never replace C.
+        let mut a = ref_at("a", Some(400));
+        a.generation = Some(1);
+        store.save_branch(&rid, "moving", &a).await.unwrap();
+
+        let mut b = ref_at("b", Some(401));
+        b.generation = Some(1);
+        b.require_matching_commit = true;
+        b.moving_publication_predecessors = vec!["a".to_string()];
+        store.save_branch(&rid, "moving", &b).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&rid, "moving")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "b"
+        );
+
+        let mut c = ref_at("c", Some(402));
+        c.generation = Some(1);
+        c.require_matching_commit = true;
+        c.moving_publication_predecessors = vec!["a".to_string(), "b".to_string()];
+        store.save_branch(&rid, "moving", &c).await.unwrap();
+        store.save_branch(&rid, "moving", &b).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&rid, "moving")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "c",
+            "late B must not replace C"
+        );
+
+        let mut first = ref_at("first", Some(403));
+        first.require_matching_commit = true;
+        first.moving_publication_predecessors =
+            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
+        store
+            .save_branch(&rid, "initial-moving", &first)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_branch(&rid, "initial-moving")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "first"
         );
     }
 
