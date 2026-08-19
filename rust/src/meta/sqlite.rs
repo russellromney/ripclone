@@ -45,17 +45,6 @@ impl MetaDb for SqliteMeta {
         .execute(&self.pool)
         .await
         .context("create refs table")?;
-        // Index for commit-keyed reuse (get_by_commit). The PK is (repo_key,
-        // branch), so without this a lookup by commit scans the repo's branches.
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_refs_commit ON refs (repo_key, commit_id)")
-            .execute(&self.pool)
-            .await
-            .context("create refs commit index")?;
-        // Add the generation column to a table created before it existed
-        // (best-effort: errors "duplicate column" on an up-to-date table).
-        let _ = sqlx::raw_sql("ALTER TABLE refs ADD COLUMN generation BIGINT")
-            .execute(&self.pool)
-            .await;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS added_repos (
                 repo_key TEXT PRIMARY KEY NOT NULL,
@@ -88,27 +77,6 @@ impl MetaDb for SqliteMeta {
         }
     }
 
-    async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>> {
-        let rows = sqlx::query(
-            "SELECT data, commit_id, synced_at FROM refs
-             WHERE repo_key = ? AND commit_id = ?",
-        )
-        .bind(repo_key)
-        .bind(commit)
-        .fetch_all(&self.pool)
-        .await
-        .context("get refs by commit")?;
-        rows.into_iter()
-            .map(|row| -> Result<RefRow> {
-                Ok(RefRow {
-                    data: row.try_get(0)?,
-                    commit_id: row.try_get(1)?,
-                    synced_at: row.try_get(2)?,
-                })
-            })
-            .collect()
-    }
-
     async fn save_ordered(
         &self,
         repo_key: &str,
@@ -117,7 +85,12 @@ impl MetaDb for SqliteMeta {
         commit_id: &str,
         synced_at: Option<i64>,
         generation: Option<i64>,
+        require_matching_commit: bool,
+        internal_exact_result: bool,
+        moving_publication_predecessor: Option<&str>,
     ) -> Result<()> {
+        let insert_only = internal_exact_result && require_matching_commit;
+        let expected = moving_publication_predecessor.unwrap_or(commit_id);
         // The DO UPDATE ... WHERE makes the ordering check atomic with the write:
         // on conflict the row is overwritten only when the new write wins — same
         // commit, a higher-or-equal generation (commit history depth), or, when
@@ -131,12 +104,14 @@ impl MetaDb for SqliteMeta {
                  synced_at = excluded.synced_at,
                  generation = excluded.generation,
                  data = excluded.data
-             WHERE excluded.commit_id = refs.commit_id
-                OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
-                    AND excluded.generation >= refs.generation)
-                OR ((refs.generation IS NULL OR excluded.generation IS NULL)
-                    AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
-                         OR excluded.synced_at >= refs.synced_at))",
+             WHERE ? = 0 AND (
+                (? = 1 AND (excluded.commit_id = refs.commit_id OR refs.commit_id = ?))
+                OR (? = 0 AND (excluded.commit_id = refs.commit_id
+                    OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
+                        AND excluded.generation >= refs.generation)
+                    OR ((refs.generation IS NULL OR excluded.generation IS NULL)
+                        AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
+                             OR excluded.synced_at >= refs.synced_at)))))",
         )
         .bind(repo_key)
         .bind(branch)
@@ -144,25 +119,35 @@ impl MetaDb for SqliteMeta {
         .bind(synced_at)
         .bind(generation)
         .bind(data)
+        .bind(insert_only)
+        .bind(require_matching_commit)
+        .bind(expected)
+        .bind(require_matching_commit)
         .execute(&self.pool)
         .await
         .context("save_ordered ref")?;
         Ok(())
     }
 
-    async fn compare_and_swap_data(
+    async fn compare_and_swap_ref(
         &self,
         repo_key: &str,
         branch: &str,
         expected_commit: &str,
         expected_data: &str,
         new_data: &str,
+        new_commit: &str,
+        new_synced_at: Option<i64>,
+        new_generation: Option<i64>,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE refs SET data = ?
+            "UPDATE refs SET data = ?, commit_id = ?, synced_at = ?, generation = ?
              WHERE repo_key = ? AND branch = ? AND commit_id = ? AND data = ?",
         )
         .bind(new_data)
+        .bind(new_commit)
+        .bind(new_synced_at)
+        .bind(new_generation)
         .bind(repo_key)
         .bind(branch)
         .bind(expected_commit)

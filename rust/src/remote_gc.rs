@@ -406,7 +406,7 @@ impl RemoteGc {
                 if info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
                     continue;
                 }
-                let last_touch = info.last_accessed_at.or(info.synced_at);
+                let last_touch = info.last_accessed_at;
                 let Some(last_touch) = last_touch else {
                     continue;
                 };
@@ -553,7 +553,6 @@ fn collect_pack_artifact(artifact: &PackArtifact, reachable: &mut HashSet<String
 fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
     add_hash(reachable, &info.skeleton_pack);
     add_hash(reachable, &info.skeleton_idx);
-    add_hash(reachable, &info.head_blobs_pack);
     add_hash(reachable, &info.head_blobs_idx);
     for chunk in &info.head_blobs_chunks {
         add_hash(reachable, chunk);
@@ -571,9 +570,6 @@ fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
     add_hash(reachable, &info.prebuilt_index);
     add_hash(reachable, &info.archive);
     add_hash(reachable, &info.manifest);
-    add_hash(reachable, &info.full_pack);
-    add_hash(reachable, &info.clonepack_manifest);
-    add_hash(reachable, &info.metadata_chunk);
     for chunk in &info.archive_chunks {
         add_hash(reachable, chunk);
     }
@@ -592,7 +588,7 @@ mod tests {
     use crate::cas::Cas;
     use crate::clonepack::hash_from_hex;
     use crate::provider::RepoId;
-    use crate::ref_store::{CachingRefStore, FileRefStore};
+    use crate::ref_store::{CachingRefStore, FileRefStore, exact_ref_key};
     use crate::storage::{HashEntry, StorageBackend, local};
     use std::time::Duration;
 
@@ -701,19 +697,17 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
             packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: manifest_hash.clone(),
-            metadata_chunk: metadata_hash,
             archive_chunks: vec![archive_hash],
             full_clonepack: ClonepackArtifacts {
                 manifest: manifest_hash,
+                metadata_chunk: metadata_hash,
+                commit: "abc".to_string(),
                 ..Default::default()
             },
             shallow_clonepack: ClonepackArtifacts::default(),
@@ -774,8 +768,8 @@ mod tests {
         assert!(!orphan_path.exists(), "orphan should be deleted");
 
         // Reachable objects should still exist.
-        assert!(cas.path(&info.clonepack_manifest).exists());
-        assert!(cas.path(&info.metadata_chunk).exists());
+        assert!(cas.path(&info.full_clonepack.manifest).exists());
+        assert!(cas.path(&info.full_clonepack.metadata_chunk).exists());
         assert!(cas.path(&info.archive_chunks[0]).exists());
     }
 
@@ -1193,16 +1187,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
             packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: String::new(),
-            metadata_chunk: String::new(),
             archive_chunks: Vec::new(),
             full_clonepack: ClonepackArtifacts::default(),
             shallow_clonepack: ClonepackArtifacts::default(),
@@ -1266,7 +1256,7 @@ mod tests {
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
-        let metadata_path = cas.path(&info.metadata_chunk);
+        let metadata_path = cas.path(&info.full_clonepack.metadata_chunk);
         let archive_path = cas.path(&info.archive_chunks[0]);
         assert!(manifest_path.exists());
         assert!(metadata_path.exists());
@@ -1294,6 +1284,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+    }
+
+    #[tokio::test]
+    async fn warm_ttl_evicts_an_aged_exact_admission_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let repo_id = RepoId::github("o/pending");
+        let commit = "1".repeat(40);
+        let key = exact_ref_key("main", &commit);
+        let old = unix_secs(SystemTime::now()).saturating_sub(10);
+        ref_store
+            .save_branch(
+                &repo_id,
+                &key,
+                &RefInfo {
+                    internal_exact_result: true,
+                    commit: commit.clone(),
+                    default_branch: "main".to_string(),
+                    build_status: Some("building".to_string()),
+                    synced_at: Some(old),
+                    last_accessed_at: Some(old),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        RemoteGc::new(
+            storage,
+            ref_store.clone(),
+            GcConfig {
+                grace_period: Duration::ZERO,
+                warm_ttl: Duration::from_secs(1),
+                dry_run: false,
+            },
+        )
+        .run()
+        .await
+        .unwrap();
+
+        let evicted = ref_store
+            .load_branch(&repo_id, &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evicted.commit, commit);
+        assert!(evicted.internal_exact_result);
+        assert_eq!(evicted.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
     }
 
     #[tokio::test]
@@ -1367,7 +1413,7 @@ mod tests {
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
-        let metadata_path = cas.path(&info.metadata_chunk);
+        let metadata_path = cas.path(&info.full_clonepack.metadata_chunk);
         let archive_path = cas.path(&info.archive_chunks[0]);
         assert!(manifest_path.exists());
         assert!(metadata_path.exists());

@@ -13,13 +13,19 @@ use ripclone::ref_store::{FileRefStore, RefStore};
 use ripclone::server::AdmissionTestProbe;
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const WEBHOOK_SECRET: &str = "immutable-admission-webhook-secret";
+
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn visit(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
@@ -65,6 +71,7 @@ async fn post_sync(
     let response = reqwest::Client::new()
         .post(url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("sync request");
@@ -105,7 +112,7 @@ async fn post_webhook(
     .into_bytes();
     let started = Instant::now();
     let response = reqwest::Client::new()
-        .post(format!("{}/v1/webhooks/github", server.url))
+        .post(format!("{}/webhooks/github", server.url))
         .header("X-GitHub-Event", "push")
         .header("X-Hub-Signature-256", sign_webhook(&body))
         .header("content-type", "application/json")
@@ -295,11 +302,56 @@ fn assert_full_artifacts(
     }
 }
 
+fn content_hashes(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::String(value)
+            if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            out.insert(value.clone());
+        }
+        Value::Array(values) => {
+            for value in values {
+                content_hashes(value, out);
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                if key == "raw_hash" {
+                    continue;
+                }
+                content_hashes(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn artifact_snapshot(
+    storage: &ripclone::storage::StorageRef,
+    info: &ripclone::RefInfo,
+) -> BTreeMap<String, Vec<u8>> {
+    let mut hashes = BTreeSet::new();
+    content_hashes(
+        &serde_json::to_value(info).expect("serialize artifact snapshot"),
+        &mut hashes,
+    );
+    hashes
+        .into_iter()
+        .map(|hash| {
+            let bytes = storage
+                .get(&hash)
+                .unwrap_or_else(|error| panic!("load artifact {hash}: {error:#}"));
+            (hash, bytes)
+        })
+        .collect()
+}
+
 /// Direct local composition: ready no-op, fast accepted response, duplicate
 /// coalescing before and after claim, separate C identity, exact B fetch after
 /// the origin moves, phase-one/full coalescing, and final C publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_sync_admission() {
+    let _guard = env_lock().lock().await;
     // One local worker makes the B/C queue order and detached Full barrier
     // observable without relying on build duration.
     unsafe {
@@ -311,7 +363,7 @@ async fn e2e_sync_admission() {
 
     let probe = Arc::new(AdmissionTestProbe::default());
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
-    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", WEBHOOK_SECRET)]).await;
+    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", WEBHOOK_SECRET)]).await;
     let origin = make_origin("acme", "immutable");
 
     let a = origin.commit(&[("value.txt", "A\n")], "A");
@@ -475,6 +527,7 @@ async fn e2e_sync_admission() {
             server.url
         ))
         .header("Authorization", "Ripclone definitely-wrong")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("unauthorized sync request");
@@ -665,7 +718,7 @@ async fn e2e_sync_admission() {
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = ripclone::provider::RepoId::github("acme/immutable");
     let b_build = store
-        .load_build(&repo_id, &b)
+        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &b))
         .await
         .expect("load exact B build")
         .expect("exact B build remains addressable before C publication");
@@ -728,71 +781,26 @@ async fn e2e_sync_admission() {
     );
     assert_full_artifacts(&local_storage, &final_ref, &c);
 
-    // A delayed older webhook is still an immutable A job, but Phase 003 does
-    // not publish a durable per-commit result for superseded work. The job must
-    // execute A exactly and every moving-ref write must remain fenced away from C.
-    let tip_probes_before_old_webhook = probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst);
-    let old_webhook_ref = store
-        .load_branch(&repo_id, "main")
+    let exact_b_key = format!(":main#{b}");
+    let exact_b = store
+        .load_branch(&repo_id, &exact_b_key)
         .await
-        .expect("snapshot C before delayed webhook")
-        .expect("C moving ref exists");
-    let old_webhook_ref = serde_json::to_value(old_webhook_ref).expect("serialize C snapshot");
-    probe.before_claim.arm();
-    probe.fetch_entry.arm();
-    let (old_webhook_status, old_webhook_elapsed) = post_webhook(&server, "main", &a).await;
-    assert_eq!(old_webhook_status, reqwest::StatusCode::OK);
-    assert!(old_webhook_elapsed < Duration::from_secs(5));
+        .expect("load exact B after C")
+        .expect("exact B remains addressable after C");
+    assert_full_artifacts(&local_storage, &exact_b, &b);
     assert_eq!(
-        probe
-            .queue_inserts
-            .load(std::sync::atomic::Ordering::SeqCst),
-        3,
-        "superseded A is a separate immutable attempt after C"
+        exact_b.moving_admission_successors,
+        vec![c.clone()],
+        "C is durably linked from B without scanning stored refs"
     );
     assert_eq!(
-        probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst),
-        tip_probes_before_old_webhook,
-        "older signed webhook must not probe the moving tip"
-    );
-    wait_entered(&probe.before_claim, 1).await;
-    probe.before_claim.release();
-    probe.before_claim.disarm();
-    wait_entered(&probe.fetch_entry, 1).await;
-    assert_eq!(
-        probe
-            .fetch_targets
-            .lock()
-            .unwrap()
-            .last()
-            .map(String::as_str),
-        Some(a.as_str()),
-        "late A job exact-fetches its admitted commit"
-    );
-    probe.fetch_entry.release();
-    probe.fetch_entry.disarm();
-    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
-        .await
-        .expect("late exact A work completed");
-    let final_after_old = store
-        .load_branch(&repo_id, "main")
-        .await
-        .expect("reload branch after late A work")
-        .expect("ordinary branch remains present");
-    assert_eq!(final_after_old.commit, c);
-    assert_eq!(final_after_old.full_clonepack.commit, c);
-    assert_eq!(
-        serde_json::to_value(final_after_old).expect("serialize C after delayed work"),
-        old_webhook_ref,
-        "late A may acquire source and write disposable artifacts, but must not mutate C metadata"
-    );
-    let branches = store
-        .list_branches(&repo_id)
-        .await
-        .expect("list ordinary publication refs");
-    assert!(
-        branches.iter().all(|branch| !branch.contains('#')),
-        "ordinary immutable work must not create synthetic aliases: {branches:?}"
+        store
+            .load_branch(&repo_id, &format!(":main#{c}"))
+            .await
+            .expect("load exact C")
+            .expect("exact C remains addressable")
+            .commit,
+        c
     );
 
     // A real HTTP admission whose one ls-remote hangs is bounded and leaves no
@@ -914,6 +922,7 @@ async fn e2e_sync_admission() {
         reqwest::Client::new()
             .post(cancel_url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
     });
@@ -957,9 +966,9 @@ async fn e2e_sync_admission() {
         "cancelled resolution admitted work"
     );
 
-    // A compatibility caller performs one moving POST, learns the exact target,
+    // A caller performs one moving POST, learns the exact target,
     // and then waits exclusively through authenticated pinned metadata GETs.
-    let wait_commit = origin.commit(&[("value.txt", "wait\n")], "compatibility wait");
+    let wait_commit = origin.commit(&[("value.txt", "wait\n")], "pinned wait");
     origin.publish();
     reset_probe(&probe);
     probe.phase2_entry.arm();
@@ -968,12 +977,12 @@ async fn e2e_sync_admission() {
         wait_client
             .sync_repo("acme/immutable", None)
             .await
-            .expect("compatibility sync becomes ready")
+            .expect("sync becomes ready")
     });
     wait_entered(&probe.phase2_entry, 1).await;
     tokio::time::timeout(Duration::from_secs(10), probe.wait_until_http_trace_len(2))
         .await
-        .expect("compatibility caller reached pinned GET");
+        .expect("caller reached pinned GET");
     let trace = probe.http_trace.lock().unwrap().clone();
     assert_eq!(
         trace.first().map(String::as_str),
@@ -982,22 +991,24 @@ async fn e2e_sync_admission() {
     assert_eq!(
         trace.iter().filter(|event| event.contains("/sync")).count(),
         1,
-        "compatibility wait repeated moving sync: {trace:?}"
+        "pinned wait repeated moving sync: {trace:?}"
     );
     assert!(
         trace.iter().skip(1).all(|event| event.starts_with(&format!(
             "GET /v1/repos/{}/refs/main?pinned={wait_commit}&clonepack=full",
             repo_id.storage_key()
         ))),
-        "compatibility wait used an unpinned or mutating follow-up: {trace:?}"
+        "pinned wait used an unpinned or mutating follow-up: {trace:?}"
     );
     probe.phase2_entry.release();
     probe.phase2_entry.disarm();
     let waited = tokio::time::timeout(Duration::from_secs(60), wait_task)
         .await
-        .expect("compatibility wait completed")
-        .expect("compatibility task joined");
+        .expect("pinned wait completed")
+        .expect("pinned task joined");
     assert_eq!(waited.commit, wait_commit);
+    let settled_wait = sync_until_archive_ready(&server, "acme", "immutable").await;
+    assert_eq!(settled_wait.commit, wait_commit);
 
     // Admit an exact target, make only that object unreachable before the
     // claimed worker may fetch, and prove the real local queue/worker reports
@@ -1063,31 +1074,75 @@ async fn e2e_sync_admission() {
         tree_snapshot(&server.storage_dir),
         "unavailable exact job wrote artifacts"
     );
+    let failed_key = format!(":main#{unavailable}");
+    let failed = store
+        .load_branch(&repo_id, &failed_key)
+        .await
+        .expect("load failed exact row")
+        .expect("failed exact row exists before publication");
+    assert_eq!(failed.commit, unavailable);
+    assert!(
+        failed
+            .build_status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("failed: ")),
+        "permanent exact failure is terminal: {failed:?}"
+    );
+    let enqueues_before_failed_polls = probe.enqueue_attempts.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/v1/repos/github/acme/immutable/refs/main?clonepack=full&pinned={unavailable}",
+                server.url
+            ))
+            .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+            .send()
+            .await
+            .expect("poll failed exact target");
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = response.json().await.expect("failed exact response");
+        assert!(body["error"].as_str().unwrap().contains(&unavailable));
+    }
+    assert_eq!(
+        probe.enqueue_attempts.load(Ordering::SeqCst),
+        enqueues_before_failed_polls,
+        "terminal exact failure must not enqueue again"
+    );
 
     // An evicted completed row is not treated as ready and its historical done
     // job does not block one fresh exact admission.
-    let mut evicted = after_unavailable;
+    let evicted_target = origin.commit(&[("value.txt", "evicted\n")], "evicted target");
+    origin.publish();
+    let evicted_key = format!(":main#{evicted_target}");
+    let mut evicted = store
+        .load_branch(&repo_id, &format!(":main#{wait_commit}"))
+        .await
+        .expect("load exact completed row before eviction")
+        .expect("exact completed row exists");
+    evicted.commit = evicted_target.clone();
+    evicted.full_clonepack.commit = evicted_target.clone();
+    evicted.shallow_clonepack.commit = evicted_target.clone();
     evicted.build_status = Some("evicted".to_string());
     store
-        .save_branch(&repo_id, "main", &evicted)
+        .save_branch(&repo_id, &evicted_key, &evicted)
         .await
-        .expect("mark exact row evicted");
-    let mut evicted_head = store
-        .load_branch(&repo_id, "HEAD")
-        .await
-        .expect("load exact HEAD alias before eviction")
-        .expect("HEAD alias exists");
-    assert_eq!(evicted_head.commit, wait_commit);
-    evicted_head.build_status = Some("evicted".to_string());
-    store
-        .save_branch(&repo_id, "HEAD", &evicted_head)
-        .await
-        .expect("mark exact HEAD alias evicted");
+        .expect("mark exact completed row evicted");
+    assert_eq!(
+        store
+            .load_branch(&repo_id, &evicted_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .build_status
+            .as_deref(),
+        Some("evicted")
+    );
     reset_probe(&probe);
     probe.before_claim.arm();
     let (evicted_status, evicted_body, evicted_elapsed) = post_sync(&server, None).await;
     assert_eq!(evicted_status, reqwest::StatusCode::ACCEPTED);
-    assert_eq!(response_commit(&evicted_body), wait_commit);
+    assert_eq!(response_commit(&evicted_body), evicted_target);
     assert_eq!(
         probe
             .queue_inserts
@@ -1128,5 +1183,545 @@ async fn e2e_sync_admission() {
         cancel_started.elapsed().as_millis(),
         evicted_elapsed.as_millis(),
         cli_add_elapsed.as_millis(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_build_publishes_exact_commit_result() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let (server, phase_one, phase_one_entered, phase_one_proceed) =
+        start_server_split_storage_phase_one_barrier().await;
+    let origin = make_origin("acme", "ordinary-exact-publish");
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/ordinary-exact-publish")
+        .await
+        .expect("register ordinary exact fixture");
+    server
+        .client()
+        .sync_repo("acme/ordinary-exact-publish", None)
+        .await
+        .expect("publish initial A");
+
+    let probe = Arc::new(AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    phase_one.arm();
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    let admission = server
+        .client()
+        .admit_sync_repo("acme/ordinary-exact-publish", None)
+        .await
+        .expect("admit B");
+    assert!(admission.accepted);
+    assert_eq!(admission.commit, b);
+    tokio::time::timeout(Duration::from_secs(20), phase_one_entered)
+        .await
+        .expect("B phase-one publication entered")
+        .expect("phase-one barrier sender alive");
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/ordinary-exact-publish");
+    let exact_key = format!(":main#{b}");
+    let phase_one_exact = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load exact phase-one B")
+        .expect("ordinary build published exact phase-one B");
+    assert_eq!(phase_one_exact.commit, b);
+    assert_eq!(phase_one_exact.full_clonepack.commit, a);
+    assert_eq!(
+        phase_one_exact.build_status.as_deref(),
+        Some("full history building")
+    );
+
+    phase_one_proceed
+        .send(())
+        .expect("release B phase-one publication");
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("B full publication");
+    let exact = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load exact B")
+        .expect("exact B remains addressable");
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open exact storage");
+    assert_full_artifacts(&storage, &exact, &b);
+    let moving = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load moving B")
+        .expect("moving B row");
+    assert_eq!(moving.commit, b);
+    assert_full_artifacts(&storage, &moving, &b);
+    let branches = store
+        .list_branches(&repo_id)
+        .await
+        .expect("list ordinary exact refs");
+    assert!(branches.iter().any(|branch| branch == &exact_key));
+    assert!(
+        branches
+            .iter()
+            .all(|branch| branch != &format!(":HEAD#{b}")),
+        "ordinary exact publication does not create a HEAD#commit alias: {branches:?}"
+    );
+    let status = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/ordinary-exact-publish/status",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("ordinary exact status");
+    assert_eq!(status.status(), reqwest::StatusCode::OK);
+    let status: serde_json::Value = status.json().await.expect("ordinary exact status body");
+    let public_refs = status["refs"].as_array().expect("public source refs");
+    assert!(
+        public_refs.iter().any(|entry| entry["branch"] == "main"),
+        "moving source branch remains public: {public_refs:?}"
+    );
+    assert!(
+        public_refs.iter().all(|entry| entry["branch"] != exact_key),
+        "internal exact result must not appear as a source branch: {public_refs:?}"
+    );
+    assert!(status["total_bytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_and_explicit_requests_share_one_exact_job() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.before_claim.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    let origin = make_origin("acme", "one-exact-job");
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/one-exact-job")
+        .await
+        .expect("register exact-job fixture");
+
+    let ordinary = server
+        .client()
+        .admit_sync_repo("acme/one-exact-job", None)
+        .await
+        .expect("ordinary B admission");
+    assert!(ordinary.accepted);
+    assert_eq!(ordinary.commit, b);
+    wait_entered(&probe.before_claim, 1).await;
+
+    let explicit = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/repos/github/acme/one-exact-job/sync?branch=main&rev={b}",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("explicit B admission");
+    assert_eq!(explicit.status(), reqwest::StatusCode::ACCEPTED);
+    let pending: Value = explicit.json().await.expect("typed pending response");
+    assert_eq!(pending["commit"], b);
+    assert_eq!(pending["branch"], "main");
+    assert_eq!(
+        probe.queue_inserts.load(Ordering::SeqCst),
+        1,
+        "ordinary and explicit B must coalesce onto one active job"
+    );
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/one-exact-job");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
+    let pending_row = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load shared exact row")
+        .expect("shared exact row exists before claim");
+    assert!(pending_row.internal_exact_result);
+    assert_eq!(pending_row.commit, b);
+
+    probe.before_claim.release();
+    probe.before_claim.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("shared B build completes");
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
+    let moving = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load ordinary-first moving row")
+        .expect("ordinary-first moving row");
+    assert_eq!(moving.commit, b);
+    let head = store
+        .load_branch(&repo_id, "HEAD")
+        .await
+        .expect("load ordinary-first HEAD row")
+        .expect("ordinary-first HEAD row");
+    assert_eq!(head.commit, b);
+    unsafe {
+        std::env::remove_var("RIPCLONE_RECHECK_MAX");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_job_promoted_by_ordinary_admission_publishes_moving_projection() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.builder_entry.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    let origin = make_origin("acme", "promoted-exact-job");
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/promoted-exact-job")
+        .await
+        .expect("register promoted exact-job fixture");
+
+    let explicit = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/repos/github/acme/promoted-exact-job/sync?branch=main&rev={b}",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("explicit-first B admission");
+    assert_eq!(explicit.status(), reqwest::StatusCode::ACCEPTED);
+    wait_entered(&probe.builder_entry, 1).await;
+
+    let ordinary = server
+        .client()
+        .admit_sync_repo("acme/promoted-exact-job", None)
+        .await
+        .expect("ordinary B promotion");
+    assert!(ordinary.accepted);
+    assert_eq!(ordinary.commit, b);
+    assert_eq!(
+        probe.queue_inserts.load(Ordering::SeqCst),
+        1,
+        "explicit-first and ordinary-second B must share one active job"
+    );
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/promoted-exact-job");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
+    let promoted = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load promoted exact row")
+        .expect("promoted exact row");
+    assert_eq!(promoted.commit, b);
+    assert!(
+        !promoted.moving_publication_predecessors.is_empty(),
+        "ordinary admission durably promotes the already-running explicit job"
+    );
+
+    probe.builder_entry.release();
+    probe.builder_entry.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("promoted shared B build completes");
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
+    let exact = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load promoted exact result")
+        .expect("promoted exact result");
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open promoted storage");
+    assert_full_artifacts(&storage, &exact, &b);
+    assert_eq!(
+        store
+            .load_branch(&repo_id, "main")
+            .await
+            .expect("load promoted moving row")
+            .expect("promoted moving row")
+            .commit,
+        b
+    );
+    assert_eq!(
+        store
+            .load_branch(&repo_id, "HEAD")
+            .await
+            .expect("load promoted HEAD row")
+            .expect("promoted HEAD row")
+            .commit,
+        b
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_only_job_never_publishes_moving_projection() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    let origin = make_origin("acme", "explicit-only-job");
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/explicit-only-job")
+        .await
+        .expect("register explicit-only fixture");
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/repos/github/acme/explicit-only-job/sync?branch=main&rev={b}",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("explicit-only B admission");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("explicit-only B build completes");
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/explicit-only-job");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
+    let exact = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load explicit-only exact result")
+        .expect("explicit-only exact result");
+    assert_eq!(exact.commit, b);
+    assert!(exact.moving_publication_predecessors.is_empty());
+    assert!(
+        store.load_branch(&repo_id, "main").await.unwrap().is_none(),
+        "explicit-only work must not publish main"
+    );
+    assert!(
+        store.load_branch(&repo_id, "HEAD").await.unwrap().is_none(),
+        "explicit-only work must not publish HEAD"
+    );
+}
+
+/// A historical sync's phase-one row is metadata and shallow readiness only.
+/// Holding phase two at its entry makes the HTTP readiness decision observable:
+/// the first response must be exact pending until Full(commit) is durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn historical_sync_requires_exact_full_before_ready() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.phase2_entry.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    let origin = make_origin("acme", "historical-full-ready");
+    let pinned = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.commit(&[("value.txt", "C\n")], "C");
+    origin.publish();
+    register_added_without_build(&server, "acme/historical-full-ready")
+        .await
+        .expect("register historical readiness fixture");
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/repos/github/acme/historical-full-ready/sync?rev=HEAD~1",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("historical sync phase-one response");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "phase one cannot report exact Full readiness"
+    );
+    let pending: Value = response.json().await.expect("typed exact pending body");
+    assert_eq!(pending["commit"], pinned);
+    assert_eq!(pending["branch"], "main");
+
+    wait_entered(&probe.phase2_entry, 1).await;
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/historical-full-ready");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
+    let phase_one = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load historical phase-one row")
+        .expect("historical phase-one row is durable");
+    assert!(phase_one.internal_exact_result);
+    assert_eq!(phase_one.commit, pinned);
+    assert_eq!(
+        phase_one.build_status.as_deref(),
+        Some("full history building")
+    );
+    assert!(phase_one.full_clonepack.manifest.is_empty());
+
+    probe.phase2_entry.release();
+    let ready = server
+        .client()
+        .sync_repo_at("acme/historical-full-ready", Some("HEAD~1"), None)
+        .await
+        .expect("historical sync reaches exact Full readiness");
+    assert_eq!(ready.commit, pinned);
+    let exact = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load historical exact result")
+        .expect("historical exact result remains durable");
+    assert_eq!(exact.full_clonepack.commit, pinned);
+    assert!(!exact.full_clonepack.manifest.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_b_exact_publish_does_not_mutate_c() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let (server, phase_one, phase_one_entered, phase_one_proceed) =
+        start_server_split_storage_phase_one_barrier().await;
+    let origin = make_origin("acme", "late-exact-publish");
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/late-exact-publish")
+        .await
+        .expect("register late publication fixture");
+    server
+        .client()
+        .sync_repo("acme/late-exact-publish", None)
+        .await
+        .expect("publish initial A");
+
+    let probe = Arc::new(AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    phase_one.arm();
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    let b_admission = server
+        .client()
+        .admit_sync_repo("acme/late-exact-publish", None)
+        .await
+        .expect("admit B");
+    assert!(b_admission.accepted);
+    assert_eq!(b_admission.commit, b);
+    let exact_key = format!(":main#{b}");
+    tokio::time::timeout(Duration::from_secs(20), phase_one_entered)
+        .await
+        .expect("B phase-one publication entered")
+        .expect("phase-one barrier sender alive");
+
+    git(&origin.work, &["reset", "--hard", &a]);
+    let c = origin.commit(&[("value.txt", "C\n")], "divergent C");
+    origin.publish();
+    let c_admission = server
+        .client()
+        .admit_sync_repo("acme/late-exact-publish", None)
+        .await
+        .expect("admit C");
+    assert!(c_admission.accepted);
+    assert_eq!(c_admission.commit, c);
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("C full publication while B is held");
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/late-exact-publish");
+    let moving_c = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load C before delayed B")
+        .expect("C moving row");
+    assert_eq!(moving_c.commit, c);
+    let exact_b_phase_one = store
+        .load_branch(&repo_id, &exact_key)
+        .await
+        .expect("load held exact B")
+        .expect("held exact B row");
+    assert_eq!(
+        exact_b_phase_one.generation, moving_c.generation,
+        "divergent B and C must have equal history depth"
+    );
+    let moving_json = serde_json::to_value(&moving_c).expect("serialize C before delayed B");
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open late storage");
+    let moving_artifacts = artifact_snapshot(&storage, &moving_c);
+    let exact_c = store
+        .load_branch(&repo_id, &format!(":main#{c}"))
+        .await
+        .expect("load exact C before delayed B")
+        .expect("exact C before delayed B");
+    assert_full_artifacts(&storage, &exact_c, &c);
+
+    phase_one_proceed
+        .send(())
+        .expect("release delayed B publication");
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))
+        .await
+        .expect("B and C full publications");
+    let final_c = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("reload moving row after B")
+        .expect("moving row after B");
+    assert_eq!(final_c.commit, c);
+    assert_eq!(
+        serde_json::to_value(&final_c).expect("serialize C after delayed B"),
+        moving_json,
+        "late B exact publication leaves moving C metadata unchanged"
+    );
+    assert_eq!(
+        artifact_snapshot(&storage, &final_c),
+        moving_artifacts,
+        "late B exact publication leaves C artifacts byte-identical"
+    );
+    let exact_b = store
+        .load_branch(&repo_id, &format!(":main#{b}"))
+        .await
+        .expect("load delayed exact B")
+        .expect("delayed exact B row");
+    assert_full_artifacts(&storage, &exact_b, &b);
+    assert_eq!(
+        store
+            .load_branch(&repo_id, "HEAD")
+            .await
+            .expect("load HEAD after delayed B")
+            .expect("HEAD after delayed B")
+            .commit,
+        c,
+        "late B cannot move HEAD backward"
+    );
+    assert_eq!(
+        probe
+            .queue_inserts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "B and C are the only admitted jobs"
     );
 }

@@ -29,7 +29,10 @@ lint() {
 # staging the full suite there was ~30m cold before integration-test
 # consolidation and is not worth it.
 run_tests() {
-  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked )
+  # Combined harnesses contain existing tests that select backends through
+  # process-global environment variables. Preserve their former cross-file
+  # isolation by running one test at a time inside each bounded harness.
+  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked -- --test-threads=1 )
 }
 
 e2e() {
@@ -42,6 +45,7 @@ e2e() {
     export RIPCLONE_BIN_DIR="$ROOT/rust/target/$profile"
   fi
   bash "$ROOT/scripts/e2e_local.sh"
+  bash "$ROOT/scripts/e2e_smart_http.sh"
 }
 
 # Historical flake-guard (ran the suite twice). Kept as an alias of `test` so
@@ -78,14 +82,6 @@ gitea() {
 databases() {
   export CARGO_PROFILE="${CARGO_PROFILE:-ci}"
   bash "$ROOT/scripts/test-queue-sql.sh"
-  if [ -n "${CI_ARTIFACTS:-}" ]; then
-    local bin="$CI_ARTIFACTS/e2e_worker_libsql"
-    [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
-    echo "databases: running prebuilt $bin"
-    ( cd "$ROOT/rust" && "$bin" --nocapture )
-  else
-    ( cd "$ROOT/rust" && cargo test --profile "$CARGO_PROFILE" --locked --test e2e_worker_libsql -- --nocapture )
-  fi
 }
 
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
@@ -111,11 +107,6 @@ benchmark() {
 # gitea/databases/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
 ci_build() {
   bash "$ROOT/scripts/ci-build-artifacts.sh"
-}
-
-# Back-compat alias used by older workflow snippets / local muscle memory.
-s3gc_build() {
-  ci_build
 }
 
 # Run the S3-backed remote GC end-to-end suite against a local MinIO container

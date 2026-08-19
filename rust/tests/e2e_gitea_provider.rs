@@ -226,7 +226,6 @@ fn ripclone(config: &Path, server_url: &str, cwd: &Path, args: &[&str]) -> std::
         // The client must NOT hold an upstream provider token; prove the server
         // side supplies it. Clear any inherited provider env for good measure.
         .env_remove("RIPCLONE_PROVIDERS")
-        .env_remove("RIPCLONE_GITHUB_TOKEN")
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr))
         .status()
@@ -263,7 +262,7 @@ async fn wait_for_editable_full_b_to_settle(
             .get(url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
             .header("X-Upstream-Token", upstream_token)
-            .header("x-ripclone-protocol", "2")
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
         {

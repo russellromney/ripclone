@@ -252,24 +252,7 @@ async fn main() -> Result<()> {
                     repo_id.storage_key(),
                     claimed.branch
                 );
-                let Some(admitted_commit) = claimed.admitted_commit.clone() else {
-                    let error = BuildError::permanent(
-                        "legacy queued job has no admitted commit; resubmit sync",
-                    );
-                    match queue.ack(job_id, &worker_id, Err(error)).await {
-                        Ok(_) => {
-                            if let Some(ref cur) = current_job {
-                                cur.store(-1, Ordering::Relaxed);
-                            }
-                            jobs_done += 1;
-                            continue;
-                        }
-                        Err(e) => {
-                            error!("failed to settle legacy job {job_id}: {e:#}");
-                            break;
-                        }
-                    }
-                };
+                let admitted_commit = claimed.admitted_commit.clone();
                 if let Err(e) = ripclone::validation::validate_object_id(&admitted_commit) {
                     let error = BuildError::permanent(format!(
                         "queued job has invalid admitted commit: {e}"
@@ -303,8 +286,7 @@ async fn main() -> Result<()> {
                 let job = BuildJob {
                     repo_id: repo_id.clone(),
                     branch: branch.clone(),
-                    rev: None,
-                    admitted_commit: Some(admitted_commit),
+                    admitted_commit,
                     admitted_default_branch: claimed.admitted_default_branch,
                     credential,
                     // The SQL queue does not persist the re-check counter; a

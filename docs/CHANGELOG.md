@@ -2,13 +2,18 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `internal/ROADMAP.md`.
 
+## One current wire implementation
+
+- **Authenticated API requests have one implementation** (`rust/src/client.rs`, `rust/src/server.rs`): the ripclone client declares the current `PROTOCOL_VERSION`; an explicitly malformed or mismatched declaration returns `426 Upgrade Required`. A missing declaration is an unversioned caller of that same implementation, which keeps vanilla Git and ordinary HTTP integrations working. Current ref and pending responses require their complete current fields, including explicit archive readiness and Full top-up support. No request or response shape selects an older implementation.
+- **Removed retired compatibility surfaces**: deleted the snapshot/sidecar CLI and API lane, old artifact URL aliases, config-token migration, old webhook and provider-token aliases, old queue/ref startup migrations, and deprecated manifest readers. Provider-qualified routes and exact commit-keyed artifacts are the sole current API and storage paths.
+
 ## Exact sync admission
 
 - **Ordinary tip sync now admits an immutable commit before queueing** (`rust/src/server.rs`, `rust/src/git.rs`): one bounded `ls-remote` resolves B, a complete ready B returns a mutation-free `200`, and changed work returns `202` with `commit` and `branch` without waiting for the builder. The CLI reports `accepted B` or `already current at B`.
-- **CLI readiness compatibility is explicit** (`rust/src/bin/cli.rs`, `docs/SYNC.md`): normal `add` and `sync` remain fast, while `add --wait` and `sync --wait` retain the readiness-oriented flow by polling exact pinned metadata after the first `202` without repeating a moving POST.
+- **CLI readiness behavior is explicit** (`rust/src/bin/cli.rs`, `docs/SYNC.md`): normal `add` and `sync` remain fast, while `add --wait` and `sync --wait` poll exact pinned metadata after the first `202` without repeating a moving POST.
 - **Active work is keyed by repository, branch, and exact admitted commit** (`rust/src/queue/`, `rust/src/api_job_queue.rs`): duplicates coalesce while queued, claimed, or in embedded Full work; a later commit remains a separate job. The commit crosses SQL/API-worker/standalone-worker transports, and workers exact-fetch and build it even if the branch moves.
 - **Signed push webhooks use their validated `after` commit directly** (`rust/src/server.rs`): they perform no second tip probe. Readiness-oriented library callers pin the admitted commit and use exact metadata GETs after the first `202`; they do not repeat a moving POST.
-- **Queue upgrades settle unsafe legacy active rows**: rows without a knowable admitted commit fail permanently with `resubmit sync` before source work. Drain or stop old direct workers before starting new writers. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
+- **Every job has one required admitted SHA** and fails closed if that identity is malformed. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
 
 ## Cold-history pack and benchmark performance
 
@@ -99,9 +104,8 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 ## Sync / ref-store correctness
 
 - **Per-stage phase-1 sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, HEAD packs, skeleton build, files table, prebuilt index, phase-1 upload, and ref publish. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with phase timings and per-artifact-class storage amplification for each build.
-- **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under `{branch}#{commit}` instead of `{branch}#{rev}`. This prevents stale/incomplete rev-keyed refs from blocking future syncs of the same tag and makes different revs that resolve to the same commit share a build.
-- **Commit-keyed reuse for file and S3 metadata stores** (`rust/src/ref_store.rs`): `RefStore::load_build` is now implemented for `FileRefStore` and `S3RefStore`, so a sync of branch `bar` can reuse a completed build of branch `foo` at the same commit instead of rebuilding.
-- **Don't reuse completed builds that lack a files archive** (`rust/src/server.rs`): `reuse_existing_build` no longer returns a full clonepack whose archive chunks are empty (unless archive generation is still in progress), which previously left files-mode clones polling forever.
+- **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under the internal `:{branch}#{commit}` namespace instead of `{branch}#{rev}`. The leading `:` cannot occur in a Git ref, so exact results cannot collide with real source branches. Different revs that resolve to the same commit share a build.
+- **Exact results are branch scoped** (`rust/src/ref_store.rs`): each branch and commit owns one internal result; workers do not republish a different branch's stored build.
 - **git index-pack fallback** (`rust/src/git.rs`): when gix fails to index a pack containing ref deltas (e.g. `oven-sh/bun`), ripclone falls back to the stock `git index-pack` subprocess.
 
 ## Version reconciliation (CLI ↔ server)
@@ -109,7 +113,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 - **`ripclone --version` and `ripclone-server --version`** now report the build version (they previously errored).
 - **`/v1/version`** (`rust/src/server.rs`): a public, unauthenticated endpoint returning `{ version, protocol }` so a client can check compatibility without credentials.
 - **`ripclone version`** (`rust/src/bin/cli.rs`): prints the CLI's version + protocol, queries the configured server's `/v1/version`, and reports a compatibility verdict. Compatibility is keyed on a new wire **`PROTOCOL_VERSION`** (`rust/src/lib.rs`), not the build version — so the CLI and server can be released on independent cadences as long as their protocol versions match. Bump `PROTOCOL_VERSION` only on a breaking protocol change.
-- **Server enforces the protocol** (`rust/src/client.rs`, `rust/src/server.rs`): the client sends its `PROTOCOL_VERSION` on authenticated requests, and the server rejects a *newer-than-it-understands* client with `426 Upgrade Required` and an actionable message instead of a confusing downstream error. A missing header (legacy client) or an older/equal protocol is allowed, so this never breaks existing clients.
+- **Server enforces the protocol** (`rust/src/client.rs`, `rust/src/server.rs`): the client sends its `PROTOCOL_VERSION` on authenticated requests. The former missing-header rejection described here is superseded by “One current wire implementation” above; only an explicit malformed or mismatched declaration returns `426 Upgrade Required`.
 
 ## Supply chain
 
@@ -132,7 +136,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 - **Standalone `ripclone-worker` binary** (`rust/src/bin/ripclone-worker.rs`): claims jobs from a SQL queue and runs the same build as the in-process worker, so sync work can be farmed out to other processes/machines. Current `/sync` admission returns after ready detection or queue acceptance; readiness-oriented clients poll exact pinned metadata. Per-request credentials may ride with their selected queue job and are cleared when it is settled; otherwise the worker resolves them from provider config. One scratch `--repo-root` per worker.
 - **Pluggable metadata store** (`RIPCLONE_METADATA` = `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql`), decoupled from storage; unset follows storage (S3 if configured, else file). A `MetaDb` adapter + `SqlRefStore` implementing `RefStore` over one `repo_key` (`RepoId::storage_key`) + branch row (`rust/src/meta/`), with the same save-ordering policy as the S3 store and a `health()` probe. Holds pointers only — never file bytes.
 - **Shared backend wiring** (`rust/src/backends.rs`): `Backends::from_env` + queue/metadata selection, used by both the server and the worker so they configure identically.
-- Cross-process correctness: the server invalidates its ref caches after a worker build, and a HEAD sync resolves from the metadata store alone (a `HEAD` ref alias) so a server without the local mirror never returns an empty ref. `?rev=` builds are rejected on the cross-process queue (use the local queue). Real-DB tested on Postgres/MySQL (`scripts/test-queue-sql.sh`) and a local `sqld` for libsql, plus a diskless (separate-`repo_root`) farm-out e2e. See `docs/BACKENDS.md`.
+- Cross-process correctness: the server invalidates its ref caches after a worker build, and a HEAD sync resolves from the metadata store alone (a `HEAD` ref alias) so a server without the local mirror never returns an empty ref. Explicit revisions use the same admitted-SHA queue as ordinary requests. Real-DB tested on Postgres/MySQL (`scripts/test-queue-sql.sh`) and a local `sqld` for libsql, plus a diskless (separate-`repo_root`) farm-out e2e. See `docs/BACKENDS.md`.
 
 ## Multi-provider auth (Phases 1 & 2)
 
@@ -226,7 +230,8 @@ Every command in the README and `docs/` was run verbatim against a real server. 
   - `ClonepackManifest` now carries `repeated ChunkRef head_blobs_chunks` (default 8 MB each).
   - `RefInfo` and `RefResponse` carry the chunk hashes and signed URLs.
   - Client `fetch_chunk_refs` downloads chunks concurrently with configurable `RIPCLONE_FETCH_CONCURRENCY`.
-  - Old single-pack manifests are still parsed for compatibility.
+  - Superseded: the single-pack manifest reader was later removed; current
+    manifests use the chunk list exclusively.
 
 - **Fixed `benchmark/remote.sh` manifest parsing**
   - The script no longer stores binary protobuf in a shell variable, which corrupted the data and reported `archive chunks: 1`.
@@ -353,11 +358,11 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 ## Smart-HTTP fallback endpoints
 
 - **Vanilla git compatibility** (`rust/src/server.rs`)
-  - `GET /v1/git/{owner}/{repo}/info/refs?service=git-upload-pack` advertises
+  - `GET /v1/git/github/{owner}/{repo}/info/refs?service=git-upload-pack` advertises
     refs using the local bare mirror.
-  - `POST /v1/git/{owner}/{repo}/git-upload-pack` runs `git upload-pack
+  - `POST /v1/git/github/{owner}/{repo}/git-upload-pack` runs `git upload-pack
     --stateless-rpc` against the mirror so a plain `git clone
-    http://server/v1/git/owner/repo` works without the archive-first path.
+    http://server/v1/git/github/owner/repo` works without the archive-first path.
   - Useful for cold caches or clients that cannot use the remote helper.
 
 - **Validation**

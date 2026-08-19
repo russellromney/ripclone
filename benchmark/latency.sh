@@ -141,8 +141,8 @@ cas_path() {
   local h="$1"
   echo "$CAS_DIR/${h:0:2}/${h}"
 }
-AUTH_HASH=$(printf '%s' "${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}" | shasum -a 256 | awk '{print $1}')
-ref_json=$(curl -fsS -H "Authorization: Ripclone $AUTH_HASH" "$SERVER_URL/v1/repos/$OWNER/$NAME/refs/HEAD")
+AUTH_HASH=$(printf '%s' "${RIPCLONE_SERVER_TOKEN:-}" | shasum -a 256 | awk '{print $1}')
+ref_json=$(curl -fsS -H "Authorization: Ripclone $AUTH_HASH" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/refs/HEAD")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 
 echo ""
@@ -158,7 +158,7 @@ total=0
 for n in $(seq 1 "$ITER"); do
   install_dir="$BASE_DIR/install-$n"
   install_start=$(now_ms)
-  "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --dir "$install_dir"
+  "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$install_dir"
   install_end=$(now_ms)
   elapsed=$((install_end - install_start))
   total=$((total + elapsed))

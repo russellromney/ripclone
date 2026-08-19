@@ -43,23 +43,6 @@ impl MetaDb for LibsqlMeta {
             )
             .await
             .context("create refs table")?;
-        // Index for commit-keyed reuse (get_by_commit); the PK is (repo_key,
-        // branch), so a by-commit lookup would otherwise scan the repo's branches.
-        self.conn()
-            .await?
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_refs_commit ON refs (repo_key, commit_id)",
-                (),
-            )
-            .await
-            .context("create refs commit index")?;
-        // Add the generation column to a table created before it existed
-        // (best-effort: errors on an up-to-date table, which is fine).
-        let _ = self
-            .conn()
-            .await?
-            .execute("ALTER TABLE refs ADD COLUMN generation BIGINT", ())
-            .await;
         self.conn()
             .await?
             .execute(
@@ -94,27 +77,6 @@ impl MetaDb for LibsqlMeta {
         }
     }
 
-    async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>> {
-        let conn = self.conn().await?;
-        let mut rows = conn
-            .query(
-                "SELECT data, commit_id, synced_at FROM refs
-                 WHERE repo_key = ? AND commit_id = ?",
-                libsql::params![repo_key, commit],
-            )
-            .await
-            .context("get refs by commit")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(RefRow {
-                data: row.get::<String>(0)?,
-                commit_id: row.get::<String>(1)?,
-                synced_at: row.get::<Option<i64>>(2)?,
-            });
-        }
-        Ok(out)
-    }
-
     async fn save_ordered(
         &self,
         repo_key: &str,
@@ -123,7 +85,13 @@ impl MetaDb for LibsqlMeta {
         commit_id: &str,
         synced_at: Option<i64>,
         generation: Option<i64>,
+        require_matching_commit: bool,
+        internal_exact_result: bool,
+        moving_publication_predecessor: Option<&str>,
     ) -> Result<()> {
+        let insert_only = i64::from(internal_exact_result && require_matching_commit);
+        let require_match = i64::from(require_matching_commit);
+        let expected = moving_publication_predecessor.unwrap_or(commit_id);
         // DO UPDATE ... WHERE makes the ordering check atomic with the write;
         // a losing write is a silent no-op. Same policy as the sqlite adapter.
         self.conn()
@@ -136,34 +104,59 @@ impl MetaDb for LibsqlMeta {
                      synced_at = excluded.synced_at,
                      generation = excluded.generation,
                      data = excluded.data
-                 WHERE excluded.commit_id = refs.commit_id
-                    OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
-                        AND excluded.generation >= refs.generation)
-                    OR ((refs.generation IS NULL OR excluded.generation IS NULL)
-                        AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
-                             OR excluded.synced_at >= refs.synced_at))",
-                libsql::params![repo_key, branch, commit_id, synced_at, generation, data],
+                 WHERE ? = 0 AND (
+                    (? = 1 AND (excluded.commit_id = refs.commit_id OR refs.commit_id = ?))
+                    OR (? = 0 AND (excluded.commit_id = refs.commit_id
+                        OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
+                            AND excluded.generation >= refs.generation)
+                        OR ((refs.generation IS NULL OR excluded.generation IS NULL)
+                            AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
+                                 OR excluded.synced_at >= refs.synced_at)))))",
+                libsql::params![
+                    repo_key,
+                    branch,
+                    commit_id,
+                    synced_at,
+                    generation,
+                    data,
+                    insert_only,
+                    require_match,
+                    expected,
+                    require_match
+                ],
             )
             .await
             .context("save_ordered ref")?;
         Ok(())
     }
 
-    async fn compare_and_swap_data(
+    async fn compare_and_swap_ref(
         &self,
         repo_key: &str,
         branch: &str,
         expected_commit: &str,
         expected_data: &str,
         new_data: &str,
+        new_commit: &str,
+        new_synced_at: Option<i64>,
+        new_generation: Option<i64>,
     ) -> Result<bool> {
         let changed = self
             .conn()
             .await?
             .execute(
-                "UPDATE refs SET data = ?
+                "UPDATE refs SET data = ?, commit_id = ?, synced_at = ?, generation = ?
                  WHERE repo_key = ? AND branch = ? AND commit_id = ? AND data = ?",
-                libsql::params![new_data, repo_key, branch, expected_commit, expected_data],
+                libsql::params![
+                    new_data,
+                    new_commit,
+                    new_synced_at,
+                    new_generation,
+                    repo_key,
+                    branch,
+                    expected_commit,
+                    expected_data
+                ],
             )
             .await
             .context("compare-and-swap ref data")?;

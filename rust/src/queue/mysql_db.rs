@@ -64,7 +64,7 @@ impl QueueDb for MysqlDb {
                 claimed_at BIGINT,
                 finished_at BIGINT,
                 error TEXT,
-                admitted_commit VARCHAR(64),
+                admitted_commit VARCHAR(64) NOT NULL,
                 admitted_default_branch VARCHAR(255),
                 credential TEXT,
                 attempts BIGINT NOT NULL DEFAULT 0,
@@ -79,70 +79,6 @@ impl QueueDb for MysqlDb {
         .execute(&self.pool)
         .await
         .context("create jobs table")?;
-        // Migrate a legacy table to add the credential column. MySQL 8 has no
-        // ADD COLUMN IF NOT EXISTS, so this is best-effort: it errors with a
-        // duplicate-column code on an up-to-date table, which we ignore.
-        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN credential TEXT")
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN admitted_commit VARCHAR(64)")
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN admitted_default_branch VARCHAR(255)")
-            .execute(&self.pool)
-            .await;
-        // Same best-effort migration for the attempts column (dead-letter bound).
-        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN attempts BIGINT NOT NULL DEFAULT 0")
-            .execute(&self.pool)
-            .await;
-        // Best-effort migration for size_class (stale-reclaim escalation rung).
-        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN size_class BIGINT NOT NULL DEFAULT 0")
-            .execute(&self.pool)
-            .await;
-        sqlx::raw_sql(
-            "UPDATE jobs
-             SET status = 'failed', finished_at = UNIX_TIMESTAMP(),
-                 error = 'legacy active job has no admitted commit; resubmit sync',
-                 worker_id = NULL, credential = NULL
-             WHERE status IN ('queued', 'claimed')
-               AND (admitted_commit IS NULL OR admitted_commit = '')",
-        )
-        .execute(&self.pool)
-        .await
-        .context("settle legacy active jobs")?;
-        sqlx::raw_sql("ALTER TABLE jobs MODIFY COLUMN `key` VARCHAR(1024) NOT NULL")
-            .execute(&self.pool)
-            .await
-            .context("widen MySQL queue key column")?;
-        // Monotonic v3 migration: add the projection and versioned uniqueness
-        // backstop without ever dropping an index during normal startup.
-        let add_active = sqlx::raw_sql(
-            "ALTER TABLE jobs ADD COLUMN active_key VARBINARY(1024) GENERATED ALWAYS AS
-                (IF(status IN ('queued', 'claimed'), CONVERT(`key` USING binary), NULL)) STORED",
-        )
-        .execute(&self.pool)
-        .await;
-        if let Err(e) = add_active
-            && !e
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("duplicate column")
-        {
-            return Err(e).context("add MySQL active-key projection");
-        }
-        let add_index = sqlx::raw_sql(
-            "ALTER TABLE jobs ADD UNIQUE INDEX idx_jobs_active_identity_v3 (active_key)",
-        )
-        .execute(&self.pool)
-        .await;
-        if let Err(e) = add_index
-            && !e
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("duplicate key name")
-        {
-            return Err(e).context("create MySQL active-key uniqueness index");
-        }
         Ok(())
     }
 
@@ -160,7 +96,7 @@ impl QueueDb for MysqlDb {
         provider: &str,
         path: &str,
         branch: &str,
-        admitted_commit: Option<&str>,
+        admitted_commit: &str,
         admitted_default_branch: Option<&str>,
         credential: Option<&str>,
         _size_class: i64,
@@ -297,7 +233,7 @@ impl QueueDb for MysqlDb {
             String,
             String,
             String,
-            Option<String>,
+            String,
             Option<String>,
             Option<String>,
         )>,

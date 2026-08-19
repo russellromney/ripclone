@@ -9,7 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::warn;
+
+/// Admission-chain marker authorizing the first public projection for a branch.
+/// `:` cannot be a Git object ID, so it cannot collide with a real commit.
+pub(crate) const INITIAL_MOVING_PROJECTION_PREDECESSOR: &str = ":initial";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddedRepo {
@@ -19,9 +23,9 @@ pub struct AddedRepo {
     pub source: AddedRepoSource,
     /// Upstream repo size from the tiered-add preflight (GitHub `repo.size` in
     /// bytes, etc.). Used to classify the first build into a size class when no
-    /// prior clonepack exists yet. `None` on legacy rows / providers with no
-    /// size signal → first build maps to the largest class.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// prior clonepack exists yet. `None` when a provider has no size signal;
+    /// the first build then maps to the largest class.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_size_bytes: Option<u64>,
 }
 
@@ -31,7 +35,14 @@ pub enum AddedRepoSource {
     Cli,
     Cloud,
     Api,
-    Migration,
+}
+
+/// Metadata key for an internal exact-commit result.
+///
+/// Git ref names cannot contain `:`, so this namespace cannot collide with a
+/// real source branch even when that branch ends in `#<commit>`.
+pub fn exact_ref_key(branch: &str, commit: &str) -> String {
+    format!(":{branch}#{commit}")
 }
 
 /// Encode a branch name so it is safe to use in a filesystem path or S3 key.
@@ -62,36 +73,42 @@ fn unbranch_slug(slug: &str) -> Option<String> {
 ///   `build_status` flipping to done — must always land), or
 /// - the new commit is at least as deep in git history as the stored one
 ///   (`generation`), or
-/// - (fallback, for refs without a generation) the new `synced_at` is
+/// - (tie-break, when either ref has no generation) the new `synced_at` is
 ///   newer-than-or-equal to the stored one.
 ///
 /// `generation` (the commit's history depth) is the primary signal: recency
 /// follows the commit's place in history, not the builder's clock, so two
 /// builders with skewed clocks still order correctly. `synced_at` is the
-/// fallback for refs written before `generation` existed. A missing value on
-/// either side defers to the backend's atomic tie-break (the SQL conditional
-/// upsert, the S3 ETag CAS); the file store serializes writes in-process.
+/// tie-break for authoritative force-push writes and cases where Git cannot
+/// provide history depth. A missing value on either side defers to the
+/// backend's atomic tie-break (the SQL conditional upsert, the S3 ETag CAS);
+/// the file store serializes writes in-process.
 ///
-/// Force-push rewinds: an *older* commit has a lower generation, so this guard
-/// would reject it. Both flavors are handled upstream in the sync path by
-/// clearing generation so the fresh `synced_at` wins:
-/// - a rewind to an *already-built* commit — `reuse_existing_build` re-points
-///   authoritatively;
-/// - a rewind to a commit *never built as a tip* — it is built fresh, and
-///   `build_and_publish_two_phase` re-confirms via `ls-remote` that the freshly
-///   built commit is still the branch tip before clearing generation, so the
-///   confirmed-tip build wins regardless of history depth.
-///
-/// A build that is genuinely stale (upstream moved on during the build, so the
-/// re-check no longer sees it as the tip) keeps its generation and correctly
-/// loses here — recency by observation is only granted to a *confirmed* tip.
+/// Exact rows are immutable commit identities. Moving projections carry the
+/// exact admission chain and are updated only when the current commit is in
+/// that chain, so generation ordering never decides whether a late exact build
+/// may replace a newer branch tip.
 pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> bool {
     if new.commit.is_empty() {
         return false;
     }
+    if new.internal_exact_result && new.require_matching_commit {
+        return existing.is_none();
+    }
     let Some(existing) = existing else {
-        return true;
+        return !new.require_matching_commit
+            || new
+                .moving_publication_predecessors
+                .iter()
+                .any(|commit| commit == INITIAL_MOVING_PROJECTION_PREDECESSOR);
     };
+    if new.require_matching_commit {
+        return existing.commit == new.commit
+            || new
+                .moving_publication_predecessors
+                .iter()
+                .any(|commit| commit == &existing.commit);
+    }
     if existing.commit == new.commit {
         return true;
     }
@@ -102,6 +119,60 @@ pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> b
         (Some(existing_ts), Some(new_ts)) => new_ts >= existing_ts,
         _ => true,
     }
+}
+
+/// Preserve ordinary-admission authorization when a worker writes newer
+/// artifact metadata for the same exact commit. This merge happens inside each
+/// store's atomic write/CAS boundary, so an explicit job promoted after claim
+/// cannot have its publication chain erased by a stale worker snapshot.
+pub(crate) fn merge_exact_admission(existing: Option<&RefInfo>, new: &RefInfo) -> RefInfo {
+    let Some(existing) = existing.filter(|existing| {
+        existing.internal_exact_result && new.internal_exact_result && existing.commit == new.commit
+    }) else {
+        return new.clone();
+    };
+    // A promotion is a metadata-only write prepared from an earlier exact-row
+    // snapshot. If artifact publication won the race, retain its current fields
+    // and merge only the newly granted moving-publication identity. Worker
+    // publications use the opposite shape (new artifacts, existing identity).
+    let identity_only = new
+        .moving_publication_predecessors
+        .iter()
+        .any(|commit| !existing.moving_publication_predecessors.contains(commit))
+        || new
+            .moving_admission_successors
+            .iter()
+            .any(|commit| !existing.moving_admission_successors.contains(commit));
+    let mut merged = if identity_only {
+        existing.clone()
+    } else {
+        new.clone()
+    };
+    for predecessor in existing
+        .moving_publication_predecessors
+        .iter()
+        .chain(&new.moving_publication_predecessors)
+    {
+        if !merged.moving_publication_predecessors.contains(predecessor) {
+            merged
+                .moving_publication_predecessors
+                .push(predecessor.clone());
+        }
+    }
+    for successor in existing
+        .moving_admission_successors
+        .iter()
+        .chain(&new.moving_admission_successors)
+    {
+        if !merged.moving_admission_successors.contains(successor) {
+            merged.moving_admission_successors.push(successor.clone());
+        }
+    }
+    merged.require_matching_commit =
+        existing.require_matching_commit && new.require_matching_commit;
+    merged.warm_pinned |= existing.warm_pinned || new.warm_pinned;
+    merged.last_accessed_at = existing.last_accessed_at.max(new.last_accessed_at);
+    merged
 }
 
 /// Abstract store for repo → `RefInfo` mappings.
@@ -124,17 +195,6 @@ pub trait RefStore: Send + Sync {
 
     /// Load the `RefInfo` for a specific branch.
     async fn load_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RefInfo>>;
-
-    /// Load a *completed full build* for an exact commit, from any branch of this
-    /// repo (commit-keyed reuse). Lets a sync of branch `bar` reuse a clonepack
-    /// branch `foo` already built at the same commit, instead of rebuilding.
-    ///
-    /// Default is `Ok(None)` — stores without an efficient commit index (file,
-    /// S3) simply fall back to the branch-scoped no-op, no regression. Returns a
-    /// `RefInfo` only when its `full_clonepack` is present and matches `commit`.
-    async fn load_build(&self, _repo_id: &RepoId, _commit: &str) -> Result<Option<RefInfo>> {
-        Ok(None)
-    }
 
     /// Save the `RefInfo` for a specific branch.
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()>;
@@ -249,13 +309,14 @@ impl FileRefStore {
             warn!("ref store {key} already has a newer sync; skipping older write");
             return Ok(());
         }
+        let info = merge_exact_admission(existing.as_ref(), info);
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("create ref store dir {}", parent.display()))?;
         }
-        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
+        let data = serde_json::to_vec_pretty(&info).context("serialize RefInfo")?;
         // Write to a temp file in the same directory and rename for atomicity.
         let tmp_path = path.with_extension("json.tmp");
         tokio::fs::write(&tmp_path, data)
@@ -329,8 +390,7 @@ impl FileRefStore {
         Ok(true)
     }
 
-    /// Path to the legacy HEAD ref file. Kept for backward compatibility with
-    /// refs created before branch-specific storage.
+    /// Path to the current moving HEAD projection.
     fn path(&self, repo_id: &RepoId) -> PathBuf {
         let key = repo_id.storage_key();
         let (owner, repo) = key
@@ -581,23 +641,6 @@ impl RefStore for FileRefStore {
         Ok(out)
     }
 
-    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // Commit-keyed reuse: scan branch refs for any completed full build at this
-        // commit. This is a cold fallback (only invoked when the requesting branch
-        // lacks a usable build), so a directory scan is acceptable.
-        let branches = self.list_branches(repo_id).await?;
-        for branch in branches {
-            if let Some(info) = self.load_branch(repo_id, &branch).await?
-                && info.full_clonepack.commit == commit
-                && !info.full_clonepack.manifest.is_empty()
-                && !info.archive_chunks.is_empty()
-            {
-                return Ok(Some(info));
-            }
-        }
-        Ok(None)
-    }
-
     async fn health(&self) -> Result<()> {
         // Write+read probe of the ref-store root, off the async worker. Catches
         // an unmounted/removed/read-only/full data volume — not just a missing
@@ -658,13 +701,12 @@ impl S3RefStore {
     /// fails and we re-read and re-decide. This is what makes branch refs
     /// "newer never loses" instead of last-writer-wins.
     async fn save_keyed(&self, key: &str, info: &RefInfo) -> Result<()> {
-        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
         // Bounded so a pathological hot key can't spin forever. Real S3-backed
         // metadata can see bursts of concurrent first writers, so allow enough
         // conflicts for every contender in the adversarial ordering test to
         // observe the winning ref and stand down.
         for attempt in 0..64 {
-            let if_match = match self.storage.get_object(key).await {
+            let (if_match, existing) = match self.storage.get_object(key).await {
                 Ok(Some((etag, existing_bytes))) => {
                     let existing: RefInfo = serde_json::from_slice(&existing_bytes)
                         .with_context(|| format!("parse existing S3 ref store {key}"))?;
@@ -672,16 +714,23 @@ impl S3RefStore {
                         warn!("S3 ref store {key} already has a newer sync; skipping older write");
                         return Ok(());
                     }
-                    Some(etag)
+                    (Some(etag), Some(existing))
                 }
-                Ok(None) => None,
+                Ok(None) => {
+                    if !should_replace_ref(None, info) {
+                        return Ok(());
+                    }
+                    (None, None)
+                }
                 Err(e) => {
                     warn!(
                         "failed to read existing S3 ref store {key}: {e}; writing unconditionally"
                     );
-                    None
+                    (None, None)
                 }
             };
+            let candidate = merge_exact_admission(existing.as_ref(), info);
+            let data = serde_json::to_vec_pretty(&candidate).context("serialize RefInfo")?;
 
             if self
                 .storage
@@ -959,32 +1008,6 @@ impl RefStore for S3RefStore {
         Ok(out)
     }
 
-    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // Commit-keyed reuse: scan branch refs for any completed full build at this
-        // commit. This is a cold fallback (only invoked when the requesting branch
-        // lacks a usable build), so an S3 list + per-key GET is acceptable.
-        let prefix = self.branch_prefix(repo_id);
-        let keys = self
-            .storage
-            .list_objects(&prefix)
-            .await
-            .context("list S3 ref store for commit-keyed reuse")?;
-        for key in keys {
-            if !key.ends_with(".json") || key == format!("{}HEAD.json", prefix) {
-                continue;
-            }
-            if let Ok(Some((_, data))) = self.storage.get_object(&key).await
-                && let Ok(info) = serde_json::from_slice::<RefInfo>(&data)
-                && info.full_clonepack.commit == commit
-                && !info.full_clonepack.manifest.is_empty()
-                && !info.archive_chunks.is_empty()
-            {
-                return Ok(Some(info));
-            }
-        }
-        Ok(None)
-    }
-
     async fn health(&self) -> Result<()> {
         // Reachability probe with a prefix that matches nothing, bounded by a
         // short timeout. The readiness handler caches the result.
@@ -1113,12 +1136,6 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
             }
         }
         Ok(info)
-    }
-
-    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // Commit-keyed reuse is a cold fallback path; read through to the inner
-        // store rather than maintaining a separate commit cache.
-        self.inner.load_build(repo_id, commit).await
     }
 
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
@@ -1253,51 +1270,6 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
     }
 }
 
-/// Migrate the legacy single-file JSON refs store into a `RefStore`.
-///
-/// Entries are keyed by `owner/repo/branch`; we only keep the HEAD entry for
-/// each repo and ignore branch-specific entries.
-pub async fn migrate_legacy_refs(store: &dyn RefStore, legacy_path: &Path) -> Result<usize> {
-    if !legacy_path.exists() {
-        return Ok(0);
-    }
-    info!("migrating legacy refs from {}", legacy_path.display());
-    let data = tokio::fs::read(legacy_path)
-        .await
-        .with_context(|| format!("read legacy refs {}", legacy_path.display()))?;
-    let refs: HashMap<String, RefInfo> = serde_json::from_slice(&data)
-        .with_context(|| format!("parse legacy refs {}", legacy_path.display()))?;
-
-    let mut migrated = 0usize;
-    for (key, info) in refs {
-        // Legacy keys are owner/repo/HEAD or owner/repo/branch. Only migrate
-        // the HEAD entry; branch-specific entries are ignored.
-        if !key.ends_with("/HEAD") {
-            continue;
-        }
-        if let Some((owner_repo, _branch)) = key.rsplit_once('/')
-            && let Some((owner, repo)) = owner_repo.split_once('/')
-        {
-            let repo_id = RepoId::github(format!("{owner}/{repo}"));
-            // Only save if the repo doesn't already have a stored ref.
-            match store.load(&repo_id).await {
-                Ok(None) => {
-                    store.save(&repo_id, &info).await?;
-                    migrated += 1;
-                }
-                Ok(Some(_)) => {
-                    info!("ref store already has {owner}/{repo}; skipping legacy entry");
-                }
-                Err(e) => {
-                    warn!("failed to check ref store for {owner}/{repo}: {e}");
-                }
-            }
-        }
-    }
-    info!("migrated {migrated} repos from legacy refs store");
-    Ok(migrated)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1310,16 +1282,12 @@ mod tests {
             default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
             packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: String::new(),
-            metadata_chunk: String::new(),
             archive_chunks: Vec::new(),
             full_clonepack: crate::ClonepackArtifacts::default(),
             shallow_clonepack: crate::ClonepackArtifacts::default(),
@@ -1499,6 +1467,129 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identity_fence_rejects_divergent_equal_generation_writer() {
+        let mut current = dummy_ref_info("c");
+        current.generation = Some(2);
+        let mut delayed = dummy_ref_info("b");
+        delayed.generation = Some(2);
+        delayed.require_matching_commit = true;
+        delayed.moving_publication_predecessors = vec!["a".to_string()];
+        assert!(!should_replace_ref(Some(&current), &delayed));
+        assert!(!should_replace_ref(None, &delayed));
+
+        current.commit = delayed.commit.clone();
+        assert!(should_replace_ref(Some(&current), &delayed));
+
+        current.commit = "a".to_string();
+        assert!(should_replace_ref(Some(&current), &delayed));
+    }
+
+    #[test]
+    fn admission_chain_orders_successive_publications_without_generation() {
+        let a = dummy_ref_info("a");
+        let mut b = dummy_ref_info("b");
+        b.require_matching_commit = true;
+        b.moving_publication_predecessors = vec!["a".to_string()];
+        let mut c = dummy_ref_info("c");
+        c.require_matching_commit = true;
+        c.moving_publication_predecessors = vec!["a".to_string(), "b".to_string()];
+
+        assert!(should_replace_ref(Some(&a), &b));
+        assert!(should_replace_ref(Some(&a), &c));
+        assert!(should_replace_ref(Some(&b), &c));
+        assert!(!should_replace_ref(Some(&c), &b));
+    }
+
+    #[test]
+    fn admission_chain_distinguishes_initial_ordinary_from_explicit_only() {
+        let mut ordinary = dummy_ref_info("b");
+        ordinary.require_matching_commit = true;
+        ordinary.moving_publication_predecessors =
+            vec![INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
+        assert!(should_replace_ref(None, &ordinary));
+
+        ordinary.moving_publication_predecessors.clear();
+        assert!(!should_replace_ref(None, &ordinary));
+    }
+
+    #[test]
+    fn exact_promotion_preserves_artifacts_published_from_an_older_snapshot() {
+        let mut published = dummy_ref_info("b");
+        published.internal_exact_result = true;
+        published.full_clonepack.commit = "b".to_string();
+        published.full_clonepack.manifest = "manifest".to_string();
+        published.last_accessed_at = Some(20);
+
+        let mut stale_promotion = dummy_ref_info("b");
+        stale_promotion.internal_exact_result = true;
+        stale_promotion.require_matching_commit = false;
+        stale_promotion.moving_publication_predecessors =
+            vec![INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
+        stale_promotion.last_accessed_at = Some(10);
+
+        let merged = merge_exact_admission(Some(&published), &stale_promotion);
+        assert_eq!(merged.full_clonepack.commit, "b");
+        assert_eq!(merged.full_clonepack.manifest, "manifest");
+        assert_eq!(merged.last_accessed_at, Some(20));
+        assert_eq!(
+            merged.moving_publication_predecessors,
+            vec![INITIAL_MOVING_PROJECTION_PREDECESSOR]
+        );
+
+        let mut stale_link = merged.clone();
+        stale_link.full_clonepack = Default::default();
+        stale_link.moving_admission_successors.push("c".to_string());
+        let linked = merge_exact_admission(Some(&merged), &stale_link);
+        assert_eq!(linked.full_clonepack.manifest, "manifest");
+        assert_eq!(linked.moving_admission_successors, vec!["c"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_identity_fence_is_atomic_with_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("meta.db").to_string_lossy().to_string();
+        let store = crate::meta::SqlRefStore::new(Box::new(
+            crate::meta::SqliteMeta::connect(&db).await.unwrap(),
+        ))
+        .await
+        .unwrap();
+        let repo = RepoId::github("o/sql-fence");
+        let mut current = dummy_ref_info("c");
+        current.generation = Some(2);
+        store.save_branch(&repo, "main", &current).await.unwrap();
+
+        let mut delayed = dummy_ref_info("b");
+        delayed.generation = Some(2);
+        delayed.require_matching_commit = true;
+        delayed.moving_publication_predecessors = vec!["a".to_string()];
+        store.save_branch(&repo, "main", &delayed).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&repo, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "c"
+        );
+
+        current.require_matching_commit = true;
+        current.moving_publication_predecessors = vec!["b".to_string()];
+        current.build_status = Some("done".to_string());
+        store.save_branch(&repo, "main", &current).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&repo, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .build_status
+                .as_deref(),
+            Some("done")
+        );
+    }
+
     #[tokio::test]
     async fn file_ref_store_status_update_is_commit_guarded_and_targeted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1544,39 +1635,6 @@ mod tests {
         assert_eq!(loaded.full_clonepack.manifest, "full-manifest");
         assert_eq!(loaded.full_clonepack.commit, "new");
         assert_eq!(loaded.generation, Some(42));
-    }
-
-    #[tokio::test]
-    async fn migrate_legacy_refs_skips_branch_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(tmp.path()));
-
-        let mut legacy = HashMap::new();
-        legacy.insert(
-            "ripclone/test/HEAD".to_string(),
-            dummy_ref_info("head-commit"),
-        );
-        legacy.insert(
-            "ripclone/test/feature".to_string(),
-            dummy_ref_info("feature-commit"),
-        );
-
-        let legacy_path = tmp.path().join(".ripclone-refs.json");
-        tokio::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap())
-            .await
-            .unwrap();
-
-        let migrated = migrate_legacy_refs(store.as_ref(), &legacy_path)
-            .await
-            .unwrap();
-        assert_eq!(migrated, 1);
-
-        let loaded = store
-            .load(&RepoId::github("ripclone/test"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.commit, "head-commit");
     }
 
     #[tokio::test]
@@ -1658,20 +1716,6 @@ mod tests {
         store.remove_added_repo(&repo_id).await.unwrap();
         assert!(store.load_added_repo(&repo_id).await.unwrap().is_none());
         assert!(store.list_added_repos().await.unwrap().is_empty());
-    }
-
-    #[test]
-    fn added_repo_legacy_json_defaults_repo_size_bytes() {
-        // Rows written before the size-class preflight field must still parse.
-        let legacy = r#"{
-            "repo_id": {"provider": "github", "path": "o/r"},
-            "added_at": 1,
-            "history_enabled": true,
-            "source": "cli"
-        }"#;
-        let added: AddedRepo = serde_json::from_str(legacy).unwrap();
-        assert_eq!(added.repo_size_bytes, None);
-        assert_eq!(added.repo_id.path, "o/r");
     }
 
     #[tokio::test]

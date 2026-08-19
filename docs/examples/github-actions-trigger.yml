@@ -10,8 +10,8 @@
 # hashes it before sending. If your secret store already holds the hash, drop the
 # hashing line and send the secret directly.
 #
-# For private repos, the ripclone server itself must be configured with
-# RIPCLONE_GITHUB_TOKEN that has read access to the consumer repo.
+# For private repos, configure the `github` provider with a token that can read
+# the consumer repo (see docs/PROVIDERS.md).
 
 name: ripclone cache
 on:

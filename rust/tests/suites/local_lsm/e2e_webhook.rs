@@ -105,7 +105,7 @@ async fn clone_branch_full_with_client(
 #[tokio::test]
 async fn webhook_push_builds_before_clone() {
     setup(true); // two-phase + LSM + async (production defaults)
-    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", SECRET)]).await;
+    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", SECRET)]).await;
     let origin = make_origin("acme", "hook");
     let commit = origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
@@ -127,7 +127,7 @@ async fn webhook_push_builds_before_clone() {
     .into_bytes();
     let http = reqwest::Client::new();
     let resp = http
-        .post(format!("{}/v1/webhooks/github", server.url))
+        .post(format!("{}/webhooks/github", server.url))
         .header("X-GitHub-Event", "push")
         .header("X-Hub-Signature-256", sign_github(&body))
         .header("content-type", "application/json")
@@ -162,7 +162,7 @@ fn parse_metric(text: &str, name: &str) -> u64 {
 #[tokio::test]
 async fn webhook_and_sync_same_branch_coalesce() {
     setup(true);
-    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", SECRET)]).await;
+    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", SECRET)]).await;
     let origin = make_origin("acme", "coal");
     let commit = origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
@@ -187,7 +187,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
         let (url, body, sig) = (url.clone(), body.clone(), sign_github(&body));
         tokio::spawn(async move {
             reqwest::Client::new()
-                .post(format!("{url}/v1/webhooks/github"))
+                .post(format!("{url}/webhooks/github"))
                 .header("X-GitHub-Event", "push")
                 .header("X-Hub-Signature-256", sig)
                 .header("content-type", "application/json")

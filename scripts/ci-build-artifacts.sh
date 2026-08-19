@@ -3,8 +3,8 @@
 # product bins (docker/e2e/benchmark) plus the integration/lib test binaries
 # those jobs run. Stages stable names under rust/target/ci-artifacts/ for upload.
 #
-# Not the full unit/integration suite (roughly 45 linked binaries) — that is the
-# `test` job's job. Keep this list to what fan-out actually executes.
+# Not the full unit/integration suite — that is the `test` job's job. Keep this
+# list to what fan-out actually executes.
 #
 # Usage: scripts/ci-build-artifacts.sh
 set -euo pipefail
@@ -45,11 +45,7 @@ BINS=(ripclone ripclone-server ripclone-worker ripclone-dispatcher git-remote-ri
 TESTS=(
   e2e_full_topup
   e2e_gitea_provider
-  e2e_worker_postgres
-  e2e_worker_mysql
-  e2e_metadata_postgres
-  e2e_metadata_mysql
-  e2e_worker_libsql
+  network_databases
   e2e_remote_gc_s3
 )
 

@@ -158,7 +158,7 @@ async fn wait_for_archive_settled(server: &Server, repo: &str, commit: &str) {
         let response = client
             .get(&url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
-            .header("x-ripclone-protocol", "2")
+            .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
             .send()
             .await
             .expect("read-only archive status request");
@@ -200,7 +200,6 @@ struct MinioAuditProxy {
 struct CloneIdProxy {
     url: String,
     authenticated_pinned_requests: Arc<std::sync::atomic::AtomicUsize>,
-    requests: Arc<std::sync::atomic::AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -215,8 +214,6 @@ struct CloneIdProxyState {
     upstream: String,
     pending_sequence: Arc<std::sync::atomic::AtomicUsize>,
     authenticated_pinned_requests: Arc<std::sync::atomic::AtomicUsize>,
-    force_old_pending: Arc<std::sync::atomic::AtomicUsize>,
-    requests: Arc<std::sync::atomic::AtomicUsize>,
     pinned_pause: Option<Arc<PinnedRequestPause>>,
 }
 
@@ -230,9 +227,6 @@ async fn clone_id_proxy(
     State(state): State<CloneIdProxyState>,
     request: Request<Body>,
 ) -> Response<Body> {
-    state
-        .requests
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let path_query = request
         .uri()
         .path_and_query()
@@ -284,37 +278,12 @@ async fn clone_id_proxy(
         .send()
         .await
         .expect("forward clone-ID proxy request");
-    let mut status = upstream.status();
+    let status = upstream.status();
     let headers = upstream.headers().clone();
-    let mut bytes = upstream
+    let bytes = upstream
         .bytes()
         .await
         .expect("read clone-ID proxy response");
-    let mut content_location = None;
-    if status == StatusCode::OK
-        && state
-            .force_old_pending
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
-    {
-        let ready: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("ready response for old-server proxy");
-        let commit = ready["commit"].as_str().expect("ready commit");
-        content_location = ready["branch"].as_str().map(str::to_string);
-        status = StatusCode::ACCEPTED;
-        bytes = serde_json::to_vec(&serde_json::json!({
-            "code": "artifact_pending",
-            "commit": commit,
-            "status": "building",
-            "queue_depth": 1
-        }))
-        .expect("encode old-server pending")
-        .into();
-    }
     let mut output = Response::builder().status(status);
     for (name, value) in &headers {
         if name != axum::http::header::CONTENT_LENGTH
@@ -331,22 +300,11 @@ async fn clone_id_proxy(
             + 1;
         output = output.header("x-ripclone-clone-id", format!("pending-clone-{sequence}"));
     }
-    if let Some(branch) = content_location {
-        output = output.header(
-            axum::http::header::CONTENT_LOCATION,
-            urlencoding::encode(&branch).into_owned(),
-        );
-    }
     output.body(Body::from(bytes)).expect("clone-ID response")
-}
-
-async fn start_clone_id_proxy(upstream: &str, force_old_pending: usize) -> CloneIdProxy {
-    start_clone_id_proxy_inner(upstream, force_old_pending, None).await
 }
 
 async fn start_clone_id_proxy_inner(
     upstream: &str,
-    force_old_pending: usize,
     pinned_pause: Option<Arc<PinnedRequestPause>>,
 ) -> CloneIdProxy {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -357,13 +315,10 @@ async fn start_clone_id_proxy_inner(
         listener.local_addr().expect("clone-ID proxy address")
     );
     let authenticated_pinned_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let state = CloneIdProxyState {
         upstream: upstream.trim_end_matches('/').to_string(),
         pending_sequence: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         authenticated_pinned_requests: Arc::clone(&authenticated_pinned_requests),
-        force_old_pending: Arc::new(std::sync::atomic::AtomicUsize::new(force_old_pending)),
-        requests: Arc::clone(&requests),
         pinned_pause,
     };
     let task = tokio::spawn(async move {
@@ -379,14 +334,12 @@ async fn start_clone_id_proxy_inner(
     CloneIdProxy {
         url,
         authenticated_pinned_requests,
-        requests,
         task,
     }
 }
 
 async fn start_clone_id_proxy_with_pinned_pause(
     upstream: &str,
-    force_old_pending: usize,
     pause_at: usize,
 ) -> (
     CloneIdProxy,
@@ -401,7 +354,7 @@ async fn start_clone_id_proxy_with_pinned_pause(
         proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
     });
     (
-        start_clone_id_proxy_inner(upstream, force_old_pending, Some(pause)).await,
+        start_clone_id_proxy_inner(upstream, Some(pause)).await,
         entered_rx,
         proceed_tx,
     )
@@ -568,6 +521,7 @@ fn commit_all(repo: &std::path::Path, message: &str) -> String {
 async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() {
     let _guard = env_lock().lock().await;
     init(false);
+    let _recheck = ScopedEnvVar::set("RIPCLONE_RECHECK_MAX", "0");
     let upstream_token = "full-topup-client-token";
     let origin = make_http_origin_with_auth("acme/full-topup", "token full-topup-client-token");
     let provider = ProviderInstance {
@@ -764,17 +718,17 @@ exec "$real_git" "$@"
 
     // Phase one has already published Shallow(B), while Full(B) remains
     // stopped at the production barrier. Make the real server Git boundary
-    // fail: this ordinary, unpinned protocol-v2 read must still serve B from
+    // fail: this exact pinned read must still serve B from
     // authenticated metadata without attempting source acquisition.
     let source_forbidden = ScopedEnvVar::set("RIPCLONE_TEST_SOURCE_FORBIDDEN", "1");
     let shallow_response = reqwest::Client::new()
         .get(format!(
-            "{}/v1/repos/counting/acme/full-topup/refs/main?clonepack=shallow",
-            server.url
+            "{}/v1/repos/counting/acme/full-topup/refs/main?clonepack=shallow&pinned={b}",
+            server.url,
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
         .header("X-Upstream-Token", upstream_token)
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("phase-one shallow metadata request");
@@ -838,6 +792,14 @@ exec "$real_git" "$@"
     assert!(
         staging_barrier.join("entered").exists(),
         "the client must acquire the carried-A top-up plan before branch movement"
+    );
+    let source_acquisitions_after_pin = std::fs::read_to_string(&source_log)
+        .expect("source log after operation pin")
+        .lines()
+        .count();
+    assert_eq!(
+        source_acquisitions_after_pin, 1,
+        "the initial unpinned request resolves the moving branch exactly once"
     );
     // This is deliberately after the server has issued the carried-A plan and
     // the client has created its private staging root. The production-generated
@@ -957,8 +919,8 @@ exec "$real_git" "$@"
         .lines()
         .count();
     assert_eq!(
-        server_source_acquisitions, 0,
-        "the pinned top-up metadata request must not acquire server source"
+        server_source_acquisitions, source_acquisitions_after_pin,
+        "no server source acquisition is allowed after the top-up pin exists"
     );
     println!(
         "TOP_UP_EVIDENCE target={b} base={a} manifest={base_manifest} advanced={c} \
@@ -1565,61 +1527,6 @@ async fn server_named_decoy_is_ignored_for_local_provider_exact_fetch() {
 }
 
 #[tokio::test]
-async fn old_server_pending_shape_keeps_bounded_exact_polling_compatible() {
-    let _guard = env_lock().lock().await;
-    init(false);
-    let server = start_server_split_storage().await;
-    let origin = make_origin("acme", "full-topup-old-server");
-    let a = origin.commit(&[("value.txt", "A\n")], "A");
-    origin.publish();
-    register_added_without_build(&server, "acme/full-topup-old-server")
-        .await
-        .expect("register old-server repo");
-    server
-        .client()
-        .sync_repo("acme/full-topup-old-server", None)
-        .await
-        .expect("publish old-server A");
-    let ready = server
-        .client()
-        .resolve_ref_with_clonepack("acme/full-topup-old-server", "main", Some("full"), None)
-        .await
-        .expect("wait for old-server Full(A)");
-    assert_eq!(ready.commit, a);
-
-    // Rewrite the first ordinary response and the first pinned opt-in response
-    // to the pre-top-up 202 shape. The new client must ignore absent extension
-    // fields, continue its existing bounded exact poll, and preserve identity.
-    let proxy = start_clone_id_proxy(&server.url, 2).await;
-    let output = tempfile::tempdir().unwrap();
-    let target = output.path().join("clone");
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(10),
-        ripclone::client::Client::new_with_token(proxy.url.clone(), Some(token_hash()))
-            .install_repo_with_mode_at(
-                "acme/full-topup-old-server",
-                "HEAD",
-                None,
-                &target,
-                CloneMode::Editable,
-                Some("full"),
-                None,
-            ),
-    )
-    .await
-    .expect("old-server compatibility poll is bounded")
-    .expect("old-server compatibility clone succeeds once exact A is returned");
-    assert_eq!(outcome.commit, a);
-    assert!(outcome.cold);
-    assert_eq!(outcome.clone_id.as_deref(), Some("pending-clone-1"));
-    assert_eq!(git(&target, &["rev-parse", "HEAD"]), a);
-    assert!(
-        proxy.requests.load(std::sync::atomic::Ordering::SeqCst) >= 3,
-        "old-server response must be polled rather than treated as new-server no-base"
-    );
-}
-
-#[tokio::test]
 async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() {
     let _guard = env_lock().lock().await;
     init(false);
@@ -1649,18 +1556,18 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/full-topup-no-base");
-    let mut moving = store
-        .load_branch(&repo_id, "main")
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
+    let mut exact = store
+        .load_branch(&repo_id, &exact_key)
         .await
-        .expect("load moving B")
-        .expect("moving B row");
-    assert_eq!(moving.commit, b);
-    let carried = moving.full_clonepack.clone();
+        .expect("load exact B")
+        .expect("exact B row");
+    assert_eq!(exact.commit, b);
+    let carried = exact.full_clonepack.clone();
     assert_eq!(carried.commit, a);
-    moving.full_clonepack = Default::default();
-    moving.clonepack_manifest.clear();
+    exact.full_clonepack = Default::default();
     store
-        .save_branch(&repo_id, "main", &moving)
+        .save_branch(&repo_id, &exact_key, &exact)
         .await
         .expect("remove carried base");
 
@@ -1701,10 +1608,10 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
     let bad_hash = storage
         .put(&bad.encode_to_vec())
         .expect("store bad manifest");
-    moving.full_clonepack = carried;
-    moving.full_clonepack.manifest = bad_hash;
+    exact.full_clonepack = carried;
+    exact.full_clonepack.manifest = bad_hash;
     store
-        .save_branch(&repo_id, "main", &moving)
+        .save_branch(&repo_id, &exact_key, &exact)
         .await
         .expect("install mismatched carried manifest");
     let bad_target = output.path().join("bad-clone");
@@ -1739,7 +1646,7 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
 }
 
 #[tokio::test]
-async fn rolling_upgrade_parent_hint_cannot_top_up_an_unrelated_target() {
+async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
     let _guard = env_lock().lock().await;
     init(false);
     let (server, barrier, entered, proceed) = start_server_split_storage_phase_one_barrier().await;
@@ -1777,21 +1684,32 @@ async fn rolling_upgrade_parent_hint_cannot_top_up_an_unrelated_target() {
 
     let store = FileRefStore::new(&server.repo_root);
     let repo_id = RepoId::github("acme/full-topup-unrelated");
-    let mut moving = store
-        .load_branch(&repo_id, "main")
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
+    let mut exact = store
+        .load_branch(&repo_id, &exact_key)
         .await
-        .expect("load moving B")
-        .expect("moving B row");
-    assert_eq!(moving.commit, b);
-    assert_eq!(moving.parent_commit.as_deref(), Some(x.as_str()));
-    assert_eq!(moving.full_clonepack.commit, a);
-    // Simulate a transient row written by an older binary that reported only a
-    // first-parent-style hint. The fetched commit object remains authoritative.
-    moving.parent_commit = Some(a.clone());
+        .expect("load exact B")
+        .expect("exact B row");
+    assert_eq!(exact.commit, b);
+    assert_eq!(exact.parent_commit.as_deref(), Some(x.as_str()));
+    assert!(
+        exact.full_clonepack.commit.is_empty(),
+        "an unrelated history must not carry Full(A) automatically"
+    );
+    let exact_a = store
+        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &a))
+        .await
+        .expect("load exact A")
+        .expect("exact A row");
+    assert_eq!(exact_a.full_clonepack.commit, a);
+    // Forge both the first-parent hint and a carried Full(A). The fetched B
+    // commit object remains authoritative and must reject this metadata.
+    exact.parent_commit = Some(a.clone());
+    exact.full_clonepack = exact_a.full_clonepack;
     store
-        .save_branch(&repo_id, "main", &moving)
+        .save_branch(&repo_id, &exact_key, &exact)
         .await
-        .expect("install rolling-upgrade parent hint");
+        .expect("install malformed parent hint");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -1871,17 +1789,20 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
         .expect("merge phase-one barrier alive");
 
     let store = FileRefStore::new(&server.repo_root);
-    let moving = store
-        .load_branch(&RepoId::github("acme/full-topup-merge"), "main")
+    let exact = store
+        .load_branch(
+            &RepoId::github("acme/full-topup-merge"),
+            &ripclone::ref_store::exact_ref_key("main", &b),
+        )
         .await
         .expect("load merge B row")
         .expect("merge B row");
-    assert_eq!(moving.commit, b);
-    assert_eq!(moving.full_clonepack.commit, a);
-    assert_eq!(
-        moving.parent_commit, None,
-        "merge B has no safe sole parent"
+    assert_eq!(exact.commit, b);
+    assert!(
+        exact.full_clonepack.commit.is_empty(),
+        "a merge target must not carry an arbitrary first-parent Full artifact"
     );
+    assert_eq!(exact.parent_commit, None, "merge B has no safe sole parent");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -1945,9 +1866,41 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
         .expect("removed B reached phase one")
         .expect("removed phase-one barrier alive");
 
-    // Make the advertised branch point back to A and physically prune B from
-    // the source repository. The client must request B by object ID and fail;
-    // following main would silently publish the wrong commit.
+    let output = tempfile::tempdir().unwrap();
+    let target = output.path().join("clone");
+    let staging_barrier = output.path().join("staging-barrier");
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let _staging_barrier =
+        ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR", &staging_barrier);
+    let install_client = server.client();
+    let target_for_install = target.clone();
+    let mut install = tokio::spawn(async move {
+        install_client
+            .install_repo_with_mode_at(
+                "acme/full-topup-removed",
+                "HEAD",
+                None,
+                &target_for_install,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    for _ in 0..800 {
+        if staging_barrier.join("entered").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        staging_barrier.join("entered").exists(),
+        "ordinary Full clone must acquire the B-from-A top-up plan"
+    );
+
+    // The ordinary clone has pinned B and privately staged Full(A). Rewind the
+    // advertised branch and physically prune B before allowing its exact fetch.
+    // Following main would silently publish A; fetching B must fail instead.
     git(&origin.work, &["reset", "--hard", &a]);
     origin.publish();
     git(&origin.bare, &["reflog", "expire", "--expire=now", "--all"]);
@@ -1957,28 +1910,19 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
         &["cat-file", "-e", &format!("{b}^{{commit}}")]
     ));
 
-    let output = tempfile::tempdir().unwrap();
-    let target = output.path().join("clone");
-    let error = tokio::time::timeout(
-        Duration::from_secs(15),
-        server.client().install_repo_with_mode_at(
-            "acme/full-topup-removed",
-            "HEAD",
-            None,
-            &target,
-            CloneMode::Editable,
-            Some("full"),
-            None,
-        ),
-    )
-    .await
-    .expect("removed B failure is bounded")
-    .expect_err("removed B must not fall back to current main/A");
-    assert!(format!("{error:#}").contains(&b));
+    std::fs::write(staging_barrier.join("proceed"), b"continue\n").unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(15), &mut install)
+        .await
+        .expect("removed B failure is bounded")
+        .expect("removed B clone task joins")
+        .expect_err("removed B must not fall back to current main/A");
+    let error = format!("{error:#}");
+    assert!(error.contains("exact upstream fetch"), "{error}");
+    assert!(error.contains(&b), "{error}");
     assert!(!target.exists());
 
     proceed.send(()).expect("release removed Full(B)");
-    // The compatibility waiter is pinned to B and must never follow the
+    // The readiness waiter is pinned to B and must never follow the
     // rewound branch to A. If the post-build recheck replaces the mutable
     // branch row before the next exact poll, the documented result is a
     // bounded typed pending error; either outcome is acceptable here because
@@ -1988,15 +1932,15 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
             Ok(response) => assert_eq!(response.commit, b),
             Err(error) => assert!(
                 format!("{error:#}").contains(&b),
-                "removed-B compatibility failure lost its B pin: {error:#}"
+                "removed-B readiness failure lost its B pin: {error:#}"
             ),
         },
         Err(_) => {
             sync_b.abort();
             tokio::time::timeout(Duration::from_secs(5), &mut sync_b)
                 .await
-                .expect("aborted removed-B compatibility waiter joined")
-                .expect_err("removed-B compatibility waiter was not aborted");
+                .expect("aborted removed-B readiness waiter joined")
+                .expect_err("removed-B readiness waiter was not aborted");
         }
     }
 }
@@ -2373,7 +2317,7 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
         ScopedEnvVar::set("RIPCLONE_S3_CACHE_DIR", controls.path().join("s3-cache"));
     let server = start_server().await;
     let (clone_proxy, refresh_entered, refresh_proceed) =
-        start_clone_id_proxy_with_pinned_pause(&server.url, 0, 2).await;
+        start_clone_id_proxy_with_pinned_pause(&server.url, 2).await;
     drop(server_cache_dir);
     let origin = make_origin("acme", "full-topup-minio");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
@@ -2426,7 +2370,7 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", "2")
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
         .expect("request MinIO top-up plan");

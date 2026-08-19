@@ -118,10 +118,6 @@ pub mod retention;
 #[doc(hidden)]
 pub mod secure_file;
 pub mod server;
-#[doc(hidden)]
-pub mod sidecar;
-#[doc(hidden)]
-pub mod snapshot;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod statx_compat;
@@ -198,33 +194,45 @@ pub struct ClonepackArtifacts {
     pub skeleton_idx: String,
     pub prebuilt_index: String,
     /// CAS hash of the pre-built multi-pack-index over this variant's packs.
-    /// Empty for older refs (client falls back to building the MIDX itself).
-    #[serde(default)]
     pub midx: String,
-    /// CAS hash of the concatenated idx bundle for this variant's packs. Empty
-    /// for older refs (client falls back to fetching each idx individually).
-    #[serde(default)]
+    /// CAS hash of the required concatenated idx bundle for this variant's packs.
     pub idx_bundle: String,
-    /// The commit this variant's clonepack is built for. May differ from
-    /// `RefInfo.commit` during two-phase publish (depth=0 briefly serves the
-    /// previous commit while the new full history builds). Empty = same as
-    /// `RefInfo.commit`.
-    #[serde(default)]
+    /// The commit this variant's clonepack is built for. Complete artifacts
+    /// always carry this identity explicitly.
     pub commit: String,
 }
 
 /// Artifact hashes returned by the server for a single ref.
 ///
 /// Every artifact is stored in the CAS and can be fetched by its hash from
-/// `/v1/artifacts/{hash}` (or the `/v1/packs/{hash}` legacy endpoint).
+/// `/v1/artifacts/{hash}`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefInfo {
+    /// Internal commit-addressed result rows are retained and garbage-collected
+    /// like every other ref, but are not source branches in the public status
+    /// model.
+    pub internal_exact_result: bool,
+    /// A moving projection carrying this flag may replace only its own commit or
+    /// one listed in `moving_publication_predecessors`. Stores enforce the check
+    /// atomically with the write.
+    pub require_matching_commit: bool,
+    /// Earlier ordinary admissions that this exact result may replace in the
+    /// moving projection. The first ordinary admission carries an internal
+    /// non-object bootstrap marker; the chain is empty for explicit-only work.
+    /// Stores compare it atomically with the current moving commit, so later
+    /// admitted work can finish before or after its predecessors without being
+    /// regressed.
+    pub moving_publication_predecessors: Vec<String>,
+    /// Later ordinary admissions linked directly from this exact result. New
+    /// admissions follow this chain from the current moving projection instead
+    /// of scanning stored refs. The chain covers only work admitted before the
+    /// moving projection advances past this result.
+    pub moving_admission_successors: Vec<String>,
     pub commit: String,
     pub parent_commit: Option<String>,
     pub default_branch: String,
     pub skeleton_pack: String,
     pub skeleton_idx: String,
-    pub head_blobs_pack: String,
     pub head_blobs_idx: String,
     /// Content-addressed chunks of the head-blobs pack. The full pack is the
     /// concatenation of these chunks in order. New builds split the pack so the
@@ -239,26 +247,13 @@ pub struct RefInfo {
     pub prebuilt_index: String,
     pub archive: String,
     pub manifest: String,
-    /// Optional full-history pack (empty when not built).
-    pub full_pack: String,
-    /// Clonepack manifest hash (protobuf). Archive chunks are referenced inside it.
-    /// Kept for backward compatibility; use `full_clonepack.manifest`.
-    #[serde(default)]
-    pub clonepack_manifest: String,
-    /// Metadata chunk hash (protobuf). Kept at the top level so the ref endpoint
-    /// can hand out a signed URL for it without re-decoding the manifest.
-    /// Kept for backward compatibility; use `full_clonepack.metadata_chunk`.
-    #[serde(default)]
-    pub metadata_chunk: String,
     /// Archive chunk hashes referenced by the clonepack manifest. Kept for
     /// retention protection and debugging.
     #[serde(default)]
     pub archive_chunks: Vec<String>,
     /// Full-history clonepack (all reachable commits/trees).
-    #[serde(default)]
     pub full_clonepack: ClonepackArtifacts,
     /// Shallow clonepack (single commit + HEAD trees). Matches `git clone --depth=1`.
-    #[serde(default)]
     pub shallow_clonepack: ClonepackArtifacts,
     /// LSM sealed history levels (oldest first). Empty unless the LSM build is
     /// enabled. Each level is immutable and content-addressed; a sync only builds
@@ -293,13 +288,13 @@ pub struct RefInfo {
     /// full-history/files artifacts finish and surfaced by `/status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_ms: Option<u64>,
-    /// Unix timestamp (seconds) when this ref was last synced. Legacy ordering
-    /// signal, kept as a fallback for refs (or repos) without a `generation`.
+    /// Unix timestamp (seconds) when this ref was last synced. It is the atomic
+    /// ordering tie-break when either side has no Git generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<u64>,
     /// Unix timestamp (seconds) when this ref was last considered "warm".
-    /// The periodic warm-TTL sweep uses this (falling back to `synced_at`) to
-    /// decide when a ref's clonepack artifacts have gone idle.
+    /// The periodic warm-TTL sweep uses this to decide when a ref's clonepack
+    /// artifacts have gone idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<u64>,
     /// When true, the warm-TTL sweep never evicts this ref's artifacts. An
@@ -310,8 +305,60 @@ pub struct RefInfo {
     /// The commit's depth in git history (`git rev-list --count`). This is the
     /// primary ordering signal for "a newer sync never loses": recency follows
     /// the commit's place in history, not the builder's clock, so two builders
-    /// with skewed clocks still order correctly. `None` on refs written before
-    /// this field existed, where callers fall back to `synced_at`.
+    /// with skewed clocks still order correctly. `None` selects the current
+    /// authoritative `synced_at` tie-break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefInfo;
+
+    #[test]
+    fn ref_info_rejects_missing_internal_exact_identity() {
+        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("internal_exact_result");
+
+        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
+        assert!(
+            error.to_string().contains("internal_exact_result"),
+            "missing identity must be named clearly: {error}"
+        );
+    }
+
+    #[test]
+    fn ref_info_rejects_missing_moving_publication_identity() {
+        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("moving_publication_predecessors");
+
+        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("moving_publication_predecessors"),
+            "missing publication identity must be named clearly: {error}"
+        );
+    }
+
+    #[test]
+    fn ref_info_rejects_missing_moving_admission_identity() {
+        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("moving_admission_successors");
+
+        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
+        assert!(
+            error.to_string().contains("moving_admission_successors"),
+            "missing admission identity must be named clearly: {error}"
+        );
+    }
 }

@@ -27,6 +27,6 @@ E4 (`expired_bearer_token_fails_clone_cleanly`) already uses a server-side `Arti
 - Do not change production code.
 
 ## Success criteria
-- `cargo test --test e2e_gc_race` passes in < 10 s locally.
+- `cargo test --test local_server e2e_gc_race::` passes in < 10 s locally.
 - `cargo test --test e2e_remote_gc_s3 -- --ignored` still compiles and passes in CI.
 - `cargo fmt --all` and `cargo clippy --all-targets --locked -- -D warnings` are clean.

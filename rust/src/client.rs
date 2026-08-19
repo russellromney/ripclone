@@ -41,21 +41,108 @@ struct ServerError {
 struct ArtifactPendingResponse {
     code: String,
     commit: String,
-    #[serde(default)]
+    branch: String,
+    status: String,
+    queue_depth: usize,
     top_up_supported: Option<bool>,
-    #[serde(default)]
     top_up_base: Option<RefResponse>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SyncAcceptedResponse {
     status: String,
-    #[serde(default)]
     queue_depth: usize,
-    #[serde(default)]
-    commit: Option<String>,
-    #[serde(default)]
+    commit: String,
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExactRevisionUnavailableResponse {
+    error: String,
+    commit: String,
+    branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncAtPin {
+    commit: String,
     branch: Option<String>,
+}
+
+fn exact_commit_from_revision(rev: Option<&str>) -> Option<String> {
+    rev.filter(|value| crate::validation::validate_object_id(value).is_ok())
+        .map(str::to_string)
+}
+
+fn observe_sync_at_identity(
+    pin: &mut Option<SyncAtPin>,
+    commit: &str,
+    branch: &str,
+    response_kind: &str,
+) -> Result<()> {
+    crate::validation::validate_object_id(commit)
+        .with_context(|| format!("validate commit in exact revision {response_kind} response"))?;
+    if branch.is_empty() {
+        anyhow::bail!(
+            "sync integrity error: exact revision {response_kind} response omitted branch"
+        );
+    }
+    crate::validation::validate_git_rev(branch)
+        .with_context(|| format!("validate branch in exact revision {response_kind} response"))?;
+
+    if let Some(expected) = pin {
+        if expected.commit != commit
+            || expected
+                .branch
+                .as_deref()
+                .is_some_and(|expected_branch| expected_branch != branch)
+        {
+            anyhow::bail!(
+                "sync integrity error: exact revision pin {}@{} changed to {branch}@{commit} in a {response_kind} response",
+                expected.branch.as_deref().unwrap_or("<unresolved>"),
+                expected.commit
+            );
+        }
+        if expected.branch.is_none() {
+            expected.branch = Some(branch.to_string());
+        }
+    } else {
+        *pin = Some(SyncAtPin {
+            commit: commit.to_string(),
+            branch: Some(branch.to_string()),
+        });
+    }
+    Ok(())
+}
+
+fn validate_ref_response_identity(
+    expected_commit: Option<&str>,
+    expected_branch: Option<&str>,
+    commit: &str,
+    branch: &str,
+    response_kind: &str,
+    repo_path: &str,
+) -> Result<()> {
+    crate::validation::validate_object_id(commit)
+        .with_context(|| format!("invalid {response_kind} commit for {repo_path}"))?;
+    crate::validation::validate_git_rev(branch)
+        .with_context(|| format!("invalid {response_kind} branch for {repo_path}"))?;
+    if let Some(expected) = expected_commit
+        && commit != expected
+    {
+        anyhow::bail!(
+            "ref integrity error: expected commit {expected} changed to {commit} in a {response_kind} response"
+        );
+    }
+    if let Some(expected) = expected_branch
+        && expected != "HEAD"
+        && branch != expected
+    {
+        anyhow::bail!(
+            "ref integrity error: resolved branch {expected} changed to {branch} in a {response_kind} response"
+        );
+    }
+    Ok(())
 }
 
 /// Result of one ordinary sync/add admission request. A caller that only needs
@@ -216,22 +303,16 @@ fn build_http_client(headers: reqwest::header::HeaderMap) -> reqwest::Client {
 pub struct RefResponse {
     pub owner: String,
     pub repo: String,
-    #[serde(default)]
     pub provider: String,
-    #[serde(default)]
     pub host: String,
-    #[serde(default)]
     pub origin_url: String,
     pub branch: String,
     pub default_branch: String,
     pub commit: String,
     pub parent_commit: Option<String>,
-    pub full_pack: String,
-    #[serde(default)]
     pub clonepack_manifest: String,
     #[serde(default)]
     pub clonepack_manifest_url: Option<String>,
-    #[serde(default)]
     pub metadata_chunk: String,
     #[serde(default)]
     pub metadata_chunk_url: Option<String>,
@@ -244,9 +325,6 @@ pub struct RefResponse {
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.
     #[serde(default)]
     pub pack_chunk_urls: Option<Vec<Option<String>>>,
-    /// Signed URL for each editable pack's idx, ordered to match `manifest.packs`.
-    #[serde(default)]
-    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
     #[serde(default)]
     pub midx_url: Option<String>,
@@ -254,17 +332,12 @@ pub struct RefResponse {
     #[serde(default)]
     pub idx_bundle_url: Option<String>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
-    #[serde(default)]
     pub shallow: bool,
     /// True once the full clonepack's archive is built (files mode can clone).
-    /// Defaults true so an older server that always shipped the archive is treated
-    /// as ready.
-    #[serde(default = "ref_archive_ready_default")]
     pub archive_ready: bool,
     /// The hosted server's per-clone id, captured from the `X-Ripclone-Clone-Id`
-    /// response header (not part of the JSON body). `None` for a self-hosted or
-    /// older server that doesn't mint one — in that case the post-clone metrics
-    /// report is skipped entirely.
+    /// response header (not part of the JSON body). `None` when the server does
+    /// not mint one; in that case the post-clone metrics report is skipped.
     #[serde(skip)]
     pub clone_id: Option<String>,
     /// True when resolving this ref required a 202/poll (a cold build) rather
@@ -272,10 +345,6 @@ pub struct RefResponse {
     /// JSON body.
     #[serde(skip)]
     pub cold: bool,
-}
-
-fn ref_archive_ready_default() -> bool {
-    true
 }
 
 fn ref_poll_config() -> (usize, std::time::Duration) {
@@ -407,19 +476,10 @@ fn record_test_managed_git(command: &str, elapsed: Duration) -> Result<()> {
     .context("record managed top-up Git timing")
 }
 
-/// Return the chunk refs that make up the head-blobs pack, falling back to the
-/// deprecated single-pack field for older manifests.
-#[allow(deprecated)]
 pub(crate) fn head_blobs_chunk_refs(
     clonepack: &ClonepackManifest,
 ) -> Vec<crate::clonepack::ChunkRef> {
-    if !clonepack.head_blobs_chunks.is_empty() {
-        clonepack.head_blobs_chunks.clone()
-    } else if let Some(pack) = &clonepack.head_blobs_pack {
-        vec![pack.clone()]
-    } else {
-        Vec::new()
-    }
+    clonepack.head_blobs_chunks.clone()
 }
 
 /// `(max_attempts, base_backoff_ms)` for artifact downloads, from the
@@ -701,8 +761,8 @@ fn fsync_requested() -> bool {
 }
 
 /// Resolve the directory to fsync after the atomic rename publishes `target`,
-/// so the rename entry itself is durable. A bare relative `--dir` (the README
-/// quickstart uses `--dir bun`) has an empty parent; fall back to the current
+/// so the rename entry itself is durable. A bare relative target directory (the
+/// README quickstart uses `bun`) has an empty parent; fall back to the current
 /// directory — the actual container — exactly as `temp_install_dir` does, so
 /// the post-rename fsync is never silently skipped.
 fn post_rename_fsync_dir(target: &Path) -> &Path {
@@ -830,22 +890,6 @@ fn wait_for_test_pack_worker(pack_index: usize) -> Result<()> {
     std::fs::write(entered, b"released").context("mark pack worker released")
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SnapshotResponse {
-    pub owner: String,
-    pub repo: String,
-    pub branch: String,
-    pub commit: String,
-    pub snapshot_hash: String,
-    pub size: u64,
-    pub hot_files: usize,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct HotfilesResponse {
-    pub files: Vec<String>,
-}
-
 /// What a finished clone learned, for the best-effort post-clone metrics report.
 /// Carries the hosted server's per-clone id (when one was minted), the resolved
 /// repo/commit, and the bytes/timing the client measured. The end-to-end wall
@@ -860,8 +904,7 @@ pub struct CloneOutcome {
     pub mode: &'static str,
     /// True when the resolve had to poll a cold build (202) before succeeding.
     pub cold: bool,
-    /// The cloud's `X-Ripclone-Clone-Id`. `None` ⇒ self-hosted/older server ⇒
-    /// no metrics report.
+    /// The cloud's `X-Ripclone-Clone-Id`. `None` means no metrics report.
     pub clone_id: Option<String>,
     /// Total bytes downloaded (metadata + pack/archive chunks).
     pub bytes: u64,
@@ -1165,8 +1208,8 @@ impl Client {
         {
             headers.insert(reqwest::header::AUTHORIZATION, header_value);
         }
-        // Advertise the wire protocol so the server can reject an incompatible
-        // (too-new) client with an actionable error instead of a confusing 4xx.
+        // Declare the sole wire protocol so an incompatible client/server pair
+        // fails at the boundary with an actionable error.
         if let Ok(pv) = reqwest::header::HeaderValue::from_str(&crate::PROTOCOL_VERSION.to_string())
         {
             headers.insert("x-ripclone-protocol", pv);
@@ -1228,9 +1271,7 @@ impl Client {
         url.rsplit('/').next().map(|s| s.to_string())
     }
 
-    /// Build a request URL for `repo_path`. GitHub repos keep the legacy
-    /// `/v1/repos/{owner}/{repo}` shape; other providers are routed under
-    /// `/v1/repos/{provider}/{repo_path}`.
+    /// Build a provider-qualified request URL for `repo_path`.
     fn repo_url(&self, repo_path: &str, suffix: &str) -> String {
         format!(
             "{}/v1/repos/{}/{repo_path}{suffix}",
@@ -1283,6 +1324,7 @@ impl Client {
         clonepack: Option<&str>,
         rev: Option<&str>,
     ) -> Result<RefResponse> {
+        let expected_commit = exact_commit_from_revision(rev);
         let mut pinned = None;
         let mut resolved_branch = None;
         let mut clone_id = None;
@@ -1293,6 +1335,7 @@ impl Client {
                 branch,
                 clonepack,
                 rev,
+                expected_commit.as_deref(),
                 &mut pinned,
                 &mut resolved_branch,
                 clonepack.unwrap_or("full"),
@@ -1313,6 +1356,7 @@ impl Client {
         branch: &str,
         clonepack: Option<&str>,
         rev: Option<&str>,
+        expected_commit: Option<&str>,
         pinned: &mut Option<String>,
         resolved_branch: &mut Option<String>,
         pending_mode: &str,
@@ -1332,7 +1376,7 @@ impl Client {
                 branch
             };
             // Branches are wildcard path values, not URL syntax. Re-encode the
-            // concrete branch learned from Content-Location before composing
+            // concrete branch learned from the first response before composing
             // the next request so valid delimiters such as `#` and `%` cannot
             // become a fragment or otherwise change the request target.
             let encoded_branch = urlencoding::encode(request_branch);
@@ -1383,43 +1427,43 @@ impl Client {
                             })
                     })
                     .transpose()?;
-                let pending: ArtifactPendingResponse = resp.json().await.with_context(|| {
-                    format!("invalid protocol-2 pending response for {repo_path}")
-                })?;
-                if pending.code != "artifact_pending" {
+                let pending: ArtifactPendingResponse = resp
+                    .json()
+                    .await
+                    .with_context(|| format!("invalid pending response for {repo_path}"))?;
+                if pending.code != "artifact_pending" || pending.status != "building" {
                     anyhow::bail!(
-                        "invalid protocol-2 pending response code {:?} for {repo_path}",
-                        pending.code
+                        "invalid pending response for {repo_path}: code={:?}, status={:?}",
+                        pending.code,
+                        pending.status
                     );
                 }
-                crate::validation::validate_object_id(&pending.commit)
-                    .with_context(|| format!("invalid pending commit for {repo_path}"))?;
-                if let Some(expected) = pinned.as_deref() {
-                    if pending.commit != expected {
-                        anyhow::bail!(
-                            "ref integrity error: pinned commit {expected} changed to {} in a pending response",
-                            pending.commit
-                        );
-                    }
-                } else {
-                    *pinned = Some(pending.commit.clone());
+                validate_ref_response_identity(
+                    pinned.as_deref().or(expected_commit),
+                    resolved_branch.as_deref().or(Some(branch)),
+                    &pending.commit,
+                    &pending.branch,
+                    "pending",
+                    repo_path,
+                )?;
+                if let Some(content_location_branch) = pending_branch.as_deref()
+                    && content_location_branch != pending.branch
+                {
+                    anyhow::bail!(
+                        "ref integrity error: pending response branch {} disagrees with Content-Location {content_location_branch}",
+                        pending.branch
+                    );
                 }
-                if let Some(response_branch) = pending_branch.filter(|value| !value.is_empty()) {
-                    crate::validation::validate_git_rev(&response_branch)
-                        .with_context(|| format!("invalid pending branch for {repo_path}"))?;
-                    if let Some(expected) = resolved_branch.as_deref()
-                        && expected != "HEAD"
-                        && response_branch != expected
-                    {
-                        anyhow::bail!(
-                            "ref integrity error: resolved branch {expected} changed to {response_branch} in a pending response"
-                        );
-                    }
-                    *resolved_branch = Some(response_branch);
-                }
+                *pinned = Some(pending.commit.clone());
+                *resolved_branch = Some(pending.branch.clone());
                 polled = true;
                 *cold = true;
-                if requested_top_up && pending.top_up_supported == Some(true) {
+                if requested_top_up {
+                    if pending.top_up_supported != Some(true) {
+                        anyhow::bail!(
+                            "invalid pending response for {repo_path}: pinned Full top-up support was not declared"
+                        );
+                    }
                     let target = pinned.clone().expect("valid 202 establishes a pin");
                     let Some(base_response) = pending.top_up_base else {
                         return Err(anyhow::Error::new(ArtifactPending {
@@ -1460,11 +1504,13 @@ impl Client {
                     });
                 }
                 if attempt == 0 {
-                    eprintln!("ripclone: warming {repo_path} — this can take a moment…");
+                    eprintln!(
+                        "ripclone: warming {repo_path} (queue depth {}) — this can take a moment…",
+                        pending.queue_depth
+                    );
                 }
                 // The first ordinary 202 exists to establish B. Eligible Full
-                // clones immediately make the one pinned opt-in request; only
-                // old servers (missing the new fields) enter the bounded poll.
+                // clones immediately make the one pinned opt-in request.
                 if allow_top_up && !requested_top_up {
                     // This is after the ordinary 202 has established B and
                     // before the first pinned/top_up request.
@@ -1483,6 +1529,24 @@ impl Client {
             }
             if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
                 polled = true;
+                let unavailable = if pinned.is_some() || expected_commit.is_some() {
+                    let unavailable: ExactRevisionUnavailableResponse = resp
+                        .json()
+                        .await
+                        .with_context(|| format!("invalid unavailable response for {repo_path}"))?;
+                    validate_ref_response_identity(
+                        pinned.as_deref().or(expected_commit),
+                        resolved_branch.as_deref().or(Some(branch)),
+                        &unavailable.commit,
+                        &unavailable.branch,
+                        "503",
+                        repo_path,
+                    )?;
+                    *resolved_branch = Some(unavailable.branch.clone());
+                    Some(unavailable)
+                } else {
+                    None
+                };
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
@@ -1495,12 +1559,19 @@ impl Client {
                         "ref lookup for pinned commit {commit} remained unavailable after {max_attempts} attempts"
                     );
                 }
+                if let Some(unavailable) = unavailable {
+                    anyhow::bail!(
+                        "ref lookup for exact commit {} remained unavailable after {max_attempts} attempts: {}",
+                        unavailable.commit,
+                        unavailable.error
+                    );
+                }
                 anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
             }
             if status == reqwest::StatusCode::OK {
                 // Capture the hosted server's per-clone id from the response
-                // header before the body is consumed. Absent on a self-hosted or
-                // older server, which leaves `clone_id` None.
+                // header before the body is consumed. If absent, `clone_id`
+                // remains `None`.
                 let clone_id = resp
                     .headers()
                     .get("x-ripclone-clone-id")
@@ -1510,29 +1581,15 @@ impl Client {
                     *first_clone_id = clone_id;
                 }
                 let mut info: RefResponse = resp.json().await?;
-                crate::validation::validate_object_id(&info.commit)
-                    .with_context(|| format!("invalid ready commit for {repo_path}"))?;
-                crate::validation::validate_git_rev(&info.branch)
-                    .with_context(|| format!("invalid ready branch for {repo_path}"))?;
-                if let Some(expected) = pinned.as_deref() {
-                    if info.commit != expected {
-                        anyhow::bail!(
-                            "ref integrity error: pinned commit {expected} changed to {} in a ready response",
-                            info.commit
-                        );
-                    }
-                } else {
-                    *pinned = Some(info.commit.clone());
-                }
-                if let Some(expected) = resolved_branch.as_deref()
-                    && expected != "HEAD"
-                    && info.branch != expected
-                {
-                    anyhow::bail!(
-                        "ref integrity error: resolved branch {expected} changed to {} in a ready response",
-                        info.branch
-                    );
-                }
+                validate_ref_response_identity(
+                    pinned.as_deref().or(expected_commit),
+                    resolved_branch.as_deref().or(Some(branch)),
+                    &info.commit,
+                    &info.branch,
+                    "ready",
+                    repo_path,
+                )?;
+                *pinned = Some(info.commit.clone());
                 *resolved_branch = Some(info.branch.clone());
                 *cold |= polled;
                 info.clone_id = first_clone_id.clone();
@@ -1559,15 +1616,6 @@ impl Client {
             return Err(error);
         }
         anyhow::bail!("ref lookup did not complete")
-    }
-
-    pub async fn fetch_object(&self, sha: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/v1/objects/{}", self.server, sha);
-        let resp = self.send(self.http.get(&url)).await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("object fetch failed: {}", resp.status());
-        }
-        Ok(resp.bytes().await?.to_vec())
     }
 
     /// Fetch any content-addressed artifact (pack, idx, index, archive, manifest).
@@ -1636,7 +1684,6 @@ impl Client {
         Ok(data)
     }
 
-    #[allow(deprecated)]
     async fn fetch_validated_manifest(
         &self,
         hash: &str,
@@ -1644,16 +1691,7 @@ impl Client {
         pinned: &str,
     ) -> Result<ClonepackManifest> {
         let decode = |data: &[u8]| -> Result<ClonepackManifest> {
-            let mut manifest =
-                ClonepackManifest::decode(data).context("decode clonepack manifest")?;
-            // Backwards compatibility: older manifests store the head-blobs
-            // pack as one field. Normalize only after the commit binding has
-            // been decoded from the same bytes.
-            if manifest.head_blobs_chunks.is_empty()
-                && let Some(pack) = manifest.head_blobs_pack.take()
-            {
-                manifest.head_blobs_chunks.push(pack);
-            }
+            let manifest = ClonepackManifest::decode(data).context("decode clonepack manifest")?;
             validate_manifest_commit(&manifest, pinned)?;
             Ok(manifest)
         };
@@ -1786,67 +1824,6 @@ impl Client {
         Ok((clonepack, Arc::new(metadata)))
     }
 
-    pub async fn create_snapshot(
-        &self,
-        repo_path: &str,
-        branch: &str,
-        hot_files: usize,
-    ) -> Result<SnapshotResponse> {
-        let url = self.repo_url(
-            repo_path,
-            &format!("/snapshot?branch={branch}&hot_files={hot_files}"),
-        );
-        let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
-        if !resp.status().is_success() {
-            return Err(server_error("snapshot create failed", resp).await);
-        }
-        Ok(resp.json().await?)
-    }
-
-    pub async fn fetch_snapshot(&self, hash: &str) -> Result<bytes::Bytes> {
-        self.fetch_artifact(hash).await
-    }
-
-    pub async fn hot_files(
-        &self,
-        repo_path: &str,
-        branch: &str,
-        count: usize,
-    ) -> Result<Vec<String>> {
-        let url = self.repo_url(
-            repo_path,
-            &format!("/hotfiles?branch={branch}&count={count}"),
-        );
-        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
-        if !resp.status().is_success() {
-            return Err(server_error("hotfiles failed", resp).await);
-        }
-        let body: HotfilesResponse = resp.json().await?;
-        Ok(body.files)
-    }
-
-    /// Fetch a batch of working-tree files as a tar archive.
-    pub async fn fetch_batch(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        commit: &str,
-        paths: &[String],
-    ) -> Result<Vec<u8>> {
-        let url = format!("{}/v1/repos/{}/{}/batch", self.server, owner, repo);
-        let body = serde_json::json!({
-            "paths": paths,
-            "branch": branch,
-            "commit": commit,
-        });
-        let resp = self.send(self.http.post(&url).json(&body)).await?;
-        if !resp.status().is_success() {
-            return Err(server_error("batch fetch failed", resp).await);
-        }
-        Ok(resp.bytes().await?.to_vec())
-    }
-
     pub async fn sync_repo(&self, repo_path: &str, depth: Option<usize>) -> Result<RefResponse> {
         let admission = self.admit_sync_repo(repo_path, depth).await?;
         if let Some(ready) = admission.ready {
@@ -1904,10 +1881,10 @@ impl Client {
         rev: Option<&str>,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
-        if rev.is_some() {
-            self.sync_inner_legacy(repo_path, None, rev, depth).await
+        if let Some(rev) = rev {
+            self.sync_at_revision(repo_path, None, rev, depth).await
         } else {
-            self.sync_inner(repo_path, None, None, depth).await
+            self.sync_repo(repo_path, depth).await
         }
     }
 
@@ -1915,7 +1892,7 @@ impl Client {
     /// own ref + clonepack, so this lets several distinct builds for one repo run
     /// at once (unlike `?rev=`, which the server keys by resolved commit).
     pub async fn sync_branch(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
-        self.sync_inner(repo_path, Some(branch), None, None).await
+        self.sync_inner(repo_path, Some(branch), None).await
     }
 
     async fn admit_sync_request(
@@ -1963,10 +1940,8 @@ impl Client {
             .json()
             .await
             .with_context(|| format!("invalid exact {context} admission response"))?;
-        let commit = accepted
-            .commit
-            .context("server accepted sync without an admitted commit")?;
-        let branch = accepted.branch.unwrap_or_else(|| "HEAD".to_string());
+        let commit = accepted.commit;
+        let branch = accepted.branch;
         crate::validation::validate_object_id(&commit)
             .context("server returned invalid admitted commit")?;
         crate::validation::validate_git_rev(&branch)
@@ -1989,7 +1964,7 @@ impl Client {
         let mut pinned = Some(admission.commit.clone());
         // HEAD is a selector, not the concrete metadata key. Let the first
         // exact pinned GET learn the advertised default branch (for example,
-        // `main`) from Content-Location; concrete admissions remain pinned to
+        // `main`) from its response identity; concrete admissions remain pinned to
         // their admitted branch.
         let mut resolved_branch = (admission.branch != "HEAD").then(|| admission.branch.clone());
         let mut clone_id = None;
@@ -1999,6 +1974,7 @@ impl Client {
                 repo_path,
                 &admission.branch,
                 Some("full"),
+                None,
                 None,
                 &mut pinned,
                 &mut resolved_branch,
@@ -2018,12 +1994,8 @@ impl Client {
         &self,
         repo_path: &str,
         branch: Option<&str>,
-        rev: Option<&str>,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
-        if rev.is_some() {
-            return self.sync_inner_legacy(repo_path, branch, rev, depth).await;
-        }
         let admission = self.admit_sync_request(repo_path, branch, depth).await?;
         if let Some(ready) = admission.ready {
             return Ok(ready);
@@ -2031,28 +2003,19 @@ impl Client {
         self.wait_for_admitted_sync(repo_path, &admission).await
     }
 
-    async fn sync_inner_legacy(
+    async fn sync_at_revision(
         &self,
         repo_path: &str,
         branch: Option<&str>,
-        rev: Option<&str>,
+        rev: &str,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
-        let mut url = self.repo_url(repo_path, "/sync");
-        let mut q: Vec<String> = Vec::new();
-        if let Some(b) = branch {
-            q.push(format!("branch={}", urlencoding::encode(b)));
-        }
-        if let Some(d) = depth {
-            q.push(format!("depth={}", d));
-        }
-        if let Some(r) = rev {
-            q.push(format!("rev={}", urlencoding::encode(r)));
-        }
-        if !q.is_empty() {
-            url.push('?');
-            url.push_str(&q.join("&"));
-        }
+        let mut selected_rev = rev.to_string();
+        let mut selected_branch = branch.map(str::to_string);
+        let mut pin = exact_commit_from_revision(Some(rev)).map(|commit| SyncAtPin {
+            commit,
+            branch: branch.map(str::to_string),
+        });
         // With the async build queue the server may return 202 (build still
         // running) or 503 (queue full). Each POST blocks server-side until its
         // wait window elapses, so we just retry — coalescing means a retry
@@ -2067,19 +2030,65 @@ impl Client {
             .unwrap_or(40);
         let poll = test_sync_poll_interval();
         for attempt in 0..max_attempts {
+            let mut url = self.repo_url(repo_path, "/sync");
+            let mut q: Vec<String> = Vec::new();
+            if let Some(branch) = selected_branch.as_deref() {
+                q.push(format!("branch={}", urlencoding::encode(branch)));
+            }
+            if let Some(depth) = depth {
+                q.push(format!("depth={depth}"));
+            }
+            q.push(format!("rev={}", urlencoding::encode(&selected_rev)));
+            url.push('?');
+            url.push_str(&q.join("&"));
             let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
             let status = resp.status();
             if status == reqwest::StatusCode::OK {
-                return Ok(resp.json().await?);
+                let ready: RefResponse = resp
+                    .json()
+                    .await
+                    .context("decode exact revision ready response")?;
+                observe_sync_at_identity(&mut pin, &ready.commit, &ready.branch, "200")?;
+                return Ok(ready);
             }
-            if status == reqwest::StatusCode::ACCEPTED
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
+            if status == reqwest::StatusCode::ACCEPTED {
+                let pending: ArtifactPendingResponse = resp
+                    .json()
+                    .await
+                    .context("decode exact revision pending response")?;
+                if pending.code != "artifact_pending" || pending.status != "building" {
+                    anyhow::bail!("invalid exact revision pending response");
+                }
+                observe_sync_at_identity(&mut pin, &pending.commit, &pending.branch, "202")?;
+                selected_rev = pending.commit;
+                selected_branch = Some(pending.branch);
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(poll).await;
                     continue;
                 }
                 anyhow::bail!("sync still building after {max_attempts} attempts");
+            }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                let unavailable: ExactRevisionUnavailableResponse = resp
+                    .json()
+                    .await
+                    .context("decode exact revision queue response")?;
+                observe_sync_at_identity(
+                    &mut pin,
+                    &unavailable.commit,
+                    &unavailable.branch,
+                    "503",
+                )?;
+                selected_rev = unavailable.commit;
+                selected_branch = Some(unavailable.branch);
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(poll).await;
+                    continue;
+                }
+                anyhow::bail!(
+                    "sync unavailable after {max_attempts} attempts: {}",
+                    unavailable.error
+                );
             }
             return Err(server_error("sync failed", resp).await);
         }
@@ -2239,6 +2248,7 @@ impl Client {
 
         let mut local_bench = Benchmark::new();
         let bench = bench.unwrap_or(&mut local_bench);
+        let expected_commit = exact_commit_from_revision(rev);
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
@@ -2262,6 +2272,7 @@ impl Client {
                 branch,
                 clonepack,
                 rev,
+                expected_commit.as_deref(),
                 &mut identity.pinned,
                 &mut identity.resolved_branch,
                 metric_mode,
@@ -2317,6 +2328,7 @@ impl Client {
                         branch,
                         clonepack,
                         rev,
+                        expected_commit.as_deref(),
                         &mut identity.pinned,
                         &mut identity.resolved_branch,
                         metric_mode,
@@ -2793,11 +2805,11 @@ impl Client {
             cold: outcome.cold,
             total_ms,
             bytes: outcome.bytes,
-            // v1 omits downloadMs: the client can't cleanly isolate pure
+            // Omit downloadMs: the client can't cleanly isolate pure
             // chunk-download time from manifest fetch + extraction, and a biased
             // number would skew the cloud's bytes/downloadMs throughput (the
             // headline metric). Better no throughput than a wrong one — the cloud
-            // simply won't compute it. Reinstated when the phase is isolated (v2).
+            // simply won't compute it. It can be reinstated once that phase is isolated.
             download_ms: None,
             client: ClientInfo::current(),
         };
@@ -2825,7 +2837,6 @@ impl Client {
     /// a pre-allocated temp pack file at their final offsets. Peak memory is
     /// ~`concurrency * chunk_size`, no bytes are re-hashed, and the pack is
     /// written exactly once.
-    #[allow(deprecated)]
     pub async fn install_prebuilt_blob_pack(
         &self,
         clonepack: &ClonepackManifest,
@@ -2872,7 +2883,11 @@ impl Client {
         std::fs::create_dir_all(pack_dir)
             .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
 
-        let idx_bundle_task = manifest.idx_bundle.as_ref().map(|bundle_ref| {
+        let bundle_ref = manifest
+            .idx_bundle
+            .as_ref()
+            .context("clonepack manifest is missing required idx bundle")?;
+        let idx_bundle_task = {
             let client = self.clone();
             let bundle_ref = bundle_ref.clone();
             let idx_bundle_url = info.idx_bundle_url.clone();
@@ -2885,7 +2900,7 @@ impl Client {
                 }),
                 cleanup.clone(),
             )
-        });
+        };
         let midx_task = manifest.midx.as_ref().map(|midx_ref| {
             let client = self.clone();
             let midx_ref = midx_ref.clone();
@@ -2931,22 +2946,17 @@ impl Client {
         let download_conc = tuning.editable_download_concurrency;
         let parse_conc = tuning.pack_parse_threads;
 
-        // Signed URLs (one per pack/idx, matching manifest.packs order). Empty
+        // Signed URLs (one per pack, matching manifest.packs order). Empty
         // entries fall back to the gateway by hash; with an object-store backend
         // these point straight at the bucket so bytes bypass the server.
         let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
-        let idx_urls = info.pack_idx_urls.clone().unwrap_or_default();
-
-        // If the manifest ships a single idx bundle, fetch it ONCE and slice each
-        // pack's idx out of it locally — instead of one GET per pack idx (cuts
-        // per-pack round-trips from 2 to 1). Falls back to per-pack idx fetches
-        // for older manifests without a bundle.
-        let idx_bundle: Option<Arc<bytes::Bytes>> = match idx_bundle_task {
-            Some(task) => Some(Arc::new(
-                task.join().await.context("idx bundle fetch task")??,
-            )),
-            None => None,
-        };
+        // Fetch the required bundle once and slice every verified pack idx from it.
+        let idx_bundle = Arc::new(
+            idx_bundle_task
+                .join()
+                .await
+                .context("idx bundle fetch task")??,
+        );
 
         let jobs: Vec<(usize, PackEntry)> = manifest.packs.iter().cloned().enumerate().collect();
 
@@ -2971,7 +2981,6 @@ impl Client {
         let downloads = stream::iter(jobs).map(|(i, entry)| {
             let client = self.clone();
             let pack_url = pack_urls.get(i).and_then(|o| o.clone());
-            let idx_url = idx_urls.get(i).and_then(|o| o.clone());
             let idx_bundle = idx_bundle.clone();
             let history_only = entry.history_only;
             let pack_dir = pack_dir.to_path_buf();
@@ -2980,36 +2989,7 @@ impl Client {
                     .pack
                     .as_ref()
                     .with_context(|| format!("pack {} missing pack ref", i))?;
-                let idx_ref = entry
-                    .idx
-                    .as_ref()
-                    .with_context(|| format!("pack {} missing idx ref", i))?;
-                let idx_bytes = if let Some(bundle) = idx_bundle.as_ref() {
-                    // Slice this pack's idx from the bundle and verify its hash;
-                    // only the pack itself needs a network fetch.
-                    let off = entry.idx_bundle_offset as usize;
-                    let end = off
-                        .checked_add(idx_ref.len as usize)
-                        .context("idx bundle offset overflow")?;
-                    // Zero-copy view into the shared bundle (refcounted Bytes).
-                    if bundle.get(off..end).is_none() {
-                        anyhow::bail!("idx {} slice out of bundle range", i);
-                    }
-                    let slice = bundle.slice(off..end);
-                    let want = hash_to_hex(&idx_ref.hash);
-                    let got = crate::cas::hash(&slice);
-                    if got != want {
-                        anyhow::bail!(
-                            "idx {i} bundle slice hash mismatch: expected {want}, got {got}"
-                        );
-                    }
-                    slice
-                } else {
-                    client
-                        .fetch_chunk_ref(idx_ref, idx_url.as_deref())
-                        .await
-                        .with_context(|| format!("fetch idx {}", i))?
-                };
+                let idx_bytes = manifest_pack_idx_bytes(&entry, i, &idx_bundle)?;
                 let pack_fetch_start = std::time::Instant::now();
                 let pack_body = if history_only {
                     let (file, len) = client
@@ -3180,11 +3160,9 @@ impl Client {
         .context("spawn clear skip-worktree and refresh index stats")??;
 
         // Install the multi-pack-index so git object lookups stay O(log) across
-        // the many installed packs. Prefer the server-pregenerated MIDX (zero
-        // client CPU; it indexes the same `pack-<trailer>` files we just wrote);
-        // fall back to building it locally for older manifests without one. Best
-        // effort either way — without a MIDX the clone is still correct, just
-        // with slower per-object lookups.
+        // the many installed packs. A cold build supplies the prebuilt MIDX;
+        // an incremental shallow build may omit it when base packs are remote,
+        // in which case the client builds it from the installed pack indexes.
         if let Some(midx_task) = midx_task {
             match midx_task
                 .join()
@@ -3358,7 +3336,6 @@ impl Client {
         Ok(pack_bytes + idx_data.len() as u64)
     }
 
-    #[allow(deprecated)]
     fn spawn_fetch_manifest(
         self,
         hash: String,
@@ -4101,48 +4078,32 @@ impl Client {
             anyhow::bail!("clonepack has no packs for git-dir install");
         }
 
-        let idx_bundle: Option<Arc<bytes::Bytes>> = match manifest.idx_bundle.as_ref() {
-            Some(b) => Some(Arc::new(
-                self.fetch_chunk_ref(b, info.idx_bundle_url.as_deref())
-                    .await
-                    .context("fetch idx bundle")?,
-            )),
-            None => None,
-        };
+        let bundle_ref = manifest
+            .idx_bundle
+            .as_ref()
+            .context("clonepack manifest is missing required idx bundle")?;
+        let idx_bundle = Arc::new(
+            self.fetch_chunk_ref(bundle_ref, info.idx_bundle_url.as_deref())
+                .await
+                .context("fetch idx bundle")?,
+        );
 
         let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
-        let idx_urls = info.pack_idx_urls.clone().unwrap_or_default();
 
         let downloads = stream::iter(packs.into_iter().enumerate()).map(|(i, entry)| {
             let client = self.clone();
             let pack_url = pack_urls.get(i).and_then(|o| o.clone());
-            let idx_url = idx_urls.get(i).and_then(|o| o.clone());
             let idx_bundle = idx_bundle.clone();
             async move {
                 let pack_ref = entry
                     .pack
                     .as_ref()
                     .with_context(|| format!("pack {} missing pack ref", i))?;
-                let (pack_bytes, idx_bytes) = if let Some(bundle) = idx_bundle.as_ref() {
-                    let pack_bytes = client
-                        .fetch_chunk_ref(pack_ref, pack_url.as_deref())
-                        .await
-                        .with_context(|| format!("fetch pack {}", i))?;
-                    let idx_bytes = manifest_pack_idx_bytes(&entry, i, Some(bundle), None)?;
-                    (pack_bytes, idx_bytes)
-                } else {
-                    let idx_ref = entry
-                        .idx
-                        .as_ref()
-                        .with_context(|| format!("pack {} missing idx ref", i))?;
-                    let (pack_bytes, idx_bytes) = tokio::try_join!(
-                        client.fetch_chunk_ref(pack_ref, pack_url.as_deref()),
-                        client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
-                    )
+                let pack_bytes = client
+                    .fetch_chunk_ref(pack_ref, pack_url.as_deref())
+                    .await
                     .with_context(|| format!("fetch pack {}", i))?;
-                    let idx_bytes = manifest_pack_idx_bytes(&entry, i, None, Some(idx_bytes))?;
-                    (pack_bytes, idx_bytes)
-                };
+                let idx_bytes = manifest_pack_idx_bytes(&entry, i, &idx_bundle)?;
                 Ok::<(bytes::Bytes, bytes::Bytes), anyhow::Error>((pack_bytes, idx_bytes))
             }
         });
@@ -4241,7 +4202,7 @@ impl Client {
                 pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
                 &idx_data,
             )?;
-            info!("wrote legacy head-blobs pack ({} bytes)", pack_data.len());
+            info!("wrote head-closure pack ({} bytes)", pack_data.len());
             (pack_data.len() + idx_data.len()) as u64
         } else if clonepack.packs.iter().any(|p| !p.history_only) {
             self.install_manifest_packs(&clonepack, info, &pack_dir)
@@ -4439,24 +4400,6 @@ impl Client {
         );
         Ok(())
     }
-
-    /// Fetch a single file's content from the server.
-    pub async fn cat_file(&self, repo_path: &str, branch: &str, path: &str) -> Result<Vec<u8>> {
-        self.fetch_file(repo_path, branch, path).await
-    }
-
-    /// Fetch a single file's content from the server by path.
-    pub async fn fetch_file(&self, repo_path: &str, branch: &str, path: &str) -> Result<Vec<u8>> {
-        let url = self.repo_url(
-            repo_path,
-            &format!("/cat?path={}&branch={}", urlencoding::encode(path), branch),
-        );
-        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
-        if !resp.status().is_success() {
-            return Err(server_error("cat failed", resp).await);
-        }
-        Ok(resp.bytes().await?.to_vec())
-    }
 }
 
 /// Try to resolve `branch` in a local repo without contacting the server.
@@ -4476,6 +4419,76 @@ fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SYNC_AT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SYNC_AT_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn sync_at_response_sequence_keeps_one_identity_across_all_statuses() {
+        let mut pin = None;
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "503").unwrap();
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "200").unwrap();
+        assert_eq!(
+            pin,
+            Some(SyncAtPin {
+                commit: SYNC_AT_B.to_string(),
+                branch: Some("main".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_sync_sha_rejects_initial_commit_change_for_every_response_status() {
+        for response_kind in ["202", "503", "200"] {
+            let mut pin = exact_commit_from_revision(Some(SYNC_AT_B)).map(|commit| SyncAtPin {
+                commit,
+                branch: None,
+            });
+            let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", response_kind)
+                .expect_err("an explicit SHA must be the initial sync pin");
+            assert!(
+                format!("{error:#}").contains("sync integrity error"),
+                "unexpected {response_kind} error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_at_response_sequence_rejects_commit_change_on_later_202() {
+        let mut pin = None;
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
+        let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", "202")
+            .expect_err("later pending response must not repin");
+        assert!(format!("{error:#}").contains("sync integrity error"));
+    }
+
+    #[test]
+    fn sync_at_response_sequence_rejects_branch_change_on_later_503() {
+        let mut pin = None;
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
+        let error = observe_sync_at_identity(&mut pin, SYNC_AT_B, "release", "503")
+            .expect_err("queue response must preserve the selected branch");
+        assert!(format!("{error:#}").contains("sync integrity error"));
+    }
+
+    #[test]
+    fn sync_at_response_sequence_rejects_commit_change_on_final_200() {
+        let mut pin = None;
+        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
+        let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", "200")
+            .expect_err("ready response must preserve the selected commit");
+        assert!(format!("{error:#}").contains("sync integrity error"));
+    }
+
+    #[test]
+    fn sync_at_pending_response_requires_branch_identity() {
+        let mut pin = None;
+        let error = observe_sync_at_identity(&mut pin, SYNC_AT_B, "", "202")
+            .expect_err("pending response without a branch must fail closed");
+        assert!(format!("{error:#}").contains("omitted branch"));
+        assert!(pin.is_none());
+    }
 
     #[test]
     fn access_error_hints_are_actionable() {
@@ -4549,8 +4562,8 @@ mod tests {
     fn post_rename_fsync_dir_resolves_relative_target_to_cwd() {
         // The post-rename durability fsync makes the atomic rename itself
         // durable (BUILD_OPTIONS: "the target's parent directory after the
-        // atomic rename"). A bare relative `--dir` — the common case, the
-        // README quickstart uses `--dir bun` — has an empty parent. The
+        // atomic rename"). A bare relative target — the common case, the
+        // README quickstart uses `bun` — has an empty parent. The
         // resolver must fall back to the containing directory (cwd `.`) so the
         // fsync runs, not be dropped/skipped (D6).
         assert_eq!(

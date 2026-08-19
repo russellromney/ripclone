@@ -48,12 +48,6 @@ pub trait MetaDb: Send + Sync {
     /// Fetch the row for one ref, if present.
     async fn get(&self, repo_key: &str, branch: &str) -> Result<Option<RefRow>>;
 
-    /// All ref rows for this repo whose `commit_id` equals `commit` (one per
-    /// branch sitting at that commit). Powers commit-keyed reuse: a sync of one
-    /// branch can reuse a build another branch already produced for the same
-    /// commit. Indexed on `(repo_key, commit_id)`; no new write needed.
-    async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>>;
-
     /// Insert-or-update the row for one ref, applying the save-ordering policy
     /// ("a newer sync never loses to an older one") in a **single atomic
     /// statement** — no read-then-write TOCTOU. The write lands when there is no
@@ -74,17 +68,23 @@ pub trait MetaDb: Send + Sync {
         commit_id: &str,
         synced_at: Option<i64>,
         generation: Option<i64>,
+        require_matching_commit: bool,
+        internal_exact_result: bool,
+        moving_publication_predecessor: Option<&str>,
     ) -> Result<()>;
 
-    /// Replace the JSON blob only if the row still has both the expected commit
-    /// and the expected current JSON blob.
-    async fn compare_and_swap_data(
+    /// Replace one complete ref row only if it still has both the expected
+    /// commit and expected current JSON blob.
+    async fn compare_and_swap_ref(
         &self,
         repo_key: &str,
         branch: &str,
         expected_commit: &str,
         expected_data: &str,
         new_data: &str,
+        new_commit: &str,
+        new_synced_at: Option<i64>,
+        new_generation: Option<i64>,
     ) -> Result<bool>;
 
     /// Distinct `repo_key`s that have at least one stored ref.
@@ -153,25 +153,101 @@ impl RefStore for SqlRefStore {
         }
     }
 
-    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // The `commit_id` index narrows to rows at this commit; we then confirm a
-        // completed full build (some rows may be depth=1-only mid two-phase).
-        // First complete match wins.
-        for row in self
-            .db
-            .get_by_commit(&repo_id.storage_key(), commit)
-            .await?
-        {
-            let info: RefInfo = serde_json::from_str(&row.data).context("parse stored RefInfo")?;
-            if info.full_clonepack.commit == commit && !info.full_clonepack.manifest.is_empty() {
-                return Ok(Some(info));
-            }
-        }
-        Ok(None)
-    }
-
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
         let repo_key = repo_id.storage_key();
+
+        // Moving publications may replace any predecessor in their durable
+        // ordinary-admission chain. Enforce that identity fence with the
+        // existing JSON CAS so every SQL backend gets identical semantics
+        // without a schema change or backend-specific dynamic SQL.
+        if info.require_matching_commit && !info.internal_exact_result {
+            let mut insert_missing = false;
+            for attempt in 0..64 {
+                let Some(row) = self.db.get(&repo_key, branch).await? else {
+                    if crate::ref_store::should_replace_ref(None, info) {
+                        insert_missing = true;
+                        break;
+                    }
+                    return Ok(());
+                };
+                let existing: RefInfo =
+                    serde_json::from_str(&row.data).context("parse stored RefInfo")?;
+                if !crate::ref_store::should_replace_ref(Some(&existing), info) {
+                    return Ok(());
+                }
+                let data = serde_json::to_string(info).context("serialize RefInfo")?;
+                if data == row.data
+                    || self
+                        .db
+                        .compare_and_swap_ref(
+                            &repo_key,
+                            branch,
+                            &row.commit_id,
+                            &row.data,
+                            &data,
+                            &info.commit,
+                            info.synced_at.map(|value| value as i64),
+                            info.generation.map(|value| value as i64),
+                        )
+                        .await?
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    (attempt.min(10) + 1) as u64,
+                ))
+                .await;
+            }
+            if !insert_missing {
+                anyhow::bail!(
+                    "SQL ref store {repo_key}@{branch}: gave up after repeated moving-publication conflicts"
+                );
+            }
+        }
+
+        // Exact artifact saves for one commit merge the admission chain under
+        // CAS. This closes explicit-first/ordinary-second promotion races where
+        // a worker built from an older snapshot would otherwise erase the
+        // promotion while publishing phase one.
+        if info.internal_exact_result {
+            for attempt in 0..64 {
+                let Some(row) = self.db.get(&repo_key, branch).await? else {
+                    break;
+                };
+                if row.commit_id != info.commit {
+                    break;
+                }
+                let existing: RefInfo =
+                    serde_json::from_str(&row.data).context("parse stored RefInfo")?;
+                if !crate::ref_store::should_replace_ref(Some(&existing), info) {
+                    return Ok(());
+                }
+                let merged = crate::ref_store::merge_exact_admission(Some(&existing), info);
+                let data = serde_json::to_string(&merged).context("serialize RefInfo")?;
+                if data == row.data
+                    || self
+                        .db
+                        .compare_and_swap_ref(
+                            &repo_key,
+                            branch,
+                            &row.commit_id,
+                            &row.data,
+                            &data,
+                            &merged.commit,
+                            merged.synced_at.map(|value| value as i64),
+                            merged.generation.map(|value| value as i64),
+                        )
+                        .await?
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    (attempt.min(10) + 1) as u64,
+                ))
+                .await;
+            }
+        }
+
         let data = serde_json::to_string(info).context("serialize RefInfo")?;
         let new_synced = info.synced_at.map(|t| t as i64);
         let new_generation = info.generation.map(|g| g as i64);
@@ -187,6 +263,11 @@ impl RefStore for SqlRefStore {
                 &info.commit,
                 new_synced,
                 new_generation,
+                info.require_matching_commit,
+                info.internal_exact_result,
+                info.moving_publication_predecessors
+                    .first()
+                    .map(String::as_str),
             )
             .await
     }
@@ -218,7 +299,16 @@ impl RefStore for SqlRefStore {
             }
             if self
                 .db
-                .compare_and_swap_data(&repo_key, branch, expected_commit, &row.data, &data)
+                .compare_and_swap_ref(
+                    &repo_key,
+                    branch,
+                    expected_commit,
+                    &row.data,
+                    &data,
+                    &info.commit,
+                    info.synced_at.map(|value| value as i64),
+                    info.generation.map(|value| value as i64),
+                )
                 .await?
             {
                 return Ok(true);
@@ -262,7 +352,16 @@ impl RefStore for SqlRefStore {
             }
             if self
                 .db
-                .compare_and_swap_data(&repo_key, branch, expected_commit, &row.data, &data)
+                .compare_and_swap_ref(
+                    &repo_key,
+                    branch,
+                    expected_commit,
+                    &row.data,
+                    &data,
+                    &info.commit,
+                    info.synced_at.map(|value| value as i64),
+                    info.generation.map(|value| value as i64),
+                )
                 .await?
             {
                 return Ok(true);
@@ -323,18 +422,6 @@ mod tests {
             synced_at,
             ..Default::default()
         }
-    }
-
-    /// A RefInfo with a *completed full* clonepack at `commit` — what commit-keyed
-    /// reuse (`load_build`) requires.
-    fn complete_build(commit: &str) -> RefInfo {
-        let mut info = ref_at(commit, Some(100));
-        info.full_clonepack = crate::ClonepackArtifacts {
-            commit: commit.to_string(),
-            manifest: "manifest-hash".to_string(),
-            ..Default::default()
-        };
-        info
     }
 
     /// The full RefStore lifecycle on a `SqlRefStore`, engine-agnostic. Run
@@ -403,37 +490,6 @@ mod tests {
         store.save(&rid, &ref_at("c3", Some(200))).await.unwrap();
         assert_eq!(store.load(&rid).await.unwrap().unwrap().commit, "c3");
 
-        // Commit-keyed reuse (get_by_commit): a completed full build is found by
-        // commit from any branch; an incomplete row and an unknown commit are not.
-        // Runs for every engine `exercise` covers.
-        store
-            .save_branch(&rid, "release", &complete_build("cf"))
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .load_build(&rid, "cf")
-                .await
-                .unwrap()
-                .expect("completed build reusable by commit")
-                .full_clonepack
-                .commit,
-            "cf"
-        );
-        assert!(
-            store
-                .load_build(&rid, "no-such-commit")
-                .await
-                .unwrap()
-                .is_none(),
-            "unknown commit yields None"
-        );
-        // "dev" was saved at c2 with an empty full_clonepack — not a reusable build.
-        assert!(
-            store.load_build(&rid, "c2").await.unwrap().is_none(),
-            "incomplete (depth=1-only) build must not be reused"
-        );
-
         // Generation (commit history depth) is the primary ordering signal.
         // Establish a baseline that has one (wins the synced_at fallback vs the
         // gen-less c3 above).
@@ -461,6 +517,63 @@ mod tests {
             "g20",
             "lower generation loses despite a newer wall clock"
         );
+
+        // Moving publications use the complete admitted predecessor chain,
+        // not generation ordering. Exercise the same SQL CAS on every backend:
+        // C may replace A or B, while a delayed B can never replace C.
+        let mut a = ref_at("a", Some(400));
+        a.generation = Some(1);
+        store.save_branch(&rid, "moving", &a).await.unwrap();
+
+        let mut b = ref_at("b", Some(401));
+        b.generation = Some(1);
+        b.require_matching_commit = true;
+        b.moving_publication_predecessors = vec!["a".to_string()];
+        store.save_branch(&rid, "moving", &b).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&rid, "moving")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "b"
+        );
+
+        let mut c = ref_at("c", Some(402));
+        c.generation = Some(1);
+        c.require_matching_commit = true;
+        c.moving_publication_predecessors = vec!["a".to_string(), "b".to_string()];
+        store.save_branch(&rid, "moving", &c).await.unwrap();
+        store.save_branch(&rid, "moving", &b).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&rid, "moving")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "c",
+            "late B must not replace C"
+        );
+
+        let mut first = ref_at("first", Some(403));
+        first.require_matching_commit = true;
+        first.moving_publication_predecessors =
+            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
+        store
+            .save_branch(&rid, "initial-moving", &first)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_branch(&rid, "initial-moving")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "first"
+        );
     }
 
     #[tokio::test]
@@ -471,45 +584,6 @@ mod tests {
             .await
             .unwrap();
         exercise(&store).await;
-    }
-
-    /// Commit-keyed reuse: a completed full build under one branch is found by
-    /// commit, so another branch at the same commit reuses it. Depth=1-only and
-    /// unknown commits return None.
-    #[tokio::test]
-    async fn sqlite_load_build_reuses_across_branches() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("meta.db").to_string_lossy().to_string();
-        let store = SqlRefStore::new(Box::new(SqliteMeta::connect(&path).await.unwrap()))
-            .await
-            .unwrap();
-        let rid = RepoId::github("o/r");
-
-        store
-            .save_branch(&rid, "foo", &complete_build("X"))
-            .await
-            .unwrap();
-        let reused = store.load_build(&rid, "X").await.unwrap();
-        assert_eq!(
-            reused.expect("reuse by commit").full_clonepack.commit,
-            "X",
-            "a completed full build is reusable across branches by commit"
-        );
-
-        assert!(
-            store.load_build(&rid, "Y").await.unwrap().is_none(),
-            "unknown commit yields None"
-        );
-
-        // A depth=1-only entry (empty full_clonepack) is not a reusable full build.
-        store
-            .save_branch(&rid, "bar", &ref_at("Z", Some(100)))
-            .await
-            .unwrap();
-        assert!(
-            store.load_build(&rid, "Z").await.unwrap().is_none(),
-            "incomplete build must not be reused"
-        );
     }
 
     #[tokio::test]
