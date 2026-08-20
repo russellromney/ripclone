@@ -1,6 +1,6 @@
-//! Durable jobs in the server-owned control database, shared across plain
-//! SQLite (`sqlx`) and the Turso embedded replica (`libsql`). The server admits
-//! work; embedded workers claim locally and standalone workers use its API.
+//! Durable jobs in the server-owned control database. The official libsql
+//! driver serves plain local SQLite and the Turso embedded replica. The server
+//! admits work; embedded workers claim locally and standalone workers use its API.
 //!
 //! [`QueueDb`] is a tiny per-engine adapter that returns plain Rust types (no
 //! engine types leak); [`SqlJobQueue`] holds one and contains all the queue
@@ -110,8 +110,8 @@ pub(crate) fn decode_credential(enc: Option<String>) -> Option<secrecy::SecretSt
 }
 
 /// Per-engine adapter. Each method runs one or two statements on a fresh
-/// connection and returns plain Rust types. Implemented by `SqliteDb` and
-/// `LibsqlDb`.
+/// connection and returns plain Rust types. `LibsqlDb` serves local SQLite and
+/// embedded-replica mode.
 #[async_trait]
 pub trait QueueDb: Send + Sync {
     /// Create the `jobs` table and indexes. Active-key uniqueness is required on
@@ -965,7 +965,7 @@ pub(crate) const SUPERSEDED_BY_NEWER_QUEUED: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::sqlite_db::SqliteDb;
+    use crate::queue::libsql_db::LibsqlDb;
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -1011,7 +1011,7 @@ mod tests {
 
     async fn make_db(engine: &str, path: &str) -> Box<dyn QueueDb> {
         match engine {
-            "sqlite" => Box::new(SqliteDb::connect(path).await.unwrap()),
+            "sqlite" => Box::new(LibsqlDb::connect(path).await.unwrap()),
             other => panic!("unknown test engine {other}"),
         }
     }
@@ -1105,9 +1105,9 @@ mod tests {
     #[tokio::test]
     async fn finish_clears_the_stored_credential() {
         // A short-lived upstream token must not linger in the kept-forever
-        // done-job history. (Adapter-level: SqliteDb directly.)
+        // done-job history. (Adapter-level: LibsqlDb directly.)
         let dir = tempfile::tempdir().unwrap();
-        let db = SqliteDb::connect(&dir.path().join("q.db").to_string_lossy())
+        let db = LibsqlDb::connect(&dir.path().join("q.db").to_string_lossy())
             .await
             .unwrap();
         db.init().await.unwrap();
@@ -1731,7 +1731,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_coalesce_and_claim_sqlite() {
         let dir = tempfile::tempdir().unwrap();
-        let db = SqliteDb::connect(&dir.path().join("q.db").to_string_lossy())
+        let db = LibsqlDb::connect(&dir.path().join("q.db").to_string_lossy())
             .await
             .unwrap();
         let q = Arc::new(SqlJobQueue::new(Box::new(db)).await.unwrap());
@@ -1787,7 +1787,7 @@ mod tests {
         let path = dir.path().join("restart-race.db");
         let path_text = path.to_string_lossy().to_string();
         let queue = Arc::new(
-            SqlJobQueue::new(Box::new(SqliteDb::connect(&path_text).await.unwrap()))
+            SqlJobQueue::new(Box::new(LibsqlDb::connect(&path_text).await.unwrap()))
                 .await
                 .unwrap(),
         );
@@ -1806,7 +1806,7 @@ mod tests {
         for _ in 0..12 {
             let path = path_text.clone();
             tasks.push(tokio::spawn(async move {
-                SqlJobQueue::new(Box::new(SqliteDb::connect(&path).await.unwrap()))
+                SqlJobQueue::new(Box::new(LibsqlDb::connect(&path).await.unwrap()))
                     .await
                     .unwrap();
             }));
@@ -1829,21 +1829,36 @@ mod tests {
             task.await.unwrap();
         }
 
-        let pool = sqlx::sqlite::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        drop(queue);
+        let database = libsql::Builder::new_local(&path).build().await.unwrap();
+        let connection = database.connect().unwrap();
+        let active: i64 = connection
+            .query(
+                "SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'claimed')",
+                (),
+            )
             .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
             .unwrap();
-        let active: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'claimed')")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
         assert_eq!(active, 1, "restart races preserve one active exact job");
-        let index_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_active_identity_v3'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let index_count: i64 = connection
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_active_identity_v3'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
         assert_eq!(index_count, 1, "versioned active index remains installed");
     }
 
@@ -2544,37 +2559,51 @@ mod tests {
             .with_heartbeat_timeout_secs(60);
         q.heartbeat_at("small-w", None, 1_000).await.unwrap();
 
-        // Read back via a second adapter on the same file.
-        use sqlx::sqlite::SqlitePoolOptions;
-        let url = format!("sqlite://{}?mode=rwc", dir.path().join("q.db").display());
-        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
-        let rank: Option<i64> =
-            sqlx::query_scalar("SELECT max_size_class FROM workers WHERE worker_id = ?")
-                .bind("small-w")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let database = libsql::Builder::new_local(dir.path().join("q.db"))
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        let rank: Option<i64> = connection
+            .query(
+                "SELECT max_size_class FROM workers WHERE worker_id = ?",
+                ["small-w"],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
         assert_eq!(rank, Some(0), "small is rank 0 in two_classes()");
     }
 
     #[tokio::test]
     async fn init_creates_workers_registry_table() {
-        use sqlx::sqlite::SqlitePoolOptions;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("q.db").to_string_lossy().to_string();
         // SqlJobQueue::new runs init → workers table.
-        let _q = SqlJobQueue::new(make_db("sqlite", &path).await)
+        let q = SqlJobQueue::new(make_db("sqlite", &path).await)
             .await
             .unwrap();
-
-        let url = format!("sqlite://{}?mode=rwc", path);
-        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
-        let name: String = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workers'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("workers table must exist after init");
+        drop(q);
+        let database = libsql::Builder::new_local(&path).build().await.unwrap();
+        let connection = database.connect().unwrap();
+        let name: String = connection
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workers'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .expect("workers table must exist after init")
+            .get(0)
+            .unwrap();
         assert_eq!(name, "workers");
     }
 
@@ -2589,7 +2618,6 @@ mod tests {
 
     #[tokio::test]
     async fn stale_row_is_hard_deleted_not_only_soft_excluded() {
-        use sqlx::sqlite::SqlitePoolOptions;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("q.db").to_string_lossy().to_string();
         let q = SqlJobQueue::new(make_db("sqlite", &path).await)
@@ -2601,11 +2629,18 @@ mod tests {
         // Age out: live-count prunes rows older than cutoff.
         assert_eq!(q.live_worker_count_at(1_100).await.unwrap(), 0);
 
-        let url = format!("sqlite://{}?mode=rwc", path);
-        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM workers")
-            .fetch_one(&pool)
+        drop(q);
+        let database = libsql::Builder::new_local(&path).build().await.unwrap();
+        let connection = database.connect().unwrap();
+        let n: i64 = connection
+            .query("SELECT count(*) FROM workers", ())
             .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
             .unwrap();
         assert_eq!(
             n, 0,
@@ -2615,7 +2650,6 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_persists_current_job_and_clears_on_idle() {
-        use sqlx::sqlite::SqlitePoolOptions;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("q.db").to_string_lossy().to_string();
         let q = SqlJobQueue::new(make_db("sqlite", &path).await)
@@ -2624,23 +2658,37 @@ mod tests {
             .with_heartbeat_timeout_secs(60);
 
         q.heartbeat_at("w1", Some(99), 1_000).await.unwrap();
-        let url = format!("sqlite://{}?mode=rwc", path);
-        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
-        let job: Option<i64> =
-            sqlx::query_scalar("SELECT current_job FROM workers WHERE worker_id = ?")
-                .bind("w1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let database = libsql::Builder::new_local(&path).build().await.unwrap();
+        let connection = database.connect().unwrap();
+        let job: Option<i64> = connection
+            .query(
+                "SELECT current_job FROM workers WHERE worker_id = ?",
+                ["w1"],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
         assert_eq!(job, Some(99));
 
         q.heartbeat_at("w1", None, 1_010).await.unwrap();
-        let job: Option<i64> =
-            sqlx::query_scalar("SELECT current_job FROM workers WHERE worker_id = ?")
-                .bind("w1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let job: Option<i64> = connection
+            .query(
+                "SELECT current_job FROM workers WHERE worker_id = ?",
+                ["w1"],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
         assert!(job.is_none(), "idle heartbeat clears current_job");
     }
 

@@ -78,7 +78,7 @@ async fn start_server_with_queue(
     let control_db = dir.path().join("control.db");
     let ref_store: Arc<dyn RefStore> = Arc::new(
         ripclone::meta::SqlRefStore::new(Box::new(
-            ripclone::meta::SqliteMeta::connect(&control_db.to_string_lossy())
+            ripclone::meta::LibsqlMeta::connect(&control_db.to_string_lossy())
                 .await
                 .unwrap(),
         ))

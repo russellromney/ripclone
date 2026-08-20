@@ -593,7 +593,7 @@ mod tests {
     use std::time::Duration;
 
     async fn test_ref_store(root: &std::path::Path) -> Arc<dyn RefStore> {
-        let db = crate::meta::SqliteMeta::connect(&root.join("refs.db").to_string_lossy())
+        let db = crate::meta::LibsqlMeta::connect(&root.join("refs.db").to_string_lossy())
             .await
             .unwrap();
         Arc::new(crate::meta::SqlRefStore::new(Box::new(db)).await.unwrap())

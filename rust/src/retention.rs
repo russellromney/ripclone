@@ -384,7 +384,7 @@ mod tests {
 
         // A live ref points at it.
         let meta =
-            crate::meta::SqliteMeta::connect(&repo_root.join("control.db").to_string_lossy())
+            crate::meta::LibsqlMeta::connect(&repo_root.join("control.db").to_string_lossy())
                 .await
                 .unwrap();
         let ref_store: Arc<dyn RefStore> =

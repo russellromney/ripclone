@@ -82,9 +82,7 @@ async-trait = "0.1.89"
 # (the GitHub App broker signs JWTs; OIDC verifies them).
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
-# Plain local SQLite uses sqlx. Turso embedded replicas use the official libsql
-# driver; both execute the same concrete control schema.
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+# One official driver serves plain local SQLite and Turso embedded replicas.
 libsql = "0.9.30"
 gix = "0.85.0"
 gix-pack = "0.72.0"

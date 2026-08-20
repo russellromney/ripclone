@@ -8795,7 +8795,7 @@ mod tests {
         async fn store(&self) -> anyhow::Result<&Arc<crate::meta::SqlRefStore>> {
             self.inner
                 .get_or_try_init(|| async {
-                    let db = crate::meta::SqliteMeta::connect(&self.path.to_string_lossy()).await?;
+                    let db = crate::meta::LibsqlMeta::connect(&self.path.to_string_lossy()).await?;
                     Ok(Arc::new(crate::meta::SqlRefStore::new(Box::new(db)).await?))
                 })
                 .await
@@ -8889,7 +8889,7 @@ mod tests {
         async fn queue(&self) -> anyhow::Result<&Arc<crate::queue::SqlJobQueue>> {
             self.inner
                 .get_or_try_init(|| async {
-                    let db = crate::queue::SqliteDb::connect(&self.path.to_string_lossy()).await?;
+                    let db = crate::queue::LibsqlDb::connect(&self.path.to_string_lossy()).await?;
                     Ok(Arc::new(
                         crate::queue::SqlJobQueue::new(Box::new(db)).await?,
                     ))
@@ -12868,7 +12868,7 @@ mod tests {
         let queue_path = tmp.path().join("historical-queue.db");
         let queue = Arc::new(
             crate::queue::SqlJobQueue::new(Box::new(
-                crate::queue::SqliteDb::connect(&queue_path.to_string_lossy())
+                crate::queue::LibsqlDb::connect(&queue_path.to_string_lossy())
                     .await
                     .unwrap(),
             ))

@@ -13,7 +13,6 @@ use std::sync::Arc;
 pub mod libsql_db;
 pub mod size_class;
 pub mod sql;
-pub mod sqlite_db;
 
 pub use libsql_db::LibsqlDb;
 pub use size_class::{
@@ -25,7 +24,6 @@ pub use sql::{
     validate_heartbeat_timing, worker_heartbeat_enabled, worker_heartbeat_enabled_from_env,
     worker_heartbeat_interval_secs, worker_heartbeat_interval_secs_from,
 };
-pub use sqlite_db::SqliteDb;
 
 /// A request to build (sync) one repo's branch.
 #[derive(Clone)]

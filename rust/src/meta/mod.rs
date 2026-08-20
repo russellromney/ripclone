@@ -1,5 +1,5 @@
-//! SQL-backed refs for the server-owned SQLite control database. Plain SQLite
-//! uses sqlx; a Turso embedded replica uses libsql.
+//! SQL-backed refs for the server-owned SQLite control database. The official
+//! libsql driver serves both plain local SQLite and Turso embedded replicas.
 //!
 //! [`MetaDb`] is a tiny per-engine adapter that returns plain Rust types (no
 //! engine types leak); [`SqlRefStore`] holds one and implements the existing
@@ -14,10 +14,8 @@ use async_trait::async_trait;
 use std::time::SystemTime;
 
 pub mod libsql;
-pub mod sqlite;
 
 pub use libsql::LibsqlMeta;
-pub use sqlite::SqliteMeta;
 
 /// One stored ref row, decoded to plain types.
 #[derive(Debug, Clone)]
@@ -32,7 +30,7 @@ pub struct RefRow {
 
 /// Per-engine adapter over a `refs(repo_key, branch, commit_id, synced_at,
 /// data)` table. `repo_key` is the repo's [`RepoId::storage_key`]. Implemented
-/// by `SqliteMeta` and `LibsqlMeta`.
+/// by `LibsqlMeta` for local SQLite and embedded-replica mode.
 #[async_trait]
 pub trait MetaDb: Send + Sync {
     /// Create the `refs` table if absent.
@@ -578,7 +576,7 @@ mod tests {
     async fn sqlite_refstore_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("meta.db").to_string_lossy().to_string();
-        let store = SqlRefStore::new(Box::new(SqliteMeta::connect(&path).await.unwrap()))
+        let store = SqlRefStore::new(Box::new(LibsqlMeta::connect(&path).await.unwrap()))
             .await
             .unwrap();
         exercise(&store).await;

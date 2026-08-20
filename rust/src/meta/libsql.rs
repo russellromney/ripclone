@@ -15,8 +15,18 @@ impl LibsqlMeta {
         Self { db }
     }
 
+    pub async fn connect(path: &str) -> Result<Self> {
+        let db = libsql::Builder::new_local(path)
+            .build()
+            .await
+            .context("open local control database")?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     async fn conn(&self) -> Result<Connection> {
-        self.db.connect().context("libsql connect")
+        let conn = self.db.connect().context("libsql connect")?;
+        let _ = conn.execute("PRAGMA busy_timeout = 5000", ()).await;
+        Ok(conn)
     }
 }
 

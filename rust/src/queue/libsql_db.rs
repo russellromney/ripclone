@@ -19,6 +19,14 @@ impl LibsqlDb {
         Self { db }
     }
 
+    pub async fn connect(path: &str) -> Result<Self> {
+        let db = libsql::Builder::new_local(path)
+            .build()
+            .await
+            .context("open local queue database")?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     async fn conn(&self) -> Result<Connection> {
         let conn = self.db.connect().context("libsql connect")?;
         // Wait out lock contention rather than erroring (local files).

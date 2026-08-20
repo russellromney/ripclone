@@ -4,16 +4,12 @@
 //! heartbeats share one schema and one local path. Plain SQLite is the default;
 //! the only replicated mode is a Turso embedded replica at that same path.
 
-use crate::meta::{LibsqlMeta, SqlRefStore, SqliteMeta};
-use crate::queue::{
-    BuildJob, EnqueueOutcome, Enqueued, LibsqlDb, SizeClass, SqlJobQueue, SqliteDb,
-};
+use crate::meta::{LibsqlMeta, SqlRefStore};
+use crate::queue::{BuildJob, EnqueueOutcome, Enqueued, LibsqlDb, SizeClass, SqlJobQueue};
 use crate::ref_store::RefStore;
 use anyhow::{Context, Result, bail};
-use libsql::{Builder, Database};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use libsql::{Builder, Database, OpenFlags};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -173,15 +169,11 @@ fn validate_removed_config(config: &crate::config::Config) -> Result<()> {
     Ok(())
 }
 
-enum Driver {
-    Sqlite(SqlitePool),
-    Turso(Arc<Database>),
-}
-
 /// One concrete control database and the two existing domain-facing views over
 /// its shared connection handle.
 pub struct ControlDb {
-    driver: Driver,
+    database: Arc<Database>,
+    turso_replica: bool,
     refs: Arc<SqlRefStore>,
     queue: Arc<SqlJobQueue>,
     path: PathBuf,
@@ -207,44 +199,17 @@ impl ControlDb {
                 .with_context(|| format!("create control directory {}", parent.display()))?;
         }
 
-        match turso {
-            None => {
-                let path_text = path
-                    .to_str()
-                    .context("control database path is not valid UTF-8")?;
-                preflight_sqlite_schema(path, path_text).await?;
-                let options = SqliteConnectOptions::from_str(path_text)
-                    .with_context(|| format!("parse control database path {}", path.display()))?
-                    .create_if_missing(true)
-                    .busy_timeout(Duration::from_secs(5))
-                    .journal_mode(SqliteJournalMode::Wal)
-                    .foreign_keys(true);
-                let pool = SqlitePoolOptions::new()
-                    .max_connections(5)
-                    .connect_with(options)
-                    .await
-                    .with_context(|| format!("open control database {}", path.display()))?;
-                validate_or_initialize_sqlite_schema(&pool, path).await?;
-                let refs = Arc::new(
-                    SqlRefStore::new(Box::new(SqliteMeta::from_pool(pool.clone()))).await?,
-                );
-                let queue = Arc::new(
-                    SqlJobQueue::new_with_classes(
-                        Box::new(SqliteDb::from_pool(pool.clone())),
-                        size_classes.clone(),
-                    )
-                    .await?,
-                );
-                Ok(Self {
-                    driver: Driver::Sqlite(pool),
-                    refs,
-                    queue,
-                    path: path.to_path_buf(),
-                    size_classes,
-                    admission_notify: Arc::new(tokio::sync::Notify::new()),
-                    _ownership: ownership,
-                })
-            }
+        preflight_sqlite_schema(path).await?;
+        let (database, turso_replica) = match turso {
+            None => (
+                Arc::new(
+                    Builder::new_local(path)
+                        .build()
+                        .await
+                        .with_context(|| format!("open control database {}", path.display()))?,
+                ),
+                false,
+            ),
             Some(config) => {
                 let database = Arc::new(
                     Builder::new_remote_replica(path, config.url, config.token)
@@ -260,28 +225,38 @@ impl ControlDb {
                     .sync()
                     .await
                     .context("bootstrap Turso embedded replica from primary")?;
-                validate_or_initialize_turso_schema(&database, path).await?;
-                let refs = Arc::new(
-                    SqlRefStore::new(Box::new(LibsqlMeta::from_database(database.clone()))).await?,
-                );
-                let queue = Arc::new(
-                    SqlJobQueue::new_with_classes(
-                        Box::new(LibsqlDb::from_database(database.clone())),
-                        size_classes.clone(),
-                    )
-                    .await?,
-                );
-                Ok(Self {
-                    driver: Driver::Turso(database),
-                    refs,
-                    queue,
-                    path: path.to_path_buf(),
-                    size_classes,
-                    admission_notify: Arc::new(tokio::sync::Notify::new()),
-                    _ownership: ownership,
-                })
+                (database, true)
             }
+        };
+        if !turso_replica {
+            database
+                .connect()
+                .context("connect to control database")?
+                .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .await
+                .context("configure local control database")?;
         }
+        validate_or_initialize_schema(&database, path).await?;
+        let refs = Arc::new(
+            SqlRefStore::new(Box::new(LibsqlMeta::from_database(database.clone()))).await?,
+        );
+        let queue = Arc::new(
+            SqlJobQueue::new_with_classes(
+                Box::new(LibsqlDb::from_database(database.clone())),
+                size_classes.clone(),
+            )
+            .await?,
+        );
+        Ok(Self {
+            database,
+            turso_replica,
+            refs,
+            queue,
+            path: path.to_path_buf(),
+            size_classes,
+            admission_notify: Arc::new(tokio::sync::Notify::new()),
+            _ownership: ownership,
+        })
     }
 
     pub fn ref_store(&self) -> Arc<dyn RefStore> {
@@ -297,7 +272,7 @@ impl ControlDb {
     }
 
     pub fn is_turso_replica(&self) -> bool {
-        matches!(self.driver, Driver::Turso(_))
+        self.turso_replica
     }
 
     pub(crate) fn admission_notifier(&self) -> Arc<tokio::sync::Notify> {
@@ -314,86 +289,16 @@ impl ControlDb {
         pending: &crate::RefInfo,
         tail: Option<(&str, &crate::RefInfo)>,
     ) -> Result<Enqueued> {
-        let result = match &self.driver {
-            Driver::Sqlite(pool) => {
-                self.admit_sqlite(pool, job, exact_branch, pending, tail)
-                    .await
-            }
-            Driver::Turso(database) => {
-                self.admit_turso(database, job, exact_branch, pending, tail)
-                    .await
-            }
-        };
+        let result = self
+            .admit(&self.database, job, exact_branch, pending, tail)
+            .await;
         if result.is_ok() {
             self.admission_notify.notify_one();
         }
         result
     }
 
-    async fn admit_sqlite(
-        &self,
-        pool: &SqlitePool,
-        job: &BuildJob,
-        exact_branch: &str,
-        pending: &crate::RefInfo,
-        tail: Option<(&str, &crate::RefInfo)>,
-    ) -> Result<Enqueued> {
-        let mut tx = pool.begin().await.context("begin durable admission")?;
-        upsert_exact_sqlite(&mut tx, job, exact_branch, pending).await?;
-        if let Some((tail_branch, tail_info)) = tail {
-            update_tail_sqlite(&mut tx, job, tail_branch, tail_info).await?;
-        }
-        let key = job.key();
-        let size_class = crate::queue::classify_rank(job.size_bytes, &self.size_classes);
-        let credential = crate::queue::sql::encode_credential(job.credential.as_ref());
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO jobs
-             (key, provider, path, branch, status, created_at, admitted_commit,
-              admitted_default_branch, credential, attempts, size_class)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?)",
-        )
-        .bind(&key)
-        .bind(job.repo_id.provider.as_str())
-        .bind(&job.repo_id.path)
-        .bind(&job.branch)
-        .bind(crate::queue::sql::now_secs())
-        .bind(&job.admitted_commit)
-        .bind(job.admitted_default_branch.as_deref())
-        .bind(credential.as_deref())
-        .bind(size_class)
-        .execute(&mut *tx)
-        .await
-        .context("insert durable admitted job")?;
-        let (outcome, id) = if result.rows_affected() == 1 {
-            (EnqueueOutcome::Enqueued, result.last_insert_rowid())
-        } else {
-            let id: i64 = sqlx::query_scalar(
-                "SELECT id FROM jobs
-                 WHERE key = ? AND status IN ('queued', 'claimed') LIMIT 1",
-            )
-            .bind(&key)
-            .fetch_one(&mut *tx)
-            .await
-            .context("load coalesced durable job")?;
-            sqlx::query(
-                "UPDATE jobs SET size_class = MAX(size_class, ?)
-                 WHERE id = ? AND status = 'queued'",
-            )
-            .bind(size_class)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .context("raise coalesced job size class")?;
-            (EnqueueOutcome::Coalesced, id)
-        };
-        tx.commit().await.context("commit durable admission")?;
-        Ok(Enqueued {
-            outcome,
-            job_id: Some(id),
-        })
-    }
-
-    async fn admit_turso(
+    async fn admit(
         &self,
         database: &Database,
         job: &BuildJob,
@@ -401,14 +306,20 @@ impl ControlDb {
         pending: &crate::RefInfo,
         tail: Option<(&str, &crate::RefInfo)>,
     ) -> Result<Enqueued> {
-        let connection = database.connect().context("connect for Turso admission")?;
+        let connection = database
+            .connect()
+            .context("connect for durable admission")?;
+        connection
+            .execute("PRAGMA busy_timeout = 5000", ())
+            .await
+            .context("configure durable admission busy timeout")?;
         let tx = connection
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
-            .context("begin Turso durable admission")?;
-        upsert_exact_turso(&tx, job, exact_branch, pending).await?;
+            .context("begin durable admission")?;
+        upsert_exact(&tx, job, exact_branch, pending).await?;
         if let Some((tail_branch, tail_info)) = tail {
-            update_tail_turso(&tx, job, tail_branch, tail_info).await?;
+            update_tail(&tx, job, tail_branch, tail_info).await?;
         }
         let key = job.key();
         let size_class = crate::queue::classify_rank(job.size_bytes, &self.size_classes);
@@ -432,7 +343,7 @@ impl ControlDb {
                 ],
             )
             .await
-            .context("insert Turso durable admitted job")?;
+            .context("insert durable admitted job")?;
         let (outcome, id) = if changed == 1 {
             (EnqueueOutcome::Enqueued, tx.last_insert_rowid())
         } else {
@@ -443,11 +354,11 @@ impl ControlDb {
                     [key.as_str()],
                 )
                 .await
-                .context("load Turso coalesced durable job")?;
+                .context("load coalesced durable job")?;
             let id = rows
                 .next()
                 .await?
-                .context("coalesced Turso job disappeared")?
+                .context("coalesced durable job disappeared")?
                 .get::<i64>(0)?;
             drop(rows);
             tx.execute(
@@ -456,12 +367,10 @@ impl ControlDb {
                 libsql::params![size_class, id],
             )
             .await
-            .context("raise Turso coalesced job size class")?;
+            .context("raise coalesced job size class")?;
             (EnqueueOutcome::Coalesced, id)
         };
-        tx.commit()
-            .await
-            .context("commit Turso durable admission")?;
+        tx.commit().await.context("commit durable admission")?;
         Ok(Enqueued {
             outcome,
             job_id: Some(id),
@@ -476,71 +385,13 @@ fn ref_times(info: &crate::RefInfo) -> (Option<i64>, Option<i64>) {
     )
 }
 
-async fn upsert_exact_sqlite(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    job: &BuildJob,
-    exact_branch: &str,
-    info: &crate::RefInfo,
-) -> Result<()> {
-    let data = serde_json::to_string(info).context("serialize exact admission")?;
-    let (synced_at, generation) = ref_times(info);
-    let result = sqlx::query(
-        "INSERT INTO refs(repo_key, branch, commit_id, synced_at, generation, data)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(repo_key, branch) DO UPDATE SET
-             commit_id=excluded.commit_id, synced_at=excluded.synced_at,
-             generation=excluded.generation, data=excluded.data
-         WHERE refs.commit_id = excluded.commit_id",
-    )
-    .bind(job.repo_id.storage_key())
-    .bind(exact_branch)
-    .bind(&job.admitted_commit)
-    .bind(synced_at)
-    .bind(generation)
-    .bind(data)
-    .execute(&mut **tx)
-    .await
-    .context("create exact admission row")?;
-    if result.rows_affected() != 1 {
-        bail!("exact admission key contains a different commit");
-    }
-    Ok(())
-}
-
-async fn update_tail_sqlite(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    job: &BuildJob,
-    tail_branch: &str,
-    info: &crate::RefInfo,
-) -> Result<()> {
-    let data = serde_json::to_string(info).context("serialize admission tail")?;
-    let (synced_at, generation) = ref_times(info);
-    let result = sqlx::query(
-        "UPDATE refs SET synced_at=?, generation=?, data=?
-         WHERE repo_key=? AND branch=? AND commit_id=?",
-    )
-    .bind(synced_at)
-    .bind(generation)
-    .bind(data)
-    .bind(job.repo_id.storage_key())
-    .bind(tail_branch)
-    .bind(&info.commit)
-    .execute(&mut **tx)
-    .await
-    .context("link moving admission tail")?;
-    if result.rows_affected() != 1 {
-        bail!("ordinary admission tail disappeared");
-    }
-    Ok(())
-}
-
-async fn upsert_exact_turso(
+async fn upsert_exact(
     tx: &libsql::Transaction,
     job: &BuildJob,
     exact_branch: &str,
     info: &crate::RefInfo,
 ) -> Result<()> {
-    let data = serde_json::to_string(info).context("serialize Turso exact admission")?;
+    let data = serde_json::to_string(info).context("serialize exact admission")?;
     let (synced_at, generation) = ref_times(info);
     let changed = tx
         .execute(
@@ -560,20 +411,20 @@ async fn upsert_exact_turso(
             ],
         )
         .await
-        .context("create Turso exact admission row")?;
+        .context("create exact admission row")?;
     if changed != 1 {
         bail!("exact admission key contains a different commit");
     }
     Ok(())
 }
 
-async fn update_tail_turso(
+async fn update_tail(
     tx: &libsql::Transaction,
     job: &BuildJob,
     tail_branch: &str,
     info: &crate::RefInfo,
 ) -> Result<()> {
-    let data = serde_json::to_string(info).context("serialize Turso admission tail")?;
+    let data = serde_json::to_string(info).context("serialize admission tail")?;
     let (synced_at, generation) = ref_times(info);
     let changed = tx
         .execute(
@@ -589,14 +440,14 @@ async fn update_tail_turso(
             ],
         )
         .await
-        .context("link Turso moving admission tail")?;
+        .context("link moving admission tail")?;
     if changed != 1 {
         bail!("ordinary admission tail disappeared");
     }
     Ok(())
 }
 
-async fn preflight_sqlite_schema(path: &Path, path_text: &str) -> Result<()> {
+async fn preflight_sqlite_schema(path: &Path) -> Result<()> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -609,35 +460,42 @@ async fn preflight_sqlite_schema(path: &Path, path_text: &str) -> Result<()> {
         return Ok(());
     }
 
-    let options = SqliteConnectOptions::from_str(path_text)
-        .with_context(|| format!("parse control database path {}", path.display()))?
-        .read_only(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
+    let database = Builder::new_local(path)
+        .flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .build()
         .await
         .with_context(|| format!("inspect control database {} read-only", path.display()))?;
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    )
-    .fetch_all(&pool)
-    .await
-    .context("inspect existing control schema")?;
+    let connection = database
+        .connect()
+        .context("connect to control database read-only")?;
+    let mut rows = connection
+        .query(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            (),
+        )
+        .await
+        .context("inspect existing control schema")?;
+    let mut tables = Vec::new();
+    while let Some(row) = rows.next().await? {
+        tables.push(row.get::<String>(0)?);
+    }
+    drop(rows);
     if !tables.iter().any(|name| name == "control_schema") {
-        pool.close().await;
         bail!(
             "incompatible control database {}: missing schema marker (found tables: {}); automatic migration is not supported",
             path.display(),
             tables.join(", ")
         );
     }
-    let version: Option<i64> =
-        sqlx::query_scalar("SELECT version FROM control_schema WHERE id = 1")
-            .fetch_optional(&pool)
-            .await
-            .context("read existing control schema version")?;
-    pool.close().await;
+    let mut rows = connection
+        .query("SELECT version FROM control_schema WHERE id = 1", ())
+        .await
+        .context("read existing control schema version")?;
+    let version = match rows.next().await? {
+        Some(row) => Some(row.get::<i64>(0)?),
+        None => None,
+    };
     if version != Some(SCHEMA_VERSION) {
         bail!(
             "incompatible control database {}: expected schema version {}, found {:?}; automatic migration is not supported",
@@ -649,60 +507,16 @@ async fn preflight_sqlite_schema(path: &Path, path_text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn validate_or_initialize_sqlite_schema(pool: &SqlitePool, path: &Path) -> Result<()> {
-    let mut tx = pool.begin().await.context("begin control schema check")?;
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .context("inspect control schema")?;
-    if tables.iter().any(|name| name == "control_schema") {
-        let version: Option<i64> =
-            sqlx::query_scalar("SELECT version FROM control_schema WHERE id = 1")
-                .fetch_optional(&mut *tx)
-                .await
-                .context("read control schema version")?;
-        if version != Some(SCHEMA_VERSION) {
-            bail!(
-                "incompatible control database {}: expected schema version {}, found {:?}; automatic migration is not supported",
-                path.display(),
-                SCHEMA_VERSION,
-                version
-            );
-        }
-    } else if !tables.is_empty() {
-        bail!(
-            "incompatible control database {}: missing schema marker (found tables: {}); automatic migration is not supported",
-            path.display(),
-            tables.join(", ")
-        );
-    } else {
-        sqlx::query(
-            "CREATE TABLE control_schema (
-                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                 version INTEGER NOT NULL
-             )",
-        )
-        .execute(&mut *tx)
+async fn validate_or_initialize_schema(database: &Database, path: &Path) -> Result<()> {
+    let connection = database.connect().context("connect to control database")?;
+    connection
+        .execute("PRAGMA busy_timeout = 5000", ())
         .await
-        .context("create control schema marker")?;
-        sqlx::query("INSERT INTO control_schema(id, version) VALUES (1, ?)")
-            .bind(SCHEMA_VERSION)
-            .execute(&mut *tx)
-            .await
-            .context("write control schema version")?;
-    }
-    tx.commit().await.context("commit control schema check")
-}
-
-async fn validate_or_initialize_turso_schema(database: &Database, path: &Path) -> Result<()> {
-    let connection = database.connect().context("connect to Turso replica")?;
+        .context("configure schema-check busy timeout")?;
     let tx = connection
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
-        .context("begin Turso control schema check")?;
+        .context("begin control schema check")?;
     let mut rows = tx
         .query(
             "SELECT name FROM sqlite_master
@@ -710,7 +524,7 @@ async fn validate_or_initialize_turso_schema(database: &Database, path: &Path) -
             (),
         )
         .await
-        .context("inspect Turso control schema")?;
+        .context("inspect control schema")?;
     let mut tables = Vec::new();
     while let Some(row) = rows.next().await? {
         tables.push(row.get::<String>(0)?);
@@ -720,7 +534,7 @@ async fn validate_or_initialize_turso_schema(database: &Database, path: &Path) -
         let mut rows = tx
             .query("SELECT version FROM control_schema WHERE id = 1", ())
             .await
-            .context("read Turso control schema version")?;
+            .context("read control schema version")?;
         let version = match rows.next().await? {
             Some(row) => Some(row.get::<i64>(0)?),
             None => None,
@@ -749,17 +563,15 @@ async fn validate_or_initialize_turso_schema(database: &Database, path: &Path) -
             (),
         )
         .await
-        .context("create Turso control schema marker")?;
+        .context("create control schema marker")?;
         tx.execute(
             "INSERT INTO control_schema(id, version) VALUES (1, ?1)",
             [SCHEMA_VERSION],
         )
         .await
-        .context("write Turso control schema version")?;
+        .context("write control schema version")?;
     }
-    tx.commit()
-        .await
-        .context("commit Turso control schema check")
+    tx.commit().await.context("commit control schema check")
 }
 
 #[cfg(unix)]
@@ -992,15 +804,14 @@ mod tests {
     async fn incompatible_database_is_not_rewritten() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("old.db");
-        let pool = SqlitePoolOptions::new()
-            .connect(&format!("sqlite:{}?mode=rwc", path.display()))
+        let database = Builder::new_local(&path).build().await.unwrap();
+        database
+            .connect()
+            .unwrap()
+            .execute("CREATE TABLE legacy_refs (id INTEGER PRIMARY KEY)", ())
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE legacy_refs (id INTEGER PRIMARY KEY)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
+        drop(database);
         let before = std::fs::read(&path).unwrap();
 
         let error = ControlDb::open(&path, None, crate::queue::default_size_classes())
