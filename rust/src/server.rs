@@ -7711,7 +7711,6 @@ async fn process_build_job_with_foreground_release(
             // `/status` look terminal while the queue still has the job — the
             // stale-until-repushed mode A7 was meant to kill.
             let classified = classify_build_error(e);
-            admission_test_build_failure(Some(&job.admitted_commit), classified.message());
             if let Some(status) = terminal_metadata_status(&classified) {
                 state.metrics.record_build_failed();
                 if let Err(status_err) =
@@ -7734,6 +7733,10 @@ async fn process_build_job_with_foreground_release(
                 );
             }
             invalidate_ref_response_cache(state, repo_id, &effective_branch);
+            // The deterministic failure hook represents a settled build
+            // result. Signal it only after terminal metadata (when applicable)
+            // and cache invalidation are visible to observers.
+            admission_test_build_failure(Some(&job.admitted_commit), classified.message());
             Err(classified)
         }
     }

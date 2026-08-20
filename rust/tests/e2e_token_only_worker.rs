@@ -5,15 +5,21 @@ mod common;
 
 use common::*;
 use ripclone::job_token::{mint_job_token, report_token_secret_from_env};
-use ripclone::queue::{BuildJob, JobQueue, JobState};
+use ripclone::mode::CloneMode;
+use ripclone::provider::RepoId;
+use ripclone::ref_store::{AddedRepo, AddedRepoSource};
 use ripclone::server::{RateLimiter, ServerState, build_app};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 #[tokio::test]
-async fn token_only_worker_never_opens_control_credentials() {
+async fn token_only_worker_builds_and_clones_without_control_credentials() {
     init(false);
+    let origin = make_origin("acme", "api-only");
+    let commit = origin.commit(&[("value.txt", "built by API worker\n")], "api worker");
+    origin.publish();
     let dir = tempfile::tempdir().unwrap();
     let cas_dir = dir.path().join("cas");
     let repo_root = dir.path().join("repos");
@@ -27,6 +33,20 @@ async fn token_only_worker_never_opens_control_credentials() {
         .await
         .unwrap(),
     );
+    control
+        .ref_store()
+        .add_repo(&AddedRepo {
+            repo_id: RepoId::github("acme/api-only"),
+            added_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            history_enabled: true,
+            source: AddedRepoSource::Api,
+            repo_size_bytes: None,
+        })
+        .await
+        .unwrap();
     let metrics = ripclone::metrics::Metrics::new();
     let backends = ripclone::backends::Backends::from_env_with_ref_store(
         &cas_dir,
@@ -97,25 +117,12 @@ async fn token_only_worker_never_opens_control_credentials() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let enqueued = queue
-        .enqueue(BuildJob {
-            repo_id: ripclone::provider::RepoId {
-                provider: ripclone::provider::ProviderInstanceId::new("missing-provider"),
-                path: "acme/api-only".to_string(),
-            },
-            branch: "main".to_string(),
-            admitted_commit: "1111111111111111111111111111111111111111".to_string(),
-            admitted_default_branch: Some("main".to_string()),
-            credential: None,
-            size_bytes: None,
-        })
-        .await
-        .unwrap();
-    let job_id = enqueued.job_id.unwrap();
     let secret = report_token_secret_from_env().unwrap();
     let token = mint_job_token(&secret, Duration::from_secs(300)).unwrap();
     let decoy = dir.path().join("worker-must-not-open.db");
-    let worker_cas = dir.path().join("worker-cas");
+    // Local artifact storage is intentionally shared for this composition;
+    // the worker still receives no path or credential for the control database.
+    let worker_cas = cas_dir.clone();
     let worker_repos = dir.path().join("worker-repos");
     let server_url = format!("http://127.0.0.1:{port}");
     let mut command = Command::new(cargo_bin("ripclone-worker"));
@@ -170,6 +177,16 @@ async fn token_only_worker_never_opens_control_credentials() {
     unsafe { std::env::set_var("RIPCLONE_CONTROL_DB_PATH", &decoy) };
     let mut child = command.spawn().unwrap();
     unsafe { std::env::remove_var("RIPCLONE_CONTROL_DB_PATH") };
+    let client = ripclone::client::Client::new_with_token(server_url, Some(token_hash()));
+    let ready = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.sync_repo("acme/api-only", None),
+    )
+    .await
+    .expect("API worker published Head within the bound")
+    .expect("API worker sync succeeded");
+    assert_eq!(ready.commit, commit);
+
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -183,10 +200,24 @@ async fn token_only_worker_never_opens_control_credentials() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    assert!(matches!(
-        queue.job_status(job_id).await.unwrap(),
-        JobState::Failed(_)
-    ));
+    let clone = dir.path().join("clone");
+    client
+        .install_repo_with_mode_at(
+            "acme/api-only",
+            "main",
+            Some(&commit),
+            &clone,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("clone API-worker artifacts");
+    assert_eq!(
+        std::fs::read_to_string(clone.join("value.txt")).unwrap(),
+        "built by API worker\n"
+    );
+    assert_eq!(git(&clone, &["rev-parse", "HEAD"]), commit);
     assert!(!decoy.exists(), "worker opened the decoy control database");
     assert!(
         control_path.exists(),
