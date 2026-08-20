@@ -92,3 +92,8 @@ allow = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+required-git-spec = "rev"
+allow-git = [
+  # Temporary exact upstream fix for libsql#2251 (native connection double-close).
+  "https://github.com/tursodatabase/libsql",
+]
