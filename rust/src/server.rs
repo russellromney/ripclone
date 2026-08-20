@@ -7801,15 +7801,27 @@ pub async fn mark_admitted_build_failed(
     admitted_commit: &str,
     message: &str,
 ) -> Result<()> {
+    let status = format!("failed: {message}");
     let exact_branch = exact_ref_store_key(branch, admitted_commit);
-    let _ = update_build_status(
-        state,
-        repo_id,
-        &exact_branch,
-        admitted_commit,
-        &format!("failed: {message}"),
-    )
-    .await?;
+    let _ = update_build_status(state, repo_id, &exact_branch, admitted_commit, &status).await?;
+    update_current_failure_status(state, repo_id, branch, admitted_commit, &status).await?;
+    Ok(())
+}
+
+/// Surface a terminal failure through moving projections only while the failed
+/// immutable result is still their current commit. A later admitted commit is
+/// therefore never marked failed by delayed older work.
+async fn update_current_failure_status(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+    admitted_commit: &str,
+    status: &str,
+) -> Result<()> {
+    let _ = update_build_status(state, repo_id, branch, admitted_commit, status).await?;
+    if branch != "HEAD" {
+        let _ = update_build_status(state, repo_id, "HEAD", admitted_commit, status).await?;
+    }
     Ok(())
 }
 
@@ -8267,9 +8279,11 @@ async fn update_job_build_status(
         }
         return update_current_build_status(state, &job.repo_id, &exact_branch, status).await;
     }
-    update_build_status(state, &job.repo_id, &exact_branch, commit, status)
-        .await
-        .map(|updated| updated.then(|| commit.to_string()))
+    let updated = update_build_status(state, &job.repo_id, &exact_branch, commit, status).await?;
+    if updated && status.starts_with("failed: ") {
+        update_current_failure_status(state, &job.repo_id, branch, commit, status).await?;
+    }
+    Ok(updated.then(|| commit.to_string()))
 }
 
 async fn update_current_build_status(

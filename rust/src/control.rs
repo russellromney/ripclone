@@ -316,8 +316,22 @@ impl ControlDb {
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .context("begin durable admission")?;
-        upsert_exact(&tx, job, exact_branch, pending).await?;
-        if let Some((tail_branch, tail_info)) = tail {
+        let mut pending = pending.clone();
+        let discovered_tail = if tail.is_none()
+            && pending.moving_publication_predecessors.len() == 1
+            && pending.moving_publication_predecessors[0]
+                == crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR
+        {
+            discover_initial_admission_tail(&tx, job, &mut pending).await?
+        } else {
+            None
+        };
+        upsert_exact(&tx, job, exact_branch, &pending).await?;
+        if let Some((tail_branch, tail_info)) = tail.or_else(|| {
+            discovered_tail
+                .as_ref()
+                .map(|(branch, info)| (branch.as_str(), info))
+        }) {
             update_tail(&tx, job, tail_branch, tail_info).await?;
         }
         let key = job.key();
@@ -375,6 +389,78 @@ impl ControlDb {
             job_id: Some(id),
         })
     }
+}
+
+/// Serialize concurrent first admissions into one ordinary-publication chain.
+///
+/// Before any moving row exists, request-side preparation can legitimately see
+/// `:initial` for two different commits. The immediate admission transaction
+/// is the authority that orders them: a later transaction links the one
+/// existing chain tail and authorizes its new exact row to replace every prior
+/// member. No transaction survives beyond the metadata/job writes below.
+async fn discover_initial_admission_tail(
+    tx: &libsql::Transaction,
+    job: &BuildJob,
+    pending: &mut crate::RefInfo,
+) -> Result<Option<(String, crate::RefInfo)>> {
+    let result_branch = if job.branch == "HEAD" {
+        job.admitted_default_branch
+            .as_deref()
+            .unwrap_or(job.branch.as_str())
+    } else {
+        job.branch.as_str()
+    };
+    let prefix = crate::ref_store::exact_ref_key(result_branch, "");
+    let mut rows = tx
+        .query(
+            "SELECT branch, data FROM refs
+             WHERE repo_key = ?1 AND substr(branch, 1, length(?2)) = ?2",
+            libsql::params![job.repo_id.storage_key(), prefix],
+        )
+        .await
+        .context("load initial ordinary-admission chain")?;
+    let mut tails = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let branch = row.get::<String>(0)?;
+        let info: crate::RefInfo =
+            serde_json::from_str(&row.get::<String>(1)?).context("parse admission-chain ref")?;
+        if info.commit != job.admitted_commit
+            && info.internal_exact_result
+            && info
+                .moving_publication_predecessors
+                .iter()
+                .any(|commit| commit == crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR)
+            && info.moving_admission_successors.is_empty()
+        {
+            tails.push((branch, info));
+        }
+    }
+    drop(rows);
+    let Some((branch, mut tail)) = tails.pop() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        tails.is_empty(),
+        "ordinary admission has multiple initial chain tails"
+    );
+    for predecessor in tail
+        .moving_publication_predecessors
+        .iter()
+        .chain(std::iter::once(&tail.commit))
+    {
+        if !pending
+            .moving_publication_predecessors
+            .contains(predecessor)
+        {
+            pending
+                .moving_publication_predecessors
+                .push(predecessor.clone());
+        }
+    }
+    tail.require_matching_commit = false;
+    tail.moving_admission_successors
+        .push(job.admitted_commit.clone());
+    Ok(Some((branch, tail)))
 }
 
 fn ref_times(info: &crate::RefInfo) -> (Option<i64>, Option<i64>) {
@@ -715,6 +801,88 @@ mod tests {
         assert_eq!(second.outcome, EnqueueOutcome::Enqueued);
         assert_ne!(second.job_id, first_id);
         assert_eq!(control.queue().depth().await, 2);
+    }
+
+    #[tokio::test]
+    async fn first_admissions_form_one_fenced_publication_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        let first_commit = "1111111111111111111111111111111111111111";
+        let second_commit = "2222222222222222222222222222222222222222";
+        let mut first_pending = pending(first_commit);
+        first_pending.require_matching_commit = true;
+        first_pending.moving_publication_predecessors =
+            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
+        let mut second_pending = pending(second_commit);
+        second_pending.require_matching_commit = true;
+        second_pending.moving_publication_predecessors =
+            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
+        let first_exact = crate::ref_store::exact_ref_key("main", first_commit);
+        let second_exact = crate::ref_store::exact_ref_key("main", second_commit);
+
+        control
+            .admit_exact_and_job(&job(first_commit), &first_exact, &first_pending, None)
+            .await
+            .unwrap();
+        control
+            .admit_exact_and_job(&job(second_commit), &second_exact, &second_pending, None)
+            .await
+            .unwrap();
+
+        let store = control.ref_store();
+        let first = store
+            .load_branch(&job(first_commit).repo_id, &first_exact)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .load_branch(&job(second_commit).repo_id, &second_exact)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.moving_admission_successors,
+            vec![second_commit.to_string()]
+        );
+        assert_eq!(
+            second.moving_publication_predecessors,
+            vec![
+                crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string(),
+                first_commit.to_string(),
+            ]
+        );
+
+        let mut first_projection = first;
+        first_projection.internal_exact_result = false;
+        first_projection.require_matching_commit = true;
+        let mut second_projection = second;
+        second_projection.internal_exact_result = false;
+        second_projection.require_matching_commit = true;
+        store
+            .save_branch(&job(first_commit).repo_id, "main", &first_projection)
+            .await
+            .unwrap();
+        store
+            .save_branch(&job(second_commit).repo_id, "main", &second_projection)
+            .await
+            .unwrap();
+        store
+            .save_branch(&job(first_commit).repo_id, "main", &first_projection)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_branch(&job(first_commit).repo_id, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            second_commit,
+            "the older first admission must not replace its admitted successor"
+        );
     }
 
     #[tokio::test]
