@@ -110,7 +110,8 @@ jobs:
             return 1
           }
           make_origin() {
-            local root="$1" repo="$2" value="$3" work="$root/work-${repo//\//-}" bare="$root/origins/$repo.git"
+            local root="$1" repo="$2" value="$3"
+            local work="$root/work-${repo//\//-}" bare="$root/origins/$repo.git"
             mkdir -p "$work" "$(dirname "$bare")"
             git init -q -b main "$work"
             git init --bare -q -b main "$bare"
@@ -200,7 +201,8 @@ jobs:
           }
 
           measure_head_while_full() {
-            local label="$1" bin_dir="$2" server="$bin_dir/ripclone-server"
+            local label="$1" bin_dir="$2"
+            local server="$bin_dir/ripclone-server"
             local i root port barrier body status commit start end
             for i in $(seq 1 7); do
               root="$RESULTS/$label-head-$i"
