@@ -45,19 +45,46 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{error, info, warn};
 
-/// Test-only deterministic barrier for artifact downloads. The first artifact
-/// response whose body is larger than `after_bytes` splits its body into a
-/// stream: it sends the prefix, signals `entered`, waits on `proceed`, and then
-/// either sends the remainder or closes the connection (when `close_on_proceed`).
-/// This lets tests pause a download mid-body without relying on wall-clock
-/// timing or first-request fault injection.
+/// Test-only deterministic barrier for artifact downloads. The first matching
+/// artifact response splits its body into a stream: it sends the prefix,
+/// signals `entered`, waits on `proceed`, and then either sends the remainder
+/// or closes the connection (when `close_on_proceed`). This lets tests pause a
+/// download mid-body without relying on wall-clock timing or first-request
+/// fault injection.
+///
+/// A response matches when its body is larger than `after_bytes` and it
+/// satisfies [`BarrierTarget`].
 #[derive(Clone)]
 pub struct ArtifactBarrier {
     pub after_bytes: usize,
+    pub target: BarrierTarget,
     pub entered: Arc<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     pub proceed: Arc<StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     pub close_on_proceed: bool,
     pub consumed: Arc<AtomicBool>,
+}
+
+/// Which artifact the barrier holds.
+#[derive(Clone)]
+pub enum BarrierTarget {
+    /// The first response whose body exceeds `after_bytes`.
+    FirstLargeBody,
+    /// Only the artifact whose content hash the test has written into the slot,
+    /// and only once it has been named — an empty slot matches nothing. This
+    /// lets a test start the server, sync, discover the exact chunk or pack it
+    /// wants to hold, and then arm the barrier.
+    Hash(Arc<StdMutex<Option<String>>>),
+}
+
+impl BarrierTarget {
+    fn matches(&self, hash: &str) -> bool {
+        match self {
+            BarrierTarget::FirstLargeBody => true,
+            BarrierTarget::Hash(slot) => {
+                slot.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(hash)
+            }
+        }
+    }
 }
 
 static TEST_ARTIFACT_BARRIER: StdMutex<Option<ArtifactBarrier>> = StdMutex::new(None);
@@ -5497,6 +5524,7 @@ async fn serve_artifact(
                     if let Some(barrier) = state.artifact_barrier.clone() {
                         if !barrier.consumed.load(Ordering::SeqCst)
                             && data.len() > barrier.after_bytes
+                            && barrier.target.matches(&hash)
                         {
                             barrier.consumed.store(true, Ordering::SeqCst);
                             return (StatusCode::OK, barrier_body(data, barrier)).into_response();

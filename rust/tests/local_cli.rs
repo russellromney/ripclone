@@ -18,6 +18,8 @@ mod e2e_clone_metrics;
 mod e2e_config_clone_mode;
 #[path = "suites/local_cli/e2e_config_provider_add_then_clone.rs"]
 mod e2e_config_provider_add_then_clone;
+#[path = "suites/local_cli/e2e_download_rules.rs"]
+mod e2e_download_rules;
 #[path = "suites/local_cli/e2e_remote_helper.rs"]
 mod e2e_remote_helper;
 #[path = "suites/local_cli/e2e_roundtrip.rs"]
@@ -27,6 +29,8 @@ mod e2e_verify_upstream;
 #[path = "suites/local_cli/e2e_version.rs"]
 mod e2e_version;
 
+#[path = "suites/contracts/client_surface.rs"]
+mod client_surface;
 #[path = "suites/contracts/docs_cli_surface.rs"]
 mod docs_cli_surface;
 #[path = "suites/contracts/e2e_config_sync_defaults.rs"]
