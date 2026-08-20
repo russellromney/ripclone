@@ -21,30 +21,40 @@ fn prometheus_value(text: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("metric {name} missing"))
 }
 
-async fn phase_metrics(client: &reqwest::Client, server: &Server) -> Vec<u64> {
-    let metrics = client
-        .get(format!("{}/metrics", server.url))
-        .send()
-        .await
-        .expect("metrics request")
-        .error_for_status()
-        .expect("metrics 2xx")
-        .text()
-        .await
-        .expect("metrics text");
-    [
-        "ripclone_sync_mirror_fetch_ms_total",
-        "ripclone_sync_commit_graph_ms_total",
-        "ripclone_sync_head_packs_ms_total",
-        "ripclone_sync_skeleton_build_ms_total",
-        "ripclone_sync_files_table_ms_total",
-        "ripclone_sync_prebuilt_index_ms_total",
-        "ripclone_sync_upload_p1_ms_total",
-        "ripclone_sync_ref_publish_ms_total",
-        "ripclone_sync_publish_p1_ms_total",
-    ]
-    .map(|name| prometheus_value(&metrics, name))
-    .to_vec()
+async fn phase_metrics_after_builds(
+    client: &reqwest::Client,
+    server: &Server,
+    expected_builds: u64,
+) -> Vec<u64> {
+    for _ in 0..160 {
+        let metrics = client
+            .get(format!("{}/metrics", server.url))
+            .send()
+            .await
+            .expect("metrics request")
+            .error_for_status()
+            .expect("metrics 2xx")
+            .text()
+            .await
+            .expect("metrics text");
+        if prometheus_value(&metrics, "ripclone_builds_completed_total") >= expected_builds {
+            return [
+                "ripclone_sync_mirror_fetch_ms_total",
+                "ripclone_sync_commit_graph_ms_total",
+                "ripclone_sync_head_packs_ms_total",
+                "ripclone_sync_skeleton_build_ms_total",
+                "ripclone_sync_files_table_ms_total",
+                "ripclone_sync_prebuilt_index_ms_total",
+                "ripclone_sync_upload_p1_ms_total",
+                "ripclone_sync_ref_publish_ms_total",
+                "ripclone_sync_publish_p1_ms_total",
+            ]
+            .map(|name| prometheus_value(&metrics, name))
+            .to_vec();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("metrics never recorded {expected_builds} completed builds");
 }
 
 #[tokio::test]
@@ -71,7 +81,7 @@ async fn cold_sync_reports_all_phase_timings() {
     // Admission returns before timing data exists. The durable worker records
     // every phase after the accepted build settles; `/metrics` is the public
     // post-completion timing surface.
-    let phases = phase_metrics(&client, &server).await;
+    let phases = phase_metrics_after_builds(&client, &server, 1).await;
     assert_eq!(phases.len(), 9);
 }
 
@@ -135,7 +145,7 @@ async fn incremental_sync_reports_all_phase_timings() {
     // Let the background full-history build finish so the next sync's storage
     // amplification report includes history packs.
     let _ = sync_response_until_manifest(&client, &server, "acme", "phasesinc", &c1).await;
-    let cold_phases = phase_metrics(&client, &server).await;
+    let cold_phases = phase_metrics_after_builds(&client, &server, 1).await;
 
     // Incremental sync: add a commit and re-sync.
     let c2 = origin.commit(&[("README.md", "v2\n")], "c2");
@@ -148,7 +158,7 @@ async fn incremental_sync_reports_all_phase_timings() {
     assert!(inc.accepted);
     assert_eq!(inc.commit, c2);
     let _ = sync_response_until_manifest(&client, &server, "acme", "phasesinc", &c2).await;
-    let incremental_phases = phase_metrics(&client, &server).await;
+    let incremental_phases = phase_metrics_after_builds(&client, &server, 2).await;
     assert_eq!(incremental_phases.len(), cold_phases.len());
     // The incremental push→clonable path should remain in the same ballpark as
     // the cold path on this tiny fixture; the real tripwire is measured on
