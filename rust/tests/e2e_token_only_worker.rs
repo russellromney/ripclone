@@ -9,6 +9,7 @@ use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
 use ripclone::ref_store::{AddedRepo, AddedRepoSource};
 use ripclone::server::{RateLimiter, ServerState, build_app};
+use ripclone::storage::StorageBackend;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -17,6 +18,26 @@ use std::time::{Duration, Instant};
 #[tokio::test]
 async fn token_only_worker_builds_and_clones_without_control_credentials() {
     init(false);
+    let require_turso = std::env::var("RIPCLONE_REQUIRE_TURSO").as_deref() == Ok("1");
+    let turso = require_turso.then(|| ripclone::control::TursoReplicaConfig {
+        url: std::env::var("RIPCLONE_TURSO_DATABASE_URL")
+            .expect("RIPCLONE_TURSO_DATABASE_URL for required Turso proof"),
+        token: std::env::var("RIPCLONE_TURSO_AUTH_TOKEN")
+            .expect("RIPCLONE_TURSO_AUTH_TOKEN for required Turso proof"),
+    });
+    if require_turso {
+        for key in [
+            "RIPCLONE_S3_ENDPOINT",
+            "RIPCLONE_S3_BUCKET",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(
+                std::env::var_os(key).is_some(),
+                "{key} is required for Turso plus S3 proof"
+            );
+        }
+    }
     let origin = make_origin("acme", "api-only");
     let commit = origin.commit(&[("value.txt", "built by API worker\n")], "api worker");
     origin.publish();
@@ -27,7 +48,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     let control = Arc::new(
         ripclone::control::ControlDb::open(
             &control_path,
-            None,
+            turso,
             ripclone::queue::default_size_classes(),
         )
         .await
@@ -218,6 +239,18 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         "built by API worker\n"
     );
     assert_eq!(git(&clone, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(control.is_turso_replica(), require_turso);
+    if require_turso {
+        let s3 = ripclone::storage::S3Storage::from_env()
+            .expect("configure required S3 fixture")
+            .expect("required S3 fixture is enabled");
+        assert!(
+            !s3.list_hashes()
+                .expect("list required S3 artifacts")
+                .is_empty(),
+            "API worker uploaded artifacts to S3"
+        );
+    }
     assert!(!decoy.exists(), "worker opened the decoy control database");
     assert!(
         control_path.exists(),
