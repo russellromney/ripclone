@@ -3144,6 +3144,12 @@ async fn get_ref_inner(
         detected_default_branch.unwrap_or_else(|| "HEAD".to_string())
     } else {
         let detected_row = match detected_default_branch {
+            // An explicit historical selector resolves against the mirror, so
+            // its readable symbolic HEAD is enough to identify the concrete
+            // exact-result key. This does not promote internal metadata: if the
+            // mirror cannot identify HEAD, the public-row fallback below still
+            // rejects an exact-only layout.
+            Some(candidate) if params.rev.is_some() => Some(candidate),
             Some(candidate) => state
                 .ref_store
                 .load_branch(&repo_id, &candidate)

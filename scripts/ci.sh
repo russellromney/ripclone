@@ -29,10 +29,24 @@ lint() {
 # staging the full suite there was ~30m cold before integration-test
 # consolidation and is not worth it.
 run_tests() {
-  # Combined harnesses contain existing tests that select backends through
-  # process-global environment variables. Preserve their former cross-file
-  # isolation by running one test at a time inside each bounded harness.
-  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked -- --test-threads=1 )
+  # The local-server harness has both LSM-on and LSM-off fixtures. LSM mode is
+  # process-global, so execute its two groups in separate processes while
+  # retaining one compiled test binary. The broad pass still compiles every
+  # target and runs every other test.
+  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked -- \
+      --test-threads=1 --skip lsm_on_ --skip lsm_off_ )
+
+  local filter listed
+  for filter in lsm_on_ lsm_off_; do
+    listed="$(cd "$ROOT/rust" && timeout 60 cargo test --profile ci --locked \
+      --test local_server -- "$filter" --list)"
+    if ! grep -Fq "$filter" <<<"$listed"; then
+      echo "required local-server group matched zero tests: $filter" >&2
+      exit 1
+    fi
+    ( cd "$ROOT/rust" && cargo test --profile ci --locked --test local_server -- \
+        "$filter" --test-threads=1 )
+  done
 }
 
 e2e() {
