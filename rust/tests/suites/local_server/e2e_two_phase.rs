@@ -282,7 +282,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
     unsafe {
         std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT", &b);
         std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS", "1500");
-        std::env::set_var("RIPCLONE_TEST_PHASE2_RETRYABLE_FAIL_COMMIT", &b);
+        std::env::set_var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT", &b);
     }
 
     register_added_without_build(&server, "acme/phase2fail-fenced")
@@ -385,7 +385,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT");
         std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS");
-        std::env::remove_var("RIPCLONE_TEST_PHASE2_RETRYABLE_FAIL_COMMIT");
+        std::env::remove_var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT");
         std::env::remove_var("RIPCLONE_TESTING");
     }
 }
