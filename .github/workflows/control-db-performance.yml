@@ -27,17 +27,20 @@ jobs:
       - name: Install release build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build perl pkg-config libssl-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build perl pkg-config libssl-dev protobuf-compiler
       - name: Build baseline and candidate release binaries once
         run: |
           set -euo pipefail
+          mkdir -p /tmp/ripclone-performance-results
           git worktree add --detach /tmp/ripclone-perf-base "$BASE_SHA"
           CARGO_TARGET_DIR=/tmp/ripclone-release-base \
             timeout 2400 cargo build --manifest-path /tmp/ripclone-perf-base/rust/Cargo.toml \
-              --release --locked --bin ripclone --bin ripclone-server
+              --release --locked --bin ripclone --bin ripclone-server \
+              2>&1 | tee /tmp/ripclone-performance-results/base-build.log
           CARGO_TARGET_DIR=/tmp/ripclone-release-candidate \
             timeout 2400 cargo build --manifest-path rust/Cargo.toml \
-              --release --locked --bin ripclone --bin ripclone-server
+              --release --locked --bin ripclone --bin ripclone-server \
+              2>&1 | tee /tmp/ripclone-performance-results/candidate-build.log
           install -d /tmp/ripclone-perf-bin/base /tmp/ripclone-perf-bin/candidate
           install -m 755 /tmp/ripclone-release-base/release/ripclone{,-server} /tmp/ripclone-perf-bin/base/
           install -m 755 /tmp/ripclone-release-candidate/release/ripclone{,-server} /tmp/ripclone-perf-bin/candidate/
