@@ -306,36 +306,42 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         clone_files_when(&server, "acme", "phase2fail-fenced", "f", "C\n").await;
     assert_eq!(read(&ready, "c"), "current\n");
 
+    let store = server_ref_store(&server).await;
+    let repo_id = RepoId::github("acme/phase2fail-fenced");
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let b_failures = probe
-                .failure_targets
+            let b_attempts = probe
+                .builder_targets
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .iter()
-                .filter(|(commit, _)| commit == &b)
+                .filter(|commit| *commit == &b)
                 .count();
-            if b_failures >= 2 {
+            let b_failed = store
+                .load_branch(&repo_id, &exact_ref_key("main", &b))
+                .await
+                .expect("load exact B while waiting")
+                .and_then(|info| info.build_status)
+                .is_some_and(|status| status.starts_with("failed: "));
+            if b_attempts >= 2 && b_failed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("initial and one bounded retry of Full(B) both failed");
-    let failures = probe
-        .failure_targets
+    .expect("initial and one bounded retry of Full(B) dead-lettered");
+    let attempts = probe
+        .builder_targets
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
     assert_eq!(
-        failures.iter().filter(|(commit, _)| commit == &b).count(),
+        attempts.iter().filter(|commit| *commit == &b).count(),
         2,
-        "Full(B) must exhaust exactly one retry: {failures:?}"
+        "Full(B) must exhaust exactly one retry: {attempts:?}"
     );
 
-    let store = server_ref_store(&server).await;
-    let repo_id = RepoId::github("acme/phase2fail-fenced");
     let moving = store
         .load_branch(&repo_id, "main")
         .await
