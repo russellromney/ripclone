@@ -1855,6 +1855,13 @@ async fn job_ack_handler(
     };
     match queue.ack(id, &req.worker_id, result).await {
         Ok(settled) => {
+            // Active API heartbeats create a registry row even when optional
+            // idle fleet registration is disabled. Once this sequential worker
+            // settles (or discovers it no longer owns) the job, remove that row;
+            // an opt-in idle heartbeat may recreate it on its next interval.
+            if let Err(error) = queue.remove_worker(&req.worker_id).await {
+                error!("remove settled API worker {}: {error:#}", req.worker_id);
+            }
             // Report the resulting lifecycle so the worker can detect a
             // dead-letter without a second round-trip.
             let (state_tag, error) =
