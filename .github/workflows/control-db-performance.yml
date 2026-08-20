@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 120
     env:
       BASE_SHA: 5c200c97ea6b5568961069a2536bdd643caba621
-      CANDIDATE_SHA: 4a5b7cf4a64bab1712f8de7090dd1c2fa03d1d7f
+      CANDIDATE_SHA: aa0ae87d38d22409542cbb606a502517b6461e23
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       CARGO_INCREMENTAL: "0"
