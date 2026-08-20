@@ -21,6 +21,7 @@ fn run_with_env<'a>(
     Command::new(ripclone_bin())
         .args(args)
         .env("HOME", home)
+        .env_remove("RIPCLONE_CONFIG")
         .env("RIPCLONE_SERVER", "http://localhost:1")
         .envs(extra)
         .stdout(std::process::Stdio::piped())
