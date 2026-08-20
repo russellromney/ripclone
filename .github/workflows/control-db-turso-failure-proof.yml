@@ -1,0 +1,68 @@
+name: control-db-turso-failure-proof
+
+on:
+  push:
+    branches:
+      - codex/control-db-performance-proof
+    paths:
+      - .github/workflows/control-db-turso-failure-proof.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  remote-primary-loss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      sqld:
+        image: ghcr.io/tursodatabase/libsql-server@sha256:bc100873a74865392a49191b4733025fe8222a409799efa424dc196feaf05035
+        ports:
+          - 8080:8080
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 76ea8c905971f647a22c301f6777b604fadf9c27
+      - name: Download exact implementation binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          implementation_run=32405370668
+          for _ in $(seq 1 90); do
+            if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${implementation_run}/artifacts" \
+              --jq '.artifacts[] | select(.name == "ci-artifacts") | .id' | grep -q .; then
+              gh run download "$implementation_run" --repo "$GITHUB_REPOSITORY" \
+                --name ci-artifacts --dir bin
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "ci-artifacts did not become available within 15 minutes" >&2
+          exit 1
+      - name: Stop the primary and reject new durable writes
+        timeout-minutes: 4
+        env:
+          RIPCLONE_REQUIRE_TURSO_FAILURE: "1"
+          RIPCLONE_TURSO_DATABASE_URL: http://127.0.0.1:8080
+          RIPCLONE_TURSO_AUTH_TOKEN: local-surrogate
+          RIPCLONE_TURSO_FAILURE_BARRIER: /tmp/ripclone-turso-failure-barrier
+          SQLD_CONTAINER_ID: ${{ job.services.sqld.id }}
+        run: |
+          set -euo pipefail
+          test_bin="${GITHUB_WORKSPACE}/bin/e2e_token_only_worker"
+          chmod +x "$test_bin"
+          test_name=turso_primary_loss_rejects_ref_and_job_writes
+          timeout 30 "$test_bin" --list | grep -Fqx "$test_name: test"
+          "$test_bin" --exact "$test_name" &
+          test_pid=$!
+          for _ in $(seq 1 120); do
+            [ -f "$RIPCLONE_TURSO_FAILURE_BARRIER/ready" ] && break
+            sleep 0.25
+          done
+          test -f "$RIPCLONE_TURSO_FAILURE_BARRIER/ready"
+          test -n "$SQLD_CONTAINER_ID"
+          timeout 20 docker stop "$SQLD_CONTAINER_ID"
+          touch "$RIPCLONE_TURSO_FAILURE_BARRIER/proceed"
+          wait "$test_pid"
