@@ -4548,7 +4548,13 @@ async fn prepare_exact_admission(
         .await
         .map_err(|e| format!("exact admission lookup failed: {e}"))?;
     let active = existing.as_ref().is_some_and(|info| {
-        info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+        matches!(
+            info.build_status.as_deref(),
+            None | Some("done")
+                | Some("building")
+                | Some(BUILDING_FULL_HISTORY)
+                | Some("archive building")
+        )
     });
     if active {
         if moving_authorized
