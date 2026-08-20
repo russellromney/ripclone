@@ -213,14 +213,14 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     let mut child = command.spawn().unwrap();
     unsafe { std::env::remove_var("RIPCLONE_CONTROL_DB_PATH") };
     let client = ripclone::client::Client::new_with_token(server_url, Some(token_hash()));
-    let ready = tokio::time::timeout(
+    let admission = tokio::time::timeout(
         Duration::from_secs(30),
-        client.sync_repo("acme/api-only", None),
+        client.admit_sync_repo("acme/api-only", None),
     )
     .await
-    .expect("API worker published Head within the bound")
-    .expect("API worker sync succeeded");
-    assert_eq!(ready.commit, commit);
+    .expect("API worker job admitted within the bound")
+    .expect("API worker admission succeeded");
+    assert_eq!(admission.commit, commit);
 
     tokio::time::timeout(Duration::from_secs(30), async {
         while !full_barrier.join("entered").exists() {
@@ -229,6 +229,18 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     })
     .await
     .expect("API worker entered the held Full phase");
+    let exact = control
+        .ref_store()
+        .load_branch(
+            &RepoId::github("acme/api-only"),
+            &ripclone::ref_store::exact_ref_key("main", &commit),
+        )
+        .await
+        .unwrap()
+        .expect("Head publication is durable before held Full");
+    assert_eq!(exact.commit, commit);
+    assert_eq!(exact.build_status.as_deref(), Some("full history building"));
+    assert!(!exact.shallow_clonepack.manifest.is_empty());
 
     // Exercise the server's real reclaim path repeatedly for longer than the
     // configured two-second stale bound. Mandatory active heartbeats keep the

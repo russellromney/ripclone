@@ -970,7 +970,6 @@ mod tests {
         let moving_a = crate::RefInfo {
             commit: a.to_string(),
             default_branch: "main".to_string(),
-            require_matching_commit: true,
             ..Default::default()
         };
         let mut exact_a = moving_a.clone();
