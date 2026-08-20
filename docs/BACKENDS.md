@@ -267,21 +267,14 @@ RIPCLONE_CACHE_DIR=/path/to/cache   # enable / override cache location
 RIPCLONE_NO_CACHE=1                  # forcibly disable caching
 ```
 
-## Fast worktrees on Linux
+## Overlay staging on Linux
 
-`ripclone worktree <path> -b <branch>` adds a git worktree using the same overlay-staging trick as `ripclone clone`. Run it inside an existing ripclone clone:
-
-```bash
-cd my-clone
-ripclone worktree ../my-clone-wt -b HEAD
-```
-
-For the same commit as the main clone, it reuses the local `.git/index` and object database, so nothing is downloaded. For a different branch/commit, it falls back to fetching the prebuilt depth pack from the server.
-
-On cloud VMs with slow overlay rootfs, point the staging directory at a fast volume:
+`ripclone clone` can stage the working tree in tmpfs and expose it through an
+overlay mount. On cloud VMs with a slow overlay rootfs, point the staging
+directory at a fast volume:
 
 ```bash
-RIPCLONE_STAGING_DIR=/data ripclone worktree ../wt -b HEAD
+RIPCLONE_STAGING_DIR=/data ripclone clone owner/repo
 ```
 
 Other overlay knobs:

@@ -1976,10 +1976,10 @@ pub async fn sync_and_clone(
         let out = tempfile::tempdir().unwrap();
         let target = out.path().join("clone");
         match client
-            .install_repo_with_mode(
-                &origin.owner,
-                &origin.repo,
+            .install_repo_with_mode_at(
+                &format!("{}/{}", origin.owner, origin.repo),
                 "HEAD",
+                None,
                 &target,
                 mode,
                 Some(kind),

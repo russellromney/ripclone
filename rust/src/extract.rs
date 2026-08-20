@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use flate2::read::ZlibDecoder;
 use sha1::{Digest as Sha1Digest, Sha1};
-use sha2::{Digest as Sha256Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
@@ -1001,92 +1000,6 @@ fn parse_pack_obj_header(buf: &[u8]) -> Result<(u8, u64, usize)> {
         cont = b & 0x80 != 0;
     }
     Ok((obj_type, size, i))
-}
-
-/// Extract a working tree by fetching each archive chunk whole.
-///
-/// `manifest_path` must point to a protobuf `MetadataChunk` whose frame table
-/// references the archive chunks in `archive_chunk_hashes` by index. Each chunk
-/// is fetched with a single GET, decompressed frame-by-frame, and written to
-/// `target_dir`.
-/// `signed_chunk_urls` may be omitted or may contain one entry per archive
-/// chunk hash. A `Some(url)` entry is fetched directly; `None` falls back to
-/// the gateway's `/v1/artifacts/{hash}` endpoint.
-pub fn extract_clonepack_streaming(
-    manifest_path: &Path,
-    archive_chunk_hashes: &[String],
-    signed_chunk_urls: Option<Vec<Option<String>>>,
-    target_dir: &Path,
-    dictionary: Option<&[u8]>,
-    server: &str,
-    // Full `Authorization` header value (e.g. "Ripclone <hash>" or "Bearer
-    // <jwt>") for the gateway artifact-fetch fallback when chunks aren't served
-    // via presigned URLs. Passed verbatim so a session-token client authenticates
-    // the same way it does on the main HTTP client.
-    auth_header: Option<&str>,
-) -> Result<ExtractStats> {
-    use anyhow::Context;
-    use reqwest::header::AUTHORIZATION;
-
-    let client = reqwest::blocking::Client::new();
-    let server = server.to_string();
-    let hashes: Vec<String> = archive_chunk_hashes.to_vec();
-    let signed: Vec<Option<String>> = signed_chunk_urls.unwrap_or_default();
-    let auth_header = auth_header.map(|h| h.to_string());
-
-    extract_archive_with_chunk_fetcher(
-        manifest_path,
-        Some(target_dir),
-        dictionary,
-        u64::MAX,
-        move |chunk: &Chunk| {
-            let hash = hashes
-                .get(chunk.chunk_index)
-                .with_context(|| format!("missing hash for archive chunk {}", chunk.chunk_index))?;
-            let signed_url = signed.get(chunk.chunk_index).and_then(|o| o.as_deref());
-            let url = signed_url
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| format!("{}/v1/artifacts/{}", server, hash));
-            let fetch_start = Instant::now();
-            let mut req = client.get(&url);
-            if signed_url.is_none() {
-                // Signed URLs are self-authenticating; only send the ripclone
-                // token when falling back to the gateway.
-                if let Some(auth) = &auth_header {
-                    req = req.header(AUTHORIZATION, auth);
-                }
-            }
-            let resp = req.send().with_context(|| {
-                format!("fetch archive chunk {} from {}", chunk.chunk_index, url)
-            })?;
-            if !resp.status().is_success() {
-                anyhow::bail!(
-                    "archive chunk {} fetch failed: {}",
-                    chunk.chunk_index,
-                    resp.status()
-                );
-            }
-            let bytes = resp
-                .bytes()
-                .with_context(|| format!("read archive chunk {} response", chunk.chunk_index))?;
-            let actual_hash = hex::encode(<Sha256 as Sha256Digest>::digest(&bytes));
-            if actual_hash != *hash {
-                anyhow::bail!(
-                    "archive chunk {} hash mismatch: expected {}, got {}",
-                    chunk.chunk_index,
-                    hash,
-                    actual_hash
-                );
-            }
-            info!(
-                "fetched archive chunk {} ({} bytes) in {:?}",
-                chunk.chunk_index,
-                bytes.len(),
-                fetch_start.elapsed()
-            );
-            Ok(bytes.to_vec())
-        },
-    )
 }
 
 #[cfg(test)]

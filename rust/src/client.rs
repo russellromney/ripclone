@@ -4,8 +4,7 @@ use crate::clonepack::{
     ChunkRef, ClonepackManifest, MetadataChunk, PackEntry, hash_to_hex,
     install_manifest_pack_bytes, manifest_pack_idx_bytes,
 };
-use crate::extract::{extract_archive_from_chunk_receiver, extract_clonepack_streaming};
-use crate::git;
+use crate::extract::extract_archive_from_chunk_receiver;
 use crate::mode::CloneMode;
 use crate::overlay;
 use crate::provider::{ProviderInstance, ProviderInstanceId, ProviderKind, RepoId};
@@ -188,11 +187,13 @@ fn validate_manifest_commit(manifest: &ClonepackManifest, pinned: &str) -> Resul
     Ok(())
 }
 
-/// A presigned artifact URL failed (most likely expired mid-clone). The bytes
-/// are served ONLY by the signed URLs in the ref response — the hosted server no
-/// longer serves content by bare hash — so the right recovery is to re-resolve
-/// the ref for fresh URLs and retry, which also re-runs the server's access
-/// check. Surfaced as a typed error so the clone driver can detect it.
+/// A presigned artifact URL was rejected with 401 or 403 (most likely expired
+/// mid-clone). The bytes are served ONLY by the signed URLs in the ref response
+/// — the hosted server no longer serves content by bare hash — so the right
+/// recovery is to re-resolve the ref for fresh URLs and retry, which also
+/// re-runs the server's access check. Surfaced as a typed error so the clone
+/// driver can detect it. A missing object, wrong length, or wrong hash is NOT
+/// this error: those fail the clone instead of entering the refresh loop.
 #[derive(Debug)]
 pub struct StaleSignedUrl;
 
@@ -546,176 +547,214 @@ fn pseudo_rand_u64() -> u64 {
     })
 }
 
-/// Run the download-with-retry loop against a specific client and URL.
-async fn fetch_artifact_with_retry(
-    client: &reqwest::Client,
-    url: &str,
-    hash: &str,
-) -> Result<bytes::Bytes> {
-    let (max_attempts, base_backoff_ms) = fetch_retry_config();
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match fetch_artifact_once(client, url, hash).await {
-            Ok(bytes) => return Ok(bytes),
-            Err((retryable, err)) => {
-                if retryable && attempt < max_attempts {
-                    let backoff = fetch_backoff(base_backoff_ms, attempt);
-                    tracing::debug!(
-                        "artifact {hash} fetch attempt {attempt}/{max_attempts} failed: {err:#}; retrying in {backoff:?}"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                return Err(err);
+/// Why one artifact download attempt failed, and what the caller may do next.
+///
+/// This is the single classification both artifact outputs share: the buffered
+/// byte download and the streamed temporary-file download run the same status,
+/// retry, verification, and credential rules and differ only in where the bytes
+/// land.
+#[derive(Debug)]
+enum FetchFailure {
+    /// Transport error, 408, 429, or 5xx — retry the same URL.
+    Retry(anyhow::Error),
+    /// 401 or 403 from a signed object URL — the clone driver refreshes the
+    /// URLs for the same pinned commit.
+    RefreshUrl(anyhow::Error),
+    /// 404, wrong length, wrong hash, or a local I/O failure — fail now.
+    Permanent(anyhow::Error),
+}
+
+impl FetchFailure {
+    fn retryable(&self) -> bool {
+        matches!(self, FetchFailure::Retry(_))
+    }
+
+    /// Surface the failure to the caller. Only a refreshable failure becomes a
+    /// [`StaleSignedUrl`], so a missing, short, or corrupt object fails the
+    /// clone instead of entering the outer re-resolve loop.
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            FetchFailure::Retry(err) | FetchFailure::Permanent(err) => err,
+            FetchFailure::RefreshUrl(err) => {
+                anyhow::Error::new(StaleSignedUrl).context(format!("{err:#}"))
             }
         }
     }
 }
 
-/// Fetch an artifact once and verify its hash. Returns `(retryable, error)` on
-/// failure so the caller can decide whether to retry.
-async fn fetch_artifact_once(
-    client: &reqwest::Client,
-    fetch_url: &str,
+/// The status rule. `signed` is true for a self-authenticating object-storage
+/// URL, where 401/403 means the signature expired or was revoked rather than
+/// that the caller is unauthenticated.
+fn classify_fetch_status(
+    status: reqwest::StatusCode,
+    signed: bool,
     hash: &str,
-) -> std::result::Result<bytes::Bytes, (bool, anyhow::Error)> {
-    let resp = match client.get(fetch_url).send().await {
-        Ok(r) => r,
-        // Transport errors (connect/reset/timeout) are transient.
-        Err(e) => return Err((true, anyhow::anyhow!("artifact fetch transport error: {e}"))),
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        let retryable = status.is_server_error()
+) -> Option<FetchFailure> {
+    if status.is_success() {
+        return None;
+    }
+    let err = anyhow::anyhow!("artifact {hash} fetch failed: {status}");
+    Some(
+        if status.is_server_error()
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || status == reqwest::StatusCode::REQUEST_TIMEOUT;
-        return Err((
-            retryable,
-            anyhow::anyhow!("artifact fetch failed: {status}"),
-        ));
-    }
-    // R1: keep the body as `Bytes` (a refcounted buffer) instead of copying it
-    // into a fresh Vec — it flows through the cache and on to the consumer
-    // (decompress/write, which read `&[u8]`) without a second per-artifact copy.
-    let data = match resp.bytes().await {
-        Ok(b) => b,
-        // A body read can fail mid-stream; retry.
-        Err(e) => return Err((true, anyhow::anyhow!("artifact body read error: {e}"))),
-    };
-    // Content-addressed artifacts must match their hash. A full body with the
-    // wrong hash is deterministic corruption (retrying re-fetches the same
-    // bytes), so treat it as permanent. Genuine truncation surfaces as a
-    // transport/body-read error above, which *is* retried.
-    let actual_hash = crate::cas::hash(&data);
-    if actual_hash != hash {
-        return Err((
-            false,
-            anyhow::anyhow!("artifact hash mismatch: expected {hash}, got {actual_hash}"),
-        ));
-    }
-    Ok(data)
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        {
+            FetchFailure::Retry(err)
+        } else if signed
+            && (status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN)
+        {
+            FetchFailure::RefreshUrl(err)
+        } else {
+            FetchFailure::Permanent(err)
+        },
+    )
 }
 
-async fn fetch_artifact_to_temp_with_retry(
+/// The verification rule. An artifact must have the length the manifest
+/// promised (when it promised one) and must hash to its content address. Both
+/// are deterministic corruption — refetching returns the same bytes — so they
+/// are permanent failures, never a retry and never a URL refresh. Genuine
+/// truncation surfaces as a transport/body-read error, which *is* retried.
+fn verify_fetched_artifact(
+    hash: &str,
+    expected_len: Option<u64>,
+    actual_len: u64,
+    actual_hash: &str,
+) -> std::result::Result<(), FetchFailure> {
+    if let Some(expected) = expected_len
+        && actual_len != expected
+    {
+        return Err(FetchFailure::Permanent(anyhow::anyhow!(
+            "artifact {hash} size mismatch: expected {expected}, got {actual_len}"
+        )));
+    }
+    if actual_hash != hash {
+        return Err(FetchFailure::Permanent(anyhow::anyhow!(
+            "artifact hash mismatch: expected {hash}, got {actual_hash}"
+        )));
+    }
+    Ok(())
+}
+
+/// The retry rule: run `attempt_once` until it succeeds, fails permanently, or
+/// exhausts the bounded attempt budget, sleeping the existing jittered backoff
+/// between transient failures.
+async fn with_fetch_retry<T, F, Fut>(hash: &str, label: &str, mut attempt_once: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, FetchFailure>>,
+{
+    let (max_attempts, base_backoff_ms) = fetch_retry_config();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match attempt_once().await {
+            Ok(value) => return Ok(value),
+            Err(failure) => {
+                if failure.retryable() && attempt < max_attempts {
+                    let backoff = fetch_backoff(base_backoff_ms, attempt);
+                    tracing::debug!(
+                        "artifact {hash} {label} attempt {attempt}/{max_attempts} failed; retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(failure.into_error());
+            }
+        }
+    }
+}
+
+/// Download an artifact into memory. Used for artifacts small enough to hold
+/// whole: manifests, metadata, pack indexes, archive chunks, and HEAD packs.
+async fn fetch_artifact_bytes(
     client: &reqwest::Client,
     url: &str,
     hash: &str,
+    expected_len: Option<u64>,
+    signed: bool,
+) -> Result<bytes::Bytes> {
+    with_fetch_retry(hash, "fetch", || async {
+        let resp = client.get(url).send().await.map_err(|e| {
+            // Transport errors (connect/reset/timeout) are transient.
+            FetchFailure::Retry(anyhow::anyhow!("artifact fetch transport error: {e}"))
+        })?;
+        if let Some(failure) = classify_fetch_status(resp.status(), signed, hash) {
+            return Err(failure);
+        }
+        // R1: keep the body as `Bytes` (a refcounted buffer) instead of copying
+        // it into a fresh Vec — it flows through the cache and on to the
+        // consumer (decompress/write, which read `&[u8]`) without a second
+        // per-artifact copy.
+        let data = resp.bytes().await.map_err(|e| {
+            // A body read can fail mid-stream; retry.
+            FetchFailure::Retry(anyhow::anyhow!("artifact body read error: {e}"))
+        })?;
+        verify_fetched_artifact(
+            hash,
+            expected_len,
+            data.len() as u64,
+            &crate::cas::hash(&data),
+        )?;
+        Ok(data)
+    })
+    .await
+}
+
+/// Download an artifact straight to a temporary file in `dir`, hashing as the
+/// body streams. Used for large packs whose bytes must never be held in memory;
+/// the caller renames the verified file into place, so a failed attempt leaves
+/// nothing behind when the handle drops.
+async fn fetch_artifact_to_temp(
+    client: &reqwest::Client,
+    url: &str,
+    hash: &str,
+    expected_len: Option<u64>,
+    signed: bool,
     dir: &Path,
 ) -> Result<(tempfile::NamedTempFile, u64)> {
-    let (max_attempts, base_backoff_ms) = fetch_retry_config();
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match fetch_artifact_to_temp_once(client, url, hash, dir).await {
-            Ok(tmp) => return Ok(tmp),
-            Err((retryable, err)) => {
-                if retryable && attempt < max_attempts {
-                    let backoff = fetch_backoff(base_backoff_ms, attempt);
-                    tracing::debug!(
-                        "artifact {hash} streaming fetch attempt {attempt}/{max_attempts} failed: {err:#}; retrying in {backoff:?}"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-}
-
-async fn fetch_artifact_to_temp_once(
-    client: &reqwest::Client,
-    fetch_url: &str,
-    hash: &str,
-    dir: &Path,
-) -> std::result::Result<(tempfile::NamedTempFile, u64), (bool, anyhow::Error)> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    let resp = match client.get(fetch_url).send().await {
-        Ok(r) => r,
-        Err(e) => return Err((true, anyhow::anyhow!("artifact fetch transport error: {e}"))),
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        let retryable = status.is_server_error()
-            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || status == reqwest::StatusCode::REQUEST_TIMEOUT;
-        return Err((
-            retryable,
-            anyhow::anyhow!("artifact streaming fetch failed: {status}"),
-        ));
-    }
-
-    let tmp = tempfile::Builder::new()
-        .suffix(".ripclone-download")
-        .tempfile_in(dir)
-        .map_err(|e| {
-            (
-                false,
-                anyhow::Error::new(e).context("create artifact temp file"),
-            )
+    with_fetch_retry(hash, "streaming fetch", || async {
+        let resp = client.get(url).send().await.map_err(|e| {
+            FetchFailure::Retry(anyhow::anyhow!("artifact fetch transport error: {e}"))
         })?;
-    let std_file = tmp.as_file().try_clone().map_err(|e| {
-        (
-            false,
-            anyhow::Error::new(e).context("clone artifact temp file"),
-        )
-    })?;
-    let mut file = tokio::fs::File::from_std(std_file);
-    let mut stream = resp.bytes_stream();
-    let mut hasher = sha2::Sha256::new();
-    let mut len = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(e) => return Err((true, anyhow::anyhow!("artifact body read error: {e}"))),
-        };
-        hasher.update(&chunk);
-        len += chunk.len() as u64;
-        if let Err(e) = file.write_all(&chunk).await {
-            return Err((
-                false,
-                anyhow::Error::new(e).context("write artifact temp file"),
-            ));
+        if let Some(failure) = classify_fetch_status(resp.status(), signed, hash) {
+            return Err(failure);
         }
-    }
-    if let Err(e) = file.flush().await {
-        return Err((
-            false,
-            anyhow::Error::new(e).context("flush artifact temp file"),
-        ));
-    }
-    drop(file);
-    let actual = hex::encode(hasher.finalize());
-    if actual != hash {
-        return Err((
-            false,
-            anyhow::anyhow!("artifact hash mismatch: expected {hash}, got {actual}"),
-        ));
-    }
-    Ok((tmp, len))
+        let tmp = tempfile::Builder::new()
+            .suffix(".ripclone-download")
+            .tempfile_in(dir)
+            .map_err(|e| {
+                FetchFailure::Permanent(anyhow::Error::new(e).context("create artifact temp file"))
+            })?;
+        let std_file = tmp.as_file().try_clone().map_err(|e| {
+            FetchFailure::Permanent(anyhow::Error::new(e).context("clone artifact temp file"))
+        })?;
+        let mut file = tokio::fs::File::from_std(std_file);
+        let mut stream = resp.bytes_stream();
+        let mut hasher = sha2::Sha256::new();
+        let mut len = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                FetchFailure::Retry(anyhow::anyhow!("artifact body read error: {e}"))
+            })?;
+            hasher.update(&chunk);
+            len += chunk.len() as u64;
+            file.write_all(&chunk).await.map_err(|e| {
+                FetchFailure::Permanent(anyhow::Error::new(e).context("write artifact temp file"))
+            })?;
+        }
+        file.flush().await.map_err(|e| {
+            FetchFailure::Permanent(anyhow::Error::new(e).context("flush artifact temp file"))
+        })?;
+        drop(file);
+        verify_fetched_artifact(hash, expected_len, len, &hex::encode(hasher.finalize()))?;
+        Ok((tmp, len))
+    })
+    .await
 }
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
@@ -1140,11 +1179,6 @@ pub struct Client {
     http: reqwest::Client,
     /// Client with no default auth headers, used for presigned URLs.
     raw_http: reqwest::Client,
-    /// Full `Authorization` header value sent on `http` ("Ripclone <hash>" or
-    /// "Bearer <jwt>"). Threaded into the streaming extractor so its separate
-    /// blocking client authenticates the gateway artifact-fetch fallback the same
-    /// way the main client does.
-    auth_header: Option<String>,
     cache: Option<Cas>,
     /// Upstream git provider instance id (e.g. "github", "gitlab").
     provider: String,
@@ -1220,7 +1254,6 @@ impl Client {
             server,
             http,
             raw_http: build_http_client(reqwest::header::HeaderMap::new()),
-            auth_header: auth_value,
             cache,
             provider: "github".to_string(),
             provider_instance: Some(ProviderInstance {
@@ -1639,49 +1672,53 @@ impl Client {
         hash: &str,
         signed_url: Option<&str>,
     ) -> Result<bytes::Bytes> {
-        self.fetch_artifact_with_url_cache(hash, signed_url, true)
-            .await
+        self.fetch_verified_artifact(hash, signed_url, None).await
     }
 
-    async fn fetch_artifact_with_url_cache(
+    /// The credential rule: a presigned URL is self-authenticating, so it is
+    /// fetched with the no-auth client and never carries the ripclone token to
+    /// object storage. Without a signed URL the by-hash gateway fetch against
+    /// the configured backend IS the path, and it uses the authenticated
+    /// client. Returns `(client, url, signed)`.
+    fn artifact_endpoint<'a>(
+        &'a self,
+        signed_url: Option<&'a str>,
+        gateway_url: &'a str,
+    ) -> (&'a reqwest::Client, &'a str, bool) {
+        match signed_url {
+            Some(url) => (&self.raw_http, url, true),
+            None => (&self.http, gateway_url, false),
+        }
+    }
+
+    /// Buffered artifact download through the shared rules, with the local
+    /// complete-object cache in front of it. `expected_len` is the length the
+    /// manifest promised, when the caller knows one.
+    ///
+    /// On a failed signed URL we do NOT fall back to a by-hash gateway fetch —
+    /// the cloud no longer serves content by hash. An expired or revoked
+    /// signature surfaces as [`StaleSignedUrl`] so the clone driver re-resolves
+    /// the same pinned commit for fresh URLs; a missing, short, or corrupt
+    /// object fails instead.
+    async fn fetch_verified_artifact(
         &self,
         hash: &str,
         signed_url: Option<&str>,
-        use_cache: bool,
+        expected_len: Option<u64>,
     ) -> Result<bytes::Bytes> {
         let gateway_url = format!("{}/v1/artifacts/{}", self.server, hash);
-        let fetch_url = signed_url.unwrap_or(&gateway_url);
-        let use_signed_url = signed_url.is_some();
 
-        if use_cache
-            && let Some(cache) = &self.cache
+        if let Some(cache) = &self.cache
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
             && let Ok(data) = cache.get(&key)
         {
             return Ok(data.into());
         }
 
-        // Presigned URLs are self-authenticating, so use the no-auth client to
-        // avoid leaking the ripclone token to object storage. On failure (most
-        // likely expiry) we do NOT fall back to a by-hash gateway fetch — the
-        // cloud no longer serves content by hash. Instead surface a typed
-        // StaleSignedUrl so the clone driver re-resolves the ref for fresh URLs.
-        // When there's no signed URL at all (a self-hosted backend without object
-        // storage), the by-hash fetch against that backend IS the path.
-        let data = if use_signed_url {
-            fetch_artifact_with_retry(&self.raw_http, fetch_url, hash)
-                .await
-                .map_err(|signed_err| {
-                    anyhow::Error::new(StaleSignedUrl).context(format!(
-                        "signed-URL fetch for {hash} failed: {signed_err:#}"
-                    ))
-                })?
-        } else {
-            fetch_artifact_with_retry(&self.http, &gateway_url, hash).await?
-        };
+        let (client, url, signed) = self.artifact_endpoint(signed_url, &gateway_url);
+        let data = fetch_artifact_bytes(client, url, hash, expected_len, signed).await?;
 
-        if use_cache
-            && let Some(cache) = &self.cache
+        if let Some(cache) = &self.cache
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
         {
             let _ = cache.put_with_hash(&key, &data);
@@ -1696,19 +1733,16 @@ impl Client {
         signed_url: Option<&str>,
         pinned: &str,
     ) -> Result<ClonepackManifest> {
-        let decode = |data: &[u8]| -> Result<ClonepackManifest> {
-            let manifest = ClonepackManifest::decode(data).context("decode clonepack manifest")?;
-            validate_manifest_commit(&manifest, pinned)?;
-            Ok(manifest)
-        };
-
         // The CAS is keyed by the verified content hash, so immutable bytes may
         // be retained even when their embedded commit is wrong for this
         // operation. Identity remains a per-use check: every cached or fetched
         // manifest is decoded and compared with the operation pin here before
         // any installation work starts.
         let data = self.fetch_artifact_with_url(hash, signed_url).await?;
-        decode(&data)
+        let manifest =
+            ClonepackManifest::decode(data.as_ref()).context("decode clonepack manifest")?;
+        validate_manifest_commit(&manifest, pinned)?;
+        Ok(manifest)
     }
 
     /// Fetch an artifact referenced by a `ChunkRef`, optionally using a signed URL.
@@ -1718,18 +1752,16 @@ impl Client {
         signed_url: Option<&str>,
     ) -> Result<bytes::Bytes> {
         let hash = hash_to_hex(&chunk.hash);
-        let data = self.fetch_artifact_with_url(&hash, signed_url).await?;
-        if data.len() as u64 != chunk.len {
-            anyhow::bail!(
-                "chunk {} size mismatch: expected {}, got {}",
-                hash,
-                chunk.len,
-                data.len()
-            );
-        }
-        Ok(data)
+        self.fetch_verified_artifact(&hash, signed_url, Some(chunk.len))
+            .await
     }
 
+    /// Stream an artifact referenced by a `ChunkRef` to a temporary file in
+    /// `dir`, verifying it as it streams. Same rules as [`Self::fetch_chunk_ref`];
+    /// only the output differs, so a large pack never lands in memory. The
+    /// complete-object cache is deliberately not used here: caching a large
+    /// streamed pack would add the second full-file copy this path exists to
+    /// avoid.
     async fn fetch_chunk_ref_to_temp(
         &self,
         chunk: &crate::clonepack::ChunkRef,
@@ -1738,28 +1770,8 @@ impl Client {
     ) -> Result<(tempfile::NamedTempFile, u64)> {
         let hash = hash_to_hex(&chunk.hash);
         let gateway_url = format!("{}/v1/artifacts/{}", self.server, hash);
-        let fetch_url = signed_url.unwrap_or(&gateway_url);
-        let use_signed_url = signed_url.is_some();
-        let result = if use_signed_url {
-            fetch_artifact_to_temp_with_retry(&self.raw_http, fetch_url, &hash, dir)
-                .await
-                .map_err(|signed_err| {
-                    anyhow::Error::new(StaleSignedUrl).context(format!(
-                        "signed-URL streaming fetch for {hash} failed: {signed_err:#}"
-                    ))
-                })?
-        } else {
-            fetch_artifact_to_temp_with_retry(&self.http, &gateway_url, &hash, dir).await?
-        };
-        if result.1 != chunk.len {
-            anyhow::bail!(
-                "chunk {} size mismatch: expected {}, got {}",
-                hash,
-                chunk.len,
-                result.1
-            );
-        }
-        Ok(result)
+        let (client, url, signed) = self.artifact_endpoint(signed_url, &gateway_url);
+        fetch_artifact_to_temp(client, url, &hash, Some(chunk.len), signed, dir).await
     }
 
     /// Fetch many chunk refs in parallel, preserving order.
@@ -2101,49 +2113,12 @@ impl Client {
     }
 
     /// Fast install: download prebuilt `.git` artifacts and the working-tree
-    /// archive, lay everything down directly, and extract the archive.
+    /// archive, lay everything down directly, and extract the archive. `rev`
+    /// (e.g. "HEAD~5") clones the artifacts a `sync --at <rev>` built; `None`
+    /// clones the branch tip.
     ///
     /// No `git init`, `index-pack`, `read-tree`, or `update-index` is run on the
     /// client. The server has already done all of that work.
-    pub async fn install_repo<P: AsRef<Path>>(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        target: P,
-    ) -> Result<()> {
-        self.install_repo_with_mode(owner, repo, branch, target, CloneMode::Editable, None, None)
-            .await
-            .map(|_| ())
-    }
-
-    /// Install a repo with a specific clone mode and optional per-phase benchmark
-    /// instrumentation.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn install_repo_with_mode<P: AsRef<Path>>(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        target: P,
-        mode: CloneMode,
-        clonepack: Option<&str>,
-        bench: Option<&mut Benchmark>,
-    ) -> Result<CloneOutcome> {
-        self.install_repo_with_mode_at(
-            &format!("{owner}/{repo}"),
-            branch,
-            None,
-            target,
-            mode,
-            clonepack,
-            bench,
-        )
-        .await
-    }
-
-    /// Like [`install_repo_with_mode`] but resolves `rev` (e.g. "HEAD~5") instead
-    /// of the branch tip — clones the artifacts a `sync --at <rev>` built.
     #[allow(clippy::too_many_arguments)]
     pub async fn install_repo_with_mode_at<P: AsRef<Path>>(
         &self,
@@ -2836,38 +2811,6 @@ impl Client {
             .await;
     }
 
-    /// Download the pre-built head-blobs pack + index and install them into
-    /// `.git/objects/pack/`. Returns the total bytes downloaded.
-    ///
-    /// Chunks are downloaded with bounded concurrency and written directly into
-    /// a pre-allocated temp pack file at their final offsets. Peak memory is
-    /// ~`concurrency * chunk_size`, no bytes are re-hashed, and the pack is
-    /// written exactly once.
-    pub async fn install_prebuilt_blob_pack(
-        &self,
-        clonepack: &ClonepackManifest,
-        info: &RefResponse,
-        pack_dir: &std::path::Path,
-    ) -> Result<u64> {
-        let head_blobs_refs = head_blobs_chunk_refs(clonepack);
-        if head_blobs_refs.is_empty() {
-            anyhow::bail!("clonepack missing head-blobs pack for hybrid install");
-        }
-        let idx_ref = clonepack
-            .head_blobs_idx
-            .as_ref()
-            .context("clonepack missing head-blobs idx")?;
-        self.install_chunked_pack(
-            "head-blobs",
-            &head_blobs_refs,
-            info.head_blobs_chunk_urls.as_deref(),
-            idx_ref,
-            info.head_blobs_idx_url.as_deref(),
-            pack_dir,
-        )
-        .await
-    }
-
     /// Editable single-download path: download the small depth packs in parallel
     /// and, as each lands, install it into `pack_dir` and extract the blobs it
     /// contains into `work_tree` — so download and extraction overlap. Uses the
@@ -3213,143 +3156,6 @@ impl Client {
 
         Ok(total)
     }
-
-    /// Download a content-addressed, chunk-split git pack + its idx and install
-    /// them into `pack_dir` (`.git/objects/pack`). Returns total bytes
-    /// downloaded.
-    ///
-    /// Chunks are downloaded with bounded concurrency and written directly into
-    /// a pre-allocated temp pack file at their final offsets. Peak memory is
-    /// ~`concurrency * chunk_size`, no bytes are re-hashed, and the pack is
-    /// written exactly once. `label` is used only for log/error messages.
-    async fn install_chunked_pack(
-        &self,
-        label: &str,
-        chunk_refs: &[ChunkRef],
-        chunk_urls: Option<&[Option<String>]>,
-        idx_ref: &ChunkRef,
-        idx_url: Option<&str>,
-        pack_dir: &std::path::Path,
-    ) -> Result<u64> {
-        use std::os::unix::fs::FileExt;
-
-        if chunk_refs.is_empty() {
-            anyhow::bail!("{} pack has no chunks", label);
-        }
-
-        // Download the small index concurrently with the pack chunks.
-        let idx_data = self
-            .fetch_chunk_ref(idx_ref, idx_url)
-            .await
-            .with_context(|| format!("fetch {} idx", label))?;
-
-        std::fs::create_dir_all(pack_dir)
-            .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
-        let tmp = tempfile::Builder::new()
-            .suffix(".tmp")
-            .tempfile_in(pack_dir)
-            .with_context(|| format!("create temp {} pack", label))?;
-        let file = tmp
-            .as_file()
-            .try_clone()
-            .with_context(|| format!("clone temp {} pack fd", label))?;
-
-        let signed_urls = chunk_urls.unwrap_or(&[]);
-        let concurrency = ClientTuning::load().fetch_concurrency;
-
-        // Compute final pack size and per-chunk byte offsets.
-        let mut offsets = Vec::with_capacity(chunk_refs.len());
-        let mut total_len = 0u64;
-        for chunk in chunk_refs {
-            offsets.push(total_len);
-            total_len += chunk.len;
-        }
-
-        // Pre-allocate the temp file on the blocking pool so the async worker
-        // is not pinned during the syscall.
-        {
-            let file = file.try_clone().context("clone fd for preallocate")?;
-            let label = label.to_string();
-            tokio::task::spawn_blocking(move || {
-                file.set_len(total_len)
-                    .with_context(|| format!("preallocate temp {} pack file", label))
-            })
-            .await
-            .context("spawn preallocate task")??;
-        }
-
-        let jobs: Vec<(usize, ChunkRef, Option<String>, u64)> = chunk_refs
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, chunk)| {
-                let signed_url = signed_urls.get(i).and_then(|o| o.clone());
-                let offset = offsets[i];
-                (i, chunk, signed_url, offset)
-            })
-            .collect();
-
-        use futures::stream::{self, StreamExt, TryStreamExt};
-        let pack_bytes: u64 = stream::iter(jobs)
-            .map(|(i, chunk, signed_url, offset)| {
-                let client = self.clone();
-                let file = file
-                    .try_clone()
-                    .with_context(|| format!("clone pack fd for {} chunk {}", label, i));
-                let write_label = label.to_string();
-                async move {
-                    let file = file?;
-                    let data = client
-                        .fetch_chunk_ref(&chunk, signed_url.as_deref())
-                        .await
-                        .with_context(|| format!("fetch {} chunk {}", label, i))?;
-                    let len = data.len() as u64;
-                    tokio::task::spawn_blocking(move || {
-                        file.write_all_at(&data, offset).with_context(|| {
-                            format!("write {} chunk {} at offset {}", write_label, i, offset)
-                        })
-                    })
-                    .await
-                    .context("spawn chunk write task")??;
-                    Ok::<_, anyhow::Error>(len)
-                }
-            })
-            .buffer_unordered(concurrency)
-            .try_fold(0u64, |acc, len| async move {
-                acc.checked_add(len)
-                    .context("downloaded pack byte count overflow")
-            })
-            .await?;
-
-        // Git names pack files after the 20-byte SHA-1 trailer at the end of the
-        // pack. Read it directly instead of re-hashing the whole file.
-        if total_len < 20 {
-            anyhow::bail!("{} pack is too short ({} bytes)", label, total_len);
-        }
-        let pack_hash = {
-            let file = file.try_clone().context("clone fd for trailer read")?;
-            let label = label.to_string();
-            let trailer = tokio::task::spawn_blocking(move || {
-                let mut trailer = [0u8; 20];
-                file.read_at(&mut trailer, total_len - 20)
-                    .with_context(|| format!("read {} pack trailer", label))?;
-                Ok::<_, anyhow::Error>(trailer)
-            })
-            .await
-            .context("spawn read trailer task")??;
-            hex::encode(trailer)
-        };
-        drop(file);
-
-        let final_path = pack_dir.join(format!("pack-{}.pack", pack_hash));
-        tmp.persist(&final_path)
-            .with_context(|| format!("rename {} pack to {}", label, final_path.display()))?;
-        std::fs::write(pack_dir.join(format!("pack-{}.idx", pack_hash)), &idx_data)
-            .with_context(|| format!("write {} idx {}", label, pack_hash))?;
-        info!("wrote {} pack {} ({} bytes)", label, pack_hash, pack_bytes);
-        Ok(pack_bytes + idx_data.len() as u64)
-    }
-
     fn spawn_fetch_manifest(
         self,
         hash: String,
@@ -3426,8 +3232,9 @@ impl Client {
                     let client = self.clone();
                     let tx = tx.clone();
                     async move {
-                        // No by-hash gateway fallback: a failed signed URL surfaces as
-                        // StaleSignedUrl and the clone driver re-resolves for fresh URLs.
+                        // No by-hash gateway fallback: an expired or revoked signed
+                        // URL surfaces as StaleSignedUrl and the clone driver
+                        // re-resolves the same pin for fresh URLs.
                         let fetch_start = Instant::now();
                         let bytes = client
                             .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
@@ -3762,270 +3569,6 @@ impl Client {
         record_test_managed_git(&command_name, command_started.elapsed())?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
-
-    /// Materialize the working tree for a git worktree into `work_tree`.
-    /// `git_dir` is the worktree-specific metadata directory (usually inside
-    /// the main repo's `.git/worktrees/`). Objects are shared with the main
-    /// repo via `commondir`, so we only need the skeleton/head packs and the
-    /// prebuilt index for this commit.
-    pub async fn install_worktree_files<P: AsRef<Path>, Q: AsRef<Path>>(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        info: &RefResponse,
-        clonepack: &ClonepackManifest,
-        metadata: Arc<MetadataChunk>,
-        archive_chunks: &[String],
-        signed_chunk_urls: Option<Vec<Option<String>>>,
-        git_dir: P,
-        work_tree: Q,
-    ) -> Result<()> {
-        let git_dir = git_dir.as_ref().to_path_buf();
-        let work_tree = work_tree.as_ref().to_path_buf();
-
-        std::fs::create_dir_all(&git_dir)?;
-        let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-
-        let skeleton_hash = cas_hash(&metadata.skeleton_pack);
-
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.pack", skeleton_hash)),
-            &metadata.skeleton_pack,
-        )?;
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.idx", skeleton_hash)),
-            &metadata.skeleton_idx,
-        )?;
-
-        // Head-blobs pack is fetched separately. Archive-extraction does not
-        // need it; direct-install needs the blob objects for checkout-index.
-        let use_archive =
-            std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some() && !archive_chunks.is_empty();
-        if !use_archive {
-            self.install_prebuilt_blob_pack(clonepack, info, &pack_dir)
-                .await
-                .context("install head-blobs pack")?;
-        }
-
-        std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
-
-        let checkout_start = Instant::now();
-        tokio::task::spawn_blocking({
-            let git_dir = git_dir.clone();
-            move || git::clear_skip_worktree_all_git_dir(&git_dir)
-        })
-        .await
-        .context("clear skip-worktree task")??;
-
-        if use_archive {
-            let archive_chunks = archive_chunks.to_vec();
-            let work_tree2 = work_tree.clone();
-            let server = self.server.clone();
-            let auth_header = self.auth_header.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut manifest_tmp =
-                    tempfile::NamedTempFile::new().context("create temp manifest")?;
-                metadata
-                    .write(&mut manifest_tmp)
-                    .context("write temp manifest")?;
-                let manifest_path = manifest_tmp.path().to_path_buf();
-                let _tmp = manifest_tmp;
-                extract_clonepack_streaming(
-                    &manifest_path,
-                    &archive_chunks,
-                    signed_chunk_urls,
-                    &work_tree2,
-                    None,
-                    &server,
-                    auth_header.as_deref(),
-                )
-            })
-            .await
-            .context("archive extraction task")??;
-            info!(
-                "extracted worktree files from archive chunks into {} in {:?}",
-                work_tree.display(),
-                checkout_start.elapsed()
-            );
-        } else {
-            tokio::task::spawn_blocking({
-                let git_dir = git_dir.clone();
-                let work_tree = work_tree.clone();
-                move || git::checkout_index_with_git_dir(&git_dir, &work_tree)
-            })
-            .await
-            .context("checkout-index task")??;
-            info!(
-                "checked out worktree files into {} in {:?}",
-                work_tree.display(),
-                checkout_start.elapsed()
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Add a git worktree at `target` for `branch` of `repo_path`, using the
-    /// main repo at `main_repo`. The working tree files are materialized
-    /// directly or through overlay staging (when available and beneficial),
-    /// just like `install_repo`.
-    pub async fn add_worktree<P: AsRef<Path>, Q: AsRef<Path>>(
-        &self,
-        repo_path: &str,
-        branch: &str,
-        main_repo: P,
-        target: Q,
-    ) -> Result<()> {
-        let main_repo = main_repo.as_ref().to_path_buf();
-        let target = target.as_ref().to_path_buf();
-
-        if target.exists() {
-            anyhow::bail!("target directory already exists: {}", target.display());
-        }
-
-        let info = self
-            .resolve_ref_with_clonepack(repo_path, branch, None, None)
-            .await?;
-        let commit = info.commit.clone();
-
-        let (clonepack, metadata) = self.fetch_clonepack(&info).await?;
-        let archive_chunks: Vec<String> = clonepack
-            .archive_chunks
-            .iter()
-            .map(|r| hash_to_hex(&r.hash))
-            .collect();
-
-        // Ask git to create the worktree metadata, but do not populate files.
-        let add_start = Instant::now();
-        tokio::task::spawn_blocking({
-            let main_repo = main_repo.clone();
-            let target = target.clone();
-            let commit = commit.clone();
-            move || {
-                // Remove stale registrations from earlier interrupted runs.
-                let _ = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&main_repo)
-                    .args(["worktree", "prune"])
-                    .status();
-
-                let status = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&main_repo)
-                    .args(["worktree", "add", "--no-checkout", "--detach"])
-                    .arg(&target)
-                    .arg(&commit)
-                    .status()
-                    .context("spawn git worktree add")?;
-                if !status.success() {
-                    anyhow::bail!("git worktree add failed");
-                }
-                Ok(())
-            }
-        })
-        .await
-        .context("worktree add task")??;
-        info!(
-            "git worktree add metadata created in {:?}",
-            add_start.elapsed()
-        );
-
-        // The .git file created by git points to the worktree metadata dir.
-        let git_file = target.join(".git");
-        let git_file_content = tokio::fs::read_to_string(&git_file)
-            .await
-            .with_context(|| format!("reading {}", git_file.display()))?;
-        let git_dir = git_file_content
-            .lines()
-            .find_map(|line| line.strip_prefix("gitdir:"))
-            .map(|s| PathBuf::from(s.trim()))
-            .context("missing gitdir: in worktree .git file")?;
-
-        // Decide whether to stage files in tmpfs and expose them through overlay.
-        let staging_dir = overlay::staging_dir();
-        let use_overlay = self.should_use_overlay(&metadata, &staging_dir).await;
-
-        let local_index = main_repo.join(".git").join("index");
-        let local_commit = local_rev_parse(&main_repo, branch).ok();
-        let reuse_local = local_commit.as_ref() == Some(&commit) && local_index.exists();
-
-        let materialize = |git_dir: &Path, work_tree: &Path| -> Result<()> {
-            if reuse_local {
-                std::fs::copy(&local_index, git_dir.join("index"))
-                    .context("copy main repo index to worktree")?;
-            }
-            tokio::task::block_in_place(|| git::clear_skip_worktree_all_git_dir(git_dir))?;
-            tokio::task::block_in_place(|| git::checkout_index_with_git_dir(git_dir, work_tree))?;
-            Ok(())
-        };
-
-        if use_overlay {
-            let dirs = overlay::OverlayDirs::create(&staging_dir, &target)
-                .context("create overlay staging dirs")?;
-
-            if reuse_local {
-                materialize(&git_dir, &dirs.lower)
-                    .context("materialize worktree files into overlay lower dir")?;
-            } else {
-                self.install_worktree_files(
-                    "",
-                    "",
-                    &info,
-                    &clonepack,
-                    Arc::clone(&metadata),
-                    &archive_chunks,
-                    info.archive_chunk_urls.clone(),
-                    &git_dir,
-                    &dirs.lower,
-                )
-                .await?;
-            }
-
-            // Preserve the worktree pointer inside the overlay lower dir.
-            std::fs::write(dirs.lower.join(".git"), &git_file_content)?;
-
-            // Remove the empty placeholder directory before mounting.
-            std::fs::remove_dir_all(&target)
-                .with_context(|| format!("remove placeholder {}", target.display()))?;
-            std::fs::create_dir_all(&target)?;
-
-            overlay::mount_dirs(&dirs).context("mount overlay at worktree")?;
-            info!(
-                "mounted overlay worktree {} -> {} (staging {})",
-                dirs.lower.display(),
-                target.display(),
-                staging_dir.display()
-            );
-        } else {
-            if reuse_local {
-                materialize(&git_dir, &target).context("materialize worktree files")?;
-            } else {
-                self.install_worktree_files(
-                    "",
-                    "",
-                    &info,
-                    &clonepack,
-                    Arc::clone(&metadata),
-                    &archive_chunks,
-                    info.archive_chunk_urls.clone(),
-                    &git_dir,
-                    &target,
-                )
-                .await?;
-            }
-            std::fs::write(target.join(".git"), &git_file_content)?;
-        }
-
-        info!(
-            "added worktree {}@{} at {}",
-            repo_path,
-            branch,
-            target.display()
-        );
-        Ok(())
-    }
-
     async fn should_use_overlay(&self, metadata: &MetadataChunk, staging_dir: &Path) -> bool {
         if !overlay::is_available() {
             return false;
@@ -4258,198 +3801,6 @@ impl Client {
         );
         Ok(())
     }
-
-    /// Install prebuilt artifacts into an existing `.git` directory and
-    /// materialize the working tree at `work_tree`. Used by the git remote
-    /// helper, which already owns the `.git` directory and remote config.
-    pub async fn install_ref<P: AsRef<Path>, Q: AsRef<Path>>(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        branch: &str,
-        info: &RefResponse,
-        clonepack: &ClonepackManifest,
-        metadata: Arc<MetadataChunk>,
-        archive_chunks: &[String],
-        signed_chunk_urls: Option<Vec<Option<String>>>,
-        git_dir: P,
-        work_tree: Q,
-    ) -> Result<()> {
-        let git_dir = git_dir.as_ref().to_path_buf();
-        let work_tree = work_tree.as_ref().to_path_buf();
-
-        std::fs::create_dir_all(&git_dir)?;
-        std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
-        std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
-        std::fs::create_dir_all(git_dir.join("info"))?;
-
-        let branch_name = if branch == "HEAD" {
-            if info.default_branch.is_empty() {
-                "main"
-            } else {
-                &info.default_branch
-            }
-        } else {
-            branch
-        };
-
-        // HEAD points at the resolved branch; create the branch ref as well so
-        // `git upload-pack` and checkout have a ref to advertise/fetch.
-        std::fs::write(
-            git_dir.join("HEAD"),
-            format!("ref: refs/heads/{}\n", branch_name),
-        )?;
-        let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
-        if let Some(parent) = branch_ref.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(branch_ref, format!("{}\n", info.commit))?;
-
-        // Exclude ripclone metadata from git status.
-        std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
-
-        // Object packs.
-        let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-
-        // Write the .git artifacts from the metadata chunk. The working tree is
-        // materialized with `git checkout-index` by default; set
-        // `RIPCLONE_EXTRACT_ARCHIVE=1` to materialize from archive chunks instead.
-        let skeleton_hash = cas_hash(&metadata.skeleton_pack);
-
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.pack", skeleton_hash)),
-            &metadata.skeleton_pack,
-        )?;
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.idx", skeleton_hash)),
-            &metadata.skeleton_idx,
-        )?;
-        info!(
-            "wrote skeleton pack ({} bytes)",
-            metadata.skeleton_pack.len()
-        );
-
-        // Head-blobs pack is fetched separately. Archive-extraction does not
-        // need it because the working tree is built from archive chunks; only
-        // direct-install (`git checkout-index`) needs the blob objects.
-        let use_archive =
-            std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some() && !archive_chunks.is_empty();
-        if !use_archive {
-            let head_blobs_refs = head_blobs_chunk_refs(clonepack);
-            if head_blobs_refs.is_empty() {
-                anyhow::bail!("clonepack missing head-blobs pack for direct-install");
-            }
-            let idx_ref = clonepack
-                .head_blobs_idx
-                .as_ref()
-                .context("clonepack missing head-blobs idx")?;
-            let (chunks, idx_data) = tokio::join!(
-                self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
-                self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
-            );
-            let chunks = chunks?;
-            let idx_data = idx_data?;
-            let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
-            let head_blobs_hash = cas_hash(&pack_data);
-            std::fs::write(
-                pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
-                &pack_data,
-            )?;
-            std::fs::write(
-                pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
-                &idx_data,
-            )?;
-            info!("wrote head-blobs pack ({} bytes)", pack_data.len());
-        }
-
-        // Prebuilt index.
-        std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
-        info!(
-            "wrote prebuilt index ({} bytes)",
-            metadata.prebuilt_index.len()
-        );
-
-        // Clear skip-worktree bits so git will actually materialize files,
-        // then let git write the working tree efficiently.
-        let checkout_start = Instant::now();
-        let cleared = tokio::task::spawn_blocking({
-            let work_tree = work_tree.clone();
-            move || git::clear_skip_worktree_all(&work_tree)
-        })
-        .await
-        .context("clear skip-worktree task")??;
-        info!(
-            "cleared skip-worktree for {} entries in {:?}",
-            cleared,
-            checkout_start.elapsed()
-        );
-
-        if std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some() && !archive_chunks.is_empty() {
-            let archive_chunks = archive_chunks.to_vec();
-            let work_tree2 = work_tree.clone();
-            let server = self.server.clone();
-            let auth_header = self.auth_header.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut manifest_tmp =
-                    tempfile::NamedTempFile::new().context("create temp manifest")?;
-                metadata
-                    .write(&mut manifest_tmp)
-                    .context("write temp manifest")?;
-                let manifest_path = manifest_tmp.path().to_path_buf();
-                let _tmp = manifest_tmp;
-                extract_clonepack_streaming(
-                    &manifest_path,
-                    &archive_chunks,
-                    signed_chunk_urls,
-                    &work_tree2,
-                    None,
-                    &server,
-                    auth_header.as_deref(),
-                )
-            })
-            .await
-            .context("archive extraction task")??;
-            info!(
-                "extracted working tree from archive chunks into {} in {:?}",
-                work_tree.display(),
-                checkout_start.elapsed()
-            );
-        } else {
-            tokio::task::spawn_blocking({
-                let work_tree = work_tree.clone();
-                move || git::checkout_index(&work_tree)
-            })
-            .await
-            .context("checkout-index task")??;
-            info!(
-                "checked out working tree into {} in {:?}",
-                work_tree.display(),
-                checkout_start.elapsed()
-            );
-        }
-
-        info!(
-            "installed ref into {} / {}",
-            git_dir.display(),
-            work_tree.display()
-        );
-        Ok(())
-    }
-}
-
-/// Try to resolve `branch` in a local repo without contacting the server.
-fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(main_repo)
-        .args(["rev-parse", branch])
-        .output()
-        .context("spawn git rev-parse")?;
-    if !output.status.success() {
-        anyhow::bail!("git rev-parse {} failed", branch);
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 #[cfg(test)]
@@ -4658,6 +4009,97 @@ mod tests {
                 None => std::env::remove_var("RIPCLONE_FSYNC"),
             }
         }
+    }
+
+    /// The shared status rule. Break any arm of this table and a real download
+    /// path changes: a retryable status stops retrying, a permanent failure
+    /// enters the signed-URL refresh loop, or an expired signature fails the
+    /// clone instead of refreshing.
+    #[test]
+    fn fetch_status_rule_separates_retry_refresh_and_permanent() {
+        use reqwest::StatusCode;
+        let classify = |status: StatusCode, signed: bool| {
+            classify_fetch_status(status, signed, "abc").map(|f| match f {
+                FetchFailure::Retry(_) => "retry",
+                FetchFailure::RefreshUrl(_) => "refresh",
+                FetchFailure::Permanent(_) => "permanent",
+            })
+        };
+
+        assert_eq!(classify(StatusCode::OK, true), None);
+        assert_eq!(classify(StatusCode::OK, false), None);
+
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(classify(status, true), Some("retry"), "{status} signed");
+            assert_eq!(classify(status, false), Some("retry"), "{status} gateway");
+        }
+
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert_eq!(classify(status, true), Some("refresh"), "{status} signed");
+            // The authenticated gateway has no URL to refresh; a rejected
+            // credential is a permanent failure, not a re-resolve loop.
+            assert_eq!(
+                classify(status, false),
+                Some("permanent"),
+                "{status} gateway"
+            );
+        }
+
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            StatusCode::BAD_REQUEST,
+        ] {
+            assert_eq!(classify(status, true), Some("permanent"), "{status} signed");
+            assert_eq!(
+                classify(status, false),
+                Some("permanent"),
+                "{status} gateway"
+            );
+        }
+    }
+
+    /// Only a refreshable failure may become a `StaleSignedUrl`. If a permanent
+    /// one did, a missing or corrupt object would re-resolve the ref forever.
+    #[test]
+    fn only_a_refreshable_failure_asks_for_fresh_urls() {
+        let refresh = FetchFailure::RefreshUrl(anyhow::anyhow!("expired")).into_error();
+        assert!(is_stale_signed_url(&refresh), "{refresh:#}");
+        for failure in [
+            FetchFailure::Retry(anyhow::anyhow!("503")),
+            FetchFailure::Permanent(anyhow::anyhow!("404")),
+        ] {
+            let error = failure.into_error();
+            assert!(
+                !is_stale_signed_url(&error),
+                "must not ask for fresh URLs: {error:#}"
+            );
+        }
+    }
+
+    /// The shared verification rule: length first, then the content address, and
+    /// both are permanent.
+    #[test]
+    fn artifact_verification_rejects_wrong_length_and_wrong_hash() {
+        let hash = "a".repeat(64);
+        verify_fetched_artifact(&hash, Some(10), 10, &hash).expect("matching artifact is accepted");
+        verify_fetched_artifact(&hash, None, 7, &hash).expect("unknown length is accepted");
+
+        let short = verify_fetched_artifact(&hash, Some(10), 9, &hash)
+            .expect_err("a short artifact is rejected");
+        assert!(matches!(short, FetchFailure::Permanent(_)));
+        assert!(format!("{:#}", short.into_error()).contains("size mismatch"));
+
+        let wrong = verify_fetched_artifact(&hash, Some(10), 10, &"b".repeat(64))
+            .expect_err("a wrong content address is rejected");
+        assert!(matches!(wrong, FetchFailure::Permanent(_)));
+        assert!(format!("{:#}", wrong.into_error()).contains("hash mismatch"));
     }
 
     #[test]

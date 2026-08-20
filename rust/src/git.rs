@@ -379,44 +379,6 @@ pub fn checkout_index<P: AsRef<Path>>(repo: P) -> Result<()> {
     Ok(())
 }
 
-/// Variant of `checkout_index` that lets the git directory and working tree live
-/// in different places. Used for worktrees where `GIT_DIR` is the worktree's
-/// metadata dir and `GIT_WORK_TREE` is the overlay lower directory.
-pub fn checkout_index_with_git_dir(git_dir: &Path, work_tree: &Path) -> Result<()> {
-    let status = Command::new("git")
-        .env("GIT_DIR", git_dir)
-        .env("GIT_WORK_TREE", work_tree)
-        .args(["checkout-index", "-a", "-f"])
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to run git checkout-index GIT_DIR={} GIT_WORK_TREE={}",
-                git_dir.display(),
-                work_tree.display()
-            )
-        })?;
-    if !status.success() {
-        bail!("git checkout-index failed");
-    }
-    Ok(())
-}
-
-/// Clear the skip-worktree bit for every entry in the index at `git_dir/index`.
-/// Returns the number of entries that were cleared.
-pub fn clear_skip_worktree_all_git_dir<P: AsRef<Path>>(git_dir: P) -> Result<usize> {
-    let index_path = git_dir.as_ref().join("index");
-    let index = open_index_file(&index_path)?;
-    let paths: Vec<String> = index
-        .entries()
-        .iter()
-        .filter(|entry| entry.flags.contains(SKIP_WORKTREE_FLAG))
-        .map(|entry| String::from_utf8_lossy(entry.path_in(index.path_backing())).to_string())
-        .collect();
-    let cleared = paths.len();
-    update_index_skip_worktree_at(&index_path, &paths, false)?;
-    Ok(cleared)
-}
-
 /// Run a git command in a repo and return stdout as String.
 pub fn run_git<P: AsRef<Path>>(repo: P, args: &[&str]) -> Result<String> {
     let output = Command::new("git")

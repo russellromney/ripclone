@@ -186,38 +186,6 @@ enum Commands {
         #[arg(long)]
         dictionary: Option<PathBuf>,
     },
-    /// Add a git worktree, materializing the files through overlay staging.
-    ///
-    /// Run inside an existing ripclone clone: this adds an ADDITIONAL linked
-    /// worktree to a repo you already have locally, reusing its objects (like
-    /// `git worktree add`, accelerated). It does not fetch a repo from the
-    /// server — for that use `clone`.
-    ///
-    /// EXPERIMENTAL (alpha): an interrupt during a worktree materialize may leave
-    /// a partial tree; its interrupt-safety is not yet as hardened as the clone
-    /// path. Full hardening is tracked separately.
-    #[command(
-        long_about = "Add a git worktree, materializing the files through overlay staging.\n\n\
-        Run inside an existing ripclone clone: this adds an ADDITIONAL linked worktree to a repo \
-        you already have locally, reusing its objects (like `git worktree add`, accelerated). \
-        It does not fetch a repo from the server — for that use `clone`.\n\n\
-        EXPERIMENTAL (alpha): an interrupt during a worktree materialize may leave a partial \
-        tree; its interrupt-safety is not yet as hardened as the clone path. Full hardening is \
-        tracked separately."
-    )]
-    Worktree {
-        /// Path where the new worktree should be created.
-        path: PathBuf,
-        /// Branch or commit to check out. Defaults to HEAD.
-        #[arg(short, long, default_value = "HEAD")]
-        branch: String,
-        /// Main repo to add the worktree to. Defaults to the current directory.
-        #[arg(short, long, default_value = ".")]
-        dir: PathBuf,
-        /// Owner/repo override (e.g. oven-sh/bun). If omitted, parsed from origin remote.
-        #[arg(short, long)]
-        repo: Option<String>,
-    },
     /// Train a zstd dictionary from a repo's HEAD blobs.
     #[command(hide = true)]
     TrainDictionary {
@@ -338,32 +306,6 @@ fn parse_repo_arg(repo: &str) -> (Option<String>, String) {
         return (Some(prefix.to_string()), path.to_string());
     }
     (None, repo.to_string())
-}
-
-/// Parse a GitHub remote URL into (owner, repo).
-fn parse_origin_url(url: &str) -> Result<(String, String)> {
-    let url = url.trim();
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    let parts: Vec<&str> = url.rsplitn(3, ['/', ':']).collect();
-    if parts.len() != 3 {
-        anyhow::bail!("cannot parse owner/repo from remote URL: {}", url);
-    }
-    Ok((parts[1].to_string(), parts[0].to_string()))
-}
-
-/// Read `origin` from a local git repo and return (owner, repo).
-fn owner_repo_from_origin(repo_dir: &std::path::Path) -> Result<(String, String)> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .context("spawn git remote get-url origin")?;
-    if !output.status.success() {
-        anyhow::bail!("git remote get-url origin failed");
-    }
-    let url = String::from_utf8(output.stdout)?;
-    parse_origin_url(&url)
 }
 
 #[derive(serde::Deserialize)]
@@ -1315,38 +1257,6 @@ async fn main() -> Result<()> {
                 "extracted {} files ({} bytes) in {:?}",
                 stats.files, stats.raw_bytes, elapsed
             );
-        }
-        Commands::Worktree {
-            path,
-            branch,
-            dir,
-            repo,
-        } => {
-            eprintln!(
-                "note: `worktree` is experimental (alpha); an interrupt during a materialize \
-                 may leave a partial tree"
-            );
-            let main_repo = std::env::current_dir()?.join(dir);
-            let repo_path = match repo {
-                Some(r) => resolve_repo(&r, &default_provider, &provider_registry)?.1,
-                None => {
-                    let is_github = provider_registry
-                        .get(&default_provider)
-                        .map(|p| p.kind == ProviderKind::GitHub)
-                        .unwrap_or(false);
-                    if is_github {
-                        let (o, r) = owner_repo_from_origin(&main_repo)?;
-                        format!("{o}/{r}")
-                    } else {
-                        anyhow::bail!("--repo is required for non-github providers")
-                    }
-                }
-            };
-            let target = std::env::current_dir()?.join(&path);
-            client
-                .add_worktree(&repo_path, &branch, &main_repo, &target)
-                .await?;
-            println!("added worktree at {}", target.display());
         }
         Commands::TrainDictionary {
             repo,

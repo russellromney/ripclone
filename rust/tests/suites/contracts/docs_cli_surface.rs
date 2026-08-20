@@ -152,10 +152,10 @@ fn removed_track_verbs_stay_out_of_the_docs() {
     );
 }
 
-/// The three materialize surfaces the README promises must all be real flags /
-/// verbs on the binary, with the documented spellings.
+/// The two materialize surfaces the README promises must both be real flags on
+/// the binary, with the documented spellings.
 #[test]
-fn the_three_documented_materialize_surfaces_exist() {
+fn the_two_documented_materialize_surfaces_exist() {
     let bin = std::env::var("CARGO_BIN_EXE_ripclone").expect("CARGO_BIN_EXE_ripclone");
     let clone_help = String::from_utf8(
         Command::new(&bin)
@@ -177,14 +177,44 @@ fn the_three_documented_materialize_surfaces_exist() {
             "`--mode {mode}` must parse"
         );
     }
+}
 
+/// The experimental `worktree` command was deleted. Clap must reject it as an
+/// unknown subcommand rather than leaving a hidden or half-wired surface, and
+/// the user-facing docs must not name it.
+#[test]
+fn removed_worktree_verb_is_unknown_and_undocumented() {
+    let bin = std::env::var("CARGO_BIN_EXE_ripclone").expect("CARGO_BIN_EXE_ripclone");
+    let out = Command::new(&bin)
+        .args(["worktree", "--help"])
+        .output()
+        .expect("spawn");
     assert!(
-        Command::new(&bin)
-            .args(["worktree", "--help"])
-            .output()
-            .expect("spawn")
-            .status
-            .success(),
-        "`ripclone worktree` must exist"
+        !out.status.success(),
+        "`ripclone worktree` must be rejected as an unknown command"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
+        "clap must name it as unknown: {stderr}"
+    );
+
+    let mut hits: Vec<String> = Vec::new();
+    for doc in doc_files() {
+        // CHANGELOG records the removal and must be able to name it.
+        if doc.file_name().is_some_and(|n| n == "CHANGELOG.md") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&doc).expect("read doc");
+        for verb in documented_verbs(&text) {
+            if verb == "worktree" {
+                hits.push(format!("{}: `ripclone {verb}`", doc.display()));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "the removed worktree verb resurfaced in the docs:\n  {}",
+        hits.join("\n  ")
     );
 }

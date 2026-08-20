@@ -4,7 +4,6 @@ pub use crate::clonepack::{
 
 use anyhow::{Context, Result};
 use prost::Message;
-use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
@@ -194,75 +193,6 @@ impl MetadataChunk {
     }
 }
 
-/// Verify every frame and each single-fragment file's SHA-1 against the supplied
-/// archive chunks. `fetch_chunk` returns the uncompressed bytes for a given
-/// chunk index.
-pub fn verify_archive<F>(metadata: &MetadataChunk, mut fetch_chunk: F) -> Result<()>
-where
-    F: FnMut(u32) -> Result<Vec<u8>>,
-{
-    metadata.validate_geometry()?;
-    let by_frame = metadata.fragments_by_frame();
-
-    for (frame_index, frame) in metadata.frames.iter().enumerate() {
-        let chunk = fetch_chunk(frame.chunk_index)
-            .with_context(|| format!("fetch chunk {}", frame.chunk_index))?;
-        let start = usize::try_from(frame.chunk_offset)
-            .context("frame chunk offset does not fit in usize")?;
-        let compressed_len = usize::try_from(frame.compressed_len)
-            .context("frame compressed length does not fit in usize")?;
-        let end = start
-            .checked_add(compressed_len)
-            .context("frame compressed bounds overflow")?;
-        if end > chunk.len() {
-            anyhow::bail!("frame {} extends past chunk end", frame_index);
-        }
-        let raw = zstd::decode_all(&chunk[start..end])
-            .with_context(|| format!("decompress frame {}", frame_index))?;
-        let raw_len = usize::try_from(frame.raw_len).context("frame raw length does not fit")?;
-        if raw.len() != raw_len {
-            anyhow::bail!(
-                "frame {} raw length mismatch: {} vs {}",
-                frame_index,
-                raw.len(),
-                frame.raw_len
-            );
-        }
-
-        if let Some(pairs) = by_frame.get(&(frame_index as u32)) {
-            for (file_idx, frag_idx) in pairs {
-                let entry = &metadata.files[*file_idx];
-                let fragment = &entry.fragments[*frag_idx];
-                let off = usize::try_from(fragment.frame_offset)
-                    .context("fragment offset does not fit in usize")?;
-                let len = usize::try_from(fragment.raw_len)
-                    .context("fragment length does not fit in usize")?;
-                let end = off.checked_add(len).context("fragment bounds overflow")?;
-                if end > raw.len() {
-                    anyhow::bail!(
-                        "fragment for {} extends past frame {}",
-                        String::from_utf8_lossy(&entry.path),
-                        frame_index
-                    );
-                }
-                let content = &raw[off..end];
-                let hash = Sha1::digest(content);
-                if hash.as_slice() != entry.blob_sha1 {
-                    // We can only verify the full file SHA-1 when the file
-                    // is contained in a single fragment. Multi-fragment
-                    // files are verified during extraction by concatenating
-                    // fragments in order.
-                    if entry.fragments.len() == 1 {
-                        anyhow::bail!("sha1 mismatch for {}", String::from_utf8_lossy(&entry.path));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,63 +228,6 @@ mod tests {
         assert_eq!(parsed.files[0].path, b"hello.txt");
         assert_eq!(parsed.files[0].mode, 0o100644);
         assert_eq!(parsed.files[0].blob_sha1, vec![1u8; 20]);
-    }
-
-    #[test]
-    fn verify_archive_catches_sha1_mismatch() {
-        let raw = b"hello";
-        let compressed = zstd::encode_all(raw.as_slice(), 1).unwrap();
-
-        let mut manifest = MetadataChunk::new();
-        manifest.frames.push(FrameInfo {
-            chunk_index: 0,
-            chunk_offset: 0,
-            compressed_len: compressed.len() as u32,
-            raw_len: raw.len() as u32,
-        });
-        manifest.files.push(FileEntry {
-            path: b"x".to_vec(),
-            mode: 0o100644,
-            blob_sha1: vec![0u8; 20], // wrong hash
-            fragments: vec![Fragment {
-                frame_index: 0,
-                frame_offset: 0,
-                raw_len: raw.len() as u32,
-            }],
-        });
-
-        let archive = compressed.clone();
-        let err = verify_archive(&manifest, |_| Ok(archive.clone())).unwrap_err();
-        assert!(
-            err.to_string().contains("sha1 mismatch"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn verify_archive_happy_path() {
-        let raw = b"hello world";
-        let compressed = zstd::encode_all(raw.as_slice(), 1).unwrap();
-
-        let mut manifest = MetadataChunk::new();
-        manifest.frames.push(FrameInfo {
-            chunk_index: 0,
-            chunk_offset: 0,
-            compressed_len: compressed.len() as u32,
-            raw_len: raw.len() as u32,
-        });
-        manifest.files.push(FileEntry {
-            path: b"x".to_vec(),
-            mode: 0o100644,
-            blob_sha1: sha1_bytes(raw.as_slice()).to_vec(),
-            fragments: vec![Fragment {
-                frame_index: 0,
-                frame_offset: 0,
-                raw_len: raw.len() as u32,
-            }],
-        });
-
-        verify_archive(&manifest, |_| Ok(compressed.clone())).unwrap();
     }
 
     #[test]
@@ -411,9 +284,5 @@ mod tests {
 
         let err = manifest.validate_geometry().unwrap_err();
         assert!(err.to_string().contains("duplicate file path"));
-    }
-
-    fn sha1_bytes(data: &[u8]) -> [u8; 20] {
-        Sha1::digest(data).into()
     }
 }
