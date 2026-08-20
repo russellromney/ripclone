@@ -14,6 +14,7 @@ STAGE="${1:-all}"
 export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-ci-e2e-token}"
 
 lint() {
+  bash "$ROOT/scripts/audit_control_support.sh"
   ( cd "$ROOT/rust"
     cargo fmt --all --check
     cargo clippy --all-targets --locked -- -D warnings )

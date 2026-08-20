@@ -49,8 +49,10 @@ behavior is controlled by:
 - `RIPCLONE_QUEUE_RETRY_BACKOFF_MS`
 - `RIPCLONE_QUEUE_FAILED_RETENTION_SECS`
 
-Enable API heartbeats with `RIPCLONE_WORKER_HEARTBEAT=queue`. Timing uses
-`RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS` and
+API workers renew every active claim unconditionally. No setting is required
+for that ownership lease. `RIPCLONE_WORKER_HEARTBEAT=queue` only opts an idle
+worker into the durable fleet registry. Both active renewal and optional idle
+registration use `RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS` and
 `RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS`.
 
 Local admissions notify idle embedded workers immediately after the SQLite

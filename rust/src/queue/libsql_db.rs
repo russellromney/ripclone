@@ -430,6 +430,17 @@ impl QueueDb for LibsqlDb {
         Ok(())
     }
 
+    async fn delete_worker(&self, worker_id: &str) -> Result<u64> {
+        self.conn()
+            .await?
+            .execute(
+                "DELETE FROM workers WHERE worker_id = ?",
+                libsql::params![worker_id],
+            )
+            .await
+            .context("delete worker heartbeat")
+    }
+
     async fn count_live_workers(&self, cutoff: i64) -> Result<i64> {
         let conn = self.conn().await?;
         let mut rows = conn

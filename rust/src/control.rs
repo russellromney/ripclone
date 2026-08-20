@@ -39,26 +39,32 @@ impl ControlSettings {
         validate_removed_environment()?;
         let config = crate::config::load_global();
         validate_removed_config(&config)?;
-        let path = explicit_path
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                std::env::var_os("RIPCLONE_CONTROL_DB_PATH")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-            })
-            .or_else(|| config.control.path.as_deref().map(PathBuf::from))
-            .unwrap_or_else(|| default_path.to_path_buf());
-        if path.as_os_str().is_empty() {
+        let environment_path = std::env::var_os("RIPCLONE_CONTROL_DB_PATH");
+        if environment_path
+            .as_ref()
+            .is_some_and(|value| value.to_string_lossy().trim().is_empty())
+        {
             bail!("RIPCLONE_CONTROL_DB_PATH must not be empty");
         }
-        let url = nonempty_env_or(
+        validate_nonempty_config("control.path", config.control.path.as_deref())?;
+        validate_nonempty_config("control.turso_url", config.control.turso_url.as_deref())?;
+        validate_nonempty_config("control.turso_token", config.control.turso_token.as_deref())?;
+        let path = explicit_path
+            .map(Path::to_path_buf)
+            .or_else(|| environment_path.map(PathBuf::from))
+            .or_else(|| config.control.path.as_deref().map(PathBuf::from))
+            .unwrap_or_else(|| default_path.to_path_buf());
+        if path.as_os_str().to_string_lossy().trim().is_empty() {
+            bail!("RIPCLONE_CONTROL_DB_PATH must not be empty");
+        }
+        let url = strict_env_or(
             "RIPCLONE_TURSO_DATABASE_URL",
             config.control.turso_url.as_deref(),
-        );
-        let token = nonempty_env_or(
+        )?;
+        let token = strict_env_or(
             "RIPCLONE_TURSO_AUTH_TOKEN",
             config.control.turso_token.as_deref(),
-        );
+        )?;
         let turso = match (url, token) {
             (None, None) => None,
             (Some(url), Some(token)) => Some(TursoReplicaConfig { url, token }),
@@ -78,15 +84,20 @@ impl ControlSettings {
     }
 }
 
-fn nonempty_env_or(key: &str, fallback: Option<&str>) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            fallback
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-        })
+fn strict_env_or(key: &str, fallback: Option<&str>) -> Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) if value.trim().is_empty() => bail!("{key} must not be empty"),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(fallback.map(str::to_owned)),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{key} must be valid UTF-8"),
+    }
+}
+
+fn validate_nonempty_config(key: &str, value: Option<&str>) -> Result<()> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        bail!("{key} must not be empty");
+    }
+    Ok(())
 }
 
 const REMOVED_ENVIRONMENT: &[&str] = &[
@@ -287,10 +298,16 @@ impl ControlDb {
         job: &BuildJob,
         exact_branch: &str,
         pending: &crate::RefInfo,
-        tail: Option<(&str, &crate::RefInfo)>,
+        moving_authorized: bool,
     ) -> Result<Enqueued> {
         let result = self
-            .admit(&self.database, job, exact_branch, pending, tail)
+            .admit(
+                &self.database,
+                job,
+                exact_branch,
+                pending,
+                moving_authorized,
+            )
             .await;
         if result.is_ok() {
             self.admission_notify.notify_one();
@@ -304,7 +321,7 @@ impl ControlDb {
         job: &BuildJob,
         exact_branch: &str,
         pending: &crate::RefInfo,
-        tail: Option<(&str, &crate::RefInfo)>,
+        moving_authorized: bool,
     ) -> Result<Enqueued> {
         let connection = database
             .connect()
@@ -317,21 +334,13 @@ impl ControlDb {
             .await
             .context("begin durable admission")?;
         let mut pending = pending.clone();
-        let discovered_tail = if tail.is_none()
-            && pending.moving_publication_predecessors.len() == 1
-            && pending.moving_publication_predecessors[0]
-                == crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR
-        {
-            discover_initial_admission_tail(&tx, job, &mut pending).await?
+        let tail = if moving_authorized {
+            discover_moving_admission_tail(&tx, job, &mut pending).await?
         } else {
             None
         };
         upsert_exact(&tx, job, exact_branch, &pending).await?;
-        if let Some((tail_branch, tail_info)) = tail.or_else(|| {
-            discovered_tail
-                .as_ref()
-                .map(|(branch, info)| (branch.as_str(), info))
-        }) {
+        if let Some((tail_branch, tail_info)) = tail.as_ref() {
             update_tail(&tx, job, tail_branch, tail_info).await?;
         }
         let key = job.key();
@@ -391,14 +400,11 @@ impl ControlDb {
     }
 }
 
-/// Serialize concurrent first admissions into one ordinary-publication chain.
-///
-/// Before any moving row exists, request-side preparation can legitimately see
-/// `:initial` for two different commits. The immediate admission transaction
-/// is the authority that orders them: a later transaction links the one
-/// existing chain tail and authorizes its new exact row to replace every prior
-/// member. No transaction survives beyond the metadata/job writes below.
-async fn discover_initial_admission_tail(
+/// Discover and extend the ordinary-publication chain under the same immediate
+/// transaction that creates the exact result and durable job. Request-side
+/// snapshots are advisory only: concurrent admissions serialize here and the
+/// later transaction follows every successor committed by the earlier one.
+async fn discover_moving_admission_tail(
     tx: &libsql::Transaction,
     job: &BuildJob,
     pending: &mut crate::RefInfo,
@@ -410,6 +416,49 @@ async fn discover_initial_admission_tail(
     } else {
         job.branch.as_str()
     };
+    let moving = load_transaction_ref(tx, job, result_branch).await?;
+    if let Some(moving) = moving {
+        if moving.commit == job.admitted_commit {
+            pending.moving_publication_predecessors = moving.moving_publication_predecessors;
+            return Ok(None);
+        }
+        let mut predecessors = vec![moving.commit.clone()];
+        let mut tail_commit = moving.commit;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            anyhow::ensure!(
+                seen.insert(tail_commit.clone()),
+                "ordinary admission chain contains a cycle"
+            );
+            let tail_branch = crate::ref_store::exact_ref_key(result_branch, &tail_commit);
+            let mut tail = load_transaction_ref(tx, job, &tail_branch)
+                .await?
+                .with_context(|| {
+                    format!("ordinary admission chain is missing exact {tail_commit}")
+                })?;
+            let Some(next) = tail.moving_admission_successors.last().cloned() else {
+                pending.moving_publication_predecessors = predecessors;
+                tail.require_matching_commit = false;
+                tail.moving_admission_successors
+                    .push(job.admitted_commit.clone());
+                return Ok(Some((tail_branch, tail)));
+            };
+            crate::validation::validate_object_id(&next)
+                .context("ordinary admission chain has invalid successor")?;
+            if next == job.admitted_commit {
+                pending.moving_publication_predecessors = predecessors;
+                return Ok(None);
+            }
+            predecessors.push(next.clone());
+            tail_commit = next;
+        }
+    }
+
+    // Before the first moving projection publishes, concurrent initial
+    // admissions are rooted at the explicit initial marker. Find the sole
+    // outstanding tail from rows committed by earlier admission transactions.
+    pending.moving_publication_predecessors =
+        vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
     let prefix = crate::ref_store::exact_ref_key(result_branch, "");
     let mut rows = tx
         .query(
@@ -461,6 +510,28 @@ async fn discover_initial_admission_tail(
     tail.moving_admission_successors
         .push(job.admitted_commit.clone());
     Ok(Some((branch, tail)))
+}
+
+async fn load_transaction_ref(
+    tx: &libsql::Transaction,
+    job: &BuildJob,
+    branch: &str,
+) -> Result<Option<crate::RefInfo>> {
+    let mut rows = tx
+        .query(
+            "SELECT data FROM refs WHERE repo_key = ?1 AND branch = ?2",
+            libsql::params![job.repo_id.storage_key(), branch],
+        )
+        .await
+        .with_context(|| format!("load transactional ref {branch}"))?;
+    let info = match rows.next().await? {
+        Some(row) => Some(
+            serde_json::from_str(&row.get::<String>(0)?)
+                .with_context(|| format!("parse transactional ref {branch}"))?,
+        ),
+        None => None,
+    };
+    Ok(info)
 }
 
 fn ref_times(info: &crate::RefInfo) -> (Option<i64>, Option<i64>) {
@@ -757,7 +828,7 @@ mod tests {
             let exact = exact.clone();
             admissions.push(tokio::spawn(async move {
                 control
-                    .admit_exact_and_job(&job, &exact, &pending, None)
+                    .admit_exact_and_job(&job, &exact, &pending, false)
                     .await
                     .unwrap()
             }));
@@ -794,7 +865,7 @@ mod tests {
                 &job(second_commit),
                 &format!("main@{second_commit}"),
                 &pending(second_commit),
-                None,
+                false,
             )
             .await
             .unwrap();
@@ -824,11 +895,11 @@ mod tests {
         let second_exact = crate::ref_store::exact_ref_key("main", second_commit);
 
         control
-            .admit_exact_and_job(&job(first_commit), &first_exact, &first_pending, None)
+            .admit_exact_and_job(&job(first_commit), &first_exact, &first_pending, true)
             .await
             .unwrap();
         control
-            .admit_exact_and_job(&job(second_commit), &second_exact, &second_pending, None)
+            .admit_exact_and_job(&job(second_commit), &second_exact, &second_pending, true)
             .await
             .unwrap();
 
@@ -886,6 +957,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn established_tail_is_extended_transactionally_for_later_admissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let c = "cccccccccccccccccccccccccccccccccccccccc";
+        let store = control.ref_store();
+        let moving_a = crate::RefInfo {
+            commit: a.to_string(),
+            default_branch: "main".to_string(),
+            require_matching_commit: true,
+            ..Default::default()
+        };
+        let mut exact_a = moving_a.clone();
+        exact_a.internal_exact_result = true;
+        store
+            .save_branch(&job(a).repo_id, "main", &moving_a)
+            .await
+            .unwrap();
+        store
+            .save_branch(
+                &job(a).repo_id,
+                &crate::ref_store::exact_ref_key("main", a),
+                &exact_a,
+            )
+            .await
+            .unwrap();
+
+        // Both request-side preparations may have observed A. The database is
+        // authoritative: serialized immediate transactions must extend the
+        // committed tail to A -> B -> C instead of overwriting A twice.
+        control
+            .admit_exact_and_job(
+                &job(b),
+                &crate::ref_store::exact_ref_key("main", b),
+                &pending(b),
+                true,
+            )
+            .await
+            .unwrap();
+        control
+            .admit_exact_and_job(
+                &job(c),
+                &crate::ref_store::exact_ref_key("main", c),
+                &pending(c),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut projection_b = store
+            .load_branch(&job(b).repo_id, &crate::ref_store::exact_ref_key("main", b))
+            .await
+            .unwrap()
+            .unwrap();
+        projection_b.internal_exact_result = false;
+        projection_b.require_matching_commit = true;
+        store
+            .save_branch(&job(b).repo_id, "main", &projection_b)
+            .await
+            .unwrap();
+        let mut projection_c = store
+            .load_branch(&job(c).repo_id, &crate::ref_store::exact_ref_key("main", c))
+            .await
+            .unwrap()
+            .unwrap();
+        projection_c.internal_exact_result = false;
+        projection_c.require_matching_commit = true;
+        store
+            .save_branch(&job(c).repo_id, "main", &projection_c)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .load_branch(&job(c).repo_id, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            c,
+            "completing B then C must leave the established moving branch at C"
+        );
+        let exact_b = store
+            .load_branch(&job(b).repo_id, &crate::ref_store::exact_ref_key("main", b))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact_b.moving_admission_successors, vec![c.to_string()]);
+        assert_eq!(
+            projection_c.moving_publication_predecessors,
+            vec![a.to_string(), b.to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_admission_rolls_back_exact_result_and_job() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
@@ -895,17 +1065,26 @@ mod tests {
         let commit = "3333333333333333333333333333333333333333";
         let job = job(commit);
         let exact = format!("main@{commit}");
-        let missing_tail = pending(commit);
+        let missing_commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let moving = crate::RefInfo {
+            commit: missing_commit.to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        control
+            .ref_store()
+            .save_branch(&job.repo_id, "main", &moving)
+            .await
+            .unwrap();
         let error = control
-            .admit_exact_and_job(
-                &job,
-                &exact,
-                &pending(commit),
-                Some(("main", &missing_tail)),
-            )
+            .admit_exact_and_job(&job, &exact, &pending(commit), true)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("tail disappeared"));
+        assert!(
+            error
+                .to_string()
+                .contains("ordinary admission chain is missing exact")
+        );
         assert!(
             control
                 .ref_store()
@@ -931,7 +1110,7 @@ mod tests {
                     &job(commit),
                     &format!("main@{commit}"),
                     &pending(commit),
-                    None,
+                    false,
                 )
                 .await
                 .unwrap()

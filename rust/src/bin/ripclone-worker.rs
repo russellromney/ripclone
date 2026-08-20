@@ -22,12 +22,12 @@
 //!   empty claim attempts (scale-to-zero). Off by default.
 //! - `RIPCLONE_MAX_JOBS` / `--max-jobs`: exit after N builds (one-shot
 //!   platforms). Off by default.
-//! - `RIPCLONE_WORKER_HEARTBEAT` (default off): when set to `queue` or a truthy
-//!   value, the worker updates the server's durable worker registry through the API.
+//! - Active claims are always renewed through the authenticated heartbeat API.
+//!   `RIPCLONE_WORKER_HEARTBEAT` (default off) additionally registers idle workers.
 //! - `RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS` (default 60): soft age-out for
 //!   live-count (must exceed the interval so a healthy worker never looks dead).
 //! - `RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS` (default timeout/3): how often
-//!   the worker refreshes its registry row (including mid-build).
+//!   the worker renews an active claim or refreshes an idle registry row.
 //!
 //! ## Topology constraints
 //!
@@ -43,8 +43,9 @@
 //! - **Lifecycle is opt-in.** Without the flags the loop runs forever (today's
 //!   behavior). With them a compute provider can drain-and-exit without knowing
 //!   which mode it is in — both flags live in the same env bag.
-//! - **Heartbeat is opt-in.** When enabled it uses the same bearer-authenticated
-//!   API and writes no local control state.
+//! - **Active lease renewal is unconditional.** The opt-in heartbeat setting
+//!   controls idle fleet visibility only. Both use the same bearer-authenticated
+//!   API and write no local control state.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -74,9 +75,9 @@ fn is_queue_auth_expired(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Spawn a background task that periodically upserts this worker's registry
-/// row. `current_job` is `-1` when idle, else the claimed job id.
-fn spawn_heartbeat_loop(
+/// Optionally register an idle worker for fleet sizing. Active jobs use their
+/// own mandatory lease-renewal loop; this task deliberately skips them.
+fn spawn_idle_heartbeat_loop(
     queue: WorkerQueueRef,
     worker_id: String,
     current_job: Arc<AtomicI64>,
@@ -84,13 +85,10 @@ fn spawn_heartbeat_loop(
 ) {
     tokio::spawn(async move {
         loop {
-            let job = match current_job.load(Ordering::Relaxed) {
-                n if n < 0 => None,
-                id => Some(id),
-            };
-            if let Err(e) = queue.heartbeat(&worker_id, job).await {
-                // Fail loudly in logs and keep trying across transient API errors.
-                error!("worker heartbeat failed: {e:#}");
+            if current_job.load(Ordering::Relaxed) < 0
+                && let Err(e) = queue.heartbeat(&worker_id, None).await
+            {
+                error!("idle worker heartbeat failed: {e:#}");
             }
             tokio::time::sleep(interval).await;
         }
@@ -152,6 +150,14 @@ async fn main() -> Result<()> {
     let queue = queue as WorkerQueueRef;
     let build_queue = queue.clone() as JobQueueRef;
 
+    if !queue.supports_worker_registry() {
+        bail!("server API does not support active-claim renewal");
+    }
+    let interval_secs = worker_heartbeat_interval_secs();
+    let timeout_secs = queue.heartbeat_timeout_secs();
+    validate_heartbeat_timing(interval_secs, timeout_secs)?;
+    let heartbeat_interval = Duration::from_secs(interval_secs);
+
     std::fs::create_dir_all(&args.cas_dir)?;
     std::fs::create_dir_all(&args.repo_root)?;
 
@@ -164,27 +170,20 @@ async fn main() -> Result<()> {
     // across machines and under-counts the live fleet in the registry.
     let worker_id = make_worker_id();
     let heartbeat_on = worker_heartbeat_enabled_from_env()?;
-    // -1 = idle; non-negative = claimed job id. Background heartbeat task reads it.
-    // Only allocated when heartbeat is on so the disabled path stays lean.
-    let current_job = heartbeat_on.then(|| Arc::new(AtomicI64::new(-1)));
+    // -1 = idle; non-negative = claimed job id. The optional idle registry
+    // task reads it so it cannot overwrite active-job ownership metadata.
+    let current_job = Arc::new(AtomicI64::new(-1));
     if heartbeat_on {
-        if !queue.supports_worker_registry() {
-            bail!("server API does not support worker heartbeats");
-        }
-        let interval_secs = worker_heartbeat_interval_secs();
-        let timeout_secs = queue.heartbeat_timeout_secs();
-        validate_heartbeat_timing(interval_secs, timeout_secs)?;
-        let interval = Duration::from_secs(interval_secs);
         info!(
-            "worker heartbeat enabled (interval={}s, timeout={}s)",
-            interval.as_secs(),
+            "idle worker registry enabled (interval={}s, timeout={}s)",
+            heartbeat_interval.as_secs(),
             timeout_secs
         );
-        spawn_heartbeat_loop(
+        spawn_idle_heartbeat_loop(
             queue.clone(),
             worker_id.clone(),
-            current_job.clone().expect("heartbeat current_job"),
-            interval,
+            current_job.clone(),
+            heartbeat_interval,
         );
     }
     match args.max_size_class.as_deref() {
@@ -223,10 +222,7 @@ async fn main() -> Result<()> {
             Ok(Some(claimed)) => {
                 idle_since = None;
                 let job_id = claimed.id;
-                // Surface the active claim to the heartbeat task (if any).
-                if let Some(ref cur) = current_job {
-                    cur.store(job_id, Ordering::Relaxed);
-                }
+                current_job.store(job_id, Ordering::Relaxed);
                 let repo_id = claimed.repo_id();
                 info!(
                     "claimed job {} for {}@{}",
@@ -241,9 +237,7 @@ async fn main() -> Result<()> {
                     ));
                     match queue.ack(job_id, &worker_id, Err(error)).await {
                         Ok(_) => {
-                            if let Some(ref cur) = current_job {
-                                cur.store(-1, Ordering::Relaxed);
-                            }
+                            current_job.store(-1, Ordering::Relaxed);
                             jobs_done += 1;
                             continue;
                         }
@@ -277,11 +271,40 @@ async fn main() -> Result<()> {
                 // job (acked as failed) instead of killing the worker and
                 // leaving the row `claimed` until the stale-reclaim timeout.
                 let st = state.clone();
-                let result =
-                    match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
-                        Ok(r) => r,
-                        Err(e) => Err(BuildError::retryable(format!("build task panicked: {e}"))),
-                    };
+                let mut build = tokio::spawn(async move { process_build_job(&st, &job).await });
+                let mut heartbeat = tokio::time::interval(heartbeat_interval);
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let (result, ownership_error) = loop {
+                    tokio::select! {
+                        joined = &mut build => {
+                            let result = match joined {
+                                Ok(result) => result,
+                                Err(error) => Err(BuildError::retryable(format!(
+                                    "build task panicked: {error}"
+                                ))),
+                            };
+                            break (result, None);
+                        }
+                        _ = heartbeat.tick() => {
+                            if let Err(error) = queue.heartbeat(&worker_id, Some(job_id)).await {
+                                error!("active claim heartbeat failed for job {job_id}: {error:#}");
+                                build.abort();
+                                let _ = build.await;
+                                let result = Err(BuildError::retryable(format!(
+                                    "durable claim lost while building: {error:#}"
+                                )));
+                                break (result, Some(error));
+                            }
+                        }
+                    }
+                };
+                if ownership_error.as_ref().is_some_and(is_queue_auth_expired) {
+                    current_job.store(-1, Ordering::Relaxed);
+                    info!(
+                        "queue token expired (401) during active build; exiting cleanly for respawn"
+                    );
+                    break;
+                }
                 // Retryable errors leave metadata non-terminal (so intermediate
                 // retries don't look permanent). If ack dead-letters at the
                 // attempts cap, surface that as a terminal failed status.
@@ -328,9 +351,7 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => error!("failed to ack job {job_id}: {e}"),
                 }
-                if let Some(ref cur) = current_job {
-                    cur.store(-1, Ordering::Relaxed);
-                }
+                current_job.store(-1, Ordering::Relaxed);
                 jobs_done += 1;
                 if let Some(max) = args.max_jobs
                     && jobs_done >= max

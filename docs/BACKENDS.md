@@ -34,6 +34,12 @@ recovery after `RIPCLONE_QUEUE_STALE_SECS`.
 An existing database without the current control schema marker is rejected. The
 server does not rewrite or automatically migrate it.
 
+Control state written by the removed file, S3, PostgreSQL, MySQL, remote
+libSQL/sqld, or in-memory implementations is unreadable by this binary. There
+is no import or compatibility path. Rolling back requires the old binary and
+its matching old control data; otherwise initialize a fresh SQLite control
+database and re-admit repositories through current requests.
+
 ## Turso embedded replica
 
 Turso is the only replicated control mode. The server opens the same local path

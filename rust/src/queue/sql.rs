@@ -249,6 +249,9 @@ pub trait QueueDb: Send + Sync {
         now: i64,
     ) -> Result<()>;
 
+    /// Remove a worker registry row when an embedded slot exits an active job.
+    async fn delete_worker(&self, worker_id: &str) -> Result<u64>;
+
     /// Count workers with `last_heartbeat >= cutoff`.
     async fn count_live_workers(&self, cutoff: i64) -> Result<i64>;
 
@@ -490,14 +493,19 @@ impl SqlJobQueue {
         self.heartbeat_timeout_secs
     }
 
+    /// Durable claim lease window. Active heartbeat intervals must remain
+    /// comfortably below this value so healthy work cannot be reclaimed.
+    pub fn stale_claim_secs(&self) -> i64 {
+        self.stale_claim_secs
+    }
+
     /// The one durable jobs table always includes the worker registry.
     pub fn supports_worker_registry(&self) -> bool {
         true
     }
 
-    /// Write/update this worker's registry row (id, size ceiling, current job).
-    /// Always writes when called — the worker process is opt-in via
-    /// `RIPCLONE_WORKER_HEARTBEAT` (default off; self-host unchanged).
+    /// Write/update this worker's registry row and, for active work, renew the
+    /// durable claim. Active renewal fails if this worker no longer owns it.
     pub async fn heartbeat(&self, worker_id: &str, current_job: Option<i64>) -> Result<()> {
         self.heartbeat_at(worker_id, current_job, now_secs()).await
     }
@@ -513,12 +521,21 @@ impl SqlJobQueue {
         if worker_id.is_empty() {
             anyhow::bail!("worker_id must not be empty");
         }
+        if let Some(job_id) = current_job {
+            anyhow::ensure!(
+                self.db.renew_claim(job_id, worker_id, now).await?,
+                "worker {worker_id} no longer owns claimed job {job_id}"
+            );
+        }
         self.db
             .upsert_heartbeat(worker_id, self.max_size_class, current_job, now)
             .await?;
-        if let Some(job_id) = current_job {
-            self.db.renew_claim(job_id, worker_id, now).await?;
-        }
+        Ok(())
+    }
+
+    /// Remove a no-longer-active embedded worker from the durable registry.
+    pub async fn remove_worker(&self, worker_id: &str) -> Result<()> {
+        self.db.delete_worker(worker_id).await?;
         Ok(())
     }
 
@@ -2334,8 +2351,8 @@ mod tests {
             "insert marks live"
         );
 
-        // Update same worker (current job set) — still one live row.
-        q.heartbeat_at("w1", Some(42), 1_010).await.unwrap();
+        // Update same idle worker — still one live row.
+        q.heartbeat_at("w1", None, 1_010).await.unwrap();
         assert_eq!(
             q.live_worker_count_at(1_010).await.unwrap(),
             1,
@@ -2513,9 +2530,7 @@ mod tests {
         let (q, _dir) = queue_with_timeout(60).await;
         let q = Arc::new(q);
         for i in 0..3 {
-            q.heartbeat_at(&format!("w{i}"), Some(i as i64), 1_000)
-                .await
-                .unwrap();
+            q.heartbeat_at(&format!("w{i}"), None, 1_000).await.unwrap();
         }
 
         let q1 = q.clone();
@@ -2657,7 +2672,14 @@ mod tests {
             .unwrap()
             .with_heartbeat_timeout_secs(60);
 
-        q.heartbeat_at("w1", Some(99), 1_000).await.unwrap();
+        let id = q
+            .enqueue(job("o", "heartbeat", "main"))
+            .await
+            .unwrap()
+            .job_id
+            .unwrap();
+        q.claim_capped_at("w1", None, 990).await.unwrap().unwrap();
+        q.heartbeat_at("w1", Some(id), 1_000).await.unwrap();
         let database = libsql::Builder::new_local(&path).build().await.unwrap();
         let connection = database.connect().unwrap();
         let job: Option<i64> = connection
@@ -2673,7 +2695,7 @@ mod tests {
             .unwrap()
             .get(0)
             .unwrap();
-        assert_eq!(job, Some(99));
+        assert_eq!(job, Some(id));
 
         q.heartbeat_at("w1", None, 1_010).await.unwrap();
         let job: Option<i64> = connection
@@ -2700,6 +2722,39 @@ mod tests {
             err.to_string().contains("worker_id must not be empty"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn active_heartbeat_fails_after_claim_ownership_changes() {
+        let (q, _dir) = queue_with_timeout(60).await;
+        let q = q.with_stale_claim_secs(0);
+        let id = q
+            .enqueue(job("o", "lost", "main"))
+            .await
+            .unwrap()
+            .job_id
+            .unwrap();
+        q.claim_capped_at("old", None, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        q.reclaim_stale_at(1_001).await.unwrap();
+        q.claim_capped_at("new", None, 1_001)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = q.heartbeat_at("old", Some(id), 1_002).await.unwrap_err();
+        assert!(error.to_string().contains("no longer owns claimed job"));
+    }
+
+    #[tokio::test]
+    async fn remove_worker_deletes_registry_row() {
+        let (q, _dir) = queue_with_timeout(60).await;
+        q.heartbeat_at("embedded-slot", None, 1_000).await.unwrap();
+        assert_eq!(q.live_worker_count_at(1_000).await.unwrap(), 1);
+        q.remove_worker("embedded-slot").await.unwrap();
+        assert_eq!(q.live_worker_count_at(1_000).await.unwrap(), 0);
     }
 
     #[test]
@@ -2796,9 +2851,7 @@ mod tests {
             writers.push(tokio::spawn(async move {
                 let id = format!("w{i}");
                 for t in 0..5 {
-                    q.heartbeat_at(&id, Some(i as i64), 1_000 + t)
-                        .await
-                        .unwrap();
+                    q.heartbeat_at(&id, None, 1_000 + t).await.unwrap();
                 }
             }));
         }

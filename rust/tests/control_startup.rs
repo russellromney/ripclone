@@ -1,6 +1,8 @@
 //! Removed and incomplete control configuration fails before the server binds,
 //! opens control state, or creates artifact and mirror directories.
 
+use ripclone::provider::RepoId;
+use ripclone::queue::{BuildJob, JobQueue};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -100,12 +102,46 @@ async fn incomplete_turso_pairs_fail_without_side_effects() {
 }
 
 #[tokio::test]
+async fn explicitly_empty_control_values_fail_without_side_effects() {
+    for key in [
+        "RIPCLONE_CONTROL_DB_PATH",
+        "RIPCLONE_TURSO_DATABASE_URL",
+        "RIPCLONE_TURSO_AUTH_TOKEN",
+    ] {
+        for value in ["", "   "] {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = server_command(root.path());
+            command.env(key, value);
+            let output = run_bounded(command).await;
+            assert!(!output.status.success(), "{key}={value:?} was accepted");
+            assert!(String::from_utf8_lossy(&output.stderr).contains(key));
+            assert_no_runtime_side_effects(root.path());
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let mut command = server_command(root.path());
+    command
+        .env("RIPCLONE_TURSO_DATABASE_URL", "")
+        .env("RIPCLONE_TURSO_AUTH_TOKEN", "");
+    let output = run_bounded(command).await;
+    assert!(
+        !output.status.success(),
+        "empty Turso pair downgraded to SQLite"
+    );
+    assert_no_runtime_side_effects(root.path());
+}
+
+#[tokio::test]
 async fn removed_config_sections_fail_without_side_effects() {
     for contents in [
         "[metadata]\nbackend = 'file'\n",
         "[queue]\nbackend = 'sqlite'\nurl = 'decoy.db'\n",
         "[control]\nturso_url = 'libsql://decoy.invalid'\n",
         "[control]\nturso_token = 'decoy-token'\n",
+        "[control]\npath = ''\n",
+        "[control]\nturso_url = ''\nturso_token = 'decoy-token'\n",
+        "[control]\nturso_url = 'libsql://decoy.invalid'\nturso_token = ''\n",
     ] {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config.toml");
@@ -119,6 +155,106 @@ async fn removed_config_sections_fail_without_side_effects() {
         );
         assert_no_runtime_side_effects(root.path());
     }
+}
+
+#[tokio::test]
+async fn empty_environment_override_does_not_fall_back_to_valid_config() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[control]\nturso_url = 'libsql://decoy.invalid'\nturso_token = 'decoy-token'\n",
+    )
+    .unwrap();
+    let mut command = server_command(root.path());
+    command
+        .env("RIPCLONE_CONFIG", &config)
+        .env("RIPCLONE_TURSO_AUTH_TOKEN", "");
+    let output = run_bounded(command).await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("RIPCLONE_TURSO_AUTH_TOKEN"));
+    assert_no_runtime_side_effects(root.path());
+}
+
+#[tokio::test]
+async fn rejected_startup_neither_contacts_s3_nor_mutates_existing_control_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let control_path = root.path().join("control.db");
+    let control = ripclone::control::ControlDb::open(
+        &control_path,
+        None,
+        ripclone::queue::default_size_classes(),
+    )
+    .await
+    .unwrap();
+    let queue = control.queue();
+    let job_id = queue
+        .enqueue(BuildJob {
+            repo_id: RepoId::github("acme/preserved"),
+            branch: "main".to_string(),
+            admitted_commit: "1111111111111111111111111111111111111111".to_string(),
+            admitted_default_branch: Some("main".to_string()),
+            credential: None,
+            size_bytes: None,
+        })
+        .await
+        .unwrap()
+        .job_id
+        .unwrap();
+    queue
+        .heartbeat_at("preserved-worker", None, 1_000)
+        .await
+        .unwrap();
+    drop(queue);
+    drop(control);
+
+    let s3_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", s3_listener.local_addr().unwrap());
+    let mut command = server_command(root.path());
+    command
+        .env("RIPCLONE_QUEUE", "removed")
+        .env("RIPCLONE_S3_ENDPOINT", endpoint)
+        .env("RIPCLONE_S3_BUCKET", "must-not-touch")
+        .env("AWS_ACCESS_KEY_ID", "decoy")
+        .env("AWS_SECRET_ACCESS_KEY", "decoy");
+    let output = run_bounded(command).await;
+    assert!(!output.status.success());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), s3_listener.accept())
+            .await
+            .is_err(),
+        "rejected startup contacted the configured S3 endpoint"
+    );
+
+    let database = libsql::Builder::new_local(&control_path)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    let mut jobs = connection
+        .query("SELECT id, status FROM jobs ORDER BY id", ())
+        .await
+        .unwrap();
+    let row = jobs.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), job_id);
+    assert_eq!(row.get::<String>(1).unwrap(), "queued");
+    assert!(jobs.next().await.unwrap().is_none());
+    let mut workers = connection
+        .query(
+            "SELECT worker_id, current_job, last_heartbeat FROM workers",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = workers.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "preserved-worker");
+    assert_eq!(row.get::<Option<i64>>(1).unwrap(), None);
+    assert_eq!(row.get::<i64>(2).unwrap(), 1_000);
+    assert!(workers.next().await.unwrap().is_none());
+    assert!(!root.path().join("cas").exists());
+    assert!(!root.path().join("repos").exists());
 }
 
 #[tokio::test]

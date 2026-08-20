@@ -182,6 +182,7 @@ pub struct AdmissionTestProbe {
     pub builder_entry: AdmissionTestBarrier,
     pub phase2_entry: AdmissionTestBarrier,
     pub embedded_idle_wait: AdmissionTestBarrier,
+    pub before_admission_tx: AdmissionTestBarrier,
     pub enqueue_attempts: AtomicUsize,
     pub queue_inserts: AtomicUsize,
     pub coalesces: AtomicUsize,
@@ -193,13 +194,16 @@ pub struct AdmissionTestProbe {
     pub artifact_uploads: AtomicUsize,
     pub embedded_notification_wakes: AtomicUsize,
     pub embedded_fallback_polls: AtomicUsize,
+    pub claim_losses: AtomicUsize,
     pub fetch_targets: StdMutex<Vec<String>>,
     pub builder_targets: StdMutex<Vec<String>>,
     pub failure_targets: StdMutex<Vec<(String, String)>>,
     pub http_trace: StdMutex<Vec<String>>,
+    admission_tx_target: StdMutex<Option<String>>,
     full_notify: Arc<tokio::sync::Notify>,
     failure_notify: Arc<tokio::sync::Notify>,
     http_notify: Arc<tokio::sync::Notify>,
+    claim_loss_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Default for AdmissionTestProbe {
@@ -211,6 +215,7 @@ impl Default for AdmissionTestProbe {
             builder_entry: AdmissionTestBarrier::default(),
             phase2_entry: AdmissionTestBarrier::default(),
             embedded_idle_wait: AdmissionTestBarrier::default(),
+            before_admission_tx: AdmissionTestBarrier::default(),
             enqueue_attempts: AtomicUsize::new(0),
             queue_inserts: AtomicUsize::new(0),
             coalesces: AtomicUsize::new(0),
@@ -222,18 +227,29 @@ impl Default for AdmissionTestProbe {
             artifact_uploads: AtomicUsize::new(0),
             embedded_notification_wakes: AtomicUsize::new(0),
             embedded_fallback_polls: AtomicUsize::new(0),
+            claim_losses: AtomicUsize::new(0),
             fetch_targets: StdMutex::new(Vec::new()),
             builder_targets: StdMutex::new(Vec::new()),
             failure_targets: StdMutex::new(Vec::new()),
             http_trace: StdMutex::new(Vec::new()),
+            admission_tx_target: StdMutex::new(None),
             full_notify: Arc::new(tokio::sync::Notify::new()),
             failure_notify: Arc::new(tokio::sync::Notify::new()),
             http_notify: Arc::new(tokio::sync::Notify::new()),
+            claim_loss_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
 
 impl AdmissionTestProbe {
+    pub fn hold_admission_transaction(&self, commit: &str) {
+        *self
+            .admission_tx_target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(commit.to_string());
+        self.before_admission_tx.arm();
+    }
+
     pub async fn wait_until_full_published(&self, count: usize) {
         while self.full_publishes.load(Ordering::SeqCst) < count {
             let notified = self.full_notify.notified();
@@ -275,6 +291,16 @@ impl AdmissionTestProbe {
             notified.await;
         }
     }
+
+    pub async fn wait_until_claim_lost(&self, count: usize) {
+        while self.claim_losses.load(Ordering::SeqCst) < count {
+            let notified = self.claim_loss_notify.notified();
+            if self.claim_losses.load(Ordering::SeqCst) >= count {
+                break;
+            }
+            notified.await;
+        }
+    }
 }
 
 static ADMISSION_TEST_PROBE: StdMutex<Option<Arc<AdmissionTestProbe>>> = StdMutex::new(None);
@@ -298,6 +324,7 @@ impl Drop for AdmissionTestProbeGuard {
         self.probe.builder_entry.disarm();
         self.probe.phase2_entry.disarm();
         self.probe.embedded_idle_wait.disarm();
+        self.probe.before_admission_tx.disarm();
         let mut slot = ADMISSION_TEST_PROBE
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -327,6 +354,20 @@ pub async fn admission_test_before_claim() {
 pub async fn admission_test_after_claim() {
     if let Some(probe) = admission_test_probe() {
         probe.after_claim.wait().await;
+    }
+}
+
+async fn admission_test_before_admission_tx(commit: &str) {
+    if let Some(probe) = admission_test_probe() {
+        let held = probe
+            .admission_tx_target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(commit);
+        if held {
+            probe.before_admission_tx.wait().await;
+        }
     }
 }
 
@@ -395,6 +436,13 @@ fn admission_test_embedded_wake(fallback: bool) {
                 .embedded_notification_wakes
                 .fetch_add(1, Ordering::SeqCst);
         }
+    }
+}
+
+fn admission_test_claim_lost() {
+    if let Some(probe) = admission_test_probe() {
+        probe.claim_losses.fetch_add(1, Ordering::SeqCst);
+        probe.claim_loss_notify.notify_waiters();
     }
 }
 
@@ -4507,12 +4555,14 @@ async fn enqueue_admitted_build(
     };
     if let Some(control) = &state.control_db {
         state.metrics.record_build_queued();
-        let tail = admission
-            .tail
-            .as_ref()
-            .map(|(branch, info)| (branch.as_str(), info));
+        admission_test_before_admission_tx(&job.admitted_commit).await;
         return match control
-            .admit_exact_and_job(&job, &admission.exact_branch, &admission.pending, tail)
+            .admit_exact_and_job(
+                &job,
+                &admission.exact_branch,
+                &admission.pending,
+                moving_authorized,
+            )
             .await
         {
             Ok(enqueued) => {
@@ -7976,25 +8026,8 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                     let repo_id = claimed.repo_id();
                     let branch = claimed.branch.clone();
                     let admitted_commit = claimed.admitted_commit.clone();
-                    let heartbeat_queue = worker_queue.clone();
-                    let heartbeat_worker = owner.clone();
-                    let heartbeat_job = claimed.id;
-                    let heartbeat_interval = Duration::from_secs(
-                        (worker_queue.heartbeat_timeout_secs() / 3).max(1) as u64,
-                    );
-                    let heartbeat = tokio::spawn(async move {
-                        loop {
-                            if let Err(error) = heartbeat_queue
-                                .heartbeat(&heartbeat_worker, Some(heartbeat_job))
-                                .await
-                            {
-                                error!("embedded worker heartbeat failed: {error:#}");
-                            }
-                            tokio::time::sleep(heartbeat_interval).await;
-                        }
-                    });
                     let mut foreground_release = Some(foreground_release);
-                    let result = match crate::validation::validate_object_id(&admitted_commit) {
+                    let build = match crate::validation::validate_object_id(&admitted_commit) {
                         Err(error) => Err(BuildError::permanent(format!(
                             "queued job has invalid admitted commit: {error}"
                         ))),
@@ -8017,23 +8050,60 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                 };
                                 let state = worker_state.clone();
                                 let release_for_build = foreground_release.take();
-                                match tokio::spawn(async move {
+                                Ok(tokio::spawn(async move {
                                     process_build_job_with_foreground_release(
                                         &state,
                                         &job,
                                         release_for_build,
                                     )
                                     .await
-                                })
-                                .await
-                                {
-                                    Ok(result) => result,
-                                    Err(error) => Err(BuildError::retryable(format!(
-                                        "build task panicked: {error}"
-                                    ))),
-                                }
+                                }))
                             }
                         },
+                    };
+                    let result = match build {
+                        Err(error) => Err(error),
+                        Ok(mut build) => {
+                            let heartbeat_interval = Duration::from_secs(
+                                (worker_queue
+                                    .heartbeat_timeout_secs()
+                                    .min(worker_queue.stale_claim_secs().max(1))
+                                    / 3)
+                                .max(1) as u64,
+                            );
+                            let mut heartbeat = tokio::time::interval(heartbeat_interval);
+                            heartbeat
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            loop {
+                                tokio::select! {
+                                    joined = &mut build => {
+                                        break match joined {
+                                            Ok(result) => result,
+                                            Err(error) => Err(BuildError::retryable(format!(
+                                                "build task panicked: {error}"
+                                            ))),
+                                        };
+                                    }
+                                    _ = heartbeat.tick() => {
+                                        if let Err(error) = worker_queue
+                                            .heartbeat(&owner, Some(claimed.id))
+                                            .await
+                                        {
+                                            error!(
+                                                "embedded worker lost claim for job {}: {error:#}",
+                                                claimed.id
+                                            );
+                                            admission_test_claim_lost();
+                                            build.abort();
+                                            let _ = build.await;
+                                            break Err(BuildError::retryable(format!(
+                                                "durable claim lost while building: {error:#}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     };
                     // An error before Head publication drops the sender here,
                     // releasing the foreground slot before terminal ack.
@@ -8071,10 +8141,8 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                             claimed.id
                         ),
                     }
-                    heartbeat.abort();
-                    let _ = heartbeat.await;
-                    if let Err(error) = worker_queue.heartbeat(&owner, None).await {
-                        error!("embedded worker idle heartbeat failed: {error:#}");
+                    if let Err(error) = worker_queue.remove_worker(&owner).await {
+                        error!("embedded worker registry cleanup failed: {error:#}");
                     }
                 });
                 // The sender fires after Head is durably published. If the

@@ -48,6 +48,10 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     let cas_dir = dir.path().join("cas");
     let repo_root = dir.path().join("repos");
     let control_path = dir.path().join("control.db");
+    // A short lease makes the real child prove renewal repeatedly while Full
+    // is held. The worker command intentionally does not enable optional idle
+    // fleet heartbeats.
+    unsafe { std::env::set_var("RIPCLONE_QUEUE_STALE_SECS", "2") };
     let control = Arc::new(
         ripclone::control::ControlDb::open(
             &control_path,
@@ -57,6 +61,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         .await
         .unwrap(),
     );
+    unsafe { std::env::remove_var("RIPCLONE_QUEUE_STALE_SECS") };
     control
         .ref_store()
         .add_repo(&AddedRepo {
@@ -148,6 +153,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     // the worker still receives no path or credential for the control database.
     let worker_cas = cas_dir.clone();
     let worker_repos = dir.path().join("worker-repos");
+    let full_barrier = dir.path().join("api-worker-full-barrier");
     let server_url = format!("http://127.0.0.1:{port}");
     let mut command = Command::new(cargo_bin("ripclone-worker"));
     command
@@ -169,6 +175,11 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
             format!("{server_url}/v1/refs"),
         )
         .env("RIPCLONE_METADATA_JOB_TOKEN", token)
+        .env("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS", "3")
+        .env("RIPCLONE_TESTING", "1")
+        .env("RIPCLONE_TEST_PHASE2_BARRIER_DIR", &full_barrier)
+        .env("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT", &commit)
+        .env_remove("RIPCLONE_WORKER_HEARTBEAT")
         .env_remove("RIPCLONE_CONTROL_DB_PATH")
         .env_remove("RIPCLONE_TURSO_DATABASE_URL")
         .env_remove("RIPCLONE_TURSO_AUTH_TOKEN")
@@ -210,6 +221,27 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     .expect("API worker published Head within the bound")
     .expect("API worker sync succeeded");
     assert_eq!(ready.commit, commit);
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !full_barrier.join("entered").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("API worker entered the held Full phase");
+
+    // Exercise the server's real reclaim path repeatedly for longer than the
+    // configured two-second stale bound. Mandatory active heartbeats keep the
+    // claim unavailable even though idle fleet heartbeats were not enabled.
+    let lease_proof_deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < lease_proof_deadline {
+        assert!(
+            queue.claim("reclaim-decoy").await.unwrap().is_none(),
+            "healthy API worker Full claim was reclaimed without idle heartbeats enabled"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::write(full_barrier.join("proceed"), b"proceed\n").unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
