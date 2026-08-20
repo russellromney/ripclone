@@ -215,7 +215,6 @@ async fn accepted_sync_reports_build_timings_through_metrics_and_status() {
         .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
-        .expect("sync request")
         .expect("sync response");
     assert_eq!(sync_resp.status(), reqwest::StatusCode::ACCEPTED);
     let accepted: serde_json::Value = sync_resp.json().await.expect("accepted response json");
