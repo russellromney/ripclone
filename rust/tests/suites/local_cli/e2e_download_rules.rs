@@ -295,9 +295,9 @@ async fn editable_installs_an_earlier_pack_while_a_later_pack_is_held() {
         .expect("the later pack must reach the barrier");
 
     let (installed, staging) = wait_for_staging(&parent, |staging| {
-        // An earlier pack is installed …
-        !pack_dir_entries(staging, ".pack").is_empty()
-            // … and its HEAD blobs are materialized in the working tree.
+        // More than the always-present metadata skeleton pack is installed …
+        pack_dir_entries(staging, ".pack").len() >= 2
+            // … and an earlier pack's HEAD blobs are materialized in the tree.
             && std::fs::read_to_string(staging.join("b.txt")).is_ok()
     })
     .await;
@@ -383,9 +383,12 @@ async fn editable_history_pack_streams_to_one_temp_file_then_is_renamed() {
         "the history pack must stream into exactly one temporary file, saw {:?}",
         pack_dir_entries(&staging, ".ripclone-download")
     );
+    // The editable install also lays down the metadata skeleton pack, so a
+    // finished install has one more `.pack` than the manifest lists.
+    let installed_when_complete = manifest.packs.len() + 1;
     let packs_mid_download = pack_dir_entries(&staging, ".pack");
     assert!(
-        packs_mid_download.len() < manifest.packs.len(),
+        packs_mid_download.len() < installed_when_complete,
         "the streamed history pack must not be installed before its body finishes: {packs_mid_download:?}"
     );
 
@@ -407,7 +410,7 @@ async fn editable_history_pack_streams_to_one_temp_file_then_is_renamed() {
     );
     assert_eq!(
         installed.iter().filter(|n| n.ends_with(".pack")).count(),
-        manifest.packs.len(),
+        installed_when_complete,
         "every pack is installed exactly once: {installed:?}"
     );
     assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "3");
@@ -437,17 +440,85 @@ async fn transient_pack_failure_is_retried_and_the_editable_clone_succeeds() {
     assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
 }
 
-/// Tamper with the published bytes of one archive chunk, then prove the clone
-/// fails on the classification the tampering implies, publishes no target, and
-/// never asks the clone driver to refresh URLs.
-async fn assert_chunk_tampering_fails_permanently(
-    repo: &str,
-    tamper: impl Fn(&Path, u64),
-    want_message: &str,
-) {
+/// Republish the manifest the client resolves, with `mutate` applied, and point
+/// every ref field that named the old bytes at the rewritten ones. The chunk
+/// objects themselves stay intact and verified, so the client meets a manifest
+/// that disagrees with what the gateway honestly serves — which is exactly what
+/// its length rule guards against.
+async fn republish_resolved_manifest(
+    server: &Server,
+    repo_path: &str,
+    resolved: &str,
+    mutate: impl FnOnce(&mut ripclone::clonepack::ClonepackManifest),
+) -> String {
+    use prost::Message;
+    use ripclone::ref_store::RefStore;
+
+    let store = ripclone::ref_store::FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github(repo_path);
+    let moving = RefStore::load_branch(&store, &repo_id, "main")
+        .await
+        .expect("load moving row")
+        .expect("moving row exists");
+    let exact_key = ripclone::ref_store::exact_ref_key("main", &moving.commit);
+
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
+    let bytes = storage.get(resolved).expect("read published manifest");
+    let mut manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice())
+        .expect("decode published manifest");
+    mutate(&mut manifest);
+    let bytes = manifest.encode_to_vec();
+    let hash = ripclone::cas::hash(&bytes);
+    storage
+        .put(&hash, &bytes)
+        .expect("publish rewritten manifest");
+
+    // Both the moving projection and the exact result name the manifest; a
+    // clone can read either, so repoint both.
+    let mut patched = 0usize;
+    for key in ["main", exact_key.as_str()] {
+        let Some(mut info) = RefStore::load_branch(&store, &repo_id, key)
+            .await
+            .expect("load ref row")
+        else {
+            continue;
+        };
+        let mut changed = false;
+        for slot in [
+            &mut info.manifest,
+            &mut info.full_clonepack.manifest,
+            &mut info.shallow_clonepack.manifest,
+        ] {
+            if slot == resolved {
+                *slot = hash.clone();
+                changed = true;
+            }
+        }
+        if changed {
+            patched += 1;
+            RefStore::save_branch(&store, &repo_id, key, &info)
+                .await
+                .expect("publish rewritten ref row");
+        }
+    }
+    assert!(
+        patched > 0,
+        "the resolved manifest {resolved} must be named by a ref row"
+    );
+    hash
+}
+
+/// A manifest that promises a longer archive chunk than the object store holds
+/// must fail the clone on the length rule, publish no target, and never ask the
+/// clone driver to refresh URLs. Fails if a wrong length is treated as transient
+/// (endless retry) or refreshable (endless re-resolve).
+#[tokio::test]
+async fn wrong_archive_chunk_length_fails_without_a_url_refresh() {
     init(false);
-    let server = start_server().await;
-    let origin = make_origin("acme", repo);
+    // Split storage keeps the ref rows readable and writable from the test, so
+    // the rewritten manifest is what the next resolve serves.
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "short-chunk");
     origin.commit(
         &[
             ("a.txt", noisy(21, 4096).as_str()),
@@ -456,28 +527,40 @@ async fn assert_chunk_tampering_fails_permanently(
         "c1",
     );
     origin.publish();
-
-    let repo_path = format!("acme/{repo}");
-    let info = sync_until_archive_ready(&server, "acme", repo).await;
-    let client = server.client();
-    let (manifest, _metadata) = client
-        .fetch_clonepack(&info)
+    register_added_without_build(&server, "acme/short-chunk")
         .await
-        .expect("fetch clonepack");
-    let chunk = manifest
-        .archive_chunks
-        .first()
-        .expect("fixture publishes an archive chunk");
-    let chunk_hex = ripclone::clonepack::hash_to_hex(&chunk.hash);
-    let path = server.cas_path(&chunk_hex);
-    assert!(path.exists(), "archive chunk must be published");
-    tamper(&path, chunk.len);
+        .expect("register the length fixture");
+    sync_until_archive_ready(&server, "acme", "short-chunk").await;
+
+    let client = server.client();
+    let resolved = client
+        .resolve_ref_with_clonepack("acme/short-chunk", "HEAD", Some("full"), None)
+        .await
+        .expect("resolve before rewriting")
+        .clonepack_manifest;
+    let rewritten =
+        republish_resolved_manifest(&server, "acme/short-chunk", &resolved, |manifest| {
+            let chunk = manifest
+                .archive_chunks
+                .first_mut()
+                .expect("fixture publishes an archive chunk");
+            chunk.len += 1;
+        })
+        .await;
+    let info = client
+        .resolve_ref_with_clonepack("acme/short-chunk", "HEAD", Some("full"), None)
+        .await
+        .expect("resolve the rewritten ref");
+    assert_eq!(
+        info.clonepack_manifest, rewritten,
+        "the clone must resolve the rewritten manifest"
+    );
 
     let out = tempfile::tempdir().expect("clone out");
     let target = out.path().join("clone");
     let error = client
         .install_repo_with_mode_at(
-            &repo_path,
+            "acme/short-chunk",
             "HEAD",
             None,
             &target,
@@ -486,21 +569,17 @@ async fn assert_chunk_tampering_fails_permanently(
             None,
         )
         .await
-        .expect_err("tampered artifact must fail the clone");
+        .expect_err("a chunk whose length disagrees with the manifest must fail the clone");
     let rendered = format!("{error:#}");
     assert!(
-        rendered.contains(want_message),
-        "expected {want_message:?} in the failure, got: {rendered}"
+        rendered.contains("size mismatch"),
+        "expected a length failure, got: {rendered}"
     );
     assert!(
         !ripclone::client::is_stale_signed_url(&error),
-        "a permanent artifact failure must not enter the signed-URL refresh loop: {rendered}"
+        "a wrong length must not enter the signed-URL refresh loop: {rendered}"
     );
-    assert!(
-        !target.exists(),
-        "a failed clone must publish no target: {}",
-        target.display()
-    );
+    assert!(!target.exists(), "a failed clone must publish no target");
     let leftovers: Vec<String> = std::fs::read_dir(out.path())
         .expect("read clone parent")
         .flatten()
@@ -510,16 +589,11 @@ async fn assert_chunk_tampering_fails_permanently(
         leftovers.is_empty(),
         "a failed clone must leave no staging directory: {leftovers:?}"
     );
-    // The verified cache never records a bad object.
-    assert!(
-        ripclone::cas::Cas::new(&server.cas_dir)
-            .expect("open server cas")
-            .verify_object(&chunk_hex)
-            .is_err(),
-        "the tampered fixture must still be tampered"
-    );
 }
 
+/// A missing artifact must fail immediately. The gateway answers 404 for an
+/// object it cannot verify or does not hold, and 404 is permanent: retrying
+/// re-reads the same absence and refreshing re-signs the same missing key.
 #[tokio::test]
 async fn missing_archive_chunk_fails_without_a_url_refresh() {
     init(false);
@@ -567,29 +641,4 @@ async fn missing_archive_chunk_fails_without_a_url_refresh() {
         "a missing artifact must not enter the signed-URL refresh loop: {rendered}"
     );
     assert!(!target.exists(), "a failed clone must publish no target");
-}
-
-#[tokio::test]
-async fn short_archive_chunk_fails_on_length_without_a_url_refresh() {
-    assert_chunk_tampering_fails_permanently(
-        "short-chunk",
-        |path, _len| std::fs::write(path, b"truncated").expect("truncate published chunk"),
-        "size mismatch",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn corrupt_archive_chunk_fails_on_hash_without_a_url_refresh() {
-    assert_chunk_tampering_fails_permanently(
-        "corrupt-chunk",
-        |path, len| {
-            // Same length, different bytes: the length check passes and the
-            // content address is what catches it.
-            let filler = vec![b'z'; usize::try_from(len).expect("chunk length fits usize")];
-            std::fs::write(path, &filler).expect("rewrite published chunk");
-        },
-        "hash mismatch",
-    )
-    .await;
 }
