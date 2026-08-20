@@ -13,18 +13,23 @@ version = 2
 # A yanked crate in the lockfile is a problem worth failing on.
 yanked = "deny"
 # Triaged-but-unfixable advisories go here, each with a dated reason.
-# All of the below are transitive deps of the #24 SQL backends (sqlx-mysql,
-# libsql remote/TLS). None has an upstream fix we can reach today: rsa has no
+# All of the below are transitive dependencies of the retained runtime stack.
+# None has an upstream fix we can reach today: rsa has no
 # patched release, and the rustls-webpki issues are pinned by libsql's
 # hyper-rustls 0.25 -> rustls 0.22 -> webpki 0.102 stack (the fixes are only in
 # webpki 0.103, which rustls 0.22 rejects; no libsql release, incl. 0.10-pre,
 # has moved to rustls 0.23). Triaged 2026-06-25; revisit when libsql adopts
 # rustls 0.23.
 ignore = [
-  # rsa (Marvin Attack): timing sidechannel in RSA *decryption*. Via sqlx-mysql.
-  # ripclone is the MySQL *client* (public-key encryption side); the vulnerable
-  # private-key decryption runs on the server. No fixed release upstream.
-  { id = "RUSTSEC-2023-0071", reason = "rsa via sqlx-mysql; client does encryption, not the vulnerable decryption; no upstream fix" },
+  # rsa (Marvin Attack): timing sidechannel in RSA private-key decryption.
+  # Ripclone uses jsonwebtoken for verification and symmetric token issuance;
+  # the vulnerable private-key decryption operation is not used.
+  { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken; vulnerable private-key decryption is not used; no upstream fix" },
+
+  # bincode 1.3.3 is complete but permanently unmaintained. It is internal to
+  # libsql's embedded-replica implementation and has no published vulnerability
+  # or safe compatible upgrade.
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 unmaintained (no CVE); transitive via libsql embedded replication; no compatible upgrade" },
 
   # rustls-pemfile: unmaintained (folded into rustls), not a vulnerability. Via libsql.
   { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained (no CVE); transitive via libsql; no separate fix" },

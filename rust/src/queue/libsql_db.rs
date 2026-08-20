@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use libsql::{Connection, Database};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct LibsqlDb {
     db: Arc<Database>,
@@ -30,7 +31,8 @@ impl LibsqlDb {
     async fn conn(&self) -> Result<Connection> {
         let conn = self.db.connect().context("libsql connect")?;
         // Wait out lock contention rather than erroring (local files).
-        let _ = conn.execute("PRAGMA busy_timeout = 5000", ()).await;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("configure queue busy timeout")?;
         Ok(conn)
     }
 }

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use libsql::{Connection, Database};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct LibsqlMeta {
     db: Arc<Database>,
@@ -25,7 +26,8 @@ impl LibsqlMeta {
 
     async fn conn(&self) -> Result<Connection> {
         let conn = self.db.connect().context("libsql connect")?;
-        let _ = conn.execute("PRAGMA busy_timeout = 5000", ()).await;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("configure metadata busy timeout")?;
         Ok(conn)
     }
 }

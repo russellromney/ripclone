@@ -310,8 +310,7 @@ impl ControlDb {
             .connect()
             .context("connect for durable admission")?;
         connection
-            .execute("PRAGMA busy_timeout = 5000", ())
-            .await
+            .busy_timeout(Duration::from_secs(5))
             .context("configure durable admission busy timeout")?;
         let tx = connection
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
@@ -510,8 +509,7 @@ async fn preflight_sqlite_schema(path: &Path) -> Result<()> {
 async fn validate_or_initialize_schema(database: &Database, path: &Path) -> Result<()> {
     let connection = database.connect().context("connect to control database")?;
     connection
-        .execute("PRAGMA busy_timeout = 5000", ())
-        .await
+        .busy_timeout(Duration::from_secs(5))
         .context("configure schema-check busy timeout")?;
     let tx = connection
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
