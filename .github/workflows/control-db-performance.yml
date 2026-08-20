@@ -33,12 +33,13 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/ripclone-performance-results
           git worktree add --detach /tmp/ripclone-perf-base "$BASE_SHA"
+          git worktree add --detach /tmp/ripclone-perf-candidate "$CANDIDATE_SHA"
           CARGO_TARGET_DIR=/tmp/ripclone-release-base \
             timeout 2400 cargo build --manifest-path /tmp/ripclone-perf-base/rust/Cargo.toml \
               --release --locked --bin ripclone --bin ripclone-server \
               2>&1 | tee /tmp/ripclone-performance-results/base-build.log
           CARGO_TARGET_DIR=/tmp/ripclone-release-candidate \
-            timeout 2400 cargo build --manifest-path rust/Cargo.toml \
+            timeout 2400 cargo build --manifest-path /tmp/ripclone-perf-candidate/rust/Cargo.toml \
               --release --locked --bin ripclone --bin ripclone-server \
               2>&1 | tee /tmp/ripclone-performance-results/candidate-build.log
           install -d /tmp/ripclone-perf-bin/base /tmp/ripclone-perf-bin/candidate
