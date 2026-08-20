@@ -166,7 +166,8 @@ jobs:
           }
 
           measure_control() {
-            local label="$1" bin_dir="$2" root="$RESULTS/$label-control" server="$bin_dir/ripclone-server" cli="$bin_dir/ripclone"
+            local label="$1" bin_dir="$2"
+            local root="$RESULTS/$label-control" server="$bin_dir/ripclone-server" cli="$bin_dir/ripclone"
             local commit port start end i
             export GIT_AUTHOR_DATE='2001-01-01T00:00:00Z'
             export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
