@@ -3055,3 +3055,261 @@ async fn public_fork_status_has_zero_unique_byte_allocation_on_s3() {
         .expect("cleanup refs");
     guard.disable();
 }
+
+/// How one artifact object behind a signed URL is broken.
+#[derive(Clone, Copy)]
+enum SignedObjectBreak {
+    /// The object is gone, so the signed URL resolves to a 404 from storage.
+    Missing,
+    /// The object is present at the right length but its bytes no longer hash
+    /// to the content address the manifest named. Only an object store can
+    /// produce this: the authenticated gateway verifies what it serves.
+    Corrupt,
+}
+
+/// A signed URL that fails for a reason a fresh signature cannot fix must fail
+/// the clone, not send the driver back to re-resolve the ref. Fails if a 404 or
+/// a corrupt object is treated as an expired signature.
+async fn signed_object_break_fails_without_a_url_refresh(
+    kind: SignedObjectBreak,
+    label: &str,
+    want_message: &str,
+) {
+    let env = match s3_env() {
+        Some(env) => env,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let _server_lock = SERVER_LOCK.lock().await;
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("sigbreak-{label}-{suffix}");
+    let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
+
+    let server = start_s3_server(&env, &prefix).await;
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    origin.commit(&[("a.txt", "signed object break\n")], "c1");
+    origin.publish();
+    add_acme_repo(&server, &repo).await;
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("sync");
+
+    // Wait through the metadata-only resolver so exact Full is ready before the
+    // object is broken, then read the manifest the clone will follow.
+    let client = server.client();
+    let info = client
+        .resolve_ref_with_clonepack(&format!("acme/{repo}"), "main", Some("full"), None)
+        .await
+        .expect("wait for exact Full before breaking an object");
+    let (manifest, _metadata) = client
+        .fetch_clonepack(&info)
+        .await
+        .expect("fetch clonepack");
+    let pack = manifest
+        .packs
+        .first()
+        .expect("full clonepack has at least one pack")
+        .pack
+        .clone()
+        .expect("pack entry carries a pack ref");
+    let hash = ripclone::clonepack::hash_to_hex(&pack.hash);
+    let key = format!("{prefix}{hash}");
+
+    let s3 = cleanup_s3_client(&env).expect("raw S3 client");
+    match kind {
+        SignedObjectBreak::Missing => {
+            delete_key_batches(&env, &s3, vec![key.clone()])
+                .await
+                .expect("delete the artifact object");
+        }
+        SignedObjectBreak::Corrupt => {
+            let len = usize::try_from(pack.len).expect("pack length fits usize");
+            s3.objects()
+                .put(&env.bucket, &key)
+                .body_bytes(vec![b'z'; len])
+                .send()
+                .await
+                .expect("overwrite the artifact object");
+        }
+    }
+
+    let out = tempfile::tempdir().expect("clone out");
+    let target = out.path().join("clone");
+    let error = client
+        .install_repo_with_mode_at(
+            &format!("acme/{repo}"),
+            "HEAD",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect_err("a broken artifact object must fail the clone");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(want_message),
+        "expected {want_message:?} in the failure, got: {rendered}"
+    );
+    assert!(
+        !ripclone::client::is_stale_signed_url(&error),
+        "a signed URL that a fresh signature cannot fix must not refresh: {rendered}"
+    );
+    assert!(
+        !target.exists(),
+        "a failed clone must publish no target: {}",
+        target.display()
+    );
+
+    cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
+    cleanup_repo_refs(&env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
+
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn signed_url_missing_object_fails_without_a_url_refresh() {
+    signed_object_break_fails_without_a_url_refresh(SignedObjectBreak::Missing, "missing", "404")
+        .await;
+}
+
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn signed_url_corrupt_object_fails_on_hash_without_a_url_refresh() {
+    signed_object_break_fails_without_a_url_refresh(
+        SignedObjectBreak::Corrupt,
+        "corrupt",
+        "hash mismatch",
+    )
+    .await;
+}
+
+/// Files mode gets the same signed-URL refresh as editable: hold one presigned
+/// archive-chunk GET until its signature expires, let storage reject it, and the
+/// clone must ask for fresh URLs on the *same* pinned commit and finish. Fails
+/// if a Files clone cannot recover from an expiry, or if the refresh moves the
+/// operation to another commit.
+#[ignore = "requires S3 credentials"]
+#[tokio::test(flavor = "multi_thread")]
+async fn files_mode_expired_signed_url_refreshes_and_stays_on_the_pinned_commit() {
+    let env = match s3_env() {
+        Some(env) => env,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let _server_lock = SERVER_LOCK.lock().await;
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("filesrefresh-{suffix}");
+    let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    // Hold the selected signed GET *before* it reaches storage, so the presign
+    // expires while it waits and MinIO itself rejects the stale signature.
+    let proxy = start_barrier_proxy(&env.endpoint, 0, true, entered_tx, proceed_rx).await;
+    let server = start_s3_server(&env, &prefix).await;
+
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    origin.commit(
+        &[("a.txt", "files refresh\n"), ("dir/b.txt", "second\n")],
+        "c1",
+    );
+    origin.publish();
+    add_acme_repo(&server, &repo).await;
+
+    // Files mode needs the archive, so wait for it before the clone is timed
+    // against a short URL lifetime.
+    let ready = sync_until_archive_ready(&server, "acme", &repo).await;
+    let pinned = ready.commit.clone();
+
+    unsafe {
+        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "2");
+        std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
+    }
+
+    let client = server.client();
+    let out = tempfile::tempdir().expect("clone out");
+    let target = out.path().join("clone");
+    let repo_path = format!("acme/{repo}");
+    let clone_target = target.clone();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                &repo_path,
+                "HEAD",
+                None,
+                &clone_target,
+                CloneMode::Files,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(60), entered_rx)
+        .await
+        .expect("a signed GET must reach the barrier")
+        .expect("barrier entered");
+    // Outlive the 2 s signature lifetime while the request is held.
+    sleep(Duration::from_secs(4)).await;
+    proceed_tx.send(()).expect("release the held signed GET");
+
+    let outcome = clone
+        .await
+        .expect("clone task joined")
+        .expect("a Files clone must recover from one expired signed URL");
+    unsafe {
+        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_SECS");
+        std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
+    }
+
+    assert_eq!(
+        proxy.selected_backend_statuses(),
+        vec![403],
+        "MinIO itself must reject the selected expired presign, so the clone \
+         really does recover from an expiry rather than passing vacuously"
+    );
+    assert_eq!(
+        outcome.commit, pinned,
+        "the refresh must keep the operation on its pinned commit"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("a.txt")).expect("read a.txt"),
+        "files refresh\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("dir/b.txt")).expect("read dir/b.txt"),
+        "second\n"
+    );
+    assert!(
+        !target.join(".git").exists(),
+        "files mode materializes no .git"
+    );
+    let headers = proxy.signed_headers();
+    assert!(
+        headers
+            .iter()
+            .all(|header| !header.to_ascii_lowercase().contains("authorization:")),
+        "artifact-host requests must not carry Ripclone authorization: {headers:?}"
+    );
+
+    proxy.shutdown().await;
+    cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
+    cleanup_repo_refs(&env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
