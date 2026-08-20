@@ -1,0 +1,73 @@
+name: control-db-hosted-turso-proof
+
+on:
+  push:
+    branches:
+      - codex/control-db-performance-proof
+    paths:
+      - .github/workflows/control-db-hosted-turso-proof.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  hosted-turso-api-worker-minio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      minio:
+        image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+        command: server /data
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 3a614c02ecc6fb4425cb1d4bb6822df7555e6aef
+      - name: Download exact implementation binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-artifacts
+          path: bin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 32339742060
+      - name: Wait for MinIO and create proof bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          PROOF_BUCKET: ripclone-${{ github.run_id }}-hosted-turso
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && break
+            sleep 0.25
+          done
+          curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:9000/minio/health/live >/dev/null
+          aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb "s3://${PROOF_BUCKET}"
+      - name: Hosted Turso replica plus token-only API worker and S3 artifacts
+        timeout-minutes: 6
+        env:
+          RIPCLONE_REQUIRE_TURSO: "1"
+          RIPCLONE_TURSO_DATABASE_URL: ${{ secrets.SLICE6_TURSO_DATABASE_URL }}
+          RIPCLONE_TURSO_AUTH_TOKEN: ${{ secrets.SLICE6_TURSO_AUTH_TOKEN }}
+          RIPCLONE_S3_ENDPOINT: http://127.0.0.1:9000
+          RIPCLONE_S3_REGION: us-east-1
+          RIPCLONE_S3_BUCKET: ripclone-${{ github.run_id }}-hosted-turso
+          RIPCLONE_S3_PREFIX: control-collapse/hosted-turso-api-worker/
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
+          CARGO_BIN_EXE_ripclone-worker: ${{ github.workspace }}/bin/ripclone-worker
+        run: |
+          set -euo pipefail
+          test -n "$RIPCLONE_TURSO_DATABASE_URL"
+          test -n "$RIPCLONE_TURSO_AUTH_TOKEN"
+          test_bin="${GITHUB_WORKSPACE}/bin/e2e_token_only_worker"
+          chmod +x "$test_bin" "$CARGO_BIN_EXE_ripclone" "$CARGO_BIN_EXE_ripclone-worker"
+          test_name=token_only_worker_builds_and_clones_without_control_credentials
+          timeout 30 "$test_bin" --list | grep -Fqx "$test_name: test"
+          timeout 300 "$test_bin" --exact "$test_name"
