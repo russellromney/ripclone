@@ -14,7 +14,7 @@ permissions:
 jobs:
   hosted-turso-api-worker-minio:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       minio:
         image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
@@ -27,14 +27,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 3a614c02ecc6fb4425cb1d4bb6822df7555e6aef
+          ref: f32cbc6fa5d791c79b2be0679c3d4fe47ee4948b
       - name: Download exact implementation binaries
-        uses: actions/download-artifact@v8
-        with:
-          name: ci-artifacts
-          path: bin
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: 32339742060
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          implementation_run=32404328586
+          for _ in $(seq 1 90); do
+            if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${implementation_run}/artifacts" \
+              --jq '.artifacts[] | select(.name == "ci-artifacts") | .id' | grep -q .; then
+              gh run download "$implementation_run" --repo "$GITHUB_REPOSITORY" \
+                --name ci-artifacts --dir bin
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "ci-artifacts did not become available within 15 minutes" >&2
+          exit 1
       - name: Wait for MinIO and create proof bucket
         env:
           AWS_ACCESS_KEY_ID: minioadmin
