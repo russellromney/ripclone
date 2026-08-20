@@ -4469,8 +4469,12 @@ async fn enqueue_admitted_build(
 ) -> Result<EnqueueOutcome, String> {
     crate::validation::validate_object_id(&job.admitted_commit)
         .map_err(|e| format!("invalid admitted commit: {e}"))?;
-    let admission = prepare_exact_admission(state, &job, moving_authorized).await?;
-    if let (Some(control), Some(admission)) = (&state.control_db, admission.as_ref()) {
+    let Some(admission) = prepare_exact_admission(state, &job, moving_authorized).await? else {
+        state.metrics.record_build_accepted();
+        admission_test_enqueue(EnqueueOutcome::Coalesced);
+        return Ok(EnqueueOutcome::Coalesced);
+    };
+    if let Some(control) = &state.control_db {
         state.metrics.record_build_queued();
         let tail = admission
             .tail
@@ -4491,19 +4495,17 @@ async fn enqueue_admitted_build(
             }
         };
     }
-    if let Some(admission) = admission {
+    state
+        .ref_store
+        .save_branch(&job.repo_id, &admission.exact_branch, &admission.pending)
+        .await
+        .map_err(|error| format!("exact admission persistence failed: {error}"))?;
+    if let Some((tail_branch, tail_info)) = admission.tail {
         state
             .ref_store
-            .save_branch(&job.repo_id, &admission.exact_branch, &admission.pending)
+            .save_branch(&job.repo_id, &tail_branch, &tail_info)
             .await
-            .map_err(|error| format!("exact admission persistence failed: {error}"))?;
-        if let Some((tail_branch, tail_info)) = admission.tail {
-            state
-                .ref_store
-                .save_branch(&job.repo_id, &tail_branch, &tail_info)
-                .await
-                .map_err(|error| format!("ordinary admission link failed: {error}"))?;
-        }
+            .map_err(|error| format!("ordinary admission link failed: {error}"))?;
     }
     state.metrics.record_build_queued();
     match state.build_queue.enqueue(job).await {

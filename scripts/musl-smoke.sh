@@ -104,6 +104,15 @@ docker run --rm --platform "$PLATFORM" \
     srv=$!
     for _ in $(seq 1 80); do
       wget -qO- http://127.0.0.1:8123/healthz >/dev/null 2>&1 && break
+      if ! kill -0 "$srv" 2>/dev/null; then
+        set +e
+        wait "$srv"
+        status=$?
+        set -e
+        echo "server exited before becoming healthy (status=$status):"
+        cat /tmp/srv.log
+        exit 1
+      fi
       sleep 0.25
     done
     health="$(wget -qO- http://127.0.0.1:8123/healthz || true)"
