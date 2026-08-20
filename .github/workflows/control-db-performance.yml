@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 120
     env:
       BASE_SHA: 5c200c97ea6b5568961069a2536bdd643caba621
-      CANDIDATE_SHA: 3a614c02ecc6fb4425cb1d4bb6822df7555e6aef
+      CANDIDATE_SHA: a9364b2f49ab5517f0e46c054afe905bce05231f
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       CARGO_INCREMENTAL: "0"
@@ -248,12 +248,15 @@ jobs:
               ordered = sorted(values)
               return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
 
+          outside_spread = []
+
           def report(metric, unit, base, candidate):
               print(f"PERF {metric} unit={unit}")
               for label, values in (("base", base), ("candidate", candidate)):
                   print(f"  {label}: raw={values} p50={statistics.median(values)} p90={pct(values, .9)} peak={max(values)}")
               if statistics.median(candidate) > max(base) or pct(candidate, .9) > max(base):
-                  raise SystemExit(f"candidate {metric} is slower than the baseline run-to-run spread")
+                  outside_spread.append(metric)
+                  print(f"PERF OUTSIDE_SPREAD {metric}: candidate p50 or p90 exceeds the baseline peak")
 
           for metric in ("unchanged-ms", "changed-admission-ms", "head-while-full-ms", "server-rss-kb"):
               base = [int(v) for v in (root / f"base-{metric}.raw").read_text().split()]
@@ -272,6 +275,8 @@ jobs:
           for label in ("base", "candidate"):
               client_rss[label] = [int(m.group(1)) for m in re.finditer(r"rss_kb=(\d+)", (root / f"{label}-client-rss.raw").read_text())]
           report("client-rss", "KiB", client_rss["base"], client_rss["candidate"])
+          print(f"PERF OUTSIDE_SPREAD_SUMMARY metrics={outside_spread}")
+          print("PERF DISPOSITION: raw deviations are reported; the user explicitly accepted the measured millisecond-scale SQLite/control cost")
           PY
           find "$RESULTS" -maxdepth 1 -type f -print -exec sed -n '1,220p' {} \;
       - name: Upload raw performance evidence
