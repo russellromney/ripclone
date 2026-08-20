@@ -642,3 +642,160 @@ async fn missing_archive_chunk_fails_without_a_url_refresh() {
     );
     assert!(!target.exists(), "a failed clone must publish no target");
 }
+
+/// Every object the local artifact cache holds after a failed clone verifies
+/// against its own name, and the artifact that failed is not among them. Fails
+/// if a partial or unverified body can be published into the cache, where the
+/// next clone would read it as good.
+#[tokio::test]
+async fn a_failed_clone_leaves_no_incomplete_cache_object() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "cache-fail");
+    origin.commit(
+        &[
+            ("a.txt", noisy(41, 4096).as_str()),
+            ("b.txt", noisy(43, 4096).as_str()),
+            ("c.txt", noisy(47, 4096).as_str()),
+        ],
+        "c1",
+    );
+    origin.publish();
+
+    let info = sync_until_archive_ready(&server, "acme", "cache-fail").await;
+    let (manifest, _metadata) = server
+        .client()
+        .fetch_clonepack(&info)
+        .await
+        .expect("fetch clonepack");
+    // Remove the last archive chunk, so the clone caches real artifacts on its
+    // way to a failure rather than dying on its first fetch.
+    let missing = ripclone::clonepack::hash_to_hex(
+        &manifest
+            .archive_chunks
+            .last()
+            .expect("fixture publishes an archive chunk")
+            .hash,
+    );
+    std::fs::remove_file(server.cas_path(&missing)).expect("delete published chunk");
+
+    let cache_dir = tempfile::tempdir().expect("client cache dir");
+    let client = ripclone::client::Client::new_with_token_and_cache(
+        server.url.clone(),
+        Some(token_hash()),
+        Some(cache_dir.path()),
+    );
+    let out = tempfile::tempdir().expect("clone out");
+    let target = out.path().join("clone");
+    client
+        .install_repo_with_mode_at(
+            "acme/cache-fail",
+            "HEAD",
+            None,
+            &target,
+            CloneMode::Files,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect_err("a missing artifact must fail the clone");
+    assert!(!target.exists(), "a failed clone must publish no target");
+
+    let cas = ripclone::cas::Cas::new(cache_dir.path()).expect("open client cache");
+    let mut cached: Vec<String> = Vec::new();
+    for shard in std::fs::read_dir(cache_dir.path())
+        .expect("read client cache")
+        .flatten()
+    {
+        if !shard.path().is_dir() {
+            continue;
+        }
+        for object in std::fs::read_dir(shard.path())
+            .expect("read cache shard")
+            .flatten()
+        {
+            let name = object.file_name().to_string_lossy().into_owned();
+            if name.len() != 64 {
+                continue;
+            }
+            cas.verify_object(&name)
+                .unwrap_or_else(|e| panic!("cache holds an unverified object {name}: {e:#}"));
+            cached.push(name);
+        }
+    }
+    assert!(
+        !cached.is_empty(),
+        "the failed clone must still have cached the artifacts it did fetch, \
+         otherwise this proves nothing about the cache"
+    );
+    assert!(
+        !cached.contains(&missing),
+        "the artifact that could not be fetched must not appear in the cache: {cached:?}"
+    );
+}
+
+/// The credential rule has two halves. The signed-URL half (no Ripclone header)
+/// is proved against MinIO; this is the gateway half: the by-hash artifact route
+/// is authenticated, the configured client credential reaches it, and a wrong or
+/// absent credential is refused there — permanently, since the gateway has no
+/// signed URL to refresh.
+#[tokio::test]
+async fn the_authenticated_gateway_receives_the_client_credential() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "gateway-cred");
+    origin.commit(&[("a.txt", noisy(53, 4096).as_str())], "c1");
+    origin.publish();
+
+    let info = sync_until_archive_ready(&server, "acme", "gateway-cred").await;
+    let (manifest, _metadata) = server
+        .client()
+        .fetch_clonepack(&info)
+        .await
+        .expect("fetch clonepack");
+    let hash = ripclone::clonepack::hash_to_hex(
+        &manifest
+            .archive_chunks
+            .first()
+            .expect("fixture publishes an archive chunk")
+            .hash,
+    );
+
+    // Control: the configured credential fetches the artifact by hash.
+    let bytes = server
+        .client()
+        .fetch_artifact(&hash)
+        .await
+        .expect("the gateway serves an artifact to a credentialed client");
+    assert!(!bytes.is_empty(), "the served artifact must have content");
+
+    // The same route refuses a wrong credential and no credential at all, so the
+    // control above can only have succeeded by sending the credential.
+    for (label, client) in [
+        (
+            "wrong token",
+            ripclone::client::Client::new_with_token(
+                server.url.clone(),
+                Some("deadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+            ),
+        ),
+        (
+            "no token",
+            ripclone::client::Client::new(server.url.clone()),
+        ),
+    ] {
+        let Err(error) = client.fetch_artifact(&hash).await else {
+            panic!("the artifact route must refuse a {label}");
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("401") || rendered.contains("403"),
+            "a {label} must be refused by the artifact route, got: {rendered}"
+        );
+        assert!(
+            !ripclone::client::is_stale_signed_url(&error),
+            "the gateway has no signed URL to refresh, so a refused credential is \
+             permanent: {rendered}"
+        );
+    }
+}
