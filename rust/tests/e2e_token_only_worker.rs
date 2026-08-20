@@ -7,6 +7,7 @@ use common::*;
 use ripclone::job_token::{mint_job_token, report_token_secret_from_env};
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
+use ripclone::queue::{BuildJob, JobQueue};
 use ripclone::ref_store::{AddedRepo, AddedRepoSource};
 use ripclone::server::{RateLimiter, ServerState, build_app};
 use ripclone::storage::StorageBackend;
@@ -257,5 +258,95 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     assert!(
         control_path.exists(),
         "server retained its control database"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turso_primary_loss_rejects_ref_and_job_writes() {
+    if std::env::var("RIPCLONE_REQUIRE_TURSO_FAILURE").as_deref() != Ok("1") {
+        return;
+    }
+    init(false);
+    let turso = ripclone::control::TursoReplicaConfig {
+        url: std::env::var("RIPCLONE_TURSO_DATABASE_URL")
+            .expect("RIPCLONE_TURSO_DATABASE_URL for required failure proof"),
+        token: std::env::var("RIPCLONE_TURSO_AUTH_TOKEN")
+            .expect("RIPCLONE_TURSO_AUTH_TOKEN for required failure proof"),
+    };
+    let barrier = std::path::PathBuf::from(
+        std::env::var_os("RIPCLONE_TURSO_FAILURE_BARRIER")
+            .expect("RIPCLONE_TURSO_FAILURE_BARRIER for required failure proof"),
+    );
+    std::fs::create_dir_all(&barrier).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let control = ripclone::control::ControlDb::open(
+        &dir.path().join("control.db"),
+        Some(turso),
+        ripclone::queue::default_size_classes(),
+    )
+    .await
+    .expect("bootstrap embedded replica while primary is available");
+    let ref_store = control.ref_store();
+    let queue = control.queue();
+    let baseline = AddedRepo {
+        repo_id: RepoId::github("acme/before-primary-loss"),
+        added_at: 1,
+        history_enabled: true,
+        source: AddedRepoSource::Api,
+        repo_size_bytes: None,
+    };
+    ref_store
+        .add_repo(&baseline)
+        .await
+        .expect("primary acknowledges baseline durable write");
+
+    std::fs::write(barrier.join("ready"), b"ready\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !barrier.join("proceed").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("proof driver stopped the primary within the bound");
+
+    let after_loss = AddedRepo {
+        repo_id: RepoId::github("acme/after-primary-loss"),
+        added_at: 2,
+        history_enabled: true,
+        source: AddedRepoSource::Api,
+        repo_size_bytes: None,
+    };
+    let ref_error = tokio::time::timeout(Duration::from_secs(30), ref_store.add_repo(&after_loss))
+        .await
+        .expect("failed ref write returned within the bound")
+        .expect_err("remote-primary loss must reject a new ref write");
+    assert!(!ref_error.to_string().is_empty());
+    assert!(
+        ref_store
+            .load_added_repo(&after_loss.repo_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "failed remote ref write became visible in the local replica"
+    );
+
+    let job = BuildJob {
+        repo_id: RepoId::github("acme/job-after-primary-loss"),
+        branch: "main".to_string(),
+        admitted_commit: "1111111111111111111111111111111111111111".to_string(),
+        admitted_default_branch: Some("main".to_string()),
+        credential: None,
+        size_bytes: None,
+    };
+    let job_error = tokio::time::timeout(Duration::from_secs(30), queue.enqueue(job))
+        .await
+        .expect("failed job write returned within the bound")
+        .expect_err("remote-primary loss must reject a new job write");
+    assert!(!job_error.to_string().is_empty());
+    assert_eq!(
+        queue.depth().await,
+        0,
+        "failed remote job write became visible in the local replica"
     );
 }
