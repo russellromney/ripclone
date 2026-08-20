@@ -1,0 +1,276 @@
+name: control-db-performance
+
+on:
+  push:
+    branches:
+      - codex/control-db-performance-proof
+
+permissions:
+  contents: read
+
+jobs:
+  release-comparison:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      BASE_SHA: 5c200c97ea6b5568961069a2536bdd643caba621
+      CANDIDATE_SHA: 4a5b7cf4a64bab1712f8de7090dd1c2fa03d1d7f
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install release build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build perl pkg-config libssl-dev
+      - name: Build baseline and candidate release binaries once
+        run: |
+          set -euo pipefail
+          git worktree add --detach /tmp/ripclone-perf-base "$BASE_SHA"
+          CARGO_TARGET_DIR=/tmp/ripclone-release-base \
+            timeout 2400 cargo build --manifest-path /tmp/ripclone-perf-base/rust/Cargo.toml \
+              --release --locked --bin ripclone --bin ripclone-server
+          CARGO_TARGET_DIR=/tmp/ripclone-release-candidate \
+            timeout 2400 cargo build --manifest-path rust/Cargo.toml \
+              --release --locked --bin ripclone --bin ripclone-server
+          install -d /tmp/ripclone-perf-bin/base /tmp/ripclone-perf-bin/candidate
+          install -m 755 /tmp/ripclone-release-base/release/ripclone{,-server} /tmp/ripclone-perf-bin/base/
+          install -m 755 /tmp/ripclone-release-candidate/release/ripclone{,-server} /tmp/ripclone-perf-bin/candidate/
+      - name: Record runner and binary environment
+        run: |
+          set -euo pipefail
+          uname -a
+          lscpu
+          free -h
+          rustc --version --verbose
+          cargo --version --verbose
+          git --version
+          sha256sum /tmp/ripclone-perf-bin/{base,candidate}/{ripclone,ripclone-server}
+      - name: Run fixed release-binary comparisons
+        run: |
+          set -euo pipefail
+          RESULTS=/tmp/ripclone-performance-results
+          mkdir -p "$RESULTS"
+          TOKEN=release-performance-token
+          TOKEN_HASH="$(printf '%s' "$TOKEN" | sha256sum | awk '{print $1}')"
+          export RIPCLONE_SERVER_TOKEN="$TOKEN"
+          export RIPCLONE_TRUST_GATEWAY=1
+          export RIPCLONE_NO_CACHE=1
+          export RIPCLONE_RATE_LIMIT_BURST=1000000
+          export RIPCLONE_RATE_LIMIT_PER_SEC=1000000
+          export RIPCLONE_CONFIG="$RESULTS/missing-config.toml"
+          export GIT_AUTHOR_NAME='Release Fixture'
+          export GIT_AUTHOR_EMAIL='release@ripclone.local'
+          export GIT_COMMITTER_NAME='Release Fixture'
+          export GIT_COMMITTER_EMAIL='release@ripclone.local'
+          export GIT_AUTHOR_DATE='2001-01-01T00:00:00Z'
+          export GIT_COMMITTER_DATE='2001-01-01T00:00:00Z'
+
+          now_ms() { date +%s%3N; }
+          free_port() {
+            python3 - <<'PY'
+          import socket
+          s = socket.socket()
+          s.bind(('127.0.0.1', 0))
+          print(s.getsockname()[1])
+          s.close()
+          PY
+          }
+          wait_health() {
+            local url="$1" pid="$2"
+            for _ in $(seq 1 400); do
+              curl --connect-timeout 1 --max-time 2 -fsS "$url/healthz" >/dev/null 2>&1 && return 0
+              kill -0 "$pid" 2>/dev/null || return 1
+              sleep 0.025
+            done
+            return 1
+          }
+          wait_ref() {
+            local url="$1" repo="$2" commit="$3" kind="$4" body status
+            body="$(mktemp)"
+            for _ in $(seq 1 1200); do
+              status="$(curl --connect-timeout 1 --max-time 3 -sS -o "$body" -w '%{http_code}' \
+                -H "Authorization: Ripclone $TOKEN_HASH" \
+                -H 'x-ripclone-protocol: 2' \
+                "$url/v1/repos/github/$repo/refs/main?clonepack=$kind&pinned=$commit" || true)"
+              if [ "$status" = 200 ]; then rm -f "$body"; return 0; fi
+              sleep 0.025
+            done
+            echo "timed out waiting for $repo@$commit kind=$kind status=$status" >&2
+            cat "$body" >&2 || true
+            rm -f "$body"
+            return 1
+          }
+          make_origin() {
+            local root="$1" repo="$2" value="$3" work="$root/work-${repo//\//-}" bare="$root/origins/$repo.git"
+            mkdir -p "$work" "$(dirname "$bare")"
+            git init -q -b main "$work"
+            git init --bare -q -b main "$bare"
+            printf '%s\n' "$value" > "$work/value.txt"
+            git -C "$work" add value.txt
+            git -C "$work" commit -q -m "$value"
+            git -C "$work" push -q "$bare" main
+            git -C "$bare" symbolic-ref HEAD refs/heads/main
+            git -C "$work" rev-parse HEAD
+          }
+          start_server() {
+            local label="$1" root="$2" server="$3" port="$4" barrier="${5:-}"
+            local -a env_args=(
+              "RIPCLONE_ORIGIN_BASE=file://$root/origins"
+              "RIPCLONE_CONTROL_DB_PATH=$root/control.db"
+              "RUST_LOG=warn"
+            )
+            if [ -n "$barrier" ]; then
+              env_args+=("RIPCLONE_TESTING=1" "RIPCLONE_TEST_PHASE2_BARRIER_DIR=$barrier")
+            fi
+            env "${env_args[@]}" "$server" --cas-dir "$root/cas" --repo-root "$root/repos" \
+              --host 127.0.0.1 --port "$port" >"$root/server.log" 2>&1 &
+            SERVER_PID=$!
+            SERVER_URL="http://127.0.0.1:$port"
+            if ! wait_health "$SERVER_URL" "$SERVER_PID"; then
+              cat "$root/server.log" >&2
+              return 1
+            fi
+            echo "$label server ready pid=$SERVER_PID url=$SERVER_URL"
+          }
+          record_hwm_and_stop() {
+            local label="$1" pid="$2"
+            awk -v label="$label" '/VmHWM:/ {print $2 >> "'"$RESULTS"'/" label "-server-rss-kb.raw"}' "/proc/$pid/status" || true
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          }
+
+          cat > /tmp/timed-ripclone <<'SH'
+          #!/usr/bin/env bash
+          exec /usr/bin/time -f 'rss_kb=%M command=%C' -a -o "$RIPCLONE_RSS_LOG" "$RIPCLONE_REAL_BIN" "$@"
+          SH
+          chmod +x /tmp/timed-ripclone
+
+          measure_clone() {
+            local label="$1" bin_dir="$2"
+            echo "=== $label clone fixture ==="
+            RIPCLONE_REAL_BIN="$bin_dir/ripclone" \
+            RIPCLONE_RSS_LOG="$RESULTS/$label-client-rss.raw" \
+            RIPCLONE_RUNS=11 \
+            SERVER_BIN="$bin_dir/ripclone-server" \
+            CLI_BIN=/tmp/timed-ripclone \
+              timeout 900 bash scripts/benchmark_smoke.sh | tee "$RESULTS/$label-clone.log"
+          }
+
+          measure_control() {
+            local label="$1" bin_dir="$2" root="$RESULTS/$label-control" server="$bin_dir/ripclone-server" cli="$bin_dir/ripclone"
+            local commit port start end i
+            export GIT_AUTHOR_DATE='2001-01-01T00:00:00Z'
+            export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+            mkdir -p "$root"
+            commit="$(make_origin "$root" bench/control initial)"
+            port="$(free_port)"
+            start_server "$label-control" "$root" "$server" "$port"
+            timeout 120 "$cli" --server "$SERVER_URL" add bench/control >/dev/null
+            for _ in $(seq 1 11); do
+              start="$(now_ms)"
+              timeout 15 "$cli" --server "$SERVER_URL" sync bench/control >/dev/null
+              end="$(now_ms)"
+              echo $((end-start)) >> "$RESULTS/$label-unchanged-ms.raw"
+            done
+            for i in $(seq 1 11); do
+              export GIT_AUTHOR_DATE="2001-01-01T00:00:$((i+1))Z"
+              export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+              printf 'change %s\n' "$i" > "$root/work-bench-control/value.txt"
+              git -C "$root/work-bench-control" add value.txt
+              git -C "$root/work-bench-control" commit -q -m "change $i"
+              git -C "$root/work-bench-control" push -q --force "$root/origins/bench/control.git" main
+              commit="$(git -C "$root/work-bench-control" rev-parse HEAD)"
+              start="$(now_ms)"
+              timeout 15 "$cli" --server "$SERVER_URL" sync bench/control >/dev/null
+              end="$(now_ms)"
+              echo $((end-start)) >> "$RESULTS/$label-changed-admission-ms.raw"
+              wait_ref "$SERVER_URL" bench/control "$commit" full
+            done
+            record_hwm_and_stop "$label" "$SERVER_PID"
+          }
+
+          measure_head_while_full() {
+            local label="$1" bin_dir="$2" server="$bin_dir/ripclone-server"
+            local i root port barrier body status commit start end
+            for i in $(seq 1 7); do
+              root="$RESULTS/$label-head-$i"
+              barrier="$root/full-barrier"
+              mkdir -p "$root"
+              make_origin "$root" bench/held held >/dev/null
+              make_origin "$root" bench/other other >/dev/null
+              port="$(free_port)"
+              start_server "$label-head-$i" "$root" "$server" "$port" "$barrier"
+              body="$root/held-add.json"
+              status="$(curl --connect-timeout 1 --max-time 10 -sS -o "$body" -w '%{http_code}' -X POST \
+                -H "Authorization: Ripclone $TOKEN_HASH" "$SERVER_URL/v1/repos/github/bench/held/add?source=api")"
+              case "$status" in 200|202) ;; *) cat "$body"; return 1 ;; esac
+              for _ in $(seq 1 1200); do [ -f "$barrier/entered" ] && break; sleep 0.025; done
+              [ -f "$barrier/entered" ] || { cat "$root/server.log"; return 1; }
+              start="$(now_ms)"
+              body="$root/other-add.json"
+              status="$(curl --connect-timeout 1 --max-time 10 -sS -o "$body" -w '%{http_code}' -X POST \
+                -H "Authorization: Ripclone $TOKEN_HASH" "$SERVER_URL/v1/repos/github/bench/other/add?source=api")"
+              case "$status" in 200|202) ;; *) cat "$body"; return 1 ;; esac
+              commit="$(jq -er .commit "$body")"
+              wait_ref "$SERVER_URL" bench/other "$commit" shallow
+              end="$(now_ms)"
+              echo $((end-start)) >> "$RESULTS/$label-head-while-full-ms.raw"
+              touch "$barrier/proceed"
+              record_hwm_and_stop "$label" "$SERVER_PID"
+            done
+          }
+
+          measure_clone base /tmp/ripclone-perf-bin/base
+          measure_clone candidate /tmp/ripclone-perf-bin/candidate
+          measure_control base /tmp/ripclone-perf-bin/base
+          measure_control candidate /tmp/ripclone-perf-bin/candidate
+          measure_head_while_full base /tmp/ripclone-perf-bin/base
+          measure_head_while_full candidate /tmp/ripclone-perf-bin/candidate
+
+          python3 - "$RESULTS" <<'PY'
+          import math, pathlib, re, statistics, sys
+          root = pathlib.Path(sys.argv[1])
+
+          def pct(values, q):
+              ordered = sorted(values)
+              return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+
+          def report(metric, unit, base, candidate):
+              print(f"PERF {metric} unit={unit}")
+              for label, values in (("base", base), ("candidate", candidate)):
+                  print(f"  {label}: raw={values} p50={statistics.median(values)} p90={pct(values, .9)} peak={max(values)}")
+              if statistics.median(candidate) > max(base) or pct(candidate, .9) > max(base):
+                  raise SystemExit(f"candidate {metric} is slower than the baseline run-to-run spread")
+
+          for metric in ("unchanged-ms", "changed-admission-ms", "head-while-full-ms", "server-rss-kb"):
+              base = [int(v) for v in (root / f"base-{metric}.raw").read_text().split()]
+              candidate = [int(v) for v in (root / f"candidate-{metric}.raw").read_text().split()]
+              report(metric, "ms" if metric.endswith("ms") else "KiB", base, candidate)
+
+          clone_pattern = re.compile(r"ripclone (full \(depth=0\)|depth=1|files).*runs=\[([^]]+)\]")
+          clone = {}
+          for label in ("base", "candidate"):
+              for mode, raw in clone_pattern.findall((root / f"{label}-clone.log").read_text()):
+                  clone[(label, mode)] = [int(v) for v in raw.split(',')]
+          for mode in ("full (depth=0)", "depth=1", "files"):
+              report(f"clone-{mode}", "ms", clone[("base", mode)], clone[("candidate", mode)])
+
+          client_rss = {}
+          for label in ("base", "candidate"):
+              client_rss[label] = [int(m.group(1)) for m in re.finditer(r"rss_kb=(\d+)", (root / f"{label}-client-rss.raw").read_text())]
+          report("client-rss", "KiB", client_rss["base"], client_rss["candidate"])
+          PY
+          find "$RESULTS" -maxdepth 1 -type f -print -exec sed -n '1,220p' {} \;
+      - name: Upload raw performance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: control-db-performance-results
+          path: /tmp/ripclone-performance-results
+          if-no-files-found: error
