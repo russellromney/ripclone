@@ -267,6 +267,11 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert_eq!(
+        queue.live_worker_count().await.unwrap(),
+        0,
+        "settled API work must not leave a fresh worker-registry row"
+    );
 
     let clone = dir.path().join("clone");
     client
