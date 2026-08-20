@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
-#[tokio::test]
+// Hosted embedded replicas bootstrap through libsql's blocking bridge, matching
+// the server binary's multi-thread Tokio runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_only_worker_builds_and_clones_without_control_credentials() {
     init(false);
     let require_turso = std::env::var("RIPCLONE_REQUIRE_TURSO").as_deref() == Ok("1");
