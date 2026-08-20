@@ -3149,15 +3149,40 @@ async fn get_ref_inner(
             // exact-result key. This does not promote internal metadata: if the
             // mirror cannot identify HEAD, the public-row fallback below still
             // rejects an exact-only layout.
-            Some(candidate) if params.rev.is_some() => Some(candidate),
-            Some(candidate) => state
-                .ref_store
-                .load_branch(&repo_id, &candidate)
-                .await
-                .ok()
-                .flatten()
-                .filter(|info| !info.internal_exact_result)
-                .map(|_| candidate),
+            Some(candidate) => {
+                if let Some(exact_commit) = params
+                    .rev
+                    .as_deref()
+                    .filter(|rev| validation::validate_object_id(rev).is_ok())
+                {
+                    let exact_key = exact_ref_store_key(&candidate, exact_commit);
+                    state
+                        .ref_store
+                        .load_branch(&repo_id, &exact_key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|info| {
+                            info.internal_exact_result
+                                && info.commit == exact_commit
+                                && info.default_branch == candidate
+                        })
+                        .map(|_| candidate)
+                } else if params.rev.is_some() {
+                    // Git still validates symbolic historical selectors such as
+                    // HEAD~1 below before an exact row can be returned.
+                    Some(candidate)
+                } else {
+                    state
+                        .ref_store
+                        .load_branch(&repo_id, &candidate)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|info| !info.internal_exact_result)
+                        .map(|_| candidate)
+                }
+            }
             None => None,
         };
         if let Some(branch_name) = detected_row {
