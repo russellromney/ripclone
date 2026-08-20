@@ -7497,6 +7497,15 @@ async fn build_full_in_background(
     {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
+    if let Ok(fail_for) = std::env::var("RIPCLONE_TEST_PHASE2_RETRYABLE_FAIL_COMMIT")
+        && fail_for == commit
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("forced retryable phase-2 failure for {commit}"),
+        )
+        .into());
+    }
     if let Ok(fail_for) = std::env::var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT")
         && fail_for == commit
     {
