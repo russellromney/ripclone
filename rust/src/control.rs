@@ -333,6 +333,7 @@ impl ControlDb {
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .context("begin durable admission")?;
+        crate::server::admission_test_inside_admission_tx(&job.admitted_commit).await;
         let mut pending = pending.clone();
         let tail = if moving_authorized {
             discover_moving_admission_tail(&tx, job, &mut pending).await?

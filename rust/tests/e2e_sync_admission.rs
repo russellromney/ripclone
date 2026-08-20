@@ -84,31 +84,63 @@ async fn concurrent_later_admissions_extend_the_established_tail_in_transaction(
         .expect("A reaches Full");
 
     let b = origin.commit(&[("value.txt", "B\n")], "B");
-    let c = origin.commit(&[("value.txt", "C\n")], "C");
     origin.publish();
+    probe.before_claim.arm();
+    wait_entered(&probe.before_claim, 1).await;
+    probe.hold_inside_admission_transaction(&b);
+
+    // B owns the immediate transaction while C resolves and prepares against
+    // the still-visible A projection. Once B commits, C must rediscover B
+    // inside its own immediate transaction instead of extending stale A.
+    let b_request = post_sync(&server, None);
+    let coordinate = async {
+        wait_entered(&probe.inside_admission_tx, 1).await;
+        let c = origin.commit(&[("value.txt", "C\n")], "C");
+        origin.publish();
+        probe.hold_admission_transaction(&c);
+        let c_request = post_sync(&server, None);
+        let release_transactions = async {
+            wait_entered(&probe.before_admission_tx, 1).await;
+            probe.inside_admission_tx.release();
+            probe.before_admission_tx.release();
+        };
+        let (c_result, ()) = tokio::join!(c_request, release_transactions);
+        (c, c_result)
+    };
+    let (b_result, (c, c_result)) = tokio::join!(b_request, coordinate);
+    let (b_status, b_body, _) = b_result;
+    let (c_status, c_body, _) = c_result;
+    assert_eq!(b_status, reqwest::StatusCode::ACCEPTED, "B: {b_body}");
+    assert_eq!(c_status, reqwest::StatusCode::ACCEPTED, "C: {c_body}");
+    assert_eq!(response_commit(&b_body), b);
+    assert_eq!(response_commit(&c_body), c);
+
+    // Inspect the committed durable chain before either worker may claim.
+    let store = server_ref_store(&server).await;
+    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
+    let exact_b = store
+        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact_b.moving_admission_successors, vec![c.clone()]);
+    let exact_c = store
+        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &c))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exact_c.moving_publication_predecessors,
+        vec![a.clone(), b.clone()]
+    );
+
     let full_barrier = tempfile::tempdir().unwrap();
     unsafe {
         std::env::set_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR", full_barrier.path());
         std::env::set_var("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT", &c);
     }
-    probe.before_claim.arm();
-    wait_entered(&probe.before_claim, 1).await;
-    probe.hold_admission_transaction(&c);
-
-    // C prepares while A is still the moving tail, then pauses immediately
-    // before its database transaction. B commits first. C must rediscover B
-    // under its immediate transaction instead of overwriting A's successor.
-    let c_request = post_webhook(&server, "main", &c);
-    let coordinate = async {
-        wait_entered(&probe.before_admission_tx, 1).await;
-        let b_result = post_webhook(&server, "main", &b).await;
-        probe.before_admission_tx.release();
-        b_result
-    };
-    let ((c_status, _), (b_status, _)) = tokio::join!(c_request, coordinate);
-    assert_eq!(b_status, reqwest::StatusCode::OK);
-    assert_eq!(c_status, reqwest::StatusCode::OK);
-
+    probe.inside_admission_tx.disarm();
+    probe.before_admission_tx.disarm();
     probe.before_claim.release();
     probe.before_claim.disarm();
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))
@@ -126,8 +158,6 @@ async fn concurrent_later_admissions_extend_the_established_tail_in_transaction(
         .await
         .expect("C completes after B");
 
-    let store = server_ref_store(&server).await;
-    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
     assert_eq!(
         store
             .load_branch(&repo_id, "main")
@@ -136,21 +166,6 @@ async fn concurrent_later_admissions_extend_the_established_tail_in_transaction(
             .unwrap()
             .commit,
         c
-    );
-    let exact_b = store
-        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &b))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(exact_b.moving_admission_successors, vec![c.clone()]);
-    let exact_c = store
-        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &c))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        exact_c.moving_publication_predecessors,
-        vec![a.clone(), b.clone()]
     );
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR");

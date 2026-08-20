@@ -183,6 +183,7 @@ pub struct AdmissionTestProbe {
     pub phase2_entry: AdmissionTestBarrier,
     pub embedded_idle_wait: AdmissionTestBarrier,
     pub before_admission_tx: AdmissionTestBarrier,
+    pub inside_admission_tx: AdmissionTestBarrier,
     pub enqueue_attempts: AtomicUsize,
     pub queue_inserts: AtomicUsize,
     pub coalesces: AtomicUsize,
@@ -200,6 +201,7 @@ pub struct AdmissionTestProbe {
     pub failure_targets: StdMutex<Vec<(String, String)>>,
     pub http_trace: StdMutex<Vec<String>>,
     admission_tx_target: StdMutex<Option<String>>,
+    inside_admission_tx_target: StdMutex<Option<String>>,
     full_notify: Arc<tokio::sync::Notify>,
     failure_notify: Arc<tokio::sync::Notify>,
     http_notify: Arc<tokio::sync::Notify>,
@@ -216,6 +218,7 @@ impl Default for AdmissionTestProbe {
             phase2_entry: AdmissionTestBarrier::default(),
             embedded_idle_wait: AdmissionTestBarrier::default(),
             before_admission_tx: AdmissionTestBarrier::default(),
+            inside_admission_tx: AdmissionTestBarrier::default(),
             enqueue_attempts: AtomicUsize::new(0),
             queue_inserts: AtomicUsize::new(0),
             coalesces: AtomicUsize::new(0),
@@ -233,6 +236,7 @@ impl Default for AdmissionTestProbe {
             failure_targets: StdMutex::new(Vec::new()),
             http_trace: StdMutex::new(Vec::new()),
             admission_tx_target: StdMutex::new(None),
+            inside_admission_tx_target: StdMutex::new(None),
             full_notify: Arc::new(tokio::sync::Notify::new()),
             failure_notify: Arc::new(tokio::sync::Notify::new()),
             http_notify: Arc::new(tokio::sync::Notify::new()),
@@ -248,6 +252,14 @@ impl AdmissionTestProbe {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(commit.to_string());
         self.before_admission_tx.arm();
+    }
+
+    pub fn hold_inside_admission_transaction(&self, commit: &str) {
+        *self
+            .inside_admission_tx_target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(commit.to_string());
+        self.inside_admission_tx.arm();
     }
 
     pub async fn wait_until_full_published(&self, count: usize) {
@@ -325,6 +337,7 @@ impl Drop for AdmissionTestProbeGuard {
         self.probe.phase2_entry.disarm();
         self.probe.embedded_idle_wait.disarm();
         self.probe.before_admission_tx.disarm();
+        self.probe.inside_admission_tx.disarm();
         let mut slot = ADMISSION_TEST_PROBE
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -367,6 +380,20 @@ async fn admission_test_before_admission_tx(commit: &str) {
             == Some(commit);
         if held {
             probe.before_admission_tx.wait().await;
+        }
+    }
+}
+
+pub(crate) async fn admission_test_inside_admission_tx(commit: &str) {
+    if let Some(probe) = admission_test_probe() {
+        let held = probe
+            .inside_admission_tx_target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(commit);
+        if held {
+            probe.inside_admission_tx.wait().await;
         }
     }
 }
