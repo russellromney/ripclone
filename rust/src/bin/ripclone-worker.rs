@@ -264,6 +264,7 @@ async fn main() -> Result<()> {
                     branch: branch.clone(),
                     admitted_commit,
                     admitted_default_branch: claimed.admitted_default_branch,
+                    repo_config: claimed.repo_config,
                     credential,
                     size_bytes: None,
                 };

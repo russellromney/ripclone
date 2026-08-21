@@ -37,6 +37,10 @@ pub struct BuildJob {
     /// Trusted concrete upstream default branch learned alongside a HEAD tip
     /// admission. This is publication metadata, not part of the active key.
     pub admitted_default_branch: Option<String>,
+    /// Validated repository build settings captured by the server at
+    /// admission. Workers use this immutable snapshot and never read live
+    /// repository configuration.
+    pub repo_config: crate::repo_config::RepoConfig,
     /// Upstream credential (Tier-B passthrough) for the mirror fetch. The jobs
     /// table stores an obfuscated copy until claim or finish.
     pub credential: Option<secrecy::SecretString>,

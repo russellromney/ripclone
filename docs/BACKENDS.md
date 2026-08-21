@@ -106,8 +106,21 @@ Configuration-file fields are `[storage].backend`, `endpoint`, `region`,
 `bucket`, `prefix`, and `cache_dir`. Credentials remain environment-only.
 Supported services include AWS S3, Cloudflare R2, Tigris, and MinIO.
 
-S3 stores clonepack artifacts only. It never stores refs, jobs, claims,
-heartbeats, or any other control state.
+S3 stores clonepack artifacts only. It never stores refs, repository build
+settings, jobs, claims, heartbeats, or any other control state.
+
+## Repository build settings
+
+The server stores one build-settings record per repository in the control
+database. `GET` and `POST /v1/admin/config/{owner}/{repo}` read and replace that
+record. A repository with no record uses the documented defaults: shallow and
+full clonepacks with zstd level 6. Only an absent row selects defaults; a
+database, decode, or validation error rejects admission.
+
+The server snapshots the validated settings into each durable job. Embedded
+and API-only workers use that snapshot, so changing a repository's settings
+does not alter work already admitted. Branch-level overrides were removed;
+requests containing the old `?branch=` query fail without changing state.
 
 ## Queue policy
 
@@ -127,4 +140,5 @@ Size classes can also be declared as `[[control.size_classes]]` entries with
 The server and worker fail closed if old metadata, queue, or dispatcher
 selectors and database connection fields are present. PostgreSQL, MySQL, direct
 remote libSQL/sqld, file/S3 control stores, and the in-memory queue are not
-supported. There is no dual-read or dual-write compatibility mode.
+supported. File/S3 repository-config objects and branch overrides are also
+unreadable. There is no dual-read or dual-write compatibility mode.

@@ -716,7 +716,6 @@ async fn start_server_split_storage_inner(
     );
     let state = ServerState {
         cas,
-        repo_config: Arc::new(ripclone::repo_config::RepoConfigStore::new(storage.clone())),
         storage,
         repo_root: repo_root.clone(),
         ref_store,
@@ -776,6 +775,7 @@ async fn start_server_split_storage_inner(
                     branch: claimed.branch,
                     admitted_commit: claimed.admitted_commit,
                     admitted_default_branch: claimed.admitted_default_branch,
+                    repo_config: claimed.repo_config,
                     credential: claimed.credential,
                     size_bytes: None,
                 };

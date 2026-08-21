@@ -1,8 +1,9 @@
 //! The server-owned SQLite control database.
 //!
-//! Refs, added repositories, durable jobs, attempts, claims, and worker
-//! heartbeats share one schema and one local path. Plain SQLite is the default;
-//! the only replicated mode is a Turso embedded replica at that same path.
+//! Refs, added repositories, repository build settings, durable jobs, attempts,
+//! claims, and worker heartbeats share one schema and one local path. Plain
+//! SQLite is the default; the only replicated mode is a Turso embedded replica
+//! at that same path.
 
 use crate::meta::{LibsqlMeta, SqlRefStore};
 use crate::queue::{BuildJob, EnqueueOutcome, Enqueued, LibsqlDb, SizeClass, SqlJobQueue};
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct TursoReplicaConfig {
@@ -290,6 +291,64 @@ impl ControlDb {
         self.admission_notify.clone()
     }
 
+    /// Load the single repository-level build configuration record. Only a
+    /// genuinely absent row returns `None`; database, decode, and validation
+    /// failures are propagated so admission cannot silently select defaults.
+    pub async fn repository_config(
+        &self,
+        repo_id: &crate::provider::RepoId,
+    ) -> Result<Option<crate::repo_config::RepoConfig>> {
+        let connection = self
+            .database
+            .connect()
+            .context("connect to read repository config")?;
+        let mut rows = connection
+            .query(
+                "SELECT data FROM repository_configs WHERE repo_key = ?1",
+                [repo_id.storage_key()],
+            )
+            .await
+            .with_context(|| format!("read repository config {}", repo_id.storage_key()))?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let config: crate::repo_config::RepoConfig =
+            serde_json::from_str(&row.get::<String>(0)?)
+                .with_context(|| format!("decode repository config {}", repo_id.storage_key()))?;
+        config
+            .validate()
+            .with_context(|| format!("validate repository config {}", repo_id.storage_key()))?;
+        Ok(Some(config))
+    }
+
+    /// Store one validated repository-level build configuration record.
+    pub async fn put_repository_config(
+        &self,
+        repo_id: &crate::provider::RepoId,
+        config: &crate::repo_config::RepoConfig,
+    ) -> Result<()> {
+        config
+            .validate()
+            .with_context(|| format!("validate repository config {}", repo_id.storage_key()))?;
+        let data = serde_json::to_string(config).context("encode repository config")?;
+        let connection = self
+            .database
+            .connect()
+            .context("connect to write repository config")?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .context("configure repository config busy timeout")?;
+        connection
+            .execute(
+                "INSERT INTO repository_configs(repo_key, data) VALUES (?1, ?2)
+                 ON CONFLICT(repo_key) DO UPDATE SET data = excluded.data",
+                libsql::params![repo_id.storage_key(), data],
+            )
+            .await
+            .with_context(|| format!("write repository config {}", repo_id.storage_key()))?;
+        Ok(())
+    }
+
     /// Atomically create/replace the exact pending row, link the temporary
     /// moving-publication fence when supplied, and enqueue or join the durable
     /// job. No worker can observe the job without its exact result row.
@@ -300,10 +359,16 @@ impl ControlDb {
         pending: &crate::RefInfo,
         moving_authorized: bool,
     ) -> Result<Enqueued> {
+        job.repo_config
+            .validate()
+            .context("validate admitted repository config")?;
+        let repo_config =
+            serde_json::to_string(&job.repo_config).context("encode admitted repository config")?;
         let result = self
             .admit(
                 &self.database,
                 job,
+                &repo_config,
                 exact_branch,
                 pending,
                 moving_authorized,
@@ -319,6 +384,7 @@ impl ControlDb {
         &self,
         database: &Database,
         job: &BuildJob,
+        repo_config: &str,
         exact_branch: &str,
         pending: &crate::RefInfo,
         moving_authorized: bool,
@@ -351,8 +417,8 @@ impl ControlDb {
             .execute(
                 "INSERT OR IGNORE INTO jobs
                  (key, provider, path, branch, status, created_at, admitted_commit,
-                  admitted_default_branch, credential, attempts, size_class)
-                 VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, 0, ?9)",
+                  admitted_default_branch, repo_config, credential, attempts, size_class)
+                 VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9, 0, ?10)",
                 libsql::params![
                     key.clone(),
                     job.repo_id.provider.as_str(),
@@ -361,6 +427,7 @@ impl ControlDb {
                     crate::queue::sql::now_secs(),
                     job.admitted_commit.as_str(),
                     job.admitted_default_branch.as_deref(),
+                    repo_config,
                     credential.as_deref(),
                     size_class
                 ],
@@ -726,6 +793,15 @@ async fn validate_or_initialize_schema(database: &Database, path: &Path) -> Resu
         )
         .await
         .context("write control schema version")?;
+        tx.execute(
+            "CREATE TABLE repository_configs (
+                 repo_key TEXT PRIMARY KEY,
+                 data TEXT NOT NULL
+             )",
+            (),
+        )
+        .await
+        .context("create repository configs table")?;
     }
     tx.commit().await.context("commit control schema check")
 }
@@ -792,6 +868,7 @@ mod tests {
             branch: "main".to_string(),
             admitted_commit: commit.to_string(),
             admitted_default_branch: Some("main".to_string()),
+            repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,
         }
@@ -805,6 +882,146 @@ mod tests {
             build_status: Some("queued".to_string()),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn repository_config_persists_and_absence_does_not_insert_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let repo_id = crate::provider::RepoId::github("acme/configured");
+        let missing = crate::provider::RepoId::github("acme/missing");
+        let config = crate::repo_config::RepoConfig {
+            compression_level: Some(3),
+            archive_chunk_size: Some(1024),
+            ..Default::default()
+        };
+        {
+            let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+                .await
+                .unwrap();
+            assert!(control.repository_config(&missing).await.unwrap().is_none());
+            control
+                .put_repository_config(&repo_id, &config)
+                .await
+                .unwrap();
+
+            let connection = control.database.connect().unwrap();
+            let mut rows = connection
+                .query("SELECT COUNT(*) FROM repository_configs", ())
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                1
+            );
+        }
+
+        let reopened = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.repository_config(&repo_id).await.unwrap(),
+            Some(config)
+        );
+        assert!(
+            reopened
+                .repository_config(&missing)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_invalid_repository_config_fails_instead_of_defaulting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        let repo_id = crate::provider::RepoId::github("acme/corrupt");
+        let connection = control.database.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO repository_configs(repo_key, data) VALUES (?1, ?2)",
+                libsql::params![repo_id.storage_key(), "not-json"],
+            )
+            .await
+            .unwrap();
+        let decode = control.repository_config(&repo_id).await.unwrap_err();
+        assert!(decode.to_string().contains("decode repository config"));
+
+        connection
+            .execute(
+                "UPDATE repository_configs SET data = ?1 WHERE repo_key = ?2",
+                libsql::params![r#"{"compression_level":99}"#, repo_id.storage_key()],
+            )
+            .await
+            .unwrap();
+        let invalid = control.repository_config(&repo_id).await.unwrap_err();
+        assert!(invalid.to_string().contains("validate repository config"));
+    }
+
+    #[tokio::test]
+    async fn admission_snapshots_repository_config_without_materializing_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        let repo_id = crate::provider::RepoId::github("acme/control");
+        let admitted_config = crate::repo_config::RepoConfig {
+            compression_level: Some(3),
+            ..Default::default()
+        };
+        control
+            .put_repository_config(&repo_id, &admitted_config)
+            .await
+            .unwrap();
+        let commit = "dddddddddddddddddddddddddddddddddddddddd";
+        let mut admitted_job = job(commit);
+        admitted_job.repo_config = control.repository_config(&repo_id).await.unwrap().unwrap();
+        control
+            .admit_exact_and_job(
+                &admitted_job,
+                &crate::ref_store::exact_ref_key("main", commit),
+                &pending(commit),
+                false,
+            )
+            .await
+            .unwrap();
+        control
+            .put_repository_config(
+                &repo_id,
+                &crate::repo_config::RepoConfig {
+                    compression_level: Some(19),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = control
+            .queue()
+            .claim("snapshot-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.repo_config, admitted_config);
+
+        let missing = crate::provider::RepoId::github("acme/no-config-row");
+        assert!(control.repository_config(&missing).await.unwrap().is_none());
+        let mut default_job = job("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        default_job.repo_id = missing.clone();
+        control
+            .admit_exact_and_job(
+                &default_job,
+                &crate::ref_store::exact_ref_key("main", &default_job.admitted_commit),
+                &pending(&default_job.admitted_commit),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(control.repository_config(&missing).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -525,9 +525,6 @@ pub struct ServerState {
     pub storage: StorageRef,
     pub repo_root: PathBuf,
     pub ref_store: Arc<dyn RefStore>,
-    /// Per-repo / per-branch build configuration (ROADMAP §2a). Read at build
-    /// time; absent config means today's default (shallow + full).
-    pub repo_config: Arc<crate::repo_config::RepoConfigStore>,
     pub provider_registry: ProviderRegistry,
     pub broker: Arc<dyn CredentialBroker>,
     pub token_hash: Option<String>,
@@ -605,7 +602,6 @@ impl ServerState {
         let broker = broker_from_env(provider_registry.clone())?;
         Ok(ServerState {
             cas: b.cas,
-            repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(b.storage.clone())),
             storage: b.storage,
             repo_root: b.repo_root,
             ref_store: b.ref_store,
@@ -1120,8 +1116,8 @@ pub fn build_app(state: ServerState) -> Router {
         // the Bearer); it mints a fresh one before the current expires.
         .route("/v1/auth/refresh", post(auth_refresh_handler))
         .route("/v1/artifacts/{hash}", get(get_artifact))
-        // Per-repo build config (ROADMAP §2a): read/write the repo-level config,
-        // or a branch-level override via `?branch=`.
+        // Repository build settings. Legacy `?branch=` queries are parsed only
+        // to return a clear fail-closed error.
         .route(
             "/v1/admin/config/{owner}/{repo}",
             get(admin_get_config).post(admin_put_config),
@@ -1823,6 +1819,7 @@ async fn job_claim_handler(
                 branch: c.branch,
                 admitted_commit: c.admitted_commit,
                 admitted_default_branch: c.admitted_default_branch,
+                repo_config: c.repo_config,
                 credential: c.credential.map(|s| s.expose_secret().to_string()),
             });
             (StatusCode::OK, Json(ClaimResponse { job })).into_response()
@@ -3086,6 +3083,7 @@ async fn get_ref_inner(
                             .as_ref()
                             .filter(|info| !info.default_branch.is_empty())
                             .map(|info| info.default_branch.clone()),
+                        repo_config: crate::repo_config::RepoConfig::default(),
                         credential: credential.clone(),
                         // Recovery is for the requested commit only. Do not
                         // launch the moving-tip freshness probe after it finishes.
@@ -3438,6 +3436,7 @@ async fn get_ref_inner(
                         branch: effective_branch.clone(),
                         admitted_commit: commit.clone(),
                         admitted_default_branch: Some(default_branch.clone()),
+                        repo_config: crate::repo_config::RepoConfig::default(),
                         credential: credential.clone(),
                         size_bytes,
                     };
@@ -4157,6 +4156,7 @@ async fn sync_repo_inner(
         branch: admitted_branch.clone(),
         admitted_commit: commit.clone(),
         admitted_default_branch,
+        repo_config: crate::repo_config::RepoConfig::default(),
         credential,
         size_bytes,
     };
@@ -4393,6 +4393,7 @@ async fn sync_repo_at_revision(
         branch: branch.clone(),
         admitted_commit: at_rev.clone(),
         admitted_default_branch: Some(branch.clone()),
+        repo_config: crate::repo_config::RepoConfig::default(),
         credential,
         size_bytes,
     };
@@ -4577,11 +4578,25 @@ fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
 /// rows.
 async fn enqueue_admitted_build(
     state: &ServerState,
-    job: BuildJob,
+    mut job: BuildJob,
     moving_authorized: bool,
 ) -> Result<EnqueueOutcome, String> {
     crate::validation::validate_object_id(&job.admitted_commit)
         .map_err(|e| format!("invalid admitted commit: {e}"))?;
+    job.repo_config = match &state.control_db {
+        Some(control) => control
+            .repository_config(&job.repo_id)
+            .await
+            .map_err(|error| format!("repository config read failed: {error:#}"))?
+            .unwrap_or_default(),
+        #[cfg(test)]
+        None => job.repo_config,
+        #[cfg(not(test))]
+        None => return Err("server control database is unavailable".to_string()),
+    };
+    job.repo_config
+        .validate()
+        .map_err(|error| format!("repository config validation failed: {error:#}"))?;
     let Some(admission) = prepare_exact_admission(state, &job, moving_authorized).await? else {
         state.metrics.record_build_accepted();
         admission_test_enqueue(EnqueueOutcome::Coalesced);
@@ -4920,6 +4935,7 @@ async fn trigger_build(
         branch: branch.to_string(),
         admitted_commit,
         admitted_default_branch,
+        repo_config: crate::repo_config::RepoConfig::default(),
         credential,
         size_bytes,
     };
@@ -4927,16 +4943,16 @@ async fn trigger_build(
     enqueue_admitted_build(state, job, moving_authorized).await
 }
 
-/// Query for the admin config endpoints: an optional branch selects a
-/// branch-level override; absent means the repo-level config.
+/// Legacy branch selectors are parsed only so they can fail closed without
+/// changing repository configuration or admitting work.
 #[derive(Deserialize)]
 struct AdminConfigQuery {
     #[serde(default)]
     branch: Option<String>,
 }
 
-/// `GET /v1/admin/config/{owner}/{repo}` — return the stored repo- or
-/// branch-level config (404 if none is stored).
+/// `GET /v1/admin/config/{owner}/{repo}` — return the stored repository config
+/// (404 if none is stored).
 async fn admin_get_config(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<AdminConfigQuery>,
@@ -4945,17 +4961,34 @@ async fn admin_get_config(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
+    if query.branch.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "branch-level repository configuration is no longer supported".to_string(),
+            }),
+        )
+            .into_response();
+    }
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let loaded = match query.branch.as_deref().filter(|b| !b.is_empty()) {
-        Some(branch) => state.repo_config.get_branch(&repo_id, branch).await,
-        None => state.repo_config.get_repo(&repo_id).await,
+    let loaded = match &state.control_db {
+        Some(control) => control.repository_config(&repo_id).await,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "server control database is unavailable".to_string(),
+                }),
+            )
+                .into_response();
+        }
     };
     match loaded {
         Ok(Some(config)) => (StatusCode::OK, Json(config)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: "no config stored for this repo/branch".to_string(),
+                error: "no config stored for this repository".to_string(),
             }),
         )
             .into_response(),
@@ -4972,9 +5005,9 @@ async fn admin_get_config(
     }
 }
 
-/// `POST /v1/admin/config/{owner}/{repo}` — store the repo- or branch-level
-/// config. The body is a `RepoConfig`; it is validated before being written.
-/// The next sync/build for the repo reads it.
+/// `POST /v1/admin/config/{owner}/{repo}` — store the repository config. The
+/// body is validated before the control database is written; the next admitted
+/// job snapshots it.
 async fn admin_put_config(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<AdminConfigQuery>,
@@ -4983,6 +5016,15 @@ async fn admin_put_config(
 ) -> Response {
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
+    }
+    if query.branch.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "branch-level repository configuration is no longer supported".to_string(),
+            }),
+        )
+            .into_response();
     }
     if let Err(e) = config.validate() {
         return (
@@ -4994,14 +5036,17 @@ async fn admin_put_config(
             .into_response();
     }
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let stored = match query.branch.as_deref().filter(|b| !b.is_empty()) {
-        Some(branch) => {
-            state
-                .repo_config
-                .put_branch(&repo_id, branch, &config)
-                .await
+    let stored = match &state.control_db {
+        Some(control) => control.put_repository_config(&repo_id, &config).await,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "server control database is unavailable".to_string(),
+                }),
+            )
+                .into_response();
         }
-        None => state.repo_config.put_repo(&repo_id, &config).await,
     };
     match stored {
         Ok(()) => (StatusCode::OK, Json(config)).into_response(),
@@ -6276,27 +6321,6 @@ fn seed_bare_mirror_from_clonepack(
     Ok(bytes)
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Load the effective per-repo/branch build config, falling back to the default
-/// (today's behavior) if the store read fails — a config-store hiccup must never
-/// block a build.
-async fn effective_repo_config(
-    state: &ServerState,
-    repo_id: &RepoId,
-    branch: &str,
-) -> crate::repo_config::RepoConfig {
-    match state.repo_config.effective(repo_id, branch).await {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!(
-                "repo config load for {} failed ({e:#}); using defaults",
-                repo_id.storage_key()
-            );
-            crate::repo_config::RepoConfig::default()
-        }
-    }
-}
-
 async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
@@ -6314,8 +6338,7 @@ async fn do_sync(
     retention: &Arc<Retention>,
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
-    // Effective per-repo/branch build config (ROADMAP §2a). Default config
-    // reproduces today's build exactly.
+    // Validated repository config snapshotted into the durable job at admission.
     repo_config: &crate::repo_config::RepoConfig,
     // Per-repo lock. do_sync holds it only while mutating the mirror (fetch +
     // commit-graph), then drops it before the heavy read-only build, so different
@@ -7739,6 +7762,11 @@ async fn process_build_job_with_foreground_release(
             "build job has invalid admitted commit: {e}"
         )));
     }
+    if let Err(error) = job.repo_config.validate() {
+        return Err(BuildError::permanent(format!(
+            "build job has invalid repository config: {error:#}"
+        )));
+    }
     // Mark as building in the shared metadata store.
     if let Err(e) = update_job_build_status(state, job, branch, "building").await {
         error!(
@@ -7777,7 +7805,6 @@ async fn process_build_job_with_foreground_release(
     let lock = repo_lock(&state.sync_locks, repo_id).await;
     // Every accepted job owns Head, Files, and Full until terminal settlement.
     // No phase is detached from the durable claim.
-    let repo_config = effective_repo_config(state, repo_id, branch).await;
     let result = do_sync(
         &state.cas,
         &mirror_dir,
@@ -7790,7 +7817,7 @@ async fn process_build_job_with_foreground_release(
         &state.retention,
         &provider,
         job.credential.as_ref(),
-        &repo_config,
+        &job.repo_config,
         &lock,
         foreground_release,
     )
@@ -8079,6 +8106,7 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                     branch: branch.clone(),
                                     admitted_commit: admitted_commit.clone(),
                                     admitted_default_branch: claimed.admitted_default_branch,
+                                    repo_config: claimed.repo_config,
                                     credential,
                                     size_bytes: None,
                                 };
@@ -8578,7 +8606,6 @@ async fn run_server_with_barrier_at_control(
 
     let state = ServerState {
         cas: b.cas,
-        repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(b.storage.clone())),
         storage: b.storage,
         repo_root: repo_root.to_path_buf(),
         ref_store: b.ref_store,
@@ -9112,7 +9139,6 @@ mod tests {
         ));
         ServerState {
             cas,
-            repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(storage.clone())),
             storage,
             repo_root,
             ref_store,
@@ -9334,6 +9360,7 @@ mod tests {
             branch: effective_branch.clone(),
             admitted_commit: tip.commit.clone(),
             admitted_default_branch: tip.default_branch.clone(),
+            repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,
         };
@@ -10610,6 +10637,7 @@ mod tests {
             branch: "main".to_string(),
             admitted_commit: missing.clone(),
             admitted_default_branch: Some("main".to_string()),
+            repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,
         };

@@ -1,21 +1,16 @@
-//! Server-side per-repo / per-branch build configuration (ROADMAP §2a).
+//! Server-side repository build configuration.
 //!
-//! A `RepoConfig` tells the server how to build a repo's clonepacks: which depth
-//! variants to produce, the zstd compression level, archive/head-blobs chunk
-//! sizes, and an optional dictionary. It is stored in the same backend as artifacts (file locally, S3 in
-//! production) via the storage layer's keyed metadata objects, written live by
-//! the admin endpoint and read fresh on each build — no restart needed.
-//!
-//! Config is read only at build time. The build records the resulting variant
-//! names into the `RefInfo`, so the resolve/clone hot path never has to read config.
+//! A `RepoConfig` tells the server how to build a repository's clonepacks:
+//! which depth variants to produce, the zstd compression level,
+//! archive/head-blobs chunk sizes, and an optional dictionary. The server-owned
+//! control database stores one record per repository. Admission snapshots the
+//! validated result into the durable job, so workers never read live config.
 //!
 //! A repo with no stored config uses [`RepoConfig::default`], which reproduces
 //! today's behavior exactly: a `shallow` (depth 1) and a `full` (unlimited)
 //! clonepack and zstd level 6.
 
-use crate::provider::RepoId;
-use crate::storage::StorageRef;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Default zstd compression level used for archive frames (matches the level the
@@ -35,9 +30,8 @@ pub struct DepthSpec {
     pub depth: Option<usize>,
 }
 
-/// Per-repo / per-branch build configuration. Every field is optional so a
-/// partial config (e.g. only `compression_level`) merges cleanly over the
-/// defaults; an empty config behaves exactly like today.
+/// Per-repository build configuration. Every field is optional; an empty
+/// config behaves exactly like the documented defaults.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
@@ -98,26 +92,6 @@ impl RepoConfig {
         self.compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL)
     }
 
-    /// Field-level overlay of `branch` config over `self` (the repo-level
-    /// config): each field the branch sets wins; unset branch fields keep the
-    /// repo value. This is how branch entries override repo entries.
-    pub fn overlay(&self, branch: &RepoConfig) -> RepoConfig {
-        RepoConfig {
-            clonepack_depths: if branch.clonepack_depths.is_empty() {
-                self.clonepack_depths.clone()
-            } else {
-                branch.clonepack_depths.clone()
-            },
-            compression_level: branch.compression_level.or(self.compression_level),
-            dictionary_id: branch
-                .dictionary_id
-                .clone()
-                .or_else(|| self.dictionary_id.clone()),
-            archive_chunk_size: branch.archive_chunk_size.or(self.archive_chunk_size),
-            head_blobs_chunk_size: branch.head_blobs_chunk_size.or(self.head_blobs_chunk_size),
-        }
-    }
-
     /// Validate the config. Returns an error describing the first problem.
     ///
     /// Option A supports exactly the two structural variants the build can emit
@@ -163,99 +137,6 @@ impl RepoConfig {
     }
 }
 
-/// Storage key for a repo-level config object.
-fn repo_key(repo_id: &RepoId) -> String {
-    format!("repo-config/{}.json", repo_id.storage_key())
-}
-
-/// Storage key for a branch-level config object. The branch is slugified so
-/// `feature/x` can't introduce extra path segments.
-fn branch_key(repo_id: &RepoId, branch: &str) -> String {
-    format!(
-        "repo-config/{}/branches/{}.json",
-        repo_id.storage_key(),
-        branch_slug(branch)
-    )
-}
-
-/// Make a branch name safe for a single key segment (mirrors the ref store).
-fn branch_slug(branch: &str) -> String {
-    branch
-        .chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
-            _ => '_',
-        })
-        .collect()
-}
-
-/// Reads and writes [`RepoConfig`] objects in the same storage backend as
-/// artifacts (file or S3), via the keyed-metadata API. Config is read at build
-/// time only, so this is deliberately cache-free: a write is visible to the next
-/// build immediately, across processes.
-pub struct RepoConfigStore {
-    storage: StorageRef,
-}
-
-impl RepoConfigStore {
-    pub fn new(storage: StorageRef) -> Self {
-        Self { storage }
-    }
-
-    /// Load the raw repo-level config, if any.
-    pub async fn get_repo(&self, repo_id: &RepoId) -> Result<Option<RepoConfig>> {
-        self.load(&repo_key(repo_id)).await
-    }
-
-    /// Load the raw branch-level config, if any.
-    pub async fn get_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RepoConfig>> {
-        self.load(&branch_key(repo_id, branch)).await
-    }
-
-    /// The effective config for `repo_id`@`branch`: the repo-level config with
-    /// the branch-level config overlaid on top, or [`RepoConfig::default`] when
-    /// neither is stored.
-    pub async fn effective(&self, repo_id: &RepoId, branch: &str) -> Result<RepoConfig> {
-        let repo = self.get_repo(repo_id).await?.unwrap_or_default();
-        let merged = match self.get_branch(repo_id, branch).await? {
-            Some(branch_cfg) => repo.overlay(&branch_cfg),
-            None => repo,
-        };
-        Ok(merged)
-    }
-
-    /// Store a repo-level config (validated by the caller).
-    pub async fn put_repo(&self, repo_id: &RepoId, config: &RepoConfig) -> Result<()> {
-        self.store(&repo_key(repo_id), config).await
-    }
-
-    /// Store a branch-level config (validated by the caller).
-    pub async fn put_branch(
-        &self,
-        repo_id: &RepoId,
-        branch: &str,
-        config: &RepoConfig,
-    ) -> Result<()> {
-        self.store(&branch_key(repo_id, branch), config).await
-    }
-
-    async fn load(&self, key: &str) -> Result<Option<RepoConfig>> {
-        match self.storage.get_meta(key).await? {
-            Some(bytes) => {
-                let cfg = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("parse repo config {key}"))?;
-                Ok(Some(cfg))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn store(&self, key: &str, config: &RepoConfig) -> Result<()> {
-        let data = serde_json::to_vec_pretty(config).context("serialize repo config")?;
-        self.storage.put_meta(key, &data).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,41 +165,6 @@ mod tests {
     }
 
     #[test]
-    fn branch_overlay_overrides_only_set_fields() {
-        let repo = RepoConfig {
-            compression_level: Some(9),
-            archive_chunk_size: Some(20),
-            ..Default::default()
-        };
-        let branch = RepoConfig {
-            archive_chunk_size: Some(50),
-            ..Default::default()
-        };
-        let merged = repo.overlay(&branch);
-        assert_eq!(merged.archive_chunk_size, Some(50));
-        assert_eq!(merged.compression_level, Some(9));
-    }
-
-    #[test]
-    fn branch_depths_replace_repo_depths_wholesale() {
-        let repo = RepoConfig {
-            clonepack_depths: vec![DepthSpec {
-                name: "shallow".into(),
-                depth: Some(1),
-            }],
-            ..Default::default()
-        };
-        let branch = RepoConfig {
-            clonepack_depths: vec![DepthSpec {
-                name: "full".into(),
-                depth: None,
-            }],
-            ..Default::default()
-        };
-        let merged = repo.overlay(&branch);
-        assert_eq!(merged.clonepack_depths, branch.clonepack_depths);
-    }
-
     #[test]
     fn validate_rejects_bad_values() {
         assert!(
@@ -402,45 +248,5 @@ mod tests {
         )
         .expect_err("nested unknown clonepack fields must not be silently ignored");
         assert!(nested.to_string().contains("unknown field `unexpected`"));
-    }
-
-    #[tokio::test]
-    async fn store_round_trips_repo_and_branch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let storage = crate::storage::local(tmp.path()).unwrap();
-        let store = RepoConfigStore::new(storage);
-        let repo = RepoId::github("acme/widget");
-
-        // Absent until written.
-        assert!(store.get_repo(&repo).await.unwrap().is_none());
-        assert_eq!(
-            store.effective(&repo, "main").await.unwrap(),
-            RepoConfig::default()
-        );
-
-        let repo_cfg = RepoConfig {
-            compression_level: Some(10),
-            archive_chunk_size: Some(7),
-            ..Default::default()
-        };
-        store.put_repo(&repo, &repo_cfg).await.unwrap();
-        assert_eq!(store.get_repo(&repo).await.unwrap().unwrap(), repo_cfg);
-
-        // Branch override merges over the repo config.
-        let branch_cfg = RepoConfig {
-            archive_chunk_size: Some(99),
-            ..Default::default()
-        };
-        store
-            .put_branch(&repo, "release", &branch_cfg)
-            .await
-            .unwrap();
-        let effective = store.effective(&repo, "release").await.unwrap();
-        assert_eq!(effective.archive_chunk_size, Some(99));
-        assert_eq!(effective.compression_level, Some(10));
-
-        // A different branch with no entry sees only the repo config.
-        let other = store.effective(&repo, "main").await.unwrap();
-        assert_eq!(other.archive_chunk_size, Some(7));
     }
 }

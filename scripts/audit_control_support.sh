@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PATTERN='RIPCLONE_(METADATA($|[^A-Z_])|METADATA_DB_|QUEUE($|[^A-Z_])|QUEUE_DB_|DISPATCH($|[^A-Z_])|DISPATCH_|HEARTBEAT_URL|RECHECK_MAX|REF_CACHE_TTL_SECS)|postgres://|mysql://|tokio-postgres|mysql_async|sqlx.*/(postgres|mysql)'
+PATTERN='RIPCLONE_(METADATA($|[^A-Z_])|METADATA_DB_|QUEUE($|[^A-Z_])|QUEUE_DB_|DISPATCH($|[^A-Z_])|DISPATCH_|HEARTBEAT_URL|RECHECK_MAX|REF_CACHE_TTL_SECS)|postgres://|mysql://|tokio-postgres|mysql_async|sqlx.*/(postgres|mysql)|branch-level repository configuration|repo-config/.*/branches'
 
 matches="$(cd "$ROOT" && git grep -nE "$PATTERN" -- . ':!scripts/audit_control_support.sh' || true)"
 allowed=0
@@ -13,7 +13,7 @@ while IFS= read -r line; do
   [ -n "$line" ] || continue
   path="${line%%:*}"
   case "$path" in
-    rust/src/control.rs|rust/tests/control_startup.rs|rust/tests/e2e_token_only_worker.rs|docs/BACKENDS.md|docs/CONFIG.md|docs/CHANGELOG.md|docs/internal/*)
+    rust/src/control.rs|rust/src/server.rs|rust/tests/control_startup.rs|rust/tests/e2e_token_only_worker.rs|rust/tests/suites/local_default/e2e_repo_config.rs|docs/BACKENDS.md|docs/CONFIG.md|docs/CHANGELOG.md|docs/internal/*)
       allowed=$((allowed + 1))
       ;;
     *)
@@ -53,5 +53,20 @@ do
     exit 1
   fi
 done
+
+removed_config_implementation="$(cd "$ROOT" && git grep -nE \
+  'RepoConfigStore|fn (branch_key|overlay)\(' -- rust/src || true)"
+if [ -n "$removed_config_implementation" ]; then
+  echo "removed repository-config implementation is present:" >&2
+  echo "$removed_config_implementation" >&2
+  exit 1
+fi
+
+artifact_config_keys="$(cd "$ROOT" && git grep -n 'repo-config/' -- rust/src || true)"
+if [ -n "$artifact_config_keys" ]; then
+  echo "artifact-backed repository-config key is present in production:" >&2
+  echo "$artifact_config_keys" >&2
+  exit 1
+fi
 
 echo "unsupported-control audit: $allowed allowlisted rejection/compatibility rows; no implementation or dependency escape"

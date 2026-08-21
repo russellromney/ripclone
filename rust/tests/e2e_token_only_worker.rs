@@ -76,6 +76,14 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         })
         .await
         .unwrap();
+    let admitted_config = ripclone::repo_config::RepoConfig {
+        compression_level: Some(3),
+        ..Default::default()
+    };
+    control
+        .put_repository_config(&RepoId::github("acme/api-only"), &admitted_config)
+        .await
+        .unwrap();
     let metrics = ripclone::metrics::Metrics::new();
     let backends = ripclone::backends::Backends::from_env_with_ref_store(
         &cas_dir,
@@ -86,12 +94,10 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     .await
     .unwrap();
     let queue = control.queue();
+    let artifact_storage = backends.storage.clone();
     let provider_registry = ripclone::provider::ProviderRegistry::new();
     let state = ServerState {
         cas: backends.cas,
-        repo_config: Arc::new(ripclone::repo_config::RepoConfigStore::new(
-            backends.storage.clone(),
-        )),
         storage: backends.storage,
         repo_root: repo_root.clone(),
         ref_store: backends.ref_store,
@@ -242,6 +248,19 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     assert_eq!(exact.build_status.as_deref(), Some("full history building"));
     assert!(!exact.shallow_clonepack.manifest.is_empty());
 
+    // The live repository setting may change while Full is in flight, but the
+    // durable job and token-only claim keep the admitted snapshot.
+    control
+        .put_repository_config(
+            &RepoId::github("acme/api-only"),
+            &ripclone::repo_config::RepoConfig {
+                compression_level: Some(19),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
     // Exercise the server's real reclaim path repeatedly for longer than the
     // configured two-second stale bound. Mandatory active heartbeats keep the
     // claim unavailable even though idle fleet heartbeats were not enabled.
@@ -271,6 +290,42 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         queue.live_worker_count().await.unwrap(),
         0,
         "settled API work must not leave a fresh worker-registry row"
+    );
+
+    let snapshot_database = libsql::Builder::new_local(&control_path)
+        .build()
+        .await
+        .unwrap();
+    let snapshot_connection = snapshot_database.connect().unwrap();
+    let mut snapshot_rows = snapshot_connection
+        .query(
+            "SELECT repo_config FROM jobs WHERE path = ?1 ORDER BY id DESC LIMIT 1",
+            ["acme/api-only"],
+        )
+        .await
+        .unwrap();
+    let snapshot: ripclone::repo_config::RepoConfig = serde_json::from_str(
+        &snapshot_rows
+            .next()
+            .await
+            .unwrap()
+            .expect("API worker durable job exists")
+            .get::<String>(0)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot, admitted_config);
+    let removed_config_key = format!(
+        "repo-config/{}.json",
+        RepoId::github("acme/api-only").storage_key()
+    );
+    assert!(
+        artifact_storage
+            .get_meta(&removed_config_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "artifact storage must not receive repository configuration metadata"
     );
 
     let clone = dir.path().join("clone");
@@ -385,6 +440,7 @@ async fn turso_primary_loss_rejects_ref_and_job_writes() {
         branch: "main".to_string(),
         admitted_commit: "1111111111111111111111111111111111111111".to_string(),
         admitted_default_branch: Some("main".to_string()),
+        repo_config: ripclone::repo_config::RepoConfig::default(),
         credential: None,
         size_bytes: None,
     };

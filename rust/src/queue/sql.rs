@@ -73,6 +73,8 @@ pub struct ClaimedJob {
     /// Concrete upstream default branch learned during HEAD admission, when
     /// available. This does not affect coalescing identity.
     pub admitted_default_branch: Option<String>,
+    /// Validated repository build settings snapshotted at admission.
+    pub repo_config: crate::repo_config::RepoConfig,
     /// Per-job upstream credential the enqueuer passed (the cloud's per-request
     /// `X-Upstream-Token`), so a cross-process worker can read a private repo it
     /// has no standing credential for. `None` falls back to the worker's broker.
@@ -134,6 +136,7 @@ pub trait QueueDb: Send + Sync {
         branch: &str,
         admitted_commit: &str,
         admitted_default_branch: Option<&str>,
+        repo_config: &str,
         credential: Option<&str>,
         size_class: i64,
         created_at: i64,
@@ -178,7 +181,7 @@ pub trait QueueDb: Send + Sync {
     async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
 
     /// `(provider, path, branch, admitted_commit, admitted_default_branch,
-    /// credential)` for a job id.
+    /// repo_config, credential)` for a job id.
     /// `credential` is the stored base64 blob (or `None`).
     async fn job_fields(
         &self,
@@ -190,6 +193,7 @@ pub trait QueueDb: Send + Sync {
             String,
             String,
             Option<String>,
+            String,
             Option<String>,
         )>,
     >;
@@ -731,11 +735,17 @@ impl SqlJobQueue {
                     branch,
                     admitted_commit,
                     admitted_default_branch,
+                    repo_config,
                     credential,
                 )) = self.db.job_fields(id).await?
                 else {
                     continue;
                 };
+                let repo_config: crate::repo_config::RepoConfig =
+                    serde_json::from_str(&repo_config).context("decode admitted repo config")?;
+                repo_config
+                    .validate()
+                    .context("validate admitted repo config")?;
                 return Ok(Some(ClaimedJob {
                     id,
                     provider,
@@ -743,6 +753,7 @@ impl SqlJobQueue {
                     branch,
                     admitted_commit,
                     admitted_default_branch,
+                    repo_config,
                     credential: decode_credential(credential),
                 }));
             }
@@ -819,6 +830,11 @@ impl JobQueue for SqlJobQueue {
     async fn enqueue(&self, job: BuildJob) -> Result<Enqueued> {
         crate::validation::validate_object_id(&job.admitted_commit)
             .context("validate admitted build commit")?;
+        job.repo_config
+            .validate()
+            .context("validate admitted repo config")?;
+        let repo_config =
+            serde_json::to_string(&job.repo_config).context("encode admitted repo config")?;
         let key = job.key();
         let size_class = classify_rank(job.size_bytes, &self.size_classes);
         // Best-effort coalesce: fold into an already-active job for this key.
@@ -841,6 +857,7 @@ impl JobQueue for SqlJobQueue {
                 &job.branch,
                 &job.admitted_commit,
                 job.admitted_default_branch.as_deref(),
+                &repo_config,
                 credential.as_deref(),
                 size_class,
                 now_secs(),
@@ -940,6 +957,7 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     error TEXT,
     admitted_commit TEXT NOT NULL,
     admitted_default_branch TEXT,
+    repo_config TEXT NOT NULL,
     credential TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     size_class INTEGER NOT NULL DEFAULT 0
@@ -1001,6 +1019,7 @@ mod tests {
             branch: branch.into(),
             admitted_commit: commit.into(),
             admitted_default_branch: None,
+            repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,
         }
@@ -1136,18 +1155,19 @@ mod tests {
                 "main",
                 "1111111111111111111111111111111111111111",
                 None,
+                "{}",
                 Some("dG9rZW4="),
                 0,
                 1,
             )
             .await
             .unwrap();
-        let (_, _, _, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(before.as_deref(), Some("dG9rZW4="));
         // finish is conditional on owning the claim: claim it as "w" first.
         assert!(db.try_claim(id, "w", 2).await.unwrap());
         assert!(db.finish(id, "w", "done", 3, None).await.unwrap());
-        let (_, _, _, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
         assert!(after.is_none(), "credential must be cleared on finish");
     }
 
@@ -1506,10 +1526,14 @@ mod tests {
                 next_stale_reclaim_at: AtomicI64::new(i64::MIN),
                 stale_reclaim_sweeps: AtomicU64::new(0),
             };
-            q.enqueue(job("o", "r", "main")).await.unwrap();
+            let mut admitted = job("o", "r", "main");
+            admitted.repo_config.compression_level = Some(3);
+            q.enqueue(admitted).await.unwrap();
             let first = q.claim("w1").await.unwrap().unwrap();
             let second = q.claim("w2").await.unwrap().unwrap();
             assert_eq!(first.id, second.id, "{engine}");
+            assert_eq!(first.repo_config.compression_level, Some(3), "{engine}");
+            assert_eq!(second.repo_config, first.repo_config, "{engine}");
         }
     }
 

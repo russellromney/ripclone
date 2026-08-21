@@ -10,8 +10,9 @@
 //!
 //! Wire shapes:
 //! - `POST /v1/jobs/claim` — body `{worker_id, max_size_class?}` → `{job?}`
-//!   where `job = {id, provider, path, branch, credential?}`. Exactly one job
-//!   (or none), scoped to the caller; `credential` is this job's upstream token.
+//!   where `job` includes the exact admitted identity, repository-config
+//!   snapshot, and optional upstream credential. Exactly one job (or none) is
+//!   scoped to the caller.
 //! - `POST /v1/jobs/{id}/ack` — body `{worker_id, result:{ok, retryable, error?}}`
 //!   → `{settled, state, error?}`.
 //! - `POST /v1/jobs/heartbeat` — body `{worker_id, current_job?}` → 200.
@@ -46,7 +47,8 @@ pub struct ClaimRequest {
 
 /// One claimed job on the wire. `credential` is the per-job upstream token the
 /// enqueuer persisted; the worker needs it to fetch a private repo it has no
-/// standing credential for. Sent only to the worker that just claimed this job.
+/// standing credential for. `repo_config` is the validated admission snapshot,
+/// not a database lookup. Sent only to the worker that just claimed this job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimedJobWire {
     pub id: JobId,
@@ -57,6 +59,7 @@ pub struct ClaimedJobWire {
     pub admitted_commit: String,
     #[serde(default)]
     pub admitted_default_branch: Option<String>,
+    pub repo_config: crate::repo_config::RepoConfig,
     #[serde(default)]
     pub credential: Option<String>,
 }
@@ -293,6 +296,7 @@ impl WorkerQueue for ApiJobQueue {
             branch: j.branch,
             admitted_commit: j.admitted_commit,
             admitted_default_branch: j.admitted_default_branch,
+            repo_config: j.repo_config,
             credential: j.credential.map(|c| SecretString::new(c.into())),
         }))
     }

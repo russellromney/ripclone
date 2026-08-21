@@ -89,6 +89,7 @@ impl QueueDb for LibsqlDb {
         branch: &str,
         admitted_commit: &str,
         admitted_default_branch: Option<&str>,
+        repo_config: &str,
         credential: Option<&str>,
         size_class: i64,
         created_at: i64,
@@ -99,8 +100,8 @@ impl QueueDb for LibsqlDb {
             None => libsql::Value::Null,
         };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, branch, admitted_commit, admitted_default_branch, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+            "INSERT INTO jobs (key, provider, path, branch, admitted_commit, admitted_default_branch, repo_config, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
             libsql::params![
                 key,
                 provider,
@@ -108,6 +109,7 @@ impl QueueDb for LibsqlDb {
                 branch,
                 admitted_commit,
                 admitted_default_branch,
+                repo_config,
                 cred_val,
                 size_class,
                 created_at
@@ -251,13 +253,14 @@ impl QueueDb for LibsqlDb {
             String,
             String,
             Option<String>,
+            String,
             Option<String>,
         )>,
     > {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT provider, path, branch, admitted_commit, admitted_default_branch, credential FROM jobs WHERE id = ?",
+                "SELECT provider, path, branch, admitted_commit, admitted_default_branch, repo_config, credential FROM jobs WHERE id = ?",
                 [id],
             )
             .await
@@ -269,7 +272,8 @@ impl QueueDb for LibsqlDb {
                 row.get::<String>(2)?,
                 row.get::<String>(3)?,
                 row.get::<Option<String>>(4)?,
-                row.get::<Option<String>>(5)?,
+                row.get::<String>(5)?,
+                row.get::<Option<String>>(6)?,
             ))),
             None => Ok(None),
         }

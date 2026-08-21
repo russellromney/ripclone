@@ -9,10 +9,16 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 
 ## Server-owned SQLite control state
 
-- **One database owns control state**: refs, added repositories, durable jobs,
-  claims, attempts, and worker heartbeats share one server-owned SQLite schema.
+- **One database owns control state**: refs, added repositories, repository
+  build settings, durable jobs, claims, attempts, and worker heartbeats share
+  one server-owned SQLite schema.
   Exact-result creation, moving-publication fencing, and job admission commit in
   one immediate transaction.
+- **Repository settings are snapshotted at admission.** One validated record per
+  repository lives in SQLite/Turso; each durable job and API claim carries its
+  immutable snapshot. Only a missing row selects defaults. File/S3 config
+  objects and branch overrides are removed, and old `?branch=` requests fail
+  without changing control or artifact state.
 - **Plain SQLite is the default; a Turso embedded replica is the only replicated
   mode.** Local and S3-compatible artifact storage remain independent.
 - **Standalone workers are authenticated API-only.** Active jobs renew their

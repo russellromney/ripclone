@@ -95,7 +95,6 @@ async fn start_server_with_queue(
     );
     let state = ServerState {
         cas,
-        repo_config: Arc::new(ripclone::repo_config::RepoConfigStore::new(storage.clone())),
         storage,
         repo_root: repo_root.clone(),
         ref_store,
