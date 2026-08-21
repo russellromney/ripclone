@@ -27,13 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 79ab3e1df9fc4f932e3273606b44ea93a024998a
+          ref: 7b91cf491f740652378a79d05f7e5ab32d267ba1
       - name: Download exact implementation binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          implementation_run=32438845537
+          implementation_run=32439992529
           for _ in $(seq 1 90); do
             if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${implementation_run}/artifacts" \
               --jq '.artifacts[] | select(.name == "ci-artifacts") | .id' | grep -q .; then
