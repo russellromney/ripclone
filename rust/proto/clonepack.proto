@@ -19,7 +19,7 @@ message ChunkRef {
 message ClonepackManifest {
   string commit = 1;
   optional string parent_commit = 2;
-  string default_branch = 3;
+  reserved 3;
 
   // Metadata chunk holds the small .git artifacts (skeleton pack + idx,
   // prebuilt index) and the file/frame tables needed to decode archive chunks.

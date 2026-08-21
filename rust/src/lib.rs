@@ -206,29 +206,8 @@ pub struct ClonepackArtifacts {
 /// `/v1/artifacts/{hash}`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefInfo {
-    /// Internal commit-addressed result rows are retained and garbage-collected
-    /// like every other ref, but are not source branches in the public status
-    /// model.
-    pub internal_exact_result: bool,
-    /// A moving projection carrying this flag may replace only its own commit or
-    /// one listed in `moving_publication_predecessors`. Stores enforce the check
-    /// atomically with the write.
-    pub require_matching_commit: bool,
-    /// Earlier ordinary admissions that this exact result may replace in the
-    /// moving projection. The first ordinary admission carries an internal
-    /// non-object bootstrap marker; the chain is empty for explicit-only work.
-    /// Stores compare it atomically with the current moving commit, so later
-    /// admitted work can finish before or after its predecessors without being
-    /// regressed.
-    pub moving_publication_predecessors: Vec<String>,
-    /// Later ordinary admissions linked directly from this exact result. New
-    /// admissions follow this chain from the current moving projection instead
-    /// of scanning stored refs. The chain covers only work admitted before the
-    /// moving projection advances past this result.
-    pub moving_admission_successors: Vec<String>,
     pub commit: String,
     pub parent_commit: Option<String>,
-    pub default_branch: String,
     pub skeleton_pack: String,
     pub skeleton_idx: String,
     pub head_blobs_idx: String,
@@ -286,8 +265,7 @@ pub struct RefInfo {
     /// full-history/files artifacts finish and surfaced by `/status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_ms: Option<u64>,
-    /// Unix timestamp (seconds) when this ref was last synced. It is the atomic
-    /// ordering tie-break when either side has no Git generation.
+    /// Unix timestamp (seconds) when this exact result was last synced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<u64>,
     /// Unix timestamp (seconds) when this ref was last considered "warm".
@@ -300,63 +278,4 @@ pub struct RefInfo {
     /// stay warm; the server simply honors it.
     #[serde(default)]
     pub warm_pinned: bool,
-    /// The commit's depth in git history (`git rev-list --count`). This is the
-    /// primary ordering signal for "a newer sync never loses": recency follows
-    /// the commit's place in history, not the builder's clock, so two builders
-    /// with skewed clocks still order correctly. `None` selects the current
-    /// authoritative `synced_at` tie-break.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RefInfo;
-
-    #[test]
-    fn ref_info_rejects_missing_internal_exact_identity() {
-        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("internal_exact_result");
-
-        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
-        assert!(
-            error.to_string().contains("internal_exact_result"),
-            "missing identity must be named clearly: {error}"
-        );
-    }
-
-    #[test]
-    fn ref_info_rejects_missing_moving_publication_identity() {
-        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("moving_publication_predecessors");
-
-        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("moving_publication_predecessors"),
-            "missing publication identity must be named clearly: {error}"
-        );
-    }
-
-    #[test]
-    fn ref_info_rejects_missing_moving_admission_identity() {
-        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("moving_admission_successors");
-
-        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
-        assert!(
-            error.to_string().contains("moving_admission_successors"),
-            "missing admission identity must be named clearly: {error}"
-        );
-    }
 }

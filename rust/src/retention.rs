@@ -390,12 +390,12 @@ mod tests {
         let ref_store: Arc<dyn RefStore> =
             Arc::new(crate::meta::SqlRefStore::new(Box::new(meta)).await.unwrap());
         let info = RefInfo {
-            commit: "c1".to_string(),
+            commit: "1111111111111111111111111111111111111111".to_string(),
             head_blobs_chunks: vec![h.clone()],
             ..Default::default()
         };
         ref_store
-            .save_branch(&RepoId::github("o/r"), "main", &info)
+            .save_result(&RepoId::github("o/r"), &info)
             .await
             .unwrap();
 

@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
                     &requested_branch
                 };
                 let info = client.resolve_ref(&repo_path, branch).await?;
-                let branch_name = effective_branch(branch, &info.default_branch);
+                let branch_name = info.branch.as_str();
                 stdout
                     .write_all(format!("{} refs/heads/{}\n", info.commit, branch_name).as_bytes())
                     .await?;
@@ -289,14 +289,6 @@ fn git_dirs() -> Result<(PathBuf, PathBuf)> {
         .context("GIT_DIR has no parent")?
         .to_path_buf();
     Ok((git_dir, work_tree))
-}
-
-fn effective_branch<'a>(requested: &'a str, default: &'a str) -> &'a str {
-    if requested == "HEAD" {
-        if default.is_empty() { "main" } else { default }
-    } else {
-        requested
-    }
 }
 
 #[cfg(test)]

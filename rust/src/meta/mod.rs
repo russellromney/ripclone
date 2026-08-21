@@ -1,15 +1,9 @@
-//! SQL-backed refs for the server-owned SQLite control database. The official
-//! libsql driver serves both plain local SQLite and Turso embedded replicas.
-//!
-//! [`MetaDb`] is a tiny per-engine adapter that returns plain Rust types (no
-//! engine types leak); [`SqlRefStore`] holds one and implements the existing
-//! [`RefStore`](crate::ref_store::RefStore) trait, owning the `RefInfo`↔JSON
-//! serialization and the save-ordering policy.
+//! Exact results in the server-owned SQLite control database.
 
 use crate::RefInfo;
 use crate::provider::{RepoId, parse_storage_key};
 use crate::ref_store::{AddedRepo, RefStore};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use std::time::SystemTime;
 
@@ -17,113 +11,182 @@ pub mod libsql;
 
 pub use libsql::LibsqlMeta;
 
-/// One stored ref row, decoded to plain types.
 #[derive(Debug, Clone)]
-pub struct RefRow {
-    /// The `RefInfo` serialized as JSON.
+pub struct ResultRow {
     pub data: String,
-    /// The ref's commit, duplicated out of the JSON for the save-ordering check.
-    pub commit_id: String,
-    /// `RefInfo.synced_at` (epoch secs), `None` when the ref has no timestamp.
-    pub synced_at: Option<i64>,
 }
 
-/// Per-engine adapter over a `refs(repo_key, branch, commit_id, synced_at,
-/// data)` table. `repo_key` is the repo's [`RepoId::storage_key`]. Implemented
-/// by `LibsqlMeta` for local SQLite and embedded-replica mode.
 #[async_trait]
 pub trait MetaDb: Send + Sync {
-    /// Create the `refs` table if absent.
     async fn init(&self) -> Result<()>;
-
-    /// Fetch the row for one ref, if present.
-    async fn get(&self, repo_key: &str, branch: &str) -> Result<Option<RefRow>>;
-
-    /// Insert-or-update the row for one ref, applying the save-ordering policy
-    /// ("a newer sync never loses to an older one") in a **single atomic
-    /// statement** — no read-then-write TOCTOU. The write lands when there is no
-    /// existing row, the commit matches (metadata-only update), the new
-    /// `generation` (commit history depth) is >= the stored one, or — for rows
-    /// without a generation — the new `synced_at` is >= the stored one. This
-    /// mirrors [`should_replace_ref`](crate::ref_store) but enforced in SQL so
-    /// concurrent writers across processes can't reorder.
-    ///
-    /// Pairs with the fetch-time `synced_at` stamping in `do_sync`: the stamp
-    /// makes "newer" mean "fetched later", the fallback used when neither side
-    /// carries a generation.
-    async fn save_ordered(
+    async fn get_result(&self, repo_key: &str, commit: &str) -> Result<Option<ResultRow>>;
+    async fn insert_result(&self, repo_key: &str, commit: &str, data: &str) -> Result<bool>;
+    async fn compare_and_swap_result(
         &self,
         repo_key: &str,
-        branch: &str,
-        data: &str,
-        commit_id: &str,
-        synced_at: Option<i64>,
-        generation: Option<i64>,
-        require_matching_commit: bool,
-        internal_exact_result: bool,
-        moving_publication_predecessor: Option<&str>,
-    ) -> Result<()>;
-
-    /// Replace one complete ref row only if it still has both the expected
-    /// commit and expected current JSON blob.
-    async fn compare_and_swap_ref(
-        &self,
-        repo_key: &str,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
         expected_data: &str,
         new_data: &str,
-        new_commit: &str,
-        new_synced_at: Option<i64>,
-        new_generation: Option<i64>,
     ) -> Result<bool>;
-
-    /// Distinct `repo_key`s that have at least one stored ref.
     async fn list_repos(&self) -> Result<Vec<String>>;
-
-    /// Branches with a stored ref for this repo.
-    async fn list_branches(&self, repo_key: &str) -> Result<Vec<String>>;
-
-    /// Delete one stored ref.
-    async fn delete_ref(&self, repo_key: &str, branch: &str) -> Result<()>;
-
-    /// Insert or update added-repo state, keyed by the unified storage key.
+    async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>>;
+    async fn delete_result(&self, repo_key: &str, commit: &str) -> Result<()>;
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()>;
-
-    /// Fetch added-repo state for one repo.
     async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>>;
-
-    /// Remove added-repo state for one repo.
     async fn remove_added_repo(&self, repo_key: &str) -> Result<()>;
-
-    /// List every added-repo record.
     async fn list_added_repos(&self) -> Result<Vec<String>>;
-
-    /// Cheap reachability probe for `/readyz`.
     async fn health(&self) -> Result<()>;
 }
 
-/// `RefStore` over a [`MetaDb`].
 pub struct SqlRefStore {
     db: Box<dyn MetaDb>,
 }
 
 impl SqlRefStore {
-    /// Wrap an engine adapter and run schema setup.
     pub async fn new(db: Box<dyn MetaDb>) -> Result<Self> {
         db.init().await?;
         Ok(Self { db })
     }
+
+    async fn update_result(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        update: impl Fn(&mut RefInfo) -> bool,
+    ) -> Result<bool> {
+        let repo_key = repo_id.storage_key();
+        for attempt in 0..64 {
+            let Some(row) = self.db.get_result(&repo_key, commit).await? else {
+                return Ok(false);
+            };
+            let mut info: RefInfo =
+                serde_json::from_str(&row.data).context("parse stored exact result")?;
+            ensure!(
+                info.commit == commit,
+                "stored exact result identity mismatch"
+            );
+            if !update(&mut info) {
+                return Ok(true);
+            }
+            let data = serde_json::to_string(&info).context("serialize exact result")?;
+            if self
+                .db
+                .compare_and_swap_result(&repo_key, commit, &row.data, &data)
+                .await?
+            {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                (attempt.min(10) + 1) as u64,
+            ))
+            .await;
+        }
+        anyhow::bail!("exact result {repo_key}@{commit}: repeated write conflicts")
+    }
+}
+
+fn variant_ready(variant: &crate::ClonepackArtifacts, commit: &str) -> bool {
+    variant.commit == commit && !variant.manifest.is_empty()
+}
+
+/// Merge one worker publication without allowing a duplicate or stale report
+/// to replace an already accepted ready variant. Ordered phase enrichment is
+/// accepted only when it carries the same previously-published variant bytes.
+fn merge_publication(existing: &RefInfo, incoming: &RefInfo) -> RefInfo {
+    let commit = existing.commit.as_str();
+    let shallow_ready = variant_ready(&existing.shallow_clonepack, commit);
+    let full_ready = variant_ready(&existing.full_clonepack, commit);
+    let files_enrichment = full_ready
+        && existing.archive_chunks.is_empty()
+        && !incoming.archive_chunks.is_empty()
+        && incoming.full_clonepack.commit == commit
+        && !existing.full_clonepack.idx_bundle.is_empty()
+        && incoming.full_clonepack.idx_bundle == existing.full_clonepack.idx_bundle
+        && incoming.build_status.is_none();
+
+    if (shallow_ready && existing.shallow_clonepack.manifest != incoming.shallow_clonepack.manifest)
+        || (full_ready
+            && existing.full_clonepack.manifest != incoming.full_clonepack.manifest
+            && !files_enrichment)
+    {
+        let mut kept = existing.clone();
+        kept.last_accessed_at = kept.last_accessed_at.max(incoming.last_accessed_at);
+        kept.warm_pinned |= incoming.warm_pinned;
+        return kept;
+    }
+
+    let mut merged = incoming.clone();
+    if shallow_ready {
+        merged.shallow_clonepack = existing.shallow_clonepack.clone();
+    }
+    if full_ready && !files_enrichment {
+        merged = existing.clone();
+    }
+    merged.last_accessed_at = existing.last_accessed_at.max(incoming.last_accessed_at);
+    merged.warm_pinned |= existing.warm_pinned;
+    merged
 }
 
 #[async_trait]
 impl RefStore for SqlRefStore {
-    async fn load(&self, repo_id: &RepoId) -> Result<Option<RefInfo>> {
-        self.load_branch(repo_id, "HEAD").await
+    async fn load_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        match self.db.get_result(&repo_id.storage_key(), commit).await? {
+            Some(row) => {
+                let info: RefInfo =
+                    serde_json::from_str(&row.data).context("parse stored exact result")?;
+                ensure!(
+                    info.commit == commit,
+                    "stored exact result identity mismatch"
+                );
+                Ok(Some(info))
+            }
+            None => Ok(None),
+        }
     }
 
-    async fn save(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
-        self.save_branch(repo_id, "HEAD", info).await
+    async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
+        crate::validation::validate_object_id(&info.commit)
+            .context("validate exact result commit")?;
+        let repo_key = repo_id.storage_key();
+        for attempt in 0..64 {
+            let data = serde_json::to_string(info).context("serialize exact result")?;
+            if self
+                .db
+                .insert_result(&repo_key, &info.commit, &data)
+                .await?
+            {
+                return Ok(());
+            }
+            let row = self
+                .db
+                .get_result(&repo_key, &info.commit)
+                .await?
+                .context("exact result disappeared after insert conflict")?;
+            let existing: RefInfo =
+                serde_json::from_str(&row.data).context("parse stored exact result")?;
+            ensure!(
+                existing.commit == info.commit,
+                "stored exact result identity mismatch"
+            );
+            let merged = merge_publication(&existing, info);
+            let merged_data = serde_json::to_string(&merged).context("serialize exact result")?;
+            if merged_data == row.data
+                || self
+                    .db
+                    .compare_and_swap_result(&repo_key, &info.commit, &row.data, &merged_data)
+                    .await?
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                (attempt.min(10) + 1) as u64,
+            ))
+            .await;
+        }
+        anyhow::bail!(
+            "exact result {repo_key}@{}: repeated publication conflicts",
+            info.commit
+        )
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
@@ -136,244 +199,40 @@ impl RefStore for SqlRefStore {
             .collect())
     }
 
-    async fn load_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RefInfo>> {
-        match self.db.get(&repo_id.storage_key(), branch).await? {
-            Some(row) => Ok(Some(
-                serde_json::from_str(&row.data).context("parse stored RefInfo")?,
-            )),
-            None => Ok(None),
-        }
-    }
-
-    async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
-        let repo_key = repo_id.storage_key();
-
-        // Moving publications may replace any predecessor in their durable
-        // ordinary-admission chain. Enforce that identity fence with the
-        // existing JSON CAS so every SQL backend gets identical semantics
-        // without a schema change or backend-specific dynamic SQL.
-        if info.require_matching_commit && !info.internal_exact_result {
-            let mut insert_missing = false;
-            for attempt in 0..64 {
-                let Some(row) = self.db.get(&repo_key, branch).await? else {
-                    if crate::ref_store::should_replace_ref(None, info) {
-                        insert_missing = true;
-                        break;
-                    }
-                    return Ok(());
-                };
-                let existing: RefInfo =
-                    serde_json::from_str(&row.data).context("parse stored RefInfo")?;
-                if !crate::ref_store::should_replace_ref(Some(&existing), info) {
-                    return Ok(());
-                }
-                let data = serde_json::to_string(info).context("serialize RefInfo")?;
-                if data == row.data
-                    || self
-                        .db
-                        .compare_and_swap_ref(
-                            &repo_key,
-                            branch,
-                            &row.commit_id,
-                            &row.data,
-                            &data,
-                            &info.commit,
-                            info.synced_at.map(|value| value as i64),
-                            info.generation.map(|value| value as i64),
-                        )
-                        .await?
-                {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    (attempt.min(10) + 1) as u64,
-                ))
-                .await;
-            }
-            if !insert_missing {
-                anyhow::bail!(
-                    "SQL ref store {repo_key}@{branch}: gave up after repeated moving-publication conflicts"
-                );
-            }
-        }
-
-        // Exact artifact saves for one commit merge the admission chain under
-        // CAS. This closes explicit-first/ordinary-second promotion races where
-        // a worker built from an older snapshot would otherwise erase the
-        // promotion while publishing phase one.
-        if info.internal_exact_result {
-            for attempt in 0..64 {
-                let Some(row) = self.db.get(&repo_key, branch).await? else {
-                    break;
-                };
-                if row.commit_id != info.commit {
-                    break;
-                }
-                let existing: RefInfo =
-                    serde_json::from_str(&row.data).context("parse stored RefInfo")?;
-                if !crate::ref_store::should_replace_ref(Some(&existing), info) {
-                    return Ok(());
-                }
-                let merged = crate::ref_store::merge_exact_admission(Some(&existing), info);
-                let data = serde_json::to_string(&merged).context("serialize RefInfo")?;
-                if data == row.data
-                    || self
-                        .db
-                        .compare_and_swap_ref(
-                            &repo_key,
-                            branch,
-                            &row.commit_id,
-                            &row.data,
-                            &data,
-                            &merged.commit,
-                            merged.synced_at.map(|value| value as i64),
-                            merged.generation.map(|value| value as i64),
-                        )
-                        .await?
-                {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    (attempt.min(10) + 1) as u64,
-                ))
-                .await;
-            }
-        }
-
-        let data = serde_json::to_string(info).context("serialize RefInfo")?;
-        let new_synced = info.synced_at.map(|t| t as i64);
-        let new_generation = info.generation.map(|g| g as i64);
-
-        // Ordering ("a newer sync never loses to an older one") is enforced
-        // atomically inside the single conditional upsert — no get-then-write
-        // TOCTOU, so concurrent writers can't reorder. See `MetaDb::save_ordered`.
-        self.db
-            .save_ordered(
-                &repo_key,
-                branch,
-                &data,
-                &info.commit,
-                new_synced,
-                new_generation,
-                info.require_matching_commit,
-                info.internal_exact_result,
-                info.moving_publication_predecessors
-                    .first()
-                    .map(String::as_str),
-            )
-            .await
-    }
-
     async fn update_build_status(
         &self,
         repo_id: &RepoId,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
         status: &str,
     ) -> Result<bool> {
-        let repo_key = repo_id.storage_key();
-        for attempt in 0..64 {
-            let Some(row) = self.db.get(&repo_key, branch).await? else {
-                return Ok(false);
-            };
-            if row.commit_id != expected_commit {
-                return Ok(false);
+        self.update_result(repo_id, commit, |info| {
+            if info.build_status.as_deref() == Some(status) {
+                false
+            } else {
+                info.build_status = Some(status.to_string());
+                true
             }
-            let mut info: RefInfo =
-                serde_json::from_str(&row.data).context("parse stored RefInfo")?;
-            if info.commit != expected_commit {
-                return Ok(false);
-            }
-            info.build_status = Some(status.to_string());
-            let data = serde_json::to_string(&info).context("serialize RefInfo")?;
-            if data == row.data {
-                return Ok(true);
-            }
-            if self
-                .db
-                .compare_and_swap_ref(
-                    &repo_key,
-                    branch,
-                    expected_commit,
-                    &row.data,
-                    &data,
-                    &info.commit,
-                    info.synced_at.map(|value| value as i64),
-                    info.generation.map(|value| value as i64),
-                )
-                .await?
-            {
-                return Ok(true);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(
-                (attempt.min(10) + 1) as u64,
-            ))
-            .await;
-        }
-        anyhow::bail!(
-            "SQL ref store {repo_key}@{branch}: gave up after repeated status-write conflicts"
-        )
+        })
+        .await
     }
 
-    async fn touch_last_accessed_at(
-        &self,
-        repo_id: &RepoId,
-        branch: &str,
-        expected_commit: &str,
-    ) -> Result<bool> {
-        let repo_key = repo_id.storage_key();
-        for attempt in 0..64 {
-            let Some(row) = self.db.get(&repo_key, branch).await? else {
-                return Ok(false);
-            };
-            if row.commit_id != expected_commit {
-                return Ok(false);
-            }
-            let mut info: RefInfo =
-                serde_json::from_str(&row.data).context("parse stored RefInfo")?;
-            if info.commit != expected_commit {
-                return Ok(false);
-            }
+    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
+        self.update_result(repo_id, commit, |info| {
             info.last_accessed_at = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .ok()
-                .map(|d| d.as_secs());
-            let data = serde_json::to_string(&info).context("serialize RefInfo")?;
-            if data == row.data {
-                return Ok(true);
-            }
-            if self
-                .db
-                .compare_and_swap_ref(
-                    &repo_key,
-                    branch,
-                    expected_commit,
-                    &row.data,
-                    &data,
-                    &info.commit,
-                    info.synced_at.map(|value| value as i64),
-                    info.generation.map(|value| value as i64),
-                )
-                .await?
-            {
-                return Ok(true);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(
-                (attempt.min(10) + 1) as u64,
-            ))
-            .await;
-        }
-        anyhow::bail!(
-            "SQL ref store {repo_key}@{branch}: gave up after repeated last-accessed-write conflicts"
-        )
+                .map(|duration| duration.as_secs());
+            true
+        })
+        .await
     }
 
-    async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
-        self.db.list_branches(&repo_id.storage_key()).await
+    async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
+        self.db.delete_result(&repo_id.storage_key(), commit).await
     }
 
-    async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
-        self.db.delete_ref(&repo_id.storage_key(), branch).await
+    async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
+        self.db.list_commits(&repo_id.storage_key()).await
     }
 
     async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
@@ -412,173 +271,73 @@ impl RefStore for SqlRefStore {
 mod tests {
     use super::*;
 
-    fn ref_at(commit: &str, synced_at: Option<u64>) -> RefInfo {
-        RefInfo {
-            commit: commit.to_string(),
-            synced_at,
+    #[tokio::test]
+    async fn stale_publication_cannot_regress_ready_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
+        let repo = RepoId::github("acme/widget");
+        let commit = "a".repeat(40);
+        let mut ready = RefInfo {
+            commit: commit.clone(),
+            build_status: Some("done".into()),
             ..Default::default()
-        }
-    }
-
-    /// The full RefStore lifecycle on a `SqlRefStore`, engine-agnostic. Run
-    /// against each available engine.
-    async fn exercise(store: &SqlRefStore) {
-        let rid = RepoId::github("o/r");
-
-        // HEAD save/load.
-        store.save(&rid, &ref_at("c1", Some(100))).await.unwrap();
-        assert_eq!(store.load(&rid).await.unwrap().unwrap().commit, "c1");
-
-        // Branch save/load, distinct from HEAD.
-        store
-            .save_branch(&rid, "dev", &ref_at("c2", Some(100)))
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .load_branch(&rid, "dev")
-                .await
-                .unwrap()
-                .unwrap()
-                .commit,
-            "c2"
-        );
-
-        // list + list_branches.
-        assert_eq!(store.list().await.unwrap(), vec![RepoId::github("o/r")]);
-        let mut branches = store.list_branches(&rid).await.unwrap();
-        branches.sort();
-        assert_eq!(branches, vec!["HEAD", "dev"]);
-
-        let added = AddedRepo {
-            repo_id: rid.clone(),
-            added_at: 123,
-            history_enabled: true,
-            source: crate::ref_store::AddedRepoSource::Api,
-            repo_size_bytes: None,
         };
-        store.add_repo(&added).await.unwrap();
-        assert_eq!(
-            store.load_added_repo(&rid).await.unwrap(),
-            Some(added.clone())
-        );
-        assert_eq!(store.list_added_repos().await.unwrap(), vec![added]);
-        store.remove_added_repo(&rid).await.unwrap();
-        assert!(store.load_added_repo(&rid).await.unwrap().is_none());
+        ready.shallow_clonepack.commit = commit.clone();
+        ready.shallow_clonepack.manifest = "ready".into();
+        store.save_result(&repo, &ready).await.unwrap();
 
-        // Ordering guard: an older sync for a *different* commit is skipped.
-        store.save(&rid, &ref_at("c0", Some(50))).await.unwrap();
-        assert_eq!(
-            store.load(&rid).await.unwrap().unwrap().commit,
-            "c1",
-            "older different-commit sync must not overwrite a newer one"
-        );
+        let stale = RefInfo {
+            commit: commit.clone(),
+            build_status: Some("building".into()),
+            ..Default::default()
+        };
+        store.save_result(&repo, &stale).await.unwrap();
 
-        // Same commit always writes (e.g. build_status updates) even with no ts.
-        let mut updated = ref_at("c1", None);
-        updated.build_status = Some("done".to_string());
-        store.save(&rid, &updated).await.unwrap();
-        let loaded = store.load(&rid).await.unwrap().unwrap();
-        assert_eq!(loaded.commit, "c1");
-        assert_eq!(loaded.build_status.as_deref(), Some("done"));
-
-        // A newer different-commit sync does overwrite.
-        store.save(&rid, &ref_at("c3", Some(200))).await.unwrap();
-        assert_eq!(store.load(&rid).await.unwrap().unwrap().commit, "c3");
-
-        // Generation (commit history depth) is the primary ordering signal.
-        // Establish a baseline that has one (wins the synced_at fallback vs the
-        // gen-less c3 above).
-        let mut g10 = ref_at("g10", Some(300));
-        g10.generation = Some(10);
-        store.save(&rid, &g10).await.unwrap();
-        assert_eq!(store.load(&rid).await.unwrap().unwrap().commit, "g10");
-
-        // Deeper history wins even with an older wall clock.
-        let mut g20 = ref_at("g20", Some(1));
-        g20.generation = Some(20);
-        store.save(&rid, &g20).await.unwrap();
-        assert_eq!(
-            store.load(&rid).await.unwrap().unwrap().commit,
-            "g20",
-            "higher generation wins over a newer wall clock"
-        );
-
-        // Shallower history loses even with a newer wall clock.
-        let mut g15 = ref_at("g15", Some(99_999));
-        g15.generation = Some(15);
-        store.save(&rid, &g15).await.unwrap();
-        assert_eq!(
-            store.load(&rid).await.unwrap().unwrap().commit,
-            "g20",
-            "lower generation loses despite a newer wall clock"
-        );
-
-        // Moving publications use the complete admitted predecessor chain,
-        // not generation ordering. Exercise the same SQL CAS on every backend:
-        // C may replace A or B, while a delayed B can never replace C.
-        let mut a = ref_at("a", Some(400));
-        a.generation = Some(1);
-        store.save_branch(&rid, "moving", &a).await.unwrap();
-
-        let mut b = ref_at("b", Some(401));
-        b.generation = Some(1);
-        b.require_matching_commit = true;
-        b.moving_publication_predecessors = vec!["a".to_string()];
-        store.save_branch(&rid, "moving", &b).await.unwrap();
-        assert_eq!(
-            store
-                .load_branch(&rid, "moving")
-                .await
-                .unwrap()
-                .unwrap()
-                .commit,
-            "b"
-        );
-
-        let mut c = ref_at("c", Some(402));
-        c.generation = Some(1);
-        c.require_matching_commit = true;
-        c.moving_publication_predecessors = vec!["a".to_string(), "b".to_string()];
-        store.save_branch(&rid, "moving", &c).await.unwrap();
-        store.save_branch(&rid, "moving", &b).await.unwrap();
-        assert_eq!(
-            store
-                .load_branch(&rid, "moving")
-                .await
-                .unwrap()
-                .unwrap()
-                .commit,
-            "c",
-            "late B must not replace C"
-        );
-
-        let mut first = ref_at("first", Some(403));
-        first.require_matching_commit = true;
-        first.moving_publication_predecessors =
-            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
-        store
-            .save_branch(&rid, "initial-moving", &first)
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .load_branch(&rid, "initial-moving")
-                .await
-                .unwrap()
-                .unwrap()
-                .commit,
-            "first"
-        );
+        let stored = store.load_result(&repo, &commit).await.unwrap().unwrap();
+        assert_eq!(stored.shallow_clonepack.manifest, "ready");
+        assert_eq!(stored.build_status.as_deref(), Some("done"));
     }
 
     #[tokio::test]
-    async fn sqlite_refstore_lifecycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("meta.db").to_string_lossy().to_string();
-        let store = SqlRefStore::new(Box::new(LibsqlMeta::connect(&path).await.unwrap()))
+    async fn files_enrichment_requires_the_accepted_full_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
             .await
             .unwrap();
-        exercise(&store).await;
+        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
+        let repo = RepoId::github("acme/files");
+        let commit = "b".repeat(40);
+        let mut editable = RefInfo {
+            commit: commit.clone(),
+            build_status: Some("archive building".into()),
+            ..Default::default()
+        };
+        editable.full_clonepack.commit = commit.clone();
+        editable.full_clonepack.manifest = "editable".into();
+        editable.full_clonepack.idx_bundle = "accepted-bundle".into();
+        store.save_result(&repo, &editable).await.unwrap();
+
+        let mut wrong_attempt = editable.clone();
+        wrong_attempt.full_clonepack.manifest = "wrong-files".into();
+        wrong_attempt.full_clonepack.idx_bundle = "other-bundle".into();
+        wrong_attempt.archive_chunks = vec!["wrong-archive".into()];
+        wrong_attempt.build_status = None;
+        store.save_result(&repo, &wrong_attempt).await.unwrap();
+        let kept = store.load_result(&repo, &commit).await.unwrap().unwrap();
+        assert_eq!(kept.full_clonepack.manifest, "editable");
+        assert!(kept.archive_chunks.is_empty());
+
+        let mut files = editable;
+        files.full_clonepack.manifest = "files".into();
+        files.archive_chunks = vec!["archive".into()];
+        files.build_status = None;
+        store.save_result(&repo, &files).await.unwrap();
+        let ready = store.load_result(&repo, &commit).await.unwrap().unwrap();
+        assert_eq!(ready.full_clonepack.manifest, "files");
+        assert_eq!(ready.archive_chunks, vec!["archive"]);
+        assert!(ready.build_status.is_none());
     }
 }

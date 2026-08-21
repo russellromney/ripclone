@@ -91,34 +91,31 @@ impl std::error::Error for ApiReportError {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RefReport {
-    SaveBranch {
+    SaveResult {
         repo_key: String,
-        branch: String,
         info: Box<RefInfo>,
     },
     UpdateBuildStatus {
         repo_key: String,
-        branch: String,
-        expected_commit: String,
+        commit: String,
         status: String,
     },
-    DeleteBranch {
+    DeleteResult {
         repo_key: String,
-        branch: String,
+        commit: String,
     },
     TouchLastAccessed {
         repo_key: String,
-        branch: String,
-        expected_commit: String,
+        commit: String,
     },
 }
 
 impl RefReport {
     pub fn repo_key(&self) -> &str {
         match self {
-            Self::SaveBranch { repo_key, .. }
+            Self::SaveResult { repo_key, .. }
             | Self::UpdateBuildStatus { repo_key, .. }
-            | Self::DeleteBranch { repo_key, .. }
+            | Self::DeleteResult { repo_key, .. }
             | Self::TouchLastAccessed { repo_key, .. } => repo_key,
         }
     }
@@ -192,8 +189,8 @@ impl ApiRefStore {
         })
     }
 
-    fn local_key(repo_id: &RepoId, branch: &str) -> (String, String) {
-        (repo_id.storage_key(), branch.to_string())
+    fn local_key(repo_id: &RepoId, commit: &str) -> (String, String) {
+        (repo_id.storage_key(), commit.to_string())
     }
 
     async fn post_report(&self, body: &RefReport) -> Result<RefReportResponse> {
@@ -245,97 +242,78 @@ impl ApiRefStore {
 
 #[async_trait]
 impl RefStore for ApiRefStore {
-    async fn load(&self, repo_id: &RepoId) -> Result<Option<RefInfo>> {
-        self.load_branch(repo_id, "HEAD").await
+    async fn load_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        // Only what this worker has written this process — no remote reads.
+        let map = self.local.read().await;
+        Ok(map.get(&Self::local_key(repo_id, commit)).cloned())
     }
 
-    async fn save(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
-        self.save_branch(repo_id, "HEAD", info).await
+    async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
+        self.post_report(&RefReport::SaveResult {
+            repo_key: repo_id.storage_key(),
+            info: Box::new(info.clone()),
+        })
+        .await?;
+        // Write-through: phase 2 reloads the phase-1 ref from this map.
+        let mut map = self.local.write().await;
+        map.insert(Self::local_key(repo_id, &info.commit), info.clone());
+        Ok(())
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
         Ok(Vec::new())
     }
 
-    async fn load_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RefInfo>> {
-        // Only what this worker has written this process — no remote reads.
-        let map = self.local.read().await;
-        Ok(map.get(&Self::local_key(repo_id, branch)).cloned())
-    }
-
-    async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
-        self.post_report(&RefReport::SaveBranch {
-            repo_key: repo_id.storage_key(),
-            branch: branch.to_string(),
-            info: Box::new(info.clone()),
-        })
-        .await?;
-        // Write-through: phase 2 reloads the phase-1 ref from this map.
-        let mut map = self.local.write().await;
-        map.insert(Self::local_key(repo_id, branch), info.clone());
-        Ok(())
-    }
-
     async fn update_build_status(
         &self,
         repo_id: &RepoId,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
         status: &str,
     ) -> Result<bool> {
         let r = self
             .post_report(&RefReport::UpdateBuildStatus {
                 repo_key: repo_id.storage_key(),
-                branch: branch.to_string(),
-                expected_commit: expected_commit.to_string(),
+                commit: commit.to_string(),
                 status: status.to_string(),
             })
             .await?;
         if r.updated {
             let mut map = self.local.write().await;
-            if let Some(info) = map.get_mut(&Self::local_key(repo_id, branch))
-                && info.commit == expected_commit
-            {
+            if let Some(info) = map.get_mut(&Self::local_key(repo_id, commit)) {
                 info.build_status = Some(status.to_string());
             }
         }
         Ok(r.updated)
     }
 
-    async fn touch_last_accessed_at(
-        &self,
-        repo_id: &RepoId,
-        branch: &str,
-        expected_commit: &str,
-    ) -> Result<bool> {
+    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
         let r = self
             .post_report(&RefReport::TouchLastAccessed {
                 repo_key: repo_id.storage_key(),
-                branch: branch.to_string(),
-                expected_commit: expected_commit.to_string(),
+                commit: commit.to_string(),
             })
             .await?;
         Ok(r.updated)
     }
 
-    async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
-        self.post_report(&RefReport::DeleteBranch {
+    async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
+        self.post_report(&RefReport::DeleteResult {
             repo_key: repo_id.storage_key(),
-            branch: branch.to_string(),
+            commit: commit.to_string(),
         })
         .await?;
         let mut map = self.local.write().await;
-        map.remove(&Self::local_key(repo_id, branch));
+        map.remove(&Self::local_key(repo_id, commit));
         Ok(())
     }
 
-    async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
+    async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
         let key = repo_id.storage_key();
         let map = self.local.read().await;
         Ok(map
             .keys()
             .filter(|(r, _)| r == &key)
-            .map(|(_, b)| b.clone())
+            .map(|(_, commit)| commit.clone())
             .collect())
     }
 
@@ -375,10 +353,9 @@ mod tests {
         let repo = RepoId::github("acme/dead");
         let info = RefInfo {
             commit: "abc".into(),
-            default_branch: "main".into(),
             ..Default::default()
         };
-        let err = store.save_branch(&repo, "main", &info).await.unwrap_err();
+        let err = store.save_result(&repo, &info).await.unwrap_err();
         let api = err
             .downcast_ref::<ApiReportError>()
             .expect("ApiReportError in chain");

@@ -16,7 +16,7 @@
 //!   one worker can flip a given row out of `queued` (SQLite serialises
 //!   writers), so no job is double-claimed. Lost races retry.
 //! - Ids come from `last_insert_rowid()`, not `RETURNING`.
-//! - **Coalescing** is keyed by repo, branch, and exact admitted commit. The
+//! - **Coalescing** is keyed by repository and exact admitted commit. The
 //!   enqueue transaction first finds an active exact key and the partial unique
 //!   index covers both `queued` and `claimed` rows as a database backstop. A
 //!   later exact commit is intentionally a distinct job; a duplicate is not.
@@ -67,12 +67,10 @@ pub struct ClaimedJob {
     pub provider: String,
     /// Opaque repo path (`owner/repo` for GitHub).
     pub path: String,
-    pub branch: String,
+    /// Optional fetch hint; never result or job identity.
+    pub source_ref: Option<String>,
     /// Exact commit admitted by the server before enqueue.
     pub admitted_commit: String,
-    /// Concrete upstream default branch learned during HEAD admission, when
-    /// available. This does not affect coalescing identity.
-    pub admitted_default_branch: Option<String>,
     /// Validated repository build settings snapshotted at admission.
     pub repo_config: crate::repo_config::RepoConfig,
     /// Per-job upstream credential the enqueuer passed (the cloud's per-request
@@ -133,9 +131,8 @@ pub trait QueueDb: Send + Sync {
         key: &str,
         provider: &str,
         path: &str,
-        branch: &str,
+        source_ref: Option<&str>,
         admitted_commit: &str,
-        admitted_default_branch: Option<&str>,
         repo_config: &str,
         credential: Option<&str>,
         size_class: i64,
@@ -180,8 +177,8 @@ pub trait QueueDb: Send + Sync {
     /// iff the claimed row was refreshed.
     async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
 
-    /// `(provider, path, branch, admitted_commit, admitted_default_branch,
-    /// repo_config, credential)` for a job id.
+    /// `(provider, path, source_ref, admitted_commit, repo_config, credential)`
+    /// for a job id.
     /// `credential` is the stored base64 blob (or `None`).
     async fn job_fields(
         &self,
@@ -190,9 +187,8 @@ pub trait QueueDb: Send + Sync {
         Option<(
             String,
             String,
-            String,
-            String,
             Option<String>,
+            String,
             String,
             Option<String>,
         )>,
@@ -729,15 +725,8 @@ impl SqlJobQueue {
                 return Ok(None);
             };
             if self.db.try_claim(id, worker_id, now).await? {
-                let Some((
-                    provider,
-                    path,
-                    branch,
-                    admitted_commit,
-                    admitted_default_branch,
-                    repo_config,
-                    credential,
-                )) = self.db.job_fields(id).await?
+                let Some((provider, path, source_ref, admitted_commit, repo_config, credential)) =
+                    self.db.job_fields(id).await?
                 else {
                     continue;
                 };
@@ -750,9 +739,8 @@ impl SqlJobQueue {
                     id,
                     provider,
                     path,
-                    branch,
+                    source_ref,
                     admitted_commit,
-                    admitted_default_branch,
                     repo_config,
                     credential: decode_credential(credential),
                 }));
@@ -854,9 +842,8 @@ impl JobQueue for SqlJobQueue {
                 &key,
                 job.repo_id.provider.as_str(),
                 &job.repo_id.path,
-                &job.branch,
+                job.source_ref.as_deref(),
                 &job.admitted_commit,
-                job.admitted_default_branch.as_deref(),
                 &repo_config,
                 credential.as_deref(),
                 size_class,
@@ -948,7 +935,7 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     key TEXT NOT NULL,
     provider TEXT NOT NULL,
     path TEXT NOT NULL,
-    branch TEXT NOT NULL,
+    source_ref TEXT,
     status TEXT NOT NULL,
     worker_id TEXT,
     created_at INTEGER NOT NULL,
@@ -956,7 +943,6 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     finished_at INTEGER,
     error TEXT,
     admitted_commit TEXT NOT NULL,
-    admitted_default_branch TEXT,
     repo_config TEXT NOT NULL,
     credential TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -1016,9 +1002,8 @@ mod tests {
     fn job_at(owner: &str, repo: &str, branch: &str, commit: &str) -> BuildJob {
         BuildJob {
             repo_id: RepoId::github(format!("{owner}/{repo}")),
-            branch: branch.into(),
             admitted_commit: commit.into(),
-            admitted_default_branch: None,
+            source_ref: Some(branch.into()),
             repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,
@@ -1072,7 +1057,7 @@ mod tests {
                 (
                     claimed.provider.as_str(),
                     claimed.path.as_str(),
-                    claimed.branch.as_str()
+                    claimed.source_ref.as_deref().unwrap()
                 ),
                 ("github", "o/r", "main"),
                 "{engine}"
@@ -1152,9 +1137,8 @@ mod tests {
                 "k",
                 "github",
                 "o/r",
-                "main",
+                Some("main"),
                 "1111111111111111111111111111111111111111",
-                None,
                 "{}",
                 Some("dG9rZW4="),
                 0,
@@ -1162,12 +1146,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let (_, _, _, _, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(before.as_deref(), Some("dG9rZW4="));
         // finish is conditional on owning the claim: claim it as "w" first.
         assert!(db.try_claim(id, "w", 2).await.unwrap());
         assert!(db.finish(id, "w", "done", 3, None).await.unwrap());
-        let (_, _, _, _, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
         assert!(after.is_none(), "credential must be cleared on finish");
     }
 
@@ -1428,7 +1412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_coalesces_by_key() {
+    async fn enqueue_coalesces_same_commit_across_source_names() {
         for (engine, q, _dir) in queues().await {
             let first = q.enqueue(job("o", "r", "main")).await.unwrap();
             assert_eq!(first.outcome, EnqueueOutcome::Enqueued, "{engine}");
@@ -1437,10 +1421,10 @@ mod tests {
             assert_eq!(first.job_id, second.job_id, "{engine}");
             assert_eq!(
                 q.enqueue(job("o", "r", "dev")).await.unwrap().outcome,
-                EnqueueOutcome::Enqueued,
+                EnqueueOutcome::Coalesced,
                 "{engine}"
             );
-            assert_eq!(q.depth().await, 2, "{engine}");
+            assert_eq!(q.depth().await, 1, "{engine}");
         }
     }
 
@@ -1792,9 +1776,11 @@ mod tests {
         }
         assert_eq!(q.depth().await, 1, "concurrent enqueues coalesced");
 
-        // Enqueue distinct jobs, drain with 4 workers — none double-claimed.
+        // Enqueue distinct exact commits, drain with 4 workers — none double-claimed.
         for i in 0..20 {
-            q.enqueue(job("o", "r", &format!("b{i}"))).await.unwrap();
+            q.enqueue(job_at("o", "r", "main", &format!("{i:040x}")))
+                .await
+                .unwrap();
         }
         let seen = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         let mut hs = Vec::new();
@@ -1814,7 +1800,7 @@ mod tests {
         for h in hs {
             h.await.unwrap();
         }
-        // 20 distinct branches + the 1 coalesced "main".
+        // 20 distinct commits + the 1 coalesced initial commit.
         assert_eq!(
             seen.lock().await.len(),
             21,
@@ -1990,12 +1976,24 @@ mod tests {
         assert_eq!(coalesced.outcome, EnqueueOutcome::Coalesced);
         assert_eq!(coalesced.job_id, Some(id));
 
-        let other = q.enqueue(job("o", "r", "dev")).await.unwrap();
+        let other = q
+            .enqueue(job_at(
+                "o",
+                "r",
+                "dev",
+                "2222222222222222222222222222222222222222",
+            ))
+            .await
+            .unwrap();
         assert_eq!(other.outcome, EnqueueOutcome::Enqueued);
         assert_eq!(q.depth().await, 2);
 
         let first = q.claim("w1").await.unwrap().unwrap();
-        assert_eq!(first.branch, "main", "oldest queued claimed first");
+        assert_eq!(
+            first.source_ref.as_deref(),
+            Some("main"),
+            "oldest queued claimed first"
+        );
         q.ack(first.id, "w1", Ok(())).await.unwrap();
         assert!(matches!(
             q.job_status(first.id).await.unwrap(),
@@ -2003,7 +2001,7 @@ mod tests {
         ));
 
         let second = q.claim("w1").await.unwrap().unwrap();
-        assert_eq!(second.branch, "dev");
+        assert_eq!(second.source_ref.as_deref(), Some("dev"));
         q.ack(second.id, "w1", Err(BuildError::permanent("boom")))
             .await
             .unwrap();

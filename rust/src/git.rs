@@ -2805,7 +2805,7 @@ mod tests {
             "exact admission retains the probed default branch without fetching it"
         );
 
-        // A later historical sync fills the moving refs. HEAD must then use the
+        // A later symbolic sync updates the mirror. HEAD must use the
         // admission-time default branch rather than the bare-init default.
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
         sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", Some("HEAD~1"), None).unwrap();

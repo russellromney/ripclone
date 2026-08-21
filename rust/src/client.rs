@@ -308,7 +308,6 @@ pub struct RefResponse {
     pub host: String,
     pub origin_url: String,
     pub branch: String,
-    pub default_branch: String,
     pub commit: String,
     pub parent_commit: Option<String>,
     pub clonepack_manifest: String,
@@ -1510,10 +1509,6 @@ impl Client {
                         .with_context(|| format!("invalid top-up base commit for {repo_path}"))?;
                     crate::validation::validate_git_rev(&base_response.branch)
                         .with_context(|| format!("invalid top-up base branch for {repo_path}"))?;
-                    crate::validation::validate_git_rev(&base_response.default_branch)
-                        .with_context(|| {
-                            format!("invalid top-up base default branch for {repo_path}")
-                        })?;
                     if let Some(expected) = resolved_branch.as_deref()
                         && base_response.branch != expected
                     {
@@ -1888,7 +1883,7 @@ impl Client {
     }
 
     /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of
-    /// the branch tip. The resolved commit is used as the ref-store key, so
+    /// the branch tip. The resolved commit is the result and job identity, so
     /// different revs that resolve to the same commit share a build. Useful for
     /// exercising the incremental build path deterministically without waiting for
     /// upstream to advance.
@@ -2486,24 +2481,11 @@ impl Client {
             std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
             std::fs::create_dir_all(git_dir.join("info"))?;
 
-            let branch_name = if branch == "HEAD" {
-                // The pinned B response establishes the resolved branch. A
-                // carried Full(A) manifest can predate an upstream default-
-                // branch rename, so never attach B to its stale default name.
-                identity
-                    .resolved_branch
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| {
-                        if info.default_branch.is_empty() {
-                            "main"
-                        } else {
-                            &info.default_branch
-                        }
-                    })
-            } else {
-                branch
-            };
+            let branch_name = identity
+                .resolved_branch
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(branch);
 
             std::fs::write(
                 git_dir.join("HEAD"),
@@ -3715,11 +3697,7 @@ impl Client {
         std::fs::create_dir_all(git_dir.join("info"))?;
 
         let branch_name = if branch == "HEAD" {
-            if info.default_branch.is_empty() {
-                "main"
-            } else {
-                &info.default_branch
-            }
+            &info.branch
         } else {
             branch
         };

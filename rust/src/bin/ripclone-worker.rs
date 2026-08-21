@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
                     "claimed job {} for {}@{}",
                     job_id,
                     repo_id.storage_key(),
-                    claimed.branch
+                    claimed.admitted_commit
                 );
                 let admitted_commit = claimed.admitted_commit.clone();
                 if let Err(e) = ripclone::validation::validate_object_id(&admitted_commit) {
@@ -257,13 +257,11 @@ async fn main() -> Result<()> {
                     .with_context(|| {
                         format!("fetch credential for queued job {}", repo_id.storage_key())
                     })?;
-                let branch = claimed.branch.clone();
                 let terminal_commit = admitted_commit.clone();
                 let job = BuildJob {
                     repo_id: repo_id.clone(),
-                    branch: branch.clone(),
                     admitted_commit,
-                    admitted_default_branch: claimed.admitted_default_branch,
+                    source_ref: claimed.source_ref,
                     repo_config: claimed.repo_config,
                     credential,
                     size_bytes: None,
@@ -322,19 +320,14 @@ async fn main() -> Result<()> {
                         // is the case that still needs a terminal write.
                         if maybe_retryable_msg.is_some()
                             && let Ok(JobState::Failed(err)) = queue.job_status(job_id).await
-                            && let Err(e) = mark_admitted_build_failed(
-                                &state,
-                                &repo_id,
-                                &branch,
-                                &terminal_commit,
-                                &err,
-                            )
-                            .await
+                            && let Err(e) =
+                                mark_admitted_build_failed(&state, &repo_id, &terminal_commit, &err)
+                                    .await
                         {
                             error!(
                                 "failed to mark {}@{} terminal after dead-letter: {e:#}",
                                 repo_id.storage_key(),
-                                branch
+                                terminal_commit
                             );
                         }
                     }

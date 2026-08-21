@@ -369,23 +369,23 @@ impl RemoteGc {
             .context("list repos for warm TTL")?;
         for repo_id in repos {
             let key = repo_id.storage_key();
-            let branches = self
+            let commits = self
                 .ref_store
-                .list_branches(&repo_id)
+                .list_commits(&repo_id)
                 .await
-                .with_context(|| format!("list branches for warm TTL {key}"))?;
+                .with_context(|| format!("list commits for warm TTL {key}"))?;
 
             // Load every ref of the repo once, so eviction can reason about the
             // whole repo rather than each ref in isolation.
-            let mut infos = Vec::with_capacity(branches.len());
-            for branch in branches {
+            let mut infos = Vec::with_capacity(commits.len());
+            for commit in commits {
                 if let Some(info) = self
                     .ref_store
-                    .load_branch(&repo_id, &branch)
+                    .load_result(&repo_id, &commit)
                     .await
-                    .with_context(|| format!("load ref for warm TTL {key}/{branch}"))?
+                    .with_context(|| format!("load result for warm TTL {key}@{commit}"))?
                 {
-                    infos.push((branch, info));
+                    infos.push(info);
                 }
             }
 
@@ -398,11 +398,11 @@ impl RemoteGc {
             // and the pin may only be set on one of them. Evicting a *sibling* ref
             // of a pinned repo deletes chunks the pinned commit still needs, so the
             // pin must cover the whole repo, not just the ref that carries the flag.
-            if infos.iter().any(|(_, info)| info.warm_pinned) {
+            if infos.iter().any(|info| info.warm_pinned) {
                 continue;
             }
 
-            for (branch, info) in infos {
+            for info in infos {
                 if info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
                     continue;
                 }
@@ -415,9 +415,9 @@ impl RemoteGc {
                 }
                 if self
                     .ref_store
-                    .update_build_status(&repo_id, &branch, &info.commit, EVICTED_BUILD_STATUS)
+                    .update_build_status(&repo_id, &info.commit, EVICTED_BUILD_STATUS)
                     .await
-                    .with_context(|| format!("evict warm ref {key}/{branch}"))?
+                    .with_context(|| format!("evict warm result {key}@{}", info.commit))?
                 {
                     evicted += 1;
                 }
@@ -445,10 +445,10 @@ pub(crate) async fn reachable_hashes(
     let repos = ref_store.list().await.context("list repos")?;
     for repo_id in repos {
         let key = repo_id.storage_key();
-        let branches = ref_store
-            .list_branches(&repo_id)
+        let commits = ref_store
+            .list_commits(&repo_id)
             .await
-            .with_context(|| format!("list branches for {key}"))?;
+            .with_context(|| format!("list commits for {key}"))?;
 
         // Load the repo's refs once so reachability can reason about the whole
         // repo. The warm pin is repo-scoped: a pinned repo keeps its artifacts
@@ -457,22 +457,22 @@ pub(crate) async fn reachable_hashes(
         // failed pin write), so a pinned repo's evicted refs are not orphans —
         // their chunks must be retained, not walked past. Mirrors the per-repo
         // pin scope the warm-TTL eviction pass applies.
-        let mut infos = Vec::with_capacity(branches.len());
-        for branch in branches {
+        let mut infos = Vec::with_capacity(commits.len());
+        for commit in commits {
             if fresh {
-                ref_store.invalidate(&repo_id, &branch).await;
+                ref_store.invalidate(&repo_id, &commit).await;
             }
             if let Some(info) = ref_store
-                .load_branch(&repo_id, &branch)
+                .load_result(&repo_id, &commit)
                 .await
-                .with_context(|| format!("load ref {key}/{branch}"))?
+                .with_context(|| format!("load result {key}@{commit}"))?
             {
-                infos.push((branch, info));
+                infos.push(info);
             }
         }
-        let warm_pinned = infos.iter().any(|(_, info)| info.warm_pinned);
+        let warm_pinned = infos.iter().any(|info| info.warm_pinned);
 
-        for (branch, info) in infos {
+        for info in infos {
             // Skip an evicted ref only when the repo is not pinned; a pinned
             // repo retains even its evicted refs.
             if !warm_pinned && info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
@@ -484,7 +484,10 @@ pub(crate) async fn reachable_hashes(
                 collect_manifest_refs(storage, &manifest_hash, &mut reachable)
                     .await
                     .with_context(|| {
-                        format!("collect manifest refs for {key}/{branch} manifest {manifest_hash}")
+                        format!(
+                            "collect manifest refs for {key}@{} manifest {manifest_hash}",
+                            info.commit
+                        )
                     })?;
             }
         }
@@ -588,7 +591,6 @@ mod tests {
     use crate::cas::Cas;
     use crate::clonepack::hash_from_hex;
     use crate::provider::RepoId;
-    use crate::ref_store::exact_ref_key;
     use crate::storage::{HashEntry, StorageBackend, local};
     use std::time::Duration;
 
@@ -683,8 +685,7 @@ mod tests {
         let archive_hash = cas.put(archive_bytes).unwrap();
 
         let manifest = ClonepackManifest {
-            commit: "abc".to_string(),
-            default_branch: "main".to_string(),
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             metadata_chunk: Some(crate::clonepack::ChunkRef {
                 hash: hash_from_hex(&metadata_hash).unwrap(),
                 len: metadata_bytes.len() as u64,
@@ -699,9 +700,8 @@ mod tests {
         let manifest_hash = cas.put(&manifest_bytes).unwrap();
 
         RefInfo {
-            commit: "abc".to_string(),
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             parent_commit: None,
-            default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
             head_blobs_idx: String::new(),
@@ -714,7 +714,7 @@ mod tests {
             full_clonepack: ClonepackArtifacts {
                 manifest: manifest_hash,
                 metadata_chunk: metadata_hash,
-                commit: "abc".to_string(),
+                commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 ..Default::default()
             },
             shallow_clonepack: ClonepackArtifacts::default(),
@@ -742,7 +742,10 @@ mod tests {
 
         // Build a ref with a manifest that points at metadata + archive chunks.
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         // Create an orphan object and age it so it passes the grace period.
         let orphan_data = b"orphan";
@@ -802,7 +805,10 @@ mod tests {
             compressed_len: 11,
             raw_len: 42,
         }];
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let orphan_hash = cas.put(b"orphan").unwrap();
         let orphan_path = cas.path(&orphan_hash);
@@ -849,7 +855,10 @@ mod tests {
         let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         // An orphan with an OLD mtime but no ledger entry: just-orphaned.
         let orphan_hash = cas.put(b"orphan").unwrap();
@@ -894,7 +903,10 @@ mod tests {
         let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let orphan_hash = cas.put(b"orphan").unwrap();
         let orphan_path = cas.path(&orphan_hash);
@@ -951,7 +963,7 @@ mod tests {
 
         let repo = RepoId::github("o/r");
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save(&repo, &info).await.unwrap();
+        ref_store.save_result(&repo, &info).await.unwrap();
 
         // An aged orphan, tombstoned long ago but still inside a long grace.
         let chunk = cas.put(b"reusable-chunk").unwrap();
@@ -971,10 +983,12 @@ mod tests {
             },
         );
 
-        // It becomes referenced again before grace expires.
+        // A later exact result references it again before grace expires.
         let mut info_v2 = info.clone();
+        info_v2.commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        info_v2.full_clonepack.commit = info_v2.commit.clone();
         info_v2.head_blobs_chunks = vec![chunk.clone()];
-        ref_store.save(&repo, &info_v2).await.unwrap();
+        ref_store.save_result(&repo, &info_v2).await.unwrap();
 
         let report = gc.run().await.unwrap();
         assert_eq!(report.objects_deleted, 0);
@@ -1004,15 +1018,10 @@ mod tests {
         assert_eq!(above.grace_period, Duration::from_secs(86_400));
     }
 
-    /// S1: a sync that re-references an already-stored (reused, aged) object
-    /// during a GC pass must not lose it. The object's mtime is old (it was not
-    /// re-uploaded), so the mtime-grace doesn't protect it; the pre-delete
-    /// reference-time recheck must. We reproduce the "ref changed mid-pass"
-    /// window deterministically with a stale ref cache: GC's first reachable
-    /// scan sees the cached (pre-sync) ref where the object is unreachable, but
-    /// the recheck reads through to the fresh durable ref where it is reachable.
+    /// A later exact result that reuses an already-stored object keeps it
+    /// reachable without a branch pointer or replacement ordering.
     #[tokio::test]
-    async fn gc_keeps_object_a_concurrent_sync_re_references() {
+    async fn gc_keeps_object_referenced_by_later_exact_result() {
         let tmp = tempfile::tempdir().unwrap();
         let cas_root = tmp.path().join("cas");
         let repo_root = tmp.path().join("repos");
@@ -1026,8 +1035,7 @@ mod tests {
 
         let repo = RepoId::github("o/r");
 
-        let cached_store = test_ref_store(&repo_root).await;
-        let durable_store = test_ref_store(&repo_root).await;
+        let ref_store = test_ref_store(&repo_root).await;
 
         // An aged, reused artifact: stored long ago, NOT referenced yet.
         let reused = cas.put(b"reused-pack-bytes").unwrap();
@@ -1035,15 +1043,15 @@ mod tests {
         let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
         filetime::set_file_mtime(&reused_path, filetime::FileTime::from_system_time(old)).unwrap();
 
-        // v1 of the ref does NOT reference the reused object. Save it through the
-        // control store before the concurrent update.
+        // Exact A does not reference the reused object.
         let info_v1 = make_ref_info_with_manifest(&cas);
-        cached_store.save(&repo, &info_v1).await.unwrap();
-        // The "concurrent sync" lands v2 — same commit, now referencing the
-        // reused object — through a second connection to the control database.
+        ref_store.save_result(&repo, &info_v1).await.unwrap();
+        // Exact B independently references the reused object.
         let mut info_v2 = info_v1.clone();
+        info_v2.commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        info_v2.full_clonepack.commit = info_v2.commit.clone();
         info_v2.head_blobs_chunks = vec![reused.clone()];
-        durable_store.save(&repo, &info_v2).await.unwrap();
+        ref_store.save_result(&repo, &info_v2).await.unwrap();
 
         // Tombstone the reused object long ago so GC reaches the delete path (and
         // thus the reference-time recheck) rather than a first-sighting tombstone.
@@ -1052,7 +1060,7 @@ mod tests {
 
         let gc = RemoteGc::new(
             storage.clone(),
-            cached_store,
+            ref_store,
             GcConfig {
                 grace_period: Duration::from_secs(60),
                 dry_run: false,
@@ -1063,11 +1071,11 @@ mod tests {
 
         assert!(
             reused_path.exists(),
-            "an object a concurrent sync re-referenced must survive GC"
+            "an object referenced by exact B must survive GC"
         );
         assert_eq!(
             report.objects_deleted, 0,
-            "the reused object was rescued by the reference-time recheck"
+            "the reused object remains reachable through exact B"
         );
     }
 
@@ -1086,7 +1094,10 @@ mod tests {
         let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let orphan_data = b"orphan";
         let orphan_hash = cas.put(orphan_data).unwrap();
@@ -1133,7 +1144,10 @@ mod tests {
         let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         // Orphan is only one hour old by mtime.
         let orphan_data = b"orphan";
@@ -1182,9 +1196,8 @@ mod tests {
 
         let pack = dummy_sized_pack(b"history-pack", &cas);
         let info = RefInfo {
-            commit: "abc".to_string(),
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             parent_commit: None,
-            default_branch: "main".to_string(),
             skeleton_pack: String::new(),
             skeleton_idx: String::new(),
             head_blobs_idx: String::new(),
@@ -1197,7 +1210,7 @@ mod tests {
             full_clonepack: ClonepackArtifacts::default(),
             shallow_clonepack: ClonepackArtifacts::default(),
             history_levels: vec![HistoryLevel {
-                tip_commit: "abc".to_string(),
+                tip_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 packs: vec![pack],
             }],
             build_status: None,
@@ -1205,7 +1218,10 @@ mod tests {
             synced_at: None,
             ..Default::default()
         };
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let orphan_hash = cas.put(b"orphan").unwrap();
         let orphan_path = cas.path(&orphan_hash);
@@ -1253,7 +1269,10 @@ mod tests {
         let now = unix_secs(SystemTime::now());
         info.last_accessed_at = Some(now.saturating_sub(10));
         info.synced_at = Some(now.saturating_sub(10));
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
         let metadata_path = cas.path(&info.full_clonepack.metadata_chunk);
@@ -1279,7 +1298,10 @@ mod tests {
         assert!(!archive_path.exists());
 
         let info = ref_store
-            .load_branch(&RepoId::github("o/r"), "HEAD")
+            .load_result(
+                &RepoId::github("o/r"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1300,16 +1322,12 @@ mod tests {
         let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
         let repo_id = RepoId::github("o/pending");
         let commit = "1".repeat(40);
-        let key = exact_ref_key("main", &commit);
         let old = unix_secs(SystemTime::now()).saturating_sub(10);
         ref_store
-            .save_branch(
+            .save_result(
                 &repo_id,
-                &key,
                 &RefInfo {
-                    internal_exact_result: true,
                     commit: commit.clone(),
-                    default_branch: "main".to_string(),
                     build_status: Some("building".to_string()),
                     synced_at: Some(old),
                     last_accessed_at: Some(old),
@@ -1333,12 +1351,11 @@ mod tests {
         .unwrap();
 
         let evicted = ref_store
-            .load_branch(&repo_id, &key)
+            .load_result(&repo_id, &commit)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(evicted.commit, commit);
-        assert!(evicted.internal_exact_result);
         assert_eq!(evicted.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
     }
 
@@ -1360,7 +1377,10 @@ mod tests {
         let now = unix_secs(SystemTime::now());
         info.last_accessed_at = Some(now.saturating_sub(10));
         info.warm_pinned = true;
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
         assert!(manifest_path.exists());
@@ -1380,7 +1400,10 @@ mod tests {
         assert!(manifest_path.exists());
 
         let info = ref_store
-            .load_branch(&RepoId::github("o/r"), "HEAD")
+            .load_result(
+                &RepoId::github("o/r"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1410,7 +1433,10 @@ mod tests {
         let mut info = make_ref_info_with_manifest(&cas);
         info.build_status = Some(EVICTED_BUILD_STATUS.to_string());
         info.warm_pinned = true;
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
         let metadata_path = cas.path(&info.full_clonepack.metadata_chunk);
@@ -1458,7 +1484,10 @@ mod tests {
         let mut info = make_ref_info_with_manifest(&cas);
         let now = unix_secs(SystemTime::now());
         info.last_accessed_at = Some(now);
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
         assert!(manifest_path.exists());
@@ -1484,7 +1513,10 @@ mod tests {
         assert!(manifest_path.exists());
 
         let info = ref_store
-            .load_branch(&RepoId::github("o/r"), "HEAD")
+            .load_result(
+                &RepoId::github("o/r"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1509,7 +1541,10 @@ mod tests {
         let now = unix_secs(SystemTime::now());
         info.last_accessed_at = Some(now.saturating_sub(10));
         info.synced_at = Some(now.saturating_sub(10));
-        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+        ref_store
+            .save_result(&RepoId::github("o/r"), &info)
+            .await
+            .unwrap();
 
         let manifest_path = cas.path(&info.full_clonepack.manifest);
         assert!(manifest_path.exists());
@@ -1529,7 +1564,10 @@ mod tests {
         assert!(manifest_path.exists());
 
         let info = ref_store
-            .load_branch(&RepoId::github("o/r"), "HEAD")
+            .load_result(
+                &RepoId::github("o/r"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .await
             .unwrap()
             .unwrap();
