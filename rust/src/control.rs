@@ -302,6 +302,9 @@ impl ControlDb {
             .database
             .connect()
             .context("connect to read repository config")?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .context("configure repository config busy timeout")?;
         let mut rows = connection
             .query(
                 "SELECT data FROM repository_configs WHERE repo_key = ?1",
