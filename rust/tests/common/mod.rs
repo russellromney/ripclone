@@ -186,7 +186,7 @@ pub struct Server {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinnedPathSnapshot {
-    pub branch_reads: usize,
+    pub result_reads: usize,
     pub enqueues: usize,
     pub builder_entries: usize,
 }
@@ -194,7 +194,7 @@ pub struct PinnedPathSnapshot {
 #[derive(Default)]
 pub struct PinnedPathProbe {
     armed: std::sync::atomic::AtomicBool,
-    branch_reads: std::sync::atomic::AtomicUsize,
+    result_reads: std::sync::atomic::AtomicUsize,
     enqueues: std::sync::atomic::AtomicUsize,
     builder_entries: std::sync::atomic::AtomicUsize,
 }
@@ -211,9 +211,8 @@ impl PhaseOnePublishBarrier {
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn after_save(&self, _branch: &str, info: &ripclone::RefInfo) {
+    async fn after_save(&self, info: &ripclone::RefInfo) {
         if !self.armed.load(std::sync::atomic::Ordering::SeqCst)
-            || !info.internal_exact_result
             || info.build_status.as_deref() != Some("full history building")
             || self
                 .consumed
@@ -240,7 +239,7 @@ impl PhaseOnePublishBarrier {
 
 impl PinnedPathProbe {
     pub fn arm(&self) {
-        self.branch_reads
+        self.result_reads
             .store(0, std::sync::atomic::Ordering::SeqCst);
         self.enqueues.store(0, std::sync::atomic::Ordering::SeqCst);
         self.builder_entries
@@ -254,7 +253,7 @@ impl PinnedPathProbe {
 
     pub fn snapshot(&self) -> PinnedPathSnapshot {
         PinnedPathSnapshot {
-            branch_reads: self.branch_reads.load(std::sync::atomic::Ordering::SeqCst),
+            result_reads: self.result_reads.load(std::sync::atomic::Ordering::SeqCst),
             enqueues: self.enqueues.load(std::sync::atomic::Ordering::SeqCst),
             builder_entries: self
                 .builder_entries
@@ -307,19 +306,29 @@ struct ProbedRefStore {
 
 #[async_trait::async_trait]
 impl ripclone::ref_store::RefStore for ProbedRefStore {
-    async fn load(
+    async fn load_result(
         &self,
         repo_id: &ripclone::provider::RepoId,
+        commit: &str,
     ) -> anyhow::Result<Option<ripclone::RefInfo>> {
-        self.inner.load(repo_id).await
+        if self.probe.is_armed() {
+            self.probe
+                .result_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.load_result(repo_id, commit).await
     }
 
-    async fn save(
+    async fn save_result(
         &self,
         repo_id: &ripclone::provider::RepoId,
         info: &ripclone::RefInfo,
     ) -> anyhow::Result<()> {
-        self.inner.save(repo_id, info).await
+        self.inner.save_result(repo_id, info).await?;
+        if let Some(barrier) = &self.phase_one_barrier {
+            barrier.after_save(info).await;
+        }
+        Ok(())
     }
 
     async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
@@ -329,71 +338,41 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         self.inner.list().await
     }
 
-    async fn load_branch(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        branch: &str,
-    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
-        if self.probe.is_armed() {
-            self.probe
-                .branch_reads
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        self.inner.load_branch(repo_id, branch).await
-    }
-
-    async fn save_branch(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        branch: &str,
-        info: &ripclone::RefInfo,
-    ) -> anyhow::Result<()> {
-        self.inner.save_branch(repo_id, branch, info).await?;
-        if let Some(barrier) = &self.phase_one_barrier {
-            barrier.after_save(branch, info).await;
-        }
-        Ok(())
-    }
-
     async fn update_build_status(
         &self,
         repo_id: &ripclone::provider::RepoId,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
         status: &str,
     ) -> anyhow::Result<bool> {
         self.inner
-            .update_build_status(repo_id, branch, expected_commit, status)
+            .update_build_status(repo_id, commit, status)
             .await
     }
 
     async fn touch_last_accessed_at(
         &self,
         repo_id: &ripclone::provider::RepoId,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
     ) -> anyhow::Result<bool> {
-        self.inner
-            .touch_last_accessed_at(repo_id, branch, expected_commit)
-            .await
+        self.inner.touch_last_accessed_at(repo_id, commit).await
     }
 
-    async fn delete_branch(
+    async fn delete_result(
         &self,
         repo_id: &ripclone::provider::RepoId,
-        branch: &str,
+        commit: &str,
     ) -> anyhow::Result<()> {
-        self.inner.delete_branch(repo_id, branch).await
+        self.inner.delete_result(repo_id, commit).await
     }
 
-    async fn list_branches(
+    async fn list_commits(
         &self,
         repo_id: &ripclone::provider::RepoId,
     ) -> anyhow::Result<Vec<String>> {
         if self.probe.is_armed() {
-            panic!("pinned metadata lookup must not scan branches");
+            panic!("pinned metadata lookup must not scan commits");
         }
-        self.inner.list_branches(repo_id).await
+        self.inner.list_commits(repo_id).await
     }
 
     async fn add_repo(&self, repo: &ripclone::ref_store::AddedRepo) -> anyhow::Result<()> {
@@ -461,23 +440,23 @@ pub async fn replace_full_manifest_commit(
     let repo_id = ripclone::provider::RepoId::github(repo_path);
     let mut published = None;
     for _ in 0..200 {
-        if let Ok(Some(info)) = store.load_branch(&repo_id, "main").await
-            && info.build_status.is_none()
-            && !info.full_clonepack.manifest.is_empty()
-        {
-            published = Some(info);
-            break;
+        if let Ok(commits) = store.list_commits(&repo_id).await {
+            for commit in commits {
+                if let Ok(Some(info)) = store.load_result(&repo_id, &commit).await
+                    && !info.full_clonepack.manifest.is_empty()
+                {
+                    published = Some(info);
+                    break;
+                }
+            }
+            if published.is_some() {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let moving = published.expect("full manifest publication settled");
-    let pinned = moving.commit.clone();
-    let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
-    let mut info = store
-        .load_branch(&repo_id, &exact_key)
-        .await
-        .expect("load exact full-manifest row")
-        .expect("exact full-manifest row exists");
+    let mut info = published.expect("full manifest publication settled");
+    let pinned = info.commit.clone();
     let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
     let bytes = storage
         .get(&info.full_clonepack.manifest)
@@ -492,7 +471,11 @@ pub async fn replace_full_manifest_commit(
         .expect("publish mismatched manifest fixture");
     info.full_clonepack.manifest = hash.clone();
     store
-        .save_branch(&repo_id, &exact_key, &info)
+        .delete_result(&repo_id, &pinned)
+        .await
+        .expect("remove exact result before installing corrupt fixture");
+    store
+        .save_result(&repo_id, &info)
         .await
         .expect("publish mismatched exact full-manifest ref");
     (pinned, hash)
@@ -733,9 +716,6 @@ async fn start_server_split_storage_inner(
         oidc_verifier: None,
         webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
         sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        mirror_freshness: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        mirror_fresh_ttl: Duration::from_secs(60),
-        ref_response_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         artifact_fetch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         fail_first_fetches: 0,
         artifact_barrier: barrier,
@@ -772,9 +752,8 @@ async fn start_server_split_storage_inner(
                 ripclone::server::admission_test_after_claim().await;
                 let job = ripclone::queue::BuildJob {
                     repo_id: claimed.repo_id(),
-                    branch: claimed.branch,
                     admitted_commit: claimed.admitted_commit,
-                    admitted_default_branch: claimed.admitted_default_branch,
+                    source_ref: claimed.source_ref,
                     repo_config: claimed.repo_config,
                     credential: claimed.credential,
                     size_bytes: None,
@@ -954,14 +933,15 @@ impl FailingRefStore {
 
 #[async_trait::async_trait]
 impl ripclone::ref_store::RefStore for FailingRefStore {
-    async fn load(
+    async fn load_result(
         &self,
         repo_id: &ripclone::provider::RepoId,
+        commit: &str,
     ) -> anyhow::Result<Option<ripclone::RefInfo>> {
-        self.inner.load(repo_id).await
+        self.inner.load_result(repo_id, commit).await
     }
 
-    async fn save(
+    async fn save_result(
         &self,
         repo_id: &ripclone::provider::RepoId,
         info: &ripclone::RefInfo,
@@ -972,7 +952,7 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
                 repo_id.storage_key()
             );
         }
-        self.inner.save(repo_id, info).await
+        self.inner.save_result(repo_id, info).await
     }
 
     async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
@@ -994,69 +974,42 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
         self.inner.list_added_repos().await
     }
 
-    async fn load_branch(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        branch: &str,
-    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
-        self.inner.load_branch(repo_id, branch).await
-    }
-
-    async fn save_branch(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        branch: &str,
-        info: &ripclone::RefInfo,
-    ) -> anyhow::Result<()> {
-        if self.should_fail_write() {
-            anyhow::bail!(
-                "injected ref-store save_branch failure for {}@{branch}",
-                repo_id.storage_key()
-            );
-        }
-        self.inner.save_branch(repo_id, branch, info).await
-    }
-
     async fn update_build_status(
         &self,
         repo_id: &ripclone::provider::RepoId,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
         status: &str,
     ) -> anyhow::Result<bool> {
         self.inner
-            .update_build_status(repo_id, branch, expected_commit, status)
+            .update_build_status(repo_id, commit, status)
             .await
     }
 
     async fn touch_last_accessed_at(
         &self,
         repo_id: &ripclone::provider::RepoId,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
     ) -> anyhow::Result<bool> {
-        self.inner
-            .touch_last_accessed_at(repo_id, branch, expected_commit)
-            .await
+        self.inner.touch_last_accessed_at(repo_id, commit).await
     }
 
-    async fn delete_branch(
+    async fn delete_result(
         &self,
         repo_id: &ripclone::provider::RepoId,
-        branch: &str,
+        commit: &str,
     ) -> anyhow::Result<()> {
-        self.inner.delete_branch(repo_id, branch).await
+        self.inner.delete_result(repo_id, commit).await
     }
 
-    async fn list_branches(
+    async fn list_commits(
         &self,
         repo_id: &ripclone::provider::RepoId,
     ) -> anyhow::Result<Vec<String>> {
-        self.inner.list_branches(repo_id).await
+        self.inner.list_commits(repo_id).await
     }
 
-    async fn invalidate(&self, repo_id: &ripclone::provider::RepoId, branch: &str) {
-        self.inner.invalidate(repo_id, branch).await
+    async fn invalidate(&self, repo_id: &ripclone::provider::RepoId, commit: &str) {
+        self.inner.invalidate(repo_id, commit).await
     }
 
     async fn health(&self) -> anyhow::Result<()> {
@@ -1152,6 +1105,11 @@ async fn start_server_inner(
     // Tests can queue on SERVER_START_LOCK for several seconds. Do not choose
     // a free port until this server can actually start binding it.
     let port = free_port();
+    let fail_first_original = std::env::var_os("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
+    let extra_original = extra_env
+        .iter()
+        .map(|(key, _)| ((*key).to_string(), std::env::var_os(key)))
+        .collect::<Vec<_>>();
     if fail_first > 0 {
         // SAFETY: set under SERVER_START_LOCK and removed before it drops, so no
         // concurrently-constructing server observes it.
@@ -1166,20 +1124,34 @@ async fn start_server_inner(
         }
     }
     tokio::spawn(async move {
-        let _ = run_server_with_barrier(&cas2, &repos2, "127.0.0.1", port, artifact_barrier).await;
+        if let Err(error) =
+            run_server_with_barrier(&cas2, &repos2, "127.0.0.1", port, artifact_barrier).await
+        {
+            eprintln!("default test server on port {port} exited: {error:#}");
+        }
     });
     // Wait for the HTTP service. The server state (including the fault
     // threshold read) is constructed before `/readyz` can succeed, so by then
     // the temporary env vars have been consumed.
     wait_for_server_ready(port, "default").await;
     if fail_first > 0 {
+        // SAFETY: restored under the same construction lock used for the
+        // temporary override.
         unsafe {
-            std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
+            match fail_first_original {
+                Some(value) => std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", value),
+                None => std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES"),
+            }
         }
     }
-    for (k, _) in extra_env {
+    for (key, original) in extra_original {
+        // SAFETY: restored under SERVER_START_LOCK before another server can
+        // observe process configuration.
         unsafe {
-            std::env::remove_var(k);
+            match original {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
     drop(_start_guard);

@@ -3,11 +3,7 @@
 //! A branch is warmed at a deep tip, then upstream runs the moral equivalent of
 //! `git reset --hard <older> && git commit && git push --force`, landing a NEW
 //! tip whose history is *shallower* than the abandoned one. That commit was never
-//! built as a tip, so the sync builds it fresh. The freshly built commit is the
-//! confirmed upstream tip and must be published authoritatively — the served ref
-//! has to follow upstream to the shallow tip, not stay stranded on the deeper,
-//! abandoned commit. Ordering by history depth alone would keep serving the old
-//! tree; this pins that the confirmed tip wins regardless of depth.
+//! built as a tip, so the next operation selects and builds that exact commit.
 
 use crate::common::*;
 
@@ -51,10 +47,8 @@ async fn forcepush_rewind_to_shallower_tip_serves_new_tip() {
         .await
         .expect("sync rewound tip");
 
-    // The published (depth=1) ref must follow upstream to the shallow tip. Before
-    // the fix, `should_replace_ref` ordered by history depth first, so the fresh
-    // depth-3 build (gen 3) lost to the stranded depth-5 ref (gen 5) and this
-    // clone kept serving the abandoned c5 tree (a.txt=5, marker DEEP).
+    // A new depth=1 operation selects the shallow tip and installs that exact
+    // result, independent of the earlier deeper result.
     let (_g1, d1) = clone_only(
         &server,
         "acme",

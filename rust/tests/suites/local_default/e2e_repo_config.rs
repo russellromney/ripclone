@@ -104,7 +104,7 @@ async fn control_counts(path: &Path) -> (i64, i64, i64, i64) {
     let database = libsql::Builder::new_local(path).build().await.unwrap();
     let connection = database.connect().unwrap();
     let mut counts = Vec::new();
-    for table in ["repository_configs", "jobs", "workers", "refs"] {
+    for table in ["repository_configs", "jobs", "workers", "results"] {
         let mut rows = connection
             .query(&format!("SELECT COUNT(*) FROM {table}"), ())
             .await
@@ -348,7 +348,7 @@ async fn repository_config_failures_admit_no_work_or_artifacts() {
                 (SELECT COUNT(*) FROM unavailable_repository_configs),
                 (SELECT COUNT(*) FROM jobs),
                 (SELECT COUNT(*) FROM workers),
-                (SELECT COUNT(*) FROM refs)",
+                (SELECT COUNT(*) FROM results)",
             (),
         )
         .await

@@ -5,7 +5,6 @@
 use crate::common::*;
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
-use ripclone::ref_store::exact_ref_key;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -242,23 +241,12 @@ async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
     let repo_id = RepoId::github("acme/phase2guard");
     for commit in [&old, &new] {
         let exact = store
-            .load_branch(&repo_id, &exact_ref_key("main", commit))
+            .load_result(&repo_id, commit)
             .await
             .expect("load exact result")
             .expect("ordinary result remains addressable");
-        assert!(exact.internal_exact_result);
         assert_eq!(&exact.commit, commit);
     }
-    assert_eq!(
-        store
-            .load_branch(&repo_id, "main")
-            .await
-            .unwrap()
-            .unwrap()
-            .commit,
-        new,
-        "late B completion must leave moving main at C"
-    );
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT");
         std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS");
@@ -318,7 +306,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
                 .filter(|commit| *commit == &b)
                 .count();
             let b_failed = store
-                .load_branch(&repo_id, &exact_ref_key("main", &b))
+                .load_result(&repo_id, &b)
                 .await
                 .expect("load exact B while waiting")
                 .and_then(|info| info.build_status)
@@ -342,24 +330,23 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         "Full(B) must exhaust exactly one retry: {attempts:?}"
     );
 
-    let moving = store
-        .load_branch(&repo_id, "main")
+    let current = store
+        .load_result(&repo_id, &c)
         .await
-        .expect("load final moving ref")
-        .expect("moving ref exists");
-    assert_eq!(moving.commit, c);
-    assert_eq!(moving.full_clonepack.commit, c);
+        .expect("load exact C")
+        .expect("exact C exists");
+    assert_eq!(current.commit, c);
+    assert_eq!(current.full_clonepack.commit, c);
     assert!(
-        moving.build_status.is_none(),
+        current.build_status.is_none(),
         "B failure must not leave C building or failed: {:?}",
-        moving.build_status
+        current.build_status
     );
     let exact_b = store
-        .load_branch(&repo_id, &exact_ref_key("main", &b))
+        .load_result(&repo_id, &b)
         .await
         .expect("load exact B")
         .expect("failed exact B remains terminal and addressable");
-    assert!(exact_b.internal_exact_result);
     assert_eq!(exact_b.commit, b);
     assert!(
         exact_b
@@ -368,24 +355,38 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
             .is_some_and(|status| status.starts_with("failed: "))
     );
     let exact_c = store
-        .load_branch(&repo_id, &exact_ref_key("main", &c))
+        .load_result(&repo_id, &c)
         .await
         .expect("load exact C")
         .expect("exact C remains addressable");
-    assert!(exact_c.internal_exact_result);
     assert_eq!(exact_c.full_clonepack.commit, c);
 
     let status = repo_status(&server, "acme", "phase2fail-fenced").await;
     let public_refs = status["refs"].as_array().expect("status refs");
+    assert_eq!(public_refs.len(), 2, "B and C remain independent results");
     assert!(
-        public_refs.iter().all(|entry| {
-            entry["branch"]
-                .as_str()
-                .is_some_and(|branch| branch == "main" || branch == "HEAD")
-                && entry["commit"] == c
-                && entry["history"] == "ready"
-        }),
-        "status must expose only ready C source refs: {public_refs:?}"
+        public_refs
+            .iter()
+            .all(|entry| entry.get("branch").is_none()),
+        "exact status entries contain no checkout name: {public_refs:?}"
+    );
+    let status_b = public_refs
+        .iter()
+        .find(|entry| entry["commit"] == b)
+        .expect("failed B status remains addressable");
+    assert_eq!(status_b["history"], "failed");
+    assert!(
+        status_b["build_status"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("failed: "))
+    );
+    let status_c = public_refs
+        .iter()
+        .find(|entry| entry["commit"] == c)
+        .expect("ready C status remains addressable");
+    assert_eq!(
+        status_c["history"], "ready",
+        "B failure must not regress C: {public_refs:?}"
     );
 
     unsafe {
@@ -425,7 +426,7 @@ async fn failed_phase2_status_recovers_on_resync() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["branch"] == "main")
+            .find(|entry| entry["commit"] == commit)
             .and_then(|entry| entry["build_status"].as_str())
             .map(str::to_string);
         if failed_status
@@ -466,7 +467,7 @@ async fn failed_phase2_status_recovers_on_resync() {
     assert!(recovered, "subsequent sync should recover the full clone");
 }
 
-/// A *panic* in the detached phase-2 task (not a returned error) must not
+/// A *panic* in phase 2 (not a returned error) must not
 /// silently strand the ref at "full history building" forever — the giant-repo
 /// stall. The panic must be caught, surfaced, and the build marked `failed:` so
 /// a following sync rebuilds and recovers the full clone.
@@ -492,7 +493,7 @@ async fn panicking_phase2_status_recovers_on_resync() {
         .await
         .expect("admit sync with forced phase-2 panic");
 
-    // The detached phase-2 task panics; the outer guard must catch it and mark
+    // The phase-2 task panics; the outer guard must catch it and mark
     // the build failed instead of leaving it stuck at "full history building".
     let mut failed_status = None;
     for _ in 0..120 {
@@ -501,7 +502,7 @@ async fn panicking_phase2_status_recovers_on_resync() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["branch"] == "main")
+            .find(|entry| entry["commit"] == commit)
             .and_then(|entry| entry["build_status"].as_str())
             .map(str::to_string);
         if failed_status

@@ -454,12 +454,6 @@ async fn republish_resolved_manifest(
     use prost::Message;
     let store = server_ref_store(server).await;
     let repo_id = ripclone::provider::RepoId::github(repo_path);
-    let moving = store
-        .load_branch(&repo_id, "main")
-        .await
-        .expect("load moving row")
-        .expect("moving row exists");
-    let exact_key = ripclone::ref_store::exact_ref_key("main", &moving.commit);
 
     let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
     let bytes = storage.get(resolved).expect("read published manifest");
@@ -472,14 +466,16 @@ async fn republish_resolved_manifest(
         .put(&hash, &bytes)
         .expect("publish rewritten manifest");
 
-    // Both the moving projection and the exact result name the manifest; a
-    // clone can read either, so repoint both.
     let mut patched = 0usize;
-    for key in ["main", exact_key.as_str()] {
+    for commit in store
+        .list_commits(&repo_id)
+        .await
+        .expect("list exact results")
+    {
         let Some(mut info) = store
-            .load_branch(&repo_id, key)
+            .load_result(&repo_id, &commit)
             .await
-            .expect("load ref row")
+            .expect("load exact result")
         else {
             continue;
         };
@@ -497,14 +493,18 @@ async fn republish_resolved_manifest(
         if changed {
             patched += 1;
             store
-                .save_branch(&repo_id, key, &info)
+                .delete_result(&repo_id, &commit)
                 .await
-                .expect("publish rewritten ref row");
+                .expect("remove exact result before installing corrupt fixture");
+            store
+                .save_result(&repo_id, &info)
+                .await
+                .expect("publish rewritten exact result");
         }
     }
     assert!(
         patched > 0,
-        "the resolved manifest {resolved} must be named by a ref row"
+        "the resolved manifest {resolved} must be named by an exact result"
     );
     hash
 }

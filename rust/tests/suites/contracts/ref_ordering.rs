@@ -1,11 +1,11 @@
-//! Concurrent ref ordering against the server control database.
+//! Concurrent exact-result writes against the server control database.
 
 use ripclone::control::ControlDb;
 use ripclone::provider::RepoId;
 use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sqlite_control_ref_ordering_keeps_newest_generation() {
+async fn sqlite_control_keeps_every_exact_commit_independent() {
     let directory = tempfile::tempdir().unwrap();
     let control = Arc::new(
         ControlDb::open(
@@ -18,18 +18,16 @@ async fn sqlite_control_ref_ordering_keeps_newest_generation() {
     );
     let repo = RepoId::github("acme/ref-ordering");
     let mut writes = Vec::new();
-    for generation in (1..=64).rev() {
+    for ordinal in (1..=64).rev() {
         let store = control.ref_store();
         let repo = repo.clone();
         writes.push(tokio::spawn(async move {
             store
-                .save_branch(
+                .save_result(
                     &repo,
-                    "main",
                     &ripclone::RefInfo {
-                        commit: format!("{generation:040x}"),
-                        generation: Some(generation),
-                        synced_at: Some(1000 - generation),
+                        commit: format!("{ordinal:040x}"),
+                        synced_at: Some(1000 - ordinal),
                         ..Default::default()
                     },
                 )
@@ -40,12 +38,19 @@ async fn sqlite_control_ref_ordering_keeps_newest_generation() {
     for write in writes {
         write.await.unwrap();
     }
-    let current = control
-        .ref_store()
-        .load_branch(&repo, "main")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.generation, Some(64));
-    assert_eq!(current.commit, format!("{:040x}", 64));
+    let commits = control.ref_store().list_commits(&repo).await.unwrap();
+    assert_eq!(commits.len(), 64);
+    for ordinal in 1..=64 {
+        let commit = format!("{ordinal:040x}");
+        assert_eq!(
+            control
+                .ref_store()
+                .load_result(&repo, &commit)
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            commit
+        );
+    }
 }

@@ -10,12 +10,17 @@ fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap()
 }
 
-async fn wait_archive_ref(server: &Server, owner: &str, repo: &str) -> ripclone::RefInfo {
+async fn wait_archive_ref(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    commit: &str,
+) -> ripclone::RefInfo {
     let store = server_ref_store(server).await;
     let repo_id = ripclone::provider::RepoId::github(format!("{owner}/{repo}"));
     let mut last = String::from("<not read>");
     for _ in 0..160 {
-        match store.load_branch(&repo_id, "main").await {
+        match store.load_result(&repo_id, commit).await {
             Ok(Some(info))
                 if !info.archive_chunks.is_empty() && !info.archive_frames.is_empty() =>
             {
@@ -29,7 +34,7 @@ async fn wait_archive_ref(server: &Server, owner: &str, repo: &str) -> ripclone:
                     info.commit
                 );
             }
-            Ok(None) => last = String::from("no main ref in control database"),
+            Ok(None) => last = format!("exact result {commit} was absent"),
             Err(error) => last = format!("control database read: {error}"),
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -131,7 +136,7 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
     let origin = make_origin("acme", "remotecontract");
     let big = vec![b'a'; 17 * 1024 * 1024];
 
-    origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"one\n")], "c1");
+    let commit1 = origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"one\n")], "c1");
     origin.publish();
     register_added_without_build(&server, "acme/remotecontract")
         .await
@@ -151,7 +156,7 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
         "files mode should not create .git before remote artifact eviction"
     );
 
-    let info1 = wait_archive_ref(&server, "acme", "remotecontract").await;
+    let info1 = wait_archive_ref(&server, "acme", "remotecontract", &commit1).await;
     assert!(
         !info1.archive_chunks.is_empty(),
         "files archive bundles should be published"
@@ -175,7 +180,7 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
         );
     }
 
-    origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"two\n")], "c2");
+    let commit2 = origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"two\n")], "c2");
     origin.publish();
     server
         .client()
@@ -192,7 +197,7 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
         "files mode should not create .git after rebuilding from durable storage"
     );
 
-    let info2 = wait_archive_ref(&server, "acme", "remotecontract").await;
+    let info2 = wait_archive_ref(&server, "acme", "remotecontract", &commit2).await;
     assert_eq!(info2.commit, git(&origin.bare, &["rev-parse", "HEAD"]));
     assert!(
         info2.archive_frames.iter().any(|f| info1
@@ -482,7 +487,6 @@ fn ref_info_history_levels_serde() {
     use ripclone::{HistoryLevel, RefInfo, SizedPack};
     let mut info = RefInfo {
         commit: "c".to_string(),
-        default_branch: "main".to_string(),
         ..Default::default()
     };
 

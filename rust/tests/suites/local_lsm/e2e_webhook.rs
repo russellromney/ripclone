@@ -156,11 +156,11 @@ fn parse_metric(text: &str, name: &str) -> u64 {
     0
 }
 
-/// A webhook and a `/sync` for the SAME branch key, fired concurrently, coalesce
+/// A webhook and a `/sync` for the same exact commit, fired concurrently, coalesce
 /// into one build (no corruption, no double-build). Proves the coalescing gate
 /// unifies the two entry points — not just `/sync`-vs-`/sync`.
 #[tokio::test]
-async fn webhook_and_sync_same_branch_coalesce() {
+async fn webhook_and_sync_same_commit_coalesce() {
     setup(true);
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", SECRET)]).await;
     let origin = make_origin("acme", "coal");
@@ -182,7 +182,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
     .into_bytes();
     let url = server.url.clone();
 
-    // Fire a webhook and a branch-targeted sync for the same key at once.
+    // Fire a webhook and a branch-targeted sync for the same commit at once.
     let webhook = {
         let (url, body, sig) = (url.clone(), body.clone(), sign_github(&body));
         tokio::spawn(async move {

@@ -115,9 +115,6 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         oidc_verifier: None,
         webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
         sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        mirror_freshness: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        mirror_fresh_ttl: Duration::from_secs(60),
-        ref_response_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         artifact_fetch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         fail_first_fetches: 0,
         artifact_barrier: None,
@@ -237,10 +234,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     .expect("API worker entered the held Full phase");
     let exact = control
         .ref_store()
-        .load_branch(
-            &RepoId::github("acme/api-only"),
-            &ripclone::ref_store::exact_ref_key("main", &commit),
-        )
+        .load_result(&RepoId::github("acme/api-only"), &commit)
         .await
         .unwrap()
         .expect("Head publication is durable before held Full");
@@ -437,9 +431,8 @@ async fn turso_primary_loss_rejects_ref_and_job_writes() {
 
     let job = BuildJob {
         repo_id: RepoId::github("acme/job-after-primary-loss"),
-        branch: "main".to_string(),
+        source_ref: Some("refs/heads/main".to_string()),
         admitted_commit: "1111111111111111111111111111111111111111".to_string(),
-        admitted_default_branch: Some("main".to_string()),
         repo_config: ripclone::repo_config::RepoConfig::default(),
         credential: None,
         size_bytes: None,

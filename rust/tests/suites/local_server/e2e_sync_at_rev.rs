@@ -330,25 +330,15 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
 
     let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/at-exact-only");
-    assert!(
-        ripclone::ref_store::RefStore::load_branch(store.as_ref(), &repo_id, "HEAD")
-            .await
-            .expect("load absent HEAD")
-            .is_none(),
-        "exact revision sync must not create a moving HEAD row"
-    );
-
-    let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
-    let exact = ripclone::ref_store::RefStore::load_branch(store.as_ref(), &repo_id, &exact_key)
+    let exact = ripclone::ref_store::RefStore::load_result(store.as_ref(), &repo_id, &pinned)
         .await
         .expect("load exact-only result")
         .expect("historical sync publishes its exact result");
-    assert!(exact.internal_exact_result);
-    assert_eq!(exact.default_branch, "main");
-    let branches = ripclone::ref_store::RefStore::list_branches(store.as_ref(), &repo_id)
+    assert_eq!(exact.commit, pinned);
+    let commits = ripclone::ref_store::RefStore::list_commits(store.as_ref(), &repo_id)
         .await
         .expect("list exact-only layout");
-    assert_eq!(branches, vec![exact_key.clone()]);
+    assert_eq!(commits, vec![pinned.clone()]);
 
     let status = reqwest::Client::new()
         .get(format!(
@@ -362,7 +352,7 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
         .expect("exact-only public status");
     assert_eq!(status.status(), reqwest::StatusCode::OK);
     let status: serde_json::Value = status.json().await.expect("exact-only status body");
-    assert_eq!(status["refs"], serde_json::json!([]));
+    assert_eq!(status["refs"][0]["commit"], pinned);
     assert!(
         status["total_bytes"]
             .as_u64()
@@ -389,8 +379,9 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
     assert_eq!(read(&target, "a.txt"), "old\n");
     assert_repo_usable(&target, "1");
 
-    // If the mirror can no longer identify HEAD, the internal exact row must
-    // not be promoted into a public default-branch projection.
+    // A full object ID skips revision resolution. Even when the mirror can no
+    // longer identify HEAD, the request keeps its validated checkout name and
+    // reuses the already-ready exact result without a fallback lookup.
     std::fs::write(
         server
             .repo_root
@@ -409,17 +400,10 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
         .send()
         .await
         .expect("HEAD fallback request");
-    assert_eq!(
-        unresolved.status(),
-        reqwest::StatusCode::UNPROCESSABLE_ENTITY
-    );
-    let unresolved: serde_json::Value = unresolved.json().await.expect("fallback error body");
-    assert!(
-        unresolved["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("current public default branch")),
-        "exact-only metadata must not select a public branch: {unresolved}"
-    );
+    assert_eq!(unresolved.status(), reqwest::StatusCode::OK);
+    let unresolved: serde_json::Value = unresolved.json().await.expect("exact result body");
+    assert_eq!(unresolved["commit"], pinned);
+    assert_eq!(unresolved["branch"], "HEAD");
 }
 
 #[tokio::test]

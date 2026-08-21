@@ -60,8 +60,8 @@ if [ "$#" -gt 0 ]; then
   tests=("$@")
 else
   tests=(
-    expired_signed_url_retry_stays_on_pinned_commit
-    revoked_authorization_blocks_pinned_refresh
+    sqlite_control_with_s3_artifacts_builds_and_resolves
+    remote_gc_uses_sqlite_refs_for_s3_reachability
   )
 fi
 

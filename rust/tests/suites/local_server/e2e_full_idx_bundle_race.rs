@@ -5,17 +5,16 @@
 //! The full clonepack is published in two phases from a detached background task:
 //! phase 2a writes the whole `full_clonepack` (manifest + idx_bundle) atomically,
 //! phase 2b then re-points only `manifest`/`metadata_chunk` at the archive-bearing
-//! variant. Two same-commit builds can overlap (each detached phase 2 keeps
-//! running after `/sync` returns, and `should_replace_ref` lets an equal-commit
-//! save win). With the old phase-2b partial poke, this interleave left the ref
+//! variant. Two same-commit build attempts can overlap. A partial phase-2b write
+//! could otherwise leave the exact result
 //! with build A's `manifest` on top of build B's `idx_bundle`: the served
 //! `idx_bundle_url` (build B's bundle) and `manifest.idx_bundle` (build A's) then
 //! disagreed, so every editable clone failed the idx-bundle hash check. Multi-pack
 //! is what makes the two builds' bundles differ (git pack-objects is non-deterministic
 //! run to run), which the `RIPCLONE_TEST_PHASE2_RACE` hook reproduces deterministically.
 //!
-//! Own test binary so the process-global `RIPCLONE_HISTORY_MAX_PACK_BYTES` /
-//! `RIPCLONE_TEST_PHASE2_RACE` can't race other tests.
+//! The existing local-server binary keeps the process-global test hook isolated
+//! from other suite groups.
 
 use crate::common::*;
 use prost::Message;
@@ -89,8 +88,9 @@ async fn full_idx_bundle_matches_manifest_under_concurrent_multipack_build() {
     // Read the stored full clonepack directly and decode the manifest it serves.
     let store: Arc<dyn RefStore> = server_ref_store(&server).await;
     let repo = RepoId::github("acme/idxrace");
+    let commit = store.list_commits(&repo).await.unwrap().pop().unwrap();
     let info = store
-        .load_branch(&repo, "main")
+        .load_result(&repo, &commit)
         .await
         .expect("load ref")
         .expect("ref exists");

@@ -80,10 +80,10 @@ async fn sqlite_control_with_s3_artifacts_builds_and_resolves() {
 
     let refs = server_ref_store(&server).await;
     let stored = refs
-        .load_branch(&RepoId::github("acme/s3-control"), "main")
+        .load_result(&RepoId::github("acme/s3-control"), &commit)
         .await
         .unwrap()
-        .expect("moving ref in SQLite control database");
+        .expect("exact result in SQLite control database");
     assert_eq!(stored.commit, commit);
     assert!(server.control_db.exists());
     assert!(
@@ -114,9 +114,8 @@ async fn remote_gc_uses_sqlite_refs_for_s3_reachability() {
     let orphan = ripclone::cas::hash(orphan_bytes);
     storage.put_async(&live, live_bytes).await.unwrap();
     storage.put_async(&orphan, orphan_bytes).await.unwrap();
-    refs.save_branch(
+    refs.save_result(
         &RepoId::github("acme/gc"),
-        "main",
         &ripclone::RefInfo {
             commit: "1111111111111111111111111111111111111111".to_string(),
             head_blobs_chunks: vec![live.clone()],

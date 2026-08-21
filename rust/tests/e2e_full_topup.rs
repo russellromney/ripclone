@@ -796,8 +796,12 @@ exec "$real_git" "$@"
         .lines()
         .count();
     assert_eq!(
-        source_acquisitions_after_pin, 1,
-        "the initial unpinned request resolves the moving branch exactly once"
+        source_acquisitions_after_pin, 0,
+        "request-time selection must not start a second mirror fetch"
+    );
+    assert!(
+        origin.auth_success_count() > 0,
+        "the initial request must perform its bounded upstream selection"
     );
     // This is deliberately after the server has issued the carried-A plan and
     // the client has created its private staging root. The production-generated
@@ -1197,139 +1201,6 @@ async fn exact_full_b_precedes_available_carried_a_without_manifest_or_upstream(
 }
 
 #[tokio::test]
-async fn surrogate_stale_carried_default_branch_uses_resolved_b_branch() {
-    let _guard = env_lock().lock().await;
-    init(false);
-    let upstream_token = "stale-default-token";
-    let origin =
-        make_http_origin_with_auth("acme/full-topup-stale-default", "token stale-default-token");
-    let provider = ProviderInstance {
-        id: ProviderInstanceId::new("counting"),
-        kind: ProviderKind::Generic,
-        host: origin.url.clone(),
-        auth_template: Some("token {token}".to_string()),
-        auth_header_name: None,
-    };
-    let mut registry = ProviderRegistry::new();
-    registry
-        .merge_one(ProviderConfig {
-            id: "counting".to_string(),
-            kind: Some("generic".to_string()),
-            host: Some(origin.url.clone()),
-            token: Some(upstream_token.to_string()),
-            auth_template: Some("token {token}".to_string()),
-            auth_header_name: None,
-        })
-        .expect("configure counting upstream");
-    let (server, barrier, entered, proceed) =
-        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
-    let a = origin.commit(&[("value.txt", "A\n")], "A");
-    origin.publish();
-    register_added_without_build_for_provider(&server, "counting", "acme/full-topup-stale-default")
-        .await
-        .expect("register repo");
-    server
-        .client()
-        .with_provider_instance(provider.clone())
-        .with_upstream_token(upstream_token)
-        .sync_repo("acme/full-topup-stale-default", None)
-        .await
-        .expect("publish Full(A)");
-    let ready_a = server
-        .client()
-        .with_provider_instance(provider.clone())
-        .with_upstream_token(upstream_token)
-        .resolve_ref_with_clonepack("acme/full-topup-stale-default", "main", Some("full"), None)
-        .await
-        .expect("wait for exact Full(A)");
-    assert_eq!(ready_a.commit, a);
-
-    barrier.arm();
-    let b = origin.commit(&[("value.txt", "B\n")], "B");
-    origin.publish();
-    let sync_client = server
-        .client()
-        .with_provider_instance(provider.clone())
-        .with_upstream_token(upstream_token);
-    let mut sync_b = tokio::spawn(async move {
-        sync_client
-            .sync_repo("acme/full-topup-stale-default", None)
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(20), entered)
-        .await
-        .expect("B reached phase-one publication")
-        .expect("phase-one barrier alive");
-
-    // This is intentionally a surrogate for an upstream default-branch rename:
-    // mutate only the carried A manifest after real phase-one publication.
-    let store = server_ref_store(&server).await;
-    let repo_id = RepoId {
-        provider: ProviderInstanceId::new("counting"),
-        path: "acme/full-topup-stale-default".to_string(),
-    };
-    let mut moving_row = None;
-    for candidate in store.list_branches(&repo_id).await.expect("list B rows") {
-        if let Some(info) = store
-            .load_branch(&repo_id, &candidate)
-            .await
-            .expect("load candidate B row")
-            && info.commit == b
-            && info.full_clonepack.commit == a
-        {
-            moving_row = Some((candidate, info));
-            break;
-        }
-    }
-    let (moving_branch, mut moving) = moving_row.expect("moving B row");
-    let storage = Cas::new(&server.storage_dir).expect("open split storage CAS");
-    let bytes = storage
-        .get(&moving.full_clonepack.manifest)
-        .expect("read carried Full(A) manifest");
-    let mut carried = ClonepackManifest::decode(bytes.as_slice()).expect("decode carried manifest");
-    carried.default_branch = "master".to_string();
-    moving.full_clonepack.manifest = storage
-        .put(&carried.encode_to_vec())
-        .expect("store renamed-default carried manifest");
-    store
-        .save_branch(&repo_id, &moving_branch, &moving)
-        .await
-        .expect("publish carried manifest with obsolete default branch");
-
-    let output = tempfile::tempdir().unwrap();
-    let target = output.path().join("clone");
-    let outcome = server
-        .client()
-        .with_provider_instance(provider)
-        .with_upstream_token(upstream_token)
-        .install_repo_with_mode_at(
-            "acme/full-topup-stale-default",
-            "HEAD",
-            None,
-            &target,
-            CloneMode::Editable,
-            Some("full"),
-            None,
-        )
-        .await
-        .expect("surrogate top-up succeeds");
-    assert_eq!(outcome.commit, b);
-    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
-    assert_eq!(
-        git(&target, &["symbolic-ref", "--short", "HEAD"]),
-        "main",
-        "a HEAD top-up must use B's resolved branch, not A's stale default branch"
-    );
-
-    proceed.send(()).expect("release Full(B)");
-    tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
-        .await
-        .expect("Full(B) finished after release")
-        .expect("join Full(B) sync")
-        .expect("sync Full(B)");
-}
-
-#[tokio::test]
 async fn missing_local_provider_fails_before_base_artifacts_download() {
     let _guard = env_lock().lock().await;
     init(false);
@@ -1554,9 +1425,8 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
 
     let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/full-topup-no-base");
-    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let mut exact = store
-        .load_branch(&repo_id, &exact_key)
+        .load_result(&repo_id, &b)
         .await
         .expect("load exact B")
         .expect("exact B row");
@@ -1565,7 +1435,7 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
     assert_eq!(carried.commit, a);
     exact.full_clonepack = Default::default();
     store
-        .save_branch(&repo_id, &exact_key, &exact)
+        .save_result(&repo_id, &exact)
         .await
         .expect("remove carried base");
 
@@ -1609,7 +1479,7 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
     exact.full_clonepack = carried;
     exact.full_clonepack.manifest = bad_hash;
     store
-        .save_branch(&repo_id, &exact_key, &exact)
+        .save_result(&repo_id, &exact)
         .await
         .expect("install mismatched carried manifest");
     let bad_target = output.path().join("bad-clone");
@@ -1682,9 +1552,8 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
 
     let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/full-topup-unrelated");
-    let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let mut exact = store
-        .load_branch(&repo_id, &exact_key)
+        .load_result(&repo_id, &b)
         .await
         .expect("load exact B")
         .expect("exact B row");
@@ -1695,7 +1564,7 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
         "an unrelated history must not carry Full(A) automatically"
     );
     let exact_a = store
-        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &a))
+        .load_result(&repo_id, &a)
         .await
         .expect("load exact A")
         .expect("exact A row");
@@ -1705,7 +1574,7 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
     exact.parent_commit = Some(a.clone());
     exact.full_clonepack = exact_a.full_clonepack;
     store
-        .save_branch(&repo_id, &exact_key, &exact)
+        .save_result(&repo_id, &exact)
         .await
         .expect("install malformed parent hint");
 
@@ -1788,10 +1657,7 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
 
     let store = server_ref_store(&server).await;
     let exact = store
-        .load_branch(
-            &RepoId::github("acme/full-topup-merge"),
-            &ripclone::ref_store::exact_ref_key("main", &b),
-        )
+        .load_result(&RepoId::github("acme/full-topup-merge"), &b)
         .await
         .expect("load merge B row")
         .expect("merge B row");
@@ -1920,11 +1786,9 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
     assert!(!target.exists());
 
     proceed.send(()).expect("release removed Full(B)");
-    // The readiness waiter is pinned to B and must never follow the
-    // rewound branch to A. If the post-build recheck replaces the mutable
-    // branch row before the next exact poll, the documented result is a
-    // bounded typed pending error; either outcome is acceptable here because
-    // the install assertion above is the source-removal proof.
+    // The readiness waiter is pinned to B and must never follow the rewound
+    // branch to A. A bounded exact-B error remains acceptable here because the
+    // install assertion above is the source-removal proof.
     match tokio::time::timeout(Duration::from_secs(20), &mut sync_b).await {
         Ok(joined) => match joined.expect("join removed B sync") {
             Ok(response) => assert_eq!(response.commit, b),

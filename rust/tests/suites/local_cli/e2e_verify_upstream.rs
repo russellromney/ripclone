@@ -283,46 +283,6 @@ async fn verify_upstream_default_succeeds_for_public() {
 }
 
 #[tokio::test]
-async fn upstream_snapshot_a_survives_branch_movement_and_installs_a() {
-    init(false);
-    let server = start_server().await;
-    let origin = make_origin("acme", "verify-snapshot-a");
-    let a = origin.commit(&[("value.txt", "A\n")], "A");
-    origin.publish();
-    register_added_without_build(&server, "acme/verify-snapshot-a")
-        .await
-        .expect("register verification fixture");
-    server
-        .client()
-        .sync_repo("acme/verify-snapshot-a", None)
-        .await
-        .expect("sync A");
-    wait_for_warm(&server, "acme/verify-snapshot-a", Some("full")).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("clone");
-    let barrier = ProbeBarrier::new();
-    let child = spawn_clone_at_probe_barrier(&server, "acme/verify-snapshot-a", &target, &barrier);
-    barrier.wait_entered().await;
-    let b = origin.commit(&[("value.txt", "B\n")], "B");
-    origin.publish();
-    assert_ne!(a, b);
-    barrier.release();
-    let output = wait_child_output_bounded(child, std::time::Duration::from_secs(60))
-        .await
-        .expect("positive verification clone bounded and reaped");
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    barrier.assert_one_probe();
-    assert_eq!(git(&target, &["rev-parse", "HEAD"]), a);
-    assert_eq!(read(&target, "value.txt"), "A\n");
-}
-
-#[tokio::test]
 async fn upstream_snapshot_a_rejects_later_pinned_install_b_without_repinning() {
     init(false);
     let server = start_server().await;
@@ -369,8 +329,10 @@ async fn upstream_snapshot_a_rejects_later_pinned_install_b_without_repinning() 
     assert!(stderr.contains("upstream verification failed"), "{stderr}");
     assert!(stderr.contains(&a), "snapshot A missing: {stderr}");
     assert!(stderr.contains(&b), "installed B missing: {stderr}");
-    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
-    assert_eq!(read(&target, "value.txt"), "B\n");
+    assert!(
+        !target.exists(),
+        "verification failure must not leave a partial target"
+    );
 }
 
 #[tokio::test]
@@ -419,11 +381,11 @@ async fn verify_upstream_succeeds_for_shallow_clone_with_history() {
 }
 
 #[tokio::test]
-async fn verify_upstream_auto_detects_stale_tip_on_public_repo() {
+async fn verify_upstream_auto_uses_the_new_exact_tip() {
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "verify-auto-stale");
-    origin.commit(&[("a.txt", "a\n")], "a");
+    let a = origin.commit(&[("a.txt", "a\n")], "a");
     origin.publish();
     server
         .client()
@@ -439,11 +401,18 @@ async fn verify_upstream_auto_detects_stale_tip_on_public_repo() {
         .client()
         .resolve_ref_with_clonepack("acme/verify-auto-stale", "main", Some("full"), None)
         .await
-        .expect("cache A on the concrete branch");
+        .expect("publish exact A");
 
     // Advance upstream without re-syncing the server.
-    origin.commit(&[("a.txt", "b\n")], "b");
+    let b = origin.commit(&[("a.txt", "b\n")], "b");
     origin.publish();
+    assert_ne!(a, b);
+    server
+        .client()
+        .sync_repo("acme/verify-auto-stale", None)
+        .await
+        .expect("admit exact B");
+    wait_for_warm(&server, "acme/verify-auto-stale", Some("full")).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -456,23 +425,20 @@ async fn verify_upstream_auto_detects_stale_tip_on_public_repo() {
     .await;
 
     assert!(
-        !out.status.success(),
-        "expected verification to fail, got stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("upstream verification failed"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
 }
 
 #[tokio::test]
-async fn verify_upstream_always_detects_stale_tip() {
+async fn verify_upstream_always_uses_the_new_exact_tip() {
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "verify-stale");
-    origin.commit(&[("a.txt", "a\n")], "a");
+    let a = origin.commit(&[("a.txt", "a\n")], "a");
     origin.publish();
     server
         .client()
@@ -488,12 +454,18 @@ async fn verify_upstream_always_detects_stale_tip() {
         .client()
         .resolve_ref_with_clonepack("acme/verify-stale", "main", Some("full"), None)
         .await
-        .expect("cache A on the concrete branch");
+        .expect("publish exact A");
 
-    // Advance upstream without re-syncing the server. The server still serves
-    // the older commit, but the upstream tip has moved.
-    origin.commit(&[("a.txt", "b\n")], "b");
+    // Advance upstream and admit the independent exact B result.
+    let b = origin.commit(&[("a.txt", "b\n")], "b");
     origin.publish();
+    assert_ne!(a, b);
+    server
+        .client()
+        .sync_repo("acme/verify-stale", None)
+        .await
+        .expect("admit exact B");
+    wait_for_warm(&server, "acme/verify-stale", Some("full")).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -506,15 +478,12 @@ async fn verify_upstream_always_detects_stale_tip() {
     .await;
 
     assert!(
-        !out.status.success(),
-        "expected verification to fail, got stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("upstream verification failed"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
 }
 
 #[tokio::test]
@@ -564,7 +533,7 @@ async fn verify_upstream_always_fails_when_unreachable() {
 }
 
 #[tokio::test]
-async fn verify_upstream_never_silently_skips() {
+async fn verify_upstream_never_does_not_bypass_exact_symbolic_resolution() {
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "verify-never");
@@ -597,20 +566,16 @@ async fn verify_upstream_never_silently_skips() {
     .await;
 
     assert!(
-        out.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join("a.txt")).unwrap(),
-        "hello\n"
+        !out.status.success(),
+        "symbolic lookup unexpectedly succeeded"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("verify-upstream"),
         "expected silent skip, got stderr: {stderr}"
     );
+    assert!(stderr.contains("upstream tip probe failed"), "{stderr}");
+    assert!(!target.exists(), "failed lookup left a partial target");
 }
 
 #[tokio::test]
@@ -641,20 +606,16 @@ async fn verify_upstream_auto_warns_and_skips_unreachable() {
     let out = run_clone(&server, "acme/verify-auto-unreachable", &target, &[]).await;
 
     assert!(
-        out.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join("a.txt")).unwrap(),
-        "hello\n"
+        !out.status.success(),
+        "symbolic lookup unexpectedly succeeded"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("warning: --verify-upstream skipped"),
         "expected degrade warning, got stderr: {stderr}"
     );
+    assert!(stderr.contains("upstream tip probe failed"), "{stderr}");
+    assert!(!target.exists(), "failed lookup left a partial target");
 }
 
 #[tokio::test]
@@ -697,20 +658,16 @@ async fn verify_upstream_auto_with_token_warns_and_skips_unreachable() {
     .await;
 
     assert!(
-        out.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join("a.txt")).unwrap(),
-        "hello\n"
+        !out.status.success(),
+        "symbolic lookup unexpectedly succeeded"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("warning: --verify-upstream skipped"),
         "expected degrade warning, got stderr: {stderr}"
     );
+    assert!(stderr.contains("upstream tip probe failed"), "{stderr}");
+    assert!(!target.exists(), "failed lookup left a partial target");
 }
 
 #[tokio::test]
