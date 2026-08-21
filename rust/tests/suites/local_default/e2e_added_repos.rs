@@ -16,12 +16,12 @@ async fn add_registers_builds_and_makes_repo_cloneable() {
     let added = client.add_repo(&repo_path).await.expect("add repo");
     assert_eq!(added.commit, git(&origin.bare, &["rev-parse", "HEAD"]));
 
-    let added_record = server
-        .repo_root
-        .join(".ripclone-added")
-        .join("github")
-        .join("b5_add%2Frepo.json");
-    assert!(added_record.exists(), "add must persist added-repo state");
+    let added_record = server_ref_store(&server)
+        .await
+        .load_added_repo(&ripclone::provider::RepoId::github(&repo_path))
+        .await
+        .expect("load added-repo state");
+    assert!(added_record.is_some(), "add must persist added-repo state");
 
     let status: serde_json::Value = reqwest::Client::new()
         .get(format!("{}/v1/repos/github/{repo_path}/status", server.url))

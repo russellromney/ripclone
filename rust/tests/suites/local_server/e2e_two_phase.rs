@@ -5,7 +5,7 @@
 use crate::common::*;
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
-use ripclone::ref_store::{FileRefStore, RefStore, exact_ref_key};
+use ripclone::ref_store::exact_ref_key;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -238,7 +238,7 @@ async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
     let (_guard, after) = clone_files_when(&server, "acme", "phase2guard", "f", "new\n").await;
     assert_eq!(read(&after, "g"), "new file\n");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/phase2guard");
     for commit in [&old, &new] {
         let exact = store
@@ -274,7 +274,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
-    let server = start_server().await;
+    let server = start_server_env(&[("RIPCLONE_QUEUE_MAX_ATTEMPTS", "2")]).await;
     let origin = make_origin("acme", "phase2fail-fenced");
     let b = origin.commit(&[("f", "B\n")], "B");
     origin.publish();
@@ -282,7 +282,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
     unsafe {
         std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT", &b);
         std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS", "1500");
-        std::env::set_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT", &b);
+        std::env::set_var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT", &b);
     }
 
     register_added_without_build(&server, "acme/phase2fail-fenced")
@@ -306,36 +306,42 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         clone_files_when(&server, "acme", "phase2fail-fenced", "f", "C\n").await;
     assert_eq!(read(&ready, "c"), "current\n");
 
+    let store = server_ref_store(&server).await;
+    let repo_id = RepoId::github("acme/phase2fail-fenced");
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let b_failures = probe
-                .failure_targets
+            let b_attempts = probe
+                .builder_targets
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .iter()
-                .filter(|(commit, _)| commit == &b)
+                .filter(|commit| *commit == &b)
                 .count();
-            if b_failures >= 2 {
+            let b_failed = store
+                .load_branch(&repo_id, &exact_ref_key("main", &b))
+                .await
+                .expect("load exact B while waiting")
+                .and_then(|info| info.build_status)
+                .is_some_and(|status| status.starts_with("failed: "));
+            if b_attempts >= 2 && b_failed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("initial and one bounded retry of Full(B) both failed");
-    let failures = probe
-        .failure_targets
+    .expect("initial and one bounded retry of Full(B) dead-lettered");
+    let attempts = probe
+        .builder_targets
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
     assert_eq!(
-        failures.iter().filter(|(commit, _)| commit == &b).count(),
+        attempts.iter().filter(|commit| *commit == &b).count(),
         2,
-        "Full(B) must exhaust exactly one retry: {failures:?}"
+        "Full(B) must exhaust exactly one retry: {attempts:?}"
     );
 
-    let store = FileRefStore::new(&server.repo_root);
-    let repo_id = RepoId::github("acme/phase2fail-fenced");
     let moving = store
         .load_branch(&repo_id, "main")
         .await
@@ -385,7 +391,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT");
         std::env::remove_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS");
-        std::env::remove_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT");
+        std::env::remove_var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT");
         std::env::remove_var("RIPCLONE_TESTING");
     }
 }
@@ -394,7 +400,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
 async fn failed_phase2_status_recovers_on_resync() {
     let _env_guard = phase2_env_lock().lock().await;
     init(false);
-    let server = start_server().await;
+    let server = start_server_env(&[("RIPCLONE_QUEUE_MAX_ATTEMPTS", "1")]).await;
     let origin = make_origin("acme", "phase2fail");
     let commit = origin.commit(&[("f", "v1\n")], "c1");
     origin.publish();
@@ -408,9 +414,9 @@ async fn failed_phase2_status_recovers_on_resync() {
         .expect("add repo");
     server
         .client()
-        .sync_repo("acme/phase2fail", None)
+        .admit_sync_repo("acme/phase2fail", None)
         .await
-        .expect("sync with forced phase-2 failure");
+        .expect("admit sync with forced phase-2 failure");
 
     let mut failed_status = None;
     for _ in 0..120 {
@@ -442,9 +448,9 @@ async fn failed_phase2_status_recovers_on_resync() {
 
     server
         .client()
-        .sync_repo("acme/phase2fail", None)
+        .admit_sync_repo("acme/phase2fail", None)
         .await
-        .expect("resync after clearing phase-2 failure");
+        .expect("readmit after clearing phase-2 failure");
 
     let mut recovered = false;
     for _ in 0..120 {
@@ -468,7 +474,7 @@ async fn failed_phase2_status_recovers_on_resync() {
 async fn panicking_phase2_status_recovers_on_resync() {
     let _env_guard = phase2_env_lock().lock().await;
     init(false);
-    let server = start_server().await;
+    let server = start_server_env(&[("RIPCLONE_QUEUE_MAX_ATTEMPTS", "1")]).await;
     let origin = make_origin("acme", "phase2panic");
     let commit = origin.commit(&[("f", "v1\n")], "c1");
     origin.publish();
@@ -482,9 +488,9 @@ async fn panicking_phase2_status_recovers_on_resync() {
         .expect("add repo");
     server
         .client()
-        .sync_repo("acme/phase2panic", None)
+        .admit_sync_repo("acme/phase2panic", None)
         .await
-        .expect("sync with forced phase-2 panic");
+        .expect("admit sync with forced phase-2 panic");
 
     // The detached phase-2 task panics; the outer guard must catch it and mark
     // the build failed instead of leaving it stuck at "full history building".
@@ -518,9 +524,9 @@ async fn panicking_phase2_status_recovers_on_resync() {
 
     server
         .client()
-        .sync_repo("acme/phase2panic", None)
+        .admit_sync_repo("acme/phase2panic", None)
         .await
-        .expect("resync after clearing phase-2 panic");
+        .expect("readmit after clearing phase-2 panic");
 
     let mut recovered = false;
     for _ in 0..120 {

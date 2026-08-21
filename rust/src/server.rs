@@ -2,7 +2,7 @@ use crate::RefInfo;
 use crate::archive::ArchiveBuilder;
 use crate::auth::access::{AccessDecision, AccessVerifier, HttpAccessVerifier};
 use crate::auth::broker::{CredentialBroker, broker_from_env};
-use crate::backends::{self, QueueBackend};
+use crate::backends;
 use crate::cas::Cas;
 use crate::clonepack::{
     ChunkRef, ClonepackManifest, collect_manifest_hashes, hash_from_hex, hash_to_hex,
@@ -13,7 +13,7 @@ use crate::metrics::{Metrics, SyncPhaseMetrics};
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
-use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef};
+use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueue, JobQueueRef, JobState};
 use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
@@ -32,7 +32,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt, TryStreamExt};
 use prost::Message;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -197,10 +197,6 @@ impl AdmissionTestBarrier {
             let _ = signal.changed().await;
         }
     }
-
-    fn is_armed(&self) -> bool {
-        self.armed.load(Ordering::SeqCst)
-    }
 }
 
 /// Operation counters and barriers used by `e2e_sync_admission`. These are
@@ -212,6 +208,9 @@ pub struct AdmissionTestProbe {
     pub fetch_entry: AdmissionTestBarrier,
     pub builder_entry: AdmissionTestBarrier,
     pub phase2_entry: AdmissionTestBarrier,
+    pub embedded_idle_wait: AdmissionTestBarrier,
+    pub before_admission_tx: AdmissionTestBarrier,
+    pub inside_admission_tx: AdmissionTestBarrier,
     pub enqueue_attempts: AtomicUsize,
     pub queue_inserts: AtomicUsize,
     pub coalesces: AtomicUsize,
@@ -221,13 +220,19 @@ pub struct AdmissionTestProbe {
     pub full_publishes: AtomicUsize,
     pub ref_store_writes: AtomicUsize,
     pub artifact_uploads: AtomicUsize,
+    pub embedded_notification_wakes: AtomicUsize,
+    pub embedded_fallback_polls: AtomicUsize,
+    pub claim_losses: AtomicUsize,
     pub fetch_targets: StdMutex<Vec<String>>,
     pub builder_targets: StdMutex<Vec<String>>,
     pub failure_targets: StdMutex<Vec<(String, String)>>,
     pub http_trace: StdMutex<Vec<String>>,
+    admission_tx_target: StdMutex<Option<String>>,
+    inside_admission_tx_target: StdMutex<Option<String>>,
     full_notify: Arc<tokio::sync::Notify>,
     failure_notify: Arc<tokio::sync::Notify>,
     http_notify: Arc<tokio::sync::Notify>,
+    claim_loss_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Default for AdmissionTestProbe {
@@ -238,6 +243,9 @@ impl Default for AdmissionTestProbe {
             fetch_entry: AdmissionTestBarrier::default(),
             builder_entry: AdmissionTestBarrier::default(),
             phase2_entry: AdmissionTestBarrier::default(),
+            embedded_idle_wait: AdmissionTestBarrier::default(),
+            before_admission_tx: AdmissionTestBarrier::default(),
+            inside_admission_tx: AdmissionTestBarrier::default(),
             enqueue_attempts: AtomicUsize::new(0),
             queue_inserts: AtomicUsize::new(0),
             coalesces: AtomicUsize::new(0),
@@ -247,18 +255,40 @@ impl Default for AdmissionTestProbe {
             full_publishes: AtomicUsize::new(0),
             ref_store_writes: AtomicUsize::new(0),
             artifact_uploads: AtomicUsize::new(0),
+            embedded_notification_wakes: AtomicUsize::new(0),
+            embedded_fallback_polls: AtomicUsize::new(0),
+            claim_losses: AtomicUsize::new(0),
             fetch_targets: StdMutex::new(Vec::new()),
             builder_targets: StdMutex::new(Vec::new()),
             failure_targets: StdMutex::new(Vec::new()),
             http_trace: StdMutex::new(Vec::new()),
+            admission_tx_target: StdMutex::new(None),
+            inside_admission_tx_target: StdMutex::new(None),
             full_notify: Arc::new(tokio::sync::Notify::new()),
             failure_notify: Arc::new(tokio::sync::Notify::new()),
             http_notify: Arc::new(tokio::sync::Notify::new()),
+            claim_loss_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
 
 impl AdmissionTestProbe {
+    pub fn hold_admission_transaction(&self, commit: &str) {
+        *self
+            .admission_tx_target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(commit.to_string());
+        self.before_admission_tx.arm();
+    }
+
+    pub fn hold_inside_admission_transaction(&self, commit: &str) {
+        *self
+            .inside_admission_tx_target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(commit.to_string());
+        self.inside_admission_tx.arm();
+    }
+
     pub async fn wait_until_full_published(&self, count: usize) {
         while self.full_publishes.load(Ordering::SeqCst) < count {
             let notified = self.full_notify.notified();
@@ -300,6 +330,16 @@ impl AdmissionTestProbe {
             notified.await;
         }
     }
+
+    pub async fn wait_until_claim_lost(&self, count: usize) {
+        while self.claim_losses.load(Ordering::SeqCst) < count {
+            let notified = self.claim_loss_notify.notified();
+            if self.claim_losses.load(Ordering::SeqCst) >= count {
+                break;
+            }
+            notified.await;
+        }
+    }
 }
 
 static ADMISSION_TEST_PROBE: StdMutex<Option<Arc<AdmissionTestProbe>>> = StdMutex::new(None);
@@ -322,6 +362,9 @@ impl Drop for AdmissionTestProbeGuard {
         self.probe.fetch_entry.disarm();
         self.probe.builder_entry.disarm();
         self.probe.phase2_entry.disarm();
+        self.probe.embedded_idle_wait.disarm();
+        self.probe.before_admission_tx.disarm();
+        self.probe.inside_admission_tx.disarm();
         let mut slot = ADMISSION_TEST_PROBE
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -348,35 +391,37 @@ pub async fn admission_test_before_claim() {
     }
 }
 
-/// Receive a local job while allowing a newly armed test gate to interrupt a
-/// worker already parked on an empty channel. This keeps the observable gate on
-/// the real pre-receive side of the local claim boundary.
-async fn admission_test_recv_before_claim(
-    rx: &mut tokio::sync::mpsc::Receiver<BuildJob>,
-) -> Option<BuildJob> {
-    let Some(probe) = admission_test_probe() else {
-        return rx.recv().await;
-    };
-    loop {
-        if probe.before_claim.is_armed() {
-            probe.before_claim.wait().await;
-            return rx.recv().await;
-        }
-        let mut armed = probe.before_claim.subscribe();
-        if probe.before_claim.is_armed() {
-            continue;
-        }
-        tokio::select! {
-            biased;
-            _ = armed.changed() => continue,
-            job = rx.recv() => return job,
+pub async fn admission_test_after_claim() {
+    if let Some(probe) = admission_test_probe() {
+        probe.after_claim.wait().await;
+    }
+}
+
+async fn admission_test_before_admission_tx(commit: &str) {
+    if let Some(probe) = admission_test_probe() {
+        let held = probe
+            .admission_tx_target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(commit);
+        if held {
+            probe.before_admission_tx.wait().await;
         }
     }
 }
 
-pub async fn admission_test_after_claim() {
+pub(crate) async fn admission_test_inside_admission_tx(commit: &str) {
     if let Some(probe) = admission_test_probe() {
-        probe.after_claim.wait().await;
+        let held = probe
+            .inside_admission_tx_target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(commit);
+        if held {
+            probe.inside_admission_tx.wait().await;
+        }
     }
 }
 
@@ -427,6 +472,31 @@ async fn admission_test_builder_entry(commit: &str) {
 async fn admission_test_phase2_entry() {
     if let Some(probe) = admission_test_probe() {
         probe.phase2_entry.wait().await;
+    }
+}
+
+async fn admission_test_embedded_idle_wait() {
+    if let Some(probe) = admission_test_probe() {
+        probe.embedded_idle_wait.wait().await;
+    }
+}
+
+fn admission_test_embedded_wake(fallback: bool) {
+    if let Some(probe) = admission_test_probe() {
+        if fallback {
+            probe.embedded_fallback_polls.fetch_add(1, Ordering::SeqCst);
+        } else {
+            probe
+                .embedded_notification_wakes
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn admission_test_claim_lost() {
+    if let Some(probe) = admission_test_probe() {
+        probe.claim_losses.fetch_add(1, Ordering::SeqCst);
+        probe.claim_loss_notify.notify_waiters();
     }
 }
 
@@ -482,9 +552,6 @@ pub struct ServerState {
     pub storage: StorageRef,
     pub repo_root: PathBuf,
     pub ref_store: Arc<dyn RefStore>,
-    /// Per-repo / per-branch build configuration (ROADMAP §2a). Read at build
-    /// time; absent config means today's default (shallow + full).
-    pub repo_config: Arc<crate::repo_config::RepoConfigStore>,
     pub provider_registry: ProviderRegistry,
     pub broker: Arc<dyn CredentialBroker>,
     pub token_hash: Option<String>,
@@ -496,19 +563,14 @@ pub struct ServerState {
     pub rate_limiter: RateLimiter,
     pub retention: Arc<Retention>,
     pub build_queue: JobQueueRef,
-    /// The concrete SQL queue, present only when `RIPCLONE_QUEUE` is a SQL
-    /// backend. Backs the worker-facing `/v1/jobs/*` endpoints (claim/ack/
-    /// heartbeat) so a token-only farm-out worker never touches the DB directly.
-    /// `None` for the in-process `local` queue (nothing to farm out) and on a
-    /// worker's own `ServerState`.
+    /// Holds the server's process-ownership lock and concrete control driver.
+    /// Standalone API workers never construct this value.
+    pub control_db: Option<Arc<crate::control::ControlDb>>,
+    /// Backs worker-facing `/v1/jobs/*` endpoints so a token-only standalone
+    /// worker never touches the database. `None` only in a worker's non-serving
+    /// `ServerState`.
     pub worker_queue: Option<Arc<crate::queue::SqlJobQueue>>,
     pub build_queue_depth: Arc<AtomicUsize>,
-    /// Waiters for in-flight background builds, keyed by the admitted job key
-    /// (`owner/repo/branch/exact-commit`).
-    /// A `/sync` registers a oneshot here and enqueues a job only if it is the
-    /// first waiter for that key (coalescing); the worker signals all waiters
-    /// when the build finishes.
-    pub build_waiters: BuildWaiters,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     /// Webhook receiver config: per-provider HMAC secret + optional repo
     /// allowlist. A provider with no configured secret returns 503. Reads
@@ -567,7 +629,6 @@ impl ServerState {
         let broker = broker_from_env(provider_registry.clone())?;
         Ok(ServerState {
             cas: b.cas,
-            repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(b.storage.clone())),
             storage: b.storage,
             repo_root: b.repo_root,
             ref_store: b.ref_store,
@@ -579,10 +640,10 @@ impl ServerState {
             rate_limiter: RateLimiter::new(60, 10.0),
             retention: b.retention,
             build_queue: queue,
+            control_db: None,
             // A worker never serves the farm-out endpoints itself.
             worker_queue: None,
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
-            build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
@@ -843,17 +904,6 @@ pub struct SyncBuildResult {
     pub phases: SyncPhases,
 }
 
-/// Waiters for in-flight background builds, keyed by the exact admitted job
-/// (`owner/repo/branch/exact-commit`) or by the explicit historical rev lane.
-pub type BuildWaiters = Arc<
-    tokio::sync::Mutex<
-        std::collections::HashMap<
-            String,
-            Vec<tokio::sync::oneshot::Sender<Result<SyncBuildResult, BuildError>>>,
-        >,
-    >,
->;
-
 fn default_branch_value() -> String {
     "HEAD".to_string()
 }
@@ -1093,8 +1143,8 @@ pub fn build_app(state: ServerState) -> Router {
         // the Bearer); it mints a fresh one before the current expires.
         .route("/v1/auth/refresh", post(auth_refresh_handler))
         .route("/v1/artifacts/{hash}", get(get_artifact))
-        // Per-repo build config (ROADMAP §2a): read/write the repo-level config,
-        // or a branch-level override via `?branch=`.
+        // Repository build settings. Legacy `?branch=` queries are parsed only
+        // to return a clear fail-closed error.
         .route(
             "/v1/admin/config/{owner}/{repo}",
             get(admin_get_config).post(admin_put_config),
@@ -1124,12 +1174,12 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/v1/auth/login", post(auth_login_handler))
         .route("/v1/build", post(build_handler))
         // Worker metadata report: authenticated by a signed, expiring HMAC
-        // bearer token (not the shared server token). Farmed-out workers with
-        // RIPCLONE_METADATA=api POST ref-writes here; the server holds the DB
+        // bearer token (not the shared server token). Standalone workers POST
+        // ref writes here; the server holds the DB
         // creds and performs the durable write. Lives outside `protected`.
         .route("/v1/refs", post(ref_report_handler))
-        // Worker queue endpoints: a token-only farm-out worker claims, acks, and
-        // heartbeats here (RIPCLONE_QUEUE=api) instead of touching the DB. Same
+        // Worker queue endpoints: a token-only worker claims, acks, and
+        // heartbeats here instead of touching the DB. Same
         // signed-bearer gate as /v1/refs; the server holds the one queue DB.
         .route("/v1/jobs/claim", post(job_claim_handler))
         .route("/v1/jobs/{id}/ack", post(job_ack_handler))
@@ -1723,8 +1773,8 @@ fn authorize_worker_token(route: &str, headers: &HeaderMap) -> Result<(), Respon
 }
 
 /// Resolve the server's concrete SQL queue for a `/v1/jobs/*` handler, or a 503
-/// response when this server has no SQL queue (in-process `local` backend — no
-/// farm-out). Called only *after* [`authorize_worker_token`].
+/// response when this state's control queue is unavailable. Called only after
+/// [`authorize_worker_token`].
 #[allow(clippy::result_large_err)]
 fn worker_queue_or_503(
     route: &str,
@@ -1733,11 +1783,11 @@ fn worker_queue_or_503(
     match &state.worker_queue {
         Some(q) => Ok(q.clone()),
         None => {
-            error!("{route}: no SQL queue on this server (RIPCLONE_QUEUE is not a SQL backend)");
+            error!("{route}: server control queue is unavailable");
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse {
-                    error: "server has no farm-out queue (RIPCLONE_QUEUE is local)".to_string(),
+                    error: "server control queue is unavailable".to_string(),
                 }),
             )
                 .into_response())
@@ -1796,6 +1846,7 @@ async fn job_claim_handler(
                 branch: c.branch,
                 admitted_commit: c.admitted_commit,
                 admitted_default_branch: c.admitted_default_branch,
+                repo_config: c.repo_config,
                 credential: c.credential.map(|s| s.expose_secret().to_string()),
             });
             (StatusCode::OK, Json(ClaimResponse { job })).into_response()
@@ -1855,6 +1906,13 @@ async fn job_ack_handler(
     };
     match queue.ack(id, &req.worker_id, result).await {
         Ok(settled) => {
+            // Active API heartbeats create a registry row even when optional
+            // idle fleet registration is disabled. Once this sequential worker
+            // settles (or discovers it no longer owns) the job, remove that row;
+            // an opt-in idle heartbeat may recreate it on its next interval.
+            if let Err(error) = queue.remove_worker(&req.worker_id).await {
+                error!("remove settled API worker {}: {error:#}", req.worker_id);
+            }
             // Report the resulting lifecycle so the worker can detect a
             // dead-letter without a second round-trip.
             let (state_tag, error) =
@@ -2878,7 +2936,7 @@ async fn branch_ref_is_evicted_for_commit(
 
 fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
     // This metadata-only shortcut is exclusively for a phase-one row whose
-    // detached Full build is already active. Eviction also counts as pending,
+    // background Full build is already active. Eviction also counts as pending,
     // but it has no active worker: it must fall through to the source/rebuild
     // path below so an initial GET admits work before it pins.
     clonepack_kind != "shallow"
@@ -3052,10 +3110,10 @@ async fn get_ref_inner(
                             .as_ref()
                             .filter(|info| !info.default_branch.is_empty())
                             .map(|info| info.default_branch.clone()),
+                        repo_config: crate::repo_config::RepoConfig::default(),
                         credential: credential.clone(),
                         // Recovery is for the requested commit only. Do not
                         // launch the moving-tip freshness probe after it finishes.
-                        recheck: recheck_max(),
                         size_bytes,
                     };
                     if let Err(error) = enqueue_direct_build(&state, job, false).await {
@@ -3193,14 +3251,45 @@ async fn get_ref_inner(
         detected_default_branch.unwrap_or_else(|| "HEAD".to_string())
     } else {
         let detected_row = match detected_default_branch {
-            Some(candidate) => state
-                .ref_store
-                .load_branch(&repo_id, &candidate)
-                .await
-                .ok()
-                .flatten()
-                .filter(|info| !info.internal_exact_result)
-                .map(|_| candidate),
+            // An explicit historical selector resolves against the mirror, so
+            // its readable symbolic HEAD is enough to identify the concrete
+            // exact-result key. This does not promote internal metadata: if the
+            // mirror cannot identify HEAD, the public-row fallback below still
+            // rejects an exact-only layout.
+            Some(candidate) => {
+                if let Some(exact_commit) = params
+                    .rev
+                    .as_deref()
+                    .filter(|rev| validation::validate_object_id(rev).is_ok())
+                {
+                    let exact_key = exact_ref_store_key(&candidate, exact_commit);
+                    state
+                        .ref_store
+                        .load_branch(&repo_id, &exact_key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|info| {
+                            info.internal_exact_result
+                                && info.commit == exact_commit
+                                && info.default_branch == candidate
+                        })
+                        .map(|_| candidate)
+                } else if params.rev.is_some() {
+                    // Git still validates symbolic historical selectors such as
+                    // HEAD~1 below before an exact row can be returned.
+                    Some(candidate)
+                } else {
+                    state
+                        .ref_store
+                        .load_branch(&repo_id, &candidate)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|info| !info.internal_exact_result)
+                        .map(|_| candidate)
+                }
+            }
             None => None,
         };
         if let Some(branch_name) = detected_row {
@@ -3374,8 +3463,8 @@ async fn get_ref_inner(
                         branch: effective_branch.clone(),
                         admitted_commit: commit.clone(),
                         admitted_default_branch: Some(default_branch.clone()),
+                        repo_config: crate::repo_config::RepoConfig::default(),
                         credential: credential.clone(),
-                        recheck: 0,
                         size_bytes,
                     };
                     let moving_authorized = params.rev.is_none();
@@ -3423,7 +3512,7 @@ async fn get_ref_inner(
                 &params.clonepack,
                 private,
             );
-            if info.build_status.is_none() && params.rev.is_none() {
+            if matches!(info.build_status.as_deref(), None | Some("done")) && params.rev.is_none() {
                 cache_ref_response(&state, &repo_id, &effective_branch, &cache_variant, &resp);
             }
             (StatusCode::OK, Json(resp)).into_response()
@@ -4094,8 +4183,8 @@ async fn sync_repo_inner(
         branch: admitted_branch.clone(),
         admitted_commit: commit.clone(),
         admitted_default_branch,
+        repo_config: crate::repo_config::RepoConfig::default(),
         credential,
-        recheck: 0,
         size_bytes,
     };
     let outcome = match enqueue_admitted_build(&state, job, true).await {
@@ -4331,8 +4420,8 @@ async fn sync_repo_at_revision(
         branch: branch.clone(),
         admitted_commit: at_rev.clone(),
         admitted_default_branch: Some(branch.clone()),
+        repo_config: crate::repo_config::RepoConfig::default(),
         credential,
-        recheck: 0,
         size_bytes,
     };
     match enqueue_admitted_build(&state, job, false).await {
@@ -4512,29 +4601,69 @@ fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
 }
 
 /// Admit one exact ordinary-tip job. The local marker spans the whole
-/// process-lifetime job, including detached phase 2; SQL/API-worker paths use
-/// the database active-key constraint for queued and claimed rows.
+/// durable job; the database active-key constraint covers queued and claimed
+/// rows.
 async fn enqueue_admitted_build(
     state: &ServerState,
-    job: BuildJob,
+    mut job: BuildJob,
     moving_authorized: bool,
 ) -> Result<EnqueueOutcome, String> {
     crate::validation::validate_object_id(&job.admitted_commit)
         .map_err(|e| format!("invalid admitted commit: {e}"))?;
-    prepare_exact_admission(state, &job, moving_authorized).await?;
-    let local_key = state.build_queue.inproc_wait().then(|| job.key());
-    if let Some(key) = local_key.as_deref() {
-        let mut waiters = state.build_waiters.lock().await;
-        if waiters.contains_key(key) {
-            state.metrics.record_build_accepted();
-            admission_test_enqueue(EnqueueOutcome::Coalesced);
-            return Ok(EnqueueOutcome::Coalesced);
-        }
-        // Empty marker: no HTTP caller is waiting, but exact active work remains
-        // visible until the worker removes it after detached phase 2.
-        waiters.insert(key.to_string(), Vec::new());
+    job.repo_config = match &state.control_db {
+        Some(control) => control
+            .repository_config(&job.repo_id)
+            .await
+            .map_err(|error| format!("repository config read failed: {error:#}"))?
+            .unwrap_or_default(),
+        #[cfg(test)]
+        None => job.repo_config,
+        #[cfg(not(test))]
+        None => return Err("server control database is unavailable".to_string()),
+    };
+    job.repo_config
+        .validate()
+        .map_err(|error| format!("repository config validation failed: {error:#}"))?;
+    let Some(admission) = prepare_exact_admission(state, &job, moving_authorized).await? else {
+        state.metrics.record_build_accepted();
+        admission_test_enqueue(EnqueueOutcome::Coalesced);
+        return Ok(EnqueueOutcome::Coalesced);
+    };
+    if let Some(control) = &state.control_db {
+        state.metrics.record_build_queued();
+        admission_test_before_admission_tx(&job.admitted_commit).await;
+        return match control
+            .admit_exact_and_job(
+                &job,
+                &admission.exact_branch,
+                &admission.pending,
+                moving_authorized,
+            )
+            .await
+        {
+            Ok(enqueued) => {
+                state.metrics.record_build_accepted();
+                admission_test_enqueue(enqueued.outcome);
+                Ok(enqueued.outcome)
+            }
+            Err(error) => {
+                state.metrics.record_build_rejected();
+                Err(format!("durable admission failed: {error:#}"))
+            }
+        };
     }
-
+    state
+        .ref_store
+        .save_branch(&job.repo_id, &admission.exact_branch, &admission.pending)
+        .await
+        .map_err(|error| format!("exact admission persistence failed: {error}"))?;
+    if let Some((tail_branch, tail_info)) = admission.tail {
+        state
+            .ref_store
+            .save_branch(&job.repo_id, &tail_branch, &tail_info)
+            .await
+            .map_err(|error| format!("ordinary admission link failed: {error}"))?;
+    }
     state.metrics.record_build_queued();
     match state.build_queue.enqueue(job).await {
         Ok(enq) if enq.outcome != EnqueueOutcome::Full => {
@@ -4545,16 +4674,10 @@ async fn enqueue_admitted_build(
         Ok(_) => {
             state.metrics.record_build_rejected();
             admission_test_enqueue(EnqueueOutcome::Full);
-            if let Some(key) = local_key {
-                state.build_waiters.lock().await.remove(&key);
-            }
             Err("build queue full".to_string())
         }
         Err(e) => {
             state.metrics.record_build_rejected();
-            if let Some(key) = local_key {
-                state.build_waiters.lock().await.remove(&key);
-            }
             Err(format!("build queue unavailable: {e}"))
         }
     }
@@ -4563,11 +4686,17 @@ async fn enqueue_admitted_build(
 /// Persist the moving-row identity at the operation's resolution point before
 /// a worker can publish. The first missing-row admission is insert-only, so a
 /// duplicate cannot replace the fence selected by the active job.
+struct ExactAdmissionPlan {
+    exact_branch: String,
+    pending: RefInfo,
+    tail: Option<(String, RefInfo)>,
+}
+
 async fn prepare_exact_admission(
     state: &ServerState,
     job: &BuildJob,
     moving_authorized: bool,
-) -> Result<(), String> {
+) -> Result<Option<ExactAdmissionPlan>, String> {
     let commit = job.admitted_commit.as_str();
     let exact_key = exact_ref_store_key(&job.branch, commit);
     let existing = state
@@ -4576,7 +4705,13 @@ async fn prepare_exact_admission(
         .await
         .map_err(|e| format!("exact admission lookup failed: {e}"))?;
     let active = existing.as_ref().is_some_and(|info| {
-        info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+        matches!(
+            info.build_status.as_deref(),
+            None | Some("done")
+                | Some("building")
+                | Some(BUILDING_FULL_HISTORY)
+                | Some("archive building")
+        )
     });
     if active {
         if moving_authorized
@@ -4601,7 +4736,7 @@ async fn prepare_exact_admission(
                 .await
                 .map_err(|e| format!("exact admission promotion failed: {e}"))?;
         }
-        return Ok(());
+        return Ok(None);
     }
     let evicted = existing.is_some();
     let (moving_publication_predecessors, admission_tail) = if evicted {
@@ -4636,12 +4771,12 @@ async fn prepare_exact_admission(
         ),
         ..Default::default()
     };
-    state
-        .ref_store
-        .save_branch(&job.repo_id, &exact_key, &pending)
-        .await
-        .map_err(|e| format!("exact admission persistence failed: {e}"))?;
-    link_moving_admission(state, job, admission_tail.as_deref()).await
+    let tail = prepare_moving_admission_tail(state, job, admission_tail.as_deref()).await?;
+    Ok(Some(ExactAdmissionPlan {
+        exact_branch: exact_key,
+        pending,
+        tail,
+    }))
 }
 
 /// Follow only the outstanding ordinary-admission chain from the current
@@ -4741,10 +4876,14 @@ async fn link_moving_admission(
     Ok(())
 }
 
-/// Only the latest ordinary admission should probe for a still-newer tip after
-/// its build completes. A later admission links itself from this exact row
-/// before returning accepted, so this is one direct metadata read.
-async fn exact_result_is_latest_ordinary(state: &ServerState, job: &BuildJob) -> bool {
+async fn prepare_moving_admission_tail(
+    state: &ServerState,
+    job: &BuildJob,
+    tail: Option<&str>,
+) -> Result<Option<(String, RefInfo)>, String> {
+    let Some(tail) = tail else {
+        return Ok(None);
+    };
     let result_branch = if job.branch == "HEAD" {
         job.admitted_default_branch
             .as_deref()
@@ -4752,24 +4891,33 @@ async fn exact_result_is_latest_ordinary(state: &ServerState, job: &BuildJob) ->
     } else {
         job.branch.as_str()
     };
-    let exact_key = exact_ref_store_key(result_branch, &job.admitted_commit);
-    let Ok(Some(current)) = state.ref_store.load_branch(&job.repo_id, &exact_key).await else {
-        return false;
-    };
-    !current.moving_publication_predecessors.is_empty()
-        && current.moving_admission_successors.is_empty()
+    let key = exact_ref_store_key(result_branch, tail);
+    let mut info = state
+        .ref_store
+        .load_branch(&job.repo_id, &key)
+        .await
+        .map_err(|error| format!("ordinary admission tail lookup failed: {error}"))?
+        .ok_or_else(|| format!("ordinary admission tail {tail} disappeared"))?;
+    if !info
+        .moving_admission_successors
+        .contains(&job.admitted_commit)
+    {
+        info.require_matching_commit = false;
+        info.moving_admission_successors
+            .push(job.admitted_commit.clone());
+    }
+    Ok(Some((key, info)))
 }
 
 /// Fire-and-forget: enqueue a build for `(repo_id, branch)` at the exact
 /// admitted commit and return immediately — the build runs ahead of any clone
 /// (build-before-clone).
 /// Used by the `/build` OIDC endpoint, the push-webhook receiver, and the poll
-/// loop. On the in-process queue it coalesces against an in-flight build exactly
-/// like `/sync` (and releases the marker if the enqueue is rejected); the SQL
-/// queue coalesces by key itself. Credentials come from the server's standing
+/// loop. The durable active-key constraint coalesces it exactly like `/sync`.
+/// Credentials come from the server's standing
 /// provider token (the caller carries no per-request token). Returns `Ok` if the
 /// build is queued or folded into one already running; `Err(msg)` if the queue is
-/// full or unavailable.
+/// unavailable.
 async fn trigger_build(
     state: &ServerState,
     repo_id: &RepoId,
@@ -4814,24 +4962,24 @@ async fn trigger_build(
         branch: branch.to_string(),
         admitted_commit,
         admitted_default_branch,
+        repo_config: crate::repo_config::RepoConfig::default(),
         credential,
-        recheck: 0,
         size_bytes,
     };
 
     enqueue_admitted_build(state, job, moving_authorized).await
 }
 
-/// Query for the admin config endpoints: an optional branch selects a
-/// branch-level override; absent means the repo-level config.
+/// Legacy branch selectors are parsed only so they can fail closed without
+/// changing repository configuration or admitting work.
 #[derive(Deserialize)]
 struct AdminConfigQuery {
     #[serde(default)]
     branch: Option<String>,
 }
 
-/// `GET /v1/admin/config/{owner}/{repo}` — return the stored repo- or
-/// branch-level config (404 if none is stored).
+/// `GET /v1/admin/config/{owner}/{repo}` — return the stored repository config
+/// (404 if none is stored).
 async fn admin_get_config(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<AdminConfigQuery>,
@@ -4840,17 +4988,34 @@ async fn admin_get_config(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
+    if query.branch.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "branch-level repository configuration is no longer supported".to_string(),
+            }),
+        )
+            .into_response();
+    }
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let loaded = match query.branch.as_deref().filter(|b| !b.is_empty()) {
-        Some(branch) => state.repo_config.get_branch(&repo_id, branch).await,
-        None => state.repo_config.get_repo(&repo_id).await,
+    let loaded = match &state.control_db {
+        Some(control) => control.repository_config(&repo_id).await,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "server control database is unavailable".to_string(),
+                }),
+            )
+                .into_response();
+        }
     };
     match loaded {
         Ok(Some(config)) => (StatusCode::OK, Json(config)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: "no config stored for this repo/branch".to_string(),
+                error: "no config stored for this repository".to_string(),
             }),
         )
             .into_response(),
@@ -4867,9 +5032,9 @@ async fn admin_get_config(
     }
 }
 
-/// `POST /v1/admin/config/{owner}/{repo}` — store the repo- or branch-level
-/// config. The body is a `RepoConfig`; it is validated before being written.
-/// The next sync/build for the repo reads it.
+/// `POST /v1/admin/config/{owner}/{repo}` — store the repository config. The
+/// body is validated before the control database is written; the next admitted
+/// job snapshots it.
 async fn admin_put_config(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<AdminConfigQuery>,
@@ -4878,6 +5043,15 @@ async fn admin_put_config(
 ) -> Response {
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
+    }
+    if query.branch.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "branch-level repository configuration is no longer supported".to_string(),
+            }),
+        )
+            .into_response();
     }
     if let Err(e) = config.validate() {
         return (
@@ -4889,14 +5063,17 @@ async fn admin_put_config(
             .into_response();
     }
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let stored = match query.branch.as_deref().filter(|b| !b.is_empty()) {
-        Some(branch) => {
-            state
-                .repo_config
-                .put_branch(&repo_id, branch, &config)
-                .await
+    let stored = match &state.control_db {
+        Some(control) => control.put_repository_config(&repo_id, &config).await,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "server control database is unavailable".to_string(),
+                }),
+            )
+                .into_response();
         }
-        None => state.repo_config.put_repo(&repo_id, &config).await,
     };
     match stored {
         Ok(()) => (StatusCode::OK, Json(config)).into_response(),
@@ -6172,27 +6349,6 @@ fn seed_bare_mirror_from_clonepack(
     Ok(bytes)
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Load the effective per-repo/branch build config, falling back to the default
-/// (today's behavior) if the store read fails — a config-store hiccup must never
-/// block a build.
-async fn effective_repo_config(
-    state: &ServerState,
-    repo_id: &RepoId,
-    branch: &str,
-) -> crate::repo_config::RepoConfig {
-    match state.repo_config.effective(repo_id, branch).await {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!(
-                "repo config load for {} failed ({e:#}); using defaults",
-                repo_id.storage_key()
-            );
-            crate::repo_config::RepoConfig::default()
-        }
-    }
-}
-
 async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
@@ -6206,25 +6362,21 @@ async fn do_sync(
     // their existing metadata semantics.
     admitted_default_branch: Option<&str>,
     ref_store: &Arc<dyn RefStore>,
-    // When true, the two-phase build finishes full history inline and only returns
-    // once it is durable, instead of detaching it into a background task. An
-    // ephemeral cross-process worker sets this so it never acks `done` while the
-    // full history is still unbuilt — a detached task would die with the worker.
-    // The long-lived in-process server leaves it false, keeping `/sync` fast.
-    inline_full_history: bool,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
-    // Effective per-repo/branch build config (ROADMAP §2a). Default config
-    // reproduces today's build exactly.
+    // Validated repository config snapshotted into the durable job at admission.
     repo_config: &crate::repo_config::RepoConfig,
     // Per-repo lock. do_sync holds it only while mutating the mirror (fetch +
     // commit-graph), then drops it before the heavy read-only build, so different
     // repos build concurrently. Safe because auto-gc is off, so the build only
     // reads the mirror's packs.
     mirror_lock: &Arc<tokio::sync::Mutex<()>>,
-    phase2_failure: Option<Phase2FailureAction>,
+    // Embedded workers use this one-shot to release their limited foreground
+    // slot after Head is durably published. Dropping it on an earlier error
+    // releases the slot as well; it is never queue or ownership state.
+    mut foreground_release: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<SyncBuildResult> {
     let compression_level = repo_config.compression_level();
     info!("syncing {}@{}", repo_id.storage_key(), branch);
@@ -6405,8 +6557,7 @@ async fn do_sync(
             info.full_clonepack.commit == commit
                 && !info.full_clonepack.manifest.is_empty()
                 && info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-                && (!info.archive_chunks.is_empty()
-                    || (!inline_full_history && archive_in_progress))
+                && !archive_in_progress
         });
     if let Some(prev) = reusable {
         info!(
@@ -6414,6 +6565,9 @@ async fn do_sync(
             repo_id.storage_key(),
             &commit[..7.min(commit.len())]
         );
+        if let Some(release) = foreground_release.take() {
+            let _ = release.send(());
+        }
         return Ok(SyncBuildResult {
             info: prev,
             status: "no-op".to_string(),
@@ -6449,12 +6603,11 @@ async fn do_sync(
         ref_store,
         storage,
         retention,
-        inline_full_history,
         t_total,
         fetched_at,
         compression_level,
         phases,
-        phase2_failure,
+        foreground_release,
     )
     .await
 }
@@ -6469,10 +6622,10 @@ fn pack_artifacts_of(packs: &[(String, u64, String, u64)]) -> Vec<crate::PackArt
         .collect()
 }
 
-/// Two-phase publish. Phase 1 (foreground) builds + publishes the depth=1
-/// clonepack and returns; phase 2 (background) builds full history and upgrades
-/// the full clonepack. depth=0 keeps serving the previous commit until phase 2
-/// finishes (option A — never fails, briefly one commit stale).
+/// Two-part publish. The foreground work builds and publishes the depth=1
+/// clonepack, then releases its worker slot. The same durable owner continues
+/// full history and upgrades the full clonepack in the background. depth=0
+/// keeps serving the previous commit until Full finishes.
 /// Result of the phase-1 HEAD-closure build: a small delta pack against the
 /// immutable base, or a fresh full base on a cold sync / rebase. See
 /// `build_head_delta_pack` / `build_head_packs`.
@@ -6488,17 +6641,6 @@ struct HeadBuild {
     /// True when every pack was built this sync (cold/rebase) → head MIDX buildable.
     all_local: bool,
     elapsed_ms: u64,
-}
-
-#[derive(Clone)]
-struct Phase2FailureAction {
-    state: ServerState,
-    job_branch: String,
-    credential: Option<SecretString>,
-    admitted_commit: String,
-    admitted_default_branch: Option<String>,
-    retry_recheck: Option<u32>,
-    local_active_key: Option<String>,
 }
 
 /// Publish the current unpinned branch projection. Completed publications are
@@ -6566,14 +6708,13 @@ async fn build_and_publish_two_phase(
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
-    inline_full_history: bool,
     t_total: Instant,
     // Publish-ordering key, stamped at fetch time by the caller (see do_sync).
     fetched_at: Option<u64>,
     // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
     mut phases: SyncPhases,
-    phase2_failure: Option<Phase2FailureAction>,
+    mut foreground_release: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<SyncBuildResult> {
     admission_test_builder_entry(commit).await;
     let history_target = 512 * 1024 * 1024;
@@ -6934,6 +7075,9 @@ async fn build_and_publish_two_phase(
     );
     phases.publish_p1_ms = Some(duration_ms(t_total.elapsed()));
     let _ = t; // p1 assemble/upload time folded into the total above
+    if let Some(release) = foreground_release.take() {
+        let _ = release.send(());
+    }
     wait_test_phase_two_barrier(commit).await?;
 
     // ---- PHASE 2: full history, in the background (survives the request) ----
@@ -6954,7 +7098,6 @@ async fn build_and_publish_two_phase(
     let sk_meta = shallow_metadata_hash.clone();
     let sk_meta_len = shallow_meta_data.len() as u64;
     let head_base_pack_count_for_p2 = head_built.base_packs.len();
-    let phase2_failure2 = phase2_failure.clone();
     let phase2 = async move {
         let started = Instant::now();
         let res = build_full_in_background(
@@ -6996,71 +7139,25 @@ async fn build_and_publish_two_phase(
                     &commit2[..7.min(commit2.len())],
                     started.elapsed()
                 );
-                if let Some(action) = phase2_failure2 {
-                    if let Some(key) = action.local_active_key.as_deref() {
-                        action.state.build_waiters.lock().await.remove(key);
-                    }
-                }
             }
             Err(e) => {
                 error!(
                     "full clone build failed for {}: {e:#}",
                     repo_id2.storage_key()
                 );
-                if let Some(action) = phase2_failure2 {
-                    handle_phase2_failure(action, &repo_id2, &branch2, &commit2, &format!("{e:#}"))
-                        .await;
-                }
             }
         }
         res
     };
 
-    if inline_full_history {
-        // Ephemeral/cross-process worker: build phase 2 now, before returning, so
-        // the job is never acked `done` while the full clonepack is still unbuilt.
-        // This runs after the per-repo lock is dropped (read-only over the mirror,
-        // safe with auto-gc off). A crash mid-build leaves the claim stale → the
-        // queue reclaims and retries it (and dead-letters after the cap).
-        phase2.await.context("phase 2 (full history) build")?;
-        ref_store.invalidate(repo_id, branch).await;
-        if let Some(updated) = ref_store.load_branch(repo_id, branch).await?
-            && updated.commit == commit
-        {
-            info = updated;
-        }
-    } else {
-        // Long-lived in-process server: detach so `/sync` returns as soon as the
-        // depth=1 clonepack is live. The task outlives the request because the
-        // server process keeps running.
-        //
-        // `phase2` handles its own `Err` (mark failed + retry). But a *panic* in
-        // its async body would unwind to the task boundary and, with the handle
-        // dropped, be swallowed silently — leaving the ref stranded at "full
-        // history building" forever (no depth-0 manifest, no archive), which is
-        // exactly the giant-repo stall. Await the inner handle in an outer task so
-        // a panic is surfaced loudly and routed through the same failure/retry
-        // path as a returned error, instead of vanishing.
-        let panic_failure = phase2_failure.clone();
-        let (rid, br, cm) = (repo_id.clone(), branch.to_string(), commit.to_string());
-        tokio::spawn(async move {
-            if let Err(join_err) = tokio::spawn(phase2).await {
-                error!(
-                    "phase 2 (full history) task aborted for {}@{br} {cm}: {join_err}",
-                    rid.storage_key()
-                );
-                if let Some(action) = panic_failure {
-                    handle_phase2_failure(
-                        action,
-                        &rid,
-                        &br,
-                        &cm,
-                        &format!("phase 2 task aborted: {join_err}"),
-                    )
-                    .await;
-                }
-            }
-        });
+    // Every durable claim owns Head, Files, and Full. A process death before
+    // this completes leaves the SQL claim stale for the next worker to reclaim.
+    phase2.await.context("phase 2 (full history) build")?;
+    ref_store.invalidate(repo_id, branch).await;
+    if let Some(updated) = ref_store.load_branch(repo_id, branch).await?
+        && updated.commit == commit
+    {
+        info = updated;
     }
 
     report_sync_phases(repo_id, branch, commit, &phases);
@@ -7540,7 +7637,7 @@ async fn build_full_in_background(
     {
         anyhow::bail!("forced phase-2 failure for {commit}");
     }
-    // Test hook: panic (rather than return Err) inside the detached phase-2 task,
+    // Test hook: panic (rather than return Err) inside the background Full task,
     // to exercise that a panicking background build is surfaced + marked failed
     // instead of silently stranding the ref at "full history building".
     if let Ok(panic_for) = std::env::var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT")
@@ -7600,7 +7697,7 @@ async fn build_full_in_background(
     // Add the archive to the full clonepack, only if the ref still points at our
     // commit AND still carries *this* build's idx bundle. The second guard is the
     // ownership check: this is a load-modify-save with no lock, and same-commit
-    // builds may overlap (each detached phase 2 keeps running after `/sync`
+    // builds may overlap (each background Full build keeps running after `/sync`
     // returns, and should_replace_ref lets an equal-commit save win). This publish
     // only re-points `manifest`/`metadata_chunk`; it must not do that on top of
     // another build's `idx_bundle`, or the served idx_bundle_url (that build's
@@ -7670,23 +7767,32 @@ async fn build_full_in_background(
     Ok(())
 }
 
-/// Run one build to completion: mark `building` in the metadata store, sync,
-/// then mark `done`/`failed`. Returns the result string so the caller can signal
-/// in-process waiters (local queue) or ack the job (worker process).
+/// Run one durable claim to completion: mark `building`, sync all artifact
+/// phases, then mark `done` or `failed` before acknowledgement.
 ///
-/// This is the unit of work shared by the in-process worker loop and the
-/// standalone `ripclone-worker`. It touches only the durable backends + provider
-/// registry, so it runs unchanged in any process that shares the same storage,
-/// metadata store, and provider config.
+/// This is shared by embedded and API-only workers.
 pub async fn process_build_job(
     state: &ServerState,
     job: &BuildJob,
+) -> Result<SyncBuildResult, BuildError> {
+    process_build_job_with_foreground_release(state, job, None).await
+}
+
+async fn process_build_job_with_foreground_release(
+    state: &ServerState,
+    job: &BuildJob,
+    foreground_release: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<SyncBuildResult, BuildError> {
     let repo_id = &job.repo_id;
     let branch = &job.branch;
     if let Err(e) = crate::validation::validate_object_id(&job.admitted_commit) {
         return Err(BuildError::permanent(format!(
             "build job has invalid admitted commit: {e}"
+        )));
+    }
+    if let Err(error) = job.repo_config.validate() {
+        return Err(BuildError::permanent(format!(
+            "build job has invalid repository config: {error:#}"
         )));
     }
     // Mark as building in the shared metadata store.
@@ -7725,11 +7831,8 @@ pub async fn process_build_job(
     // do_sync takes the per-repo lock itself (via `&lock`) and releases it before
     // the heavy build, so we don't hold a guard here.
     let lock = repo_lock(&state.sync_locks, repo_id).await;
-    // A cross-process worker must finish the full history before it acks `done`,
-    // or a worker that exits would lose the detached task. The in-process server
-    // builds it in the background instead, for a fast response.
-    let inline_full_history = !state.build_queue.inproc_wait();
-    let repo_config = effective_repo_config(state, repo_id, branch).await;
+    // Every accepted job owns Head, Files, and Full until terminal settlement.
+    // No phase is detached from the durable claim.
     let result = do_sync(
         &state.cas,
         &mirror_dir,
@@ -7738,34 +7841,13 @@ pub async fn process_build_job(
         &job.admitted_commit,
         job.admitted_default_branch.as_deref(),
         &state.ref_store,
-        inline_full_history,
         &state.storage,
         &state.retention,
         &provider,
         job.credential.as_ref(),
-        &repo_config,
+        &job.repo_config,
         &lock,
-        if job.recheck == 0 {
-            Some(Phase2FailureAction {
-                state: state.clone(),
-                job_branch: branch.clone(),
-                credential: job.credential.clone(),
-                admitted_commit: job.admitted_commit.clone(),
-                admitted_default_branch: job.admitted_default_branch.clone(),
-                retry_recheck: Some(1),
-                local_active_key: state.build_queue.inproc_wait().then(|| job.key()),
-            })
-        } else {
-            Some(Phase2FailureAction {
-                state: state.clone(),
-                job_branch: branch.clone(),
-                credential: job.credential.clone(),
-                admitted_commit: job.admitted_commit.clone(),
-                admitted_default_branch: job.admitted_default_branch.clone(),
-                retry_recheck: None,
-                local_active_key: state.build_queue.inproc_wait().then(|| job.key()),
-            })
-        },
+        foreground_release,
     )
     .await;
 
@@ -7779,15 +7861,12 @@ pub async fn process_build_job(
             let info = &result.info;
             state.metrics.record_build_completed(start.elapsed());
             state.metrics.record_sync_phases((&result.phases).into());
-            if inline_full_history {
-                if let Err(e) = update_job_build_status(state, job, &effective_branch, "done").await
-                {
-                    error!(
-                        "build status update failed for {}@{effective_branch} {}: {e:#}",
-                        repo_id.storage_key(),
-                        info.commit
-                    );
-                }
+            if let Err(e) = update_job_build_status(state, job, &effective_branch, "done").await {
+                error!(
+                    "build status update failed for {}@{effective_branch} {}: {e:#}",
+                    repo_id.storage_key(),
+                    info.commit
+                );
             }
             invalidate_mirror_fresh(
                 state,
@@ -7799,27 +7878,6 @@ pub async fn process_build_job(
                 "background build completed for {}@{effective_branch}",
                 repo_id.storage_key()
             );
-            // A push that landed during this build is invisible to it (the tip was
-            // resolved once, at the start). Re-check the tip and, if it moved, build
-            // the latest — so a fast-moving repo's served HEAD catches up within one
-            // build cycle instead of waiting for the next poke. Detached so the
-            // just-finished build signals its /sync waiter and releases its build
-            // permit immediately; the re-check's ls-remote runs off the hot path.
-            let recheck_state = state.clone();
-            let recheck_job = job.clone();
-            let recheck_provider = provider.clone();
-            let recheck_commit = info.commit.clone();
-            if exact_result_is_latest_ordinary(state, job).await {
-                tokio::spawn(async move {
-                    post_build_freshness_recheck(
-                        &recheck_state,
-                        &recheck_job,
-                        &recheck_provider,
-                        &recheck_commit,
-                    )
-                    .await;
-                });
-            }
             Ok(result.clone())
         }
         Err(e) => {
@@ -7829,7 +7887,6 @@ pub async fn process_build_job(
             // `/status` look terminal while the queue still has the job — the
             // stale-until-repushed mode A7 was meant to kill.
             let classified = classify_build_error(e);
-            admission_test_build_failure(Some(&job.admitted_commit), classified.message());
             if let Some(status) = terminal_metadata_status(&classified) {
                 state.metrics.record_build_failed();
                 if let Err(status_err) =
@@ -7852,6 +7909,10 @@ pub async fn process_build_job(
                 );
             }
             invalidate_ref_response_cache(state, repo_id, &effective_branch);
+            // The deterministic failure hook represents a settled build
+            // result. Signal it only after terminal metadata (when applicable)
+            // and cache invalidation are visible to observers.
+            admission_test_build_failure(Some(&job.admitted_commit), classified.message());
             Err(classified)
         }
     }
@@ -7879,15 +7940,27 @@ pub async fn mark_admitted_build_failed(
     admitted_commit: &str,
     message: &str,
 ) -> Result<()> {
+    let status = format!("failed: {message}");
     let exact_branch = exact_ref_store_key(branch, admitted_commit);
-    let _ = update_build_status(
-        state,
-        repo_id,
-        &exact_branch,
-        admitted_commit,
-        &format!("failed: {message}"),
-    )
-    .await?;
+    let _ = update_build_status(state, repo_id, &exact_branch, admitted_commit, &status).await?;
+    update_current_failure_status(state, repo_id, branch, admitted_commit, &status).await?;
+    Ok(())
+}
+
+/// Surface a terminal failure through moving projections only while the failed
+/// immutable result is still their current commit. A later admitted commit is
+/// therefore never marked failed by delayed older work.
+async fn update_current_failure_status(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+    admitted_commit: &str,
+    status: &str,
+) -> Result<()> {
+    let _ = update_build_status(state, repo_id, branch, admitted_commit, status).await?;
+    if branch != "HEAD" {
+        let _ = update_build_status(state, repo_id, "HEAD", admitted_commit, status).await?;
+    }
     Ok(())
 }
 
@@ -7959,171 +8032,6 @@ fn is_retryable_io_error(error: &std::io::Error) -> bool {
     )
 }
 
-/// Max consecutive post-build freshness re-triggers before deferring to the
-/// periodic poller. Bounds how aggressively one fast-moving repo can re-trigger
-/// itself and monopolize a worker; the poller still picks up any remainder.
-/// `0` disables the post-build re-check entirely.
-fn recheck_max() -> u32 {
-    std::env::var("RIPCLONE_RECHECK_MAX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3)
-}
-
-/// Test-only barrier for post-build freshness re-checks. When set, each re-check
-/// increments an "entered" counter and waits for a "proceed" counter to advance
-/// past the value it saw on entry. The test waits for the entered counter, does
-/// any setup (e.g. pushes a new commit), then advances proceed. This replaces
-/// the old `RIPCLONE_TEST_RECHECK_DELAY_MS` wall-clock sleep and makes the
-/// freshness tests deterministic. The e2e tests serialize on their own mutex, so
-/// only one barrier is active at a time.
-static RECHECK_BARRIER: StdMutex<
-    Option<(
-        tokio::sync::watch::Sender<usize>,
-        tokio::sync::watch::Receiver<usize>,
-    )>,
-> = StdMutex::new(None);
-
-/// Install a barrier. `entered_tx` is signaled when a re-check starts; the test
-/// advances `proceed_rx` to let that re-check continue.
-pub fn set_recheck_barrier(
-    entered_tx: tokio::sync::watch::Sender<usize>,
-    proceed_rx: tokio::sync::watch::Receiver<usize>,
-) {
-    *RECHECK_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) = Some((entered_tx, proceed_rx));
-}
-
-/// Remove the barrier. Safe to call even if no barrier is set.
-pub fn clear_recheck_barrier() {
-    *RECHECK_BARRIER.lock().unwrap_or_else(|e| e.into_inner()) = None;
-}
-
-/// After an ordinary exact build completes, check whether the upstream tip
-/// moved during the build and, if so, admit that newly observed exact commit.
-/// Existing exact jobs are coalesced, while a later commit is a distinct job.
-/// Bounded by [`recheck_max`] so a repo pushing faster than it builds cannot pin
-/// a worker.
-async fn post_build_freshness_recheck(
-    state: &ServerState,
-    job: &BuildJob,
-    provider: &ProviderInstance,
-    built_commit: &str,
-) {
-    let max = recheck_max();
-    if max == 0 {
-        return;
-    }
-    let repo_id = &job.repo_id;
-    let branch = &job.branch;
-
-    // Test hook: hold the re-check until the test signals via the barrier. This
-    // replaces the old RIPCLONE_TEST_RECHECK_DELAY_MS wall-clock sleep and makes
-    // the freshness tests deterministic. Clone the channels out of the static so
-    // the mutex guard is not held across the await.
-    let barrier = RECHECK_BARRIER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some((entered_tx, mut proceed_rx)) = barrier {
-        let seen = *proceed_rx.borrow_and_update();
-        entered_tx.send_modify(|v| *v += 1);
-        // Wait for the test to advance the proceed counter past the value we saw
-        // on entry. A closed channel means the barrier was torn down; just continue.
-        let _ = proceed_rx.wait_for(|v| *v > seen).await;
-    }
-
-    // Stop once the re-check chain hits the cap; the poller picks up any
-    // remainder. The test-only barrier above lets the cap test move the tip
-    // before this decision without permitting a provider probe at the cap.
-    if job.recheck >= max {
-        return;
-    }
-
-    let credential = match state.broker.fetch_credential(repo_id, None) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                "recheck: credential fetch for {} failed: {e:#}",
-                repo_id.storage_key()
-            );
-            return;
-        }
-    };
-
-    // One bounded ls-remote round-trip, under the same cap as a real fetch.
-    let tip = {
-        let _permit = fetch_semaphore()
-            .acquire()
-            .await
-            .expect("fetch semaphore never closed");
-        git::ls_remote_tip_async(provider, repo_id, branch, credential.as_ref()).await
-    };
-    let Ok(Some(tip)) = tip else {
-        return;
-    };
-    if tip.commit == built_commit {
-        return;
-    }
-
-    // The tip moved during the build. Admit the exact observed target; it is a
-    // distinct immutable job and duplicates coalesce by that target.
-    info!(
-        "post-build re-check: {} tip moved to {}; building exact target",
-        repo_id.storage_key(),
-        &tip.commit[..7.min(tip.commit.len())]
-    );
-    if let Err(e) = enqueue_recheck_build(
-        state,
-        repo_id,
-        branch,
-        &tip.commit,
-        tip.default_branch.clone(),
-        job.recheck + 1,
-    )
-    .await
-    {
-        warn!(
-            "post-build re-check trigger failed for {}: {e}",
-            repo_id.storage_key()
-        );
-    }
-}
-
-/// Enqueue a freshness re-check build. Unlike [`trigger_build`], this does *not*
-/// take the in-process `build_waiters` coalescing slot: it runs at the end of the
-/// just-completed build, whose slot is still held until the worker releases it, so
-/// going through `build_waiters` would fold this re-trigger into the finishing
-/// build and never rebuild. A direct enqueue creates a genuine new exact job;
-/// same-repo builds still serialize on the per-repo mirror lock.
-async fn enqueue_recheck_build(
-    state: &ServerState,
-    repo_id: &RepoId,
-    branch: &str,
-    admitted_commit: &str,
-    admitted_default_branch: Option<String>,
-    recheck: u32,
-) -> Result<(), String> {
-    let credential = state
-        .broker
-        .fetch_credential(repo_id, None)
-        .map_err(|e| e.to_string())?;
-    let size_bytes = enqueue_size_bytes(state, repo_id, branch).await;
-    enqueue_direct_build(
-        state,
-        BuildJob {
-            repo_id: repo_id.clone(),
-            branch: branch.to_string(),
-            admitted_commit: admitted_commit.to_string(),
-            admitted_default_branch,
-            credential,
-            recheck,
-            size_bytes,
-        },
-        true,
-    )
-    .await
-}
-
 async fn enqueue_direct_build(
     state: &ServerState,
     job: BuildJob,
@@ -8132,49 +8040,6 @@ async fn enqueue_direct_build(
     enqueue_admitted_build(state, job, moving_authorized)
         .await
         .map(|_| ())
-}
-
-async fn handle_phase2_failure(
-    action: Phase2FailureAction,
-    repo_id: &RepoId,
-    branch: &str,
-    commit: &str,
-    reason: &str,
-) {
-    if let Some(key) = action.local_active_key.as_deref() {
-        action.state.build_waiters.lock().await.remove(key);
-    }
-    admission_test_build_failure(Some(commit), reason);
-    let status = format!("failed: {reason}");
-    match update_build_status(&action.state, repo_id, branch, commit, &status).await {
-        Ok(true) => {
-            invalidate_ref_response_cache(&action.state, repo_id, branch);
-        }
-        Ok(false) => {}
-        Err(e) => error!(
-            "build status update failed for {}@{branch} {commit}: {e:#}",
-            repo_id.storage_key()
-        ),
-    }
-
-    if let Some(recheck) = action.retry_recheck {
-        let size_bytes = enqueue_size_bytes(&action.state, repo_id, &action.job_branch).await;
-        let job = BuildJob {
-            repo_id: repo_id.clone(),
-            branch: action.job_branch,
-            admitted_commit: action.admitted_commit,
-            admitted_default_branch: action.admitted_default_branch,
-            credential: action.credential,
-            recheck,
-            size_bytes,
-        };
-        if let Err(e) = enqueue_direct_build(&action.state, job, false).await {
-            warn!(
-                "phase-2 retry trigger failed for {}@{branch} {commit}: {e}",
-                repo_id.storage_key()
-            );
-        }
-    }
 }
 
 /// Concurrency cap for in-process builds. Builds are CPU-heavy (history
@@ -8197,70 +8062,185 @@ fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
     SEM.get_or_init(|| tokio::sync::Semaphore::new(4))
 }
 
-/// Spawn the in-process worker loop for the local queue. Up to
-/// `build_concurrency()` jobs run at once (different repos in parallel); each
-/// finished job decrements the shared depth counter and signals any coalesced
-/// `/sync` waiters via their oneshots.
-fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<BuildJob>) {
-    let sem = Arc::new(tokio::sync::Semaphore::new(build_concurrency()));
-    tokio::spawn(async move {
-        loop {
-            // Test-only gate: an accepted local job can be observed in the
-            // queue before the worker claims it. The production path returns
-            // immediately because this is a no-op when no probe is installed.
-            let Some(job) = admission_test_recv_before_claim(&mut rx).await else {
-                break;
-            };
-            // Block here until a build slot frees, so we never spawn faster than
-            // we drain. The owned permit rides with the build task and frees on
-            // completion.
-            let permit = sem
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("build semaphore never closed");
-            let state = state.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                // The waiter key is the full immutable queue key, including the
-                // exact admitted commit (or the historical rev lane).
-                let key = job.key();
-                // Receiving from the local channel is the local queue's claim
-                // boundary. Hold here before any credential/provider/source
-                // work so duplicate-after-claim admission is deterministic.
-                admission_test_after_claim().await;
-                // Inner spawn isolates a panic so it fails just this job
-                // (signalling its waiters) instead of killing the task with
-                // waiters left hanging.
-                let st = state.clone();
-                let result =
-                    match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
-                        Ok(r) => r,
-                        Err(e) => Err(BuildError::retryable(format!("build task panicked: {e}"))),
-                    };
-                state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
-                let keep_marker = matches!(
-                    &result,
-                    Ok(result)
-                        if result.info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
-                );
-                if !keep_marker && let Some(senders) = state.build_waiters.lock().await.remove(&key)
-                {
-                    for s in senders {
-                        let _ = s.send(result.clone());
-                    }
-                } else if keep_marker {
-                    // Phase 2 owns marker removal; still wake callers that were
-                    // attached to phase 1.
-                    if let Some(senders) = state.build_waiters.lock().await.get_mut(&key) {
-                        for sender in senders.drain(..) {
-                            let _ = sender.send(result.clone());
+/// Run embedded workers against the same durable jobs table used by admission.
+/// A slot starts one Head at a time. After Head publishes, the claimed job keeps
+/// running and heartbeating in its own task while the slot starts another Head.
+fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJobQueue>) {
+    let admission_notify = state
+        .control_db
+        .as_ref()
+        .expect("embedded workers require the server control database")
+        .admission_notifier();
+    for slot in 0..build_concurrency() {
+        let state = state.clone();
+        let queue = queue.clone();
+        let admission_notify = admission_notify.clone();
+        tokio::spawn(async move {
+            let mut owner_sequence = 0u64;
+            loop {
+                owner_sequence = owner_sequence.wrapping_add(1);
+                let worker_id = format!("embedded-{}-{slot}-{owner_sequence}", std::process::id());
+                let claimed = loop {
+                    // Register the notification before reading SQLite. If an
+                    // admission commits during the claim attempt, the stored
+                    // permit wins the select below instead of being lost.
+                    let notified = admission_notify.notified();
+                    tokio::pin!(notified);
+                    admission_test_before_claim().await;
+                    match queue.claim(&worker_id).await {
+                        Ok(Some(claimed)) => break claimed,
+                        Ok(None) => {
+                            admission_test_embedded_idle_wait().await;
+                            tokio::select! {
+                                () = &mut notified => {
+                                    admission_test_embedded_wake(false);
+                                }
+                                () = tokio::time::sleep(Duration::from_millis(250)) => {
+                                    admission_test_embedded_wake(true);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            error!("embedded worker claim failed: {error:#}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
-                }
-            });
-        }
-    });
+                };
+                admission_test_after_claim().await;
+                let (foreground_release, foreground_released) = tokio::sync::oneshot::channel();
+                let worker_state = state.clone();
+                let worker_queue = queue.clone();
+                let owner = worker_id.clone();
+                tokio::spawn(async move {
+                    let repo_id = claimed.repo_id();
+                    let branch = claimed.branch.clone();
+                    let admitted_commit = claimed.admitted_commit.clone();
+                    let mut foreground_release = Some(foreground_release);
+                    let build = match crate::validation::validate_object_id(&admitted_commit) {
+                        Err(error) => Err(BuildError::permanent(format!(
+                            "queued job has invalid admitted commit: {error}"
+                        ))),
+                        Ok(()) => match worker_state
+                            .broker
+                            .fetch_credential(&repo_id, claimed.credential.as_ref())
+                        {
+                            Err(error) => Err(BuildError::permanent(format!(
+                                "fetch credential for queued job {}: {error:#}",
+                                repo_id.storage_key()
+                            ))),
+                            Ok(credential) => {
+                                let job = BuildJob {
+                                    repo_id: repo_id.clone(),
+                                    branch: branch.clone(),
+                                    admitted_commit: admitted_commit.clone(),
+                                    admitted_default_branch: claimed.admitted_default_branch,
+                                    repo_config: claimed.repo_config,
+                                    credential,
+                                    size_bytes: None,
+                                };
+                                let state = worker_state.clone();
+                                let release_for_build = foreground_release.take();
+                                Ok(tokio::spawn(async move {
+                                    process_build_job_with_foreground_release(
+                                        &state,
+                                        &job,
+                                        release_for_build,
+                                    )
+                                    .await
+                                }))
+                            }
+                        },
+                    };
+                    let result = match build {
+                        Err(error) => Err(error),
+                        Ok(mut build) => {
+                            let heartbeat_interval = Duration::from_secs(
+                                (worker_queue
+                                    .heartbeat_timeout_secs()
+                                    .min(worker_queue.stale_claim_secs().max(1))
+                                    / 3)
+                                .max(1) as u64,
+                            );
+                            let mut heartbeat = tokio::time::interval(heartbeat_interval);
+                            heartbeat
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            loop {
+                                tokio::select! {
+                                    joined = &mut build => {
+                                        break match joined {
+                                            Ok(result) => result,
+                                            Err(error) => Err(BuildError::retryable(format!(
+                                                "build task panicked: {error}"
+                                            ))),
+                                        };
+                                    }
+                                    _ = heartbeat.tick() => {
+                                        if let Err(error) = worker_queue
+                                            .heartbeat(&owner, Some(claimed.id))
+                                            .await
+                                        {
+                                            error!(
+                                                "embedded worker lost claim for job {}: {error:#}",
+                                                claimed.id
+                                            );
+                                            admission_test_claim_lost();
+                                            build.abort();
+                                            let _ = build.await;
+                                            break Err(BuildError::retryable(format!(
+                                                "durable claim lost while building: {error:#}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    // An error before Head publication drops the sender here,
+                    // releasing the foreground slot before terminal ack.
+                    drop(foreground_release);
+                    let retryable = result.as_ref().err().is_some_and(BuildError::is_retryable);
+                    match worker_queue
+                        .ack(claimed.id, &owner, result.map(|_| ()))
+                        .await
+                    {
+                        Ok(true) if retryable => {
+                            if let Ok(JobState::Failed(error)) =
+                                worker_queue.job_status(claimed.id).await
+                                && let Err(status_error) = mark_admitted_build_failed(
+                                    &worker_state,
+                                    &repo_id,
+                                    &branch,
+                                    &admitted_commit,
+                                    &error,
+                                )
+                                .await
+                            {
+                                error!(
+                                    "failed to mark embedded job {} dead-lettered: {status_error:#}",
+                                    claimed.id
+                                );
+                            }
+                        }
+                        Ok(true) => {}
+                        Ok(false) => warn!(
+                            "embedded job {} lost its claim before acknowledgement",
+                            claimed.id
+                        ),
+                        Err(error) => error!(
+                            "embedded worker failed to acknowledge job {}: {error:#}",
+                            claimed.id
+                        ),
+                    }
+                    if let Err(error) = worker_queue.remove_worker(&owner).await {
+                        error!("embedded worker registry cleanup failed: {error:#}");
+                    }
+                });
+                // The sender fires after Head is durably published. If the
+                // build fails earlier, sender drop also releases this slot.
+                let _ = foreground_released.await;
+            }
+        });
+    }
 }
 
 /// One polling pass: for every known repo+branch, cheaply check the upstream tip
@@ -8457,9 +8437,11 @@ async fn update_job_build_status(
         }
         return update_current_build_status(state, &job.repo_id, &exact_branch, status).await;
     }
-    update_build_status(state, &job.repo_id, &exact_branch, commit, status)
-        .await
-        .map(|updated| updated.then(|| commit.to_string()))
+    let updated = update_build_status(state, &job.repo_id, &exact_branch, commit, status).await?;
+    if updated && status.starts_with("failed: ") {
+        update_current_failure_status(state, &job.repo_id, branch, commit, status).await?;
+    }
+    Ok(updated.then(|| commit.to_string()))
 }
 
 async fn update_current_build_status(
@@ -8532,15 +8514,19 @@ fn read_server_auth_token() -> Result<String> {
     auth_token_hash(None)
 }
 
-pub async fn run_server_with_barrier(
+async fn run_server_with_barrier_at_control(
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
+    explicit_control_path: Option<&std::path::Path>,
     host: &str,
     port: u16,
     artifact_barrier: Option<ArtifactBarrier>,
 ) -> Result<()> {
-    std::fs::create_dir_all(cas_dir)?;
-    std::fs::create_dir_all(repo_root)?;
+    let default_control_path = repo_root.parent().unwrap_or(repo_root).join("control.db");
+    let control_settings = crate::control::ControlSettings::from_sources(
+        explicit_control_path,
+        &default_control_path,
+    )?;
 
     let token_hash = read_server_auth_token()?;
     info!("server auth token configured; auth middleware enabled");
@@ -8582,8 +8568,28 @@ pub async fn run_server_with_barrier(
     );
 
     let metrics = Metrics::new();
-    // Pluggable storage + metadata store + retention, shared with ripclone-worker.
-    let b = backends::Backends::from_env(cas_dir, repo_root, &metrics).await?;
+    let control_db = Arc::new(
+        crate::control::ControlDb::open(
+            &control_settings.path,
+            control_settings.turso,
+            control_settings.size_classes,
+        )
+        .await?,
+    );
+    info!(
+        path = %control_db.path().display(),
+        turso_replica = control_db.is_turso_replica(),
+        "server owns control database"
+    );
+    std::fs::create_dir_all(cas_dir)?;
+    std::fs::create_dir_all(repo_root)?;
+    let b = backends::Backends::from_env_with_ref_store(
+        cas_dir,
+        repo_root,
+        &metrics,
+        control_db.ref_store(),
+    )
+    .await?;
     let retention_interval: Duration = env::var("RIPCLONE_RETENTION_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -8623,23 +8629,11 @@ pub async fn run_server_with_barrier(
     // before the registry is moved into the state). A push to a configured
     // webhook triggers a build before any clone — no per-repo Actions workflow.
     let webhook_config = Arc::new(WebhookConfig::from_env(&provider_registry));
-    // Select the queue backend. The local queue drives an in-process worker; the
-    // SQL queues' builds run in separate ripclone-worker processes, so the server
-    // only enqueues.
-    let (build_queue, build_queue_depth, local_rx, worker_queue) =
-        match backends::select_queue().await? {
-            QueueBackend::Local { queue, rx, depth } => (queue, depth, Some(rx), None),
-            QueueBackend::Sql { queue } => (
-                queue.clone() as JobQueueRef,
-                Arc::new(AtomicUsize::new(0)),
-                None,
-                Some(queue),
-            ),
-        };
+    let worker_queue = control_db.queue();
+    let build_queue = worker_queue.clone() as JobQueueRef;
 
     let state = ServerState {
         cas: b.cas,
-        repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(b.storage.clone())),
         storage: b.storage,
         repo_root: repo_root.to_path_buf(),
         ref_store: b.ref_store,
@@ -8651,9 +8645,9 @@ pub async fn run_server_with_barrier(
         rate_limiter,
         retention: b.retention,
         build_queue,
-        worker_queue,
-        build_queue_depth,
-        build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        control_db: Some(control_db),
+        worker_queue: Some(worker_queue.clone()),
+        build_queue_depth: Arc::new(AtomicUsize::new(0)),
         oidc_verifier,
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -8668,10 +8662,7 @@ pub async fn run_server_with_barrier(
         require_repo_auth: require_repo_auth_from_env(),
     };
 
-    // Only the local queue runs builds in-process.
-    if let Some(rx) = local_rx {
-        spawn_build_worker(state.clone(), rx);
-    }
+    spawn_durable_build_worker(state.clone(), worker_queue);
 
     // Polling fallback: catches pushes that arrived without a webhook/Actions
     // trigger so build-before-clone still holds. Defaults to 5 minutes so
@@ -8715,13 +8706,48 @@ pub async fn run_server(
     host: &str,
     port: u16,
 ) -> Result<()> {
-    run_server_with_barrier(cas_dir, repo_root, host, port, take_test_artifact_barrier()).await
+    run_server_with_barrier_at_control(
+        cas_dir,
+        repo_root,
+        None,
+        host,
+        port,
+        take_test_artifact_barrier(),
+    )
+    .await
+}
+
+pub async fn run_server_with_control(
+    cas_dir: &std::path::Path,
+    repo_root: &std::path::Path,
+    control_path: &std::path::Path,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    run_server_with_barrier_at_control(
+        cas_dir,
+        repo_root,
+        Some(control_path),
+        host,
+        port,
+        take_test_artifact_barrier(),
+    )
+    .await
+}
+
+pub async fn run_server_with_barrier(
+    cas_dir: &std::path::Path,
+    repo_root: &std::path::Path,
+    host: &str,
+    port: u16,
+    artifact_barrier: Option<ArtifactBarrier>,
+) -> Result<()> {
+    run_server_with_barrier_at_control(cas_dir, repo_root, None, host, port, artifact_barrier).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::JobQueue;
     use tower::util::ServiceExt;
 
     #[test]
@@ -8960,6 +8986,166 @@ mod tests {
         assert!(!classify_build_error(&permanent).is_retryable());
     }
 
+    struct TestSqlQueue {
+        path: PathBuf,
+        inner: tokio::sync::OnceCell<Arc<crate::queue::SqlJobQueue>>,
+        observer: Option<tokio::sync::mpsc::UnboundedSender<BuildJob>>,
+    }
+
+    struct TestSqlRefStore {
+        path: PathBuf,
+        inner: tokio::sync::OnceCell<Arc<crate::meta::SqlRefStore>>,
+    }
+
+    impl TestSqlRefStore {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                path,
+                inner: tokio::sync::OnceCell::new(),
+            }
+        }
+
+        async fn store(&self) -> anyhow::Result<&Arc<crate::meta::SqlRefStore>> {
+            self.inner
+                .get_or_try_init(|| async {
+                    let db = crate::meta::LibsqlMeta::connect(&self.path.to_string_lossy()).await?;
+                    Ok(Arc::new(crate::meta::SqlRefStore::new(Box::new(db)).await?))
+                })
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RefStore for TestSqlRefStore {
+        async fn load(&self, repo_id: &RepoId) -> anyhow::Result<Option<RefInfo>> {
+            self.store().await?.load(repo_id).await
+        }
+        async fn save(&self, repo_id: &RepoId, info: &RefInfo) -> anyhow::Result<()> {
+            self.store().await?.save(repo_id, info).await
+        }
+        async fn list(&self) -> anyhow::Result<Vec<RepoId>> {
+            self.store().await?.list().await
+        }
+        async fn load_branch(
+            &self,
+            repo_id: &RepoId,
+            branch: &str,
+        ) -> anyhow::Result<Option<RefInfo>> {
+            self.store().await?.load_branch(repo_id, branch).await
+        }
+        async fn save_branch(
+            &self,
+            repo_id: &RepoId,
+            branch: &str,
+            info: &RefInfo,
+        ) -> anyhow::Result<()> {
+            self.store().await?.save_branch(repo_id, branch, info).await
+        }
+        async fn update_build_status(
+            &self,
+            repo_id: &RepoId,
+            branch: &str,
+            expected_commit: &str,
+            status: &str,
+        ) -> anyhow::Result<bool> {
+            self.store()
+                .await?
+                .update_build_status(repo_id, branch, expected_commit, status)
+                .await
+        }
+        async fn touch_last_accessed_at(
+            &self,
+            repo_id: &RepoId,
+            branch: &str,
+            expected_commit: &str,
+        ) -> anyhow::Result<bool> {
+            self.store()
+                .await?
+                .touch_last_accessed_at(repo_id, branch, expected_commit)
+                .await
+        }
+        async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> anyhow::Result<()> {
+            self.store().await?.delete_branch(repo_id, branch).await
+        }
+        async fn list_branches(&self, repo_id: &RepoId) -> anyhow::Result<Vec<String>> {
+            self.store().await?.list_branches(repo_id).await
+        }
+        async fn add_repo(&self, repo: &AddedRepo) -> anyhow::Result<()> {
+            self.store().await?.add_repo(repo).await
+        }
+        async fn load_added_repo(&self, repo_id: &RepoId) -> anyhow::Result<Option<AddedRepo>> {
+            self.store().await?.load_added_repo(repo_id).await
+        }
+        async fn remove_added_repo(&self, repo_id: &RepoId) -> anyhow::Result<()> {
+            self.store().await?.remove_added_repo(repo_id).await
+        }
+        async fn list_added_repos(&self) -> anyhow::Result<Vec<AddedRepo>> {
+            self.store().await?.list_added_repos().await
+        }
+        async fn health(&self) -> anyhow::Result<()> {
+            self.store().await?.health().await
+        }
+    }
+
+    impl TestSqlQueue {
+        fn new(
+            path: PathBuf,
+            observer: Option<tokio::sync::mpsc::UnboundedSender<BuildJob>>,
+        ) -> Self {
+            Self {
+                path,
+                inner: tokio::sync::OnceCell::new(),
+                observer,
+            }
+        }
+
+        async fn queue(&self) -> anyhow::Result<&Arc<crate::queue::SqlJobQueue>> {
+            self.inner
+                .get_or_try_init(|| async {
+                    let db = crate::queue::LibsqlDb::connect(&self.path.to_string_lossy()).await?;
+                    Ok(Arc::new(
+                        crate::queue::SqlJobQueue::new(Box::new(db)).await?,
+                    ))
+                })
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::queue::JobQueue for TestSqlQueue {
+        async fn enqueue(&self, job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
+            let result = self.queue().await?.enqueue(job.clone()).await?;
+            if result.outcome == EnqueueOutcome::Enqueued
+                && let Some(observer) = &self.observer
+            {
+                let _ = observer.send(job);
+            }
+            Ok(result)
+        }
+
+        async fn job_status(&self, job_id: i64) -> anyhow::Result<JobState> {
+            self.queue().await?.job_status(job_id).await
+        }
+
+        async fn depth(&self) -> usize {
+            match self.queue().await {
+                Ok(queue) => queue.depth().await,
+                Err(_) => 0,
+            }
+        }
+    }
+
+    fn install_observed_queue(
+        state: &mut ServerState,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<BuildJob> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.build_queue = Arc::new(TestSqlQueue::new(
+            state.repo_root.join("test-control-jobs.db"),
+            Some(sender),
+        ));
+        receiver
+    }
+
     fn test_state(tmp: &tempfile::TempDir) -> ServerState {
         let cas_root = tmp.path().join("cas");
         let cas = Cas::new(&cas_root).unwrap();
@@ -8967,19 +9153,20 @@ mod tests {
         let repo_root = tmp.path().join("repos");
         std::fs::create_dir_all(&repo_root).unwrap();
         let ref_store: Arc<dyn RefStore> =
-            Arc::new(crate::ref_store::FileRefStore::new(&repo_root));
+            Arc::new(TestSqlRefStore::new(repo_root.join("test-control-refs.db")));
         let token_hash = hex::encode(Sha256::digest("secret"));
         let metrics = Metrics::new();
         let retention = Arc::new(Retention::new(cas.clone(), metrics.clone()).unwrap());
-        let (local_queue, _build_rx, _depth) = crate::queue::LocalJobQueue::new(16);
-        let build_queue: JobQueueRef = Arc::new(local_queue);
+        let build_queue: JobQueueRef = Arc::new(TestSqlQueue::new(
+            repo_root.join("test-control-jobs.db"),
+            None,
+        ));
         let provider_registry = ProviderRegistry::new();
         let broker: Arc<dyn CredentialBroker> = Arc::new(crate::auth::broker::StaticBroker::new(
             provider_registry.clone(),
         ));
         ServerState {
             cas,
-            repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(storage.clone())),
             storage,
             repo_root,
             ref_store,
@@ -8991,9 +9178,9 @@ mod tests {
             rate_limiter: RateLimiter::new(100, 100.0),
             retention,
             build_queue,
+            control_db: None,
             worker_queue: None,
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
-            build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
@@ -9201,13 +9388,27 @@ mod tests {
             branch: effective_branch.clone(),
             admitted_commit: tip.commit.clone(),
             admitted_default_branch: tip.default_branch.clone(),
+            repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
-            recheck: 0,
             size_bytes: None,
         };
-        prepare_exact_admission(state, &job, true)
+        if let Some(admission) = prepare_exact_admission(state, &job, true)
             .await
-            .expect("prepare exact test admission");
+            .expect("prepare exact test admission")
+        {
+            state
+                .ref_store
+                .save_branch(&job.repo_id, &admission.exact_branch, &admission.pending)
+                .await
+                .expect("save exact test admission");
+            if let Some((branch, tail)) = admission.tail {
+                state
+                    .ref_store
+                    .save_branch(&job.repo_id, &branch, &tail)
+                    .await
+                    .expect("save moving test admission");
+            }
+        }
         let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
         let lock = repo_lock(&state.sync_locks, repo_id).await;
         do_sync(
@@ -9218,7 +9419,6 @@ mod tests {
             &tip.commit,
             tip.default_branch.as_deref(),
             &state.ref_store,
-            true,
             &state.storage,
             &state.retention,
             provider,
@@ -9575,7 +9775,7 @@ mod tests {
     #[tokio::test]
     async fn rev_ref_lookup_reads_only_the_exact_result() {
         let tmp = tempfile::tempdir().unwrap();
-        let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
+        let store: Arc<dyn RefStore> = Arc::new(TestSqlRefStore::new(tmp.path().join("refs.db")));
         let repo = RepoId::github("o/r");
         let commit = "1111111111111111111111111111111111111111";
         let exact_key = exact_ref_store_key("main", commit);
@@ -9607,7 +9807,7 @@ mod tests {
     #[tokio::test]
     async fn rev_ref_lookup_rejects_carried_full_clonepack_for_new_commit() {
         let tmp = tempfile::tempdir().unwrap();
-        let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
+        let store: Arc<dyn RefStore> = Arc::new(TestSqlRefStore::new(tmp.path().join("refs.db")));
         let repo = RepoId::github("o/r");
         let new_commit = "4444444444444444444444444444444444444444";
         let old_commit = "5555555555555555555555555555555555555555";
@@ -10159,149 +10359,20 @@ mod tests {
         }
     }
 
-    /// `test_state` drops the build-queue receiver, so a fire-and-forget enqueue
-    /// would fail. This variant keeps the receiver alive (drained in the
-    /// background) so enqueues succeed — we assert the HTTP response, not the
-    /// build itself.
+    /// Compatibility helper for request tests that do not inspect the durable
+    /// job after admission.
     fn test_state_draining(tmp: &tempfile::TempDir) -> ServerState {
-        let mut state = test_state(tmp);
-        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(64);
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = depth;
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        state
+        test_state(tmp)
     }
 
-    /// Like `test_state_draining`, but returns the receiver so tests can assert
-    /// exactly what was enqueued.
+    /// Return an observation receiver while the authoritative queue remains
+    /// SQLite-backed.
     fn test_state_with_queue(
         tmp: &tempfile::TempDir,
-    ) -> (ServerState, tokio::sync::mpsc::Receiver<BuildJob>) {
+    ) -> (ServerState, tokio::sync::mpsc::UnboundedReceiver<BuildJob>) {
         let mut state = test_state(tmp);
-        let (queue, rx, depth) = crate::queue::LocalJobQueue::new(64);
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = depth;
+        let rx = install_observed_queue(&mut state);
         (state, rx)
-    }
-
-    #[tokio::test]
-    async fn ordinary_admission_releases_marker_when_local_queue_is_full() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        let (queue, _rx, depth) = crate::queue::LocalJobQueue::new(1);
-        queue
-            .enqueue(BuildJob {
-                repo_id: RepoId::github("acme/filler"),
-                branch: "main".to_string(),
-                admitted_commit: "2222222222222222222222222222222222222222".to_string(),
-                admitted_default_branch: None,
-                credential: None,
-                recheck: 0,
-                size_bytes: None,
-            })
-            .await
-            .expect("fill the one-slot queue");
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = Arc::clone(&depth);
-
-        let error = enqueue_admitted_build(
-            &state,
-            BuildJob {
-                repo_id: RepoId::github("acme/full"),
-                branch: "main".to_string(),
-                admitted_commit: "1111111111111111111111111111111111111111".to_string(),
-                admitted_default_branch: None,
-                credential: None,
-                recheck: 0,
-                size_bytes: None,
-            },
-            true,
-        )
-        .await
-        .expect_err("a full local queue must reject the job");
-
-        assert_eq!(error, "build queue full");
-        assert_eq!(depth.load(Ordering::SeqCst), 1);
-        assert!(
-            state.build_waiters.lock().await.is_empty(),
-            "a rejected exact admission must not leave an active local marker"
-        );
-        let exact_key = exact_ref_store_key("main", "1111111111111111111111111111111111111111");
-        let placeholder = state
-            .ref_store
-            .load_branch(&RepoId::github("acme/full"), &exact_key)
-            .await
-            .unwrap()
-            .expect("rejected admission retains terminalizable exact identity");
-        assert!(placeholder.internal_exact_result);
-        assert!(
-            placeholder.last_accessed_at.is_some(),
-            "rejected admission placeholder must remain warm-TTL eligible"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ordinary_http_admission_queue_full_has_no_source_side_effects() {
-        let _env = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        let origin_path = origin_base.path().join("acme").join("full.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let _commit = crate::test_fixture::commit(&origin, &[("README.md", b"full")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        let (queue, _rx, depth) = crate::queue::LocalJobQueue::new(1);
-        queue
-            .enqueue(BuildJob {
-                repo_id: RepoId::github("acme/filler"),
-                branch: "main".to_string(),
-                admitted_commit: "2222222222222222222222222222222222222222".to_string(),
-                admitted_default_branch: None,
-                credential: None,
-                recheck: 0,
-                size_bytes: None,
-            })
-            .await
-            .unwrap();
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = Arc::clone(&depth);
-        let repo_id = RepoId::github("acme/full");
-        mark_added(&state, repo_id.clone()).await;
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
-
-        let response = build_app(state.clone())
-            .oneshot(test_request(
-                "POST",
-                "/v1/repos/github/acme/full/sync?branch=main",
-            ))
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(depth.load(Ordering::SeqCst), 1);
-        assert!(!state.repo_root.join(repo_id.mirror_dir_name()).exists());
-        assert!(
-            state
-                .ref_store
-                .load_branch(&repo_id, "main")
-                .await
-                .unwrap()
-                .is_none(),
-            "queue rejection must not create a metadata row"
-        );
-        assert!(
-            state.storage.list_hashes().unwrap().is_empty(),
-            "queue rejection must not write artifacts"
-        );
-        assert!(
-            state.build_waiters.lock().await.is_empty(),
-            "queue rejection must release the exact local marker"
-        );
     }
 
     #[tokio::test]
@@ -10521,7 +10592,6 @@ mod tests {
             &missing,
             Some("main"),
             &state.ref_store,
-            true,
             &state.storage,
             &state.retention,
             &provider,
@@ -10595,8 +10665,8 @@ mod tests {
             branch: "main".to_string(),
             admitted_commit: missing.clone(),
             admitted_default_branch: Some("main".to_string()),
+            repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
-            recheck: 0,
             size_bytes: None,
         };
         prepare_exact_admission(&state, &job, false).await.unwrap();
@@ -10712,16 +10782,13 @@ mod tests {
         .into_bytes()
     }
 
-    /// A test state with a configured `github` webhook secret whose local-queue
-    /// receiver is kept (non-draining) so a test can assert what `trigger_build`
-    /// enqueued.
+    /// A test state with a configured `github` webhook secret and a durable-job
+    /// observer so a test can assert what `trigger_build` admitted.
     fn webhook_state(
         tmp: &tempfile::TempDir,
-    ) -> (ServerState, tokio::sync::mpsc::Receiver<BuildJob>) {
+    ) -> (ServerState, tokio::sync::mpsc::UnboundedReceiver<BuildJob>) {
         let mut state = test_state(tmp);
-        let (queue, rx, depth) = crate::queue::LocalJobQueue::new(16);
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = depth;
+        let rx = install_observed_queue(&mut state);
         state.webhook_config = Arc::new(WebhookConfig::with_secret("github", WEBHOOK_SECRET));
         (state, rx)
     }
@@ -10944,9 +11011,7 @@ mod tests {
     async fn webhook_warm_all_warms_every_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = depth;
+        let mut rx = install_observed_queue(&mut state);
         state.webhook_config =
             Arc::new(WebhookConfig::with_secret("github", WEBHOOK_SECRET).with_warm_all(true));
         mark_added(&state, RepoId::github("acme/widget")).await;
@@ -10976,9 +11041,7 @@ mod tests {
     async fn webhook_allowlist_blocks_unlisted_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = depth;
+        let mut rx = install_observed_queue(&mut state);
         state.webhook_config = Arc::new(
             WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                 .with_allowlist(["acme/allowed".to_string()]),
@@ -11005,9 +11068,7 @@ mod tests {
     async fn webhook_allowlist_allows_listed_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = depth;
+        let mut rx = install_observed_queue(&mut state);
         state.webhook_config = Arc::new(
             WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                 .with_allowlist(["acme/widget".to_string()]),
@@ -11042,9 +11103,7 @@ mod tests {
         for entry in ["acme/widget", "github/acme/widget"] {
             let tmp = tempfile::tempdir().unwrap();
             let mut state = test_state(&tmp);
-            let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
-            state.build_queue = Arc::new(queue);
-            state.build_queue_depth = depth;
+            let mut rx = install_observed_queue(&mut state);
             state.webhook_config = Arc::new(
                 WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                     .with_allowlist([entry.to_string()]),
@@ -11159,9 +11218,6 @@ mod tests {
     async fn webhook_delete_outside_allowlist_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        let (queue, _rx, depth) = crate::queue::LocalJobQueue::new(16);
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = depth;
         state.webhook_config = Arc::new(
             WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                 .with_allowlist(["acme/allowed".to_string()]),
@@ -11218,18 +11274,15 @@ mod tests {
     }
 
     /// Build state with a single non-default provider instance configured plus
-    /// its webhook secret. Returns the (non-draining) queue receiver so a test
-    /// can assert what `trigger_build` enqueued.
+    /// its webhook secret and a durable-job observer.
     fn provider_webhook_state(
         tmp: &tempfile::TempDir,
         id: &str,
         kind: &str,
         host: &str,
-    ) -> (ServerState, tokio::sync::mpsc::Receiver<BuildJob>) {
+    ) -> (ServerState, tokio::sync::mpsc::UnboundedReceiver<BuildJob>) {
         let mut state = test_state(tmp);
-        let (queue, rx, depth) = crate::queue::LocalJobQueue::new(16);
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = depth;
+        let rx = install_observed_queue(&mut state);
         let mut registry = ProviderRegistry::new();
         registry
             .merge_one(crate::provider::ProviderConfig {
@@ -12401,60 +12454,6 @@ mod tests {
         assert!(explicit_test_mode(Some(std::ffi::OsStr::new("1"))));
     }
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn before_claim_barrier_cannot_lose_arm_or_release_wakeups() {
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let probe = Arc::new(AdmissionTestProbe::default());
-        let _guard = install_admission_test_probe(Arc::clone(&probe));
-        unsafe { std::env::set_var("RIPCLONE_TESTING", "1") };
-
-        for generation in 0..64 {
-            probe.before_claim.disarm();
-            let (queue, mut rx, _depth) = crate::queue::LocalJobQueue::new(1);
-            let mut receiver =
-                tokio::spawn(async move { admission_test_recv_before_claim(&mut rx).await });
-            tokio::task::yield_now().await;
-
-            probe.before_claim.arm();
-            queue
-                .enqueue(BuildJob {
-                    repo_id: RepoId::github(format!("acme/barrier-{generation}")),
-                    branch: "main".to_string(),
-                    admitted_commit: format!("{generation:040x}"),
-                    admitted_default_branch: None,
-                    credential: None,
-                    recheck: 0,
-                    size_bytes: None,
-                })
-                .await
-                .unwrap();
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                probe.before_claim.wait_until_entered(1),
-            )
-            .await
-            .expect("armed receive must enter the pre-claim gate");
-            assert!(
-                !receiver.is_finished(),
-                "generation {generation} crossed the claim boundary before release"
-            );
-
-            probe.before_claim.release();
-            let job = tokio::time::timeout(Duration::from_secs(1), &mut receiver)
-                .await
-                .expect("release signal must not be lost")
-                .unwrap()
-                .expect("queued job remains available after release");
-            assert_eq!(job.repo_id.path, format!("acme/barrier-{generation}"));
-        }
-
-        probe.before_claim.disarm();
-        unsafe { std::env::remove_var("RIPCLONE_TESTING") };
-    }
-
     #[test]
     fn metadata_only_full_pending_excludes_evicted_rows() {
         let info = RefInfo {
@@ -12548,94 +12547,6 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn evicted_get_returns_503_when_local_queue_is_full() {
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        let origin_path = origin_base.path().join("acme").join("evicted-full.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let commit = crate::test_fixture::commit(&origin, &[("f.txt", b"ready")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(1);
-        queue
-            .enqueue(BuildJob {
-                repo_id: RepoId::github("acme/filler"),
-                branch: "main".to_string(),
-                admitted_commit: "f".repeat(40),
-                admitted_default_branch: None,
-                credential: None,
-                recheck: 0,
-                size_bytes: None,
-            })
-            .await
-            .unwrap();
-        state.build_queue = Arc::new(queue);
-        state.build_queue_depth = Arc::clone(&depth);
-        let repo_id = RepoId::github("acme/evicted-full");
-        mark_added(&state, repo_id.clone()).await;
-        let exact_key = exact_ref_store_key("main", &commit);
-        state
-            .ref_store
-            .save_branch(
-                &repo_id,
-                &exact_key,
-                &RefInfo {
-                    internal_exact_result: true,
-                    commit: commit.clone(),
-                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        unsafe {
-            std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
-            std::env::set_var("RIPCLONE_TESTING", "1");
-        }
-
-        let response = build_app(state.clone())
-            .oneshot(protocol_request(
-                "/v1/repos/github/acme/evicted-full/refs/main?clonepack=shallow",
-                Some("2"),
-            ))
-            .await
-            .unwrap();
-        unsafe {
-            std::env::remove_var("RIPCLONE_ORIGIN_BASE");
-            std::env::remove_var("RIPCLONE_TESTING");
-        }
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("build queue full"));
-        assert_eq!(depth.load(Ordering::SeqCst), 1, "only the filler remains");
-        let filler = rx.try_recv().expect("preexisting filler remains queued");
-        assert_eq!(filler.repo_id, RepoId::github("acme/filler"));
-        assert!(rx.try_recv().is_err(), "no eviction rebuild was inserted");
-        assert!(state.storage.list_hashes().unwrap().is_empty());
-        assert!(state.build_waiters.lock().await.is_empty());
-        assert_eq!(
-            state
-                .ref_store
-                .load_branch(&repo_id, &exact_key)
-                .await
-                .unwrap()
-                .unwrap()
-                .build_status
-                .as_deref(),
-            Some(crate::remote_gc::EVICTED_BUILD_STATUS),
-            "queue rejection cannot claim that a rebuild started"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn evicted_get_returns_503_when_queue_errors() {
         struct ErrorQueue {
             attempts: Arc<AtomicUsize>,
@@ -12723,7 +12634,7 @@ mod tests {
         let repo_root = tmp.path().join("repos");
         std::fs::create_dir_all(&repo_root).unwrap();
         let ref_store: Arc<dyn RefStore> =
-            Arc::new(crate::ref_store::FileRefStore::new(&repo_root));
+            Arc::new(TestSqlRefStore::new(repo_root.join("refs.db")));
         let rid = RepoId::github("o/r");
 
         let evicted = RefInfo {
@@ -13171,7 +13082,7 @@ mod tests {
         let queue_path = tmp.path().join("historical-queue.db");
         let queue = Arc::new(
             crate::queue::SqlJobQueue::new(Box::new(
-                crate::queue::SqliteDb::connect(&queue_path.to_string_lossy())
+                crate::queue::LibsqlDb::connect(&queue_path.to_string_lossy())
                     .await
                     .unwrap(),
             ))

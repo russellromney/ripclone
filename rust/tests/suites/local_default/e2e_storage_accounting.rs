@@ -7,7 +7,6 @@ use common::*;
 use prost::Message;
 use ripclone::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex};
 use ripclone::provider::RepoId;
-use ripclone::ref_store::{FileRefStore, RefStore};
 
 /// Helper: GET /v1/repos/{provider}/{owner}/{repo}/status with optional query params.
 async fn get_status(
@@ -100,7 +99,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
     sync_until_manifest(&server, "acme", "historical-storage-accounting").await;
 
     let before = get_status(&server, "acme", "historical-storage-accounting", None).await;
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/historical-storage-accounting");
     let info = store
         .load_branch(&repo_id, "main")
@@ -143,8 +142,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
         .put(&historical_manifest_hash, &historical_manifest_bytes)
         .expect("store historical-only manifest");
 
-    let mut historical_info = info.clone();
-    historical_info.internal_exact_result = true;
+    let mut historical_info = ordinary_exact;
     historical_info.full_clonepack.manifest = historical_manifest_hash.clone();
     store
         .save_branch(&repo_id, &historical_key, &historical_info)
@@ -178,7 +176,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
 }
 
 #[tokio::test]
-async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
+async fn accepted_sync_reports_build_timings_through_metrics_and_status() {
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "synctiming");
@@ -205,9 +203,8 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
         .expect("metrics text");
     let before_publish_p1 =
         prometheus_value(&before_metrics, "ripclone_sync_publish_p1_ms_total").unwrap_or(0);
-    // Ordinary `/sync` now returns exact admission before build timing data
-    // exists. Exercise the unchanged explicit-revision ready payload for this
-    // phase-timing/metrics regression.
+    // Admission returns before build timing data exists. The completed build
+    // publishes those timings through metrics and status instead.
     let sync_url = format!(
         "{}/v1/repos/github/acme/synctiming/sync?rev={c2}",
         server.url
@@ -218,20 +215,12 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
         .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
-        .expect("sync request")
-        .error_for_status()
-        .expect("sync 2xx");
-    let sync: ripclone::server::SyncResponse = sync_resp.json().await.expect("sync response json");
-    assert_eq!(sync.status, "built");
-    assert!(!sync.ref_info.commit.is_empty(), "sync response commit");
-    assert!(
-        sync.phases.mirror_fetch_ms.is_some(),
-        "mirror fetch timing should be present"
-    );
-    assert!(
-        sync.phases.publish_p1_ms.is_some(),
-        "phase-1 publish timing should be present"
-    );
+        .expect("sync response");
+    assert_eq!(sync_resp.status(), reqwest::StatusCode::ACCEPTED);
+    let accepted: serde_json::Value = sync_resp.json().await.expect("accepted response json");
+    assert_eq!(accepted["commit"], c2);
+
+    sync_until_manifest(&server, "acme", "synctiming").await;
     let metrics = client
         .get(format!("{}/metrics", server.url))
         .send()
@@ -244,10 +233,9 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
         .expect("metrics text");
     let after_publish_p1 = prometheus_value(&metrics, "ripclone_sync_publish_p1_ms_total")
         .expect("publish p1 metric present");
-    assert_eq!(
-        after_publish_p1 - before_publish_p1,
-        sync.phases.publish_p1_ms.unwrap_or(0),
-        "phase timings should feed /metrics without RIPCLONE_BENCH"
+    assert!(
+        after_publish_p1 > before_publish_p1,
+        "completed phase-one timing should feed /metrics without RIPCLONE_BENCH"
     );
 
     let mut build_ms = None;

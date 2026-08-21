@@ -1,26 +1,34 @@
-//! [`MetaDb`] backed by the `libsql` crate, connecting to a **remote** Turso
-//! Cloud database. SQLite-flavored SQL (`?` placeholders, `ON CONFLICT` upsert).
+//! [`MetaDb`] over the server's Turso embedded-replica handle.
 
 use super::{MetaDb, RefRow};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use libsql::{Builder, Connection, Database};
+use libsql::{Connection, Database};
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct LibsqlMeta {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl LibsqlMeta {
-    pub async fn connect_remote(url: &str, token: &str) -> Result<Self> {
-        let db = Builder::new_remote(url.to_string(), token.to_string())
+    pub(crate) fn from_database(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
+    pub async fn connect(path: &str) -> Result<Self> {
+        let db = libsql::Builder::new_local(path)
             .build()
             .await
-            .with_context(|| format!("open libsql remote metadata {url}"))?;
-        Ok(Self { db })
+            .context("open local control database")?;
+        Ok(Self { db: Arc::new(db) })
     }
 
     async fn conn(&self) -> Result<Connection> {
-        self.db.connect().context("libsql connect")
+        let conn = self.db.connect().context("libsql connect")?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("configure metadata busy timeout")?;
+        Ok(conn)
     }
 }
 
@@ -190,6 +198,18 @@ impl MetaDb for LibsqlMeta {
             out.push(row.get::<String>(0)?);
         }
         Ok(out)
+    }
+
+    async fn delete_ref(&self, repo_key: &str, branch: &str) -> Result<()> {
+        self.conn()
+            .await?
+            .execute(
+                "DELETE FROM refs WHERE repo_key = ? AND branch = ?",
+                libsql::params![repo_key, branch],
+            )
+            .await
+            .context("delete ref")?;
+        Ok(())
     }
 
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {

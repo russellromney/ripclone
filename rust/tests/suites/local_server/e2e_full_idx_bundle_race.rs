@@ -21,7 +21,7 @@ use crate::common::*;
 use prost::Message;
 use ripclone::clonepack::{ClonepackManifest, hash_to_hex};
 use ripclone::provider::RepoId;
-use ripclone::ref_store::{FileRefStore, RefStore};
+use ripclone::ref_store::RefStore;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,7 +87,7 @@ async fn full_idx_bundle_matches_manifest_under_concurrent_multipack_build() {
     tokio::time::sleep(Duration::from_secs(16)).await;
 
     // Read the stored full clonepack directly and decode the manifest it serves.
-    let store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&server.repo_root));
+    let store: Arc<dyn RefStore> = server_ref_store(&server).await;
     let repo = RepoId::github("acme/idxrace");
     let info = store
         .load_branch(&repo, "main")

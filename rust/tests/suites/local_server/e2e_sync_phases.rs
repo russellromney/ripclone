@@ -12,43 +12,49 @@ fn init_bench() {
     init(false);
 }
 
-fn assert_all_phases_present(phases: &ripclone::server::SyncPhases, label: &str) {
-    assert!(
-        phases.mirror_fetch_ms.is_some(),
-        "{label}: mirror_fetch_ms missing"
-    );
-    assert!(
-        phases.commit_graph_ms.is_some(),
-        "{label}: commit_graph_ms missing"
-    );
-    assert!(
-        phases.head_packs_ms.is_some(),
-        "{label}: head_packs_ms missing"
-    );
-    assert!(
-        phases.skeleton_build_ms.is_some(),
-        "{label}: skeleton_build_ms missing"
-    );
-    assert!(
-        phases.files_table_ms.is_some(),
-        "{label}: files_table_ms missing"
-    );
-    assert!(
-        phases.prebuilt_index_ms.is_some(),
-        "{label}: prebuilt_index_ms missing"
-    );
-    assert!(
-        phases.upload_p1_ms.is_some(),
-        "{label}: upload_p1_ms missing"
-    );
-    assert!(
-        phases.ref_publish_ms.is_some(),
-        "{label}: ref_publish_ms missing"
-    );
-    assert!(
-        phases.publish_p1_ms.is_some(),
-        "{label}: publish_p1_ms missing"
-    );
+fn prometheus_value(text: &str, name: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let (metric, value) = line.split_once(' ')?;
+            (metric == name).then(|| value.parse().ok()).flatten()
+        })
+        .unwrap_or_else(|| panic!("metric {name} missing"))
+}
+
+async fn phase_metrics_after_builds(
+    client: &reqwest::Client,
+    server: &Server,
+    expected_builds: u64,
+) -> Vec<u64> {
+    for _ in 0..160 {
+        let metrics = client
+            .get(format!("{}/metrics", server.url))
+            .send()
+            .await
+            .expect("metrics request")
+            .error_for_status()
+            .expect("metrics 2xx")
+            .text()
+            .await
+            .expect("metrics text");
+        if prometheus_value(&metrics, "ripclone_builds_completed_total") >= expected_builds {
+            return [
+                "ripclone_sync_mirror_fetch_ms_total",
+                "ripclone_sync_commit_graph_ms_total",
+                "ripclone_sync_head_packs_ms_total",
+                "ripclone_sync_skeleton_build_ms_total",
+                "ripclone_sync_files_table_ms_total",
+                "ripclone_sync_prebuilt_index_ms_total",
+                "ripclone_sync_upload_p1_ms_total",
+                "ripclone_sync_ref_publish_ms_total",
+                "ripclone_sync_publish_p1_ms_total",
+            ]
+            .map(|name| prometheus_value(&metrics, name))
+            .to_vec();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("metrics never recorded {expected_builds} completed builds");
 }
 
 #[tokio::test]
@@ -63,28 +69,20 @@ async fn cold_sync_reports_all_phase_timings() {
         .expect("add repo");
 
     let client = reqwest::Client::new();
-    // Ordinary `/sync` is now an admission endpoint and returns 202 before
-    // phase timings exist. Keep this timing-specific regression on the
-    // first-class historical exact-revision path, whose ready 200 payload
-    // carries the detailed phase data.
-    let sync_url = format!(
-        "{}/v1/repos/github/acme/phasescold/sync?rev={c1}",
-        server.url
-    );
-    let sync: ripclone::server::SyncResponse = client
-        .post(&sync_url)
-        .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .send()
+    let admission = server
+        .client()
+        .admit_sync_repo("acme/phasescold", None)
         .await
-        .expect("sync request")
-        .error_for_status()
-        .expect("sync 2xx")
-        .json()
-        .await
-        .expect("sync json");
-    assert_eq!(sync.status, "built");
-    assert_all_phases_present(&sync.phases, "cold");
+        .expect("admit cold sync");
+    assert!(admission.accepted);
+    assert_eq!(admission.commit, c1);
+    let _ = sync_response_until_manifest(&client, &server, "acme", "phasescold", &c1).await;
+
+    // Admission returns before timing data exists. The durable worker records
+    // every phase after the accepted build settles; `/metrics` is the public
+    // post-completion timing surface.
+    let phases = phase_metrics_after_builds(&client, &server, 1).await;
+    assert_eq!(phases.len(), 9);
 }
 
 /// Poll the exact pinned metadata path until the full clonepack manifest is
@@ -135,57 +133,39 @@ async fn incremental_sync_reports_all_phase_timings() {
         .expect("add repo");
 
     let client = reqwest::Client::new();
-    let sync_url = format!(
-        "{}/v1/repos/github/acme/phasesinc/sync?rev={c1}",
-        server.url
-    );
-
     // Cold sync.
-    let cold: ripclone::server::SyncResponse = client
-        .post(&sync_url)
-        .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .send()
+    let cold = server
+        .client()
+        .admit_sync_repo("acme/phasesinc", None)
         .await
-        .expect("sync request")
-        .error_for_status()
-        .expect("sync 2xx")
-        .json()
-        .await
-        .expect("sync json");
-    assert_eq!(cold.status, "built");
-    assert_all_phases_present(&cold.phases, "cold");
+        .expect("admit cold sync");
+    assert!(cold.accepted);
+    assert_eq!(cold.commit, c1);
 
     // Let the background full-history build finish so the next sync's storage
     // amplification report includes history packs.
     let _ = sync_response_until_manifest(&client, &server, "acme", "phasesinc", &c1).await;
+    let cold_phases = phase_metrics_after_builds(&client, &server, 1).await;
 
     // Incremental sync: add a commit and re-sync.
     let c2 = origin.commit(&[("README.md", "v2\n")], "c2");
     origin.publish();
-    let sync_url = format!(
-        "{}/v1/repos/github/acme/phasesinc/sync?rev={c2}",
-        server.url
-    );
-    let inc: ripclone::server::SyncResponse = client
-        .post(&sync_url)
-        .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .send()
+    let inc = server
+        .client()
+        .admit_sync_repo("acme/phasesinc", None)
         .await
-        .expect("sync request")
-        .error_for_status()
-        .expect("sync 2xx")
-        .json()
-        .await
-        .expect("sync json");
-    assert_eq!(inc.status, "built");
-    assert_all_phases_present(&inc.phases, "incremental");
+        .expect("admit incremental sync");
+    assert!(inc.accepted);
+    assert_eq!(inc.commit, c2);
+    let _ = sync_response_until_manifest(&client, &server, "acme", "phasesinc", &c2).await;
+    let incremental_phases = phase_metrics_after_builds(&client, &server, 2).await;
+    assert_eq!(incremental_phases.len(), cold_phases.len());
     // The incremental push→clonable path should remain in the same ballpark as
     // the cold path on this tiny fixture; the real tripwire is measured on
     // larger repos.
+    let incremental_publish_p1 = incremental_phases[8].saturating_sub(cold_phases[8]);
     assert!(
-        inc.phases.publish_p1_ms.unwrap_or(u64::MAX) < 5000,
+        incremental_publish_p1 < 5000,
         "incremental push→clonable must stay under the ~5s tripwire on small repos"
     );
 }

@@ -452,11 +452,10 @@ async fn republish_resolved_manifest(
     mutate: impl FnOnce(&mut ripclone::clonepack::ClonepackManifest),
 ) -> String {
     use prost::Message;
-    use ripclone::ref_store::RefStore;
-
-    let store = ripclone::ref_store::FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(server).await;
     let repo_id = ripclone::provider::RepoId::github(repo_path);
-    let moving = RefStore::load_branch(&store, &repo_id, "main")
+    let moving = store
+        .load_branch(&repo_id, "main")
         .await
         .expect("load moving row")
         .expect("moving row exists");
@@ -477,7 +476,8 @@ async fn republish_resolved_manifest(
     // clone can read either, so repoint both.
     let mut patched = 0usize;
     for key in ["main", exact_key.as_str()] {
-        let Some(mut info) = RefStore::load_branch(&store, &repo_id, key)
+        let Some(mut info) = store
+            .load_branch(&repo_id, key)
             .await
             .expect("load ref row")
         else {
@@ -496,7 +496,8 @@ async fn republish_resolved_manifest(
         }
         if changed {
             patched += 1;
-            RefStore::save_branch(&store, &repo_id, key, &info)
+            store
+                .save_branch(&repo_id, key, &info)
                 .await
                 .expect("publish rewritten ref row");
         }

@@ -80,20 +80,20 @@ Implemented in `rust/src/lib.rs`, `rust/src/server.rs`, `rust/src/client.rs`, `r
 - The CLI exposes `--history shallow|full` on clone and `--depth N` on sync.
 
 Remaining work:
-- **Repo/branch-specific depth configuration** (see section below).
+- **Repository-specific depth configuration** (see section below).
 - Support more than two hard-coded depths (e.g., depth=10, depth=50) without recompiling.
 
-### 2a. Repo/branch-specific configuration (partly shipped)
+### 2a. Repository-specific configuration (partly shipped)
 
-Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `full` = unlimited). Users and orgs should be able to configure this per repo/branch without recompiling.
+Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `full` = unlimited). Users and orgs can configure build settings per repository without recompiling.
 
 **Shipped** (`rust/src/repo_config.rs`, admin endpoint + build wiring in `rust/src/server.rs`):
 
-- A `RepoConfigStore` backed by the same storage as artifacts (file for local dev, S3 for production), keyed `owner/repo[/branch]` with branch-level entries overriding repo-level entries (field-level overlay). It is read at build time only — the build records what the resolve path needs into the `RefInfo`, so the clone hot path never reads config. A write is visible to the next build immediately, across processes.
+- One repository-config record lives in the server-owned SQLite/Turso control database. Admission validates it and snapshots the resolved settings into the durable job; embedded and API workers use that snapshot without a live configuration read. Artifact storage contains only artifact bytes and GC bookkeeping, not live repository settings.
 - The current config schema: `clonepack_depths: Vec<DepthSpec>` (`{ name, depth: Option<usize> }`), `compression_level`, `dictionary_id`, `archive_chunk_size`, and `head_blobs_chunk_size`. Unknown fields are rejected rather than ignored.
-- Admin read/write endpoint: `GET`/`POST /v1/admin/config/{owner}/{repo}` (with `?branch=` for a branch override).
+- Admin read/write endpoint: `GET`/`POST /v1/admin/config/{owner}/{repo}`. Branch overrides are not supported; a `?branch=` request fails without changing state.
 - The build reads the effective config and applies `compression_level` to the archive build (single-phase and two-phase paths).
-- Default config (none stored) produces `shallow` + `full` exactly like today — unconfigured repos are byte-for-byte unchanged.
+- Only an absent repository row selects the defaults, producing `shallow` + `full` exactly like today. Database, decode, or validation failures reject admission rather than silently selecting defaults.
 
 **Remaining** (needs the multi-variant build):
 

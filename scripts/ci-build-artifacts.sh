@@ -39,14 +39,13 @@ pick_lib_test_exe() {
 }
 
 # writer_bench: Dockerfile.client.ci COPY only (not product runtime).
-# ripclone-dispatcher: product bin (release/musl/e2e); stage with the others.
-BINS=(ripclone ripclone-server ripclone-worker ripclone-dispatcher git-remote-ripclone writer_bench)
+BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone writer_bench)
 
 TESTS=(
   e2e_full_topup
   e2e_gitea_provider
-  network_databases
   e2e_remote_gc_s3
+  e2e_token_only_worker
 )
 
 echo "==> building bins (profile=$PROFILE)"

@@ -123,9 +123,10 @@ export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
 ```
 
 The server defaults to storing its local cache and bare mirrors under
-`~/.local/share/ripclone/` (`cache` and `repos`). Use `--cas-dir` and
-`--repo-root` to override. `--host` (default `0.0.0.0`) and `--port` (default
-`8000`) set the listen address. Object storage (S3/R2/Tigris/MinIO) and most
+`~/.local/share/ripclone/` (`cache`, `repos`, and `control.db`). Use `--cas-dir`,
+`--repo-root`, and `--control-db` to override. `--host` (default `0.0.0.0`) and
+`--port` (default `8000`) set the listen address. Object storage
+(S3/R2/Tigris/MinIO) and most
 other tuning are set with environment variables — see [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md)
 and [`docs/BACKENDS.md`](docs/BACKENDS.md).
 
@@ -297,28 +298,24 @@ ripclone is host-agnostic: point it at GitHub (built in), GitLab, Gitea/Forgejo/
 │  push / CI hook  │  POST /sync
 └────────┬─────────┘
          ▼
-┌──────────────────┐   enqueue   ┌──────────────────┐
-│ ripclone-server  │ ──────────▶ │    sync queue    │
-│ resolve · serve  │             │ in-process / SQL │
-└────────┬─────────┘             └────────┬─────────┘
-         │ serves                  claim  │
-         ▼                                ▼
-      clients               ┌──────────────────┐
-                            │ ripclone-worker  │ ×N
-                            │  fetch · build   │
-                            └────────┬─────────┘
-                                     ▼ writes
-                       ┌────────────────────────────┐
-                       │  artifact store · metadata │
-                       │  object/local · SQLx/file  │
-                       └────────────────────────────┘
+┌──────────────────┐     transaction     ┌────────────────────────┐
+│ ripclone-server  │ ──────────────────▶ │ server control SQLite  │
+│ resolve · serve  │                     │ refs · jobs · workers  │
+└────────┬─────────┘                     └───────────┬────────────┘
+         │ serves                         claim/API │
+         ▼                                          ▼
+      clients                              ┌──────────────────┐
+                                           │ embedded/API     │
+                                           │ workers          │
+                                           └────────┬─────────┘
+                                                    ▼
+                                           local/S3 artifacts
 ```
 
-ripclone splits into a **server** — it resolves refs, serves artifacts, and enqueues a sync job on every push — and one or more **workers** (`ripclone-worker`) that claim jobs from the queue, `git fetch` the upstream, and build the clonepack. On a single box the worker runs inside the server; with a SQL queue you run a farm of workers across machines (see [Running workers at scale](docs/SCALING_WORKERS.md)). Three backends are pluggable, each set with environment variables (see [`docs/BACKENDS.md`](docs/BACKENDS.md)):
+ripclone splits into a **server** — it resolves refs, serves artifacts, and atomically admits exact work — and workers that fetch the upstream and build clonepacks. Embedded workers claim the server's durable jobs table. Standalone `ripclone-worker` processes are authenticated API-only and receive no database credential (see [Running workers at scale](docs/SCALING_WORKERS.md)).
 
 - **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Local disk also caches hot artifacts in front of object storage. A background GC drops artifacts nothing references (after a grace period, so an in-flight upload is never deleted).
-- **Metadata store.** The ref → clonepack mapping and build status. Any database SQLx supports (Postgres, MySQL, SQLite, libsql/Turso), or a file / object-storage store. Writes are ordered so a newer sync never loses to an older one.
-- **Sync queue.** Pending build jobs: in-process for a single box, or SQL-backed so workers can claim jobs across machines. Each active ordinary job carries its exact admitted commit and its existing per-job upstream credential transport. SQL active-key uniqueness covers queued and claimed rows; the local queue is process-lifetime only.
+- **Control database.** One server-owned SQLite database stores refs, added repositories, jobs, claims, attempts, and heartbeats. Plain local SQLite is the default; a Turso embedded replica is the replicated mode. Exact-result creation and job admission are one transaction.
 
 **Your git host stays the source of truth** for repos, refs, permissions, and writes. Clients download artifacts (signed URL or server proxy), decompress, and write files straight to disk. Public endpoints are rate-limited.
 

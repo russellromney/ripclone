@@ -365,7 +365,7 @@ mod tests {
     async fn retention_keeps_ref_reachable_object_without_side_list() {
         use crate::RefInfo;
         use crate::provider::RepoId;
-        use crate::ref_store::{FileRefStore, RefStore};
+        use crate::ref_store::RefStore;
 
         let tmp = tempfile::tempdir().unwrap();
         let cas_root = tmp.path().join("cas");
@@ -383,7 +383,12 @@ mod tests {
         filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old)).unwrap();
 
         // A live ref points at it.
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let meta =
+            crate::meta::LibsqlMeta::connect(&repo_root.join("control.db").to_string_lossy())
+                .await
+                .unwrap();
+        let ref_store: Arc<dyn RefStore> =
+            Arc::new(crate::meta::SqlRefStore::new(Box::new(meta)).await.unwrap());
         let info = RefInfo {
             commit: "c1".to_string(),
             head_blobs_chunks: vec![h.clone()],

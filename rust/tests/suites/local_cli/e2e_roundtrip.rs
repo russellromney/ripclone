@@ -11,53 +11,30 @@ fn read(dir: &Path, name: &str) -> String {
 }
 
 async fn wait_archive_ref(server: &Server, owner: &str, repo: &str) -> ripclone::RefInfo {
-    let root = server.repo_root.join(".ripclone-refs");
+    let store = server_ref_store(server).await;
+    let repo_id = ripclone::provider::RepoId::github(format!("{owner}/{repo}"));
     let mut last = String::from("<not read>");
     for _ in 0..160 {
-        let mut files = Vec::new();
-        collect_json_files(&root, &mut files);
-        for path in files {
-            match std::fs::read(&path) {
-                Ok(data) => match serde_json::from_slice::<ripclone::RefInfo>(&data) {
-                    Ok(info)
-                        if !info.archive_chunks.is_empty() && !info.archive_frames.is_empty() =>
-                    {
-                        return info;
-                    }
-                    Ok(info) => {
-                        last = format!(
-                            "{}: archive_chunks={} archive_frames={} commit={}",
-                            path.display(),
-                            info.archive_chunks.len(),
-                            info.archive_frames.len(),
-                            info.commit
-                        );
-                    }
-                    Err(e) => last = format!("{} parse: {e}", path.display()),
-                },
-                Err(e) => last = format!("{} read: {e}", path.display()),
+        match store.load_branch(&repo_id, "main").await {
+            Ok(Some(info))
+                if !info.archive_chunks.is_empty() && !info.archive_frames.is_empty() =>
+            {
+                return info;
             }
-        }
-        if last == "<not read>" {
-            last = format!("no ref json under {}", root.display());
+            Ok(Some(info)) => {
+                last = format!(
+                    "archive_chunks={} archive_frames={} commit={}",
+                    info.archive_chunks.len(),
+                    info.archive_frames.len(),
+                    info.commit
+                );
+            }
+            Ok(None) => last = String::from("no main ref in control database"),
+            Err(error) => last = format!("control database read: {error}"),
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     panic!("archive ref never became ready for {owner}/{repo} (last: {last})");
-}
-
-fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_json_files(&path, out);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
-            out.push(path);
-        }
-    }
 }
 
 /// editable --depth 1: shallow, worktree correct, `.git/shallow` present,

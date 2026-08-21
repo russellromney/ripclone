@@ -79,8 +79,7 @@ async fn remote_gc_during_local_clone_is_safe() {
     let storage: ripclone::storage::StorageRef = Arc::new(RemoteLocalStorage::new(
         ripclone::storage::local(&server.storage_dir).unwrap(),
     ));
-    let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
-        Arc::new(ripclone::ref_store::FileRefStore::new(&server.repo_root));
+    let ref_store: Arc<dyn ripclone::ref_store::RefStore> = server_ref_store(&server).await;
     let gc = RemoteGc::new(
         storage,
         ref_store,

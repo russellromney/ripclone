@@ -81,8 +81,7 @@ enum Commands {
     ///
     /// Uses the server's job-token secret (`RIPCLONE_JOB_TOKEN_SECRET`, or
     /// `RIPCLONE_SERVER_TOKEN`) to print a signed, expiring token. Provision it
-    /// as each farm-out worker's `RIPCLONE_METADATA_JOB_TOKEN` — a Fly machine
-    /// secret for a pooled machine, or the dispatcher's env for exec/http. One
+    /// as each standalone worker's `RIPCLONE_METADATA_JOB_TOKEN`. One
     /// token authenticates claim/ack/heartbeat and the metadata reports. Rotate
     /// by re-minting before it expires.
     MintWorkerToken {
