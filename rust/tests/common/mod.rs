@@ -124,7 +124,7 @@ pub fn token_hash() -> String {
 /// CI runs the test binaries sequentially, so a monotonically-growing issued set
 /// (ports stay reserved by live servers for the whole run) makes collisions
 /// within a binary impossible.
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static ISSUED: Mutex<Option<HashSet<u16>>> = Mutex::new(None);

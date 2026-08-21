@@ -165,7 +165,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn validate_rejects_bad_values() {
         assert!(
             RepoConfig {
