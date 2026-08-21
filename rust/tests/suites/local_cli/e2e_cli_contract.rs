@@ -10,7 +10,6 @@ use ripclone::client::Client;
 use ripclone::mode::CloneMode;
 use ripclone::provider::{ProviderConfig, ProviderRegistry, RepoId};
 use ripclone::queue::{BuildJob, EnqueueOutcome, Enqueued, JobQueue};
-use ripclone::ref_store::RefStore;
 use ripclone::server::{AdmissionTestProbe, RateLimiter, ServerState, build_app};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -76,15 +75,16 @@ async fn start_server_with_queue(
     let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
     let storage = ripclone::storage::local(&cas_dir).unwrap();
     let control_db = dir.path().join("control.db");
-    let ref_store: Arc<dyn RefStore> = Arc::new(
-        ripclone::meta::SqlRefStore::new(Box::new(
-            ripclone::meta::LibsqlMeta::connect(&control_db.to_string_lossy())
-                .await
-                .unwrap(),
-        ))
+    let control = Arc::new(
+        ripclone::control::ControlDb::open(
+            &control_db,
+            None,
+            ripclone::queue::default_size_classes(),
+        )
         .await
         .unwrap(),
     );
+    let ref_store = control.ref_store();
     let metrics = ripclone::metrics::Metrics::new();
     let retention = Arc::new(
         ripclone::retention::Retention::new(cas.clone(), metrics.clone())
@@ -106,7 +106,7 @@ async fn start_server_with_queue(
         rate_limiter: RateLimiter::new(1_000_000, 1_000_000.0),
         retention,
         build_queue,
-        control_db: None,
+        control_db: Some(control),
         worker_queue: None,
         build_queue_depth: Arc::new(AtomicUsize::new(0)),
         oidc_verifier: None,
