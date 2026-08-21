@@ -32,12 +32,16 @@ Internal tuning knobs use code constants at their current defaults.
   clients and self-hosted servers.
 - `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`,
   `RIPCLONE_S3_PREFIX`, `RIPCLONE_S3_CACHE_DIR` - object storage backend.
-- `RIPCLONE_METADATA`, `RIPCLONE_METADATA_DB_URL`,
-  `RIPCLONE_METADATA_DB_TOKEN` - metadata/ref-store backend.
-- `RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`, `RIPCLONE_QUEUE_DB_TOKEN` - build
-  queue backend.
-- `RIPCLONE_SIZE_CLASSES` - JSON array of size classes for the SQL queue claim
-  filter (overrides `[[queue.size_classes]]` in config.toml). Each entry:
+- `RIPCLONE_CONTROL_DB_PATH` - server-owned SQLite database path.
+- `RIPCLONE_TURSO_DATABASE_URL`, `RIPCLONE_TURSO_AUTH_TOKEN` - paired Turso
+  primary settings enabling embedded-replica control mode.
+- `RIPCLONE_QUEUE_API_URL`, `RIPCLONE_METADATA_REPORT_URL`,
+  `RIPCLONE_METADATA_JOB_TOKEN` - standalone worker claim/ref APIs and bearer.
+- `RIPCLONE_QUEUE_STALE_SECS`, `RIPCLONE_QUEUE_MAX_ATTEMPTS`,
+  `RIPCLONE_QUEUE_RETRY_BACKOFF_MS`, `RIPCLONE_QUEUE_FAILED_RETENTION_SECS` -
+  durable job recovery and retention policy.
+- `RIPCLONE_SIZE_CLASSES` - JSON array of size classes for durable job claims
+  (overrides `[[control.size_classes]]` in config.toml). Each entry:
   `{ "name", "max_bytes", "machine"? }`. Ordered small→large; launch default is
   `small` (≤1 GiB) | `large` (catch-all). Worker flag:
   `ripclone-worker --max-size-class <name>` claims only jobs at or below that
@@ -64,8 +68,6 @@ be tuned casually.
 - `RIPCLONE_HEAD_REBASE_BYTES` - test/expert threshold for HEAD delta rebasing.
 - `RIPCLONE_SIGNED_URL_TTL_SECS`, `RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS` -
   signed artifact URL lifetimes.
-- `RIPCLONE_REF_CACHE_TTL_SECS` - in-process ref cache TTL.
-- `RIPCLONE_RECHECK_MAX` - post-build freshness re-check cap.
 - `RIPCLONE_LSM`, `RIPCLONE_LSM_MAX_LEVELS` - incremental history compaction.
 - `RIPCLONE_TRUST_GATEWAY`, `RIPCLONE_TRUST_FORWARDED_FOR` - trust-boundary
   controls for self-hosted gateways/proxies.

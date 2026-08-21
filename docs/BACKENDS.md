@@ -1,333 +1,144 @@
-# Backends
+# Control database, workers, and artifact storage
 
-`ripclone-server` has three independent, pluggable backends. The defaults need
-zero infrastructure — a single binary with local storage and an in-process
-builder — and you swap any one of them out without touching the others:
+ripclone has one control database per server. It stores refs, added repositories,
+durable jobs, claims, attempts, and worker heartbeats. Exact-result creation and
+job admission commit in one transaction.
 
-- **Storage** — where artifacts live (local filesystem or S3-compatible).
-- **Metadata store** — where per-repo/branch refs (the pointers into storage)
-  live (files, S3, or a SQL database).
-- **Build queue** — where sync/build jobs are dispatched (in-process, or a SQL
-  queue drained by standalone `ripclone-worker` processes for farm-out).
+Artifact bytes are separate: use local disk or any S3-compatible service.
 
-Storage and the metadata store hold all durable state; the build queue is just
-coordination. A worker is therefore stateless — that is what lets builds be
-farmed out to other machines.
+## Plain SQLite (default)
 
-## How to configure them
+The server creates `control.db` beside its default cache and repository
+directories. Set an explicit path with either:
 
-Each setting can come from an **environment variable** or from `config.toml`
-(`~/.config/ripclone/config.toml`, or the path in `RIPCLONE_CONFIG` — handy for a
-daemon/container with no `$HOME`). Precedence is **env var > `config.toml` >
-built-in default**, so an env var always wins. The server reads only this global
-file (a project `ripclone.toml` in the working directory does not affect server
-backends). The sections below list the env vars; the same values live under
-`[storage]`, `[metadata]`, and `[queue]` in the file.
+```bash
+ripclone-server --control-db /var/lib/ripclone/control.db
+```
 
-Write the file values yourself (keep it `0600` — it can hold DB tokens):
+```bash
+export RIPCLONE_CONTROL_DB_PATH=/var/lib/ripclone/control.db
+```
+
+or global configuration:
 
 ```toml
-[storage]
-backend = "s3"
-bucket = "my-bucket"
-endpoint = "https://s3.example.com"
-
-[metadata]
-backend = "postgres"
-url = "postgres://user:pass@host:5432/ripclone"
-
-[queue]
-backend = "postgres"
-url = "postgres://user:pass@host:5432/ripclone"
+[control]
+path = "/var/lib/ripclone/control.db"
 ```
 
-S3 credentials are **never** read from `config.toml`: S3 keys come from
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Provider tokens can be declared
-under `[providers.<id>]` for self-hosted server-side syncs; `libsql` DB tokens
-may be set in-file (`[queue].token` / `[metadata].token`) or via env.
+Only one server process may own a control path. A second server fails before it
+binds its listener or starts storage, GC, polling, or worker tasks. Accepted jobs
+survive restart, and claims abandoned by a dead worker become eligible for
+recovery after `RIPCLONE_QUEUE_STALE_SECS`.
+
+An existing database without the current control schema marker is rejected. The
+server does not rewrite or automatically migrate it.
+
+Control state written by the removed file, S3, PostgreSQL, MySQL, remote
+libSQL/sqld, or in-memory implementations is unreadable by this binary. There
+is no import or compatibility path. Rolling back requires the old binary and
+its matching old control data; otherwise initialize a fresh SQLite control
+database and re-admit repositories through current requests.
+
+## Turso embedded replica
+
+Turso is the only replicated control mode. The server opens the same local path
+as an embedded replica and synchronizes writes to its Turso primary:
+
+```bash
+export RIPCLONE_CONTROL_DB_PATH=/var/lib/ripclone/control-replica.db
+export RIPCLONE_TURSO_DATABASE_URL=libsql://example-org.turso.io
+export RIPCLONE_TURSO_AUTH_TOKEN=...
+ripclone-server
+```
+
+Configuration-file equivalent:
 
 ```toml
-[providers.my-gitea]
-kind = "gitea"
-host = "https://git.example.com"
-token = "gitea-token"
+[control]
+path = "/var/lib/ripclone/control-replica.db"
+turso_url = "libsql://example-org.turso.io"
+turso_token = "..."
 ```
 
-## Storage
+URL and token are a required pair. Startup performs an initial sync before the
+server begins work; bootstrap or primary-write failure is fatal. The local path
+still has one process owner.
 
-`ripclone-server` can store artifacts on the local filesystem or in any S3-compatible object store.
+## Embedded and standalone workers
 
-### Local filesystem (default, easiest for self-hosting)
+The server always starts embedded workers. They claim the durable jobs table
+through the server's existing database handle and hold each claim through Head,
+Files, and Full publication before acknowledging it.
 
-If you do not set any S3 environment variables, the server stores artifacts in its CAS directory (`--cas-dir`, default `/data/cache`). This is the path used by `tests/fly/docker-compose.yml`.
-
-Pros:
-- Works out of the box.
-- No external account or egress costs.
-- Fast when the server and client are on the same machine or LAN.
-
-Cons:
-- The server must proxy every byte if clients are remote.
-- No built-in CDN for distributed clients.
-
-### S3-compatible object storage
-
-Set these environment variables:
+`ripclone-worker` is the standalone option. It is authenticated API-only and
+accepts no control path, database URL, database token, or Turso credential:
 
 ```bash
-RIPCLONE_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com
-RIPCLONE_S3_REGION=us-east-1
-RIPCLONE_S3_BUCKET=my-ripclone-bucket
-RIPCLONE_S3_PREFIX=artifacts/          # optional
-RIPCLONE_S3_CACHE_DIR=/data/cache      # local on-disk cache for hot reads
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
+export RIPCLONE_QUEUE_API_URL=https://ripclone.example.com
+export RIPCLONE_METADATA_REPORT_URL=https://ripclone.example.com/v1/refs
+export RIPCLONE_METADATA_JOB_TOKEN=rcjt1...
+ripclone-worker --cas-dir /tmp/cache --repo-root /tmp/repos
 ```
 
-The server will redirect clients to signed URLs so bytes are served directly from the object store rather than proxied through the ripclone server.
+The token covers claim, acknowledgement, heartbeat, and ref reports. Mint one
+with `ripclone mint-worker-token`. Local cache and repository paths are scratch;
+artifact storage configuration may be shared with the server.
 
-Artifact files smaller than 100 MiB use one streaming object PUT. Larger files use
-bounded multipart uploads (128 MiB parts and one backend-wide, CPU-scaled budget
-of at most eight concurrent parts), so a compact multi-gigabyte Git history pack does
-not need to be split into less efficient Git packs or buffered in memory. The uploader
-increases the part size when necessary to stay within the S3 10,000-part limit and
-aborts an incomplete multipart upload when any part fails. The configured provider
-must implement the standard S3 multipart API.
+Server database credentials are rejected in the worker environment and config
+before it creates scratch directories or initializes artifact storage.
 
-Works with:
-- **Tigris** (current default for the hosted service)
-- **MinIO** (great for on-prem)
-- **Cloudflare R2** (no egress fees, good global performance)
-- **AWS S3**
-- Any other S3-compatible provider
+## Artifact storage
 
-### AWS S3 Express One Zone (highest performance)
-
-For a hosted service where you want the lowest latency and highest throughput to clients, use an **S3 Express One Zone directory bucket**.
-
-1. Create a directory bucket in the AWS region closest to your users, e.g. `usw2-az1`.
-2. Use the S3 Express endpoint pattern:
+Local storage is the default and needs no configuration. To use S3-compatible
+storage, set:
 
 ```bash
-RIPCLONE_S3_ENDPOINT=https://my-bucket--usw2-az1--x-s3.s3express-us-west-2.amazonaws.com
-RIPCLONE_S3_REGION=us-west-2
-RIPCLONE_S3_BUCKET=my-bucket--usw2-az1--x-s3
+export RIPCLONE_S3_ENDPOINT=https://s3.example.com
+export RIPCLONE_S3_REGION=us-east-1
+export RIPCLONE_S3_BUCKET=ripclone
+export RIPCLONE_S3_PREFIX=production
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
 ```
 
-S3 Express is significantly faster than standard S3 for the small, range-heavy reads ripclone clients make. Cost is higher, so it is best for the hosted/new-user path rather than the default open-source setup.
+Configuration-file fields are `[storage].backend`, `endpoint`, `region`,
+`bucket`, `prefix`, and `cache_dir`. Credentials remain environment-only.
+Supported services include AWS S3, Cloudflare R2, Tigris, and MinIO.
 
-### CDN in front of S3
+S3 stores clonepack artifacts only. It never stores refs, repository build
+settings, jobs, claims, heartbeats, or any other control state.
 
-If you want a custom domain or edge cache in front of S3/Tigris/R2, put a CDN or reverse proxy between clients and the object store and point `RIPCLONE_S3_ENDPOINT` at it. The server generates presigned S3-style URLs against that endpoint; the CDN/proxy must forward the `Authorization` header and request path to the origin.
+## Repository build settings
 
-A future improvement is to support provider-specific signed URLs (e.g. CloudFront signed URLs) directly in the server.
+The server stores one build-settings record per repository in the control
+database. `GET` and `POST /v1/admin/config/{owner}/{repo}` read and replace that
+record. A repository with no record uses the documented defaults: shallow and
+full clonepacks with zstd level 6. Only an absent row selects defaults; a
+database, decode, or validation error rejects admission.
 
-## Metadata store
+The server snapshots the validated settings into each durable job. Embedded
+and API-only workers use that snapshot, so changing a repository's settings
+does not alter work already admitted. Branch-level overrides were removed;
+requests containing the old `?branch=` query fail without changing state.
 
-The metadata store holds one small `RefInfo` record per repo/branch — the commit
-and the hashes that point at artifacts in storage. It never holds file bytes.
-Choose it with `RIPCLONE_METADATA`, independently of storage:
+## Queue policy
 
-| `RIPCLONE_METADATA` | Where refs live | Notes |
-|---|---|---|
-| *(unset)* | follows storage | S3 when S3 is configured, else local files — the historical default |
-| `file` | `--repo-root/.ripclone-refs/` | one JSON file per ref |
-| `s3` | the configured S3 bucket | requires `RIPCLONE_S3_*` |
-| `sqlite` | a local SQLite file | single box |
-| `postgres` | a Postgres database | shared across machines |
-| `mysql` | a MySQL database | shared across machines |
-| `libsql` | a remote Turso Cloud database | shared across machines |
-| `api` | server via `POST /v1/refs` | **Worker-only, token-only farm-out.** Requires `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN` (a signed, expiring token with no repo/job scope; the write target is the `repo_key` in each report body). No DB credentials on the worker; the server holds them and performs the durable write. Pair with `RIPCLONE_QUEUE=api` (below): one token authenticates both. The token is operator-provisioned (`ripclone mint-worker-token`), not minted per dispatch. |
+These settings apply to the one durable jobs table:
 
-The SQL backends read a connection URL (and a token for `libsql`):
+- `RIPCLONE_QUEUE_STALE_SECS`
+- `RIPCLONE_QUEUE_MAX_ATTEMPTS`
+- `RIPCLONE_QUEUE_RETRY_BACKOFF_MS`
+- `RIPCLONE_QUEUE_FAILED_RETENTION_SECS`
+- `RIPCLONE_SIZE_CLASSES`
 
-```bash
-RIPCLONE_METADATA=postgres
-RIPCLONE_METADATA_DB_URL=postgres://user:pass@host:5432/ripclone
-# mysql:  RIPCLONE_METADATA_DB_URL=mysql://user:pass@host:3306/ripclone
-# sqlite: RIPCLONE_METADATA_DB_URL=/data/meta.db
-# libsql: RIPCLONE_METADATA_DB_URL=libsql://db.turso.io  RIPCLONE_METADATA_DB_TOKEN=...
-```
+Size classes can also be declared as `[[control.size_classes]]` entries with
+`name`, `max_bytes`, and optional `machine` fields.
 
-`libsql` is remote-only — for a local SQLite file use `sqlite`. The current
-schema is created on first start. Put the metadata store on a database your
-workers can also reach when you farm builds out (below).
+## Removed configuration
 
-## Build queue & workers (farm-out)
-
-By default the server admits ordinary sync work and builds it in-process. To
-move that CPU/IO-heavy work onto one or more separate machines, point the server
-and one or more `ripclone-worker` processes at a shared **SQL queue**. The server
-only enqueues; the workers claim, build, and write results to the shared storage
-and metadata store. `/sync` returns after ready detection or queue acceptance, so
-it does not wait for a worker or care which machine built the target. Readiness-
-oriented library callers poll exact pinned metadata after the first `202`.
-
-Choose the queue with `RIPCLONE_QUEUE`:
-
-| `RIPCLONE_QUEUE` | Backend | Use |
-|---|---|---|
-| `local` *(default)* | in-process channel | single binary, no farm-out |
-| `sqlite` | a local SQLite file | single-box farm-out (server + workers share the file) |
-| `postgres` | a Postgres database | multi-machine farm-out (direct DB) |
-| `mysql` | a MySQL database | multi-machine farm-out (direct DB) |
-| `libsql` | a remote Turso Cloud database | multi-machine farm-out (direct DB) |
-| `api` | server via `POST /v1/jobs/*` | **token-only farm-out** — worker claims/acks/heartbeats over HTTP with a bearer token and **no** DB credentials. Requires `RIPCLONE_QUEUE_API_URL` (server base URL) + `RIPCLONE_METADATA_JOB_TOKEN`. Pair with `RIPCLONE_METADATA=api`. This is the path for workers on untrusted infra; the server holds the one queue+metadata DB. |
-
-```bash
-# Server: enqueue onto Postgres (builds run in workers, not here)
-RIPCLONE_QUEUE=postgres
-RIPCLONE_QUEUE_DB_URL=postgres://user:pass@host:5432/ripclone
-# libsql also needs RIPCLONE_QUEUE_DB_TOKEN=...
-
-# Worker(s): same queue + storage + metadata config, plus a scratch repo root
-ripclone-worker --cas-dir /data/cache --repo-root /data/repos
-```
-
-Notes:
-
-- **Same config on both sides (direct SQL path).** A direct worker must see the
-  same storage (`RIPCLONE_S3_*` or the shared `--cas-dir`), the same metadata
-  store (`RIPCLONE_METADATA*`), and the same queue (`RIPCLONE_QUEUE*`) as the
-  server. With a SQL queue, use a SQL metadata store too — a `file` store under a
-  per-machine `--repo-root` would not be shared.
-- **Token-only farm-out (`RIPCLONE_QUEUE=api` + `RIPCLONE_METADATA=api`).** A
-  worker on untrusted infra holds **no** DB credentials: it claims/acks/
-  heartbeats and reports refs over HTTP with a single bearer token
-  (`RIPCLONE_METADATA_JOB_TOKEN`) against the server's `RIPCLONE_QUEUE_API_URL` /
-  `RIPCLONE_METADATA_REPORT_URL`. The server holds the one queue+metadata DB. A
-  401 (expired token) exits the worker cleanly for respawn. It still shares
-  **storage** (that is where durable artifacts live). The token is
-  operator-provisioned once with `ripclone mint-worker-token` (default 90d) and
-  provisioned per provider: a **Fly machine secret** on each pooled machine, or
-  **forwarded by the dispatcher** for the exec/http escape hatch. Rotate by
-  re-minting. On Fly the "no DB creds" guarantee is the provisioning — the machine
-  physically carries only the token + storage creds.
-- **One `repo_root` per worker.** The bare mirror under `--repo-root` is per-repo
-  scratch guarded by an in-process lock; give each worker its own. All durable
-  state is in storage + the metadata store.
-- **Credentials for private builds.** A per-request `X-Upstream-Token` rides
-  with the queued job so a cross-process worker can fetch a repo it has no
-  standing token for. SQL queues store that token only as an obfuscated value
-  and clear it when the job is claimed or finished; otherwise the worker falls
-  back to provider config (`RIPCLONE_PROVIDERS` or `config.toml`).
-- **Async builds are always on for changed targets.** Ordinary `/sync` resolves
-  one exact commit, returns `200` for a complete ready hit, or enqueues and
-  returns `202` for changed work. The selected queue survives client disconnect
-  according to its existing durability boundary; the local queue remains
-  process-lifetime in-memory.
-
-Worker tuning and queue housekeeping:
-
-```bash
-# worker flags
---idle-poll-ms 1000        # how often to poll an empty queue (default 1000)
-
-# queue env (server + workers)
-RIPCLONE_QUEUE_STALE_SECS=1800              # reclaim a crashed worker's claimed job after N s (default 1800)
-RIPCLONE_QUEUE_FAILED_RETENTION_SECS=604800 # prune failed jobs older than N s (default 7 days)
-```
-
-`done` jobs are kept as build history; only `failed` jobs are pruned.
-
-> Truly diskless workers (no bare mirror on disk, seeded from the clonepack
-> instead of a fresh fetch) are future work. Today a worker fetches the bare
-> mirror it needs, and a server answering a clone fetches it on demand if it
-> lacks one. For running a worker pool at scale, see
-> [`SCALING_WORKERS.md`](SCALING_WORKERS.md).
-
-## Client authentication
-
-If the server is configured with `RIPCLONE_SERVER_TOKEN`, the client must send a SHA-256 hash of that token in the `Authorization` header. The client never sends the raw secret.
-
-```bash
-# Provide the raw token; the client hashes it before sending.
-RIPCLONE_SERVER_TOKEN=your-secret ripclone clone owner/repo
-
-# Or provide the pre-hashed token directly (useful in CI / 1Password / .env files).
-RIPCLONE_SERVER_TOKEN_HASH=sha256-of-your-secret ripclone clone owner/repo
-```
-
-`git-remote-ripclone` reads the same variables.
-
-## Client-side cache
-
-The `ripclone` client has no local cache by default. This avoids filling disk with multi-gigabyte artifact copies during benchmarks or one-off clones.
-
-Enable caching explicitly to make repeated clones of the same repo/commit almost entirely local:
-
-```bash
-RIPCLONE_CACHE_DIR=~/.cache/ripclone ripclone clone owner/repo
-```
-
-Environment variables:
-
-```bash
-RIPCLONE_CACHE_DIR=/path/to/cache   # enable / override cache location
-RIPCLONE_NO_CACHE=1                  # forcibly disable caching
-```
-
-## Fast worktrees on Linux
-
-`ripclone worktree <path> -b <branch>` adds a git worktree using the same overlay-staging trick as `ripclone clone`. Run it inside an existing ripclone clone:
-
-```bash
-cd my-clone
-ripclone worktree ../my-clone-wt -b HEAD
-```
-
-For the same commit as the main clone, it reuses the local `.git/index` and object database, so nothing is downloaded. For a different branch/commit, it falls back to fetching the prebuilt depth pack from the server.
-
-On cloud VMs with slow overlay rootfs, point the staging directory at a fast volume:
-
-```bash
-RIPCLONE_STAGING_DIR=/data ripclone worktree ../wt -b HEAD
-```
-
-Other overlay knobs:
-
-```bash
-RIPCLONE_NO_OVERLAY=1                # disable overlay staging
-RIPCLONE_OVERLAY_THRESHOLD_MB=50     # only stage repos larger than this
-RIPCLONE_OVERLAY_MARGIN_MB=128       # headroom required in staging dir
-```
-
-## Recommended matrix
-
-| Use case | Storage | Metadata | Queue | Why |
-|---|---|---|---|---|
-| Local dev / single machine | Local filesystem | *(default)* | `local` | Zero setup, one binary |
-| Small team self-host | MinIO or S3 | *(default = s3)* | `local` | Shared storage, still simple |
-| Single box, offload builds | S3 / MinIO | `sqlite` or `s3` | `sqlite` | Server + workers on one host share the queue file |
-| Multi-machine farm-out | S3 / R2 | `postgres`/`mysql`/`libsql` | `postgres`/`mysql`/`libsql` | Workers on other hosts share a network DB |
-| Hosted service / new users | S3 Express One Zone or R2 | SQL | SQL | Fastest downloads + farm-out builds |
-| Cost-sensitive hosted | R2 + client cache | SQL | SQL | No egress fees |
-
-## Access control & the trust boundary (AU1)
-
-ripclone has **no separate auth gateway**. Two layers gate reads:
-
-1. **The shared server token** (`RIPCLONE_SERVER_TOKEN`) authenticates *that a
-   caller may talk to this backend at all*. It is **not** per-repo authorization
-   — every holder of it can address every repo path.
-2. **Per-repo access enforcement** decides whether a given caller may read a
-   given repo:
-   - **Public repos** are served anonymously.
-   - **Private repos** require the caller's *own* git credential (passed via the
-     `X-Upstream-Token` header). On every read — including cache hits — the
-     backend verifies that credential grants access to that repo against the
-     provider (a `git-upload-pack` `info/refs` probe, cached for a short TTL,
-     `RIPCLONE_REPO_AUTH_TTL_SECS`, default 60s). A caller who can't prove
-     access gets `403`, even if the repo is already cached.
-
-This is **on by default**. It is what stops one tenant from reading another
-tenant's cached private repos with only the shared token.
-
-### Single-tenant self-host: `RIPCLONE_TRUST_GATEWAY=1`
-
-If you run a single-tenant backend that fully trusts whoever holds the shared
-token (e.g. one operator, a standing backend credential, no per-request
-tokens), set `RIPCLONE_TRUST_GATEWAY=1` to skip the per-repo check. In that mode
-the backend **must** be kept network-isolated and never shared across tenants —
-anyone with the shared token can read any cached repo. Repo visibility then
-falls back to the client-supplied `x-ripclone-visibility` header.
+The server and worker fail closed if old metadata, queue, or dispatcher
+selectors and database connection fields are present. PostgreSQL, MySQL, direct
+remote libSQL/sqld, file/S3 control stores, and the in-memory queue are not
+supported. File/S3 repository-config objects and branch overrides are also
+unreadable. There is no dual-read or dual-write compatibility mode.

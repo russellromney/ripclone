@@ -1,89 +1,34 @@
-# Post-build freshness re-check
+# Freshness and exact admission
 
-Status: **implemented.** Ordinary sync admission pins one exact upstream
-commit. A push that lands while a build is running is therefore not folded into
-the already-admitted job: a later exact commit gets its own queued or claimed
-job. The post-build re-check closes the smaller window where no webhook or
-poller event was received during the build.
+Every ordinary request resolves its selector to one exact commit before job
+admission. Exact-result creation and durable job insertion share one control
+database transaction.
 
-## The admission model
+- Duplicate requests for commit B coalesce while B is queued or claimed.
+- A later commit C has a different active key and receives its own job.
+- Workers fetch and verify only the admitted commit.
+- Moving branch publication is fenced so a late B build cannot replace C.
 
-A normal `sync` or `add` performs at most one bounded `git ls-remote`, resolves
-the advertised branch to an exact commit, and admits that commit. The active
-work key is `owner/repo/branch/exact-commit`.
+## After a build
 
-- A duplicate request for B coalesces while B is queued **or claimed**.
-- A later C is a distinct job, even when B is still running.
-- A validated signed webhook `after` value is already an exact admission and
-  does not perform a second tip probe.
-- A ready unchanged request is read-only after its single probe: it does not
-  enqueue, fetch, or enter the builder.
+A completed worker does not probe the moving ref and does not enqueue another
+job. This keeps one claim bounded to the work it accepted and avoids a hidden
+self-scheduling loop.
 
-## The window the re-check closes
+A later webhook, periodic poll, or user request may observe and admit a newer
+commit. Each such admission repeats the same exact-resolution and atomic
+transaction rules.
 
-Suppose A is admitted and starts building. If B lands after A's admission:
+## Source probes
 
-1. A continues to build the exact commit A.
-2. A webhook, poller, or API request can independently admit B while A is
-   queued or claimed.
-3. A publishes only its own exact artifacts. B remains separate work and is
-   fetched and built as B.
-4. If no external event arrives, the post-build re-check performs one bounded
-   tip probe and admits the exact current tip if it differs from A.
+Ordinary admission and fallback polling use bounded `ls-remote` probes.
+`RIPCLONE_LS_REMOTE_TIMEOUT_SECS` sets the timeout; a timed-out child is killed
+and reaped. Probe failure performs no ref write, job insertion, mirror fetch, or
+artifact work.
 
-This means the branch can temporarily serve A while B is pending, but it does
-not silently turn A's immutable job into B or lose B's admission.
+## Recovery
 
-## Bounded re-check
-
-After an ordinary exact build publishes, the worker performs one bounded
-`ls-remote` under the upstream fetch cap. If the observed exact commit equals
-the one just built, it stops. Otherwise it enqueues that exact commit with the
-same active-key coalescing rules. A rev-pinned `sync --at REV` never enters this
-path.
-
-The chain is bounded by `RIPCLONE_RECHECK_MAX` consecutive re-triggers (default
-3; `0` disables it). Once the bound is reached, the periodic poller remains the
-backstop. The re-check is not a debounce, tip cache, probe single-flight, or
-latest-only supersession mechanism: already admitted exact jobs remain jobs.
-
-## Ordering and workers
-
-Each ordinary exact row carries the transitive set of earlier ordinary
-admissions it may replace. The ref store compares that identity chain with the
-current moving projection atomically. If B and then C are admitted while the
-projection is A, B may replace A and C may replace either A or B; B can never
-replace C, regardless of build completion order, history depth, or force-push
-shape. Explicit-only exact work carries no moving-publication authorization.
-Outstanding admissions are linked directly from the current exact result, so
-admission follows only that chain and never lists all repository refs.
-
-Workers exact-fetch and resolve the admitted commit even if the upstream branch
-has advanced. The same exact target and durable publication identity are used by
-the local queue, supported SQL queues, the dispatcher, standalone workers, and
-authenticated API worker endpoints.
-
-## Cross-process behavior
-
-`process_build_job` is shared by the in-process and standalone workers. The
-re-check enqueues the exact observed target into the configured queue, so a
-shared SQL queue can hand it to any worker. Local queue durability remains the
-existing process-lifetime boundary.
-
-## Configuration
-
-| Env | Meaning |
-|---|---|
-| `RIPCLONE_RECHECK_MAX` | Maximum consecutive post-build exact re-triggers (default 3; `0` disables). |
-| `RIPCLONE_POLL_INTERVAL_SECS` | Existing periodic backstop; unchanged. |
-| `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` | Bound for each ordinary tip probe; the process is killed and reaped on timeout. |
-
-## Testing
-
-The deterministic `e2e_sync_admission` target uses barriers and operation
-counters, not sleeps or tiny-build timing assumptions. It proves duplicate B
-admission before and after claim, distinct C admission, exact B fetch/build
-targets, an older webhook that cannot regress the served ref, a ready no-op with
-no mutation, a signed webhook with no probe, and a killed/reaped bounded probe
-with no source work. The supported queue and worker targets cover SQL transport
-and standalone/API-worker paths.
+Accepted work survives server restart. A worker process that dies during Head,
+Files, or Full leaves a claimed row; it becomes eligible for retry after
+`RIPCLONE_QUEUE_STALE_SECS`. Retry attempts remain tied to the same admitted
+commit.

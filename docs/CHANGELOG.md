@@ -7,13 +7,36 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 - **Authenticated API requests have one implementation** (`rust/src/client.rs`, `rust/src/server.rs`): the ripclone client declares the current `PROTOCOL_VERSION`; an explicitly malformed or mismatched declaration returns `426 Upgrade Required`. A missing declaration is an unversioned caller of that same implementation, which keeps vanilla Git and ordinary HTTP integrations working. Current ref and pending responses require their complete current fields, including explicit archive readiness and Full top-up support. No request or response shape selects an older implementation.
 - **Removed retired compatibility surfaces**: deleted the snapshot/sidecar CLI and API lane, old artifact URL aliases, config-token migration, old webhook and provider-token aliases, old queue/ref startup migrations, and deprecated manifest readers. Provider-qualified routes and exact commit-keyed artifacts are the sole current API and storage paths.
 
+## Server-owned SQLite control state
+
+- **One database owns control state**: refs, added repositories, repository
+  build settings, durable jobs, claims, attempts, and worker heartbeats share
+  one server-owned SQLite schema.
+  Exact-result creation, moving-publication fencing, and job admission commit in
+  one immediate transaction.
+- **Repository settings are snapshotted at admission.** One validated record per
+  repository lives in SQLite/Turso; each durable job and API claim carries its
+  immutable snapshot. Only a missing row selects defaults. File/S3 config
+  objects and branch overrides are removed, and old `?branch=` requests fail
+  without changing control or artifact state.
+- **Plain SQLite is the default; a Turso embedded replica is the only replicated
+  mode.** Local and S3-compatible artifact storage remain independent.
+- **Standalone workers are authenticated API-only.** Active jobs renew their
+  durable claim unconditionally; the optional heartbeat setting controls idle
+  fleet registration only. Embedded workers retain the same durable claim
+  through detached Full work and release foreground capacity after Head.
+- **Removed control implementations fail closed.** File/S3 control stores,
+  PostgreSQL, MySQL, generic remote libSQL/sqld, the in-memory queue,
+  dispatcher, and database-direct worker paths are deleted. Their old state is
+  unreadable here; rollback requires the old binary and matching old data.
+
 ## Exact sync admission
 
 - **Ordinary tip sync now admits an immutable commit before queueing** (`rust/src/server.rs`, `rust/src/git.rs`): one bounded `ls-remote` resolves B, a complete ready B returns a mutation-free `200`, and changed work returns `202` with `commit` and `branch` without waiting for the builder. The CLI reports `accepted B` or `already current at B`.
 - **CLI readiness behavior is explicit** (`rust/src/bin/cli.rs`, `docs/SYNC.md`): normal `add` and `sync` remain fast, while `add --wait` and `sync --wait` poll exact pinned metadata after the first `202` without repeating a moving POST.
 - **Active work is keyed by repository, branch, and exact admitted commit** (`rust/src/queue/`, `rust/src/api_job_queue.rs`): duplicates coalesce while queued, claimed, or in embedded Full work; a later commit remains a separate job. The commit crosses SQL/API-worker/standalone-worker transports, and workers exact-fetch and build it even if the branch moves.
 - **Signed push webhooks use their validated `after` commit directly** (`rust/src/server.rs`): they perform no second tip probe. Readiness-oriented library callers pin the admitted commit and use exact metadata GETs after the first `202`; they do not repeat a moving POST.
-- **Every job has one required admitted SHA** and fails closed if that identity is malformed. The local queue remains process-lifetime in-memory; SQL durability remains backend-defined.
+- **Every job has one required admitted SHA** and fails closed if that identity is malformed. Admission and execution use the one durable SQLite jobs table.
 
 ## Cold-history pack and benchmark performance
 
@@ -21,16 +44,16 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 - **Large S3-compatible uploads use bounded multipart streaming** (`rust/src/storage/s3_storage.rs`): files at least 100 MiB use 128 MiB parts with one backend-wide, CPU-scaled budget of at most eight uploads in flight, automatically increasing part size to remain within the 10,000-part limit. Failed uploads are aborted, and local cache publication still occurs only after the remote object completes.
 - **The shaped benchmark times cloning, not repository admission** (`benchmark/fly_shaped_benchmark.sh`): add/readiness happens before each sample set, every run is pinned to one resolved commit, validation happens after the timer, failures propagate, and summaries report p50 and nearest-rank p90.
 
-## Worker heartbeat / registry (D3)
+## Worker heartbeat / registry (superseded implementation history)
 
-- **`workers` registry table** on the blessed SQL queues (`sqlite` / `libsql`, DDL in the shared `SqlJobQueue` adapter). Each row is `worker_id`, optional `max_size_class` ceiling, optional `current_job`, and `last_heartbeat`. Postgres/MySQL lag: heartbeat/live-count **fail loudly** (never silently report a zero fleet).
-- **`SqlJobQueue::heartbeat` / `live_worker_count`**: workers upsert their row; the dispatcher (D2) queries how many heartbeats are fresh within `RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS` (default 60s). Stale rows age out of the live-count and are hard-pruned. Two concurrent readers see the same count so replicas do not double-spawn.
-- **`ripclone-worker` opt-in**: `RIPCLONE_WORKER_HEARTBEAT=queue` (or the queue DSN / truthy `1`/`true`) enables a background heartbeat loop. Default off — self-host without a dispatcher is unchanged. Worker ids are fleet-unique (`FLY_MACHINE_ID`/`HOSTNAME` + pid + start nanos) so two machines with the same pid cannot under-count. Interval must be `<` timeout or startup fails.
+- **`workers` registry table** now lives only in the server-owned SQLite control database. Each row is `worker_id`, optional `max_size_class` ceiling, optional `current_job`, and `last_heartbeat`.
+- **Active claim renewal is mandatory** for embedded and API workers. Stale rows age out of live-count queries and embedded slots remove their row after settling work.
+- **`ripclone-worker` idle registration is opt-in** via `RIPCLONE_WORKER_HEARTBEAT=queue`; this setting never disables active claim renewal.
 
 ## Config-driven size classes + claim filter (O2)
 
-- **`size_class` on the blessed SQL queues** (`sqlite` / `libsql`, column landed in the shared `SqlJobQueue` adapter): each job is classified at enqueue from a byte size already in hand. **First build** → `AddedRepo.repo_size_bytes` from the tiered-add GitHub preflight (`repo.size` KB→bytes, best-effort at `add`); **re-sync** → `max(prior clonepack total, preflight)`. Unknown size → largest class (never under-size a first build). Coalesce raises `size_class` if a later enqueue needs a bigger box. Size classes are an ordered config list (`[[queue.size_classes]]` or `RIPCLONE_SIZE_CLASSES` JSON) — name, `max_bytes` threshold, machine-spec label. Launch default is `small | large` (1 GiB cut). Adding a lane or retuning a threshold is config-only.
-- **`ripclone-worker --max-size-class <name>`**: worker claims only jobs at or below its ceiling. No flag → claims everything (single-worker self-host unchanged). Postgres/MySQL lag the column and still claim all.
+- **`size_class` in the SQLite jobs table**: each job is classified at enqueue from a byte size already in hand. **First build** → `AddedRepo.repo_size_bytes` from the tiered-add GitHub preflight (`repo.size` KB→bytes, best-effort at `add`); **re-sync** → `max(prior clonepack total, preflight)`. Unknown size → largest class (never under-size a first build). Coalesce raises `size_class` if a later enqueue needs a bigger box. Size classes are an ordered control configuration list or `RIPCLONE_SIZE_CLASSES` JSON — name, `max_bytes` threshold, machine-spec label. Launch default is `small | large` (1 GiB cut). Adding a lane or retuning a threshold is config-only.
+- **`ripclone-worker --max-size-class <name>`**: worker claims only jobs at or below its ceiling. No flag → claims everything (single-worker self-host unchanged).
 
 ## Docs that don't lie (adversarial backfill of F5/F6)
 
@@ -59,24 +82,11 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 - **New [Agents & CI](AGENTS.md) doc page**: depth-1 vs files vs full guidance (full is for humans; agents want depth-1/files), `--temp` for ephemeral fleet VMs, a copy-paste fleet quickstart (install + token-in-env + headless clone, no login round-trip), and the table of machine-parseable access errors.
 - **Machine-parseable access-error hint factored out and unit-tested** (`rust/src/client.rs`): the status→next-step mapping is now a pure `error_hint`, so an agent fleet can detect and route access failures on the machine-parseable `code` without scraping prose.
 
-## Compute dispatch seam
+## Compute dispatch seam (removed)
 
-- **`ComputeProvider` trait** (`rust/src/dispatch/`): one verb —
-  `ensure_worker(&WorkerSpec) -> Result<()>` — idempotent, non-blocking,
-  best-effort. `WorkerSpec { size_class, env }` is the stable contract (queue /
-  storage / metadata / upstream-cred / token / size-class / lifecycle flags).
-  `size_class` is a config-driven lane name, not a hardcoded enum.
-- **Four backends** behind `RIPCLONE_DISPATCH=fly|exec|http|mock|none`:
-  - **fly** — start a pre-provisioned stopped Fly machine via the Machines API
-    (pooling internal; already-starting → no-op).
-  - **exec** — self-host escape hatch: run `RIPCLONE_DISPATCH_CMD` with the env
-    bag as process env and `size_class` as a separate argv (never shell-interpolated);
-    fire-and-forget spawn (does not wait for the child to exit).
-  - **http** — self-host escape hatch: POST the `WorkerSpec` JSON to
-    `RIPCLONE_DISPATCH_URL`.
-  - **mock** — records calls for tests.
-- Callers outside the module never know the platform. Cloud webhook/cron wiring
-  and the reconcile loop remain separate.
+- The dispatcher, provider registry, and all `RIPCLONE_DISPATCH*` selectors are
+  removed. External systems may start authenticated API workers; ripclone does
+  not schedule them.
 
 ## Distribution
 
@@ -123,14 +133,14 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 - **Removed the vestigial `ripclone mount` (FUSE) experiment** — the `fusefs` module, the `Mount` command, and the `fuser` dependency are deleted (~1.1k lines). This clears `RUSTSEC-2021-0154` by removal; the `git2` advisories (`RUSTSEC-2026-0183`/`-0184`) were already cleared by the gix migration removing `git2`. The three now-stale advisory `ignore` entries are dropped from `rust/deny.toml`. Can be re-added later if FUSE mounting is wanted.
 - **Allow `MPL-2.0` in `deny.toml`** (weak/file-level copyleft, safe to depend on from a permissive project) — the gix migration pulls in `uluru` (MPL-2.0), which the license check was rejecting.
 
-## Backend config in config.toml + `ripclone backend` CLI
+## Backend config in config.toml + `ripclone backend` CLI (historical; removed)
 
 - **Server-side backends are now configurable from `config.toml`**, not just env vars (`rust/src/config.rs`, `rust/src/backends.rs`). New `[storage]`, `[metadata]`, and `[queue]` sections feed the same selection logic. The matching `RIPCLONE_*` env vars **always override** the file (consistent with the existing `--flag > env > config` precedence). The config is loaded once and consulted as a fallback by `queue_kind`/`queue_db_url`/metadata selection and `S3Storage::from_env_or_config`.
 - **`ripclone backend` CLI removed**. Backend selection is now env-only from the CLI's perspective; use `RIPCLONE_*` environment variables or edit `config.toml` directly. The server and worker still read `[storage]`, `[metadata]`, and `[queue]` from the global config file.
 - **Credentials stay in the environment.** `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are never read from config. DB tokens (`[queue].token` / `[metadata].token`) are supported in-file and masked by `backend show`.
 - **Server reads the global config only, with an explicit path override.** Backend selection now uses `load_global` (not the cwd-walked `load`), so a stray project `ripclone.toml` in the server's working directory can no longer silently change its backends. `RIPCLONE_CONFIG` points the global config at an explicit file (e.g. `/etc/ripclone/config.toml`) — useful for a daemon/container without a `$HOME` — and `backend show` prints which file is in effect.
 
-## Pluggable build queue, standalone worker, and SQL metadata store
+## Pluggable build queue and SQL metadata store (historical; removed)
 
 - **Pluggable build queue** (`RIPCLONE_QUEUE` = `local` | `sqlite` | `postgres` | `mysql` | `libsql`). A `JobQueue` trait; the in-process channel is now `local` (default). The SQL backends share one `SqlJobQueue` orchestration over a per-engine `QueueDb` adapter (`rust/src/queue/`): atomic conditional-`UPDATE` claim, best-effort coalescing with a partial-unique-index backstop where supported, crashed-worker reclaim (`RIPCLONE_QUEUE_STALE_SECS`, default 1800), and failed-job pruning (`RIPCLONE_QUEUE_FAILED_RETENTION_SECS`, default 7d; `done` jobs kept as build history). `libsql` is remote-only (Turso Cloud).
 - **Standalone `ripclone-worker` binary** (`rust/src/bin/ripclone-worker.rs`): claims jobs from a SQL queue and runs the same build as the in-process worker, so sync work can be farmed out to other processes/machines. Current `/sync` admission returns after ready detection or queue acceptance; readiness-oriented clients poll exact pinned metadata. Per-request credentials may ride with their selected queue job and are cleared when it is settled; otherwise the worker resolves them from provider config. One scratch `--repo-root` per worker.

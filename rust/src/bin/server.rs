@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use ripclone::server::run_server;
+use ripclone::server::{run_server, run_server_with_control};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -32,6 +32,12 @@ struct Args {
     #[arg(long)]
     repo_root: Option<PathBuf>,
 
+    /// Server-owned SQLite control database. Defaults beside cache/repos in the
+    /// data directory. `RIPCLONE_CONTROL_DB_PATH` and `[control].path` are used
+    /// when this flag is absent.
+    #[arg(long)]
+    control_db: Option<PathBuf>,
+
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
@@ -48,5 +54,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cas_dir = args.cas_dir.unwrap_or_else(default_cas_dir);
     let repo_root = args.repo_root.unwrap_or_else(default_repo_root);
-    run_server(&cas_dir, &repo_root, &args.host, args.port).await
+    match args.control_db {
+        Some(control_db) => {
+            run_server_with_control(&cas_dir, &repo_root, &control_db, &args.host, args.port).await
+        }
+        None => run_server(&cas_dir, &repo_root, &args.host, args.port).await,
+    }
 }

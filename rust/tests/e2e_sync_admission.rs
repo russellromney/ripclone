@@ -9,7 +9,6 @@ use common::*;
 use hmac::{Hmac, KeyInit, Mac};
 use prost::Message;
 use ripclone::clonepack::{ClonepackManifest, hash_to_hex, manifest_chunk_refs};
-use ripclone::ref_store::{FileRefStore, RefStore};
 use ripclone::server::AdmissionTestProbe;
 use serde_json::Value;
 use sha2::Sha256;
@@ -58,6 +57,124 @@ async fn wait_entered(barrier: &ripclone::server::AdmissionTestBarrier, count: u
         .expect("admission barrier entered within 20 seconds");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_later_admissions_extend_the_established_tail_in_transaction() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", WEBHOOK_SECRET)]).await;
+    let origin = make_origin("acme", "immutable");
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/immutable")
+        .await
+        .unwrap();
+    server
+        .client()
+        .sync_repo("acme/immutable", None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("A reaches Full");
+
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    probe.before_claim.arm();
+    wait_entered(&probe.before_claim, 1).await;
+    probe.hold_inside_admission_transaction(&b);
+
+    // B owns the immediate transaction while C resolves and prepares against
+    // the still-visible A projection. Once B commits, C must rediscover B
+    // inside its own immediate transaction instead of extending stale A.
+    let b_request = post_sync(&server, None);
+    let coordinate = async {
+        wait_entered(&probe.inside_admission_tx, 1).await;
+        let c = origin.commit(&[("value.txt", "C\n")], "C");
+        origin.publish();
+        probe.hold_admission_transaction(&c);
+        let c_request = post_sync(&server, None);
+        let release_transactions = async {
+            wait_entered(&probe.before_admission_tx, 1).await;
+            probe.inside_admission_tx.release();
+            probe.before_admission_tx.release();
+        };
+        let (c_result, ()) = tokio::join!(c_request, release_transactions);
+        (c, c_result)
+    };
+    let (b_result, (c, c_result)) = tokio::join!(b_request, coordinate);
+    let (b_status, b_body, _) = b_result;
+    let (c_status, c_body, _) = c_result;
+    assert_eq!(b_status, reqwest::StatusCode::ACCEPTED, "B: {b_body}");
+    assert_eq!(c_status, reqwest::StatusCode::ACCEPTED, "C: {c_body}");
+    assert_eq!(response_commit(&b_body), b);
+    assert_eq!(response_commit(&c_body), c);
+
+    // Inspect the committed durable chain before either worker may claim.
+    let store = server_ref_store(&server).await;
+    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
+    let exact_b = store
+        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact_b.moving_admission_successors, vec![c.clone()]);
+    let exact_c = store
+        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &c))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exact_c.moving_publication_predecessors,
+        vec![a.clone(), b.clone()]
+    );
+
+    let full_barrier = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR", full_barrier.path());
+        std::env::set_var("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT", &c);
+    }
+    probe.inside_admission_tx.disarm();
+    probe.before_admission_tx.disarm();
+    probe.before_claim.release();
+    probe.before_claim.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))
+        .await
+        .expect("B completes before held C Full");
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !full_barrier.path().join("entered").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("C reaches held Full");
+    std::fs::write(full_barrier.path().join("proceed"), b"proceed\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
+        .await
+        .expect("C completes after B");
+
+    assert_eq!(
+        store
+            .load_branch(&repo_id, "main")
+            .await
+            .unwrap()
+            .unwrap()
+            .commit,
+        c
+    );
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR");
+        std::env::remove_var("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT");
+        std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
 async fn post_sync(
     server: &Server,
     branch: Option<&str>,
@@ -78,6 +195,18 @@ async fn post_sync(
     let status = response.status();
     let body = response.json().await.expect("sync response json");
     (status, body, started.elapsed())
+}
+
+async fn admit_repo(server: &Server, repo: &str) -> Value {
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/repos/github/{repo}/sync", server.url))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("admission request");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    response.json().await.expect("admission response json")
 }
 
 fn response_commit(body: &Value) -> &str {
@@ -261,6 +390,12 @@ fn reset_probe(probe: &AdmissionTestProbe) {
     probe
         .artifact_uploads
         .store(0, std::sync::atomic::Ordering::SeqCst);
+    probe
+        .embedded_notification_wakes
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    probe
+        .embedded_fallback_polls
+        .store(0, std::sync::atomic::Ordering::SeqCst);
     probe.fetch_targets.lock().unwrap().clear();
     probe.builder_targets.lock().unwrap().clear();
     probe.failure_targets.lock().unwrap().clear();
@@ -346,6 +481,118 @@ fn artifact_snapshot(
         .collect()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_admission_wakes_idle_embedded_worker_before_fallback_poll() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    setup(false);
+
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.embedded_idle_wait.arm();
+    probe.builder_entry.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    wait_entered(&probe.embedded_idle_wait, 1).await;
+
+    let origin = make_origin("acme", "immediate-wake");
+    origin.commit(&[("value.txt", "wake\n")], "wake");
+    origin.publish();
+    register_added_without_build(&server, "acme/immediate-wake")
+        .await
+        .expect("register immediate-wake repo");
+
+    admit_repo(&server, "acme/immediate-wake").await;
+    assert_eq!(probe.embedded_notification_wakes.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.embedded_fallback_polls.load(Ordering::SeqCst), 0);
+
+    // The fallback sleep is not created until this barrier releases. The
+    // post-commit Notify permit is already stored, so the notification side of
+    // the select must win without advancing that timer.
+    probe.embedded_idle_wait.disarm();
+    wait_entered(&probe.builder_entry, 1).await;
+    assert_eq!(probe.embedded_notification_wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        probe.embedded_fallback_polls.load(Ordering::SeqCst),
+        0,
+        "normal committed admission did not use the recovery poll"
+    );
+    probe.builder_entry.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("notified job settles before fixture teardown");
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn held_full_jobs_release_foreground_slots_for_another_head() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "2");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    setup(false);
+
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.phase2_entry.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+
+    let mut commits = Vec::new();
+    for repo in ["capacity-a", "capacity-b", "capacity-c"] {
+        let origin = make_origin("acme", repo);
+        let commit = origin.commit(&[("value.txt", repo)], repo);
+        origin.publish();
+        register_added_without_build(&server, &format!("acme/{repo}"))
+            .await
+            .expect("register capacity fixture");
+        commits.push((repo, commit, origin));
+    }
+
+    for (repo, _, _) in &commits[..2] {
+        admit_repo(&server, &format!("acme/{repo}")).await;
+    }
+    wait_entered(&probe.phase2_entry, 2).await;
+
+    let (third_repo, third_commit, _) = &commits[2];
+    admit_repo(&server, &format!("acme/{third_repo}")).await;
+    wait_entered(&probe.phase2_entry, 3).await;
+
+    let store = server_ref_store(&server).await;
+    let repo_id = ripclone::provider::RepoId::github(format!("acme/{third_repo}"));
+    let exact = store
+        .load_branch(
+            &repo_id,
+            &ripclone::ref_store::exact_ref_key("main", third_commit),
+        )
+        .await
+        .expect("load third exact Head")
+        .expect("third exact Head exists");
+    assert_eq!(exact.commit, *third_commit);
+    assert_eq!(exact.shallow_clonepack.commit, *third_commit);
+    assert!(!exact.shallow_clonepack.manifest.is_empty());
+    assert_eq!(exact.build_status.as_deref(), Some("full history building"));
+
+    // The third admission and both exact/moving Head publications committed
+    // while the first two Full barriers were held. Those writes directly prove
+    // that Full work retains no SQLite transaction or write lock.
+    probe.phase2_entry.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
+        .await
+        .expect("all held Full jobs settle after release");
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
 /// Direct local composition: ready no-op, fast accepted response, duplicate
 /// coalescing before and after claim, separate C identity, exact B fetch after
 /// the origin moves, phase-one/full coalescing, and final C publication.
@@ -356,7 +603,6 @@ async fn e2e_sync_admission() {
     // observable without relying on build duration.
     unsafe {
         std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "1");
-        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
     setup(false);
@@ -568,7 +814,6 @@ async fn e2e_sync_admission() {
         "B admission: {b_body}"
     );
     assert_eq!(response_commit(&b_body), b);
-    assert_eq!(b_body["queue_depth"], 1, "B is observably queued");
     assert_eq!(probe.after_claim.entered(), 0, "B has not been claimed");
     assert!(
         b_elapsed < Duration::from_secs(5),
@@ -609,7 +854,11 @@ async fn e2e_sync_admission() {
     );
     assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 3);
 
-    assert_eq!(b_body["queue_depth"], 1, "one B remains queued");
+    assert_eq!(
+        probe.queue_inserts.load(Ordering::SeqCst),
+        1,
+        "one durable B job remains admitted"
+    );
     probe.before_claim.release();
     probe.before_claim.disarm();
     wait_entered(&probe.after_claim, 1).await;
@@ -704,35 +953,19 @@ async fn e2e_sync_admission() {
         b_phase1_elapsed.as_millis(),
     );
 
-    // Hold C before claim so Full(B)'s exact metadata and every named artifact
-    // can be inspected before the ordinary branch advances. This proves B was
-    // not merely counted at a builder hook and then overwritten by C.
-    probe.before_claim.arm();
+    // Full(B) is held, but its foreground slot is already free for C. Releasing
+    // the shared Full barrier lets both durable claims settle; exact B must
+    // remain addressable after the moving branch advances to C.
     probe.phase2_entry.release();
     probe.phase2_entry.disarm();
-    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
-        .await
-        .expect("B full publication completed");
-    wait_entered(&probe.before_claim, 1).await;
-
-    let store = FileRefStore::new(&server.repo_root);
-    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
-    let b_build = store
-        .load_branch(&repo_id, &ripclone::ref_store::exact_ref_key("main", &b))
-        .await
-        .expect("load exact B build")
-        .expect("exact B build remains addressable before C publication");
-    let local_storage = ripclone::storage::local(&server.storage_dir)
-        .expect("open local artifact storage for exact proof");
-    assert_full_artifacts(&local_storage, &b_build, &b);
-
-    // C was already a distinct queued job. Release its claim and require its
-    // own exact publication as well.
-    probe.before_claim.release();
-    probe.before_claim.disarm();
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))
         .await
         .expect("B and C full publications completed");
+
+    let store = server_ref_store(&server).await;
+    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
+    let local_storage = ripclone::storage::local(&server.storage_dir)
+        .expect("open local artifact storage for exact proof");
 
     let fetch_targets = probe.fetch_targets.lock().unwrap().clone();
     let mut sorted_fetch_targets = fetch_targets.clone();
@@ -1191,7 +1424,6 @@ async fn ordinary_build_publishes_exact_commit_result() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
-        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
     let (server, phase_one, phase_one_entered, phase_one_proceed) =
@@ -1225,7 +1457,7 @@ async fn ordinary_build_publishes_exact_commit_result() {
         .expect("B phase-one publication entered")
         .expect("phase-one barrier sender alive");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/ordinary-exact-publish");
     let exact_key = format!(":main#{b}");
     let phase_one_exact = store
@@ -1300,7 +1532,6 @@ async fn ordinary_and_explicit_requests_share_one_exact_job() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
-        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
     let probe = Arc::new(AdmissionTestProbe::default());
@@ -1343,7 +1574,7 @@ async fn ordinary_and_explicit_requests_share_one_exact_job() {
         "ordinary and explicit B must coalesce onto one active job"
     );
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/one-exact-job");
     let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let pending_row = store
@@ -1373,7 +1604,6 @@ async fn ordinary_and_explicit_requests_share_one_exact_job() {
         .expect("ordinary-first HEAD row");
     assert_eq!(head.commit, b);
     unsafe {
-        std::env::remove_var("RIPCLONE_RECHECK_MAX");
         std::env::remove_var("RIPCLONE_TESTING");
     }
 }
@@ -1383,7 +1613,6 @@ async fn explicit_job_promoted_by_ordinary_admission_publishes_moving_projection
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
-        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
     let probe = Arc::new(AdmissionTestProbe::default());
@@ -1423,7 +1652,7 @@ async fn explicit_job_promoted_by_ordinary_admission_publishes_moving_projection
         "explicit-first and ordinary-second B must share one active job"
     );
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/promoted-exact-job");
     let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let promoted = store
@@ -1475,7 +1704,6 @@ async fn explicit_only_job_never_publishes_moving_projection() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
-        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
     let probe = Arc::new(AdmissionTestProbe::default());
@@ -1503,7 +1731,7 @@ async fn explicit_only_job_never_publishes_moving_projection() {
         .await
         .expect("explicit-only B build completes");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/explicit-only-job");
     let exact_key = ripclone::ref_store::exact_ref_key("main", &b);
     let exact = store
@@ -1523,6 +1751,94 @@ async fn explicit_only_job_never_publishes_moving_projection() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedded_worker_stops_before_publication_after_losing_claim() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "1");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.phase2_entry.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server_env(&[
+        ("RIPCLONE_QUEUE_STALE_SECS", "3"),
+        ("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS", "3"),
+    ])
+    .await;
+    let origin = make_origin("acme", "lost-claim");
+    let commit = origin.commit(&[("value.txt", "old owner\n")], "held Full");
+    origin.publish();
+    register_added_without_build(&server, "acme/lost-claim")
+        .await
+        .expect("register lost-claim fixture");
+    let admitted = admit_repo(&server, "acme/lost-claim").await;
+    assert_eq!(response_commit(&admitted), commit);
+    wait_entered(&probe.phase2_entry, 1).await;
+
+    let takeover = ripclone::queue::SqlJobQueue::new(Box::new(
+        ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
+            .await
+            .unwrap(),
+    ))
+    .await
+    .unwrap()
+    .with_stale_claim_secs(0);
+    let transferred = takeover
+        .claim("replacement-owner")
+        .await
+        .unwrap()
+        .expect("replacement takes the held durable claim");
+    tokio::time::timeout(Duration::from_secs(10), probe.wait_until_claim_lost(1))
+        .await
+        .expect("old owner detects transferred claim");
+    let writes_after_loss = probe.ref_store_writes.load(Ordering::SeqCst);
+    let uploads_after_loss = probe.artifact_uploads.load(Ordering::SeqCst);
+
+    probe.phase2_entry.release();
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(probe.full_publishes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        probe.ref_store_writes.load(Ordering::SeqCst),
+        writes_after_loss
+    );
+    assert_eq!(
+        probe.artifact_uploads.load(Ordering::SeqCst),
+        uploads_after_loss
+    );
+    let store = server_ref_store(&server).await;
+    let repo_id = ripclone::provider::RepoId::github("acme/lost-claim");
+    let exact = store
+        .load_branch(
+            &repo_id,
+            &ripclone::ref_store::exact_ref_key("main", &commit),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(exact.full_clonepack.manifest.is_empty());
+    assert_ne!(exact.build_status.as_deref(), Some("ready"));
+    assert!(
+        takeover
+            .ack(
+                transferred.id,
+                "replacement-owner",
+                Err(ripclone::queue::BuildError::permanent(
+                    "test settled replacement"
+                )),
+            )
+            .await
+            .unwrap()
+    );
+    unsafe {
+        std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
 /// A historical sync's phase-one row is metadata and shallow readiness only.
 /// Holding phase two at its entry makes the HTTP readiness decision observable:
 /// the first response must be exact pending until Full(commit) is durable.
@@ -1531,7 +1847,6 @@ async fn historical_sync_requires_exact_full_before_ready() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
-        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
     let probe = Arc::new(AdmissionTestProbe::default());
@@ -1566,7 +1881,7 @@ async fn historical_sync_requires_exact_full_before_ready() {
     assert_eq!(pending["branch"], "main");
 
     wait_entered(&probe.phase2_entry, 1).await;
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/historical-full-ready");
     let exact_key = ripclone::ref_store::exact_ref_key("main", &pinned);
     let phase_one = store
@@ -1603,7 +1918,6 @@ async fn late_b_exact_publish_does_not_mutate_c() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
-        std::env::set_var("RIPCLONE_RECHECK_MAX", "0");
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
     let (server, phase_one, phase_one_entered, phase_one_proceed) =
@@ -1652,7 +1966,7 @@ async fn late_b_exact_publish_does_not_mutate_c() {
         .await
         .expect("C full publication while B is held");
 
-    let store = FileRefStore::new(&server.repo_root);
+    let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/late-exact-publish");
     let moving_c = store
         .load_branch(&repo_id, "main")

@@ -1,25 +1,25 @@
 //! `WorkerQueue` that claims/acks/heartbeats over the server's HTTP API.
 //!
-//! Selected with `RIPCLONE_QUEUE=api`. A farmed-out worker holds only a base URL
+//! A standalone worker holds only a base URL
 //! and a signed, expiring bearer token — never database credentials. It reaches
 //! the queue entirely through the server's `/v1/jobs/*` endpoints; the server
 //! holds the one queue database and performs every state change after checking
 //! the token. This is the queue-side twin of [`ApiRefStore`](crate::api_ref_store)
 //! (metadata over `POST /v1/refs`): together they let a worker run on untrusted
-//! infra with a single token as its whole credential.
+//! infrastructure with a single token as its whole control credential.
 //!
 //! Wire shapes:
 //! - `POST /v1/jobs/claim` — body `{worker_id, max_size_class?}` → `{job?}`
-//!   where `job = {id, provider, path, branch, credential?}`. Exactly one job
-//!   (or none), scoped to the caller; `credential` is this job's upstream token.
+//!   where `job` includes the exact admitted identity, repository-config
+//!   snapshot, and optional upstream credential. Exactly one job (or none) is
+//!   scoped to the caller.
 //! - `POST /v1/jobs/{id}/ack` — body `{worker_id, result:{ok, retryable, error?}}`
 //!   → `{settled, state, error?}`.
 //! - `POST /v1/jobs/heartbeat` — body `{worker_id, current_job?}` → 200.
 //!
 //! A failed claim/ack/heartbeat is never swallowed: network / 5xx / 429 map to a
 //! retryable [`ApiReportError`] (the worker polls again / the job stays queued),
-//! and a 401/403 maps to an *unauthorized* error so the worker exits cleanly and
-//! the dispatcher respawns it with a fresh token.
+//! and a 401/403 maps to an *unauthorized* error so the worker exits cleanly.
 
 use crate::api_ref_store::ApiReportError;
 use crate::queue::{
@@ -47,7 +47,8 @@ pub struct ClaimRequest {
 
 /// One claimed job on the wire. `credential` is the per-job upstream token the
 /// enqueuer persisted; the worker needs it to fetch a private repo it has no
-/// standing credential for. Sent only to the worker that just claimed this job.
+/// standing credential for. `repo_config` is the validated admission snapshot,
+/// not a database lookup. Sent only to the worker that just claimed this job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimedJobWire {
     pub id: JobId,
@@ -58,6 +59,7 @@ pub struct ClaimedJobWire {
     pub admitted_commit: String,
     #[serde(default)]
     pub admitted_default_branch: Option<String>,
+    pub repo_config: crate::repo_config::RepoConfig,
     #[serde(default)]
     pub credential: Option<String>,
 }
@@ -134,6 +136,7 @@ pub struct ApiJobQueue {
     job_token: String,
     client: reqwest::Client,
     heartbeat_timeout_secs: i64,
+    max_size_class: Option<String>,
     /// Last known lifecycle per job id, populated on `ack` so a follow-up
     /// `job_status` (the dead-letter check) needs no extra round-trip.
     last_status: Mutex<HashMap<JobId, JobState>>,
@@ -148,6 +151,7 @@ impl std::fmt::Debug for ApiJobQueue {
             .field("base_url", &self.base_url)
             .field("job_token", &"<redacted>")
             .field("heartbeat_timeout_secs", &self.heartbeat_timeout_secs)
+            .field("max_size_class", &self.max_size_class)
             .finish_non_exhaustive()
     }
 }
@@ -161,14 +165,14 @@ impl ApiJobQueue {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .context(
-                "RIPCLONE_QUEUE=api requires RIPCLONE_QUEUE_API_URL \
+                "standalone workers require RIPCLONE_QUEUE_API_URL \
                  (the server base URL that serves POST /v1/jobs/*)",
             )?;
         let job_token = std::env::var("RIPCLONE_METADATA_JOB_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .context(
-                "RIPCLONE_QUEUE=api requires RIPCLONE_METADATA_JOB_TOKEN \
+                "standalone workers require RIPCLONE_METADATA_JOB_TOKEN \
                  (the one signed, expiring bearer token for all worker endpoints)",
             )?;
         let timeout = std::env::var("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS")
@@ -208,8 +212,15 @@ impl ApiJobQueue {
             job_token,
             client,
             heartbeat_timeout_secs: heartbeat_timeout_secs.max(1),
+            max_size_class: None,
             last_status: Mutex::new(HashMap::new()),
         })
+    }
+
+    #[must_use]
+    pub fn with_max_size_class(mut self, max_size_class: Option<String>) -> Self {
+        self.max_size_class = max_size_class;
+        self
     }
 
     /// POST `body` to `path` and deserialize the JSON response. Maps transport /
@@ -273,12 +284,9 @@ impl WorkerQueue for ApiJobQueue {
     async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>> {
         // The server applies this worker's ceiling per claim. We don't carry a
         // resolved rank here; the name is enough and the server owns the classes.
-        let max_size_class = std::env::var("RIPCLONE_MAX_SIZE_CLASS")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
         let req = ClaimRequest {
             worker_id: worker_id.to_string(),
-            max_size_class,
+            max_size_class: self.max_size_class.clone(),
         };
         let resp: ClaimResponse = self.post("/v1/jobs/claim", &req).await?;
         Ok(resp.job.map(|j| ClaimedJob {
@@ -288,6 +296,7 @@ impl WorkerQueue for ApiJobQueue {
             branch: j.branch,
             admitted_commit: j.admitted_commit,
             admitted_default_branch: j.admitted_default_branch,
+            repo_config: j.repo_config,
             credential: j.credential.map(|c| SecretString::new(c.into())),
         }))
     }
@@ -352,17 +361,12 @@ impl WorkerQueue for ApiJobQueue {
     }
 }
 
-/// The api worker's `ServerState.build_queue`. All durable enqueue/coalesce
-/// happens on the server; the only enqueue a worker would attempt is the
-/// post-build freshness re-check, and the server's poll loop is that backstop
-/// for cross-process queues. So `enqueue` fails loudly rather than pretend.
+/// The API worker's `ServerState.build_queue`. All durable enqueue/coalescing
+/// happens on the server, so worker-side enqueue fails loudly.
 #[async_trait]
 impl JobQueue for ApiJobQueue {
     async fn enqueue(&self, _job: BuildJob) -> Result<Enqueued> {
-        bail!(
-            "RIPCLONE_QUEUE=api workers do not enqueue; the server enqueues and its \
-             periodic poll loop is the freshness backstop for cross-process queues"
-        )
+        bail!("standalone API workers do not enqueue; the server owns admission")
     }
 
     async fn job_status(&self, id: JobId) -> Result<JobState> {
@@ -380,10 +384,6 @@ impl JobQueue for ApiJobQueue {
     async fn depth(&self) -> usize {
         0
     }
-
-    fn inproc_wait(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]
@@ -393,8 +393,9 @@ mod tests {
 
     #[test]
     fn from_env_needs_url_and_token() {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_url = std::env::var("RIPCLONE_QUEUE_API_URL").ok();
         let prev_tok = std::env::var("RIPCLONE_METADATA_JOB_TOKEN").ok();
 

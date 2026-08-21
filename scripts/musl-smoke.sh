@@ -25,7 +25,7 @@ PROFILE="${MUSL_PROFILE:-ci}"
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repo_root/rust"
 
-BINS=(ripclone ripclone-server ripclone-worker ripclone-dispatcher git-remote-ripclone)
+BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone)
 
 # One zigbuild of the lib *test* binary first — it pulls the whole graph with
 # cfg(test) and is what we need for the musl-only unit tests. Then build the
@@ -96,24 +96,41 @@ docker run --rm --platform "$PLATFORM" \
     /b/ripclone --version
     /b/ripclone-server --version
     /b/ripclone-worker --help >/dev/null && echo "ripclone-worker: ok"
-    # none → clean no-op exit (no queue/provider required).
-    RIPCLONE_DISPATCH=none /b/ripclone-dispatcher && echo "ripclone-dispatcher: ok"
     /b/git-remote-ripclone 2>&1 | head -1 >/dev/null && echo "git-remote-ripclone: ok"
 
-    # ...and one of them must do real work: boot the server (tokio, rustls,
-    # sqlite, the local storage backend) and answer live requests.
-    /b/ripclone-server --port 8123 --cas-dir /tmp/cas --repo-root /tmp/repos >/tmp/srv.log 2>&1 &
-    srv=$!
-    for _ in $(seq 1 80); do
-      wget -qO- http://127.0.0.1:8123/healthz >/dev/null 2>&1 && break
-      sleep 0.25
+    # ...and one of them must do real work: repeatedly boot the server (tokio,
+    # rustls, sqlite, the local storage backend) and answer live requests. The
+    # repetition catches connection-teardown faults that a single lucky boot can
+    # miss on musl.
+    for attempt in $(seq 1 8); do
+      log="/tmp/srv-$attempt.log"
+      /b/ripclone-server \
+        --port 8123 \
+        --cas-dir "/tmp/cas-$attempt" \
+        --repo-root "/tmp/repos-$attempt" \
+        --control-db "/tmp/control-$attempt.db" >"$log" 2>&1 &
+      srv=$!
+      for _ in $(seq 1 80); do
+        wget -qO- http://127.0.0.1:8123/healthz >/dev/null 2>&1 && break
+        if ! kill -0 "$srv" 2>/dev/null; then
+          set +e
+          wait "$srv"
+          status=$?
+          set -e
+          echo "server attempt $attempt exited before becoming healthy (status=$status):"
+          cat "$log"
+          exit 1
+        fi
+        sleep 0.25
+      done
+      health="$(wget -qO- http://127.0.0.1:8123/healthz || true)"
+      version="$(wget -qO- http://127.0.0.1:8123/v1/version || true)"
+      [ -n "$health" ] || { echo "server attempt $attempt never became healthy:"; cat "$log"; exit 1; }
+      kill "$srv" 2>/dev/null || true
+      wait "$srv" 2>/dev/null || true
+      echo "attempt $attempt GET /healthz    -> $health"
+      echo "attempt $attempt GET /v1/version -> $version"
     done
-    health="$(wget -qO- http://127.0.0.1:8123/healthz || true)"
-    version="$(wget -qO- http://127.0.0.1:8123/v1/version || true)"
-    kill "$srv" 2>/dev/null || true
-    [ -n "$health" ] || { echo "server never became healthy:"; cat /tmp/srv.log; exit 1; }
-    echo "GET /healthz    -> $health"
-    echo "GET /v1/version -> $version"
 
     # The musl-only code paths: the hand-written statx layout and the mimalloc
     # global allocator. Only these two are run here — the rest of the library

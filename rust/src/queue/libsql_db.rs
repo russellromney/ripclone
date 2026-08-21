@@ -1,7 +1,4 @@
-//! [`QueueDb`] backed by the `libsql` crate, connecting to a **remote** Turso
-//! Cloud database over the network — the multi-machine farm-out backend. (Local
-//! files are served by the `sqlite` backend; libsql is built remote-only here so
-//! it doesn't bundle SQLite's C core and collide with sqlx.)
+//! [`QueueDb`] over the server's Turso embedded-replica handle.
 
 use super::sql::{
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
@@ -10,26 +7,32 @@ use super::sql::{
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use libsql::{Builder, Connection, Database};
+use libsql::{Connection, Database};
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct LibsqlDb {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl LibsqlDb {
-    /// Connect to a remote Turso Cloud / libsql server.
-    pub async fn connect_remote(url: &str, token: &str) -> Result<Self> {
-        let db = Builder::new_remote(url.to_string(), token.to_string())
+    pub(crate) fn from_database(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
+    pub async fn connect(path: &str) -> Result<Self> {
+        let db = libsql::Builder::new_local(path)
             .build()
             .await
-            .with_context(|| format!("open libsql remote {url}"))?;
-        Ok(Self { db })
+            .context("open local queue database")?;
+        Ok(Self { db: Arc::new(db) })
     }
 
     async fn conn(&self) -> Result<Connection> {
         let conn = self.db.connect().context("libsql connect")?;
         // Wait out lock contention rather than erroring (local files).
-        let _ = conn.execute("PRAGMA busy_timeout = 5000", ()).await;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("configure queue busy timeout")?;
         Ok(conn)
     }
 }
@@ -53,7 +56,7 @@ impl QueueDb for LibsqlDb {
         conn.execute(CREATE_HISTORY_INDEX_SQL, ())
             .await
             .context("create history index")?;
-        // Worker heartbeat/registry for dispatcher live-count (D3).
+        // Durable worker heartbeat registry.
         conn.execute(CREATE_WORKERS_TABLE_SQL, ())
             .await
             .context("create workers table")?;
@@ -86,6 +89,7 @@ impl QueueDb for LibsqlDb {
         branch: &str,
         admitted_commit: &str,
         admitted_default_branch: Option<&str>,
+        repo_config: &str,
         credential: Option<&str>,
         size_class: i64,
         created_at: i64,
@@ -96,8 +100,8 @@ impl QueueDb for LibsqlDb {
             None => libsql::Value::Null,
         };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, branch, admitted_commit, admitted_default_branch, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+            "INSERT INTO jobs (key, provider, path, branch, admitted_commit, admitted_default_branch, repo_config, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
             libsql::params![
                 key,
                 provider,
@@ -105,6 +109,7 @@ impl QueueDb for LibsqlDb {
                 branch,
                 admitted_commit,
                 admitted_default_branch,
+                repo_config,
                 cred_val,
                 size_class,
                 created_at
@@ -225,6 +230,19 @@ impl QueueDb for LibsqlDb {
         Ok(n == 1)
     }
 
+    async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
+        let conn = self.conn().await?;
+        let n = conn
+            .execute(
+                "UPDATE jobs SET claimed_at = ?
+                 WHERE id = ? AND status = 'claimed' AND worker_id = ?",
+                libsql::params![now, id, worker_id],
+            )
+            .await
+            .context("renew job claim")?;
+        Ok(n == 1)
+    }
+
     async fn job_fields(
         &self,
         id: i64,
@@ -235,13 +253,14 @@ impl QueueDb for LibsqlDb {
             String,
             String,
             Option<String>,
+            String,
             Option<String>,
         )>,
     > {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT provider, path, branch, admitted_commit, admitted_default_branch, credential FROM jobs WHERE id = ?",
+                "SELECT provider, path, branch, admitted_commit, admitted_default_branch, repo_config, credential FROM jobs WHERE id = ?",
                 [id],
             )
             .await
@@ -253,7 +272,8 @@ impl QueueDb for LibsqlDb {
                 row.get::<String>(2)?,
                 row.get::<String>(3)?,
                 row.get::<Option<String>>(4)?,
-                row.get::<Option<String>>(5)?,
+                row.get::<String>(5)?,
+                row.get::<Option<String>>(6)?,
             ))),
             None => Ok(None),
         }
@@ -383,10 +403,6 @@ impl QueueDb for LibsqlDb {
             .context("prune failed jobs")
     }
 
-    fn supports_worker_registry(&self) -> bool {
-        true
-    }
-
     async fn upsert_heartbeat(
         &self,
         worker_id: &str,
@@ -416,6 +432,17 @@ impl QueueDb for LibsqlDb {
             .await
             .context("upsert worker heartbeat")?;
         Ok(())
+    }
+
+    async fn delete_worker(&self, worker_id: &str) -> Result<u64> {
+        self.conn()
+            .await?
+            .execute(
+                "DELETE FROM workers WHERE worker_id = ?",
+                libsql::params![worker_id],
+            )
+            .await
+            .context("delete worker heartbeat")
     }
 
     async fn count_live_workers(&self, cutoff: i64) -> Result<i64> {

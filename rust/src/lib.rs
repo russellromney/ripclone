@@ -12,6 +12,9 @@
 //! points used by the bundled binaries. Modules marked `doc(hidden)` are public
 //! for in-repo binaries and integration tests, not a stability promise.
 
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // mimalloc as the global allocator on musl targets. The Linux release binaries
 // are statically linked against musl (so one binary runs on any Linux, Alpine
 // included), but musl's default allocator is markedly slower than glibc's under
@@ -78,12 +81,7 @@ pub mod client;
 pub mod clone_metrics;
 pub mod clonepack;
 pub mod config;
-/// Provider-agnostic compute dispatch (`RIPCLONE_DISPATCH=fly|exec|http|mock`).
-///
-/// The cloud webhook/cron and self-host escape hatches wake workers through
-/// [`dispatch::ComputeProvider`]; nothing outside the module knows the platform.
-#[doc(hidden)]
-pub mod dispatch;
+pub mod control;
 #[doc(hidden)]
 pub mod extract;
 #[doc(hidden)]

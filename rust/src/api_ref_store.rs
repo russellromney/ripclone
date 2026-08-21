@@ -1,20 +1,20 @@
 //! `RefStore` that reports writes to a ripclone server over HTTP.
 //!
-//! Selected with `RIPCLONE_METADATA=api`. The worker holds only a report URL
-//! and a signed, expiring bearer token — never database credentials. The token
+//! A standalone worker holds only a report URL and a signed, expiring bearer
+//! token — never database credentials. The token
 //! carries no repo/job scope (the worker pool claims any repo); the write
 //! target is the `repo_key` in each report body. The server that holds the real
-//! metadata store performs the durable write after checking the token
+//! control database performs the durable write after checking the token
 //! (`POST /v1/refs`).
 //!
 //! Reads return empty: a farmed-out worker builds cold and only needs the write
 //! path for publish. A failed report is never swallowed — network/5xx map to
 //! retryable errors so the job requeues, and 401/403 to an unauthorized error so
-//! the worker exits cleanly for respawn with a fresh token.
+//! the worker exits cleanly without refreshing credentials locally.
 //!
 //! The token is a durable, operator-provisioned value (`ripclone
-//! mint-worker-token`), so `api` mode is deployable for real farm-out. The
-//! queue-side twin is [`ApiJobQueue`](crate::api_job_queue) (`RIPCLONE_QUEUE=api`).
+//! mint-worker-token`). The queue-side twin is
+//! [`ApiJobQueue`](crate::api_job_queue).
 
 use crate::RefInfo;
 use crate::provider::RepoId;
@@ -34,8 +34,8 @@ pub struct ApiReportError {
     message: String,
     retryable: bool,
     /// The server rejected our bearer token (401/403). Not retryable, and a
-    /// distinct signal so a farmed-out worker can exit cleanly on an expired
-    /// token (the dispatcher respawns it with a fresh one) instead of spinning.
+    /// distinct signal so a worker can exit cleanly on an expired token instead
+    /// of spinning.
     unauthorized: bool,
 }
 
@@ -151,14 +151,14 @@ impl ApiRefStore {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .context(
-                "RIPCLONE_METADATA=api requires RIPCLONE_METADATA_REPORT_URL \
+                "standalone workers require RIPCLONE_METADATA_REPORT_URL \
                  (the server's POST /v1/refs endpoint)",
             )?;
         let job_token = std::env::var("RIPCLONE_METADATA_JOB_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .context(
-                "RIPCLONE_METADATA=api requires RIPCLONE_METADATA_JOB_TOKEN \
+                "standalone workers require RIPCLONE_METADATA_JOB_TOKEN \
                  (signed, expiring bearer token from job_token::mint_job_token; \
                  the server does not mint or inject this automatically yet)",
             )?;
@@ -389,8 +389,9 @@ mod tests {
     fn from_env_fails_loudly_without_url_or_token() {
         // Process-global env: run both checks under one lock so parallel
         // lib tests can't clobber each other mid-assertion.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let key_url = "RIPCLONE_METADATA_REPORT_URL";
         let key_tok = "RIPCLONE_METADATA_JOB_TOKEN";

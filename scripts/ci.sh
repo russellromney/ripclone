@@ -14,6 +14,7 @@ STAGE="${1:-all}"
 export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-ci-e2e-token}"
 
 lint() {
+  bash "$ROOT/scripts/audit_control_support.sh"
   ( cd "$ROOT/rust"
     cargo fmt --all --check
     cargo clippy --all-targets --locked -- -D warnings )
@@ -25,14 +26,28 @@ lint() {
 # while io_uring is the default writer.
 #
 # This job self-compiles (ci profile + sccache/rust-cache). Fan-out jobs
-# (gitea/databases/s3gc/e2e/…) use prebuilt binaries from ci-build instead;
+# (gitea/s3gc/e2e/…) use prebuilt binaries from ci-build instead;
 # staging the full suite there was ~30m cold before integration-test
 # consolidation and is not worth it.
 run_tests() {
-  # Combined harnesses contain existing tests that select backends through
-  # process-global environment variables. Preserve their former cross-file
-  # isolation by running one test at a time inside each bounded harness.
-  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked -- --test-threads=1 )
+  # The local-server harness has both LSM-on and LSM-off fixtures. LSM mode is
+  # process-global, so execute its two groups in separate processes while
+  # retaining one compiled test binary. The broad pass still compiles every
+  # target and runs every other test.
+  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked -- \
+      --test-threads=1 --skip lsm_on_ --skip lsm_off_ )
+
+  local filter listed
+  for filter in lsm_on_ lsm_off_; do
+    listed="$(cd "$ROOT/rust" && timeout 60 cargo test --profile ci --locked \
+      --test local_server -- "$filter" --list)"
+    if ! grep -Fq "$filter" <<<"$listed"; then
+      echo "required local-server group matched zero tests: $filter" >&2
+      exit 1
+    fi
+    ( cd "$ROOT/rust" && cargo test --profile ci --locked --test local_server -- \
+        "$filter" --test-threads=1 )
+  done
 }
 
 e2e() {
@@ -75,15 +90,6 @@ gitea() {
   fi
 }
 
-# Real network databases for the queue + metadata adapters the default suite can
-# only compile-check: Postgres + MySQL via throwaway docker containers, and
-# libsql against a local `sqld`. Needs docker; the libsql leg also needs `sqld`
-# on PATH (the test auto-skips without it).
-databases() {
-  export CARGO_PROFILE="${CARGO_PROFILE:-ci}"
-  bash "$ROOT/scripts/test-queue-sql.sh"
-}
-
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
 # raw HTTP, so a change to the server's contract (like the B5 added-repos gate)
 # does not recompile them — it silently breaks the harness against the next
@@ -104,7 +110,7 @@ benchmark() {
 }
 
 # Compile-once fan-out: product bins + integration tests for
-# gitea/databases/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
+# gitea/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
 ci_build() {
   bash "$ROOT/scripts/ci-build-artifacts.sh"
 }

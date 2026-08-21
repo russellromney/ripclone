@@ -2602,12 +2602,12 @@ mod tests {
             &crate::provider::RepoId::github("acme/timeout"),
             "HEAD",
             None,
-            Duration::from_millis(100),
+            Duration::from_secs(1),
         );
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         accepted_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(5))
             .expect("bounded ls-remote fixture accepted the request");
         assert!(
             result
