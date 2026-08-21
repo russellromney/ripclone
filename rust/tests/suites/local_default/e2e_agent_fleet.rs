@@ -247,17 +247,14 @@ async fn agent_files_mode_fleet_clone_is_correct() {
     );
 }
 
-/// The three materialize surfaces the README's "Which one do I use?" table
+/// The two materialize surfaces the README's "Which one do I use?" table
 /// promises must be genuinely distinct, driven through the real binary the way
 /// the docs tell you to drive them:
 ///
 ///   * `clone --mode editable` → a full git repo (`.git` + working tree)
 ///   * `clone --mode files`    → the working tree only, no `.git`
-///   * `worktree`              → an additional *linked* git worktree
-///
-/// `--mode files` and `worktree` are not the same thing; this pins that.
 #[tokio::test]
-async fn three_materialize_surfaces_are_distinct() {
+async fn two_materialize_surfaces_are_distinct() {
     setup(false);
 
     let origin = make_origin("acme", "surfaces");
@@ -311,46 +308,7 @@ async fn three_materialize_surfaces_are_distinct() {
     assert_eq!(read(&filesonly, "README.md"), "v2\n");
     assert_eq!(read(&filesonly, "src/lib.rs"), "pub fn f() {}\n");
 
-    // 3. worktree → an additional linked checkout of the repo cloned in (1),
-    //    registered with git and fully git-aware (unlike files mode).
-    let wt_out = tokio::task::spawn_blocking({
-        let (bin, editable, home, url) = (
-            bin.clone(),
-            editable.clone(),
-            home.path().to_path_buf(),
-            server.url.clone(),
-        );
-        move || {
-            Command::new(&bin)
-                .args(["worktree", "../linked", "-b", "HEAD"])
-                .current_dir(&editable)
-                .env("HOME", &home)
-                .env("RIPCLONE_SERVER", &url)
-                .env("RIPCLONE_SERVER_TOKEN", TOKEN)
-                .stdin(Stdio::null())
-                .output()
-                .expect("spawn ripclone worktree")
-        }
-    })
-    .await
-    .expect("subprocess panicked");
-    assert_ok("worktree", &wt_out);
-
-    let linked = cwd.path().join("linked");
-    assert!(
-        linked.join(".git").is_file(),
-        "a linked worktree's .git is a file, not a dir"
-    );
-    assert_eq!(read(&linked, "README.md"), "v2\n");
-    assert_eq!(
-        git(&linked, &["rev-parse", "HEAD"]),
-        git(&editable, &["rev-parse", "HEAD"]),
-        "linked worktree checks out the same commit"
-    );
-    assert!(
-        git(&editable, &["worktree", "list"]).contains("linked"),
-        "the main repo must register the linked worktree"
-    );
-    // The distinguishing property vs `--mode files`: git works in the tree.
-    assert_eq!(git(&linked, &["status", "--porcelain"]), "");
+    // The distinguishing property vs `--mode files`: git works in the editable
+    // clone's tree and there is no object database in the files-only tree.
+    assert_eq!(git(&editable, &["status", "--porcelain"]), "");
 }

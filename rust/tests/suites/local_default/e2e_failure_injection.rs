@@ -67,10 +67,10 @@ async fn storage_upload_failure_mid_build_does_not_publish_partial_ref_and_retry
     let failed_target = failed_out.path().join("clone");
     let failed_clone = server
         .client()
-        .install_repo_with_mode(
-            "acme",
-            "writefail",
+        .install_repo_with_mode_at(
+            "acme/writefail",
             "HEAD",
+            None,
             &failed_target,
             CloneMode::Editable,
             Some("full"),
@@ -132,10 +132,10 @@ async fn ref_store_write_failure_does_not_publish_partial_ref_and_retry_recovers
     let failed_target = failed_out.path().join("clone");
     let failed_clone = server
         .client()
-        .install_repo_with_mode(
-            "acme",
-            "reffail",
+        .install_repo_with_mode_at(
+            "acme/reffail",
             "HEAD",
+            None,
             &failed_target,
             CloneMode::Editable,
             Some("full"),

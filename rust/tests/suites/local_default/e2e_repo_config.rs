@@ -454,10 +454,10 @@ async fn repository_config_survives_server_restart_and_drives_embedded_job_snaps
     assert_eq!(ready.commit, commit);
     let clone = root.path().join("clone");
     client
-        .install_repo_with_mode(
-            "acme",
-            "restart-config",
+        .install_repo_with_mode_at(
+            "acme/restart-config",
             "HEAD",
+            None,
             &clone,
             CloneMode::Files,
             Some("full"),

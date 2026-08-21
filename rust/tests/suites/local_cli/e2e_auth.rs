@@ -279,6 +279,7 @@ async fn expired_bearer_token_fails_clone_cleanly() {
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
     let barrier = ArtifactBarrier {
         after_bytes: 16,
+        target: ripclone::server::BarrierTarget::FirstLargeBody,
         entered: Arc::new(std::sync::Mutex::new(Some(entered_tx))),
         proceed: Arc::new(std::sync::Mutex::new(Some(proceed_rx))),
         close_on_proceed: true,

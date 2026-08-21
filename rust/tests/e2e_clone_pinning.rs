@@ -1773,50 +1773,6 @@ async fn cached_mismatched_manifest_is_rejected_on_every_use() {
     assert!(!target.exists());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn worktree_rejects_mismatched_manifest_before_git_registration() {
-    let _guard = env_lock().lock().await;
-    init(false);
-    let server = start_server_split_storage().await;
-    let origin = make_origin("acme", "worktree-manifest-guard");
-    origin.commit(&[("value.txt", "A\n")], "A");
-    origin.publish();
-    register_added_without_build(&server, "acme/worktree-manifest-guard")
-        .await
-        .expect("register worktree fixture");
-    server
-        .client()
-        .sync_repo("acme/worktree-manifest-guard", None)
-        .await
-        .expect("sync worktree fixture");
-    let (pinned, _) =
-        replace_full_manifest_commit(&server, "acme/worktree-manifest-guard", B).await;
-
-    let root = tempfile::tempdir().expect("worktree root");
-    let main_repo = root.path().join("main");
-    let clone_status = std::process::Command::new("git")
-        .args([
-            "clone",
-            origin.bare.to_str().unwrap(),
-            main_repo.to_str().unwrap(),
-        ])
-        .status()
-        .expect("clone main worktree fixture");
-    assert!(clone_status.success());
-    let target = root.path().join("linked");
-    let error = server
-        .client()
-        .add_worktree("acme/worktree-manifest-guard", "main", &main_repo, &target)
-        .await
-        .expect_err("worktree must reject manifest B under pin A");
-    let error = format!("{error:#}");
-    assert!(error.contains(&format!("manifest commit {B}")));
-    assert!(error.contains(&format!("pinned commit {pinned}")));
-    assert!(!target.exists());
-    let registrations = git(&main_repo, &["worktree", "list", "--porcelain"]);
-    assert!(!registrations.contains(target.to_str().unwrap()));
-}
-
 #[tokio::test]
 async fn cancelling_real_clone_waits_for_midx_writer_before_staging_cleanup() {
     let _guard = env_lock().lock().await;

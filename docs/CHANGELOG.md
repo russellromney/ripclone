@@ -2,6 +2,13 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `internal/ROADMAP.md`.
 
+## One client install and fetch path
+
+- **The experimental `worktree` command is deleted** (`rust/src/bin/cli.rs`, `rust/src/client.rs`, `rust/src/extract.rs`, `README.md`, `docs/BACKENDS.md`, `docs/BUILD_OPTIONS.md`): `ripclone worktree` is now an unknown subcommand, and its client methods (`add_worktree`, `install_worktree_files`) and the `extract.rs` URL-fetch path that only it used are gone. `extract.rs` performs no network request. Use `git worktree add` for a second checkout. `clone --mode editable` and `clone --mode files` are the two materialize surfaces.
+- **Dead client entry points removed**: `install_ref`, `install_repo`, `install_repo_with_mode`, `install_prebuilt_blob_pack`, `install_chunked_pack`, `manifest::verify_archive`, and the unused cache switch on the artifact fetch. `install_repo_with_mode_at` is the retained install entry point and tests now drive it.
+- **Byte and streamed-file artifact downloads share one set of rules** (`rust/src/client.rs`): the same HTTP request, status classification, retry budget, length + SHA-256 verification, and credential rule serve both outputs. Only where the bytes land differs — small artifacts stay a refcounted buffer, large history packs stream to one temporary file that is verified and renamed into `.git/objects/pack/`.
+- **Signed-URL failures are classified instead of lumped together**: transport errors, 408, 429, and 5xx retry the same URL with the existing bounded backoff; 401 or 403 from a signed object URL asks the clone loop to refresh URLs for the same pinned commit; 404, a wrong length, and a wrong hash fail immediately instead of entering the refresh loop. A signed object URL never receives the ripclone credential.
+
 ## One current wire implementation
 
 - **Authenticated API requests have one implementation** (`rust/src/client.rs`, `rust/src/server.rs`): the ripclone client declares the current `PROTOCOL_VERSION`; an explicitly malformed or mismatched declaration returns `426 Upgrade Required`. A missing declaration is an unversioned caller of that same implementation, which keeps vanilla Git and ordinary HTTP integrations working. Current ref and pending responses require their complete current fields, including explicit archive readiness and Full top-up support. No request or response shape selects an older implementation.

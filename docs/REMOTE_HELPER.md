@@ -6,7 +6,7 @@ ref, seeds `.git` from the prebuilt clonepack, and hands the objects back to git
 over a local `git upload-pack`. Install it on `PATH` (the installer and release
 tarball include it) and git picks it up automatically for `ripclone://` URLs.
 
-Use the `ripclone` CLI for the full feature set (files mode, `--temp`, worktrees,
+Use the `ripclone` CLI for the full feature set (files mode, `--temp`,
 `--verify-upstream`, progress). The helper is for the cases where you want a
 stock `git clone`/`git fetch` to go fast with no wrapper — CI steps, tools that
 shell out to `git`, `go get`-style fetchers.

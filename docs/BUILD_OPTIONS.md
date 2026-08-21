@@ -28,7 +28,7 @@ still ~2-3x faster than the default).
 Environment variables for tuning clone performance:
 
 - `RIPCLONE_FETCH_MAX_ATTEMPTS` / `RIPCLONE_FETCH_BACKOFF_MS` — retry budget and base backoff for transient download failures (defaults 3 and 100).
-- `RIPCLONE_IO_URING` — the worktree writer uses io_uring by default on Linux; set `=0` to force the POSIX writer.
+- `RIPCLONE_IO_URING` — the working-tree writer uses io_uring by default on Linux; set `=0` to force the POSIX writer.
 - `RIPCLONE_MODE` — default clone mode (`editable` or `files`) when `--mode` is omitted.
 - `RIPCLONE_CACHE_DIR` / `RIPCLONE_NO_CACHE` — opt in to (or force off) a local artifact cache; off by default.
 
@@ -45,7 +45,7 @@ If a crash immediately *after* the clone must not leave a torn tree that `git st
 
 This is done efficiently on both writer paths: the Linux io_uring writer batches `IORING_OP_FSYNC` (one submit per queue-depth chunk, not one blocking `fsync` per file); the POSIX fallback fsyncs sequentially. Off by default.
 
-> The `worktree` subcommand is **experimental (alpha)** and does not yet run this durability barrier; an interrupt during a worktree materialize may leave a partial tree. Full hardening is tracked separately. See the [three materialize surfaces](../README.md#which-one-do-i-use) for how `clone --mode editable`, `clone --mode files`, and `worktree` differ.
+See the [two materialize surfaces](../README.md#which-one-do-i-use) for how `clone --mode editable` and `clone --mode files` differ.
 
 ## Server-side state
 

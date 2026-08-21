@@ -254,10 +254,10 @@ async fn corrupt_artifact_fails_clone() {
     // hash-verification path is exercised on the tampered artifact.
     let out = tempfile::tempdir().unwrap();
     let res = client
-        .install_repo_with_mode(
-            "acme",
-            "corrupt",
+        .install_repo_with_mode_at(
+            "acme/corrupt",
             "HEAD",
+            None,
             out.path().join("clone"),
             CloneMode::Editable,
             Some("full"),
@@ -286,10 +286,10 @@ async fn missing_artifact_fails_clone() {
     // Clone the same (full) variant whose manifest we removed.
     let out = tempfile::tempdir().unwrap();
     let res = client
-        .install_repo_with_mode(
-            "acme",
-            "missing",
+        .install_repo_with_mode_at(
+            "acme/missing",
             "HEAD",
+            None,
             out.path().join("clone"),
             CloneMode::Editable,
             Some("full"),
@@ -374,10 +374,10 @@ async fn persistent_fetch_failure_fails_clone() {
 
     let out = tempfile::tempdir().unwrap();
     let res = client
-        .install_repo_with_mode(
-            "acme",
-            "retryfail",
+        .install_repo_with_mode_at(
+            "acme/retryfail",
             "HEAD",
+            None,
             out.path().join("clone"),
             CloneMode::Files,
             Some("full"),
@@ -450,10 +450,10 @@ async fn failed_clone_after_temp_dir_leaves_nothing() {
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("clone");
     let res = client
-        .install_repo_with_mode(
-            "acme",
-            "notemp",
+        .install_repo_with_mode_at(
+            "acme/notemp",
             "HEAD",
+            None,
             &target,
             CloneMode::Files,
             Some("full"),

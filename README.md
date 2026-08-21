@@ -35,17 +35,14 @@ On every push, ripclone prebuilds a **clonepack** for `HEAD` — a set of files 
 
 ### Which one do I use?
 
-ripclone has three ways to materialize a tree. They are not redundant — they mirror git's own clone-vs-worktree split.
+ripclone has two ways to materialize a tree.
 
 | Surface | What it produces | Source | Use this when… |
 |---|---|---|---|
 | `clone --mode editable` | A full git repo: `.git` (objects + packs) **and** a working tree | Prebuilt clonepack from the **server** | You want a normal repo to commit, branch, `git diff`, and push — the drop-in `git clone`. |
 | `clone --mode files` | **Just the source files** — no `.git`, no history | Prebuilt archive from the **server** | You only need the file contents (agents, CI, build inputs) and never run git in the tree. Fastest path. |
-| `worktree` | An **additional linked git worktree** attached to a repo you already have | The **local repo's** objects when it already has the rev; otherwise the server's prebuilt archive | You already cloned once and want a second checkout (another branch/rev) that shares the existing object store — like `git worktree add`, accelerated. **Experimental (alpha).** |
 
-Rule of thumb: `clone` brings a repo (or its files) down from the server; `worktree` spins up an extra checkout of a repo you already have. `--mode files` and `worktree` are **not** the same thing — one gives you bare files with no git, the other gives you a fully git-aware linked worktree.
-
-`worktree` always resolves the requested rev against the ripclone server, so it needs the server reachable; it only skips the file download when the local repo is already at that rev.
+Rule of thumb: `--mode editable` when you will run git in the tree, `--mode files` when you will not. For a second checkout of a repo you already have, use `git worktree add` directly.
 
 **Git LFS:** LFS objects come from your git host, not ripclone — run `git lfs pull` after cloning to fetch them. ripclone stores the LFS pointer files (it never stores the blobs); resolving them is a pass-through to your host by design.
 
@@ -163,13 +160,6 @@ CI hooks call automatically. If you prefer to pass the server per command
 instead of the env var, put the global flag first:
 `ripclone --server http://localhost:8000 add oven-sh/bun`.)
 
-Add a fast worktree — an additional linked checkout of a repo you already have, reusing its local objects and overlay staging (Linux). Experimental (alpha); see [Which one do I use?](#which-one-do-i-use):
-
-```bash
-cd bun
-cargo run --release --bin ripclone -- worktree ../bun-wt -b HEAD
-```
-
 ## GitHub Actions trigger
 
 Add a workflow to a repo so ripclone builds artifacts on every push. Set `RIPCLONE_SERVER` as a repository variable and `RIPCLONE_SERVER_TOKEN` as a repository secret. (A ready-to-copy version lives in [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).)
@@ -267,9 +257,6 @@ ripclone sync owner/repo --at HEAD~5           # build at a past rev
 # Register and admit a repo; add is fast unless --wait is requested
 ripclone add owner/repo
 ripclone add owner/repo --wait                 # wait for exact Full readiness
-
-# Add a fast worktree inside an existing clone (experimental, alpha)
-ripclone worktree ../wt -b HEAD
 ```
 
 For a private repo, pass an upstream credential with `--token`. The client sends it as `X-Upstream-Token` and the server translates it to the host's auth form (GitHub, GitLab, Gitea, …):
