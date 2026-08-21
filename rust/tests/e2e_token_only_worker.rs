@@ -431,7 +431,6 @@ async fn turso_primary_loss_rejects_ref_and_job_writes() {
 
     let job = BuildJob {
         repo_id: RepoId::github("acme/job-after-primary-loss"),
-        source_ref: Some("refs/heads/main".to_string()),
         admitted_commit: "1111111111111111111111111111111111111111".to_string(),
         repo_config: ripclone::repo_config::RepoConfig::default(),
         credential: None,

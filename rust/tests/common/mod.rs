@@ -753,7 +753,6 @@ async fn start_server_split_storage_inner(
                 let job = ripclone::queue::BuildJob {
                     repo_id: claimed.repo_id(),
                     admitted_commit: claimed.admitted_commit,
-                    source_ref: claimed.source_ref,
                     repo_config: claimed.repo_config,
                     credential: claimed.credential,
                     size_bytes: None,

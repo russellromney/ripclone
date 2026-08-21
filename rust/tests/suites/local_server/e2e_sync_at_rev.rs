@@ -175,18 +175,21 @@ async fn sync_at_symbolic_revision_stays_pinned_while_branch_advances() {
     assert_eq!(read(&clone, "value.txt"), "A\n");
 }
 
-/// A concrete-branch admission still initializes an exact-only mirror. Its
-/// single provider advertisement must retain the upstream symbolic HEAD so a
-/// later historical HEAD~N request resolves through the real default branch,
-/// never Git's platform-specific bare-init default.
+/// A concrete-branch job must not install its checkout name as mirror HEAD. A
+/// later historical HEAD~N request resolves the upstream default at its own
+/// request boundary, even when the named branch has a divergent history.
 #[tokio::test]
 async fn named_branch_admission_then_head_relative_history_uses_upstream_default() {
     setup(true);
     let server = start_server().await;
     let origin = make_origin("acme", "named-then-history");
     let old = origin.commit(&[("a.txt", "old\n")], "old");
-    let tip = origin.commit(&[("a.txt", "tip\n")], "tip");
+    origin.commit(&[("a.txt", "tip\n")], "tip");
     origin.publish();
+    git(&origin.work, &["checkout", "-q", "--orphan", "feature"]);
+    git(&origin.work, &["rm", "-q", "-rf", "."]);
+    origin.commit(&[("feature.txt", "base\n")], "feature base");
+    let feature_tip = origin.commit(&[("feature.txt", "tip\n")], "feature tip");
     git(
         &origin.work,
         &[
@@ -206,13 +209,17 @@ async fn named_branch_admission_then_head_relative_history_uses_upstream_default
         .sync_branch("acme/named-then-history", "feature")
         .await
         .expect("admit and build concrete feature branch");
-    assert_eq!(feature.commit, tip);
+    assert_eq!(feature.commit, feature_tip);
 
     let historical = client
         .sync_repo_at("acme/named-then-history", Some("HEAD~1"), None)
         .await
         .expect("HEAD~1 resolves after named-branch exact admission");
     assert_eq!(historical.commit, old);
+    assert_ne!(
+        historical.commit,
+        git(&origin.work, &["rev-parse", "feature~1"])
+    );
     let (_guard, target) = clone_full_rev(&server, "named-then-history", "HEAD~1", "1").await;
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), old);
     assert_eq!(read(&target, "a.txt"), "old\n");

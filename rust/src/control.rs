@@ -396,14 +396,13 @@ impl ControlDb {
         let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO jobs
-                 (key, provider, path, source_ref, status, created_at, admitted_commit,
+                 (key, provider, path, status, created_at, admitted_commit,
                   repo_config, credential, attempts, size_class)
-                 VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, 0, ?9)",
+                 VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, 0, ?8)",
                 libsql::params![
                     key.clone(),
                     job.repo_id.provider.as_str(),
                     job.repo_id.path.as_str(),
-                    job.source_ref.as_deref(),
                     crate::queue::sql::now_secs(),
                     job.admitted_commit.as_str(),
                     repo_config,
@@ -663,11 +662,10 @@ mod tests {
     use super::*;
     use crate::queue::{JobQueue, JobState};
 
-    fn job(commit: &str, source_ref: &str) -> BuildJob {
+    fn job(commit: &str, _checkout_name: &str) -> BuildJob {
         BuildJob {
             repo_id: crate::provider::RepoId::github("acme/control"),
             admitted_commit: commit.to_string(),
-            source_ref: Some(source_ref.to_string()),
             repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,

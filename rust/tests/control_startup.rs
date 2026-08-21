@@ -192,7 +192,6 @@ async fn rejected_startup_neither_contacts_s3_nor_mutates_existing_control_rows(
         .enqueue(BuildJob {
             repo_id: RepoId::github("acme/preserved"),
             admitted_commit: "1111111111111111111111111111111111111111".to_string(),
-            source_ref: Some("main".to_string()),
             repo_config: ripclone::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,

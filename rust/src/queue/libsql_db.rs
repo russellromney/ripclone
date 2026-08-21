@@ -86,7 +86,6 @@ impl QueueDb for LibsqlDb {
         key: &str,
         provider: &str,
         path: &str,
-        source_ref: Option<&str>,
         admitted_commit: &str,
         repo_config: &str,
         credential: Option<&str>,
@@ -99,13 +98,12 @@ impl QueueDb for LibsqlDb {
             None => libsql::Value::Null,
         };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, source_ref, admitted_commit, repo_config, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+            "INSERT INTO jobs (key, provider, path, admitted_commit, repo_config, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
             libsql::params![
                 key,
                 provider,
                 path,
-                source_ref,
                 admitted_commit,
                 repo_config,
                 cred_val,
@@ -244,20 +242,11 @@ impl QueueDb for LibsqlDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<
-        Option<(
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            Option<String>,
-        )>,
-    > {
+    ) -> Result<Option<(String, String, String, String, Option<String>)>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT provider, path, source_ref, admitted_commit, repo_config, credential FROM jobs WHERE id = ?",
+                "SELECT provider, path, admitted_commit, repo_config, credential FROM jobs WHERE id = ?",
                 [id],
             )
             .await
@@ -266,10 +255,9 @@ impl QueueDb for LibsqlDb {
             Some(row) => Ok(Some((
                 row.get::<String>(0)?,
                 row.get::<String>(1)?,
-                row.get::<Option<String>>(2)?,
+                row.get::<String>(2)?,
                 row.get::<String>(3)?,
-                row.get::<String>(4)?,
-                row.get::<Option<String>>(5)?,
+                row.get::<Option<String>>(4)?,
             ))),
             None => Ok(None),
         }

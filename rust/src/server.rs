@@ -1805,7 +1805,6 @@ async fn job_claim_handler(
                 id: c.id,
                 provider: c.provider,
                 path: c.path,
-                source_ref: c.source_ref,
                 admitted_commit: c.admitted_commit,
                 repo_config: c.repo_config,
                 credential: c.credential.map(|s| s.expose_secret().to_string()),
@@ -2824,41 +2823,60 @@ async fn get_ref_inner(
         };
 
     state.metrics.record_ref_lookup();
-    let (commit, checkout_name, source_ref, already_pinned) =
-        if let Some(pinned) = params.pinned.as_deref() {
-            admission_test_http(format!(
-                "GET /v1/repos/{}/refs/{requested_checkout}?pinned={pinned}&clonepack={}",
-                repo_id.storage_key(),
-                params.clonepack
-            ));
-            (
-                pinned.to_string(),
-                requested_checkout.clone(),
-                Some(requested_checkout.clone()),
-                true,
+    let (commit, checkout_name, already_pinned) = if let Some(pinned) = params.pinned.as_deref() {
+        admission_test_http(format!(
+            "GET /v1/repos/{}/refs/{requested_checkout}?pinned={pinned}&clonepack={}",
+            repo_id.storage_key(),
+            params.clonepack
+        ));
+        (pinned.to_string(), requested_checkout.clone(), true)
+    } else if let Some(rev) = params.rev.as_deref() {
+        if validation::validate_object_id(rev).is_ok() {
+            (rev.to_string(), requested_checkout.clone(), false)
+        } else {
+            let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+            let lock = repo_lock(&state.sync_locks, &repo_id).await;
+            let _guard = lock.lock().await;
+            if let Err(error) = ensure_mirror(
+                &mirror_dir,
+                &provider,
+                &repo_id,
+                &requested_checkout,
+                Some(rev),
+                credential.as_ref(),
             )
-        } else if let Some(rev) = params.rev.as_deref() {
-            if validation::validate_object_id(rev).is_ok() {
-                (
-                    rev.to_string(),
-                    requested_checkout.clone(),
-                    Some(requested_checkout.clone()),
-                    false,
+            .await
+            {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse {
+                        error: format!("cannot resolve exact revision {rev}: {error:#}"),
+                    }),
                 )
-            } else {
-                let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-                let lock = repo_lock(&state.sync_locks, &repo_id).await;
-                let _guard = lock.lock().await;
-                if let Err(error) = ensure_mirror(
-                    &mirror_dir,
-                    &provider,
-                    &repo_id,
-                    &requested_checkout,
-                    Some(rev),
-                    credential.as_ref(),
-                )
-                .await
+                    .into_response();
+            }
+            let checkout_name = if requested_checkout == "HEAD" {
+                match git::default_branch(&mirror_dir)
+                    .ok()
+                    .filter(|name| !name.is_empty() && name != "HEAD")
                 {
+                    Some(name) => name,
+                    None => {
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(ErrorResponse {
+                                error: "cannot determine checkout name for HEAD".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
+            } else {
+                requested_checkout.clone()
+            };
+            let commit = match git::resolve_commit(&mirror_dir, rev) {
+                Ok(commit) => commit,
+                Err(error) => {
                     return (
                         StatusCode::UNPROCESSABLE_ENTITY,
                         Json(ErrorResponse {
@@ -2867,17 +2885,35 @@ async fn get_ref_inner(
                     )
                         .into_response();
                 }
+            };
+            (commit, checkout_name, false)
+        }
+    } else {
+        admission_test_tip_probe();
+        let tip = {
+            let _permit = fetch_semaphore()
+                .acquire()
+                .await
+                .expect("fetch semaphore never closed");
+            git::ls_remote_tip_async(
+                &provider,
+                &repo_id,
+                &requested_checkout,
+                credential.as_ref(),
+            )
+            .await
+        };
+        match tip {
+            Ok(Some(tip)) => {
                 let checkout_name = if requested_checkout == "HEAD" {
-                    match git::default_branch(&mirror_dir)
-                        .ok()
-                        .filter(|name| !name.is_empty() && name != "HEAD")
-                    {
+                    match tip.default_branch.filter(|name| !name.is_empty()) {
                         Some(name) => name,
                         None => {
                             return (
                                 StatusCode::UNPROCESSABLE_ENTITY,
                                 Json(ErrorResponse {
-                                    error: "cannot determine checkout name for HEAD".to_string(),
+                                    error: "upstream HEAD did not advertise a checkout name"
+                                        .to_string(),
                                 }),
                             )
                                 .into_response();
@@ -2886,81 +2922,28 @@ async fn get_ref_inner(
                 } else {
                     requested_checkout.clone()
                 };
-                let commit = match git::resolve_commit(&mirror_dir, rev) {
-                    Ok(commit) => commit,
-                    Err(error) => {
-                        return (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            Json(ErrorResponse {
-                                error: format!("cannot resolve exact revision {rev}: {error:#}"),
-                            }),
-                        )
-                            .into_response();
-                    }
-                };
-                (commit, checkout_name.clone(), Some(checkout_name), false)
+                (tip.commit, checkout_name, false)
             }
-        } else {
-            admission_test_tip_probe();
-            let tip = {
-                let _permit = fetch_semaphore()
-                    .acquire()
-                    .await
-                    .expect("fetch semaphore never closed");
-                git::ls_remote_tip_async(
-                    &provider,
-                    &repo_id,
-                    &requested_checkout,
-                    credential.as_ref(),
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("upstream ref not found: {requested_checkout}"),
+                    }),
                 )
-                .await
-            };
-            match tip {
-                Ok(Some(tip)) => {
-                    let checkout_name = if requested_checkout == "HEAD" {
-                        match tip.default_branch.filter(|name| !name.is_empty()) {
-                            Some(name) => name,
-                            None => {
-                                return (
-                                    StatusCode::UNPROCESSABLE_ENTITY,
-                                    Json(ErrorResponse {
-                                        error: "upstream HEAD did not advertise a checkout name"
-                                            .to_string(),
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                        }
-                    } else {
-                        requested_checkout.clone()
-                    };
-                    (
-                        tip.commit,
-                        checkout_name.clone(),
-                        Some(checkout_name),
-                        false,
-                    )
-                }
-                Ok(None) => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(ErrorResponse {
-                            error: format!("upstream ref not found: {requested_checkout}"),
-                        }),
-                    )
-                        .into_response();
-                }
-                Err(error) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(ErrorResponse {
-                            error: format!("upstream tip probe failed: {error:#}"),
-                        }),
-                    )
-                        .into_response();
-                }
+                    .into_response();
             }
-        };
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse {
+                        error: format!("upstream tip probe failed: {error:#}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
 
     let existing = match state.ref_store.load_result(&repo_id, &commit).await {
         Ok(result) => result,
@@ -3016,7 +2999,6 @@ async fn get_ref_inner(
         let job = BuildJob {
             repo_id: repo_id.clone(),
             admitted_commit: commit.clone(),
-            source_ref,
             repo_config: crate::repo_config::RepoConfig::default(),
             credential: credential.clone(),
             size_bytes,
@@ -3114,6 +3096,43 @@ async fn wait_test_phase_two_barrier(commit: &str) -> Result<()> {
     while !dir.join("proceed").exists() {
         if Instant::now() >= deadline {
             anyhow::bail!("test phase-two barrier was not released within 60 seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Ok(())
+}
+
+fn test_build_crash_barrier_matches(stage: &str, commit: &str) -> bool {
+    explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref())
+        && std::env::var("RIPCLONE_TEST_BUILD_CRASH_STAGE").as_deref() == Ok(stage)
+        && std::env::var("RIPCLONE_TEST_BUILD_CRASH_COMMIT")
+            .ok()
+            .is_none_or(|target| target == commit)
+}
+
+/// Deterministic cancellation point used only by direct worker-crash tests.
+/// The first attempt signals `entered` and waits. A retried exact build sees
+/// that signal and continues, so the test can abort the original task and prove
+/// recovery without a timer race or a production behavior change.
+async fn wait_test_build_crash_barrier(stage: &str, commit: &str) -> Result<()> {
+    if !test_build_crash_barrier_matches(stage, commit) {
+        return Ok(());
+    }
+    let Some(dir) = std::env::var_os("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR").map(PathBuf::from)
+    else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&dir).context("create test build-crash barrier directory")?;
+    let entered = dir.join("entered");
+    if entered.exists() {
+        return Ok(());
+    }
+    std::fs::write(&entered, format!("{stage} {commit}\n"))
+        .context("signal test build-crash barrier")?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !dir.join("proceed").exists() {
+        if Instant::now() >= deadline {
+            anyhow::bail!("test build-crash barrier was not released within 60 seconds");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -3669,7 +3688,6 @@ async fn sync_repo_inner(
     let job = BuildJob {
         repo_id: repo_id.clone(),
         admitted_commit: commit.clone(),
-        source_ref: Some(admitted_branch.clone()),
         repo_config: crate::repo_config::RepoConfig::default(),
         credential,
         size_bytes,
@@ -3880,7 +3898,6 @@ async fn sync_repo_at_revision(
     let job = BuildJob {
         repo_id: repo_id.clone(),
         admitted_commit: at_rev.clone(),
-        source_ref: Some(branch.clone()),
         repo_config: crate::repo_config::RepoConfig::default(),
         credential,
         size_bytes,
@@ -4183,7 +4200,6 @@ async fn prepare_exact_admission(
 async fn trigger_build(
     state: &ServerState,
     repo_id: &RepoId,
-    source_ref: Option<&str>,
     admitted_commit: String,
 ) -> Result<EnqueueOutcome, String> {
     match state.ref_store.load_added_repo(repo_id).await {
@@ -4219,7 +4235,6 @@ async fn trigger_build(
     let job = BuildJob {
         repo_id: repo_id.clone(),
         admitted_commit,
-        source_ref: source_ref.map(str::to_string),
         repo_config: crate::repo_config::RepoConfig::default(),
         credential,
         size_bytes,
@@ -4478,7 +4493,7 @@ async fn build_handler(
         .default_branch
         .clone()
         .unwrap_or_else(|| "HEAD".to_string());
-    match trigger_build(&state, &job_repo_id, Some("HEAD"), tip.commit.clone()).await {
+    match trigger_build(&state, &job_repo_id, tip.commit.clone()).await {
         Ok(outcome) => (
             StatusCode::ACCEPTED,
             Json(BuildResponse {
@@ -4671,7 +4686,7 @@ async fn webhook_dispatch_push(
     }
     // The signed, validated `after` is the admission target. No second
     // upstream probe is permitted on this path.
-    match trigger_build(state, &repo_id, Some(&branch), after.to_string()).await {
+    match trigger_build(state, &repo_id, after.to_string()).await {
         Ok(_) => {
             info!(
                 "webhook: triggered build for {}@{branch}",
@@ -5352,7 +5367,6 @@ async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     repo_id: &RepoId,
-    source_ref: Option<&str>,
     // Every request resolves to one immutable object before admission. Workers
     // fetch and build only this object; they never resolve a moving selector.
     admitted_commit: &str,
@@ -5403,7 +5417,6 @@ async fn do_sync(
     let provider_sync = provider.clone();
     let repo_id_sync = repo_id.clone();
     let admitted_commit_sync = admitted_commit.to_string();
-    let source_ref_sync = source_ref.map(str::to_string);
     let credential_sync = credential.cloned();
     admission_test_fetch_entry(Some(admitted_commit)).await;
     // Cap concurrent upstream fetches across the process (bandwidth + upstream
@@ -5418,7 +5431,6 @@ async fn do_sync(
             &provider_sync,
             &repo_id_sync,
             &admitted_commit_sync,
-            source_ref_sync.as_deref(),
             credential_sync.as_ref(),
         )
     })
@@ -5891,11 +5903,30 @@ async fn build_and_publish_two_phase(
     let head_idx_keep: std::collections::HashSet<String> =
         head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
     let upload_start = Instant::now();
-    upload_artifacts(cas, storage, p1.clone(), upload_conc).await?;
+    wait_test_build_crash_barrier("before_upload", commit).await?;
+    if test_build_crash_barrier_matches("during_upload", commit) {
+        let first = p1
+            .first()
+            .cloned()
+            .context("phase-one upload set is empty")?;
+        upload_artifacts(cas, storage, vec![first], upload_conc).await?;
+        wait_test_build_crash_barrier("during_upload", commit).await?;
+        upload_artifacts(
+            cas,
+            storage,
+            p1.iter().skip(1).cloned().collect(),
+            upload_conc,
+        )
+        .await?;
+    } else {
+        upload_artifacts(cas, storage, p1.clone(), upload_conc).await?;
+    }
+    wait_test_build_crash_barrier("after_upload", commit).await?;
     settle_storage(cas, storage, retention, p1, head_idx_keep).await;
     phases.upload_p1_ms = Some(duration_ms(upload_start.elapsed()));
 
     let publish_start = Instant::now();
+    wait_test_build_crash_barrier("before_ready_publication", commit).await?;
     admission_test_ref_store_write();
     ref_store
         .save_result(repo_id, &info)
@@ -6653,7 +6684,6 @@ async fn process_build_job_with_foreground_release(
         &state.cas,
         &mirror_dir,
         repo_id,
-        job.source_ref.as_deref(),
         &job.admitted_commit,
         &state.ref_store,
         &state.storage,
@@ -6895,7 +6925,6 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                 let job = BuildJob {
                                     repo_id: repo_id.clone(),
                                     admitted_commit: admitted_commit.clone(),
-                                    source_ref: claimed.source_ref,
                                     repo_config: claimed.repo_config,
                                     credential,
                                     size_bytes: None,
@@ -7054,7 +7083,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
         let Ok(Some(tip)) = tip else {
             continue; // unknown HEAD / probe failed
         };
-        match trigger_build(state, &repo_id, Some("HEAD"), tip.commit.clone()).await {
+        match trigger_build(state, &repo_id, tip.commit.clone()).await {
             Ok(EnqueueOutcome::Enqueued) => {
                 triggered += 1;
                 info!(
@@ -8538,7 +8567,6 @@ mod tests {
         assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
         let job = rx.try_recv().expect("OIDC wakeup enqueued exact HEAD job");
         assert_eq!(job.repo_id, RepoId::github("acme/widget"));
-        assert_eq!(job.source_ref.as_deref(), Some("HEAD"));
         assert_eq!(job.admitted_commit, head);
         assert_ne!(job.admitted_commit, decoy);
         assert!(rx.try_recv().is_err(), "one HEAD probe admitted one job");
@@ -8569,7 +8597,6 @@ mod tests {
             &state.cas,
             &mirror_dir,
             &repo_id,
-            Some("main"),
             &missing,
             &state.ref_store,
             &state.storage,
@@ -8609,6 +8636,133 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn worker_crashes_at_artifact_boundaries_never_publish_false_ready_results() {
+        let _env = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
+            std::env::set_var("RIPCLONE_TESTING", "1");
+        }
+
+        for stage in [
+            "before_upload",
+            "during_upload",
+            "after_upload",
+            "before_ready_publication",
+        ] {
+            let repo_path = format!("acme/crash-{}", stage.replace('_', "-"));
+            let origin_path = origin_base.path().join(format!("{repo_path}.git"));
+            std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+            let origin = crate::test_fixture::init_bare(&origin_path);
+            let admitted = crate::test_fixture::commit(
+                &origin,
+                &[("value.txt", format!("{stage}\n").as_bytes())],
+            );
+            let later = crate::test_fixture::commit(&origin, &[("value.txt", b"later\n")]);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let state = test_state(&tmp);
+            let repo_id = RepoId::github(&repo_path);
+            let job = BuildJob {
+                repo_id: repo_id.clone(),
+                admitted_commit: admitted.clone(),
+                repo_config: crate::repo_config::RepoConfig::default(),
+                credential: None,
+                size_bytes: None,
+            };
+            let pending = prepare_exact_admission(&state, &job)
+                .await
+                .unwrap()
+                .expect("new exact result admission")
+                .pending;
+            state
+                .ref_store
+                .save_result(&repo_id, &pending)
+                .await
+                .unwrap();
+
+            let barrier = tmp.path().join(format!("crash-{stage}"));
+            unsafe {
+                std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_STAGE", stage);
+                std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_COMMIT", &admitted);
+                std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR", &barrier);
+            }
+            let crashed_state = state.clone();
+            let crashed_job = job.clone();
+            let attempt =
+                tokio::spawn(async move { process_build_job(&crashed_state, &crashed_job).await });
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !barrier.join("entered").exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("worker reached deterministic {stage} barrier"));
+            attempt.abort();
+            assert!(
+                attempt.await.unwrap_err().is_cancelled(),
+                "{stage}: the admitted worker task is the crashed attempt"
+            );
+
+            let interrupted = state
+                .ref_store
+                .load_result(&repo_id, &admitted)
+                .await
+                .unwrap()
+                .expect("interrupted exact row remains retryable");
+            assert_eq!(interrupted.commit, admitted, "{stage}: no wrong commit");
+            assert!(
+                interrupted.shallow_clonepack.manifest.is_empty(),
+                "{stage}: interrupted upload must not expose a ready Head result"
+            );
+            assert!(
+                interrupted.full_clonepack.manifest.is_empty(),
+                "{stage}: interrupted upload must not expose a ready Full result"
+            );
+            assert!(
+                state
+                    .ref_store
+                    .load_result(&repo_id, &later)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{stage}: the worker must not publish the branch's later commit"
+            );
+
+            let recovered = process_build_job(&state, &job)
+                .await
+                .unwrap_or_else(|error| panic!("{stage}: exact retry failed: {error:#}"));
+            assert_eq!(recovered.info.commit, admitted);
+            assert!(exact_ref_info_serves_commit(
+                &recovered.info,
+                "shallow",
+                &admitted
+            ));
+            assert!(exact_ref_info_serves_commit(
+                &recovered.info,
+                "full",
+                &admitted
+            ));
+            assert_eq!(
+                state.ref_store.list_commits(&repo_id).await.unwrap(),
+                vec![admitted],
+                "{stage}: crash and retry must not create an extra result"
+            );
+        }
+
+        unsafe {
+            std::env::remove_var("RIPCLONE_TEST_BUILD_CRASH_STAGE");
+            std::env::remove_var("RIPCLONE_TEST_BUILD_CRASH_COMMIT");
+            std::env::remove_var("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR");
+            std::env::remove_var("RIPCLONE_TESTING");
+            std::env::remove_var("RIPCLONE_ORIGIN_BASE");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn historical_source_failure_retries_only_same_exact_commit() {
         let _env = crate::git::ORIGIN_BASE_LOCK
             .lock()
@@ -8642,7 +8796,6 @@ mod tests {
         let job = BuildJob {
             repo_id: repo_id.clone(),
             admitted_commit: missing.clone(),
-            source_ref: Some("main".to_string()),
             repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,
@@ -8696,7 +8849,6 @@ mod tests {
         let retry = rx.try_recv().expect("failed exact result is retried");
         assert_eq!(retry.repo_id, repo_id);
         assert_eq!(retry.admitted_commit, missing);
-        assert_eq!(retry.source_ref.as_deref(), Some("main"));
         assert!(
             rx.try_recv().is_err(),
             "retry must enqueue exactly one job for the failed commit"
@@ -8837,7 +8989,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let job = rx.try_recv().expect("a build job was enqueued");
         assert_eq!(job.repo_id, RepoId::github("acme/widget"));
-        assert_eq!(job.source_ref.as_deref(), Some("main"));
+        assert_eq!(job.admitted_commit, "1".repeat(40));
         assert!(rx.try_recv().is_err(), "exactly one job enqueued");
     }
 
@@ -9212,7 +9364,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let job = rx.try_recv().expect("gitlab default-branch push enqueues");
         assert_eq!(job.repo_id.path, "group/sub/proj");
-        assert_eq!(job.source_ref.as_deref(), Some("main"));
+        assert_eq!(job.admitted_commit, "1".repeat(40));
     }
 
     #[tokio::test]
@@ -9268,7 +9420,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let job = rx.try_recv().expect("gitea default-branch push enqueues");
         assert_eq!(job.repo_id.path, "acme/widget");
-        assert_eq!(job.source_ref.as_deref(), Some("main"));
+        assert_eq!(job.admitted_commit, "1".repeat(40));
     }
 
     #[tokio::test]
@@ -9382,7 +9534,6 @@ mod tests {
         assert_eq!(poll_once(&state).await, 1);
         let first = observed.try_recv().expect("HEAD poll admitted exact work");
         assert_eq!(first.admitted_commit, tip);
-        assert_eq!(first.source_ref.as_deref(), Some("HEAD"));
         assert_eq!(poll_once(&state).await, 0);
         assert!(
             observed.try_recv().is_err(),
@@ -10149,7 +10300,6 @@ mod tests {
         let job = rx
             .try_recv()
             .expect("initial GET must admit the evicted ordinary ref");
-        assert_eq!(job.source_ref.as_deref(), Some("main"));
         assert_eq!(job.admitted_commit, commit);
         assert!(rx.try_recv().is_err(), "exactly one rebuild is admitted");
 
@@ -10346,7 +10496,6 @@ mod tests {
             .try_recv()
             .expect("evicted ref read must enqueue a rebuild");
         assert_eq!(job.repo_id, rid);
-        assert_eq!(job.source_ref.as_deref(), Some("main"));
         assert_eq!(job.admitted_commit, tip);
         assert!(
             rx.try_recv().is_err(),
@@ -10412,7 +10561,6 @@ mod tests {
         // Its historical target must already be the resolved B, not HEAD~2.
         let e = crate::test_fixture::commit(&origin, &[("f.txt", b"E")]);
         let job = rx.try_recv().expect("historical B rebuild admitted");
-        assert_eq!(job.source_ref.as_deref(), Some("main"));
         assert_eq!(job.admitted_commit, b);
         let built = process_build_job(&state, &job)
             .await
@@ -10519,7 +10667,6 @@ mod tests {
             .await
             .unwrap()
             .expect("exact revision job is claimable");
-        assert_eq!(claimed.source_ref.as_deref(), Some("main"));
         assert_eq!(claimed.admitted_commit, b);
     }
 

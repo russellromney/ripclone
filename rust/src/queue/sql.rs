@@ -67,8 +67,6 @@ pub struct ClaimedJob {
     pub provider: String,
     /// Opaque repo path (`owner/repo` for GitHub).
     pub path: String,
-    /// Optional fetch hint; never result or job identity.
-    pub source_ref: Option<String>,
     /// Exact commit admitted by the server before enqueue.
     pub admitted_commit: String,
     /// Validated repository build settings snapshotted at admission.
@@ -131,7 +129,6 @@ pub trait QueueDb: Send + Sync {
         key: &str,
         provider: &str,
         path: &str,
-        source_ref: Option<&str>,
         admitted_commit: &str,
         repo_config: &str,
         credential: Option<&str>,
@@ -177,22 +174,13 @@ pub trait QueueDb: Send + Sync {
     /// iff the claimed row was refreshed.
     async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
 
-    /// `(provider, path, source_ref, admitted_commit, repo_config, credential)`
+    /// `(provider, path, admitted_commit, repo_config, credential)`
     /// for a job id.
     /// `credential` is the stored base64 blob (or `None`).
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<
-        Option<(
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            Option<String>,
-        )>,
-    >;
+    ) -> Result<Option<(String, String, String, String, Option<String>)>>;
 
     /// Settle a claimed job: `status` is `done` or `failed`, with optional
     /// error. Conditional on the caller still owning the claim — the UPDATE
@@ -725,7 +713,7 @@ impl SqlJobQueue {
                 return Ok(None);
             };
             if self.db.try_claim(id, worker_id, now).await? {
-                let Some((provider, path, source_ref, admitted_commit, repo_config, credential)) =
+                let Some((provider, path, admitted_commit, repo_config, credential)) =
                     self.db.job_fields(id).await?
                 else {
                     continue;
@@ -739,7 +727,6 @@ impl SqlJobQueue {
                     id,
                     provider,
                     path,
-                    source_ref,
                     admitted_commit,
                     repo_config,
                     credential: decode_credential(credential),
@@ -842,7 +829,6 @@ impl JobQueue for SqlJobQueue {
                 &key,
                 job.repo_id.provider.as_str(),
                 &job.repo_id.path,
-                job.source_ref.as_deref(),
                 &job.admitted_commit,
                 &repo_config,
                 credential.as_deref(),
@@ -935,7 +921,6 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     key TEXT NOT NULL,
     provider TEXT NOT NULL,
     path TEXT NOT NULL,
-    source_ref TEXT,
     status TEXT NOT NULL,
     worker_id TEXT,
     created_at INTEGER NOT NULL,
@@ -999,11 +984,10 @@ mod tests {
         )
     }
 
-    fn job_at(owner: &str, repo: &str, branch: &str, commit: &str) -> BuildJob {
+    fn job_at(owner: &str, repo: &str, _checkout_name: &str, commit: &str) -> BuildJob {
         BuildJob {
             repo_id: RepoId::github(format!("{owner}/{repo}")),
             admitted_commit: commit.into(),
-            source_ref: Some(branch.into()),
             repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,
@@ -1054,12 +1038,8 @@ mod tests {
 
             let claimed = q.claim("w1").await.unwrap().unwrap();
             assert_eq!(
-                (
-                    claimed.provider.as_str(),
-                    claimed.path.as_str(),
-                    claimed.source_ref.as_deref().unwrap()
-                ),
-                ("github", "o/r", "main"),
+                (claimed.provider.as_str(), claimed.path.as_str()),
+                ("github", "o/r"),
                 "{engine}"
             );
             assert_eq!(
@@ -1137,7 +1117,6 @@ mod tests {
                 "k",
                 "github",
                 "o/r",
-                Some("main"),
                 "1111111111111111111111111111111111111111",
                 "{}",
                 Some("dG9rZW4="),
@@ -1146,12 +1125,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let (_, _, _, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(before.as_deref(), Some("dG9rZW4="));
         // finish is conditional on owning the claim: claim it as "w" first.
         assert!(db.try_claim(id, "w", 2).await.unwrap());
         assert!(db.finish(id, "w", "done", 3, None).await.unwrap());
-        let (_, _, _, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
         assert!(after.is_none(), "credential must be cleared on finish");
     }
 
@@ -1990,9 +1969,8 @@ mod tests {
 
         let first = q.claim("w1").await.unwrap().unwrap();
         assert_eq!(
-            first.source_ref.as_deref(),
-            Some("main"),
-            "oldest queued claimed first"
+            first.admitted_commit, "1111111111111111111111111111111111111111",
+            "oldest exact commit claimed first"
         );
         q.ack(first.id, "w1", Ok(())).await.unwrap();
         assert!(matches!(
@@ -2001,7 +1979,10 @@ mod tests {
         ));
 
         let second = q.claim("w1").await.unwrap().unwrap();
-        assert_eq!(second.source_ref.as_deref(), Some("dev"));
+        assert_eq!(
+            second.admitted_commit,
+            "2222222222222222222222222222222222222222"
+        );
         q.ack(second.id, "w1", Err(BuildError::permanent("boom")))
             .await
             .unwrap();

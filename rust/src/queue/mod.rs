@@ -32,9 +32,6 @@ pub struct BuildJob {
     /// Exact commit admitted for this build. Every selector is resolved before
     /// enqueue, so ordinary and explicit requests for the same result coalesce.
     pub admitted_commit: String,
-    /// Optional source ref used only as a fetch hint. Workers still verify and
-    /// build `admitted_commit`; this value is never result or job identity.
-    pub source_ref: Option<String>,
     /// Validated repository build settings captured by the server at
     /// admission. Workers use this immutable snapshot and never read live
     /// repository configuration.

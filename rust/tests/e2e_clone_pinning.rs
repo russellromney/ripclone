@@ -410,14 +410,13 @@ async fn pinned_top_up_requires_the_current_pending_shape() {
 }
 
 #[tokio::test]
-async fn service_unavailable_switches_to_exact_only_after_a_pin_exists() {
+async fn exact_service_unavailable_establishes_and_preserves_the_pin() {
     let _guard = env_lock().lock().await;
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
         std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "3");
     }
-    let unavailable = || (StatusCode::SERVICE_UNAVAILABLE, json!({"error": "busy"}));
     let exact_unavailable = || {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -426,19 +425,17 @@ async fn service_unavailable_switches_to_exact_only_after_a_pin_exists() {
     };
 
     let (url, pre_pin_requests, pre_pin_task) =
-        scripted_server(vec![unavailable(), ready(A)]).await;
+        scripted_server(vec![exact_unavailable(), ready(A)]).await;
     Client::new(url)
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await
-        .expect("pre-pin 503 may retry the unresolved selector");
+        .expect("the first exact 503 pins subsequent polling");
     abort_server_task(pre_pin_task).await;
     {
         let pre_pin_requests = pre_pin_requests.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            pre_pin_requests
-                .iter()
-                .all(|request| !request.contains("pinned="))
-        );
+        assert_eq!(pre_pin_requests.len(), 2);
+        assert!(!pre_pin_requests[0].contains("pinned="));
+        assert!(pre_pin_requests[1].contains(&format!("pinned={A}")));
     }
 
     let (url, post_pin_requests, post_pin_task) =

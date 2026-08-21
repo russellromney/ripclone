@@ -54,8 +54,6 @@ pub struct ClaimedJobWire {
     pub id: JobId,
     pub provider: String,
     pub path: String,
-    #[serde(default)]
-    pub source_ref: Option<String>,
     /// Exact commit admitted before enqueue.
     pub admitted_commit: String,
     pub repo_config: crate::repo_config::RepoConfig,
@@ -292,7 +290,6 @@ impl WorkerQueue for ApiJobQueue {
             id: j.id,
             provider: j.provider,
             path: j.path,
-            source_ref: j.source_ref,
             admitted_commit: j.admitted_commit,
             repo_config: j.repo_config,
             credential: j.credential.map(|c| SecretString::new(c.into())),

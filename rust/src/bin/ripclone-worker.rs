@@ -261,7 +261,6 @@ async fn main() -> Result<()> {
                 let job = BuildJob {
                     repo_id: repo_id.clone(),
                     admitted_commit,
-                    source_ref: claimed.source_ref,
                     repo_config: claimed.repo_config,
                     credential,
                     size_bytes: None,

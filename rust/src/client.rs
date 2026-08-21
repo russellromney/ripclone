@@ -1561,24 +1561,34 @@ impl Client {
             }
             if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
                 polled = true;
-                let unavailable = if pinned.is_some() || expected_commit.is_some() {
-                    let unavailable: ExactRevisionUnavailableResponse = resp
-                        .json()
-                        .await
-                        .with_context(|| format!("invalid unavailable response for {repo_path}"))?;
-                    validate_ref_response_identity(
-                        pinned.as_deref().or(expected_commit),
-                        resolved_branch.as_deref().or(Some(branch)),
-                        &unavailable.commit,
-                        &unavailable.branch,
-                        "503",
-                        repo_path,
-                    )?;
-                    *resolved_branch = Some(unavailable.branch.clone());
-                    Some(unavailable)
-                } else {
-                    None
-                };
+                let body = resp
+                    .bytes()
+                    .await
+                    .with_context(|| format!("read unavailable response for {repo_path}"))?;
+                let unavailable =
+                    match serde_json::from_slice::<ExactRevisionUnavailableResponse>(&body) {
+                        Ok(unavailable) => {
+                            validate_ref_response_identity(
+                                pinned.as_deref().or(expected_commit),
+                                resolved_branch.as_deref().or(Some(branch)),
+                                &unavailable.commit,
+                                &unavailable.branch,
+                                "503",
+                                repo_path,
+                            )?;
+                            if pinned.is_none() {
+                                *pinned = Some(unavailable.commit.clone());
+                            }
+                            *resolved_branch = Some(unavailable.branch.clone());
+                            Some(unavailable)
+                        }
+                        Err(error) if pinned.is_some() || expected_commit.is_some() => {
+                            return Err(error).with_context(|| {
+                                format!("invalid unavailable response for {repo_path}")
+                            });
+                        }
+                        Err(_) => None,
+                    };
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
