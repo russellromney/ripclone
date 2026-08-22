@@ -46,8 +46,9 @@ Internal tuning knobs use code constants at their current defaults.
   `small` (≤1 GiB) | `large` (catch-all). Worker flag:
   `ripclone-worker --max-size-class <name>` claims only jobs at or below that
   class; omit the flag to claim everything (single-worker self-host unchanged).
-- `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>`, `RIPCLONE_WEBHOOK_ALLOWLIST`,
-  `RIPCLONE_WEBHOOK_WARM_ALL` - webhook authentication and warming policy.
+- `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>`, `RIPCLONE_WEBHOOK_ALLOWLIST` - webhook
+  authentication and added-repository allowlist. Only the payload-identified
+  default branch admits exact work.
 - `RIPCLONE_POLL_INTERVAL_SECS` - fallback polling interval, default `300`
   (on); `0` disables it.
 - `RIPCLONE_REMOTE_GC_INTERVAL_SECS`, `RIPCLONE_REMOTE_GC_GRACE_SECS`,

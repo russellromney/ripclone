@@ -13,8 +13,8 @@ default). The result is handled as follows:
 
 | Result | HTTP behavior |
 | --- | --- |
-| Branch metadata already has a complete, usable build for B | `200` with the normal ref response for B; no queue, mirror, builder, artifact, ref, or access-time mutation |
-| Exact work for `(repo, branch, B)` is already queued or claimed | `202` with `commit: B` and no second job |
+| Exact metadata already has a complete, usable build for B | `200` with the normal ref response for B; no queue, mirror, builder, artifact, ref, or access-time mutation |
+| Exact work for `(repo, B)` is already queued or claimed | `202` with `commit: B` and no second job |
 | No active B work exists | One job is accepted with `commit: B`; response is `202` |
 | Ref is absent | `404`; no queue or source work |
 | Probe times out, fails, or returns malformed output | Retryable upstream error; no queue or source work |
@@ -53,10 +53,10 @@ metadata path below. It never repeats a moving `POST /add` or `POST /sync`.
 
 ## Exact identity and workers
 
-Active work is keyed by repository storage key, branch, and full admitted
-commit. Duplicate B requests coalesce while B is queued or claimed. A later C
-is a different active key and gets its own job. The control database enforces
-this across both states.
+Active work is keyed only by repository storage key and full admitted commit.
+Duplicate B requests—including different valid checkout names that resolve to
+B—coalesce while B is queued or claimed. A later C is a different active key
+and gets its own job. The control database enforces this across both states.
 
 The embedded worker claims directly through the server's control handle. A
 standalone worker receives the same admitted commit through the authenticated
@@ -95,8 +95,9 @@ methods or the normal CLI commands.
 
 `sync --at REV` is a first-class exact-revision request. Symbolic expressions
 such as `HEAD~5` are resolved once before admission; every retry then uses the
-selected object ID. Ordinary and explicit requests for the same branch and
-commit share one durable job and one internal exact result.
+selected object ID. A full object ID requires no upstream resolution. Ordinary
+and explicit requests for the same commit share one durable job and one exact
+result.
 
 ## Queue durability
 

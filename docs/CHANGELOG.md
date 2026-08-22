@@ -19,8 +19,8 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 - **One database owns control state**: refs, added repositories, repository
   build settings, durable jobs, claims, attempts, and worker heartbeats share
   one server-owned SQLite schema.
-  Exact-result creation, moving-publication fencing, and job admission commit in
-  one immediate transaction.
+  Exact-result readiness, active-job coalescing, result creation, and job
+  admission are decided in one immediate transaction.
 - **Repository settings are snapshotted at admission.** One validated record per
   repository lives in SQLite/Turso; each durable job and API claim carries its
   immutable snapshot. Only a missing row selects defaults. File/S3 config
@@ -41,7 +41,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 
 - **Ordinary tip sync now admits an immutable commit before queueing** (`rust/src/server.rs`, `rust/src/git.rs`): one bounded `ls-remote` resolves B, a complete ready B returns a mutation-free `200`, and changed work returns `202` with `commit` and `branch` without waiting for the builder. The CLI reports `accepted B` or `already current at B`.
 - **CLI readiness behavior is explicit** (`rust/src/bin/cli.rs`, `docs/SYNC.md`): normal `add` and `sync` remain fast, while `add --wait` and `sync --wait` poll exact pinned metadata after the first `202` without repeating a moving POST.
-- **Active work is keyed by repository, branch, and exact admitted commit** (`rust/src/queue/`, `rust/src/api_job_queue.rs`): duplicates coalesce while queued, claimed, or in embedded Full work; a later commit remains a separate job. The commit crosses SQL/API-worker/standalone-worker transports, and workers exact-fetch and build it even if the branch moves.
+- **Active work is keyed only by repository and exact admitted commit** (`rust/src/queue/`, `rust/src/api_job_queue.rs`): duplicate names resolving to B coalesce while queued or claimed; a later commit remains a separate job. The commit crosses SQL/API-worker/standalone-worker transports, and workers exact-fetch and build it even if a source branch moves.
 - **Signed push webhooks use their validated `after` commit directly** (`rust/src/server.rs`): they perform no second tip probe. Readiness-oriented library callers pin the admitted commit and use exact metadata GETs after the first `202`; they do not repeat a moving POST.
 - **Every job has one required admitted SHA** and fails closed if that identity is malformed. Admission and execution use the one durable SQLite jobs table.
 
@@ -118,11 +118,15 @@ Every command in the README and `docs/` was run verbatim against a real server. 
   commit.
 - Documentation and example workflow updated to use `RIPCLONE_SERVER_TOKEN` consistently.
 
-## Sync / ref-store correctness
+## Sync / ref-store correctness (superseded implementation history)
+
+The branch-scoped storage details in this historical section were removed by
+the exact-only result model described above. They are retained only as release
+history and do not describe current keys, reads, writes, or worker behavior.
 
 - **Per-stage phase-1 sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, HEAD packs, skeleton build, files table, prebuilt index, phase-1 upload, and ref publish. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with phase timings and per-artifact-class storage amplification for each build.
 - **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under the internal `:{branch}#{commit}` namespace instead of `{branch}#{rev}`. The leading `:` cannot occur in a Git ref, so exact results cannot collide with real source branches. Different revs that resolve to the same commit share a build.
-- **Exact results are branch scoped** (`rust/src/ref_store.rs`): each branch and commit owns one internal result; workers do not republish a different branch's stored build.
+- **Historical branch-scoped exact results (removed)** (`rust/src/ref_store.rs`): this former implementation gave each branch and commit an internal result. Current results are keyed only by repository and commit.
 - **git index-pack fallback** (`rust/src/git.rs`): when gix fails to index a pack containing ref deltas (e.g. `oven-sh/bun`), ripclone falls back to the stock `git index-pack` subprocess.
 
 ## Version reconciliation (CLI ↔ server)
