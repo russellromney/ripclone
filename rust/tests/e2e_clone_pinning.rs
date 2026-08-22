@@ -461,6 +461,101 @@ async fn exact_service_unavailable_establishes_and_preserves_the_pin() {
 }
 
 #[tokio::test]
+async fn unidentified_503_fails_instead_of_repinning_after_branch_moves() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+        std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2");
+    }
+    // The proxy-style generic 503 represents an operation that selected B but
+    // lost the server's structured identity. Ready(C) is queued as the next
+    // response to prove this operation must not retry and accept the moved tip.
+    let (url, requests, task) = scripted_server(vec![
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "proxy unavailable"}),
+        ),
+        ready(B),
+    ])
+    .await;
+    let error = Client::new(url)
+        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .await
+        .expect_err("unidentified 503 cannot establish an operation pin");
+    abort_server_task(task).await;
+    assert!(format!("{error:#}").contains("invalid unavailable response"));
+    assert_eq!(
+        requests.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "the original operation must not resolve or accept C"
+    );
+    unsafe {
+        std::env::remove_var("RIPCLONE_TESTING");
+        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+        std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
+    }
+}
+
+#[tokio::test]
+async fn absolute_checkout_name_is_rejected_before_filesystem_use() {
+    let _guard = env_lock().lock().await;
+    let output = tempfile::tempdir().unwrap();
+    let victim = output.path().join("victim");
+    std::fs::write(&victim, b"unchanged\n").unwrap();
+    let malicious = victim.to_string_lossy().to_string();
+    let (url, requests, task) = scripted_server(vec![ready_on(A, &malicious)]).await;
+    let target = output.path().join("clone");
+    let error = Client::new(url)
+        .install_repo_with_mode_at(
+            "acme/demo",
+            "HEAD",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect_err("absolute checkout name must fail closed");
+    abort_server_task(task).await;
+    assert!(format!("{error:#}").contains("invalid ready branch"));
+    assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged\n");
+    assert!(
+        !target.exists(),
+        "invalid identity cannot publish a partial target"
+    );
+    assert_eq!(requests.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+}
+
+#[tokio::test]
+async fn empty_checkout_name_is_rejected_for_moving_head() {
+    let _guard = env_lock().lock().await;
+    let output = tempfile::tempdir().unwrap();
+    let (url, requests, task) = scripted_server(vec![ready_on(A, "")]).await;
+    let target = output.path().join("clone");
+    let error = Client::new(url)
+        .install_repo_with_mode_at(
+            "acme/demo",
+            "HEAD",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect_err("only an exact full-object-ID operation may detach");
+    abort_server_task(task).await;
+    assert!(format!("{error:#}").contains("checkout name is empty"));
+    assert!(
+        !target.exists(),
+        "invalid identity cannot publish a partial target"
+    );
+    assert_eq!(requests.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+}
+
+#[tokio::test]
 async fn ready_response_cannot_change_an_established_pin() {
     let _guard = env_lock().lock().await;
     let (url, requests, task) = scripted_server(vec![pending(A), ready(B)]).await;

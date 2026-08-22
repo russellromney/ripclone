@@ -98,6 +98,36 @@ pub fn validate_git_rev(rev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a concrete local branch name before it is used below
+/// `.git/refs/heads`. This mirrors Git's ref-name restrictions and additionally
+/// rejects the reserved pseudo-ref `HEAD`.
+pub fn validate_checkout_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("checkout branch must not be empty");
+    }
+    if name.len() > MAX_REF_LEN {
+        anyhow::bail!("checkout branch too long: {}", name.len());
+    }
+    if name == "HEAD" || name == "@" || name.starts_with('-') || name.starts_with('/') {
+        anyhow::bail!("invalid checkout branch: {name}");
+    }
+    if name.ends_with('/')
+        || name.ends_with('.')
+        || name.contains("//")
+        || name.contains("..")
+        || name.contains("@{")
+        || name.chars().any(|c| {
+            c.is_control() || c == ' ' || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+    {
+        anyhow::bail!("invalid checkout branch: {name}");
+    }
+    Ok(())
+}
+
 /// Validate a 40-character (SHA-1) or 64-character (SHA-256) hex object id.
 pub fn validate_object_id(id: &str) -> Result<()> {
     if id.len() != 40 && id.len() != 64 {
@@ -151,6 +181,27 @@ mod tests {
         assert!(validate_git_rev("main").is_ok());
         assert!(validate_git_rev("feature/foo-bar").is_ok());
         assert!(validate_git_rev("abc123").is_ok());
+    }
+
+    #[test]
+    fn validate_checkout_name_rejects_paths_and_invalid_git_branches() {
+        for invalid in [
+            "/tmp/victim",
+            "HEAD",
+            "../victim",
+            "topic//name",
+            ".hidden",
+            "topic.lock",
+            "topic name",
+            "topic@{1}",
+        ] {
+            assert!(
+                validate_checkout_name(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        assert!(validate_checkout_name("main").is_ok());
+        assert!(validate_checkout_name("feature/exact-results").is_ok());
     }
 
     fn provider(kind: ProviderKind, id: &str) -> ProviderInstance {

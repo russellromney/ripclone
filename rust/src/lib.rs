@@ -184,7 +184,7 @@ pub struct ArchiveFrame {
 }
 
 /// Artifact hashes for one clonepack variant (e.g. shallow depth=1 or full).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClonepackArtifacts {
     pub manifest: String,
     pub metadata_chunk: String,

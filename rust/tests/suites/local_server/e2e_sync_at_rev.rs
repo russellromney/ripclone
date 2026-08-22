@@ -6,6 +6,8 @@
 use crate::common::*;
 use ripclone::mode::CloneMode;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -410,7 +412,7 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
     assert_eq!(unresolved.status(), reqwest::StatusCode::OK);
     let unresolved: serde_json::Value = unresolved.json().await.expect("exact result body");
     assert_eq!(unresolved["commit"], pinned);
-    assert_eq!(unresolved["branch"], "HEAD");
+    assert_eq!(unresolved["branch"], "");
 }
 
 #[tokio::test]
@@ -424,6 +426,9 @@ async fn public_cli_clones_at_a_full_sha() {
     ensure_added(&server, "acme/at-full-sha")
         .await
         .expect("add and build full-SHA fixture through the public workflow");
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let tip_probes_before_exact_operation = probe.tip_probes.load(Ordering::SeqCst);
     server
         .client()
         .sync_repo_at("acme/at-full-sha", Some(&pinned), None)
@@ -434,6 +439,11 @@ async fn public_cli_clones_at_a_full_sha() {
         .resolve_ref_with_clonepack("acme/at-full-sha", "HEAD", Some("full"), Some(&pinned))
         .await
         .expect("full-SHA build ready");
+    assert_eq!(
+        probe.tip_probes.load(Ordering::SeqCst),
+        tip_probes_before_exact_operation,
+        "a full object ID requires no upstream ref resolution"
+    );
 
     let out = tempfile::tempdir().expect("CLI output");
     let target = out.path().join("clone");
@@ -476,6 +486,40 @@ async fn public_cli_clones_at_a_full_sha() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
+    assert!(
+        !git_ok(&target, &["symbolic-ref", "-q", "HEAD"]),
+        "default clone --at <full SHA> installs detached at the admitted commit"
+    );
     assert_eq!(read(&target, "a.txt"), "pinned\n");
     assert_repo_usable(&target, "1");
+    assert_eq!(
+        probe.tip_probes.load(Ordering::SeqCst),
+        tip_probes_before_exact_operation,
+        "default-HEAD polling of a full object ID stays exact and detached"
+    );
+
+    let named_target = out.path().join("named-clone");
+    server
+        .client()
+        .install_repo_with_mode_at(
+            "acme/at-full-sha",
+            "release",
+            Some(&pinned),
+            &named_target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("explicit valid checkout branch remains attached");
+    assert_eq!(git(&named_target, &["rev-parse", "HEAD"]), pinned);
+    assert_eq!(
+        git(&named_target, &["symbolic-ref", "--short", "HEAD"]),
+        "release"
+    );
+    assert_eq!(
+        probe.tip_probes.load(Ordering::SeqCst),
+        tip_probes_before_exact_operation,
+        "an explicit checkout branch does not resolve a full object ID upstream"
+    );
 }

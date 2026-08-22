@@ -1947,11 +1947,9 @@ async fn job_heartbeat_handler(
 /// `POST /v1/refs` — farmed-out worker reports a ref write.
 ///
 /// Auth is a signed, expiring HMAC bearer token (`Authorization: Bearer …`), not
-/// the shared server token. There is no repo/job scope: the worker pool claims
-/// any repo, so a scoped token cannot work. Missing / malformed / expired /
-/// wrong-secret tokens return 401 and do **not** write. The write target comes
-/// from the request body. On success the server's real `RefStore` (the one
-/// holding DB credentials) performs the durable write.
+/// the shared server token. Every mutation additionally carries the existing
+/// job/worker claim identity; the control database validates ownership in the
+/// same transaction as the result write.
 async fn ref_report_handler(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1980,33 +1978,65 @@ async fn ref_report_handler(
     };
 
     let result: Result<RefReportResponse, anyhow::Error> = match body {
-        RefReport::SaveResult { info, .. } => {
+        RefReport::SaveResult {
+            job_id,
+            worker_id,
+            info,
+            ..
+        } => {
             admission_test_ref_store_write();
-            state
-                .ref_store
-                .save_result(&repo_id, &info)
-                .await
-                .map(|_| RefReportResponse { updated: true })
+            match state.control_db.as_ref() {
+                Some(control) => {
+                    control
+                        .save_result_for_claim(job_id, &worker_id, &repo_id, &info)
+                        .await
+                }
+                #[cfg(test)]
+                None => {
+                    state
+                        .ref_store
+                        .save_claimed_result(&repo_id, &info, job_id, &worker_id)
+                        .await
+                }
+                #[cfg(not(test))]
+                None => Err(anyhow::anyhow!("control database unavailable")),
+            }
+            .map(|updated| RefReportResponse { updated })
         }
-        RefReport::UpdateBuildStatus { commit, status, .. } => state
-            .ref_store
-            .update_build_status(&repo_id, &commit, &status)
-            .await
-            .map(|updated| RefReportResponse { updated }),
-        RefReport::DeleteResult { commit, .. } => state
-            .ref_store
-            .delete_result(&repo_id, &commit)
-            .await
-            .map(|_| RefReportResponse { updated: true }),
-        RefReport::TouchLastAccessed { commit, .. } => state
-            .ref_store
-            .touch_last_accessed_at(&repo_id, &commit)
-            .await
-            .map(|updated| RefReportResponse { updated }),
+        RefReport::UpdateBuildStatus {
+            job_id,
+            worker_id,
+            commit,
+            status,
+            ..
+        } => match state.control_db.as_ref() {
+            Some(control) => {
+                control
+                    .update_result_status_for_claim(job_id, &worker_id, &repo_id, &commit, &status)
+                    .await
+            }
+            #[cfg(test)]
+            None => {
+                state
+                    .ref_store
+                    .update_claimed_build_status(&repo_id, &commit, &status, job_id, &worker_id)
+                    .await
+            }
+            #[cfg(not(test))]
+            None => Err(anyhow::anyhow!("control database unavailable")),
+        }
+        .map(|updated| RefReportResponse { updated }),
     };
 
     match result {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(resp) if resp.updated => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(_resp) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "worker no longer owns the claimed job".to_string(),
+            }),
+        )
+            .into_response(),
         Err(e) => {
             error!("POST /v1/refs write failed for {repo_key}: {e:#}");
             (
@@ -2573,6 +2603,15 @@ fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &s
     )
 }
 
+/// Parent reuse is safe only after the parent's exact Full and Files result is
+/// complete. A phase-one row may carry artifacts from its own parent; treating
+/// that row as reusable would relabel those older bytes as the new parent.
+fn exact_parent_ready_for_reuse(info: &RefInfo, commit: &str) -> bool {
+    info.build_status.is_none()
+        && exact_ref_info_serves_commit(info, "full", commit)
+        && !info.archive_chunks.is_empty()
+}
+
 /// `build_status` set on a phase-1 row while the full history + archive build
 /// runs in the background.
 pub(crate) const BUILDING_FULL_HISTORY: &str = "full history building";
@@ -2785,9 +2824,13 @@ async fn get_ref_inner(
         )
             .into_response();
     }
-    if let Some(response) =
-        validation::reject_if_invalid(|| validation::validate_git_rev(&requested_checkout))
-    {
+    if let Some(response) = validation::reject_if_invalid(|| {
+        if requested_checkout == "HEAD" {
+            Ok(())
+        } else {
+            validation::validate_checkout_name(&requested_checkout)
+        }
+    }) {
         return response;
     }
     if let Some(rev) = params.rev.as_deref()
@@ -2832,7 +2875,12 @@ async fn get_ref_inner(
         (pinned.to_string(), requested_checkout.clone(), true)
     } else if let Some(rev) = params.rev.as_deref() {
         if validation::validate_object_id(rev).is_ok() {
-            (rev.to_string(), requested_checkout.clone(), false)
+            let checkout_name = if requested_checkout == "HEAD" {
+                String::new()
+            } else {
+                requested_checkout.clone()
+            };
+            (rev.to_string(), checkout_name, false)
         } else {
             let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
             let lock = repo_lock(&state.sync_locks, &repo_id).await;
@@ -3558,9 +3606,13 @@ async fn sync_repo_inner(
     headers: HeaderMap,
     state: ServerState,
 ) -> Response {
-    if let Some(resp) =
-        validation::reject_if_invalid(|| validation::validate_git_rev(&params.branch))
-    {
+    if let Some(resp) = validation::reject_if_invalid(|| {
+        if params.branch == "HEAD" {
+            Ok(())
+        } else {
+            validation::validate_checkout_name(&params.branch)
+        }
+    }) {
         return resp;
     }
     if params.rev.is_some() {
@@ -3731,9 +3783,13 @@ async fn sync_repo_at_revision(
     headers: HeaderMap,
     state: ServerState,
 ) -> Response {
-    if let Some(resp) =
-        validation::reject_if_invalid(|| validation::validate_git_rev(&params.branch))
-    {
+    if let Some(resp) = validation::reject_if_invalid(|| {
+        if params.branch == "HEAD" {
+            Ok(())
+        } else {
+            validation::validate_checkout_name(&params.branch)
+        }
+    }) {
         return resp;
     }
     let Some(at_rev) = params.rev else {
@@ -3774,13 +3830,9 @@ async fn sync_repo_at_revision(
         };
 
     // Resolve a symbolic historical selector exactly once. Subsequent work and
-    // polls use only the selected object id. A concrete object id with a known
-    // branch can skip this fetch entirely; HEAD on a cold mirror needs one fetch
-    // to recover the concrete checkout name returned to this client operation.
-    let local_default_branch = (branch == "HEAD")
-        .then(|| git::default_branch(&mirror_dir).ok())
-        .flatten()
-        .filter(|candidate| !candidate.is_empty() && candidate != "HEAD");
+    // polls use only the selected object id. A concrete object id never needs
+    // upstream resolution: an explicit branch remains the checkout name, while
+    // the default HEAD selector is represented by an empty detached marker.
     let selector_is_exact = crate::validation::validate_object_id(&at_rev).is_ok();
     let needs_resolution_fetch = !selector_is_exact;
     let selected_commit = if needs_resolution_fetch {
@@ -3837,10 +3889,8 @@ async fn sync_repo_at_revision(
             }
         }
     } else {
-        if branch == "HEAD"
-            && let Some(default_branch) = local_default_branch
-        {
-            branch = default_branch;
+        if branch == "HEAD" {
+            branch.clear();
         }
         at_rev.clone()
     };
@@ -4102,12 +4152,10 @@ async fn enqueue_admitted_build(
     job.repo_config
         .validate()
         .map_err(|error| format!("repository config validation failed: {error:#}"))?;
-    let Some(admission) = prepare_exact_admission(state, &job).await? else {
-        state.metrics.record_build_accepted();
-        admission_test_enqueue(EnqueueOutcome::Coalesced);
-        return Ok(EnqueueOutcome::Coalesced);
-    };
     if let Some(control) = &state.control_db {
+        let admission = ExactAdmissionPlan {
+            pending: pending_exact_result(&job, false),
+        };
         state.metrics.record_build_queued();
         admission_test_before_admission_tx(&job.admitted_commit).await;
         return match control.admit_exact_and_job(&job, &admission.pending).await {
@@ -4122,6 +4170,11 @@ async fn enqueue_admitted_build(
             }
         };
     }
+    let Some(admission) = prepare_exact_admission(state, &job).await? else {
+        state.metrics.record_build_accepted();
+        admission_test_enqueue(EnqueueOutcome::Coalesced);
+        return Ok(EnqueueOutcome::Coalesced);
+    };
     state
         .ref_store
         .save_result(&job.repo_id, &admission.pending)
@@ -4173,10 +4226,15 @@ async fn prepare_exact_admission(
         return Ok(None);
     }
     let evicted = existing.is_some();
-    let pending = RefInfo {
-        commit: commit.to_string(),
-        build_status: evicted.then(|| crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-        warm_pinned: existing.as_ref().is_some_and(|info| info.warm_pinned),
+    let mut pending = pending_exact_result(job, evicted);
+    pending.warm_pinned = existing.as_ref().is_some_and(|info| info.warm_pinned);
+    Ok(Some(ExactAdmissionPlan { pending }))
+}
+
+fn pending_exact_result(job: &BuildJob, replacement: bool) -> RefInfo {
+    RefInfo {
+        commit: job.admitted_commit.clone(),
+        build_status: replacement.then(|| crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
         last_accessed_at: Some(
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -4184,8 +4242,7 @@ async fn prepare_exact_admission(
                 .as_secs(),
         ),
         ..Default::default()
-    };
-    Ok(Some(ExactAdmissionPlan { pending }))
+    }
 }
 
 /// Fire-and-forget: enqueue a build for `(repo_id, admitted_commit)` and return
@@ -4670,7 +4727,7 @@ async fn webhook_dispatch_push(
     };
     let branch = branch.to_string();
     // Validate the payload-derived branch before it reaches the queue / git.
-    if validation::validate_git_rev(&branch).is_err() {
+    if validation::validate_checkout_name(&branch).is_err() {
         return webhook_ignored("invalid branch");
     }
     let Some(after) = event.after.as_deref() else {
@@ -5489,12 +5546,24 @@ async fn do_sync(
                 && info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
                 && !archive_in_progress
         });
-    if let Some(prev) = reusable {
+    if let Some(mut prev) = reusable {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
             repo_id.storage_key(),
             &commit[..7.min(commit.len())]
         );
+        if prev
+            .build_status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("failed: "))
+        {
+            prev.build_status = None;
+            admission_test_ref_store_write();
+            ref_store
+                .save_result(repo_id, &prev)
+                .await
+                .context("publish recovered exact no-op result")?;
+        }
         if let Some(release) = foreground_release.take() {
             let _ = release.send(());
         }
@@ -5595,13 +5664,10 @@ async fn build_and_publish_two_phase(
     // Load the previous synced ref once: used both for the files-table by-diff
     // below and for Option-A full-clonepack carry later in this phase.
     //
-    // Ignore an *evicted* prev. Warm-TTL eviction marks the ref `evicted` and the
-    // remote-GC pass then deletes its clonepack/pack/archive objects, but leaves
-    // the ref's artifact-pointer fields (head_base_packs, full_clonepack, history
-    // levels, archive frames) intact. Carrying any of those into this rebuild
-    // would reference objects storage no longer has, so the published manifest
-    // would point at deleted packs and the next clone 404s. Treat an evicted prev
-    // as absent so the rebuild is cold and re-uploads everything it references.
+    // Reuse only a completed exact Full/Files parent. Phase one deliberately
+    // carries its own parent's Full/archive artifacts while it builds; those
+    // bytes must never become the base for its child. Evicted and failed rows
+    // are likewise cold.
     let current = ref_store.load_result(repo_id, commit).await.ok().flatten();
     let prev_loaded = match parent.as_deref() {
         Some(parent_commit) => ref_store
@@ -5620,8 +5686,11 @@ async fn build_and_publish_two_phase(
     // un-pinned and be re-evicted every idle cycle. Read the pin from the raw
     // prev, before the evicted filter.
     let prev_warm_pinned = current.as_ref().is_some_and(|info| info.warm_pinned);
-    let prev = prev_loaded
-        .filter(|p| p.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS));
+    let prev = prev_loaded.filter(|candidate| {
+        parent
+            .as_deref()
+            .is_some_and(|parent| exact_parent_ready_for_reuse(candidate, parent))
+    });
 
     // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----
     let mut t = Instant::now();
@@ -6616,6 +6685,115 @@ async fn build_full_in_background(
     Ok(())
 }
 
+struct ClaimScopedRefStore {
+    inner: Arc<dyn RefStore>,
+    control: Option<Arc<crate::control::ControlDb>>,
+    job_id: crate::queue::JobId,
+    worker_id: String,
+}
+
+#[async_trait::async_trait]
+impl RefStore for ClaimScopedRefStore {
+    async fn load_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        self.inner.load_result(repo_id, commit).await
+    }
+
+    async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
+        self.inner
+            .before_claimed_result_write(repo_id, info)
+            .await?;
+        let updated = match &self.control {
+            Some(control) => {
+                control
+                    .save_result_for_claim(self.job_id, &self.worker_id, repo_id, info)
+                    .await?
+            }
+            None => {
+                self.inner
+                    .save_claimed_result(repo_id, info, self.job_id, &self.worker_id)
+                    .await?
+            }
+        };
+        anyhow::ensure!(updated, "worker no longer owns job {}", self.job_id);
+        self.inner.after_claimed_result_write(repo_id, info).await?;
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<RepoId>> {
+        self.inner.list().await
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let updated = match &self.control {
+            Some(control) => {
+                control
+                    .update_result_status_for_claim(
+                        self.job_id,
+                        &self.worker_id,
+                        repo_id,
+                        commit,
+                        status,
+                    )
+                    .await?
+            }
+            None => {
+                self.inner
+                    .update_claimed_build_status(
+                        repo_id,
+                        commit,
+                        status,
+                        self.job_id,
+                        &self.worker_id,
+                    )
+                    .await?
+            }
+        };
+        anyhow::ensure!(updated, "worker no longer owns job {}", self.job_id);
+        Ok(true)
+    }
+
+    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
+        self.inner.touch_last_accessed_at(repo_id, commit).await
+    }
+
+    async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
+        self.inner.delete_result(repo_id, commit).await
+    }
+
+    async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
+        self.inner.list_commits(repo_id).await
+    }
+
+    async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
+        self.inner.add_repo(repo).await
+    }
+
+    async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
+        self.inner.load_added_repo(repo_id).await
+    }
+
+    async fn remove_added_repo(&self, repo_id: &RepoId) -> Result<()> {
+        self.inner.remove_added_repo(repo_id).await
+    }
+
+    async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
+        self.inner.list_added_repos().await
+    }
+
+    async fn invalidate(&self, repo_id: &RepoId, commit: &str) {
+        self.inner.invalidate(repo_id, commit).await;
+    }
+
+    async fn health(&self) -> Result<()> {
+        self.inner.health().await
+    }
+}
+
 /// Run one durable claim to completion: mark `building`, sync all artifact
 /// phases, then mark `done` or `failed` before acknowledgement.
 ///
@@ -6623,15 +6801,25 @@ async fn build_full_in_background(
 pub async fn process_build_job(
     state: &ServerState,
     job: &BuildJob,
+    job_id: crate::queue::JobId,
+    worker_id: &str,
 ) -> Result<SyncBuildResult, BuildError> {
-    process_build_job_with_foreground_release(state, job, None).await
+    process_build_job_with_foreground_release(state, job, job_id, worker_id, None).await
 }
 
 async fn process_build_job_with_foreground_release(
     state: &ServerState,
     job: &BuildJob,
+    job_id: crate::queue::JobId,
+    worker_id: &str,
     foreground_release: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<SyncBuildResult, BuildError> {
+    let ref_store: Arc<dyn RefStore> = Arc::new(ClaimScopedRefStore {
+        inner: Arc::clone(&state.ref_store),
+        control: state.control_db.clone(),
+        job_id,
+        worker_id: worker_id.to_string(),
+    });
     let repo_id = &job.repo_id;
     let commit = &job.admitted_commit;
     if let Err(e) = crate::validation::validate_object_id(&job.admitted_commit) {
@@ -6645,7 +6833,7 @@ async fn process_build_job_with_foreground_release(
         )));
     }
     // Mark as building in the shared metadata store.
-    if let Err(e) = update_job_build_status(state, job, "building").await {
+    if let Err(e) = update_job_build_status(&ref_store, job, "building").await {
         error!(
             "build status update failed for {}@{commit}: {e:#}",
             repo_id.storage_key()
@@ -6658,7 +6846,8 @@ async fn process_build_job_with_foreground_release(
         Some(p) => p.clone(),
         None => {
             let message = format!("unknown provider {}", repo_id.provider.as_str());
-            if let Err(e) = update_job_build_status(state, job, &format!("failed: {message}")).await
+            if let Err(e) =
+                update_job_build_status(&ref_store, job, &format!("failed: {message}")).await
             {
                 error!(
                     "build status update failed for {}@{commit}: {e:#}",
@@ -6685,7 +6874,7 @@ async fn process_build_job_with_foreground_release(
         &mirror_dir,
         repo_id,
         &job.admitted_commit,
-        &state.ref_store,
+        &ref_store,
         &state.storage,
         &state.retention,
         &provider,
@@ -6716,7 +6905,7 @@ async fn process_build_job_with_foreground_release(
             let classified = classify_build_error(e);
             if let Some(status) = terminal_metadata_status(&classified) {
                 state.metrics.record_build_failed();
-                if let Err(status_err) = update_job_build_status(state, job, &status).await {
+                if let Err(status_err) = update_job_build_status(&ref_store, job, &status).await {
                     error!(
                         "build status update failed for {}@{commit}: {status_err:#}",
                         repo_id.storage_key()
@@ -6759,12 +6948,33 @@ fn terminal_metadata_status(err: &BuildError) -> Option<String> {
 /// for retryable failures so intermediate retries don't look permanent.
 pub async fn mark_admitted_build_failed(
     state: &ServerState,
+    job_id: crate::queue::JobId,
+    worker_id: &str,
     repo_id: &RepoId,
     admitted_commit: &str,
     message: &str,
 ) -> Result<()> {
     let status = format!("failed: {message}");
-    let _ = update_build_status(state, repo_id, admitted_commit, &status).await?;
+    let updated = match &state.control_db {
+        Some(control) => {
+            control
+                .update_result_status_for_claim(
+                    job_id,
+                    worker_id,
+                    repo_id,
+                    admitted_commit,
+                    &status,
+                )
+                .await?
+        }
+        None => {
+            state
+                .ref_store
+                .update_claimed_build_status(repo_id, admitted_commit, &status, job_id, worker_id)
+                .await?
+        }
+    };
+    anyhow::ensure!(updated, "worker no longer owns job {job_id}");
     Ok(())
 }
 
@@ -6931,10 +7141,13 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                 };
                                 let state = worker_state.clone();
                                 let release_for_build = foreground_release.take();
+                                let build_owner = owner.clone();
                                 Ok(tokio::spawn(async move {
                                     process_build_job_with_foreground_release(
                                         &state,
                                         &job,
+                                        claimed.id,
+                                        &build_owner,
                                         release_for_build,
                                     )
                                     .await
@@ -6999,6 +7212,8 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                 worker_queue.job_status(claimed.id).await
                                 && let Err(status_error) = mark_admitted_build_failed(
                                     &worker_state,
+                                    claimed.id,
+                                    &owner,
                                     &repo_id,
                                     &admitted_commit,
                                     &error,
@@ -7122,13 +7337,12 @@ fn spawn_poll_loop(state: ServerState, interval: Duration) {
 }
 
 async fn update_build_status(
-    state: &ServerState,
+    ref_store: &Arc<dyn RefStore>,
     repo_id: &RepoId,
     commit: &str,
     status: &str,
 ) -> Result<bool> {
-    state
-        .ref_store
+    ref_store
         .update_build_status(repo_id, commit, status)
         .await
         .with_context(|| format!("update build status for {}@{commit}", repo_id.storage_key()))
@@ -7137,13 +7351,13 @@ async fn update_build_status(
 /// Status writes for every immutable job target only its admitted commit.
 /// A job that fails before artifact publication cannot update any other result.
 async fn update_job_build_status(
-    state: &ServerState,
+    ref_store: &Arc<dyn RefStore>,
     job: &BuildJob,
     status: &str,
 ) -> Result<Option<String>> {
     let commit = job.admitted_commit.as_str();
     if status == "building" {
-        let existing = state.ref_store.load_result(&job.repo_id, commit).await?;
+        let existing = ref_store.load_result(&job.repo_id, commit).await?;
         if existing.as_ref().is_some_and(|info| {
             info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
                 || (!info.full_clonepack.manifest.is_empty()
@@ -7163,8 +7377,7 @@ async fn update_job_build_status(
                 last_accessed_at: now,
                 ..Default::default()
             };
-            state
-                .ref_store
+            ref_store
                 .save_result(&job.repo_id, &pending)
                 .await
                 .with_context(|| {
@@ -7175,10 +7388,10 @@ async fn update_job_build_status(
                 })?;
             return Ok(Some(commit.to_string()));
         }
-        let updated = update_build_status(state, &job.repo_id, commit, status).await?;
+        let updated = update_build_status(ref_store, &job.repo_id, commit, status).await?;
         return Ok(updated.then(|| commit.to_string()));
     }
-    let updated = update_build_status(state, &job.repo_id, commit, status).await?;
+    let updated = update_build_status(ref_store, &job.repo_id, commit, status).await?;
     Ok(updated.then(|| commit.to_string()))
 }
 
@@ -8460,7 +8673,7 @@ mod tests {
             .await
             .unwrap();
 
-        mark_admitted_build_failed(&state, &repo_id, &b, "attempts exhausted")
+        mark_admitted_build_failed(&state, 0, "test-worker", &repo_id, &b, "attempts exhausted")
             .await
             .unwrap();
 
@@ -8691,8 +8904,9 @@ mod tests {
             }
             let crashed_state = state.clone();
             let crashed_job = job.clone();
-            let attempt =
-                tokio::spawn(async move { process_build_job(&crashed_state, &crashed_job).await });
+            let attempt = tokio::spawn(async move {
+                process_build_job(&crashed_state, &crashed_job, 0, "test-worker").await
+            });
             tokio::time::timeout(Duration::from_secs(30), async {
                 while !barrier.join("entered").exists() {
                     tokio::task::yield_now().await;
@@ -8731,7 +8945,7 @@ mod tests {
                 "{stage}: the worker must not publish the branch's later commit"
             );
 
-            let recovered = process_build_job(&state, &job)
+            let recovered = process_build_job(&state, &job, 0, "test-worker")
                 .await
                 .unwrap_or_else(|error| panic!("{stage}: exact retry failed: {error:#}"));
             assert_eq!(recovered.info.commit, admitted);
@@ -8810,7 +9024,7 @@ mod tests {
             .await
             .unwrap();
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
-        process_build_job(&state, &job)
+        process_build_job(&state, &job, 0, "test-worker")
             .await
             .expect_err("missing historical object must fail");
 
@@ -10303,7 +10517,7 @@ mod tests {
         assert_eq!(job.admitted_commit, commit);
         assert!(rx.try_recv().is_err(), "exactly one rebuild is admitted");
 
-        let built = process_build_job(&state, &job)
+        let built = process_build_job(&state, &job, 0, "test-worker")
             .await
             .expect("admitted evicted ref rebuild");
         assert_eq!(built.info.commit, commit);
@@ -10562,7 +10776,7 @@ mod tests {
         let e = crate::test_fixture::commit(&origin, &[("f.txt", b"E")]);
         let job = rx.try_recv().expect("historical B rebuild admitted");
         assert_eq!(job.admitted_commit, b);
-        let built = process_build_job(&state, &job)
+        let built = process_build_job(&state, &job, 0, "test-worker")
             .await
             .expect("historical B rebuild after branch advancement");
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
@@ -10728,6 +10942,8 @@ mod tests {
         };
         let body = serde_json::json!({
             "op": "save_result",
+            "job_id": 1,
+            "worker_id": "test-worker",
             "repo_key": repo_key,
             "info": info,
         });
@@ -10774,6 +10990,8 @@ mod tests {
         };
         let body = serde_json::json!({
             "op": "save_result",
+            "job_id": 1,
+            "worker_id": "test-worker",
             "repo_key": repo_key,
             "info": info,
         });

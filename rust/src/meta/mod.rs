@@ -92,7 +92,7 @@ fn variant_ready(variant: &crate::ClonepackArtifacts, commit: &str) -> bool {
 /// Merge one worker publication without allowing a duplicate or stale report
 /// to replace an already accepted ready variant. Ordered phase enrichment is
 /// accepted only when it carries the same previously-published variant bytes.
-fn merge_publication(existing: &RefInfo, incoming: &RefInfo) -> RefInfo {
+pub(crate) fn merge_publication(existing: &RefInfo, incoming: &RefInfo) -> RefInfo {
     let commit = existing.commit.as_str();
     let shallow_ready = variant_ready(&existing.shallow_clonepack, commit);
     let full_ready = variant_ready(&existing.full_clonepack, commit);
@@ -102,6 +102,14 @@ fn merge_publication(existing: &RefInfo, incoming: &RefInfo) -> RefInfo {
         && incoming.full_clonepack.commit == commit
         && !existing.full_clonepack.idx_bundle.is_empty()
         && incoming.full_clonepack.idx_bundle == existing.full_clonepack.idx_bundle
+        && incoming.build_status.is_none();
+    let exact_retry_completed = full_ready
+        && incoming.full_clonepack == existing.full_clonepack
+        && incoming.shallow_clonepack == existing.shallow_clonepack
+        && existing
+            .build_status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("failed: "))
         && incoming.build_status.is_none();
 
     if (shallow_ready && existing.shallow_clonepack.manifest != incoming.shallow_clonepack.manifest)
@@ -119,7 +127,7 @@ fn merge_publication(existing: &RefInfo, incoming: &RefInfo) -> RefInfo {
     if shallow_ready {
         merged.shallow_clonepack = existing.shallow_clonepack.clone();
     }
-    if full_ready && !files_enrichment {
+    if full_ready && !files_enrichment && !exact_retry_completed {
         merged = existing.clone();
     }
     merged.last_accessed_at = existing.last_accessed_at.max(incoming.last_accessed_at);
@@ -339,5 +347,36 @@ mod tests {
         assert_eq!(ready.full_clonepack.manifest, "files");
         assert_eq!(ready.archive_chunks, vec!["archive"]);
         assert!(ready.build_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_retry_can_clear_failure_without_replacing_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
+        let repo = RepoId::github("acme/retry");
+        let commit = "c".repeat(40);
+        let mut failed = RefInfo {
+            commit: commit.clone(),
+            build_status: Some("failed: transient source".into()),
+            ..Default::default()
+        };
+        failed.full_clonepack.commit = commit.clone();
+        failed.full_clonepack.manifest = "same-full".into();
+        failed.full_clonepack.metadata_chunk = "same-metadata".into();
+        failed.full_clonepack.idx_bundle = "same-bundle".into();
+        failed.shallow_clonepack.commit = commit.clone();
+        failed.shallow_clonepack.manifest = "same-shallow".into();
+        store.save_result(&repo, &failed).await.unwrap();
+
+        let mut recovered = failed.clone();
+        recovered.build_status = None;
+        store.save_result(&repo, &recovered).await.unwrap();
+        let stored = store.load_result(&repo, &commit).await.unwrap().unwrap();
+        assert!(stored.build_status.is_none());
+        assert_eq!(stored.full_clonepack, failed.full_clonepack);
+        assert_eq!(stored.shallow_clonepack, failed.shallow_clonepack);
     }
 }

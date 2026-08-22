@@ -29,6 +29,25 @@ pub enum AddedRepoSource {
 pub trait RefStore: Send + Sync {
     async fn load_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>>;
     async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()>;
+    async fn save_claimed_result(
+        &self,
+        repo_id: &RepoId,
+        info: &RefInfo,
+        _job_id: i64,
+        _worker_id: &str,
+    ) -> Result<bool> {
+        self.save_result(repo_id, info).await?;
+        Ok(true)
+    }
+    /// Optional wrapper hooks around an atomically authorized claimed write.
+    /// Production stores use the defaults; deterministic test stores use these
+    /// without moving the authority check outside the control transaction.
+    async fn before_claimed_result_write(&self, _repo_id: &RepoId, _info: &RefInfo) -> Result<()> {
+        Ok(())
+    }
+    async fn after_claimed_result_write(&self, _repo_id: &RepoId, _info: &RefInfo) -> Result<()> {
+        Ok(())
+    }
     async fn list(&self) -> Result<Vec<RepoId>>;
     async fn update_build_status(
         &self,
@@ -36,6 +55,16 @@ pub trait RefStore: Send + Sync {
         commit: &str,
         status: &str,
     ) -> Result<bool>;
+    async fn update_claimed_build_status(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        status: &str,
+        _job_id: i64,
+        _worker_id: &str,
+    ) -> Result<bool> {
+        self.update_build_status(repo_id, commit, status).await
+    }
     async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool>;
     async fn delete_result(&self, _repo_id: &RepoId, _commit: &str) -> Result<()> {
         Ok(())

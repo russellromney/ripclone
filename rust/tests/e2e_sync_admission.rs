@@ -173,6 +173,81 @@ async fn concurrent_b_and_c_admissions_create_independent_exact_work() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_rechecks_ready_result_inside_immediate_transaction() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe { std::env::set_var("RIPCLONE_TESTING", "1") };
+    let probe = Arc::new(AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    let origin = make_origin("acme", "immutable");
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/immutable")
+        .await
+        .unwrap();
+    server
+        .client()
+        .sync_repo("acme/immutable", None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("initial B result completes");
+
+    let store = server_ref_store(&server).await;
+    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
+    store
+        .update_build_status(&repo_id, &b, "failed: injected retry fixture")
+        .await
+        .unwrap();
+    let jobs_before = probe.queue_inserts.load(Ordering::SeqCst);
+    let fetches_before = probe.exact_fetches.load(Ordering::SeqCst);
+    let builders_before = probe.builder_entries.load(Ordering::SeqCst);
+    let uploads_before = probe.artifact_uploads.load(Ordering::SeqCst);
+    probe.hold_admission_transaction(&b);
+
+    let retry = post_sync(&server, None);
+    let make_ready = async {
+        wait_entered(&probe.before_admission_tx, 1).await;
+        store
+            .update_build_status(&repo_id, &b, "done")
+            .await
+            .expect("first retry makes B ready before second transaction");
+        probe.before_admission_tx.release();
+    };
+    let ((status, body, _), ()) = tokio::join!(retry, make_ready);
+    assert_eq!(
+        status,
+        reqwest::StatusCode::ACCEPTED,
+        "retry response: {body}"
+    );
+    assert_eq!(response_commit(&body), b);
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), jobs_before);
+    assert_eq!(probe.exact_fetches.load(Ordering::SeqCst), fetches_before);
+    assert_eq!(
+        probe.builder_entries.load(Ordering::SeqCst),
+        builders_before
+    );
+    assert_eq!(
+        probe.artifact_uploads.load(Ordering::SeqCst),
+        uploads_before
+    );
+    assert_eq!(
+        store
+            .load_result(&repo_id, &b)
+            .await
+            .unwrap()
+            .unwrap()
+            .build_status
+            .as_deref(),
+        Some("done")
+    );
+    probe.before_admission_tx.disarm();
+    unsafe { std::env::remove_var("RIPCLONE_TESTING") };
+}
+
 async fn post_sync(
     server: &Server,
     branch: Option<&str>,
@@ -581,6 +656,82 @@ async fn held_full_jobs_release_foreground_slots_for_another_head() {
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
         .await
         .expect("all held Full jobs settle after release");
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn incomplete_parent_forces_cold_files_build() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "2");
+        std::env::set_var("RIPCLONE_TESTING", "1");
+    }
+    setup(false);
+    let probe = Arc::new(AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    let origin = make_origin("acme", "incomplete-parent");
+
+    origin.commit(
+        &[("same-size.txt", "PPPP\n"), ("stable.txt", "stable\n")],
+        "P",
+    );
+    origin.publish();
+    register_added_without_build(&server, "acme/incomplete-parent")
+        .await
+        .expect("register incomplete-parent fixture");
+    server
+        .client()
+        .sync_repo("acme/incomplete-parent", None)
+        .await
+        .expect("P ready");
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("P Full/Files complete");
+
+    probe.phase2_entry.arm();
+    let _a = origin.commit(&[("same-size.txt", "AAAA\n")], "A equal-length edit");
+    origin.publish();
+    admit_repo(&server, "acme/incomplete-parent").await;
+    wait_entered(&probe.phase2_entry, 1).await;
+
+    let b = origin.commit(&[("stable.txt", "B-only\n")], "B while A is phase one");
+    origin.publish();
+    admit_repo(&server, "acme/incomplete-parent").await;
+    wait_entered(&probe.phase2_entry, 2).await;
+    probe.phase2_entry.release();
+    probe.phase2_entry.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
+        .await
+        .expect("A and B complete in either order");
+
+    let output = tempfile::tempdir().unwrap();
+    let target = output.path().join("files-b");
+    server
+        .client()
+        .install_repo_with_mode_at(
+            "acme/incomplete-parent",
+            "HEAD",
+            Some(&b),
+            &target,
+            ripclone::mode::CloneMode::Files,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("Files(B) passes archive integrity verification");
+    assert_eq!(
+        std::fs::read_to_string(target.join("same-size.txt")).unwrap(),
+        "AAAA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("stable.txt")).unwrap(),
+        "B-only\n"
+    );
 
     unsafe {
         std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
@@ -1715,7 +1866,7 @@ async fn default_branch_rename_reuses_commit_and_returns_each_operations_name() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn embedded_worker_stops_before_publication_after_losing_claim() {
+async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
@@ -1753,30 +1904,28 @@ async fn embedded_worker_stops_before_publication_after_losing_claim() {
         .await
         .unwrap()
         .expect("replacement takes the held durable claim");
-    tokio::time::timeout(Duration::from_secs(10), probe.wait_until_claim_lost(1))
-        .await
-        .expect("old owner detects transferred claim");
-    let writes_after_loss = probe.ref_store_writes.load(Ordering::SeqCst);
-    let uploads_after_loss = probe.artifact_uploads.load(Ordering::SeqCst);
-
+    let writes_before_release = probe.ref_store_writes.load(Ordering::SeqCst);
+    // Release the old attempt immediately after reclaim, before its next
+    // heartbeat can detect ownership loss. The publication itself must reject
+    // the stale `(job_id, worker_id)` atomically.
     probe.phase2_entry.release();
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while probe.ref_store_writes.load(Ordering::SeqCst) == writes_before_release {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old attempt reaches rejected publication");
     assert_eq!(probe.full_publishes.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        probe.ref_store_writes.load(Ordering::SeqCst),
-        writes_after_loss
-    );
-    assert_eq!(
-        probe.artifact_uploads.load(Ordering::SeqCst),
-        uploads_after_loss
-    );
     let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/lost-claim");
     let exact = store.load_result(&repo_id, &commit).await.unwrap().unwrap();
     assert!(exact.full_clonepack.manifest.is_empty());
-    assert_ne!(exact.build_status.as_deref(), Some("ready"));
+    assert_eq!(
+        exact.build_status.as_deref(),
+        Some("full history building"),
+        "stale owner cannot mark the exact result ready or failed"
+    );
     assert!(
         takeover
             .ack(

@@ -81,13 +81,19 @@ fn observe_sync_at_identity(
 ) -> Result<()> {
     crate::validation::validate_object_id(commit)
         .with_context(|| format!("validate commit in exact revision {response_kind} response"))?;
-    if branch.is_empty() {
+    let detached_allowed = pin
+        .as_ref()
+        .is_some_and(|identity| identity.branch.as_deref().is_none_or(str::is_empty));
+    if branch.is_empty() && !detached_allowed {
         anyhow::bail!(
             "sync integrity error: exact revision {response_kind} response omitted branch"
         );
     }
-    crate::validation::validate_git_rev(branch)
-        .with_context(|| format!("validate branch in exact revision {response_kind} response"))?;
+    if !branch.is_empty() {
+        crate::validation::validate_checkout_name(branch).with_context(|| {
+            format!("validate branch in exact revision {response_kind} response")
+        })?;
+    }
 
     if let Some(expected) = pin {
         if expected.commit != commit
@@ -117,6 +123,7 @@ fn observe_sync_at_identity(
 fn validate_ref_response_identity(
     expected_commit: Option<&str>,
     expected_branch: Option<&str>,
+    detached_checkout_allowed: bool,
     commit: &str,
     branch: &str,
     response_kind: &str,
@@ -124,8 +131,13 @@ fn validate_ref_response_identity(
 ) -> Result<()> {
     crate::validation::validate_object_id(commit)
         .with_context(|| format!("invalid {response_kind} commit for {repo_path}"))?;
-    crate::validation::validate_git_rev(branch)
-        .with_context(|| format!("invalid {response_kind} branch for {repo_path}"))?;
+    if branch.is_empty() && !detached_checkout_allowed {
+        anyhow::bail!("invalid {response_kind} branch for {repo_path}: checkout name is empty");
+    }
+    if !branch.is_empty() {
+        crate::validation::validate_checkout_name(branch)
+            .with_context(|| format!("invalid {response_kind} branch for {repo_path}"))?;
+    }
     if let Some(expected) = expected_commit
         && commit != expected
     {
@@ -1397,13 +1409,18 @@ impl Client {
         cold: &mut bool,
     ) -> Result<InstallPlan> {
         let (max_attempts, poll_delay) = ref_poll_config();
+        let detached_checkout_allowed = branch == "HEAD"
+            && rev.is_some_and(|value| crate::validation::validate_object_id(value).is_ok());
         // Track whether any attempt polled a cold build (202/503) before
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
             let requested_top_up = allow_top_up && pinned.is_some() && rev.is_none();
             let request_branch = if pinned.is_some() {
-                resolved_branch.as_deref().unwrap_or(branch)
+                resolved_branch
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(branch)
             } else {
                 branch
             };
@@ -1473,6 +1490,7 @@ impl Client {
                 validate_ref_response_identity(
                     pinned.as_deref().or(expected_commit),
                     resolved_branch.as_deref().or(Some(branch)),
+                    detached_checkout_allowed,
                     &pending.commit,
                     &pending.branch,
                     "pending",
@@ -1507,7 +1525,7 @@ impl Client {
                     };
                     crate::validation::validate_object_id(&base_response.commit)
                         .with_context(|| format!("invalid top-up base commit for {repo_path}"))?;
-                    crate::validation::validate_git_rev(&base_response.branch)
+                    crate::validation::validate_checkout_name(&base_response.branch)
                         .with_context(|| format!("invalid top-up base branch for {repo_path}"))?;
                     if let Some(expected) = resolved_branch.as_deref()
                         && base_response.branch != expected
@@ -1571,6 +1589,7 @@ impl Client {
                             validate_ref_response_identity(
                                 pinned.as_deref().or(expected_commit),
                                 resolved_branch.as_deref().or(Some(branch)),
+                                detached_checkout_allowed,
                                 &unavailable.commit,
                                 &unavailable.branch,
                                 "503",
@@ -1582,12 +1601,11 @@ impl Client {
                             *resolved_branch = Some(unavailable.branch.clone());
                             Some(unavailable)
                         }
-                        Err(error) if pinned.is_some() || expected_commit.is_some() => {
+                        Err(error) => {
                             return Err(error).with_context(|| {
                                 format!("invalid unavailable response for {repo_path}")
                             });
                         }
-                        Err(_) => None,
                     };
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
@@ -1626,6 +1644,7 @@ impl Client {
                 validate_ref_response_identity(
                     pinned.as_deref().or(expected_commit),
                     resolved_branch.as_deref().or(Some(branch)),
+                    detached_checkout_allowed,
                     &info.commit,
                     &info.branch,
                     "ready",
@@ -1966,8 +1985,10 @@ impl Client {
         let branch = accepted.branch;
         crate::validation::validate_object_id(&commit)
             .context("server returned invalid admitted commit")?;
-        crate::validation::validate_git_rev(&branch)
-            .context("server returned invalid admitted branch")?;
+        if branch != "HEAD" {
+            crate::validation::validate_checkout_name(&branch)
+                .context("server returned invalid admitted branch")?;
+        }
         Ok(SyncAdmission {
             commit,
             branch,
@@ -2083,7 +2104,7 @@ impl Client {
                 }
                 observe_sync_at_identity(&mut pin, &pending.commit, &pending.branch, "202")?;
                 selected_rev = pending.commit;
-                selected_branch = Some(pending.branch);
+                selected_branch = (!pending.branch.is_empty()).then_some(pending.branch);
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(poll).await;
                     continue;
@@ -2102,7 +2123,7 @@ impl Client {
                     "503",
                 )?;
                 selected_rev = unavailable.commit;
-                selected_branch = Some(unavailable.branch);
+                selected_branch = (!unavailable.branch.is_empty()).then_some(unavailable.branch);
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(poll).await;
                     continue;
@@ -2491,21 +2512,22 @@ impl Client {
             std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
             std::fs::create_dir_all(git_dir.join("info"))?;
 
-            let branch_name = identity
-                .resolved_branch
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(branch);
-
-            std::fs::write(
-                git_dir.join("HEAD"),
-                format!("ref: refs/heads/{branch_name}\n"),
-            )?;
-            let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
-            if let Some(parent) = branch_ref.parent() {
-                std::fs::create_dir_all(parent)?;
+            let branch_name = identity.resolved_branch.as_deref().unwrap_or(branch);
+            if branch_name.is_empty() {
+                std::fs::write(git_dir.join("HEAD"), format!("{}\n", info.commit))?;
+            } else {
+                crate::validation::validate_checkout_name(branch_name)
+                    .context("server returned invalid checkout branch")?;
+                std::fs::write(
+                    git_dir.join("HEAD"),
+                    format!("ref: refs/heads/{branch_name}\n"),
+                )?;
+                let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
+                if let Some(parent) = branch_ref.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(branch_ref, format!("{}\n", info.commit))?;
             }
-            std::fs::write(branch_ref, format!("{}\n", info.commit))?;
             std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
             if info.shallow {
                 // Mark HEAD as a shallow boundary so git does not try to traverse
@@ -3711,16 +3733,21 @@ impl Client {
         } else {
             branch
         };
-
-        std::fs::write(
-            git_dir.join("HEAD"),
-            format!("ref: refs/heads/{}\n", branch_name),
-        )?;
-        let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
-        if let Some(parent) = branch_ref.parent() {
-            std::fs::create_dir_all(parent)?;
+        if branch_name.is_empty() {
+            std::fs::write(git_dir.join("HEAD"), format!("{}\n", info.commit))?;
+        } else {
+            crate::validation::validate_checkout_name(branch_name)
+                .context("server returned invalid checkout branch")?;
+            std::fs::write(
+                git_dir.join("HEAD"),
+                format!("ref: refs/heads/{}\n", branch_name),
+            )?;
+            let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
+            if let Some(parent) = branch_ref.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(branch_ref, format!("{}\n", info.commit))?;
         }
-        std::fs::write(branch_ref, format!("{}\n", info.commit))?;
         std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
         if info.shallow {
             std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;

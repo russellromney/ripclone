@@ -291,6 +291,129 @@ impl ControlDb {
         self.admission_notify.clone()
     }
 
+    /// Publish exact-result metadata only while `(job_id, worker_id)` owns the
+    /// admitted job. Ownership validation and the result mutation share one
+    /// immediate transaction, so stale workers have no check/write window.
+    pub async fn save_result_for_claim(
+        &self,
+        job_id: i64,
+        worker_id: &str,
+        repo_id: &crate::provider::RepoId,
+        info: &crate::RefInfo,
+    ) -> Result<bool> {
+        crate::validation::validate_object_id(&info.commit)
+            .context("validate claimed result commit")?;
+        let connection = self
+            .database
+            .connect()
+            .context("connect for claimed result write")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .context("begin claimed result write")?;
+        if !claim_authorizes(&tx, job_id, worker_id, repo_id, &info.commit, false).await? {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        let repo_key = repo_id.storage_key();
+        let mut rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), info.commit.as_str()],
+            )
+            .await
+            .context("read claimed exact result")?;
+        let merged = match rows.next().await? {
+            Some(row) => {
+                let existing: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
+                    .context("decode claimed exact result")?;
+                crate::meta::merge_publication(&existing, info)
+            }
+            None => info.clone(),
+        };
+        drop(rows);
+        let data = serde_json::to_string(&merged).context("encode claimed exact result")?;
+        tx.execute(
+            "INSERT INTO results(repo_key, commit_id, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(repo_key, commit_id) DO UPDATE SET data = excluded.data",
+            libsql::params![repo_key, info.commit.as_str(), data],
+        )
+        .await
+        .context("write claimed exact result")?;
+        tx.commit().await.context("commit claimed result write")?;
+        Ok(true)
+    }
+
+    /// Update status under the same claim authority. A terminal failed status
+    /// is also allowed immediately after that owner has dead-lettered the job;
+    /// the jobs row retains its worker id, while a reclaimed row does not.
+    pub async fn update_result_status_for_claim(
+        &self,
+        job_id: i64,
+        worker_id: &str,
+        repo_id: &crate::provider::RepoId,
+        commit: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let connection = self
+            .database
+            .connect()
+            .context("connect for claimed status write")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .context("begin claimed status write")?;
+        let allow_settled_failure = status.starts_with("failed: ");
+        if !claim_authorizes(
+            &tx,
+            job_id,
+            worker_id,
+            repo_id,
+            commit,
+            allow_settled_failure,
+        )
+        .await?
+        {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        let repo_key = repo_id.storage_key();
+        let mut rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), commit],
+            )
+            .await
+            .context("read exact result for claimed status")?;
+        let Some(row) = rows.next().await? else {
+            tx.rollback().await.ok();
+            return Ok(false);
+        };
+        let mut info: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
+            .context("decode exact result for claimed status")?;
+        drop(rows);
+        if allow_settled_failure
+            && info.build_status.is_none()
+            && info.full_clonepack.commit == commit
+            && !info.full_clonepack.manifest.is_empty()
+        {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        info.build_status = Some(status.to_string());
+        let data = serde_json::to_string(&info).context("encode claimed status")?;
+        tx.execute(
+            "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
+            libsql::params![data, repo_key, commit],
+        )
+        .await
+        .context("write claimed status")?;
+        tx.commit().await.context("commit claimed status write")?;
+        Ok(true)
+    }
+
     /// Load the single repository-level build configuration record. Only a
     /// genuinely absent row returns `None`; database, decode, and validation
     /// failures are propagated so admission cannot silently select defaults.
@@ -389,6 +512,55 @@ impl ControlDb {
             .await
             .context("begin durable admission")?;
         crate::server::admission_test_inside_admission_tx(&job.admitted_commit).await;
+        let repo_key = job.repo_id.storage_key();
+        let mut existing_rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), job.admitted_commit.as_str()],
+            )
+            .await
+            .context("read exact result during durable admission")?;
+        let existing = match existing_rows.next().await? {
+            Some(row) => Some(
+                serde_json::from_str::<crate::RefInfo>(&row.get::<String>(0)?)
+                    .context("decode exact result during durable admission")?,
+            ),
+            None => None,
+        };
+        drop(existing_rows);
+        let mut rows = tx
+            .query(
+                "SELECT id FROM jobs WHERE key = ?1 AND status IN ('queued', 'claimed') LIMIT 1",
+                [job.key().as_str()],
+            )
+            .await
+            .context("load active job for exact result")?;
+        let active_job_id = match rows.next().await? {
+            Some(row) => Some(row.get::<i64>(0)?),
+            None => None,
+        };
+        drop(rows);
+        let result_ready = existing.as_ref().is_some_and(|info| {
+            info.commit == job.admitted_commit
+                && info.full_clonepack.commit == job.admitted_commit
+                && !info.full_clonepack.manifest.is_empty()
+                && !info.full_clonepack.metadata_chunk.is_empty()
+                && !info.full_clonepack.idx_bundle.is_empty()
+                && info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+                && !info
+                    .build_status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("failed: "))
+        });
+        if result_ready || active_job_id.is_some() {
+            tx.commit()
+                .await
+                .context("commit coalesced exact admission")?;
+            return Ok(Enqueued {
+                outcome: EnqueueOutcome::Coalesced,
+                job_id: active_job_id,
+            });
+        }
         insert_exact_result(&tx, job, pending).await?;
         let key = job.key();
         let size_class = crate::queue::classify_rank(job.size_bytes, &self.size_classes);
@@ -444,6 +616,53 @@ impl ControlDb {
             job_id: Some(id),
         })
     }
+}
+
+async fn claim_authorizes(
+    tx: &libsql::Transaction,
+    job_id: i64,
+    worker_id: &str,
+    repo_id: &crate::provider::RepoId,
+    commit: &str,
+    allow_settled_failure: bool,
+) -> Result<bool> {
+    let mut rows = tx
+        .query(
+            "SELECT provider, path, admitted_commit, status, key FROM jobs
+             WHERE id = ?1 AND worker_id = ?2",
+            libsql::params![job_id, worker_id],
+        )
+        .await
+        .context("verify claimed result owner")?;
+    let Some(row) = rows.next().await? else {
+        return Ok(false);
+    };
+    let provider = row.get::<String>(0)?;
+    let path = row.get::<String>(1)?;
+    let admitted_commit = row.get::<String>(2)?;
+    let status = row.get::<String>(3)?;
+    let key = row.get::<String>(4)?;
+    drop(rows);
+    let identity_matches =
+        provider == repo_id.provider.as_str() && path == repo_id.path && admitted_commit == commit;
+    if !identity_matches || (status != "claimed" && !(allow_settled_failure && status == "failed"))
+    {
+        return Ok(false);
+    }
+    if status == "failed" {
+        let mut newer = tx
+            .query(
+                "SELECT 1 FROM jobs WHERE key = ?1 AND id != ?2
+                 AND status IN ('queued', 'claimed') LIMIT 1",
+                libsql::params![key, job_id],
+            )
+            .await
+            .context("check newer active attempt before terminal status")?;
+        if newer.next().await?.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn insert_exact_result(

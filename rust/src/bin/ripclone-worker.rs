@@ -269,7 +269,10 @@ async fn main() -> Result<()> {
                 // job (acked as failed) instead of killing the worker and
                 // leaving the row `claimed` until the stale-reclaim timeout.
                 let st = state.clone();
-                let mut build = tokio::spawn(async move { process_build_job(&st, &job).await });
+                let build_worker_id = worker_id.clone();
+                let mut build = tokio::spawn(async move {
+                    process_build_job(&st, &job, job_id, &build_worker_id).await
+                });
                 let mut heartbeat = tokio::time::interval(heartbeat_interval);
                 heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let (result, ownership_error) = loop {
@@ -319,9 +322,15 @@ async fn main() -> Result<()> {
                         // is the case that still needs a terminal write.
                         if maybe_retryable_msg.is_some()
                             && let Ok(JobState::Failed(err)) = queue.job_status(job_id).await
-                            && let Err(e) =
-                                mark_admitted_build_failed(&state, &repo_id, &terminal_commit, &err)
-                                    .await
+                            && let Err(e) = mark_admitted_build_failed(
+                                &state,
+                                job_id,
+                                &worker_id,
+                                &repo_id,
+                                &terminal_commit,
+                                &err,
+                            )
+                            .await
                         {
                             error!(
                                 "failed to mark {}@{} terminal after dead-letter: {e:#}",
@@ -332,7 +341,7 @@ async fn main() -> Result<()> {
                     }
                     Ok(false) => warn!(
                         "job {job_id} was reclaimed (or dead-lettered) before this worker \
-                         finished; discarding its build result"
+                         finished; claim-scoped publication rejected the stale result"
                     ),
                     Err(e) if is_queue_auth_expired(&e) => {
                         // Token expired mid-job: exit cleanly for respawn. The

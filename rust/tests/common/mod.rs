@@ -331,6 +331,26 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         Ok(())
     }
 
+    async fn before_claimed_result_write(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        self.inner.before_claimed_result_write(repo_id, info).await
+    }
+
+    async fn after_claimed_result_write(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        self.inner.after_claimed_result_write(repo_id, info).await?;
+        if let Some(barrier) = &self.phase_one_barrier {
+            barrier.after_save(info).await;
+        }
+        Ok(())
+    }
+
     async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
         if self.probe.is_armed() {
             panic!("pinned metadata lookup must not scan repositories");
@@ -757,9 +777,10 @@ async fn start_server_split_storage_inner(
                     credential: claimed.credential,
                     size_bytes: None,
                 };
-                let result = ripclone::server::process_build_job(&state, &job)
-                    .await
-                    .map(|_| ());
+                let result =
+                    ripclone::server::process_build_job(&state, &job, claimed.id, &worker_id)
+                        .await
+                        .map(|_| ());
                 let _ = worker_queue.ack(claimed.id, &worker_id, result).await;
             }
         });
@@ -952,6 +973,28 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
             );
         }
         self.inner.save_result(repo_id, info).await
+    }
+
+    async fn before_claimed_result_write(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected ref-store save failure for {}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.before_claimed_result_write(repo_id, info).await
+    }
+
+    async fn after_claimed_result_write(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        self.inner.after_claimed_result_write(repo_id, info).await
     }
 
     async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {

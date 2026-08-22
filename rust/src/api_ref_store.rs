@@ -2,10 +2,10 @@
 //!
 //! A standalone worker holds only a report URL and a signed, expiring bearer
 //! token — never database credentials. The token
-//! carries no repo/job scope (the worker pool claims any repo); the write
-//! target is the `repo_key` in each report body. The server that holds the real
-//! control database performs the durable write after checking the token
-//! (`POST /v1/refs`).
+//! carries no repo/job scope (the worker pool claims any repo); each report
+//! carries the already-issued `(job_id, worker_id)` claim plus its `repo_key`.
+//! The server that holds the real control database performs the durable write
+//! only when that owner still holds that exact job (`POST /v1/refs`).
 //!
 //! Reads return empty: a farmed-out worker builds cold and only needs the write
 //! path for publish. A failed report is never swallowed — network/5xx map to
@@ -92,31 +92,26 @@ impl std::error::Error for ApiReportError {}
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RefReport {
     SaveResult {
+        job_id: i64,
+        worker_id: String,
         repo_key: String,
         info: Box<RefInfo>,
     },
     UpdateBuildStatus {
+        job_id: i64,
+        worker_id: String,
         repo_key: String,
         commit: String,
         status: String,
-    },
-    DeleteResult {
-        repo_key: String,
-        commit: String,
-    },
-    TouchLastAccessed {
-        repo_key: String,
-        commit: String,
     },
 }
 
 impl RefReport {
     pub fn repo_key(&self) -> &str {
         match self {
-            Self::SaveResult { repo_key, .. }
-            | Self::UpdateBuildStatus { repo_key, .. }
-            | Self::DeleteResult { repo_key, .. }
-            | Self::TouchLastAccessed { repo_key, .. } => repo_key,
+            Self::SaveResult { repo_key, .. } | Self::UpdateBuildStatus { repo_key, .. } => {
+                repo_key
+            }
         }
     }
 }
@@ -248,8 +243,20 @@ impl RefStore for ApiRefStore {
         Ok(map.get(&Self::local_key(repo_id, commit)).cloned())
     }
 
-    async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
+    async fn save_result(&self, _repo_id: &RepoId, _info: &RefInfo) -> Result<()> {
+        bail!("standalone worker result writes require claim identity")
+    }
+
+    async fn save_claimed_result(
+        &self,
+        repo_id: &RepoId,
+        info: &RefInfo,
+        job_id: i64,
+        worker_id: &str,
+    ) -> Result<bool> {
         self.post_report(&RefReport::SaveResult {
+            job_id,
+            worker_id: worker_id.to_string(),
             repo_key: repo_id.storage_key(),
             info: Box::new(info.clone()),
         })
@@ -257,7 +264,7 @@ impl RefStore for ApiRefStore {
         // Write-through: phase 2 reloads the phase-1 ref from this map.
         let mut map = self.local.write().await;
         map.insert(Self::local_key(repo_id, &info.commit), info.clone());
-        Ok(())
+        Ok(true)
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
@@ -266,12 +273,25 @@ impl RefStore for ApiRefStore {
 
     async fn update_build_status(
         &self,
+        _repo_id: &RepoId,
+        _commit: &str,
+        _status: &str,
+    ) -> Result<bool> {
+        bail!("standalone worker status writes require claim identity")
+    }
+
+    async fn update_claimed_build_status(
+        &self,
         repo_id: &RepoId,
         commit: &str,
         status: &str,
+        job_id: i64,
+        worker_id: &str,
     ) -> Result<bool> {
         let r = self
             .post_report(&RefReport::UpdateBuildStatus {
+                job_id,
+                worker_id: worker_id.to_string(),
                 repo_key: repo_id.storage_key(),
                 commit: commit.to_string(),
                 status: status.to_string(),
@@ -287,24 +307,13 @@ impl RefStore for ApiRefStore {
     }
 
     async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
-        let r = self
-            .post_report(&RefReport::TouchLastAccessed {
-                repo_key: repo_id.storage_key(),
-                commit: commit.to_string(),
-            })
-            .await?;
-        Ok(r.updated)
+        let _ = (repo_id, commit);
+        bail!("ApiRefStore does not support access touches (server-only operation)")
     }
 
     async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
-        self.post_report(&RefReport::DeleteResult {
-            repo_key: repo_id.storage_key(),
-            commit: commit.to_string(),
-        })
-        .await?;
-        let mut map = self.local.write().await;
-        map.remove(&Self::local_key(repo_id, commit));
-        Ok(())
+        let _ = (repo_id, commit);
+        bail!("ApiRefStore does not support result deletion (server-only operation)")
     }
 
     async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
@@ -355,7 +364,10 @@ mod tests {
             commit: "abc".into(),
             ..Default::default()
         };
-        let err = store.save_result(&repo, &info).await.unwrap_err();
+        let err = store
+            .save_claimed_result(&repo, &info, 7, "worker-test")
+            .await
+            .unwrap_err();
         let api = err
             .downcast_ref::<ApiReportError>()
             .expect("ApiReportError in chain");
