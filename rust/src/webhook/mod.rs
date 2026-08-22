@@ -1,4 +1,4 @@
-//! Provider-agnostic webhook receiver: a provider push → enqueue a sync → warm.
+//! Provider-agnostic webhook receiver: a signed default-branch push → exact admission.
 //!
 //! A webhook is a thin **front door**. Everything heavy already exists — the
 //! build queue, the worker, storage, the metadata store. The receiver does
@@ -55,7 +55,7 @@ pub struct CanonicalEvent {
 pub enum EventKind {
     /// A branch advanced — warm it.
     Push,
-    /// A branch was deleted — clean up its stored ref, do not build.
+    /// A branch was deleted — acknowledge without changing durable exact results.
     BranchDelete,
     /// A provider connectivity check — acknowledge with `200`.
     Ping,
@@ -135,7 +135,8 @@ impl WebhookConfig {
     ///
     /// Allowlist: `RIPCLONE_WEBHOOK_ALLOWLIST`, a comma-separated list of repo
     /// storage keys (e.g. `owner/repo,other/repo`). Unset or empty ⇒ allow all,
-    /// with a loud startup log so the operator knows every pushed repo warms.
+    /// with a loud startup log so the operator knows every added repository is
+    /// eligible for default-branch push admission.
     pub fn from_env(registry: &ProviderRegistry) -> Self {
         let mut secrets = HashMap::new();
         for instance in registry.iter() {
@@ -164,7 +165,7 @@ impl WebhookConfig {
                 ),
                 None => warn!(
                     "webhooks: NO allowlist (RIPCLONE_WEBHOOK_ALLOWLIST unset) — \
-                     warming ALL repos pushed via configured providers"
+                     every added repo is eligible for default-branch push admission"
                 ),
             }
         }
@@ -178,8 +179,8 @@ impl WebhookConfig {
         self.secrets.get(provider_id)
     }
 
-    /// Whether a repo (by its natural key — see [`RepoId::natural_key`]) may be
-    /// warmed. Allow-all when no allowlist is configured.
+    /// Whether a repo (by its natural key — see [`RepoId::natural_key`]) may
+    /// admit a signed default-branch push. Allow-all when no allowlist is configured.
     ///
     /// [`RepoId::natural_key`]: crate::provider::RepoId::natural_key
     pub fn allows(&self, repo_key: &str) -> bool {

@@ -214,6 +214,7 @@ pub struct AdmissionTestProbe {
     pub enqueue_attempts: AtomicUsize,
     pub queue_inserts: AtomicUsize,
     pub coalesces: AtomicUsize,
+    pub pending_responses: AtomicUsize,
     pub tip_probes: AtomicUsize,
     pub exact_fetches: AtomicUsize,
     pub builder_entries: AtomicUsize,
@@ -249,6 +250,7 @@ impl Default for AdmissionTestProbe {
             enqueue_attempts: AtomicUsize::new(0),
             queue_inserts: AtomicUsize::new(0),
             coalesces: AtomicUsize::new(0),
+            pending_responses: AtomicUsize::new(0),
             tip_probes: AtomicUsize::new(0),
             exact_fetches: AtomicUsize::new(0),
             builder_entries: AtomicUsize::new(0),
@@ -2627,6 +2629,9 @@ fn artifact_pending_response_with_top_up(
     top_up_supported: Option<bool>,
     top_up_base: Option<RefResponse>,
 ) -> Response {
+    if let Some(probe) = admission_test_probe() {
+        probe.pending_responses.fetch_add(1, Ordering::SeqCst);
+    }
     let mut response = (
         StatusCode::ACCEPTED,
         Json(ArtifactPendingResponse {
@@ -2872,7 +2877,15 @@ async fn get_ref_inner(
             repo_id.storage_key(),
             params.clonepack
         ));
-        (pinned.to_string(), requested_checkout.clone(), true)
+        let checkout_name = if requested_checkout == "HEAD"
+            && params.rev.as_deref() == Some(pinned)
+            && validation::validate_object_id(pinned).is_ok()
+        {
+            String::new()
+        } else {
+            requested_checkout.clone()
+        };
+        (pinned.to_string(), checkout_name, true)
     } else if let Some(rev) = params.rev.as_deref() {
         if validation::validate_object_id(rev).is_ok() {
             let checkout_name = if requested_checkout == "HEAD" {
@@ -3033,36 +3046,29 @@ async fn get_ref_inner(
         )
             .into_response();
     }
-    let active = existing.as_ref().is_some_and(|info| {
-        matches!(
-            info.build_status.as_deref(),
-            None | Some("done")
-                | Some("building")
-                | Some(BUILDING_FULL_HISTORY)
-                | Some("archive building")
-        ) && info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-    });
-    if !active {
-        let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&commit)).await;
-        let job = BuildJob {
-            repo_id: repo_id.clone(),
-            admitted_commit: commit.clone(),
-            repo_config: crate::repo_config::RepoConfig::default(),
-            credential: credential.clone(),
-            size_bytes,
-        };
-        if let Err(error) = enqueue_admitted_build(&state, job).await {
-            state.metrics.record_error();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ExactRevisionUnavailableResponse {
-                    error,
-                    commit,
-                    branch: checkout_name,
-                }),
-            )
-                .into_response();
-        }
+    // Metadata phase text is not proof that a live durable job exists. Every
+    // non-ready exact request enters the one atomic admission transaction,
+    // which coalesces an active job or creates replacement work after a stale
+    // claim was dead-lettered.
+    let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&commit)).await;
+    let job = BuildJob {
+        repo_id: repo_id.clone(),
+        admitted_commit: commit.clone(),
+        repo_config: crate::repo_config::RepoConfig::default(),
+        credential: credential.clone(),
+        size_bytes,
+    };
+    if let Err(error) = enqueue_admitted_build(&state, job).await {
+        state.metrics.record_error();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ExactRevisionUnavailableResponse {
+                error,
+                commit,
+                branch: checkout_name,
+            }),
+        )
+            .into_response();
     }
 
     if already_pinned && params.top_up && params.clonepack == "full" {
@@ -4160,12 +4166,16 @@ async fn enqueue_admitted_build(
         admission_test_before_admission_tx(&job.admitted_commit).await;
         return match control.admit_exact_and_job(&job, &admission.pending).await {
             Ok(enqueued) => {
-                state.metrics.record_build_accepted();
+                if enqueued.outcome == EnqueueOutcome::Enqueued {
+                    state.metrics.record_build_accepted();
+                } else {
+                    state.metrics.rollback_build_queued();
+                }
                 admission_test_enqueue(enqueued.outcome);
                 Ok(enqueued.outcome)
             }
             Err(error) => {
-                state.metrics.record_build_rejected();
+                state.metrics.rollback_build_queued();
                 Err(format!("durable admission failed: {error:#}"))
             }
         };
@@ -4182,18 +4192,23 @@ async fn enqueue_admitted_build(
         .map_err(|error| format!("exact admission persistence failed: {error}"))?;
     state.metrics.record_build_queued();
     match state.build_queue.enqueue(job).await {
-        Ok(enq) if enq.outcome != EnqueueOutcome::Full => {
+        Ok(enq) if enq.outcome == EnqueueOutcome::Enqueued => {
             state.metrics.record_build_accepted();
             admission_test_enqueue(enq.outcome);
             Ok(enq.outcome)
         }
+        Ok(enq) if enq.outcome == EnqueueOutcome::Coalesced => {
+            state.metrics.rollback_build_queued();
+            admission_test_enqueue(enq.outcome);
+            Ok(enq.outcome)
+        }
         Ok(_) => {
-            state.metrics.record_build_rejected();
+            state.metrics.rollback_build_queued();
             admission_test_enqueue(EnqueueOutcome::Full);
             Err("build queue full".to_string())
         }
         Err(e) => {
-            state.metrics.record_build_rejected();
+            state.metrics.rollback_build_queued();
             Err(format!("build queue unavailable: {e}"))
         }
     }
@@ -4692,8 +4707,8 @@ fn webhook_repo_allowed(state: &ServerState, repo_id: &RepoId) -> bool {
         || (repo_id.is_github_default() && cfg.allows(&format!("github/{}", repo_id.path)))
 }
 
-/// Push → warm. Applies the allowlist gate and the branch policy, then triggers
-/// a build via the shared fire-and-forget path and returns immediately.
+/// Default-branch push → exact admission. Applies the allowlist and added-repo
+/// gates, then triggers the shared fire-and-forget path and returns immediately.
 async fn webhook_dispatch_push(
     state: &ServerState,
     provider: &ProviderInstance,
@@ -4717,7 +4732,8 @@ async fn webhook_dispatch_push(
         Ok(false) => return webhook_ignored("repo not added"),
         Err(resp) => return resp,
     }
-    // Phase 1 warms branches only; tags and other refs are ignored.
+    // Only branch pushes can identify the admitted default-branch commit; tags
+    // and other refs are ignored.
     let Some(branch) = event
         .ref_
         .strip_prefix("refs/heads/")
@@ -4736,7 +4752,7 @@ async fn webhook_dispatch_push(
     if validation::validate_object_id(after).is_err() {
         return webhook_ignored("push event has invalid after commit");
     }
-    // Only a signed event that names its default branch may warm a commit.
+    // Only a signed event that names its default branch may admit a commit.
     // Missing identity and non-default pushes are acknowledged without work.
     if event.default_branch.as_deref() != Some(branch.as_str()) {
         return webhook_ignored("push is not identified as the default branch");
@@ -9298,7 +9314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_untracked_non_default_branch_is_ignored() {
+    async fn webhook_non_default_branch_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = webhook_state(&tmp);
         let app = build_app(state);
@@ -9316,10 +9332,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            rx.try_recv().is_err(),
-            "untracked non-default must not enqueue"
-        );
+        assert!(rx.try_recv().is_err(), "non-default push must not enqueue");
     }
 
     #[tokio::test]
@@ -9707,7 +9720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_no_default_no_mirror_untracked_is_ignored() {
+    async fn webhook_missing_default_identity_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = webhook_state(&tmp);
         let app = build_app(state);
@@ -9721,7 +9734,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             rx.try_recv().is_err(),
-            "unknowable default + untracked → ignored"
+            "missing default-branch identity is ignored"
         );
     }
 

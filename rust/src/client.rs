@@ -1929,9 +1929,9 @@ impl Client {
         }
     }
 
-    /// Sync a specific branch instead of the repo's default. Each branch is its
-    /// own ref + clonepack, so this lets several distinct builds for one repo run
-    /// at once (unlike `?rev=`, which the server keys by resolved commit).
+    /// Resolve a specific branch once instead of using the repo's default, then
+    /// admit its exact commit. Checkout names are request-local: two names that
+    /// resolve to the same commit share one durable result and job.
     pub async fn sync_branch(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
         self.sync_inner(repo_path, Some(branch), None).await
     }

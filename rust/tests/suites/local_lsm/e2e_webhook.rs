@@ -497,9 +497,9 @@ async fn gitea_webhook_push_builds_before_clone() {
     assert_repo_usable(&c, "1");
 }
 
-/// A Gitea `delete` webhook removes the stored ref for a deleted branch.
+/// A Gitea `delete` webhook is acknowledged without resurrecting the deleted name.
 #[tokio::test]
-async fn gitea_webhook_branch_delete_cleans_up_ref() {
+async fn gitea_webhook_branch_delete_is_ignored_without_resurrection() {
     setup(true);
     let origin = make_http_origin("acme/hook");
     origin.commit(&[("main.txt", "m\n")], "main commit");

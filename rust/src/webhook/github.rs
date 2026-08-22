@@ -2,8 +2,8 @@
 //!
 //! - Signature: `X-Hub-Signature-256: sha256=<hex>` is HMAC-SHA256 of the raw
 //!   body keyed by the configured secret. We compare in constant time.
-//! - Routing: `X-GitHub-Event` selects the event; we act on `push` (warm /
-//!   delete) and `ping` (acknowledge).
+//! - Routing: `X-GitHub-Event` selects the event; default-branch `push` can
+//!   admit its exact `after`, while delete and `ping` are acknowledged.
 //! - Fields: `ref`, `after`, `deleted`, and `repository.{owner.login, name,
 //!   default_branch, private}`.
 

@@ -94,8 +94,14 @@ fn variant_ready(variant: &crate::ClonepackArtifacts, commit: &str) -> bool {
 /// accepted only when it carries the same previously-published variant bytes.
 pub(crate) fn merge_publication(existing: &RefInfo, incoming: &RefInfo) -> RefInfo {
     let commit = existing.commit.as_str();
-    let shallow_ready = variant_ready(&existing.shallow_clonepack, commit);
-    let full_ready = variant_ready(&existing.full_clonepack, commit);
+    // GC deliberately retains artifact pointers on an evicted row so its
+    // accounting remains inspectable after the objects are removed. Those
+    // pointers are not ready variants and must not defeat a rebuilt exact
+    // publication merely because their manifests differ from the new bytes.
+    let existing_evicted =
+        existing.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS);
+    let shallow_ready = !existing_evicted && variant_ready(&existing.shallow_clonepack, commit);
+    let full_ready = !existing_evicted && variant_ready(&existing.full_clonepack, commit);
     let files_enrichment = full_ready
         && existing.archive_chunks.is_empty()
         && !incoming.archive_chunks.is_empty()

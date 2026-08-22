@@ -90,9 +90,9 @@ impl Metrics {
         self.build_queue_depth.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Roll back a queue-depth increment when the queue is full and the job is
-    /// rejected.
-    pub fn record_build_rejected(&self) {
+    /// Roll back a provisional queue-depth increment when admission does not
+    /// create a new job (coalesced, full, or failed).
+    pub fn rollback_build_queued(&self) {
         Self::dec_saturating(&self.build_queue_depth);
     }
 

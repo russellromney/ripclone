@@ -288,6 +288,21 @@ fn response_commit(body: &Value) -> &str {
         .expect("accepted response includes exact commit")
 }
 
+async fn metric(server: &Server, name: &str) -> u64 {
+    let body = reqwest::get(format!("{}/metrics", server.url))
+        .await
+        .expect("metrics request")
+        .text()
+        .await
+        .expect("metrics body");
+    body.lines()
+        .find_map(|line| {
+            let (metric, value) = line.split_once(' ')?;
+            (metric == name).then(|| value.parse::<u64>().expect("numeric metric"))
+        })
+        .unwrap_or_else(|| panic!("missing metric {name} in:\n{body}"))
+}
+
 fn sign_webhook(body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(WEBHOOK_SECRET.as_bytes()).unwrap();
     mac.update(body);
@@ -779,7 +794,7 @@ async fn e2e_sync_admission() {
     );
     reset_probe(&probe);
 
-    // A signed replay for a complete branch-scoped B/A is a read-only no-op:
+    // A signed replay for a complete exact A is a read-only no-op:
     // the trusted exact path does not probe the upstream or touch the queue.
     let replay_refs = tree_snapshot(&server.repo_root);
     let replay_storage = tree_snapshot(&server.storage_dir);
@@ -1938,6 +1953,196 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
             .await
             .unwrap()
     );
+    unsafe {
+        std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dead_lettered_stale_claim_is_readmitted_by_a_subsequent_exact_clone() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_QUEUE_MAX_ATTEMPTS", "2");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.before_claim.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server_env(&[("RIPCLONE_QUEUE_STALE_SECS", "3")]).await;
+    wait_entered(&probe.before_claim, 1).await;
+
+    let origin = make_origin("acme", "dead-letter-readmit");
+    let b = origin.commit(&[("value.txt", "exact B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/dead-letter-readmit")
+        .await
+        .expect("register stale-claim fixture");
+    let first = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/dead-letter-readmit/refs/HEAD?rev={b}&clonepack=full",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("initial exact-B clone request");
+    assert_eq!(first.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
+
+    let takeover = ripclone::queue::SqlJobQueue::new(Box::new(
+        ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
+            .await
+            .unwrap(),
+    ))
+    .await
+    .unwrap()
+    .with_stale_claim_secs(0);
+    let first_claim = takeover
+        .claim("crashed-worker-1")
+        .await
+        .unwrap()
+        .expect("first crashed attempt claims B");
+    assert_eq!(first_claim.admitted_commit, b);
+    let second_claim = takeover
+        .claim("crashed-worker-2")
+        .await
+        .unwrap()
+        .expect("second attempt reclaims B");
+    assert_eq!(second_claim.id, first_claim.id);
+    assert_eq!(second_claim.admitted_commit, b);
+    assert!(
+        takeover.claim("after-attempt-cap").await.unwrap().is_none(),
+        "the over-cap stale claim must dead-letter"
+    );
+    assert!(matches!(
+        ripclone::queue::JobQueue::job_status(&takeover, first_claim.id)
+            .await
+            .unwrap(),
+        ripclone::queue::JobState::Failed(error) if error.contains("dead-lettered")
+    ));
+    let repo_id = ripclone::provider::RepoId::github("acme/dead-letter-readmit");
+    let stranded_phase = server_ref_store(&server)
+        .await
+        .load_result(&repo_id, &b)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stranded_phase.full_clonepack.manifest.is_empty(),
+        "the dead-lettered attempt must leave B non-ready"
+    );
+
+    let output = tempfile::tempdir().expect("readmitted clone output");
+    let target = output.path().join("clone");
+    let client = server.client();
+    let task_target = target.clone();
+    let task_b = b.clone();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/dead-letter-readmit",
+                "HEAD",
+                Some(&task_b),
+                &task_target,
+                ripclone::mode::CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while probe.queue_inserts.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("subsequent clone admits replacement exact-B work");
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        ripclone::queue::JobQueue::depth(&takeover).await,
+        1,
+        "exactly one replacement B job is queued"
+    );
+    probe.before_claim.release();
+    probe.before_claim.disarm();
+    let outcome = tokio::time::timeout(Duration::from_secs(60), clone)
+        .await
+        .expect("subsequent exact-B clone cannot remain pending forever")
+        .expect("clone task joined")
+        .expect("replacement exact-B build completes");
+    assert_eq!(outcome.commit, b);
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
+    assert!(!git_ok(&target, &["symbolic-ref", "-q", "HEAD"]));
+    assert_eq!(read(&target, "value.txt"), "exact B\n");
+    assert_repo_usable(&target, "1");
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_QUEUE_MAX_ATTEMPTS");
+        std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_exact_admissions_count_one_queued_build_and_balance_depth() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "1");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.before_claim.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", WEBHOOK_SECRET)]).await;
+    wait_entered(&probe.before_claim, 1).await;
+    let origin = make_origin("acme", "immutable");
+    let b = origin.commit(&[("value.txt", "one exact build\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/immutable")
+        .await
+        .expect("register metrics fixture");
+
+    for duplicate in 0..16 {
+        let (status, _) = post_webhook(&server, "main", &b).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "duplicate admission {duplicate}"
+        );
+    }
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.coalesces.load(Ordering::SeqCst), 15);
+    assert_eq!(
+        metric(&server, "ripclone_builds_queued_total").await,
+        1,
+        "coalesced requests must not fabricate queued builds"
+    );
+    assert_eq!(
+        metric(&server, "ripclone_build_queue_depth").await,
+        1,
+        "one real B build is queued"
+    );
+
+    probe.before_claim.release();
+    probe.before_claim.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("the one B build completes");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while metric(&server, "ripclone_build_queue_depth").await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queue-depth gauge returns to zero");
+    assert_eq!(metric(&server, "ripclone_builds_queued_total").await, 1);
+    assert_eq!(metric(&server, "ripclone_build_queue_depth").await, 0);
+
     unsafe {
         std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TESTING");

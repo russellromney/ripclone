@@ -122,3 +122,125 @@ async fn remote_gc_during_local_clone_is_safe() {
         }
     }
 }
+
+/// A production-shaped eviction retains B's artifact pointers while deleting
+/// the referenced objects. Re-admission must replace that evicted publication,
+/// clear the marker, and make both Full and Files cloneable again at exact B.
+#[tokio::test]
+async fn completed_exact_result_rebuilds_after_real_gc_eviction() {
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "gc-rebuild-exact");
+    let b = origin.commit(
+        &[("a.txt", "rebuilt B\n"), ("nested/b.txt", "files B\n")],
+        "B",
+    );
+    origin.publish();
+    register_added_without_build(&server, "acme/gc-rebuild-exact")
+        .await
+        .expect("register exact GC fixture");
+    server
+        .client()
+        .sync_repo_at("acme/gc-rebuild-exact", Some(&b), None)
+        .await
+        .expect("build completed exact B");
+    let (_before_full_guard, before_full) = clone_only_at(
+        &server,
+        "acme",
+        "gc-rebuild-exact",
+        Some(&b),
+        0,
+        ripclone::mode::CloneMode::Editable,
+    )
+    .await
+    .expect("completed B is Full-cloneable before eviction");
+    assert_eq!(read(&before_full, "a.txt"), "rebuilt B\n");
+    let (_before_files_guard, before_files) = clone_only_at(
+        &server,
+        "acme",
+        "gc-rebuild-exact",
+        Some(&b),
+        0,
+        ripclone::mode::CloneMode::Files,
+    )
+    .await
+    .expect("completed B is Files-cloneable before eviction");
+    assert_eq!(read(&before_files, "nested/b.txt"), "files B\n");
+
+    let repo_id = ripclone::provider::RepoId::github("acme/gc-rebuild-exact");
+    let ref_store = server_ref_store(&server).await;
+    let mut completed = ref_store
+        .load_result(&repo_id, &b)
+        .await
+        .unwrap()
+        .expect("load completed exact B");
+    assert!(completed.build_status.is_none());
+    assert!(!completed.full_clonepack.manifest.is_empty());
+    assert!(!completed.archive_chunks.is_empty());
+    let old_manifest = completed.full_clonepack.manifest.clone();
+    let old_archive = completed.archive_chunks[0].clone();
+
+    // Age only the completed row; RemoteGc performs the real eviction status
+    // mutation and removes the now-unreachable artifact objects.
+    completed.last_accessed_at = Some(1);
+    ref_store.delete_result(&repo_id, &b).await.unwrap();
+    ref_store.save_result(&repo_id, &completed).await.unwrap();
+    let storage: ripclone::storage::StorageRef = Arc::new(RemoteLocalStorage::new(
+        ripclone::storage::local(&server.storage_dir).unwrap(),
+    ));
+    let report = RemoteGc::new(
+        storage,
+        Arc::clone(&ref_store),
+        GcConfig {
+            grace_period: Duration::ZERO,
+            warm_ttl: Duration::from_secs(1),
+            dry_run: false,
+        },
+    )
+    .run()
+    .await
+    .expect("run real warm-TTL eviction and object removal");
+    assert!(report.objects_deleted > 0, "GC must remove B artifacts");
+    assert!(!server.storage_path(&old_manifest).exists());
+    assert!(!server.storage_path(&old_archive).exists());
+    let evicted = ref_store.load_result(&repo_id, &b).await.unwrap().unwrap();
+    assert_eq!(evicted.build_status.as_deref(), Some("evicted"));
+    assert_eq!(
+        evicted.full_clonepack.manifest, old_manifest,
+        "real eviction retains the production artifact pointers"
+    );
+
+    let (_full_guard, full) = clone_only_at(
+        &server,
+        "acme",
+        "gc-rebuild-exact",
+        Some(&b),
+        0,
+        ripclone::mode::CloneMode::Editable,
+    )
+    .await
+    .expect("Full(B) rebuilds after real eviction");
+    assert_eq!(git(&full, &["rev-parse", "HEAD"]), b);
+    assert_eq!(read(&full, "a.txt"), "rebuilt B\n");
+    assert_repo_usable(&full, "1");
+
+    let (_files_guard, files) = clone_only_at(
+        &server,
+        "acme",
+        "gc-rebuild-exact",
+        Some(&b),
+        0,
+        ripclone::mode::CloneMode::Files,
+    )
+    .await
+    .expect("Files(B) rebuilds after real eviction");
+    assert_eq!(read(&files, "a.txt"), "rebuilt B\n");
+    assert_eq!(read(&files, "nested/b.txt"), "files B\n");
+    assert!(!files.join(".git").exists());
+
+    let rebuilt = ref_store.load_result(&repo_id, &b).await.unwrap().unwrap();
+    assert_eq!(rebuilt.commit, b);
+    assert!(rebuilt.build_status.is_none(), "rebuild clears eviction");
+    assert!(!rebuilt.full_clonepack.manifest.is_empty());
+    assert!(!rebuilt.archive_chunks.is_empty());
+}

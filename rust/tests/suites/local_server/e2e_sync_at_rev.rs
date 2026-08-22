@@ -416,8 +416,80 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
 }
 
 #[tokio::test]
+async fn cold_full_sha_clone_polls_pinned_and_installs_detached_without_tip_probe() {
+    setup(true);
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server().await;
+    let origin = make_origin("acme", "at-cold-full-sha");
+    let pinned = origin.commit(&[("a.txt", "cold pinned\n")], "cold pinned");
+    origin.commit(&[("a.txt", "later tip\n")], "later tip");
+    origin.publish();
+    register_added_without_build(&server, "acme/at-cold-full-sha")
+        .await
+        .expect("register cold full-SHA fixture without admitting work");
+
+    let repo_id = ripclone::provider::RepoId::github("acme/at-cold-full-sha");
+    let store = server_ref_store(&server).await;
+    assert!(
+        store
+            .load_result(&repo_id, &pinned)
+            .await
+            .unwrap()
+            .is_none(),
+        "B must have no result before the clone operation"
+    );
+
+    let out = tempfile::tempdir().expect("cold full-SHA output");
+    let target = out.path().join("clone");
+    let outcome = server
+        .client()
+        .install_repo_with_mode_at(
+            "acme/at-cold-full-sha",
+            "HEAD",
+            Some(&pinned),
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("cold full-SHA clone polls its pinned detached identity");
+
+    assert!(outcome.cold, "the clone must observe its initial 202");
+    assert!(
+        probe.pending_responses.load(Ordering::SeqCst) >= 1,
+        "the cold clone must receive a real 202 pending response"
+    );
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        probe.tip_probes.load(Ordering::SeqCst),
+        0,
+        "a full object ID requires no upstream tip resolution"
+    );
+    let polls = probe.http_trace.lock().unwrap().clone();
+    assert!(
+        !polls.is_empty()
+            && polls
+                .iter()
+                .all(|request| request.contains(&format!("pinned={pinned}"))),
+        "every readiness retry must remain pinned to B: {polls:?}"
+    );
+    assert_eq!(outcome.commit, pinned);
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
+    assert!(
+        !git_ok(&target, &["symbolic-ref", "-q", "HEAD"]),
+        "default HEAD plus a full object ID installs detached"
+    );
+    assert_eq!(read(&target, "a.txt"), "cold pinned\n");
+    assert_repo_usable(&target, "1");
+}
+
+#[tokio::test]
 async fn public_cli_clones_at_a_full_sha() {
     setup(true);
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
     let server = start_server().await;
     let origin = make_origin("acme", "at-full-sha");
     let pinned = origin.commit(&[("a.txt", "pinned\n")], "pinned");
