@@ -208,6 +208,7 @@ pub struct AdmissionTestProbe {
     pub fetch_entry: AdmissionTestBarrier,
     pub builder_entry: AdmissionTestBarrier,
     pub phase2_entry: AdmissionTestBarrier,
+    pub after_editable_publish: AdmissionTestBarrier,
     pub embedded_idle_wait: AdmissionTestBarrier,
     pub before_admission_tx: AdmissionTestBarrier,
     pub inside_admission_tx: AdmissionTestBarrier,
@@ -244,6 +245,7 @@ impl Default for AdmissionTestProbe {
             fetch_entry: AdmissionTestBarrier::default(),
             builder_entry: AdmissionTestBarrier::default(),
             phase2_entry: AdmissionTestBarrier::default(),
+            after_editable_publish: AdmissionTestBarrier::default(),
             embedded_idle_wait: AdmissionTestBarrier::default(),
             before_admission_tx: AdmissionTestBarrier::default(),
             inside_admission_tx: AdmissionTestBarrier::default(),
@@ -364,6 +366,7 @@ impl Drop for AdmissionTestProbeGuard {
         self.probe.fetch_entry.disarm();
         self.probe.builder_entry.disarm();
         self.probe.phase2_entry.disarm();
+        self.probe.after_editable_publish.disarm();
         self.probe.embedded_idle_wait.disarm();
         self.probe.before_admission_tx.disarm();
         self.probe.inside_admission_tx.disarm();
@@ -474,6 +477,12 @@ async fn admission_test_builder_entry(commit: &str) {
 async fn admission_test_phase2_entry() {
     if let Some(probe) = admission_test_probe() {
         probe.phase2_entry.wait().await;
+    }
+}
+
+async fn admission_test_after_editable_publish() {
+    if let Some(probe) = admission_test_probe() {
+        probe.after_editable_publish.wait().await;
     }
 }
 
@@ -2605,6 +2614,15 @@ fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &s
     )
 }
 
+/// An editable Full is useful immediately, but Files also needs its archive.
+/// A non-terminal status must therefore retain (or recreate) durable work even
+/// while Full requests continue to receive the usable metadata.
+fn exact_full_needs_repair(info: &RefInfo, commit: &str) -> bool {
+    exact_ref_info_serves_commit(info, "full", commit)
+        && (info.archive_chunks.is_empty()
+            || !matches!(info.build_status.as_deref(), None | Some("done")))
+}
+
 /// Parent reuse is safe only after the parent's exact Full and Files result is
 /// complete. A phase-one row may carry artifacts from its own parent; treating
 /// that row as reusable would relabel those older bytes as the new parent.
@@ -3022,6 +3040,22 @@ async fn get_ref_inner(
     if let Some(info) = existing.as_ref()
         && exact_ref_info_serves_commit(info, &params.clonepack, &commit)
     {
+        if params.clonepack == "full" && exact_full_needs_repair(info, &commit) {
+            if let Err(error) =
+                ensure_exact_full_repair(&state, &repo_id, &commit, credential.clone()).await
+            {
+                state.metrics.record_error();
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ExactRevisionUnavailableResponse {
+                        error,
+                        commit,
+                        branch: checkout_name,
+                    }),
+                )
+                    .into_response();
+            }
+        }
         if let Err(error) = state
             .ref_store
             .touch_last_accessed_at(&repo_id, &commit)
@@ -3698,9 +3732,8 @@ async fn sync_repo_inner(
         requested_branch.clone()
     };
 
-    // Admission is intentionally an exact-row read only. A ready unchanged
-    // sync after its one probe has no queue, source, builder, or metadata
-    // mutation side effect.
+    // A complete exact Full is a read-only no-op. An editable-only Full enters
+    // durable admission so the archive work remains live for Files.
     let loaded_exact = match state.ref_store.load_result(&repo_id, &commit).await {
         Ok(info) => info,
         Err(e) => {
@@ -3716,10 +3749,7 @@ async fn sync_repo_inner(
     };
     let ready = loaded_exact.as_ref().filter(|info| {
         exact_ref_info_serves_commit(info, "full", &commit)
-            && !info
-                .build_status
-                .as_deref()
-                .is_some_and(|status| status.starts_with("failed: "))
+            && !exact_full_needs_repair(info, &commit)
     });
     if let Some(info) = ready {
         state.metrics.record_sync(start.elapsed());
@@ -3908,7 +3938,10 @@ async fn sync_repo_at_revision(
     {
         let commit = at_rev.clone();
         match state.ref_store.load_result(&repo_id, &commit).await {
-            Ok(Some(info)) if exact_ref_info_serves_commit(&info, "full", &commit) => {
+            Ok(Some(info))
+                if exact_ref_info_serves_commit(&info, "full", &commit)
+                    && !exact_full_needs_repair(&info, &commit) =>
+            {
                 if let Err(error) = state
                     .ref_store
                     .touch_last_accessed_at(&repo_id, &commit)
@@ -3948,8 +3981,8 @@ async fn sync_repo_at_revision(
         }
     }
 
-    // Exact revisions use the same admitted-SHA lane as ordinary requests.
-    // Queue implementations coalesce the same repo/branch/commit identity.
+    // Exact revisions use the same immutable `(repository, admitted commit)`
+    // lane as ordinary requests; checkout names are never queue identity.
     let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&at_rev)).await;
     let job = BuildJob {
         repo_id: repo_id.clone(),
@@ -4214,6 +4247,25 @@ async fn enqueue_admitted_build(
     }
 }
 
+/// Preserve a usable exact Full response while atomically joining or replacing
+/// unfinished archive work for that same immutable commit.
+async fn ensure_exact_full_repair(
+    state: &ServerState,
+    repo_id: &RepoId,
+    commit: &str,
+    credential: Option<secrecy::SecretString>,
+) -> Result<(), String> {
+    let size_bytes = enqueue_size_bytes(state, repo_id, Some(commit)).await;
+    let job = BuildJob {
+        repo_id: repo_id.clone(),
+        admitted_commit: commit.to_string(),
+        repo_config: crate::repo_config::RepoConfig::default(),
+        credential,
+        size_bytes,
+    };
+    enqueue_admitted_build(state, job).await.map(|_| ())
+}
+
 struct ExactAdmissionPlan {
     pending: RefInfo,
 }
@@ -4289,10 +4341,7 @@ async fn trigger_build(
         .flatten();
     if let Some(info) = existing
         && exact_ref_info_serves_commit(&info, "full", &admitted_commit)
-        && !info
-            .build_status
-            .as_deref()
-            .is_some_and(|status| status.starts_with("failed: "))
+        && !exact_full_needs_repair(&info, &admitted_commit)
     {
         // A signed replay/poller wakeup for a branch that already serves this
         // exact full commit is a read-only no-op. Do not fetch credentials or
@@ -6560,6 +6609,9 @@ async fn build_full_in_background(
                 })?;
         }
     }
+    // Test-only crash boundary: the editable Full row is durable, but Files
+    // has not yet been published. Production has no corresponding pause.
+    admission_test_after_editable_publish().await;
     settle_storage(cas, storage, retention, uploads, idx_keep).await;
     info!(
         "published editable full clone for {} in {:?}",

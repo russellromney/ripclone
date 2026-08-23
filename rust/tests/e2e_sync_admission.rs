@@ -2088,6 +2088,165 @@ async fn dead_lettered_stale_claim_is_readmitted_by_a_subsequent_exact_clone() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
+    let _guard = env_lock().lock().await;
+    setup(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_QUEUE_MAX_ATTEMPTS", "2");
+    }
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.after_editable_publish.arm();
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server_env(&[("RIPCLONE_QUEUE_STALE_SECS", "3")]).await;
+    let origin = make_origin("acme", "dead-letter-editable-full");
+    let b = origin.commit(&[("value.txt", "editable B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/dead-letter-editable-full")
+        .await
+        .expect("register editable-full stale-claim fixture");
+    server
+        .client()
+        .sync_repo("acme/dead-letter-editable-full", None)
+        .await
+        .expect("admit B");
+    wait_entered(&probe.after_editable_publish, 1).await;
+
+    let repo_id = ripclone::provider::RepoId::github("acme/dead-letter-editable-full");
+    let store = server_ref_store(&server).await;
+    let editable = store
+        .load_result(&repo_id, &b)
+        .await
+        .expect("load editable B")
+        .expect("editable B remains durable");
+    assert_eq!(editable.commit, b);
+    assert_eq!(editable.full_clonepack.commit, b);
+    assert!(!editable.full_clonepack.manifest.is_empty());
+    assert!(editable.archive_chunks.is_empty());
+    assert_eq!(editable.build_status.as_deref(), Some("archive building"));
+
+    // Full is usable while its archive job is still live. This request must
+    // remain a 200 response rather than turning the editable artifact pending.
+    let full = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/dead-letter-editable-full/refs/HEAD?rev={b}&clonepack=full",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("read usable editable Full");
+    assert_eq!(full.status(), reqwest::StatusCode::OK);
+    let full: Value = full.json().await.expect("decode editable Full response");
+    assert_eq!(response_commit(&full), b);
+    assert_eq!(full["archive_ready"], false);
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
+
+    // The original worker is paused immediately after writing Full(B). Reclaim
+    // it once, then let the stale-claim cap dead-letter it. This is the exact
+    // process-death boundary that used to strand Files permanently.
+    let takeover = ripclone::queue::SqlJobQueue::new(Box::new(
+        ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
+            .await
+            .expect("connect takeover queue"),
+    ))
+    .await
+    .expect("open takeover queue")
+    .with_stale_claim_secs(0);
+    let reclaimed = takeover
+        .claim("crashed-after-editable")
+        .await
+        .expect("reclaim editable job")
+        .expect("editable job exists");
+    assert_eq!(reclaimed.admitted_commit, b);
+    assert!(
+        takeover
+            .claim("dead-letter-after-editable")
+            .await
+            .expect("dead-letter stale editable job")
+            .is_none(),
+        "attempt cap must dead-letter the paused worker after Full publication"
+    );
+    assert!(matches!(
+        ripclone::queue::JobQueue::job_status(&takeover, reclaimed.id)
+            .await
+            .expect("read dead-letter status"),
+        ripclone::queue::JobState::Failed(error) if error.contains("dead-lettered")
+    ));
+    let stranded = store
+        .load_result(&repo_id, &b)
+        .await
+        .expect("reload stranded editable B")
+        .expect("editable B metadata remains after dead letter");
+    assert_eq!(stranded.full_clonepack, editable.full_clonepack);
+    assert!(stranded.archive_chunks.is_empty());
+    assert_eq!(stranded.build_status.as_deref(), Some("archive building"));
+
+    // Files receives that same 200 Full response with no archive, atomically
+    // admits one replacement, and polls it to a usable files checkout.
+    probe.before_claim.arm();
+    let output = tempfile::tempdir().expect("files replacement output");
+    let target = output.path().join("files");
+    let client = server.client();
+    let task_target = target.clone();
+    let task_b = b.clone();
+    let files = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/dead-letter-editable-full",
+                "HEAD",
+                Some(&task_b),
+                &task_target,
+                ripclone::mode::CloneMode::Files,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while probe.queue_inserts.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Files request admits replacement B work");
+    wait_entered(&probe.before_claim, 1).await;
+    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        ripclone::queue::JobQueue::depth(&takeover).await,
+        1,
+        "exactly one replacement archive job is active"
+    );
+    probe.after_editable_publish.release();
+    probe.after_editable_publish.disarm();
+    probe.before_claim.release();
+    probe.before_claim.disarm();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), files)
+        .await
+        .expect("Files clone does not remain pending after replacement")
+        .expect("Files task joined")
+        .expect("replacement archive build completes");
+    assert_eq!(outcome.commit, b);
+    assert_eq!(read(&target, "value.txt"), "editable B\n");
+    let settled = store
+        .load_result(&repo_id, &b)
+        .await
+        .expect("load completed replacement")
+        .expect("completed replacement result");
+    assert!(!settled.archive_chunks.is_empty());
+    assert!(settled.build_status.is_none());
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_QUEUE_MAX_ATTEMPTS");
+        std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TESTING");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn duplicate_exact_admissions_count_one_queued_build_and_balance_depth() {
     let _guard = env_lock().lock().await;
     setup(false);
