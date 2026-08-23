@@ -219,6 +219,7 @@ pub struct AdmissionTestProbe {
     pub tip_probes: AtomicUsize,
     pub exact_fetches: AtomicUsize,
     pub builder_entries: AtomicUsize,
+    pub files_completion_entries: AtomicUsize,
     pub full_publishes: AtomicUsize,
     pub ref_store_writes: AtomicUsize,
     pub artifact_uploads: AtomicUsize,
@@ -256,6 +257,7 @@ impl Default for AdmissionTestProbe {
             tip_probes: AtomicUsize::new(0),
             exact_fetches: AtomicUsize::new(0),
             builder_entries: AtomicUsize::new(0),
+            files_completion_entries: AtomicUsize::new(0),
             full_publishes: AtomicUsize::new(0),
             ref_store_writes: AtomicUsize::new(0),
             artifact_uploads: AtomicUsize::new(0),
@@ -471,6 +473,14 @@ async fn admission_test_builder_entry(commit: &str) {
             .unwrap_or_else(|e| e.into_inner())
             .push(commit.to_string());
         probe.builder_entry.wait().await;
+    }
+}
+
+fn admission_test_files_completion_entry() {
+    if let Some(probe) = admission_test_probe() {
+        probe
+            .files_completion_entries
+            .fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -2619,14 +2629,13 @@ fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &s
 /// phase-two state. An empty committed tree legitimately has no archive
 /// chunks, so the chunk count is deliberately not a readiness signal.
 fn exact_full_build_settled(info: &RefInfo, commit: &str) -> bool {
-    exact_ref_info_serves_commit(info, "full", commit)
-        && matches!(info.build_status.as_deref(), None | Some("done"))
+    exact_ref_info_serves_commit(info, "full", commit) && info.build_status.is_none()
 }
 
 /// An editable Full is useful immediately, but Files also needs phase two to
 /// settle. A non-terminal status must therefore retain (or recreate) durable
 /// work even while Full requests continue to receive the usable metadata.
-fn exact_full_needs_repair(info: &RefInfo, commit: &str) -> bool {
+fn exact_full_files_incomplete(info: &RefInfo, commit: &str) -> bool {
     exact_ref_info_serves_commit(info, "full", commit) && !exact_full_build_settled(info, commit)
 }
 
@@ -2640,6 +2649,7 @@ fn exact_parent_ready_for_reuse(info: &RefInfo, commit: &str) -> bool {
 /// `build_status` set on a phase-1 row while the full history + archive build
 /// runs in the background.
 pub(crate) const BUILDING_FULL_HISTORY: &str = "full history building";
+pub(crate) const BUILDING_FILES: &str = "files building";
 
 fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
     artifact_pending_response_with_top_up(commit, branch, queue_depth, None, None)
@@ -3045,13 +3055,13 @@ async fn get_ref_inner(
     if let Some(info) = existing.as_ref()
         && exact_ref_info_serves_commit(info, &params.clonepack, &commit)
     {
-        if params.clonepack == "full" && exact_full_needs_repair(info, &commit) {
+        if params.clonepack == "full" && exact_full_files_incomplete(info, &commit) {
             if let Err(error) =
-                ensure_exact_full_repair(&state, &repo_id, &commit, credential.clone()).await
+                ensure_exact_files_completion(&state, &repo_id, &commit, credential.clone()).await
             {
                 state.metrics.record_error();
                 warn!(
-                    "failed to ensure repair for unfinished Full {}@{commit}; serving usable editable metadata: {error}",
+                    "failed to ensure Files completion for unfinished Full {}@{commit}; serving usable editable metadata: {error}",
                     repo_id.storage_key()
                 );
             }
@@ -3750,7 +3760,7 @@ async fn sync_repo_inner(
     };
     let ready = loaded_exact.as_ref().filter(|info| {
         exact_ref_info_serves_commit(info, "full", &commit)
-            && !exact_full_needs_repair(info, &commit)
+            && !exact_full_files_incomplete(info, &commit)
     });
     if let Some(info) = ready {
         state.metrics.record_sync(start.elapsed());
@@ -3941,7 +3951,7 @@ async fn sync_repo_at_revision(
         match state.ref_store.load_result(&repo_id, &commit).await {
             Ok(Some(info))
                 if exact_ref_info_serves_commit(&info, "full", &commit)
-                    && !exact_full_needs_repair(&info, &commit) =>
+                    && !exact_full_files_incomplete(&info, &commit) =>
             {
                 if let Err(error) = state
                     .ref_store
@@ -4248,9 +4258,9 @@ async fn enqueue_admitted_build(
     }
 }
 
-/// Preserve a usable exact Full response while atomically joining or replacing
-/// unfinished archive work for that same immutable commit.
-async fn ensure_exact_full_repair(
+/// Preserve a usable exact Full response while atomically joining or starting
+/// the missing Files completion for that same immutable commit.
+async fn ensure_exact_files_completion(
     state: &ServerState,
     repo_id: &RepoId,
     commit: &str,
@@ -4281,13 +4291,25 @@ async fn prepare_exact_admission(
         .load_result(&job.repo_id, commit)
         .await
         .map_err(|e| format!("exact admission lookup failed: {e}"))?;
+    if existing.as_ref().is_some_and(|info| {
+        exact_ref_info_serves_commit(info, "full", commit)
+            && info
+                .build_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("files failed: "))
+    }) {
+        // The Files-only job has already exhausted its queue budget. Keep the
+        // ready Full result visible, but never turn every later poll into a
+        // fresh attempt with a reset counter.
+        return Ok(None);
+    }
     let active = existing.as_ref().is_some_and(|info| {
         matches!(
             info.build_status.as_deref(),
-            None | Some("done")
-                | Some("building")
+            None | Some("building")
                 | Some(BUILDING_FULL_HISTORY)
                 | Some("archive building")
+                | Some(BUILDING_FILES)
         )
     });
     if active {
@@ -4342,7 +4364,7 @@ async fn trigger_build(
         .flatten();
     if let Some(info) = existing
         && exact_ref_info_serves_commit(&info, "full", &admitted_commit)
-        && !exact_full_needs_repair(&info, &admitted_commit)
+        && !exact_full_files_incomplete(&info, &admitted_commit)
     {
         // A signed replay/poller wakeup for a branch that already serves this
         // exact full commit is a read-only no-op. Do not fetch credentials or
@@ -5520,6 +5542,34 @@ async fn do_sync(
     let mut t = t_total;
     let mut phases = SyncPhases::default();
 
+    // If editable Full is already durable, this job exists solely to finish
+    // Files. Do not fetch upstream or rebuild HEAD/full-history packs: the
+    // immutable Full manifest is the source of truth and only the archive is
+    // missing. `process_build_job` marks this kind of claim explicitly so an
+    // ordinary initial build can never take this shortcut.
+    if let Some(existing) = ref_store.load_result(repo_id, admitted_commit).await?
+        && exact_full_files_incomplete(&existing, admitted_commit)
+        && existing.build_status.as_deref() == Some(BUILDING_FILES)
+    {
+        if let Some(release) = foreground_release.take() {
+            let _ = release.send(());
+        }
+        return complete_files_from_editable(
+            cas,
+            mirror_dir,
+            repo_id,
+            admitted_commit,
+            ref_store,
+            storage,
+            retention,
+            compression_level,
+            t_total,
+            phases,
+            existing,
+        )
+        .await;
+    }
+
     // Best-effort: remove stale build temp dirs left by a previously killed
     // sync. `tempfile` cleans up on drop, but not on SIGKILL/OOM, so a crashed
     // build leaks a `.tmp*` dir in TMPDIR (= repo_root). Only sweep old ones so a
@@ -5595,7 +5645,7 @@ async fn do_sync(
     // poke-to-check sync of an unchanged repo returns near-instantly.
     // It is safe only once phase two is terminally successful. The Full
     // clonepack is published before the archive, so merely matching its commit
-    // would turn a failed archive repair into a no-op forever. Settled empty
+    // would turn a failed archive completion into a no-op forever. Settled empty
     // trees are intentionally reusable even though their archive list is empty.
     let reusable = ref_store
         .load_result(repo_id, &commit)
@@ -6731,6 +6781,181 @@ async fn build_full_in_background(
     Ok(())
 }
 
+/// Finish Files from an already-published editable Full. This deliberately
+/// reads the existing immutable manifest instead of rebuilding its source
+/// mirror, HEAD closure, or full-history packs. A phase-two failure therefore
+/// costs only the missing archive work on its bounded continuation attempt.
+#[allow(clippy::too_many_arguments)]
+async fn complete_files_from_editable(
+    cas: &Cas,
+    mirror_dir: &std::path::Path,
+    repo_id: &RepoId,
+    commit: &str,
+    ref_store: &Arc<dyn RefStore>,
+    storage: &crate::storage::StorageRef,
+    retention: &Arc<Retention>,
+    compression_level: i32,
+    started_at: Instant,
+    phases: SyncPhases,
+    editable: RefInfo,
+) -> Result<SyncBuildResult> {
+    admission_test_files_completion_entry();
+    info!(
+        "completing Files for {}@{} from existing editable Full",
+        repo_id.storage_key(),
+        &commit[..7.min(commit.len())]
+    );
+    let fetch = |hash: &str| -> Result<Vec<u8>> { cas.get(hash).or_else(|_| storage.get(hash)) };
+    let editable_metadata = crate::clonepack::MetadataChunk::decode_and_validate(
+        fetch(&editable.full_clonepack.metadata_chunk)?.as_slice(),
+    )
+    .context("decode editable Full metadata for Files completion")?;
+    let editable_manifest_hash = editable.full_clonepack.manifest.clone();
+    let editable_manifest = ClonepackManifest::decode(fetch(&editable_manifest_hash)?.as_slice())
+        .context("decode editable Full manifest for Files completion")?;
+    anyhow::ensure!(
+        editable_manifest.commit == commit,
+        "editable Full manifest commit mismatch for {}@{commit}: {}",
+        repo_id.storage_key(),
+        editable_manifest.commit
+    );
+    let manifest_bundle = editable_manifest
+        .idx_bundle
+        .as_ref()
+        .map(|chunk| hash_to_hex(&chunk.hash))
+        .unwrap_or_default();
+    anyhow::ensure!(
+        manifest_bundle == editable.full_clonepack.idx_bundle,
+        "editable Full idx bundle mismatch for {}@{commit}",
+        repo_id.storage_key()
+    );
+
+    // The phase-two fault hook applies to a Files-only continuation as well as
+    // the original phase-two task. This keeps the bounded-attempt regression
+    // deterministic without changing production behavior.
+    if let Ok(fail_for) = std::env::var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT")
+        && fail_for == commit
+    {
+        anyhow::bail!("forced phase-2 failure for {commit}");
+    }
+    if let Ok(panic_for) = std::env::var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT")
+        && panic_for == commit
+    {
+        panic!("forced phase-2 panic for {commit}");
+    }
+
+    let previous_frames: std::collections::HashMap<String, (String, u64)> = editable
+        .archive_frames
+        .iter()
+        .map(|frame| {
+            (
+                frame.raw_hash.clone(),
+                (frame.chunk_hash.clone(), frame.compressed_len),
+            )
+        })
+        .collect();
+    let archive_mirror = mirror_dir.to_path_buf();
+    let archive_cas = cas.clone();
+    let archive_storage = storage.clone();
+    let archive_commit = commit.to_string();
+    let archive_output = tokio::task::spawn_blocking(move || {
+        ArchiveBuilder::new(&archive_mirror).build_into_cas_incremental(
+            &archive_commit,
+            &archive_cas,
+            Some(&archive_storage),
+            compression_level,
+            None,
+            &previous_frames,
+            crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+        )
+    })
+    .await
+    .context("Files archive task")??;
+
+    let archive_chunk_hashes = archive_output.download_bundle_hashes;
+    let mut files_metadata = archive_output.metadata;
+    // The archive builder owns the frames/files tables. The editable manifest
+    // already contains the exact skeleton/index bytes needed by both modes.
+    files_metadata.skeleton_pack = editable_metadata.skeleton_pack;
+    files_metadata.skeleton_idx = editable_metadata.skeleton_idx;
+    files_metadata.prebuilt_index = editable_metadata.prebuilt_index;
+    let files_metadata_data = files_metadata.encode_to_vec();
+    let files_metadata_hash = cas.put(&files_metadata_data)?;
+    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &files_metadata)?;
+    let files_manifest = make_manifest(
+        commit,
+        &editable.parent_commit,
+        &archive_chunks,
+        &files_metadata_hash,
+        files_metadata_data.len() as u64,
+        editable_manifest.packs,
+        editable_manifest.midx,
+        editable_manifest.idx_bundle,
+    )?;
+    let files_manifest_hash = cas.put(&files_manifest.encode_to_vec())?;
+    let uploads = archive_publish_upload_hashes(
+        &files_metadata_hash,
+        &files_manifest_hash,
+        &archive_chunk_hashes,
+        &archive_output.new_reuse_frame_hashes,
+    );
+    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
+
+    let mut info = ref_store
+        .load_result(repo_id, commit)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("result vanished before Files publish"))?;
+    // Another owner may have published a coherent Files variant while this
+    // continuation was running. Never mix this archive with that owner's pack
+    // bundle; simply leave its settled publication intact.
+    if info.commit == commit
+        && info.full_clonepack.manifest == editable_manifest_hash
+        && info.full_clonepack.idx_bundle == editable.full_clonepack.idx_bundle
+    {
+        info.manifest = files_metadata_hash.clone();
+        info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
+        info.archive_chunks = archive_chunk_hashes.clone();
+        info.full_clonepack.manifest = files_manifest_hash;
+        info.full_clonepack.metadata_chunk = files_metadata_hash;
+        info.archive_frames = archive_output.archive_frames;
+        info.build_status = None;
+        info.build_ms = Some(duration_ms(started_at.elapsed()));
+        let final_bundle = files_manifest
+            .idx_bundle
+            .as_ref()
+            .map(|chunk| hash_to_hex(&chunk.hash))
+            .unwrap_or_default();
+        anyhow::ensure!(
+            final_bundle == info.full_clonepack.idx_bundle,
+            "Files completion idx bundle mismatch for {}@{commit}",
+            repo_id.storage_key()
+        );
+        admission_test_ref_store_write();
+        ref_store
+            .save_result(repo_id, &info)
+            .await
+            .with_context(|| {
+                format!(
+                    "persist Files completion for {}@{commit}",
+                    repo_id.storage_key()
+                )
+            })?;
+    }
+    settle_storage(
+        cas,
+        storage,
+        retention,
+        uploads,
+        std::collections::HashSet::new(),
+    )
+    .await;
+    Ok(SyncBuildResult {
+        info,
+        status: "files completed".to_string(),
+        phases,
+    })
+}
+
 struct ClaimScopedRefStore {
     inner: Arc<dyn RefStore>,
     control: Option<Arc<crate::control::ControlDb>>,
@@ -6878,8 +7103,27 @@ async fn process_build_job_with_foreground_release(
             "build job has invalid repository config: {error:#}"
         )));
     }
-    // Mark as building in the shared metadata store.
-    if let Err(e) = update_job_build_status(&ref_store, job, "building").await {
+    // A job admitted after editable Full published owns only the missing Files
+    // archive. Preserve that fact in durable status so a terminal failure can
+    // consume the continuation's budget rather than being mistaken for a new
+    // initial build on every client poll.
+    let completing_files = match ref_store.load_result(repo_id, commit).await {
+        Ok(Some(info)) => exact_full_files_incomplete(&info, commit),
+        Ok(None) => false,
+        Err(error) => {
+            warn!(
+                "failed to inspect exact result before building {}@{commit}: {error:#}",
+                repo_id.storage_key()
+            );
+            false
+        }
+    };
+    let building_status = if completing_files {
+        BUILDING_FILES
+    } else {
+        "building"
+    };
+    if let Err(e) = update_job_build_status(&ref_store, job, building_status).await {
         error!(
             "build status update failed for {}@{commit}: {e:#}",
             repo_id.storage_key()
@@ -6892,8 +7136,12 @@ async fn process_build_job_with_foreground_release(
         Some(p) => p.clone(),
         None => {
             let message = format!("unknown provider {}", repo_id.provider.as_str());
-            if let Err(e) =
-                update_job_build_status(&ref_store, job, &format!("failed: {message}")).await
+            if let Err(e) = update_job_build_status(
+                &ref_store,
+                job,
+                &failed_build_status(completing_files, &message),
+            )
+            .await
             {
                 error!(
                     "build status update failed for {}@{commit}: {e:#}",
@@ -6949,7 +7197,7 @@ async fn process_build_job_with_foreground_release(
             // `/status` look terminal while the queue still has the job — the
             // stale-until-repushed mode A7 was meant to kill.
             let classified = classify_build_error(e);
-            if let Some(status) = terminal_metadata_status(&classified) {
+            if let Some(status) = terminal_metadata_status(&classified, completing_files) {
                 state.metrics.record_build_failed();
                 if let Err(status_err) = update_job_build_status(&ref_store, job, &status).await {
                     error!(
@@ -6980,12 +7228,21 @@ async fn process_build_job_with_foreground_release(
 /// Metadata status string for a terminal build failure, or `None` when the
 /// queue may still requeue the job (retryable). Callers must not write a
 /// terminal `failed: …` for retryable errors.
-fn terminal_metadata_status(err: &BuildError) -> Option<String> {
+fn terminal_metadata_status(err: &BuildError, completing_files: bool) -> Option<String> {
     if err.is_retryable() {
         None
     } else {
-        Some(format!("failed: {}", err.message()))
+        Some(failed_build_status(completing_files, err.message()))
     }
+}
+
+fn failed_build_status(completing_files: bool, message: &str) -> String {
+    let phase = if completing_files {
+        "files failed"
+    } else {
+        "failed"
+    };
+    format!("{phase}: {message}")
 }
 
 /// Write a terminal `failed: …` build status for the job's admitted commit. Used by the
@@ -7000,7 +7257,12 @@ pub async fn mark_admitted_build_failed(
     admitted_commit: &str,
     message: &str,
 ) -> Result<()> {
-    let status = format!("failed: {message}");
+    let completing_files = state
+        .ref_store
+        .load_result(repo_id, admitted_commit)
+        .await?
+        .is_some_and(|info| info.build_status.as_deref() == Some(BUILDING_FILES));
+    let status = failed_build_status(completing_files, message);
     let updated = match &state.control_db {
         Some(control) => {
             control
@@ -7833,12 +8095,16 @@ mod tests {
         // Retryable must not write a terminal metadata status — /status would
         // look failed while SqlJobQueue::ack still requeues under the cap.
         assert_eq!(
-            terminal_metadata_status(&BuildError::retryable("storage 503")),
+            terminal_metadata_status(&BuildError::retryable("storage 503"), false),
             None
         );
         assert_eq!(
-            terminal_metadata_status(&BuildError::permanent("bad repo")),
+            terminal_metadata_status(&BuildError::permanent("bad repo"), false),
             Some("failed: bad repo".to_string())
+        );
+        assert_eq!(
+            terminal_metadata_status(&BuildError::permanent("archive failed"), true),
+            Some("files failed: archive failed".to_string())
         );
     }
 
@@ -8688,7 +8954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_full_repair_admission_does_not_hide_usable_editable_metadata() {
+    async fn failed_files_completion_admission_does_not_hide_usable_editable_metadata() {
         struct FailingQueue;
 
         #[async_trait::async_trait]
@@ -8705,7 +8971,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
         state.build_queue = Arc::new(FailingQueue);
-        let repo_id = RepoId::github("acme/repair-visible");
+        let repo_id = RepoId::github("acme/files-visible");
         let commit = "a".repeat(40);
         mark_added(&state, repo_id.clone()).await;
         state
@@ -8732,7 +8998,7 @@ mod tests {
             .oneshot(test_request(
                 "GET",
                 &format!(
-                    "/v1/repos/github/acme/repair-visible/refs/HEAD?pinned={commit}&clonepack=full"
+                    "/v1/repos/github/acme/files-visible/refs/HEAD?pinned={commit}&clonepack=full"
                 ),
             ))
             .await
@@ -8740,7 +9006,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "repair admission failure must not hide an already-usable Full"
+            "Files completion admission failure must not hide an already-usable Full"
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

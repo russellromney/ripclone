@@ -380,7 +380,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
     let repo_id = RepoId::github("acme/phase2fail-fenced");
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let b_attempts = probe
+            let b_full_builds = probe
                 .builder_targets
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -392,15 +392,15 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
                 .await
                 .expect("load exact B while waiting")
                 .and_then(|info| info.build_status)
-                .is_some_and(|status| status.starts_with("failed: "));
-            if b_attempts >= 2 && b_failed {
+                .is_some_and(|status| status.starts_with("files failed: "));
+            if b_full_builds >= 1 && b_failed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("initial and one bounded retry of Full(B) dead-lettered");
+    .expect("bounded Files continuation dead-lettered without rebuilding Full(B)");
     let attempts = probe
         .builder_targets
         .lock()
@@ -408,8 +408,8 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         .clone();
     assert_eq!(
         attempts.iter().filter(|commit| *commit == &b).count(),
-        2,
-        "Full(B) must exhaust exactly one retry: {attempts:?}"
+        1,
+        "Files retry must not rebuild ready Full(B): {attempts:?}"
     );
 
     let current = store
@@ -434,7 +434,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         exact_b
             .build_status
             .as_deref()
-            .is_some_and(|status| status.starts_with("failed: "))
+            .is_some_and(|status| status.starts_with("files failed: "))
     );
     let exact_c = store
         .load_result(&repo_id, &c)
@@ -456,11 +456,14 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
         .iter()
         .find(|entry| entry["commit"] == b)
         .expect("failed B status remains addressable");
-    assert_eq!(status_b["history"], "failed");
+    assert_eq!(
+        status_b["history"], "ready",
+        "editable Full remains ready even when its Files continuation failed"
+    );
     assert!(
         status_b["build_status"]
             .as_str()
-            .is_some_and(|value| value.starts_with("failed: "))
+            .is_some_and(|value| value.starts_with("files failed: "))
     );
     let status_c = public_refs
         .iter()
@@ -480,7 +483,7 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
 }
 
 #[tokio::test]
-async fn failed_phase2_status_recovers_on_resync() {
+async fn failed_phase2_status_completes_files_without_rebuilding_full() {
     let _env_guard = phase2_env_lock().lock().await;
     init(false);
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
@@ -532,7 +535,9 @@ async fn failed_phase2_status_recovers_on_resync() {
         std::env::remove_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT");
     }
 
-    let builds_before_repair = probe.builder_entries.load(Ordering::SeqCst);
+    let builds_before_completion = probe.builder_entries.load(Ordering::SeqCst);
+    let fetches_before_completion = probe.exact_fetches.load(Ordering::SeqCst);
+    let files_before_completion = probe.files_completion_entries.load(Ordering::SeqCst);
     let (_recovered_guard, recovered) = tokio::time::timeout(
         Duration::from_secs(60),
         clone_only(&server, "acme", "phase2fail", 0, CloneMode::Files),
@@ -543,8 +548,18 @@ async fn failed_phase2_status_recovers_on_resync() {
     assert_eq!(read(&recovered, "f"), "v1\n");
     assert_eq!(
         probe.builder_entries.load(Ordering::SeqCst),
-        builds_before_repair + 1,
-        "Files repair must run exactly one replacement build"
+        builds_before_completion,
+        "Files completion must reuse the ready Full packs"
+    );
+    assert_eq!(
+        probe.exact_fetches.load(Ordering::SeqCst),
+        fetches_before_completion,
+        "Files completion must not fetch upstream again"
+    );
+    assert_eq!(
+        probe.files_completion_entries.load(Ordering::SeqCst),
+        files_before_completion + 1,
+        "Files completion must run exactly once"
     );
 
     let status = repo_status(&server, "acme", "phase2fail").await;
@@ -560,12 +575,103 @@ async fn failed_phase2_status_recovers_on_resync() {
     );
 }
 
+/// A failed Files-only continuation is terminal for that exact result. Pinned
+/// Full polls keep serving the usable metadata, but must not keep admitting new
+/// jobs with a fresh attempt budget.
+#[tokio::test]
+async fn failed_files_completion_does_not_reset_attempt_budget() {
+    let _env_guard = phase2_env_lock().lock().await;
+    init(false);
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server_env(&[("RIPCLONE_QUEUE_MAX_ATTEMPTS", "1")]).await;
+    let origin = make_origin("acme", "phase2-budget");
+    let commit = origin.commit(&[("f", "v1\n")], "c1");
+    origin.publish();
+    let _failure = ScopedEnvVar::set("RIPCLONE_TEST_PHASE2_FAIL_COMMIT", &commit);
+
+    register_added_without_build(&server, "acme/phase2-budget")
+        .await
+        .expect("add repo");
+    server
+        .client()
+        .admit_sync_repo("acme/phase2-budget", None)
+        .await
+        .expect("admit initial phase-two failure");
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = repo_status(&server, "acme", "phase2-budget").await;
+            let failed = status["refs"]
+                .as_array()
+                .and_then(|refs| refs.iter().find(|entry| entry["commit"] == commit))
+                .and_then(|entry| entry["build_status"].as_str())
+                .is_some_and(|value| value.starts_with("failed: "));
+            if failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("initial phase-two failure must settle");
+
+    // Full is already useful and its normal ref request atomically starts the
+    // one missing Files completion attempt.
+    let (_full_guard, full) = clone_only(&server, "acme", "phase2-budget", 0, CloneMode::Editable)
+        .await
+        .expect("Full remains clonable while Files is incomplete");
+    assert_eq!(read(&full, "f"), "v1\n");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = repo_status(&server, "acme", "phase2-budget").await;
+            let failed = status["refs"]
+                .as_array()
+                .and_then(|refs| refs.iter().find(|entry| entry["commit"] == commit))
+                .and_then(|entry| entry["build_status"].as_str())
+                .is_some_and(|value| value.starts_with("files failed: "));
+            if failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Files-only continuation must record its terminal failure");
+
+    let completions = probe.files_completion_entries.load(Ordering::SeqCst);
+    let fetches = probe.exact_fetches.load(Ordering::SeqCst);
+    let builds = probe.builder_entries.load(Ordering::SeqCst);
+    let (_again_guard, again) =
+        clone_only(&server, "acme", "phase2-budget", 0, CloneMode::Editable)
+            .await
+            .expect("terminal Files failure must not hide Full");
+    assert_eq!(read(&again, "f"), "v1\n");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        probe.files_completion_entries.load(Ordering::SeqCst),
+        completions,
+        "a repeated pinned poll must not create another Files completion job"
+    );
+    assert_eq!(
+        probe.exact_fetches.load(Ordering::SeqCst),
+        fetches,
+        "a terminal Files failure must not refetch upstream"
+    );
+    assert_eq!(
+        probe.builder_entries.load(Ordering::SeqCst),
+        builds,
+        "a terminal Files failure must not rebuild the ready Full"
+    );
+}
+
 /// A *panic* in phase 2 (not a returned error) must not
 /// silently strand the ref at "full history building" forever — the giant-repo
 /// stall. The panic must be caught, surfaced, and the build marked `failed:` so
 /// a following sync rebuilds and recovers the full clone.
 #[tokio::test]
-async fn panicking_phase2_status_recovers_on_resync() {
+async fn panicking_phase2_status_completes_files_without_rebuilding_full() {
     let _env_guard = phase2_env_lock().lock().await;
     init(false);
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
@@ -619,7 +725,9 @@ async fn panicking_phase2_status_recovers_on_resync() {
         std::env::remove_var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT");
     }
 
-    let builds_before_repair = probe.builder_entries.load(Ordering::SeqCst);
+    let builds_before_completion = probe.builder_entries.load(Ordering::SeqCst);
+    let fetches_before_completion = probe.exact_fetches.load(Ordering::SeqCst);
+    let files_before_completion = probe.files_completion_entries.load(Ordering::SeqCst);
     let (_recovered_guard, recovered) = tokio::time::timeout(
         Duration::from_secs(60),
         clone_only(&server, "acme", "phase2panic", 0, CloneMode::Files),
@@ -630,8 +738,18 @@ async fn panicking_phase2_status_recovers_on_resync() {
     assert_eq!(read(&recovered, "f"), "v1\n");
     assert_eq!(
         probe.builder_entries.load(Ordering::SeqCst),
-        builds_before_repair + 1,
-        "Files repair must run exactly one replacement build"
+        builds_before_completion,
+        "Files completion must reuse the ready Full packs"
+    );
+    assert_eq!(
+        probe.exact_fetches.load(Ordering::SeqCst),
+        fetches_before_completion,
+        "Files completion must not fetch upstream again"
+    );
+    assert_eq!(
+        probe.files_completion_entries.load(Ordering::SeqCst),
+        files_before_completion + 1,
+        "Files completion must run exactly once"
     );
 
     let status = repo_status(&server, "acme", "phase2panic").await;

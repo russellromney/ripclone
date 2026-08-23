@@ -365,7 +365,8 @@ impl ControlDb {
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .context("begin claimed status write")?;
-        let allow_settled_failure = status.starts_with("failed: ");
+        let allow_settled_failure =
+            status.starts_with("failed: ") || status.starts_with("files failed: ");
         if !claim_authorizes(
             &tx,
             job_id,
@@ -547,9 +548,22 @@ impl ControlDb {
                 && !info.full_clonepack.metadata_chunk.is_empty()
                 && !info.full_clonepack.idx_bundle.is_empty()
                 && info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-                && matches!(info.build_status.as_deref(), None | Some("done"))
+                && info.build_status.is_none()
         });
-        if result_ready || active_job_id.is_some() {
+        // A failed Files-only completion has already consumed its queue retry
+        // budget. Coalesce subsequent polls instead of creating a fresh job
+        // whose attempts start at zero. The usable Full metadata remains
+        // available to the caller either way.
+        let files_completion_failed = existing.as_ref().is_some_and(|info| {
+            info.commit == job.admitted_commit
+                && info.full_clonepack.commit == job.admitted_commit
+                && !info.full_clonepack.manifest.is_empty()
+                && info
+                    .build_status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("files failed: "))
+        });
+        if result_ready || active_job_id.is_some() || files_completion_failed {
             tx.commit()
                 .await
                 .context("commit coalesced exact admission")?;
