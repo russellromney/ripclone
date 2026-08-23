@@ -104,7 +104,6 @@ pub(crate) fn merge_publication(existing: &RefInfo, incoming: &RefInfo) -> RefIn
     let full_ready = !existing_evicted && variant_ready(&existing.full_clonepack, commit);
     let files_enrichment = full_ready
         && existing.archive_chunks.is_empty()
-        && !incoming.archive_chunks.is_empty()
         && incoming.full_clonepack.commit == commit
         && !existing.full_clonepack.idx_bundle.is_empty()
         && incoming.full_clonepack.idx_bundle == existing.full_clonepack.idx_bundle
@@ -353,6 +352,36 @@ mod tests {
         assert_eq!(ready.full_clonepack.manifest, "files");
         assert_eq!(ready.archive_chunks, vec!["archive"]);
         assert!(ready.build_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_tree_files_enrichment_settles_without_archive_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
+        let repo = RepoId::github("acme/empty-files");
+        let commit = "e".repeat(40);
+        let mut editable = RefInfo {
+            commit: commit.clone(),
+            build_status: Some("archive building".into()),
+            ..Default::default()
+        };
+        editable.full_clonepack.commit = commit.clone();
+        editable.full_clonepack.manifest = "editable".into();
+        editable.full_clonepack.idx_bundle = "accepted-bundle".into();
+        store.save_result(&repo, &editable).await.unwrap();
+
+        let mut settled = editable;
+        settled.full_clonepack.manifest = "empty-files".into();
+        settled.build_status = None;
+        store.save_result(&repo, &settled).await.unwrap();
+
+        let stored = store.load_result(&repo, &commit).await.unwrap().unwrap();
+        assert_eq!(stored.full_clonepack.manifest, "empty-files");
+        assert!(stored.archive_chunks.is_empty());
+        assert!(stored.build_status.is_none());
     }
 
     #[tokio::test]

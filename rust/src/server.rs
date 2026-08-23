@@ -1050,9 +1050,10 @@ pub struct RefResponse {
     pub idx_bundle_url: Option<String>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     pub shallow: bool,
-    /// True once the full clonepack's archive is built. The server publishes an
-    /// editable clonepack first and adds the archive a moment later, so a files
-    /// clone waits for this. Editable clones ignore it.
+    /// True once the full clonepack's phase two has settled. The server
+    /// publishes editable metadata first and finishes Files data later; a
+    /// committed empty tree settles with zero archive frames. Editable clones
+    /// ignore this flag.
     pub archive_ready: bool,
 }
 
@@ -2614,22 +2615,26 @@ fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &s
     )
 }
 
-/// An editable Full is useful immediately, but Files also needs its archive.
-/// A non-terminal status must therefore retain (or recreate) durable work even
-/// while Full requests continue to receive the usable metadata.
-fn exact_full_needs_repair(info: &RefInfo, commit: &str) -> bool {
+/// A complete Full has durable editable metadata and a terminal successful
+/// phase-two state. An empty committed tree legitimately has no archive
+/// chunks, so the chunk count is deliberately not a readiness signal.
+fn exact_full_build_settled(info: &RefInfo, commit: &str) -> bool {
     exact_ref_info_serves_commit(info, "full", commit)
-        && (info.archive_chunks.is_empty()
-            || !matches!(info.build_status.as_deref(), None | Some("done")))
+        && matches!(info.build_status.as_deref(), None | Some("done"))
+}
+
+/// An editable Full is useful immediately, but Files also needs phase two to
+/// settle. A non-terminal status must therefore retain (or recreate) durable
+/// work even while Full requests continue to receive the usable metadata.
+fn exact_full_needs_repair(info: &RefInfo, commit: &str) -> bool {
+    exact_ref_info_serves_commit(info, "full", commit) && !exact_full_build_settled(info, commit)
 }
 
 /// Parent reuse is safe only after the parent's exact Full and Files result is
 /// complete. A phase-one row may carry artifacts from its own parent; treating
 /// that row as reusable would relabel those older bytes as the new parent.
 fn exact_parent_ready_for_reuse(info: &RefInfo, commit: &str) -> bool {
-    info.build_status.is_none()
-        && exact_ref_info_serves_commit(info, "full", commit)
-        && !info.archive_chunks.is_empty()
+    exact_full_build_settled(info, commit)
 }
 
 /// `build_status` set on a phase-1 row while the full history + archive build
@@ -3045,15 +3050,10 @@ async fn get_ref_inner(
                 ensure_exact_full_repair(&state, &repo_id, &commit, credential.clone()).await
             {
                 state.metrics.record_error();
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ExactRevisionUnavailableResponse {
-                        error,
-                        commit,
-                        branch: checkout_name,
-                    }),
-                )
-                    .into_response();
+                warn!(
+                    "failed to ensure repair for unfinished Full {}@{commit}; serving usable editable metadata: {error}",
+                    repo_id.storage_key()
+                );
             }
         }
         if let Err(error) = state
@@ -3324,7 +3324,8 @@ fn ref_response(
         midx_url,
         idx_bundle_url,
         shallow: clonepack_kind == "shallow",
-        archive_ready: !info.archive_chunks.is_empty(),
+        archive_ready: clonepack_kind != "full"
+            || exact_full_build_settled(info, &artifacts.commit),
     }
 }
 
@@ -3566,7 +3567,7 @@ async fn build_repo_status(
 
         let warm = !is_evicted && ref_bytes > 0;
         let depth1_ready = !is_evicted && !info.shallow_clonepack.manifest.is_empty();
-        let archive_ready = !is_evicted && !info.archive_chunks.is_empty();
+        let archive_ready = !is_evicted && exact_full_build_settled(&info, &info.commit);
         let history = if is_evicted {
             "cold"
         } else if info
@@ -5592,43 +5593,20 @@ async fn do_sync(
     // this commit, the prior clonepack artifacts are still valid — reuse them and
     // build nothing (skips commit-graph/bitmap/skeleton/history/archive), so a
     // poke-to-check sync of an unchanged repo returns near-instantly.
-    // Keying on `full_clonepack.commit == commit` (not `build_status`) is robust:
-    // it is set only once the full clonepack is published for this commit, so it
-    // excludes the Option-A carried-prior case, an unpublished/failed phase 2, and
-    // the async worker's transient "building" status. (It does *not* require the
-    // archive sub-phase to be done — a files-mode client re-resolves until the
-    // archive is ready, so reusing an archive-pending build is safe.)
+    // It is safe only once phase two is terminally successful. The Full
+    // clonepack is published before the archive, so merely matching its commit
+    // would turn a failed archive repair into a no-op forever. Settled empty
+    // trees are intentionally reusable even though their archive list is empty.
     let reusable = ref_store
         .load_result(repo_id, &commit)
         .await?
-        .filter(|info| {
-            let archive_in_progress = info.archive_chunks.is_empty()
-                && info.build_status.as_ref().is_some_and(|status| {
-                    status == "full history building" || status == "archive building"
-                });
-            info.full_clonepack.commit == commit
-                && !info.full_clonepack.manifest.is_empty()
-                && info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-                && !archive_in_progress
-        });
-    if let Some(mut prev) = reusable {
+        .filter(|info| exact_full_build_settled(info, &commit));
+    if let Some(prev) = reusable {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
             repo_id.storage_key(),
             &commit[..7.min(commit.len())]
         );
-        if prev
-            .build_status
-            .as_deref()
-            .is_some_and(|status| status.starts_with("failed: "))
-        {
-            prev.build_status = None;
-            admission_test_ref_store_write();
-            ref_store
-                .save_result(repo_id, &prev)
-                .await
-                .context("publish recovered exact no-op result")?;
-        }
         if let Some(release) = foreground_release.take() {
             let _ = release.send(());
         }
@@ -8707,6 +8685,70 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["commit"], commit);
+    }
+
+    #[tokio::test]
+    async fn failed_full_repair_admission_does_not_hide_usable_editable_metadata() {
+        struct FailingQueue;
+
+        #[async_trait::async_trait]
+        impl crate::queue::JobQueue for FailingQueue {
+            async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
+                anyhow::bail!("injected durable admission failure")
+            }
+
+            async fn depth(&self) -> usize {
+                0
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.build_queue = Arc::new(FailingQueue);
+        let repo_id = RepoId::github("acme/repair-visible");
+        let commit = "a".repeat(40);
+        mark_added(&state, repo_id.clone()).await;
+        state
+            .ref_store
+            .save_result(
+                &repo_id,
+                &RefInfo {
+                    commit: commit.clone(),
+                    full_clonepack: crate::ClonepackArtifacts {
+                        manifest: "full-manifest".to_string(),
+                        metadata_chunk: "full-metadata".to_string(),
+                        idx_bundle: "full-idx-bundle".to_string(),
+                        commit: commit.clone(),
+                        ..Default::default()
+                    },
+                    build_status: Some("failed: archive upload".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = build_app(state)
+            .oneshot(test_request(
+                "GET",
+                &format!(
+                    "/v1/repos/github/acme/repair-visible/refs/HEAD?pinned={commit}&clonepack=full"
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "repair admission failure must not hide an already-usable Full"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["commit"], commit);
+        assert_eq!(body["archive_ready"], false);
+        assert_eq!(body["clonepack_manifest"], "full-manifest");
     }
 
     #[tokio::test]

@@ -40,6 +40,48 @@ fn doc_files() -> Vec<PathBuf> {
     files
 }
 
+/// Internal design notes are normally excluded from the user-facing CLI scan,
+/// but a public document can still make one reachable. Such a link must make
+/// the historical status explicit, rather than presenting an obsolete design
+/// as current product documentation.
+fn linked_internal_doc_files() -> Vec<PathBuf> {
+    let root = repo_root();
+    let mut linked = BTreeSet::new();
+    for doc in doc_files() {
+        let text = std::fs::read_to_string(&doc).expect("read public doc");
+        let mut rest = text.as_str();
+        while let Some((_, after_open)) = rest.split_once("](internal/") {
+            let Some((relative, after_close)) = after_open.split_once(')') else {
+                break;
+            };
+            linked.insert(root.join("docs").join("internal").join(relative));
+            rest = after_close;
+        }
+    }
+    linked.into_iter().collect()
+}
+
+#[test]
+fn public_links_to_internal_docs_disclose_historical_status() {
+    let linked = linked_internal_doc_files();
+    assert!(
+        !linked.is_empty(),
+        "keep linked internal documentation in this audit's scope"
+    );
+    assert!(
+        linked.iter().all(|path| path.exists()),
+        "linked internal doc missing"
+    );
+    for doc in linked {
+        let text = std::fs::read_to_string(&doc).expect("read linked internal doc");
+        assert!(
+            text.contains("> **Historical design snapshot."),
+            "publicly linked internal document must disclose that it is historical: {}",
+            doc.display()
+        );
+    }
+}
+
 /// Pull `ripclone <verb>` out of the shell blocks in a doc.
 ///
 /// A line counts only when `ripclone` is the *command* being run — the first

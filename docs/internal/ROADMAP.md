@@ -1,4 +1,10 @@
-# ripclone roadmap
+# Historical ripclone roadmap (superseded)
+
+> **Historical design snapshot.** This document records an earlier
+> branch-pointer and multi-ref-store design. It is not an implementation plan
+> or deployment guide. Current behavior uses immutable exact results in the
+> server-owned control database; exact-result retention and GC are documented
+> in [`../GC.md`](../GC.md).
 
 > Goal: the fastest practical way to clone a GitHub repo and be ready to work on it (`git status`, `git diff`, `git edit`, `git commit`) without rebuilding git or leaving GitHub.
 >

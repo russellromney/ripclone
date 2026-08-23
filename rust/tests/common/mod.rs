@@ -1312,6 +1312,27 @@ impl Origin {
         git(&self.work, &["rev-parse", "HEAD"])
     }
 
+    /// Create a real commit whose root tree is empty. This differs from an
+    /// unborn repository: it has a resolvable HEAD and must complete both Full
+    /// and Files publication without archive frames.
+    pub fn empty_commit(&self, msg: &str) -> String {
+        git(
+            &self.work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                msg,
+            ],
+        );
+        git(&self.work, &["rev-parse", "HEAD"])
+    }
+
     /// Publish the current work tree to the bare origin the server mirrors.
     pub fn publish(&self) {
         git(

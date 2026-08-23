@@ -6,6 +6,7 @@ use crate::common::*;
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -16,6 +17,28 @@ fn read(dir: &Path, name: &str) -> String {
 fn phase2_env_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
 }
 
 async fn repo_status(server: &Server, owner: &str, repo: &str) -> serde_json::Value {
@@ -125,6 +148,65 @@ async fn two_phase_files_mode_after_phase2() {
     assert!(
         materialized,
         "files-mode worktree materializes after phase 2"
+    );
+}
+
+/// A committed empty tree has no archive frames, but it is still a complete
+/// Full/Files result. Completion is represented by settled phase-two state,
+/// not by a non-empty archive list (an unborn repository is a separate case).
+#[tokio::test]
+async fn two_phase_committed_empty_tree_settles_full_and_files() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "empty-tree");
+    let commit = origin.empty_commit("empty root tree");
+    origin.publish();
+    register_added_without_build(&server, "acme/empty-tree")
+        .await
+        .expect("add empty-tree repo");
+    server
+        .client()
+        .sync_repo("acme/empty-tree", None)
+        .await
+        .expect("sync committed empty tree");
+
+    let mut settled = false;
+    for _ in 0..120 {
+        if let Ok(info) = server
+            .client()
+            .resolve_ref_with_clonepack("acme/empty-tree", "HEAD", Some("full"), None)
+            .await
+            && info.commit == commit
+            && info.archive_ready
+        {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        settled,
+        "empty-tree Full result settles without archive chunks"
+    );
+
+    let (_full_guard, full) = clone_only(&server, "acme", "empty-tree", 0, CloneMode::Editable)
+        .await
+        .expect("full editable clone of committed empty tree");
+    assert_eq!(git(&full, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(git(&full, &["ls-files"]), "");
+    assert!(git_ok(&full, &["fsck", "--connectivity-only", "HEAD"]));
+    assert_eq!(git(&full, &["status", "--porcelain"]), "");
+
+    let (_files_guard, files) = clone_only(&server, "acme", "empty-tree", 0, CloneMode::Files)
+        .await
+        .expect("files clone of committed empty tree");
+    assert!(files.exists(), "files mode creates the empty worktree");
+    assert!(
+        std::fs::read_dir(&files)
+            .expect("read empty files-mode worktree")
+            .next()
+            .is_none(),
+        "committed empty tree materializes no worktree entries"
     );
 }
 
@@ -401,6 +483,9 @@ async fn exhausted_older_phase2_failure_cannot_mutate_newer_ref_or_leave_hidden_
 async fn failed_phase2_status_recovers_on_resync() {
     let _env_guard = phase2_env_lock().lock().await;
     init(false);
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server_env(&[("RIPCLONE_QUEUE_MAX_ATTEMPTS", "1")]).await;
     let origin = make_origin("acme", "phase2fail");
     let commit = origin.commit(&[("f", "v1\n")], "c1");
@@ -447,24 +532,32 @@ async fn failed_phase2_status_recovers_on_resync() {
         std::env::remove_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT");
     }
 
-    server
-        .client()
-        .admit_sync_repo("acme/phase2fail", None)
-        .await
-        .expect("readmit after clearing phase-2 failure");
+    let builds_before_repair = probe.builder_entries.load(Ordering::SeqCst);
+    let (_recovered_guard, recovered) = tokio::time::timeout(
+        Duration::from_secs(60),
+        clone_only(&server, "acme", "phase2fail", 0, CloneMode::Files),
+    )
+    .await
+    .expect("Files clone must not remain pending after phase-2 failure")
+    .expect("Files clone recovers failed phase-2 result");
+    assert_eq!(read(&recovered, "f"), "v1\n");
+    assert_eq!(
+        probe.builder_entries.load(Ordering::SeqCst),
+        builds_before_repair + 1,
+        "Files repair must run exactly one replacement build"
+    );
 
-    let mut recovered = false;
-    for _ in 0..120 {
-        if let Ok((_g, d)) = clone_only(&server, "acme", "phase2fail", 0, CloneMode::Editable).await
-            && git(&d, &["rev-parse", "HEAD"]) == commit
-            && git_ok(&d, &["fsck", "--connectivity-only", "HEAD"])
-        {
-            recovered = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    assert!(recovered, "subsequent sync should recover the full clone");
+    let status = repo_status(&server, "acme", "phase2fail").await;
+    let recovered_status = status["refs"]
+        .as_array()
+        .expect("status refs")
+        .iter()
+        .find(|entry| entry["commit"] == commit)
+        .expect("recovered exact status");
+    assert!(
+        recovered_status["build_status"].is_null(),
+        "replacement must settle phase two: {recovered_status:?}"
+    );
 }
 
 /// A *panic* in phase 2 (not a returned error) must not
@@ -475,6 +568,9 @@ async fn failed_phase2_status_recovers_on_resync() {
 async fn panicking_phase2_status_recovers_on_resync() {
     let _env_guard = phase2_env_lock().lock().await;
     init(false);
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server_env(&[("RIPCLONE_QUEUE_MAX_ATTEMPTS", "1")]).await;
     let origin = make_origin("acme", "phase2panic");
     let commit = origin.commit(&[("f", "v1\n")], "c1");
@@ -523,26 +619,30 @@ async fn panicking_phase2_status_recovers_on_resync() {
         std::env::remove_var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT");
     }
 
-    server
-        .client()
-        .admit_sync_repo("acme/phase2panic", None)
-        .await
-        .expect("readmit after clearing phase-2 panic");
+    let builds_before_repair = probe.builder_entries.load(Ordering::SeqCst);
+    let (_recovered_guard, recovered) = tokio::time::timeout(
+        Duration::from_secs(60),
+        clone_only(&server, "acme", "phase2panic", 0, CloneMode::Files),
+    )
+    .await
+    .expect("Files clone must not remain pending after phase-2 panic")
+    .expect("Files clone recovers panicked phase-2 result");
+    assert_eq!(read(&recovered, "f"), "v1\n");
+    assert_eq!(
+        probe.builder_entries.load(Ordering::SeqCst),
+        builds_before_repair + 1,
+        "Files repair must run exactly one replacement build"
+    );
 
-    let mut recovered = false;
-    for _ in 0..120 {
-        if let Ok((_g, d)) =
-            clone_only(&server, "acme", "phase2panic", 0, CloneMode::Editable).await
-            && git(&d, &["rev-parse", "HEAD"]) == commit
-            && git_ok(&d, &["fsck", "--connectivity-only", "HEAD"])
-        {
-            recovered = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    let status = repo_status(&server, "acme", "phase2panic").await;
+    let recovered_status = status["refs"]
+        .as_array()
+        .expect("status refs")
+        .iter()
+        .find(|entry| entry["commit"] == commit)
+        .expect("recovered exact status");
     assert!(
-        recovered,
-        "subsequent sync should recover the full clone after a phase-2 panic"
+        recovered_status["build_status"].is_null(),
+        "replacement must settle phase two: {recovered_status:?}"
     );
 }

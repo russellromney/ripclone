@@ -247,7 +247,7 @@ pre-warm (see [Events](#events--phase-1-vs-later)).
 
 ## See also
 
-- [`GITHUB_INTEGRATION.md`](internal/GITHUB_INTEGRATION.md) — GitHub auth / token setup
-  the webhook reuses for private clones (`StaticBroker`).
+- [`CONFIG.md`](CONFIG.md) — current provider credential configuration for
+  private clone and webhook builds.
 - [`BACKENDS.md`](BACKENDS.md) — the build queue + worker the receiver enqueues
   onto.

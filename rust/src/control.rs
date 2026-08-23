@@ -546,7 +546,6 @@ impl ControlDb {
                 && !info.full_clonepack.manifest.is_empty()
                 && !info.full_clonepack.metadata_chunk.is_empty()
                 && !info.full_clonepack.idx_bundle.is_empty()
-                && !info.archive_chunks.is_empty()
                 && info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
                 && matches!(info.build_status.as_deref(), None | Some("done"))
         });
