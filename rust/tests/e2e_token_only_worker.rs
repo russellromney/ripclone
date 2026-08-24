@@ -7,7 +7,7 @@ use common::*;
 use ripclone::job_token::{mint_job_token, report_token_secret_from_env};
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
-use ripclone::queue::{BuildJob, JobQueue};
+use ripclone::queue::{BuildJob, JobQueue, JobState};
 use ripclone::ref_store::{AddedRepo, AddedRepoSource};
 use ripclone::server::{RateLimiter, ServerState, build_app};
 use ripclone::storage::StorageBackend;
@@ -167,7 +167,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         .arg("--idle-poll-ms")
         .arg("20")
         .arg("--max-jobs")
-        .arg("1")
+        .arg("2")
         .env("RIPCLONE_QUEUE_API_URL", &server_url)
         .env(
             "RIPCLONE_CONFIG",
@@ -274,6 +274,71 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     }
     std::fs::write(full_barrier.join("proceed"), b"proceed\n").unwrap();
 
+    let job_key = format!(
+        "{}\x1f{commit}",
+        RepoId::github("acme/api-only").storage_key()
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(
+                queue.job_state_for_key(&job_key).await.unwrap(),
+                JobState::Done
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("first API worker job settled");
+
+    let refs = control.ref_store();
+    let first = refs
+        .load_result(&RepoId::github("acme/api-only"), &commit)
+        .await
+        .unwrap()
+        .expect("first API worker job published the exact result");
+    assert!(first.head.is_some() && first.full.is_some() && first.files.is_some());
+    assert!(
+        refs.evict_if_unchanged(&RepoId::github("acme/api-only"), &first)
+            .await
+            .unwrap(),
+        "completed exact result is evicted between jobs"
+    );
+    let evicted = refs
+        .load_result(&RepoId::github("acme/api-only"), &commit)
+        .await
+        .unwrap()
+        .expect("evicted exact row remains available for readmission");
+    assert!(evicted.head.is_none() && evicted.full.is_none() && evicted.files.is_none());
+
+    std::fs::remove_file(full_barrier.join("entered")).unwrap();
+    std::fs::remove_file(full_barrier.join("proceed")).unwrap();
+    let replacement = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.admit_sync_repo("acme/api-only", None),
+    )
+    .await
+    .expect("replacement API worker job admitted within the bound")
+    .expect("replacement API worker admission succeeded");
+    assert_eq!(replacement.commit, commit);
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !full_barrier.join("entered").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("same API worker rebuilt Head after server-side eviction");
+    let rebuilt = refs
+        .load_result(&RepoId::github("acme/api-only"), &commit)
+        .await
+        .unwrap()
+        .expect("same API worker republished Head");
+    assert!(rebuilt.head.is_some(), "replacement job rebuilt Head");
+    assert!(rebuilt.full.is_none(), "replacement Full remains held");
+    std::fs::write(full_barrier.join("proceed"), b"proceed\n").unwrap();
+
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -282,7 +347,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         }
         assert!(
             Instant::now() < deadline,
-            "worker did not finish one API job"
+            "same worker did not finish both API jobs"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -299,22 +364,27 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     let snapshot_connection = snapshot_database.connect().unwrap();
     let mut snapshot_rows = snapshot_connection
         .query(
-            "SELECT repo_config FROM jobs WHERE path = ?1 ORDER BY id DESC LIMIT 1",
+            "SELECT repo_config FROM jobs WHERE path = ?1 ORDER BY id ASC",
             ["acme/api-only"],
         )
         .await
         .unwrap();
-    let snapshot: ripclone::repo_config::RepoConfig = serde_json::from_str(
-        &snapshot_rows
-            .next()
-            .await
-            .unwrap()
-            .expect("API worker durable job exists")
-            .get::<String>(0)
+    let mut snapshots = Vec::new();
+    while let Some(row) = snapshot_rows.next().await.unwrap() {
+        snapshots.push(
+            serde_json::from_str::<ripclone::repo_config::RepoConfig>(
+                &row.get::<String>(0).unwrap(),
+            )
             .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(snapshot, admitted_config);
+        );
+    }
+    assert_eq!(
+        snapshots.len(),
+        2,
+        "one long-lived API worker must settle the initial and replacement jobs"
+    );
+    assert_eq!(snapshots[0], admitted_config);
+    assert_eq!(snapshots[1].compression_level, Some(19));
     let removed_config_key = format!(
         "repo-config/{}.json",
         RepoId::github("acme/api-only").storage_key()

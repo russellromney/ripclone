@@ -7,10 +7,11 @@
 //! The server that holds the real control database performs the durable write
 //! only when that owner still holds that exact job (`POST /v1/refs`).
 //!
-//! Reads return empty: a farmed-out worker builds cold and only needs the write
-//! path for publish. A failed report is never swallowed — network/5xx map to
-//! retryable errors so the job requeues, and 401/403 to an unauthorized error so
-//! the worker exits cleanly without refreshing credentials locally.
+//! Reads come from the server at the beginning of each claimed job, then use a
+//! process-local write-through cache while that job publishes its results. A
+//! failed report is never swallowed — network/5xx map to retryable errors so
+//! the job requeues, and 401/403 to an unauthorized error so the worker exits
+//! cleanly without refreshing credentials locally.
 //!
 //! The token is a durable, operator-provisioned value (`ripclone
 //! mint-worker-token`). The queue-side twin is
@@ -396,7 +397,7 @@ impl RefStore for ApiRefStore {
                     commit: commit.to_string(),
                     ..Default::default()
                 });
-            result.full.get_or_insert(full);
+            result.full = Some(full);
         }
         Ok(response.updated)
     }
@@ -426,7 +427,7 @@ impl RefStore for ApiRefStore {
                     commit: commit.to_string(),
                     ..Default::default()
                 });
-            result.files.get_or_insert(files);
+            result.files = Some(files);
         }
         Ok(response.updated)
     }
@@ -462,6 +463,13 @@ impl RefStore for ApiRefStore {
 
     async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
         Ok(Vec::new())
+    }
+
+    async fn invalidate(&self, repo_id: &RepoId, commit: &str) {
+        self.local
+            .write()
+            .await
+            .remove(&Self::local_key(repo_id, commit));
     }
 
     async fn health(&self) -> Result<()> {
