@@ -135,15 +135,27 @@ pub fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for hash in [
-        info.head
-            .as_ref()
-            .map(|result| result.clonepack.manifest.as_str()),
-        info.full
-            .as_ref()
-            .map(|result| result.clonepack.manifest.as_str()),
-        info.files
-            .as_ref()
-            .map(|result| result.clonepack.manifest.as_str()),
+        if crate::exact_output_ready(info, crate::ExactResultKind::Head, &info.commit) {
+            info.head
+                .as_ref()
+                .map(|result| result.clonepack.manifest.as_str())
+        } else {
+            None
+        },
+        if crate::exact_output_ready(info, crate::ExactResultKind::Full, &info.commit) {
+            info.full
+                .as_ref()
+                .map(|result| result.clonepack.manifest.as_str())
+        } else {
+            None
+        },
+        if crate::exact_output_ready(info, crate::ExactResultKind::Files, &info.commit) {
+            info.files
+                .as_ref()
+                .map(|result| result.clonepack.manifest.as_str())
+        } else {
+            None
+        },
     ]
     .into_iter()
     .flatten()

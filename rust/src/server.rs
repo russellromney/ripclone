@@ -2149,6 +2149,16 @@ async fn ref_report_handler(
             head,
             ..
         } => {
+            if !crate::exact_output_artifacts_ready(&commit, ExactResultKind::Head, &head.clonepack)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid Head result for exact commit {commit}"),
+                    }),
+                )
+                    .into_response();
+            }
             admission_test_ref_store_write();
             match state.control_db.as_ref() {
                 Some(control) => {
@@ -2174,46 +2184,73 @@ async fn ref_report_handler(
             commit,
             full,
             ..
-        } => match state.control_db.as_ref() {
-            Some(control) => {
-                control
-                    .publish_full_for_claim(job_id, &worker_id, &repo_id, &commit, *full)
-                    .await
+        } => {
+            if !crate::exact_output_artifacts_ready(&commit, ExactResultKind::Full, &full.clonepack)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid Full result for exact commit {commit}"),
+                    }),
+                )
+                    .into_response();
             }
-            #[cfg(test)]
-            None => {
-                state
-                    .ref_store
-                    .publish_claimed_full(&repo_id, &commit, *full, job_id, &worker_id)
-                    .await
+            match state.control_db.as_ref() {
+                Some(control) => {
+                    control
+                        .publish_full_for_claim(job_id, &worker_id, &repo_id, &commit, *full)
+                        .await
+                }
+                #[cfg(test)]
+                None => {
+                    state
+                        .ref_store
+                        .publish_claimed_full(&repo_id, &commit, *full, job_id, &worker_id)
+                        .await
+                }
+                #[cfg(not(test))]
+                None => Err(anyhow::anyhow!("control database unavailable")),
             }
-            #[cfg(not(test))]
-            None => Err(anyhow::anyhow!("control database unavailable")),
+            .map(|updated| RefReportResponse { updated })
         }
-        .map(|updated| RefReportResponse { updated }),
         RefReport::PublishFiles {
             job_id,
             worker_id,
             commit,
             files,
             ..
-        } => match state.control_db.as_ref() {
-            Some(control) => {
-                control
-                    .publish_files_for_claim(job_id, &worker_id, &repo_id, &commit, *files)
-                    .await
+        } => {
+            if !crate::exact_output_artifacts_ready(
+                &commit,
+                ExactResultKind::Files,
+                &files.clonepack,
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid Files result for exact commit {commit}"),
+                    }),
+                )
+                    .into_response();
             }
-            #[cfg(test)]
-            None => {
-                state
-                    .ref_store
-                    .publish_claimed_files(&repo_id, &commit, *files, job_id, &worker_id)
-                    .await
+            match state.control_db.as_ref() {
+                Some(control) => {
+                    control
+                        .publish_files_for_claim(job_id, &worker_id, &repo_id, &commit, *files)
+                        .await
+                }
+                #[cfg(test)]
+                None => {
+                    state
+                        .ref_store
+                        .publish_claimed_files(&repo_id, &commit, *files, job_id, &worker_id)
+                        .await
+                }
+                #[cfg(not(test))]
+                None => Err(anyhow::anyhow!("control database unavailable")),
             }
-            #[cfg(not(test))]
-            None => Err(anyhow::anyhow!("control database unavailable")),
+            .map(|updated| RefReportResponse { updated })
         }
-        .map(|updated| RefReportResponse { updated }),
     };
 
     match result {
@@ -2786,15 +2823,15 @@ fn exact_result_clonepack(
 }
 
 fn exact_result_ready(info: &RefInfo, result: ExactResultKind, commit: &str) -> bool {
-    info.commit == commit && exact_result_clonepack(info, result).is_some()
+    crate::exact_output_ready(info, result, commit)
 }
 
 fn exact_result_complete(info: &RefInfo, commit: &str) -> bool {
-    info.commit == commit && info.head.is_some() && info.full.is_some() && info.files.is_some()
+    crate::exact_result_complete(info, commit)
 }
 
 fn exact_parent_head_ready(info: &RefInfo, commit: &str) -> bool {
-    info.commit == commit && info.head.is_some()
+    crate::exact_output_ready(info, ExactResultKind::Head, commit)
 }
 
 fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
@@ -2941,6 +2978,9 @@ async fn carried_full_top_up_response(
     let parent = info.head.as_ref()?.parent_commit.as_deref()?;
     let parent_result = ref_store.load_result(repo_id, parent).await.ok()??;
     let full = parent_result.full.as_ref()?;
+    if !crate::exact_output_artifacts_ready(parent, ExactResultKind::Full, &full.clonepack) {
+        return None;
+    }
     let artifact = full.clonepack.commit.as_str();
     let manifest_hash = full.clonepack.manifest.as_str();
     if parent != artifact
@@ -3679,7 +3719,9 @@ async fn build_repo_status(
                 record_chunk(&mut unique_chunks, &hash_to_hex(&chunk.hash), chunk.len);
             }
         }
-        if let Some(full) = &info.full {
+        if exact_result_ready(&info, ExactResultKind::Full, &info.commit)
+            && let Some(full) = &info.full
+        {
             for level in &full.history_levels {
                 for pack in &level.packs {
                     if !pack.pack.is_empty() {
@@ -3709,6 +3751,9 @@ async fn build_repo_status(
         };
         let is_public_fork = public && fork_of.is_some();
         let branch_unique_bytes = if is_public_fork { 0 } else { ref_bytes };
+        let head_ready = exact_result_ready(&info, ExactResultKind::Head, &info.commit);
+        let full_ready = exact_result_ready(&info, ExactResultKind::Full, &info.commit);
+        let files_ready = exact_result_ready(&info, ExactResultKind::Files, &info.commit);
 
         refs.push(ExactStatusEntry {
             commit: info.commit,
@@ -3716,11 +3761,11 @@ async fn build_repo_status(
             unique_bytes: branch_unique_bytes,
             built_at,
             last_accessed_at,
-            warm: info.head.is_some() || info.full.is_some() || info.files.is_some(),
+            warm: head_ready || full_ready || files_ready,
             pinned: info.warm_pinned,
-            head: info.head.is_some(),
-            full: info.full.is_some(),
-            files: info.files.is_some(),
+            head: head_ready,
+            full: full_ready,
+            files: files_ready,
             job,
             job_error,
         });
@@ -4378,9 +4423,10 @@ async fn prepare_exact_admission(
         .load_result(&job.repo_id, commit)
         .await
         .map_err(|e| format!("exact admission lookup failed: {e}"))?;
-    if existing.as_ref().is_some_and(|result| {
-        result.head.is_some() && result.full.is_some() && result.files.is_some()
-    }) {
+    if existing
+        .as_ref()
+        .is_some_and(|result| exact_result_complete(result, commit))
+    {
         return Ok(None);
     }
     let pending = existing.unwrap_or_else(|| pending_exact_result(job));
@@ -4428,9 +4474,7 @@ async fn trigger_build(
         .ok()
         .flatten();
     if let Some(info) = existing
-        && info.head.is_some()
-        && info.full.is_some()
-        && info.files.is_some()
+        && exact_result_complete(&info, &admitted_commit)
     {
         // A signed replay/poller wakeup for a branch that already serves this
         // exact full commit is a read-only no-op. Do not fetch credentials or
@@ -5557,9 +5601,7 @@ async fn do_sync(
 
     let existing_before_fetch = ref_store.load_result(repo_id, admitted_commit).await?;
     if let Some(existing) = existing_before_fetch.as_ref()
-        && existing.head.is_some()
-        && existing.full.is_some()
-        && existing.files.is_some()
+        && exact_result_complete(existing, admitted_commit)
     {
         if let Some(release) = foreground_release.take() {
             let _ = release.send(());
@@ -5645,6 +5687,7 @@ async fn do_sync(
 
     let existing = ref_store.load_result(repo_id, &commit).await?;
     if let Some(result) = existing
+        && exact_result_ready(&result, ExactResultKind::Head, &commit)
         && let Some(head) = result.head.clone()
     {
         drop(_guard);
@@ -5662,8 +5705,8 @@ async fn do_sync(
             storage,
             retention,
             compression_level,
-            result.full.is_none(),
-            result.files.is_none(),
+            !exact_result_ready(&result, ExactResultKind::Full, &commit),
+            !exact_result_ready(&result, ExactResultKind::Files, &commit),
             false,
         )
         .await?;
@@ -5751,7 +5794,7 @@ async fn build_and_publish_results(
     //
     // Head construction needs only the parent's exact Head result. Full and
     // Files select their own parent outputs independently below.
-    let current = ref_store.load_result(repo_id, commit).await.ok().flatten();
+    let current = ref_store.load_result(repo_id, commit).await?;
     let prev_loaded = match parent.as_deref() {
         Some(parent_commit) => ref_store
             .load_result(repo_id, parent_commit)
@@ -6075,8 +6118,12 @@ async fn build_and_publish_results(
 
     // Every durable claim owns Head, Files, and Full. A process death before
     // this completes leaves the SQL claim stale for the next worker to reclaim.
-    let need_full = current.as_ref().is_none_or(|result| result.full.is_none());
-    let need_files = current.as_ref().is_none_or(|result| result.files.is_none());
+    let need_full = current
+        .as_ref()
+        .is_none_or(|result| !exact_result_ready(result, ExactResultKind::Full, commit));
+    let need_files = current
+        .as_ref()
+        .is_none_or(|result| !exact_result_ready(result, ExactResultKind::Files, commit));
     build_missing_full_and_files(
         cas,
         mirror_dir,
@@ -6320,7 +6367,13 @@ async fn build_missing_full_and_files(
             head_packs,
             parent_result
                 .as_ref()
-                .and_then(|result| result.full.as_ref())
+                .and_then(|result| {
+                    if exact_result_ready(result, ExactResultKind::Full, &result.commit) {
+                        result.full.as_ref()
+                    } else {
+                        None
+                    }
+                })
                 .map(|full| full.history_levels.clone())
                 .unwrap_or_default(),
             ref_store,
@@ -6627,7 +6680,13 @@ async fn build_files_result(
         anyhow::bail!("forced Files failure for {commit}");
     }
 
-    let parent_files = parent_result.and_then(|result| result.files.as_ref());
+    let parent_files = parent_result.and_then(|result| {
+        if exact_result_ready(result, ExactResultKind::Files, &result.commit) {
+            result.files.as_ref()
+        } else {
+            None
+        }
+    });
     let previous_frames = parent_files
         .map(|files| files.archive_frames.clone())
         .unwrap_or_default();
@@ -7623,16 +7682,27 @@ mod tests {
     use super::*;
     use tower::util::ServiceExt;
 
+    fn ready_artifacts(commit: &str, label: &str) -> crate::ClonepackArtifacts {
+        let hash = |suffix: &str| crate::cas::hash(format!("{label}-{suffix}").as_bytes());
+        crate::ClonepackArtifacts {
+            manifest: hash("manifest"),
+            metadata_chunk: hash("metadata"),
+            skeleton_pack: hash("skeleton-pack"),
+            skeleton_idx: hash("skeleton-idx"),
+            prebuilt_index: hash("index"),
+            idx_bundle: hash("idx-bundle"),
+            commit: commit.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn exact_result_requires_the_requested_stored_result() {
         let commit = "a".repeat(40);
         let info = RefInfo {
             commit: commit.clone(),
             full: Some(crate::FullResult {
-                clonepack: crate::ClonepackArtifacts {
-                    commit: commit.clone(),
-                    ..Default::default()
-                },
+                clonepack: ready_artifacts(&commit, "full"),
                 ..Default::default()
             }),
             ..Default::default()
@@ -9698,14 +9768,31 @@ mod tests {
         let state = test_state(&tmp);
         let repo_id = RepoId::github("acme/status-results");
         let commit = "a".repeat(40);
+        let metadata = state.cas.put(b"status metadata").unwrap();
+        let manifest =
+            make_manifest(&commit, &None, &[], &metadata, 15, Vec::new(), None, None).unwrap();
+        let manifest = state.cas.put(&manifest.encode_to_vec()).unwrap();
+        let mut head_artifacts = ready_artifacts(&commit, "status-head");
+        head_artifacts.manifest = manifest.clone();
+        head_artifacts.metadata_chunk = metadata.clone();
+        let mut full_artifacts = ready_artifacts(&commit, "status-full");
+        full_artifacts.manifest = manifest;
+        full_artifacts.metadata_chunk = metadata;
+        let head = crate::HeadResult {
+            clonepack: head_artifacts,
+            ..Default::default()
+        };
         state
             .ref_store
             .save_result(
                 &repo_id,
                 &RefInfo {
                     commit: commit.clone(),
-                    head: Some(crate::HeadResult::default()),
-                    full: Some(crate::FullResult::default()),
+                    head: Some(head.clone()),
+                    full: Some(crate::FullResult {
+                        clonepack: full_artifacts,
+                        ..Default::default()
+                    }),
                     files: None,
                     ..Default::default()
                 },
@@ -9714,7 +9801,7 @@ mod tests {
             .unwrap();
         state
             .ref_store
-            .publish_head(&repo_id, &commit, crate::HeadResult::default())
+            .publish_head(&repo_id, &commit, head)
             .await
             .unwrap();
 
@@ -9762,9 +9849,10 @@ mod tests {
             .unwrap()
     }
 
-    /// Happy path: valid job token → durable write through the server's RefStore.
+    /// Authenticated worker output must match the exact commit and contain the
+    /// hashes its result needs. A valid retry replaces invalid stored output.
     #[tokio::test]
-    async fn ref_report_valid_token_writes_ref() {
+    async fn ref_report_rejects_invalid_outputs_and_accepts_valid_retries() {
         let secret = crate::job_token::report_token_secret_from_env()
             .or_else(|| {
                 // test_state does not set RIPCLONE_SERVER_TOKEN; plant one for the mint.
@@ -9786,41 +9874,125 @@ mod tests {
                 &rid,
                 &RefInfo {
                     commit: commit.clone(),
+                    head: Some(crate::HeadResult::default()),
+                    full: Some(crate::FullResult::default()),
+                    files: Some(crate::FilesResult::default()),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
         let app = build_app(state);
+        let wrong_commit = "b".repeat(40);
 
-        let head = crate::HeadResult {
-            clonepack: crate::ClonepackArtifacts {
-                commit: commit.clone(),
-                manifest: "m1".into(),
-                ..Default::default()
-            },
+        let mut wrong_head = crate::HeadResult {
+            clonepack: ready_artifacts(&wrong_commit, "wrong-head"),
             ..Default::default()
         };
-        let body = serde_json::json!({
-            "op": "publish_head",
-            "job_id": 1,
-            "worker_id": "test-worker",
-            "repo_key": repo_key,
-            "commit": commit,
-            "head": head,
-        });
-        let resp = app
-            .oneshot(ref_report_request(Some(&tok), &body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "valid token must write");
+        wrong_head.clonepack.commit = wrong_commit.clone();
+        let valid_head = crate::HeadResult {
+            clonepack: ready_artifacts(&commit, "valid-head"),
+            ..Default::default()
+        };
+        let head_reports = [
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_head}),
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":crate::HeadResult::default()}),
+        ];
+        for body in &head_reports {
+            let response = app
+                .clone()
+                .oneshot(ref_report_request(Some(&tok), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let body = serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":valid_head});
+        assert_eq!(
+            app.clone()
+                .oneshot(ref_report_request(Some(&tok), &body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let wrong_full = crate::FullResult {
+            clonepack: ready_artifacts(&wrong_commit, "wrong-full"),
+            ..Default::default()
+        };
+        let full_reports = [
+            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_full}),
+            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":crate::FullResult::default()}),
+        ];
+        for body in &full_reports {
+            let response = app
+                .clone()
+                .oneshot(ref_report_request(Some(&tok), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let valid_full = crate::FullResult {
+            clonepack: ready_artifacts(&commit, "valid-full"),
+            ..Default::default()
+        };
+        let body = serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":valid_full});
+        assert_eq!(
+            app.clone()
+                .oneshot(ref_report_request(Some(&tok), &body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let wrong_files = crate::FilesResult {
+            clonepack: ready_artifacts(&wrong_commit, "wrong-files"),
+            ..Default::default()
+        };
+        let files_reports = [
+            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":wrong_files}),
+            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":crate::FilesResult::default()}),
+        ];
+        for body in &files_reports {
+            let response = app
+                .clone()
+                .oneshot(ref_report_request(Some(&tok), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let valid_files = crate::FilesResult {
+            clonepack: ready_artifacts(&commit, "valid-files"),
+            ..Default::default()
+        };
+        let body = serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":valid_files});
+        assert_eq!(
+            app.oneshot(ref_report_request(Some(&tok), &body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
 
         let stored = ref_store
-            .load_result(&rid, &"a".repeat(40))
+            .load_result(&rid, &commit)
             .await
             .unwrap()
-            .expect("ref must land in store");
-        assert_eq!(stored.head.unwrap().clonepack.manifest, "m1");
+            .expect("valid retries must replace invalid stored outputs");
+        assert!(crate::exact_result_complete(&stored, &commit));
+        assert_eq!(
+            stored.head.unwrap().clonepack.manifest,
+            crate::cas::hash(b"valid-head-manifest")
+        );
+        assert_eq!(
+            stored.full.unwrap().clonepack.manifest,
+            crate::cas::hash(b"valid-full-manifest")
+        );
+        assert_eq!(
+            stored.files.unwrap().clonepack.manifest,
+            crate::cas::hash(b"valid-files-manifest")
+        );
     }
 
     /// Auth gate: wrong / missing token → 401 and no write.
@@ -9858,10 +10030,7 @@ mod tests {
         let app = build_app(state);
 
         let head = crate::HeadResult {
-            clonepack: crate::ClonepackArtifacts {
-                commit: commit.clone(),
-                ..Default::default()
-            },
+            clonepack: ready_artifacts(&commit, "authorized-head"),
             ..Default::default()
         };
         let body = serde_json::json!({

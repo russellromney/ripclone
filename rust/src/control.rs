@@ -300,6 +300,14 @@ impl ControlDb {
         head: crate::HeadResult,
     ) -> Result<bool> {
         crate::validation::validate_object_id(commit).context("validate claimed result commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Head,
+                &head.clonepack,
+            ),
+            "invalid claimed Head result for {commit}"
+        );
         let connection = self
             .database
             .connect()
@@ -328,11 +336,17 @@ impl ControlDb {
         let mut result: crate::RefInfo =
             serde_json::from_str(&row.get::<String>(0)?).context("decode claimed exact result")?;
         drop(rows);
-        result.head = Some(head);
-        result.synced_at = std::time::SystemTime::now()
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        let published_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|duration| duration.as_secs());
+        result.head = Some(head);
+        result.synced_at = published_at;
+        result.last_accessed_at = published_at;
         let data = serde_json::to_string(&result).context("encode claimed Head result")?;
         tx.execute(
             "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
@@ -353,6 +367,14 @@ impl ControlDb {
         full: crate::FullResult,
     ) -> Result<bool> {
         crate::validation::validate_object_id(commit).context("validate claimed Full commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Full,
+                &full.clonepack,
+            ),
+            "invalid claimed Full result for {commit}"
+        );
         let connection = self
             .database
             .connect()
@@ -381,8 +403,16 @@ impl ControlDb {
         let mut result: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
             .context("decode exact result for claimed Full")?;
         drop(rows);
-        if result.full.is_none() {
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        if !crate::exact_output_ready(&result, crate::ExactResultKind::Full, commit) {
             result.full = Some(full);
+            result.last_accessed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs());
             let data = serde_json::to_string(&result).context("encode claimed Full")?;
             tx.execute(
                 "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
@@ -404,6 +434,14 @@ impl ControlDb {
         files: crate::FilesResult,
     ) -> Result<bool> {
         crate::validation::validate_object_id(commit).context("validate claimed Files commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Files,
+                &files.clonepack,
+            ),
+            "invalid claimed Files result for {commit}"
+        );
         let connection = self
             .database
             .connect()
@@ -432,8 +470,16 @@ impl ControlDb {
         let mut result: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
             .context("decode exact result for claimed Files")?;
         drop(rows);
-        if result.files.is_none() {
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        if !crate::exact_output_ready(&result, crate::ExactResultKind::Files, commit) {
             result.files = Some(files);
+            result.last_accessed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs());
             let data = serde_json::to_string(&result).context("encode claimed Files")?;
             tx.execute(
                 "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
@@ -583,12 +629,9 @@ impl ControlDb {
             None => None,
         };
         drop(rows);
-        let all_results_ready = existing.as_ref().is_some_and(|result| {
-            result.commit == job.admitted_commit
-                && result.head.is_some()
-                && result.full.is_some()
-                && result.files.is_some()
-        });
+        let all_results_ready = existing
+            .as_ref()
+            .is_some_and(|result| crate::exact_result_complete(result, &job.admitted_commit));
         if all_results_ready || active_job_id.is_some() {
             tx.commit()
                 .await
@@ -917,6 +960,20 @@ mod tests {
         }
     }
 
+    fn ready_artifacts(commit: &str, label: &str) -> crate::ClonepackArtifacts {
+        let hash = |suffix: &str| crate::cas::hash(format!("{label}-{suffix}").as_bytes());
+        crate::ClonepackArtifacts {
+            manifest: hash("manifest"),
+            metadata_chunk: hash("metadata"),
+            skeleton_pack: hash("skeleton-pack"),
+            skeleton_idx: hash("skeleton-idx"),
+            prebuilt_index: hash("index"),
+            idx_bundle: hash("idx-bundle"),
+            commit: commit.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn repository_config_persists_and_absence_does_not_insert_defaults() {
         let directory = tempfile::tempdir().unwrap();
@@ -1185,11 +1242,7 @@ mod tests {
         let first = control.queue().claim("first-owner").await.unwrap().unwrap();
         assert_eq!(first.id, first_id);
         let head = crate::HeadResult {
-            clonepack: crate::ClonepackArtifacts {
-                manifest: "ready-head".to_string(),
-                commit: commit.to_string(),
-                ..Default::default()
-            },
+            clonepack: ready_artifacts(commit, "ready-head"),
             ..Default::default()
         };
         assert!(
@@ -1235,19 +1288,11 @@ mod tests {
             .unwrap();
         assert_eq!(second.id, second_id);
         let full = crate::FullResult {
-            clonepack: crate::ClonepackArtifacts {
-                manifest: "ready-full".to_string(),
-                commit: commit.to_string(),
-                ..Default::default()
-            },
+            clonepack: ready_artifacts(commit, "ready-full"),
             ..Default::default()
         };
         let files = crate::FilesResult {
-            clonepack: crate::ClonepackArtifacts {
-                manifest: "ready-files".to_string(),
-                commit: commit.to_string(),
-                ..Default::default()
-            },
+            clonepack: ready_artifacts(commit, "ready-files"),
             ..Default::default()
         };
         assert!(
@@ -1276,7 +1321,10 @@ mod tests {
                     "first-owner",
                     &repo_id,
                     commit,
-                    crate::HeadResult::default(),
+                    crate::HeadResult {
+                        clonepack: ready_artifacts(commit, "stale-head"),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .unwrap()
@@ -1288,7 +1336,10 @@ mod tests {
                     "first-owner",
                     &repo_id,
                     commit,
-                    crate::FullResult::default(),
+                    crate::FullResult {
+                        clonepack: ready_artifacts(commit, "stale-full"),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .unwrap()
@@ -1300,7 +1351,10 @@ mod tests {
                     "first-owner",
                     &repo_id,
                     commit,
-                    crate::FilesResult::default(),
+                    crate::FilesResult {
+                        clonepack: ready_artifacts(commit, "stale-files"),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .unwrap()

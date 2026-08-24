@@ -241,6 +241,53 @@ pub enum ExactResultKind {
     Files,
 }
 
+/// Return whether one stored output is structurally usable for `commit`.
+///
+/// Files may validly contain zero archive chunks (for an empty committed tree),
+/// and MIDX is optional for every result. The remaining hashes are required by
+/// the corresponding clone/install or follow-on build path.
+pub(crate) fn exact_output_artifacts_ready(
+    commit: &str,
+    result: ExactResultKind,
+    artifacts: &ClonepackArtifacts,
+) -> bool {
+    let valid_hash = |hash: &str| crate::cas::Cas::validate_artifact_id(hash).is_ok();
+    if artifacts.commit != commit
+        || !valid_hash(&artifacts.manifest)
+        || !valid_hash(&artifacts.metadata_chunk)
+    {
+        return false;
+    }
+
+    match result {
+        ExactResultKind::Head | ExactResultKind::Full => {
+            valid_hash(&artifacts.skeleton_pack)
+                && valid_hash(&artifacts.skeleton_idx)
+                && valid_hash(&artifacts.prebuilt_index)
+                && valid_hash(&artifacts.idx_bundle)
+        }
+        ExactResultKind::Files => true,
+    }
+}
+
+pub(crate) fn exact_output_ready(info: &RefInfo, result: ExactResultKind, commit: &str) -> bool {
+    if info.commit != commit {
+        return false;
+    }
+    let artifacts = match result {
+        ExactResultKind::Head => info.head.as_ref().map(|output| &output.clonepack),
+        ExactResultKind::Full => info.full.as_ref().map(|output| &output.clonepack),
+        ExactResultKind::Files => info.files.as_ref().map(|output| &output.clonepack),
+    };
+    artifacts.is_some_and(|artifacts| exact_output_artifacts_ready(commit, result, artifacts))
+}
+
+pub(crate) fn exact_result_complete(info: &RefInfo, commit: &str) -> bool {
+    exact_output_ready(info, ExactResultKind::Head, commit)
+        && exact_output_ready(info, ExactResultKind::Full, commit)
+        && exact_output_ready(info, ExactResultKind::Files, commit)
+}
+
 impl std::fmt::Display for ExactResultKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {

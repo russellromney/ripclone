@@ -370,8 +370,8 @@ impl RemoteGc {
                 .await
                 .with_context(|| format!("list commits for warm TTL {key}"))?;
 
-            // Load every ref of the repo once, so eviction can reason about the
-            // whole repo rather than each ref in isolation.
+            // Load every exact result of the repo once, so eviction can reason
+            // about the whole repo rather than each commit in isolation.
             let mut infos = Vec::with_capacity(commits.len());
             for commit in commits {
                 if let Some(info) = self
@@ -386,13 +386,8 @@ impl RemoteGc {
 
             // Repo-scoped pin protection. `warm_pinned` marks a repo that should
             // stay warm (an operator or external control plane sets the flag); the
-            // guarantee is that its artifacts survive TTL eviction. A repo keeps
-            // more than one ref object
-            // for the same commit — notably the literal `HEAD` alias alongside the
-            // concrete default branch that actually holds the full-history build —
-            // and the pin may only be set on one of them. Evicting a *sibling* ref
-            // of a pinned repo deletes chunks the pinned commit still needs, so the
-            // pin must cover the whole repo, not just the ref that carries the flag.
+            // guarantee is that its artifacts survive TTL eviction, so the pin
+            // covers every retained exact result for the repository.
             if infos.iter().any(|info| info.warm_pinned) {
                 continue;
             }
@@ -424,9 +419,9 @@ impl RemoteGc {
 /// by remote GC and local retention so both protect exactly what the refs point
 /// at, not a best-effort side list.
 ///
-/// When `fresh` is true, each branch's cache entry is invalidated before it is
-/// loaded so the read goes through to the durable store (a stale cached ref
-/// could otherwise let a delete race a just-saved ref). It is a no-op for
+/// When `fresh` is true, each exact result's cache entry is invalidated before
+/// it is loaded so the read goes through to the durable store (a stale cached
+/// result could otherwise let a delete race a just-saved result). It is a no-op for
 /// non-caching ref stores. A manifest that can't be read fails the whole walk,
 /// so the caller never deletes against an incomplete set.
 pub(crate) async fn reachable_hashes(
@@ -546,7 +541,9 @@ fn collect_pack_artifact(artifact: &PackArtifact, reachable: &mut HashSet<String
 
 /// Collect every artifact hash referenced directly by a RefInfo.
 fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
-    if let Some(head) = &info.head {
+    if crate::exact_output_ready(info, crate::ExactResultKind::Head, &info.commit)
+        && let Some(head) = &info.head
+    {
         collect_clonepack_artifacts(&head.clonepack, reachable);
         for artifact in &head.packs {
             collect_pack_artifact(artifact, reachable);
@@ -555,14 +552,18 @@ fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
             collect_sized_pack(pack, reachable);
         }
     }
-    if let Some(full) = &info.full {
+    if crate::exact_output_ready(info, crate::ExactResultKind::Full, &info.commit)
+        && let Some(full) = &info.full
+    {
         collect_clonepack_artifacts(&full.clonepack, reachable);
         for artifact in &full.packs {
             collect_pack_artifact(artifact, reachable);
         }
         collect_history_levels(&full.history_levels, reachable);
     }
-    if let Some(files) = &info.files {
+    if crate::exact_output_ready(info, crate::ExactResultKind::Files, &info.commit)
+        && let Some(files) = &info.files
+    {
         collect_clonepack_artifacts(&files.clonepack, reachable);
         for chunk in &files.archive_chunks {
             add_hash(reachable, chunk);
@@ -1176,11 +1177,32 @@ mod tests {
         let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
 
         let pack = dummy_sized_pack(b"history-pack", &cas);
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let metadata_hash = cas.put(b"history metadata").unwrap();
+        let manifest = ClonepackManifest {
+            commit: commit.to_string(),
+            metadata_chunk: Some(crate::clonepack::ChunkRef {
+                hash: hash_from_hex(&metadata_hash).unwrap(),
+                len: 16,
+            }),
+            ..Default::default()
+        };
+        let manifest_hash = cas.put(&manifest.encode_to_vec()).unwrap();
         let info = RefInfo {
-            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            commit: commit.to_string(),
             full: Some(crate::FullResult {
+                clonepack: ClonepackArtifacts {
+                    manifest: manifest_hash,
+                    metadata_chunk: metadata_hash,
+                    skeleton_pack: pack.pack.clone(),
+                    skeleton_idx: pack.idx.clone(),
+                    prebuilt_index: pack.pack.clone(),
+                    idx_bundle: pack.idx.clone(),
+                    commit: commit.to_string(),
+                    ..Default::default()
+                },
                 history_levels: vec![HistoryLevel {
-                    tip_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    tip_commit: commit.to_string(),
                     packs: vec![pack],
                 }],
                 ..Default::default()
@@ -1212,8 +1234,8 @@ mod tests {
         );
         let report = gc.run().await.unwrap();
 
-        assert_eq!(report.objects_scanned, 3); // pack, idx, orphan
-        assert_eq!(report.objects_reachable, 2);
+        assert_eq!(report.objects_scanned, 5); // pack, idx, metadata, manifest, orphan
+        assert_eq!(report.objects_reachable, 4);
         assert_eq!(report.objects_deleted, 1);
         assert!(!orphan_path.exists());
         let full = info.full.as_ref().unwrap();

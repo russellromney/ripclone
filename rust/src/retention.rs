@@ -348,6 +348,7 @@ fn list_cas_entries(root: &Path) -> Result<Vec<CasEntry>> {
 mod tests {
     use super::*;
     use crate::metrics::Metrics;
+    use prost::Message;
 
     fn make_cas(root: &Path) -> Cas {
         Cas::new(root).unwrap()
@@ -389,9 +390,30 @@ mod tests {
                 .unwrap();
         let ref_store: Arc<dyn RefStore> =
             Arc::new(crate::meta::SqlRefStore::new(Box::new(meta)).await.unwrap());
+        let commit = "1111111111111111111111111111111111111111";
+        let metadata = cas.put(b"retention metadata").unwrap();
+        let manifest = crate::clonepack::ClonepackManifest {
+            commit: commit.to_string(),
+            metadata_chunk: Some(crate::clonepack::ChunkRef {
+                hash: crate::clonepack::hash_from_hex(&metadata).unwrap(),
+                len: 18,
+            }),
+            ..Default::default()
+        };
+        let manifest = cas.put(&manifest.encode_to_vec()).unwrap();
         let info = RefInfo {
-            commit: "1111111111111111111111111111111111111111".to_string(),
+            commit: commit.to_string(),
             head: Some(crate::HeadResult {
+                clonepack: crate::ClonepackArtifacts {
+                    manifest,
+                    metadata_chunk: metadata,
+                    skeleton_pack: h.clone(),
+                    skeleton_idx: h.clone(),
+                    prebuilt_index: h.clone(),
+                    idx_bundle: h.clone(),
+                    commit: commit.to_string(),
+                    ..Default::default()
+                },
                 packs: vec![crate::PackArtifact {
                     pack: h.clone(),
                     idx: String::new(),

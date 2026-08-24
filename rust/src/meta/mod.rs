@@ -2,7 +2,7 @@
 
 use crate::provider::{RepoId, parse_storage_key};
 use crate::ref_store::{AddedRepo, RefStore};
-use crate::{FilesResult, FullResult, HeadResult, RefInfo};
+use crate::{ExactResultKind, FilesResult, FullResult, HeadResult, RefInfo};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use std::time::SystemTime;
@@ -22,6 +22,13 @@ pub trait MetaDb: Send + Sync {
     async fn get_result(&self, repo_key: &str, commit: &str) -> Result<Option<ResultRow>>;
     async fn insert_result(&self, repo_key: &str, commit: &str, data: &str) -> Result<bool>;
     async fn compare_and_swap_result(
+        &self,
+        repo_key: &str,
+        commit: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool>;
+    async fn compare_and_swap_result_if_job_inactive(
         &self,
         repo_key: &str,
         commit: &str,
@@ -83,6 +90,13 @@ impl SqlRefStore {
         }
         anyhow::bail!("exact result {repo_key}@{commit}: repeated write conflicts")
     }
+
+    fn publication_time() -> Option<u64> {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+    }
 }
 
 #[async_trait]
@@ -140,24 +154,32 @@ impl RefStore for SqlRefStore {
     }
 
     async fn publish_head(&self, repo_id: &RepoId, commit: &str, head: HeadResult) -> Result<bool> {
-        let synced_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|duration| duration.as_secs());
+        ensure!(
+            crate::exact_output_artifacts_ready(commit, ExactResultKind::Head, &head.clonepack),
+            "invalid Head result for {commit}"
+        );
+        let published_at = Self::publication_time();
         self.update_result(repo_id, commit, move |info| {
             info.head = Some(head.clone());
-            info.synced_at = synced_at;
+            info.synced_at = published_at;
+            info.last_accessed_at = published_at;
             true
         })
         .await
     }
 
     async fn publish_full(&self, repo_id: &RepoId, commit: &str, full: FullResult) -> Result<bool> {
+        ensure!(
+            crate::exact_output_artifacts_ready(commit, ExactResultKind::Full, &full.clonepack),
+            "invalid Full result for {commit}"
+        );
+        let published_at = Self::publication_time();
         self.update_result(repo_id, commit, move |info| {
-            if info.full.is_some() {
+            if crate::exact_output_ready(info, ExactResultKind::Full, commit) {
                 false
             } else {
                 info.full = Some(full.clone());
+                info.last_accessed_at = published_at;
                 true
             }
         })
@@ -170,11 +192,17 @@ impl RefStore for SqlRefStore {
         commit: &str,
         files: FilesResult,
     ) -> Result<bool> {
+        ensure!(
+            crate::exact_output_artifacts_ready(commit, ExactResultKind::Files, &files.clonepack),
+            "invalid Files result for {commit}"
+        );
+        let published_at = Self::publication_time();
         self.update_result(repo_id, commit, move |info| {
-            if info.files.is_some() {
+            if crate::exact_output_ready(info, ExactResultKind::Files, commit) {
                 false
             } else {
                 info.files = Some(files.clone());
+                info.last_accessed_at = published_at;
                 true
             }
         })
@@ -193,9 +221,14 @@ impl RefStore for SqlRefStore {
             serde_json::to_string(expected).context("serialize expected exact result")?;
         let evicted_data = serde_json::to_string(&evicted).context("serialize evicted result")?;
         self.db
-            .compare_and_swap_result(&repo_key, &expected.commit, &expected_data, &evicted_data)
+            .compare_and_swap_result_if_job_inactive(
+                &repo_key,
+                &expected.commit,
+                &expected_data,
+                &evicted_data,
+            )
             .await
-            .context("conditionally evict exact result")
+            .context("conditionally evict inactive exact result")
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
@@ -264,9 +297,15 @@ mod tests {
     use super::*;
 
     fn artifacts(commit: &str, manifest: &str) -> crate::ClonepackArtifacts {
+        let hash = |suffix: &str| crate::cas::hash(format!("{manifest}-{suffix}").as_bytes());
         crate::ClonepackArtifacts {
             commit: commit.to_string(),
-            manifest: manifest.to_string(),
+            manifest: hash("manifest"),
+            metadata_chunk: hash("metadata"),
+            skeleton_pack: hash("skeleton-pack"),
+            skeleton_idx: hash("skeleton-idx"),
+            prebuilt_index: hash("index"),
+            idx_bundle: hash("idx-bundle"),
             ..Default::default()
         }
     }
@@ -307,8 +346,14 @@ mod tests {
             .await
             .unwrap();
         let result = store.load_result(&repo, &commit).await.unwrap().unwrap();
-        assert_eq!(result.head.unwrap().clonepack.manifest, "head");
-        assert_eq!(result.full.unwrap().clonepack.manifest, "full");
+        assert_eq!(
+            result.head.unwrap().clonepack.manifest,
+            crate::cas::hash(b"head-manifest")
+        );
+        assert_eq!(
+            result.full.unwrap().clonepack.manifest,
+            crate::cas::hash(b"full-manifest")
+        );
         assert!(result.files.is_none());
     }
 
@@ -406,7 +451,13 @@ mod tests {
         assert!(!store.evict_if_unchanged(&repo, &selected).await.unwrap());
 
         let result = store.load_result(&repo, &commit).await.unwrap().unwrap();
-        assert_eq!(result.head.unwrap().clonepack.manifest, "old-head");
-        assert_eq!(result.full.unwrap().clonepack.manifest, "new-full");
+        assert_eq!(
+            result.head.unwrap().clonepack.manifest,
+            crate::cas::hash(b"old-head-manifest")
+        );
+        assert_eq!(
+            result.full.unwrap().clonepack.manifest,
+            crate::cas::hash(b"new-full-manifest")
+        );
     }
 }

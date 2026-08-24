@@ -3,7 +3,9 @@
 use crate::common::*;
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
+use ripclone::remote_gc::{GcConfig, RemoteGc};
 use ripclone::server::{AdmissionTestBarrier, AdmissionTestProbe};
+use ripclone::storage::StorageRef;
 use ripclone::{ExactResultKind, RefInfo};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -59,6 +61,45 @@ async fn exact_result(server: &Server, repo: &str, commit: &str) -> RefInfo {
         .await
         .expect("load exact result")
         .expect("exact result exists")
+}
+
+async fn age_exact_result(server: &Server, repo: &str, commit: &str) {
+    let repo_id = RepoId::github(repo);
+    let store = server_ref_store(server).await;
+    let mut result = store
+        .load_result(&repo_id, commit)
+        .await
+        .expect("load exact result before aging")
+        .expect("exact result exists before aging");
+    result.last_accessed_at = Some(1);
+    store
+        .delete_result(&repo_id, commit)
+        .await
+        .expect("remove exact result before deterministic aging");
+    store
+        .save_result(&repo_id, &result)
+        .await
+        .expect("restore deterministically aged exact result");
+}
+
+async fn run_warm_eviction(server: &Server) {
+    let storage: StorageRef = Arc::new(RemoteLocalStorage::new(
+        ripclone::storage::local(&server.storage_dir).expect("open test artifact storage"),
+    ));
+    let result = RemoteGc::new(
+        storage,
+        server_ref_store(server).await,
+        GcConfig {
+            grace_period: Duration::ZERO,
+            warm_ttl: Duration::from_secs(1),
+            dry_run: false,
+        },
+    )
+    .run()
+    .await;
+    if let Err(error) = result {
+        panic!("run real warm eviction: {error:#}");
+    }
 }
 
 async fn admit(server: &Server, repo: &str) -> String {
@@ -239,6 +280,156 @@ async fn full_can_publish_while_files_is_running() {
     );
     probe.before_files_publish.release();
     wait_count(&probe.files_publishes, 1).await;
+}
+
+async fn active_job_survives_warm_eviction(first: ExactResultKind, repo: &str) {
+    let _lock = env_lock().lock().await;
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    setup(false);
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.after_head_entry.arm();
+    probe.before_full_publish.arm();
+    probe.before_files_publish.arm();
+    let _probe = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", repo.strip_prefix("acme/").unwrap());
+    let commit = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, repo)
+        .await
+        .expect("register GC fixture");
+
+    admit(&server, repo).await;
+    wait_barrier(&probe.after_head_entry, 1).await;
+    let head_only = exact_result(&server, repo, &commit).await;
+    assert!(head_only.head.is_some());
+    assert!(
+        head_only
+            .last_accessed_at
+            .is_some_and(|timestamp| timestamp > 1)
+    );
+    let head_manifest = &head_only.head.as_ref().unwrap().clonepack.manifest;
+    assert!(
+        server.storage_path(head_manifest).exists(),
+        "published Head manifest must exist in durable storage"
+    );
+    age_exact_result(&server, repo, &commit).await;
+    assert!(
+        server.storage_path(head_manifest).exists(),
+        "aging metadata must not remove Head artifacts"
+    );
+    run_warm_eviction(&server).await;
+    let retained_head = exact_result(&server, repo, &commit)
+        .await
+        .head
+        .expect("GC must not erase Head while Full and Files are running");
+    for hash in [
+        &retained_head.clonepack.manifest,
+        &retained_head.clonepack.metadata_chunk,
+        &retained_head.clonepack.skeleton_pack,
+        &retained_head.clonepack.skeleton_idx,
+        &retained_head.clonepack.prebuilt_index,
+        &retained_head.clonepack.idx_bundle,
+    ] {
+        assert!(
+            server.storage_path(hash).exists(),
+            "GC must retain published Head artifact {hash}"
+        );
+    }
+    probe.after_head_entry.release();
+    probe.after_head_entry.disarm();
+    wait_count(&probe.full_builds, 1).await;
+    wait_count(&probe.files_builds, 1).await;
+    let ((), ()) = tokio::join!(
+        wait_barrier(&probe.before_full_publish, 1),
+        wait_barrier(&probe.before_files_publish, 1),
+    );
+
+    match first {
+        ExactResultKind::Full => probe.before_full_publish.release(),
+        ExactResultKind::Files => probe.before_files_publish.release(),
+        ExactResultKind::Head => unreachable!("Head is already published"),
+    }
+    match first {
+        ExactResultKind::Full => wait_count(&probe.full_publishes, 1).await,
+        ExactResultKind::Files => wait_count(&probe.files_publishes, 1).await,
+        ExactResultKind::Head => unreachable!("Head is already published"),
+    }
+    let first_ready = exact_result(&server, repo, &commit).await;
+    assert!(first_ready.head.is_some());
+    assert!(
+        first_ready
+            .last_accessed_at
+            .is_some_and(|timestamp| timestamp > 1)
+    );
+    match first {
+        ExactResultKind::Full => assert!(first_ready.full.is_some()),
+        ExactResultKind::Files => assert!(first_ready.files.is_some()),
+        ExactResultKind::Head => unreachable!("Head is already published"),
+    }
+    age_exact_result(&server, repo, &commit).await;
+    run_warm_eviction(&server).await;
+    let retained = exact_result(&server, repo, &commit).await;
+    assert!(retained.head.is_some());
+    match first {
+        ExactResultKind::Full => {
+            assert!(retained.full.is_some());
+            probe.before_files_publish.release();
+            wait_count(&probe.files_publishes, 1).await;
+        }
+        ExactResultKind::Files => {
+            assert!(retained.files.is_some());
+            probe.before_full_publish.release();
+            wait_count(&probe.full_publishes, 1).await;
+        }
+        ExactResultKind::Head => unreachable!("Head is already published"),
+    }
+    let complete = exact_result(&server, repo, &commit).await;
+    assert!(complete.head.is_some() && complete.full.is_some() && complete.files.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_eviction_preserves_head_and_full_while_files_is_running() {
+    active_job_survives_warm_eviction(ExactResultKind::Full, "acme/gc-full-first").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_eviction_preserves_head_and_files_while_full_is_running() {
+    active_job_survives_warm_eviction(ExactResultKind::Files, "acme/gc-files-first").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_result_read_failure_starts_no_full_or_files_work() {
+    let _lock = env_lock().lock().await;
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    setup(false);
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.builder_entry.arm();
+    let _probe = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let fail_next_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server =
+        start_server_split_storage_failing_next_ref_read(Arc::clone(&fail_next_read)).await;
+    let origin = make_origin("acme", "current-read-failure");
+    let commit = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    register_added_without_build(&server, "acme/current-read-failure")
+        .await
+        .expect("register read-failure fixture");
+
+    admit(&server, "acme/current-read-failure").await;
+    wait_barrier(&probe.builder_entry, 1).await;
+    fail_next_read.store(true, Ordering::SeqCst);
+    probe.builder_entry.release();
+    probe.builder_entry.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_failure(1))
+        .await
+        .expect("current-result read failure settles");
+
+    assert_eq!(probe.full_builds.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.files_builds.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.artifact_uploads.load(Ordering::SeqCst), 0);
+    let result = exact_result(&server, "acme/current-read-failure", &commit).await;
+    assert!(result.head.is_none() && result.full.is_none() && result.files.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

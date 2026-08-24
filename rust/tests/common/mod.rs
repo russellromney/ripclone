@@ -591,13 +591,13 @@ pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
 }
 
 pub async fn start_server_split_storage() -> Server {
-    start_server_split_storage_inner(None, None, None, None, None).await
+    start_server_split_storage_inner(None, None, None, None, None, None).await
 }
 
 /// Start a split-storage server with a deterministic artifact download barrier.
 /// See [`ripclone::server::ArtifactBarrier`].
 pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
-    start_server_split_storage_inner(Some(barrier), None, None, None, None).await
+    start_server_split_storage_inner(Some(barrier), None, None, None, None, None).await
 }
 
 pub async fn start_server_split_storage_head_publish_barrier() -> (
@@ -616,7 +616,8 @@ pub async fn start_server_split_storage_head_publish_barrier() -> (
         proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
     });
     let server =
-        start_server_split_storage_inner(None, None, None, Some(Arc::clone(&barrier)), None).await;
+        start_server_split_storage_inner(None, None, None, None, Some(Arc::clone(&barrier)), None)
+            .await;
     (server, barrier, entered_rx, proceed_tx)
 }
 
@@ -641,6 +642,7 @@ pub async fn start_server_split_storage_head_publish_barrier_with_registry(
         None,
         None,
         None,
+        None,
         Some(Arc::clone(&barrier)),
         Some(provider_registry),
     )
@@ -662,6 +664,7 @@ pub async fn start_server_split_storage_failing_put(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -680,14 +683,25 @@ pub async fn start_server_split_storage_failing_ref_save(
         Some((fail_after_successes, failures)),
         None,
         None,
+        None,
     )
     .await
+}
+
+/// Start a split-storage server with a one-shot exact-result read failure.
+/// Tests arm the signal only after the builder barrier has been entered, so the
+/// failure targets the current commit's readiness read rather than admission.
+pub async fn start_server_split_storage_failing_next_ref_read(
+    fail_next_read: Arc<std::sync::atomic::AtomicBool>,
+) -> Server {
+    start_server_split_storage_inner(None, None, None, Some(fail_next_read), None, None).await
 }
 
 async fn start_server_split_storage_inner(
     barrier: Option<ArtifactBarrier>,
     fail_put: Option<(usize, usize)>,
     fail_ref: Option<(usize, usize)>,
+    fail_next_ref_read: Option<Arc<std::sync::atomic::AtomicBool>>,
     head_publish_barrier: Option<Arc<HeadPublishBarrier>>,
     provider_registry: Option<ripclone::provider::ProviderRegistry>,
 ) -> Server {
@@ -723,11 +737,13 @@ async fn start_server_split_storage_inner(
     };
     let base_ref_store: Arc<dyn ripclone::ref_store::RefStore> = control_db.ref_store();
     let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
-        if let Some((fail_after_successes, failures)) = fail_ref {
-            Arc::new(FailingRefStore::new(
+        if fail_ref.is_some() || fail_next_ref_read.is_some() {
+            let (fail_after_successes, failures) = fail_ref.unwrap_or((0, 0));
+            Arc::new(FailingRefStore::new_with_read_signal(
                 base_ref_store,
                 fail_after_successes,
                 failures,
+                fail_next_ref_read,
             ))
         } else {
             base_ref_store
@@ -962,6 +978,7 @@ pub struct FailingRefStore {
     inner: Arc<dyn ripclone::ref_store::RefStore>,
     fail_after_successes: Mutex<usize>,
     failures_remaining: Mutex<usize>,
+    fail_next_read: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl FailingRefStore {
@@ -970,10 +987,20 @@ impl FailingRefStore {
         fail_after_successes: usize,
         failures: usize,
     ) -> Self {
+        Self::new_with_read_signal(inner, fail_after_successes, failures, None)
+    }
+
+    fn new_with_read_signal(
+        inner: Arc<dyn ripclone::ref_store::RefStore>,
+        fail_after_successes: usize,
+        failures: usize,
+        fail_next_read: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
         Self {
             inner,
             fail_after_successes: Mutex::new(fail_after_successes),
             failures_remaining: Mutex::new(failures),
+            fail_next_read,
         }
     }
 
@@ -1001,6 +1028,16 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
         repo_id: &ripclone::provider::RepoId,
         commit: &str,
     ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        if self
+            .fail_next_read
+            .as_ref()
+            .is_some_and(|signal| signal.swap(false, std::sync::atomic::Ordering::SeqCst))
+        {
+            anyhow::bail!(
+                "injected exact-result read failure for {}@{commit}",
+                repo_id.storage_key()
+            );
+        }
         self.inner.load_result(repo_id, commit).await
     }
 
