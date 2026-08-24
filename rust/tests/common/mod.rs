@@ -55,7 +55,7 @@ fn init_env(lsm: bool) {
             // single-tenant local e2e tests, so use the documented trust-mode
             // escape hatch (the shared token is the only auth here).
             std::env::set_var("RIPCLONE_TRUST_GATEWAY", "1");
-            // Two-phase publish and async builds are always on (no env toggle).
+            // Async exact-result builds are always on (no env toggle).
             std::env::set_var("RIPCLONE_LSM", if lsm { "1" } else { "0" });
         }
         lsm
@@ -199,21 +199,28 @@ pub struct PinnedPathProbe {
     builder_entries: std::sync::atomic::AtomicUsize,
 }
 
-pub struct PhaseOnePublishBarrier {
+pub struct HeadPublishBarrier {
     armed: std::sync::atomic::AtomicBool,
     consumed: std::sync::atomic::AtomicBool,
+    target: std::sync::Mutex<Option<String>>,
     entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     proceed: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
-impl PhaseOnePublishBarrier {
-    pub fn arm(&self) {
+impl HeadPublishBarrier {
+    pub fn arm_for(&self, commit: &str) {
+        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = Some(commit.to_string());
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn after_save(&self, info: &ripclone::RefInfo) {
+    async fn after_head(&self, commit: &str) {
         if !self.armed.load(std::sync::atomic::Ordering::SeqCst)
-            || info.build_status.as_deref() != Some("full history building")
+            || self
+                .target
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref()
+                .is_some_and(|target| target != commit)
             || self
                 .consumed
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -231,8 +238,8 @@ impl PhaseOnePublishBarrier {
         if let Some(proceed) = self.proceed.lock().await.take() {
             tokio::time::timeout(Duration::from_secs(20), proceed)
                 .await
-                .expect("phase-one publication barrier released within 20 seconds")
-                .expect("phase-one publication barrier sender remained alive");
+                .expect("Head publication barrier released within 20 seconds")
+                .expect("Head publication barrier sender remained alive");
         }
     }
 }
@@ -293,6 +300,10 @@ impl ripclone::queue::JobQueue for ProbedJobQueue {
         self.inner.job_status(job_id).await
     }
 
+    async fn job_state_for_key(&self, key: &str) -> anyhow::Result<ripclone::queue::JobState> {
+        self.inner.job_state_for_key(key).await
+    }
+
     async fn depth(&self) -> usize {
         self.inner.depth().await
     }
@@ -301,7 +312,7 @@ impl ripclone::queue::JobQueue for ProbedJobQueue {
 struct ProbedRefStore {
     inner: Arc<dyn ripclone::ref_store::RefStore>,
     probe: Arc<PinnedPathProbe>,
-    phase_one_barrier: Option<Arc<PhaseOnePublishBarrier>>,
+    head_publish_barrier: Option<Arc<HeadPublishBarrier>>,
 }
 
 #[async_trait::async_trait]
@@ -325,10 +336,38 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         info: &ripclone::RefInfo,
     ) -> anyhow::Result<()> {
         self.inner.save_result(repo_id, info).await?;
-        if let Some(barrier) = &self.phase_one_barrier {
-            barrier.after_save(info).await;
-        }
         Ok(())
+    }
+
+    async fn publish_head(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+        head: ripclone::HeadResult,
+    ) -> anyhow::Result<bool> {
+        let published = self.inner.publish_head(repo_id, commit, head).await?;
+        if published && let Some(barrier) = &self.head_publish_barrier {
+            barrier.after_head(commit).await;
+        }
+        Ok(published)
+    }
+
+    async fn publish_full(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+        full: ripclone::FullResult,
+    ) -> anyhow::Result<bool> {
+        self.inner.publish_full(repo_id, commit, full).await
+    }
+
+    async fn publish_files(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+        files: ripclone::FilesResult,
+    ) -> anyhow::Result<bool> {
+        self.inner.publish_files(repo_id, commit, files).await
     }
 
     async fn before_claimed_result_write(
@@ -345,8 +384,12 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         info: &ripclone::RefInfo,
     ) -> anyhow::Result<()> {
         self.inner.after_claimed_result_write(repo_id, info).await?;
-        if let Some(barrier) = &self.phase_one_barrier {
-            barrier.after_save(info).await;
+        if info.head.is_some()
+            && info.full.is_none()
+            && info.files.is_none()
+            && let Some(barrier) = &self.head_publish_barrier
+        {
+            barrier.after_head(&info.commit).await;
         }
         Ok(())
     }
@@ -356,17 +399,6 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
             panic!("pinned metadata lookup must not scan repositories");
         }
         self.inner.list().await
-    }
-
-    async fn update_build_status(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-        status: &str,
-    ) -> anyhow::Result<bool> {
-        self.inner
-            .update_build_status(repo_id, commit, status)
-            .await
     }
 
     async fn touch_last_accessed_at(
@@ -463,7 +495,7 @@ pub async fn replace_full_manifest_commit(
         if let Ok(commits) = store.list_commits(&repo_id).await {
             for commit in commits {
                 if let Ok(Some(info)) = store.load_result(&repo_id, &commit).await
-                    && !info.full_clonepack.manifest.is_empty()
+                    && info.full.is_some()
                 {
                     published = Some(info);
                     break;
@@ -478,8 +510,9 @@ pub async fn replace_full_manifest_commit(
     let mut info = published.expect("full manifest publication settled");
     let pinned = info.commit.clone();
     let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
+    let full = info.full.as_mut().expect("Full result published");
     let bytes = storage
-        .get(&info.full_clonepack.manifest)
+        .get(&full.clonepack.manifest)
         .expect("read published full manifest");
     let mut manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice())
         .expect("decode published full manifest");
@@ -489,7 +522,7 @@ pub async fn replace_full_manifest_commit(
     storage
         .put(&hash, &bytes)
         .expect("publish mismatched manifest fixture");
-    info.full_clonepack.manifest = hash.clone();
+    full.clonepack.manifest = hash.clone();
     store
         .delete_result(&repo_id, &pinned)
         .await
@@ -502,7 +535,7 @@ pub async fn replace_full_manifest_commit(
 }
 
 /// Initialize a tracing subscriber once so server-side `info!`/`warn!`/`error!`
-/// (e.g. background phase-2 failures) surface under `RUST_LOG` during tests.
+/// (e.g. background Full or Files failures) surface under `RUST_LOG` during tests.
 fn init_tracing() {
     static T: Once = Once::new();
     T.call_once(|| {
@@ -559,17 +592,18 @@ pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Ser
     start_server_split_storage_inner(Some(barrier), None, None, None, None).await
 }
 
-pub async fn start_server_split_storage_phase_one_barrier() -> (
+pub async fn start_server_split_storage_head_publish_barrier() -> (
     Server,
-    Arc<PhaseOnePublishBarrier>,
+    Arc<HeadPublishBarrier>,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
-    let barrier = Arc::new(PhaseOnePublishBarrier {
+    let barrier = Arc::new(HeadPublishBarrier {
         armed: std::sync::atomic::AtomicBool::new(false),
         consumed: std::sync::atomic::AtomicBool::new(false),
+        target: std::sync::Mutex::new(None),
         entered: std::sync::Mutex::new(Some(entered_tx)),
         proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
     });
@@ -578,19 +612,20 @@ pub async fn start_server_split_storage_phase_one_barrier() -> (
     (server, barrier, entered_rx, proceed_tx)
 }
 
-pub async fn start_server_split_storage_phase_one_barrier_with_registry(
+pub async fn start_server_split_storage_head_publish_barrier_with_registry(
     provider_registry: ripclone::provider::ProviderRegistry,
 ) -> (
     Server,
-    Arc<PhaseOnePublishBarrier>,
+    Arc<HeadPublishBarrier>,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
-    let barrier = Arc::new(PhaseOnePublishBarrier {
+    let barrier = Arc::new(HeadPublishBarrier {
         armed: std::sync::atomic::AtomicBool::new(false),
         consumed: std::sync::atomic::AtomicBool::new(false),
+        target: std::sync::Mutex::new(None),
         entered: std::sync::Mutex::new(Some(entered_tx)),
         proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
     });
@@ -645,7 +680,7 @@ async fn start_server_split_storage_inner(
     barrier: Option<ArtifactBarrier>,
     fail_put: Option<(usize, usize)>,
     fail_ref: Option<(usize, usize)>,
-    phase_one_barrier: Option<Arc<PhaseOnePublishBarrier>>,
+    head_publish_barrier: Option<Arc<HeadPublishBarrier>>,
     provider_registry: Option<ripclone::provider::ProviderRegistry>,
 ) -> Server {
     init_tracing();
@@ -690,11 +725,11 @@ async fn start_server_split_storage_inner(
             base_ref_store
         };
     let pinned_path_probe = Arc::new(PinnedPathProbe::default());
-    let worker_count = if phase_one_barrier.is_some() { 2 } else { 1 };
+    let worker_count = if head_publish_barrier.is_some() { 2 } else { 1 };
     let ref_store: Arc<dyn ripclone::ref_store::RefStore> = Arc::new(ProbedRefStore {
         inner: ref_store,
         probe: Arc::clone(&pinned_path_probe),
-        phase_one_barrier,
+        head_publish_barrier,
     });
     let metrics = ripclone::metrics::Metrics::new();
     let retention = Arc::new(
@@ -975,6 +1010,51 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
         self.inner.save_result(repo_id, info).await
     }
 
+    async fn publish_head(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+        head: ripclone::HeadResult,
+    ) -> anyhow::Result<bool> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected Head publication failure for {}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.publish_head(repo_id, commit, head).await
+    }
+
+    async fn publish_full(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+        full: ripclone::FullResult,
+    ) -> anyhow::Result<bool> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected Full publication failure for {}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.publish_full(repo_id, commit, full).await
+    }
+
+    async fn publish_files(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+        files: ripclone::FilesResult,
+    ) -> anyhow::Result<bool> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected Files publication failure for {}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.publish_files(repo_id, commit, files).await
+    }
+
     async fn before_claimed_result_write(
         &self,
         repo_id: &ripclone::provider::RepoId,
@@ -1014,17 +1094,6 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
 
     async fn list_added_repos(&self) -> anyhow::Result<Vec<ripclone::ref_store::AddedRepo>> {
         self.inner.list_added_repos().await
-    }
-
-    async fn update_build_status(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-        status: &str,
-    ) -> anyhow::Result<bool> {
-        self.inner
-            .update_build_status(repo_id, commit, status)
-            .await
     }
 
     async fn touch_last_accessed_at(
@@ -1667,7 +1736,7 @@ with ReusableTCPServer(('', PORT), AuthHandler) as httpd:
 }
 
 /// Install (clone) without syncing first — returns Result so callers can retry
-/// (e.g. waiting for two-phase phase 2 to publish the full clonepack).
+/// while the requested exact result is still pending.
 pub async fn clone_only(
     server: &Server,
     owner: &str,
@@ -1770,8 +1839,8 @@ pub fn read(dir: &Path, name: &str) -> String {
         .unwrap_or_else(|e| panic!("read {} in {}: {e}", name, dir.display()))
 }
 
-/// Unified per-binary configuration: base env plus the LSM build flag. Two-phase
-/// publish and async builds are always on. Because the flags are read from
+/// Unified per-binary configuration: base env plus the LSM build flag. Async
+/// exact-result builds are always on. Because the flags are read from
 /// process env, each test binary pins exactly one config; call this at the top of
 /// every test in the binary. The LSM build seals every advancing tail and
 /// compacts at `max_levels` (16).
@@ -1779,9 +1848,7 @@ pub fn setup(lsm: bool) {
     init_env(lsm);
 }
 
-/// Clone the full (depth=0) editable variant, waiting for it to reach
-/// `want_count` commits. The full variant is built in the background (phase 2),
-/// so poll until it lands.
+/// Clone the Full editable result, waiting for it to reach `want_count` commits.
 pub async fn clone_full_at(
     server: &Server,
     owner: &str,
@@ -1806,8 +1873,7 @@ pub async fn clone_full_at(
     panic!("depth=0 never reached {want_count} for {owner}/{repo} (last: {last})");
 }
 
-/// Clone files mode, waiting until `probe` exists with `want` contents (the
-/// full archive is built in phase 2).
+/// Clone Files mode, waiting until `probe` exists with `want` contents.
 pub async fn clone_files_when(
     server: &Server,
     owner: &str,
@@ -1897,8 +1963,8 @@ pub fn assert_repo_usable(dir: &Path, want_count: &str) {
 
 /// The full correctness lifecycle for one server config: first sync, re-sync on
 /// a new commit, and multi-commit growth — each verified across depth=1,
-/// depth=0 (real usable repo), and files mode. The full/files variants build in
-/// the background (phase 2), so they are polled for.
+/// depth=0 (real usable repo), and Files mode. Full and Files build concurrently,
+/// so they are polled independently.
 pub async fn lifecycle_battery(server: &Server, origin: &Origin) {
     let client = server.client();
     let (o, r) = (origin.owner.clone(), origin.repo.clone());
@@ -1959,8 +2025,8 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin) {
             .sync_repo(&format!("{o}/{r}"), None)
             .await
             .expect("resync loop");
-        // The full variant builds in the background; wait for each step to land
-        // before advancing so successive phase-2 builds don't run concurrently on
+        // Full builds in the background; wait for each step to land before
+        // advancing so successive Full builds don't run concurrently on
         // the same mirror (the async queue serializes this in production). Also
         // verifies the full clone at every incremental step.
         let _ = clone_full_at(server, &o, &r, &i.to_string()).await;
@@ -1977,9 +2043,8 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin) {
 
 /// Clone helper: sync, then install with the given depth, returning the dir.
 ///
-/// Builds are two-phase: depth=1 is ready as soon as `sync` returns, but the
-/// full (depth=0) and files variants build in the background (phase 2) and, on a
-/// resync, serve the previous commit until phase 2 lands. So poll the install
+/// Head can be ready as soon as `sync` returns, while Full and Files build in
+/// the background and, on a resync, serve the previous commit until ready. Poll
 /// until the clone's HEAD matches the just-published origin HEAD.
 pub async fn sync_and_clone(
     server: &Server,
@@ -2038,11 +2103,9 @@ pub async fn sync_and_clone(
     );
 }
 
-/// Poll `/sync` until the clonepack manifest for the current commit is published,
-/// returning the ref response. Builds are two-phase: depth=1 publishes first and
-/// the full clonepack (with its manifest + archive) builds in the background, so
-/// the first sync's `clonepack_manifest` can be empty.
-pub async fn sync_until_manifest(
+/// Resolve the current commit once and poll that exact commit until its Full
+/// result is ready.
+pub async fn sync_until_full_ready(
     server: &Server,
     owner: &str,
     repo: &str,
@@ -2050,31 +2113,22 @@ pub async fn sync_until_manifest(
     let client = server.client();
     ensure_added(server, &format!("{owner}/{repo}"))
         .await
-        .expect("add before sync_until_manifest");
-    let mut last = String::from("<no successful sync>");
-    for _ in 0..160 {
-        match client.sync_repo(&format!("{owner}/{repo}"), None).await {
-            Ok(resp) if !resp.clonepack_manifest.is_empty() => return resp,
-            Ok(resp) => last = format!("manifest empty at commit {}", resp.commit),
-            Err(e) => last = format!("sync err: {e:#}"),
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    panic!("clonepack manifest never published for {owner}/{repo} (last: {last})");
+        .expect("add before sync_until_full_ready");
+    client
+        .resolve_exact_result(
+            &format!("{owner}/{repo}"),
+            "HEAD",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
+        .await
+        .expect("Full result became ready")
 }
 
-/// Poll `/sync` until the build has fully settled: the archive is published, so
-/// `clonepack_manifest` has reached its final, stable hash for this commit.
-///
-/// Phase 2 publishes the full clonepack manifest *twice* — first an editable
-/// manifest (`build_status = "archive building"`), then, once the zstd archive
-/// finishes, a distinct files manifest with `archive_ready = true`. A test that
-/// captures the manifest hash before the archive lands would tamper with the
-/// transient editable hash while the clone goes on to fetch the final files
-/// hash. Waiting for `archive_ready` pins the returned `clonepack_manifest` to
-/// the exact artifact the subsequent clone resolves, so negative tests that
-/// corrupt/remove that hash are deterministic under parallel load.
-pub async fn sync_until_archive_ready(
+/// Poll `/sync` until the Files result for the current commit is published.
+/// Negative artifact tests use the returned Files manifest so their mutation
+/// remains deterministic under parallel load.
+pub async fn sync_until_files_ready(
     server: &Server,
     owner: &str,
     repo: &str,
@@ -2082,24 +2136,16 @@ pub async fn sync_until_archive_ready(
     let client = server.client();
     ensure_added(server, &format!("{owner}/{repo}"))
         .await
-        .expect("add before sync_until_archive_ready");
-    let mut last = String::from("<no successful sync>");
-    for _ in 0..160 {
-        match client.sync_repo(&format!("{owner}/{repo}"), None).await {
-            Ok(resp) if resp.archive_ready && !resp.clonepack_manifest.is_empty() => return resp,
-            Ok(resp) => {
-                last = format!(
-                    "archive_ready={} manifest_empty={} at commit {}",
-                    resp.archive_ready,
-                    resp.clonepack_manifest.is_empty(),
-                    resp.commit
-                )
-            }
-            Err(e) => last = format!("sync err: {e:#}"),
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    panic!("archive never became ready for {owner}/{repo} (last: {last})");
+        .expect("add before sync_until_files_ready");
+    client
+        .resolve_exact_result(
+            &format!("{owner}/{repo}"),
+            "HEAD",
+            ripclone::ExactResultKind::Files,
+            None,
+        )
+        .await
+        .expect("Files result became ready")
 }
 
 /// Shared B5 seam: make a repo warm enough that a subsequent clone can fetch
@@ -2111,7 +2157,7 @@ pub async fn warm_repo_until_cloneable(
     owner: &str,
     repo: &str,
 ) -> ripclone::client::RefResponse {
-    sync_until_manifest(server, owner, repo).await
+    sync_until_full_ready(server, owner, repo).await
 }
 
 /// Wait until an already-triggered build has published cloneable artifacts.

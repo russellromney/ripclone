@@ -1,4 +1,4 @@
-//! End-to-end tests for the HEAD delta-pack build (two-phase publish).
+//! End-to-end tests for the Head delta-pack build.
 //!
 //! A re-sync packs only the depth-1 objects new since the prior commit into a
 //! small delta pack, keeping the prior sync's HEAD packs as an immutable base.
@@ -7,15 +7,15 @@
 //! reachability-exclude, plus the background compaction that bounds the chain.
 //!
 //! Broad end-to-end coverage of the delta path (cold build, linear re-syncs,
-//! multi-commit growth, files mode) lives in the e2e_matrix_twophase_lsm /
-//! e2e_matrix_async_twophase_lsm batteries; this file adds the adversarial cases.
+//! multi-commit growth, Files mode) lives in the exact-results matrix; this file
+//! adds the adversarial cases.
 
 use crate::common::*;
 use ripclone::mode::CloneMode;
 use std::sync::Once;
 use std::time::Duration;
 
-/// Two-phase + LSM, with a 1-byte HEAD rebase threshold so the background
+/// LSM with a 1-byte Head rebase threshold so the background
 /// base-rebuild path runs on every non-empty delta — exercising rebase
 /// continuously rather than only after a large cumulative delta.
 fn setup() {
@@ -26,8 +26,8 @@ fn setup() {
     init(true);
 }
 
-/// Sync, then wait until depth=0 reaches `want_count` so phase 2 (full history,
-/// archive, and any HEAD compaction) has fully landed before the next sync.
+/// Sync, then wait until Full reaches `want_count` and any Head compaction has
+/// landed before the next sync.
 async fn sync_and_settle(server: &Server, origin: &Origin, want_count: &str) {
     register_added_without_build(server, &format!("{}/{}", origin.owner, origin.repo))
         .await
@@ -83,7 +83,7 @@ async fn re_add_identical_blob_survives_in_depth1() {
     );
     assert_eq!(git(&d, &["status", "--porcelain"]), "", "status clean");
 
-    // Full clone after phase 2 is complete + fsck-clean.
+    // Full clone is complete and fsck-clean.
     let (_g0, d0) = clone_full_at(&server, "acme", "readd", "3").await;
     assert_eq!(read(&d0, "secret.txt"), "TOPSECRET\n");
     assert_repo_usable(&d0, "3");
@@ -214,7 +214,7 @@ async fn head_compaction_keeps_clones_complete() {
             "status clean at c{i}"
         );
 
-        // Wait for phase 2 (incl. any compaction) to land before the next sync.
+        // Wait for Full and any compaction to land before the next sync.
         let (_g0, d0) = clone_full_at(&server, "acme", "compact", &i.to_string()).await;
         for j in 2..=i {
             assert!(

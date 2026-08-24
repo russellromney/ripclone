@@ -124,8 +124,7 @@ fn ready(commit: &str) -> (StatusCode, serde_json::Value) {
             "parent_commit": null,
             "clonepack_manifest": "manifest",
             "metadata_chunk": "metadata",
-            "shallow": false,
-            "archive_ready": true
+            "result": "full"
         }),
     )
 }
@@ -166,8 +165,6 @@ struct RefBarrierState {
     upstream: String,
     held: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<String>>>,
-    force_first_archive_pending: bool,
-    force_first_pending: bool,
     entered: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     proceed: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
@@ -195,10 +192,9 @@ async fn ref_barrier_proxy(
         }
     }
     let response = request.send().await.expect("forward proxy request");
-    let mut status = response.status();
+    let status = response.status();
     let response_headers = response.headers().clone();
-    let mut bytes = response.bytes().await.expect("forward proxy body");
-    let mut pending_content_location = None;
+    let bytes = response.bytes().await.expect("forward proxy body");
 
     let first_ref = is_ref && !state.held.swap(true, Ordering::SeqCst);
     if first_ref {
@@ -216,37 +212,6 @@ async fn ref_barrier_proxy(
                 .expect("ref barrier released within 20 seconds")
                 .expect("ref barrier sender remained alive");
         }
-        if state.force_first_archive_pending {
-            let mut body: serde_json::Value =
-                serde_json::from_slice(&bytes).expect("ready ref JSON");
-            body["archive_ready"] = serde_json::Value::Bool(false);
-            bytes = Bytes::from(serde_json::to_vec(&body).expect("encode pending archive ref"));
-        }
-        if state.force_first_pending {
-            let body: serde_json::Value =
-                serde_json::from_slice(&bytes).expect("ready ref JSON for pending response");
-            let commit = body["commit"]
-                .as_str()
-                .expect("ready response commit")
-                .to_string();
-            pending_content_location = Some(
-                body["branch"]
-                    .as_str()
-                    .expect("ready response concrete branch")
-                    .to_string(),
-            );
-            status = StatusCode::ACCEPTED;
-            bytes = Bytes::from(
-                serde_json::to_vec(&json!({
-                    "code": "artifact_pending",
-                    "commit": commit,
-                    "branch": pending_content_location.as_deref(),
-                    "status": "building",
-                    "queue_depth": 1
-                }))
-                .expect("encode pending ref"),
-            );
-        }
     }
 
     let mut output = axum::http::Response::builder().status(status);
@@ -259,19 +224,11 @@ async fn ref_barrier_proxy(
             output = output.header(name, value);
         }
     }
-    if let Some(branch) = pending_content_location {
-        output = output.header(
-            axum::http::header::CONTENT_LOCATION,
-            urlencoding::encode(&branch).as_ref(),
-        );
-    }
     output.body(Body::from(bytes)).expect("proxy response")
 }
 
 async fn start_ref_barrier_proxy(
     upstream: &str,
-    force_first_archive_pending: bool,
-    force_first_pending: bool,
 ) -> (
     String,
     tokio::sync::oneshot::Receiver<()>,
@@ -286,8 +243,6 @@ async fn start_ref_barrier_proxy(
         upstream: upstream.to_string(),
         held: Arc::new(AtomicBool::new(false)),
         requests: Arc::clone(&requests),
-        force_first_archive_pending,
-        force_first_pending,
         entered: Arc::new(Mutex::new(Some(entered_tx))),
         proceed: Arc::new(tokio::sync::Mutex::new(Some(proceed_rx))),
     };
@@ -339,7 +294,7 @@ async fn changing_pending_commit_is_an_integrity_error() {
     }
     let (url, requests, task) = scripted_server(vec![pending(A), pending(B)]).await;
     let error = Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect_err("changing pending commit must fail");
     abort_server_task(task).await;
@@ -358,7 +313,7 @@ async fn malformed_pending_commit_is_a_protocol_error() {
     let _guard = env_lock().lock().await;
     let (url, requests, task) = scripted_server(vec![pending("not-an-object-id")]).await;
     let error = Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect_err("malformed pending commit must fail");
     abort_server_task(task).await;
@@ -427,7 +382,7 @@ async fn exact_service_unavailable_establishes_and_preserves_the_pin() {
     let (url, pre_pin_requests, pre_pin_task) =
         scripted_server(vec![exact_unavailable(), ready(A)]).await;
     Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect("the first exact 503 pins subsequent polling");
     abort_server_task(pre_pin_task).await;
@@ -441,7 +396,7 @@ async fn exact_service_unavailable_establishes_and_preserves_the_pin() {
     let (url, post_pin_requests, post_pin_task) =
         scripted_server(vec![pending(A), exact_unavailable(), ready(A)]).await;
     Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect("post-pin 503 retries exact selector");
     abort_server_task(post_pin_task).await;
@@ -480,7 +435,7 @@ async fn unidentified_503_fails_instead_of_repinning_after_branch_moves() {
     ])
     .await;
     let error = Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect_err("unidentified 503 cannot establish an operation pin");
     abort_server_task(task).await;
@@ -560,7 +515,7 @@ async fn ready_response_cannot_change_an_established_pin() {
     let _guard = env_lock().lock().await;
     let (url, requests, task) = scripted_server(vec![pending(A), ready(B)]).await;
     let error = Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect_err("ready response cannot change pin");
     abort_server_task(task).await;
@@ -587,7 +542,12 @@ async fn pending_historical_head_keeps_rev_on_concrete_pinned_polls() {
         let (url, requests, task) =
             scripted_server(vec![pending_on(A, concrete), ready_on(A, concrete)]).await;
         Client::new(url)
-            .resolve_ref_with_clonepack("acme/demo", "HEAD", Some("full"), Some("HEAD~1"))
+            .resolve_exact_result(
+                "acme/demo",
+                "HEAD",
+                ripclone::ExactResultKind::Full,
+                Some("HEAD~1"),
+            )
             .await
             .expect("pending rev continues at its concrete branch");
         abort_server_task(task).await;
@@ -620,7 +580,7 @@ async fn ready_ref_requires_http_200() {
     let (_, ready_body) = ready(A);
     let (url, requests, task) = scripted_server(vec![(StatusCode::CREATED, ready_body)]).await;
     let error = Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect_err("201 with a ready-shaped body is not protocol success");
     abort_server_task(task).await;
@@ -643,7 +603,7 @@ async fn pinned_refresh_distinguishes_authorization_from_server_failure() {
     ])
     .await;
     let forbidden = Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect_err("403 pinned refresh must fail");
     abort_server_task(forbidden_task).await;
@@ -660,7 +620,7 @@ async fn pinned_refresh_distinguishes_authorization_from_server_failure() {
     ])
     .await;
     let server_failure = Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
         .expect_err("500 pinned refresh must fail");
     abort_server_task(server_task).await;
@@ -696,14 +656,19 @@ async fn pinned_input_is_validated_and_scoped_to_the_authorized_repository() {
         .expect("sync repo B");
     let b = server
         .client()
-        .resolve_ref_with_clonepack("acme/pin-scope-b", "HEAD", Some("full"), None)
+        .resolve_exact_result(
+            "acme/pin-scope-b",
+            "HEAD",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("repo B ready")
         .commit;
     let http = reqwest::Client::new();
     let request = |pin: &str| {
         http.get(format!(
-            "{}/v1/repos/github/acme/pin-scope-a/refs/HEAD?clonepack=full&pinned={pin}",
+            "{}/v1/repos/github/acme/pin-scope-a/refs/HEAD?result=full&pinned={pin}",
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -715,10 +680,14 @@ async fn pinned_input_is_validated_and_scoped_to_the_authorized_repository() {
         .expect("malformed request");
     assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     let cross_repo = request(&b).send().await.expect("cross-repo request");
-    assert_eq!(cross_repo.status(), StatusCode::ACCEPTED);
-    let body: serde_json::Value = cross_repo.json().await.expect("pending body");
+    assert_eq!(cross_repo.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = cross_repo.json().await.expect("conflict body");
     assert_eq!(body["commit"], b);
-    assert_eq!(body["code"], "artifact_pending");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("no job is active"))
+    );
 }
 
 #[tokio::test]
@@ -772,21 +741,23 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
         register_added_without_build(&server, &format!("acme/{repo}"))
             .await
             .expect("register release fixture");
-        let settled = sync_until_archive_ready(&server, "acme", &repo).await;
-        let variant = if mode == CloneMode::Files {
-            "full"
+        let settled = sync_until_files_ready(&server, "acme", &repo).await;
+        let result = if mode == CloneMode::Files {
+            ripclone::ExactResultKind::Files
+        } else if depth == 1 {
+            ripclone::ExactResultKind::Head
         } else {
-            ripclone::mode::clonepack_kind_for_depth(depth)
+            ripclone::ExactResultKind::Full
         };
         let pinned = server
             .client()
-            .resolve_ref_with_clonepack(&format!("acme/{repo}"), "HEAD", Some(variant), None)
+            .resolve_exact_result(&format!("acme/{repo}"), "HEAD", result, None)
             .await
             .expect("selected variant ready")
             .commit;
         assert_eq!(pinned, settled.commit);
         let (proxy, entered, proceed, requests, proxy_task) =
-            start_ref_barrier_proxy(&server.url, false, false).await;
+            start_ref_barrier_proxy(&server.url).await;
         let out = tempfile::tempdir().expect("release clone output");
         let target = out.path().join("clone");
         let mut command = std::process::Command::new(&binary);

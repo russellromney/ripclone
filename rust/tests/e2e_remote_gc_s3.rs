@@ -118,7 +118,13 @@ async fn remote_gc_uses_sqlite_refs_for_s3_reachability() {
         &RepoId::github("acme/gc"),
         &ripclone::RefInfo {
             commit: "1111111111111111111111111111111111111111".to_string(),
-            head_blobs_chunks: vec![live.clone()],
+            head: Some(ripclone::HeadResult {
+                packs: vec![ripclone::PackArtifact {
+                    pack: live.clone(),
+                    idx: String::new(),
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )

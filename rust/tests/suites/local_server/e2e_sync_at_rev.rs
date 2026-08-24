@@ -33,7 +33,7 @@ impl Drop for ScopedEnvVar {
     }
 }
 
-/// Clone the full (depth=0) artifacts built for `rev`, polling until phase 2
+/// Clone the Full result built for `rev`, polling until it
 /// publishes the full clonepack at the expected commit count.
 async fn clone_full_rev(
     server: &Server,
@@ -55,7 +55,7 @@ async fn clone_full_rev(
 
 #[tokio::test]
 async fn sync_at_rev_builds_and_clones_older_then_newer() {
-    setup(true); // two-phase + LSM + async (production defaults)
+    setup(true); // separate exact results + LSM + async (production defaults)
     let server = start_server().await;
     let origin = make_origin("acme", "atrev");
     origin.commit(&[("a.txt", "1\n")], "c1");
@@ -124,8 +124,8 @@ async fn sync_at_symbolic_revision_stays_pinned_while_branch_advances() {
     let controls = tempfile::tempdir().expect("historical pin controls");
     let barrier = controls.path().join("phase-two");
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
-    let _barrier = ScopedEnvVar::set("RIPCLONE_TEST_PHASE2_BARRIER_DIR", &barrier);
-    let _target = ScopedEnvVar::set("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT", &selected);
+    let _barrier = ScopedEnvVar::set("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR", &barrier);
+    let _target = ScopedEnvVar::set("RIPCLONE_TEST_AFTER_HEAD_BARRIER_COMMIT", &selected);
 
     let historical_client = server.client();
     let mut historical = tokio::spawn(async move {
@@ -272,10 +272,9 @@ async fn sync_at_rev_does_not_clobber_tip() {
 /// Regression: the documented pairing `ripclone sync <repo> --at REV` then
 /// `ripclone clone <repo> --at REV` must work on the FIRST try.
 ///
-/// A two-phase sync publishes the depth-1 clonepack immediately and the full
-/// history in the background. The ref endpoint used to answer `202 building`
-/// only for branch-tip requests, so a rev-targeted clone raced that background
-/// phase and failed outright with "ref is missing clonepack manifest; run sync
+/// A sync publishes Head before Full. The ref endpoint used to answer `202 building`
+/// only for branch-tip requests, so a rev-targeted clone raced Full and failed
+/// outright with "ref is missing clonepack manifest; run sync
 /// first" — right after the user had run sync. The clone must poll like the tip
 /// path does, so no retry loop here on purpose: a single call has to succeed.
 #[tokio::test]
@@ -401,7 +400,7 @@ async fn clone_at_rev_first_operation_uses_exact_only_layout() {
     .expect("hide symbolic default branch");
     let unresolved = reqwest::Client::new()
         .get(format!(
-            "{}/v1/repos/github/acme/at-exact-only/refs/HEAD?rev={pinned}",
+            "{}/v1/repos/github/acme/at-exact-only/refs/HEAD?result=full&rev={pinned}",
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -508,7 +507,12 @@ async fn public_cli_clones_at_a_full_sha() {
         .expect("sync at full SHA");
     server
         .client()
-        .resolve_ref_with_clonepack("acme/at-full-sha", "HEAD", Some("full"), Some(&pinned))
+        .resolve_exact_result(
+            "acme/at-full-sha",
+            "HEAD",
+            ripclone::ExactResultKind::Full,
+            Some(&pinned),
+        )
         .await
         .expect("full-SHA build ready");
     assert_eq!(

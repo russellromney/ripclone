@@ -20,9 +20,9 @@ for bin in "$SERVER_BIN" "$CLI_BIN"; do
 done
 
 export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-e2e-local-token}"
-# This script does `sync` then `clone`. Builds are always asynchronous and
-# two-phase: depth=1 is ready when `sync` returns, but the full/files variants
-# finish in the background, so the clone helpers below retry until ready.
+# This script does `sync` then `clone`. Builds are always asynchronous: Head
+# publishes first, while Full and Files finish concurrently in the background,
+# so the clone helpers below retry until their requested result is ready.
 # Per-repo access enforcement (AU1) probes the provider over HTTP and can't
 # reach this file:// origin. This is a single-tenant local e2e, so use the
 # documented trust-mode escape hatch (the shared token is the only auth here).
@@ -118,9 +118,8 @@ sync_repo() {
   add_repo "$1" "$2"
   "$CLI_BIN" --server "$SERVER_URL" sync "$1/$2" >/dev/null
 }
-# Builds are two-phase: depth=1 is ready as soon as `sync` returns, but the full
-# and files variants finish in the background, and on a re-sync the full variant
-# briefly serves the previous commit. So retry the clone until it succeeds.
+# Head can be ready as soon as `sync` returns, while Full and Files finish in
+# the background. Retry the clone until its requested result succeeds.
 clone_repo() { # owner repo dir [extra cli args...]
   local i
   for i in $(seq 1 80); do

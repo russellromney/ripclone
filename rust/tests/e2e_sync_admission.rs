@@ -123,29 +123,13 @@ async fn concurrent_b_and_c_admissions_create_independent_exact_work() {
     let exact_c = store.load_result(&repo_id, &c).await.unwrap().unwrap();
     assert_eq!(exact_c.commit, c);
 
-    let full_barrier = tempfile::tempdir().unwrap();
-    unsafe {
-        std::env::set_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR", full_barrier.path());
-        std::env::set_var("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT", &c);
-    }
     probe.inside_admission_tx.disarm();
     probe.before_admission_tx.disarm();
     probe.before_claim.release();
     probe.before_claim.disarm();
-    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))
-        .await
-        .expect("B completes before held C Full");
-    tokio::time::timeout(Duration::from_secs(60), async {
-        while !full_barrier.path().join("entered").exists() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("C reaches held Full");
-    std::fs::write(full_barrier.path().join("proceed"), b"proceed\n").unwrap();
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
         .await
-        .expect("C completes after B");
+        .expect("B and C both complete");
 
     assert_eq!(
         store
@@ -166,15 +150,13 @@ async fn concurrent_b_and_c_admissions_create_independent_exact_work() {
         c
     );
     unsafe {
-        std::env::remove_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR");
-        std::env::remove_var("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT");
         std::env::remove_var("RIPCLONE_BUILD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TESTING");
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admission_rechecks_ready_result_inside_immediate_transaction() {
+async fn ready_exact_result_admits_no_job_or_build_work() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe { std::env::set_var("RIPCLONE_TESTING", "1") };
@@ -196,33 +178,12 @@ async fn admission_rechecks_ready_result_inside_immediate_transaction() {
         .await
         .expect("initial B result completes");
 
-    let store = server_ref_store(&server).await;
-    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
-    store
-        .update_build_status(&repo_id, &b, "failed: injected retry fixture")
-        .await
-        .unwrap();
     let jobs_before = probe.queue_inserts.load(Ordering::SeqCst);
     let fetches_before = probe.exact_fetches.load(Ordering::SeqCst);
     let builders_before = probe.builder_entries.load(Ordering::SeqCst);
     let uploads_before = probe.artifact_uploads.load(Ordering::SeqCst);
-    probe.hold_admission_transaction(&b);
-
-    let retry = post_sync(&server, None);
-    let make_ready = async {
-        wait_entered(&probe.before_admission_tx, 1).await;
-        store
-            .update_build_status(&repo_id, &b, "done")
-            .await
-            .expect("first retry makes B ready before second transaction");
-        probe.before_admission_tx.release();
-    };
-    let ((status, body, _), ()) = tokio::join!(retry, make_ready);
-    assert_eq!(
-        status,
-        reqwest::StatusCode::ACCEPTED,
-        "retry response: {body}"
-    );
+    let (status, body, _) = post_sync(&server, None).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "retry response: {body}");
     assert_eq!(response_commit(&body), b);
     assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), jobs_before);
     assert_eq!(probe.exact_fetches.load(Ordering::SeqCst), fetches_before);
@@ -234,17 +195,10 @@ async fn admission_rechecks_ready_result_inside_immediate_transaction() {
         probe.artifact_uploads.load(Ordering::SeqCst),
         uploads_before
     );
-    assert_eq!(
-        store
-            .load_result(&repo_id, &b)
-            .await
-            .unwrap()
-            .unwrap()
-            .build_status
-            .as_deref(),
-        Some("done")
-    );
-    probe.before_admission_tx.disarm();
+    let store = server_ref_store(&server).await;
+    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
+    let exact = store.load_result(&repo_id, &b).await.unwrap().unwrap();
+    assert!(exact.head.is_some() && exact.full.is_some() && exact.files.is_some());
     unsafe { std::env::remove_var("RIPCLONE_TESTING") };
 }
 
@@ -496,17 +450,18 @@ fn assert_full_artifacts(
     commit: &str,
 ) {
     assert_eq!(info.commit, commit, "ref identity");
-    assert_eq!(info.full_clonepack.commit, commit, "full artifact identity");
+    let full = info.full.as_ref().expect("Full result");
+    assert_eq!(full.clonepack.commit, commit, "Full artifact identity");
     assert!(
-        !info.full_clonepack.manifest.is_empty(),
-        "full manifest is present"
+        !full.clonepack.manifest.is_empty(),
+        "Full manifest is present"
     );
     let bytes = storage
-        .get(&info.full_clonepack.manifest)
+        .get(&full.clonepack.manifest)
         .expect("load exact full manifest bytes");
     assert_eq!(
         ripclone::cas::hash(&bytes),
-        info.full_clonepack.manifest,
+        full.clonepack.manifest,
         "full manifest hash"
     );
     let manifest = ClonepackManifest::decode(bytes.as_slice()).expect("decode exact full manifest");
@@ -628,7 +583,7 @@ async fn held_full_jobs_release_foreground_slots_for_another_head() {
     setup(false);
 
     let probe = Arc::new(AdmissionTestProbe::default());
-    probe.phase2_entry.arm();
+    probe.after_head_entry.arm();
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server().await;
 
@@ -646,11 +601,11 @@ async fn held_full_jobs_release_foreground_slots_for_another_head() {
     for (repo, _, _) in &commits[..2] {
         admit_repo(&server, &format!("acme/{repo}")).await;
     }
-    wait_entered(&probe.phase2_entry, 2).await;
+    wait_entered(&probe.after_head_entry, 2).await;
 
     let (third_repo, third_commit, _) = &commits[2];
     admit_repo(&server, &format!("acme/{third_repo}")).await;
-    wait_entered(&probe.phase2_entry, 3).await;
+    wait_entered(&probe.after_head_entry, 3).await;
 
     let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github(format!("acme/{third_repo}"));
@@ -660,14 +615,15 @@ async fn held_full_jobs_release_foreground_slots_for_another_head() {
         .expect("load third exact Head")
         .expect("third exact Head exists");
     assert_eq!(exact.commit, *third_commit);
-    assert_eq!(exact.shallow_clonepack.commit, *third_commit);
-    assert!(!exact.shallow_clonepack.manifest.is_empty());
-    assert_eq!(exact.build_status.as_deref(), Some("full history building"));
+    let head = exact.head.as_ref().expect("Head result");
+    assert_eq!(head.clonepack.commit, *third_commit);
+    assert!(!head.clonepack.manifest.is_empty());
+    assert!(exact.full.is_none());
 
     // The third admission and exact Head publication committed
     // while the first two Full barriers were held. Those writes directly prove
     // that Full work retains no SQLite transaction or write lock.
-    probe.phase2_entry.disarm();
+    probe.after_head_entry.disarm();
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
         .await
         .expect("all held Full jobs settle after release");
@@ -708,18 +664,18 @@ async fn incomplete_parent_forces_cold_files_build() {
         .await
         .expect("P Full/Files complete");
 
-    probe.phase2_entry.arm();
+    probe.after_head_entry.arm();
     let _a = origin.commit(&[("same-size.txt", "AAAA\n")], "A equal-length edit");
     origin.publish();
     admit_repo(&server, "acme/incomplete-parent").await;
-    wait_entered(&probe.phase2_entry, 1).await;
+    wait_entered(&probe.after_head_entry, 1).await;
 
     let b = origin.commit(&[("stable.txt", "B-only\n")], "B while A is phase one");
     origin.publish();
     admit_repo(&server, "acme/incomplete-parent").await;
-    wait_entered(&probe.phase2_entry, 2).await;
-    probe.phase2_entry.release();
-    probe.phase2_entry.disarm();
+    wait_entered(&probe.after_head_entry, 2).await;
+    probe.after_head_entry.release();
+    probe.after_head_entry.disarm();
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
         .await
         .expect("A and B complete in either order");
@@ -964,7 +920,7 @@ async fn e2e_sync_admission() {
     probe.after_claim.arm();
     probe.fetch_entry.arm();
     probe.builder_entry.arm();
-    probe.phase2_entry.arm();
+    probe.after_head_entry.arm();
     // The worker is now stopped on the pre-receive side of the real local
     // claim boundary. B will remain in the channel until this gate is released.
     wait_entered(&probe.before_claim, 1).await;
@@ -1077,17 +1033,17 @@ async fn e2e_sync_admission() {
     );
     probe.builder_entry.release();
     probe.builder_entry.disarm();
-    wait_entered(&probe.phase2_entry, 1).await;
+    wait_entered(&probe.after_head_entry, 1).await;
 
     // Phase one has published B, while detached Full(B) is held. A signed
     // replay of B is admitted directly by the webhook path and coalesces
     // without probing the moving upstream tip.
     let tip_probes_before_webhook = probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst);
-    let (b_phase1_status, b_phase1_elapsed) = post_webhook(&server, "main", &b).await;
-    assert_eq!(b_phase1_status, reqwest::StatusCode::OK);
+    let (b_head_status, b_head_elapsed) = post_webhook(&server, "main", &b).await;
+    assert_eq!(b_head_status, reqwest::StatusCode::OK);
     assert!(
-        b_phase1_elapsed < Duration::from_secs(5),
-        "webhook replay waited for blocked Full(B): {b_phase1_elapsed:?}"
+        b_head_elapsed < Duration::from_secs(5),
+        "webhook replay waited for blocked Full(B): {b_head_elapsed:?}"
     );
     assert_eq!(
         probe
@@ -1102,7 +1058,7 @@ async fn e2e_sync_admission() {
         "signed webhook replay must not perform a moving-tip probe"
     );
     eprintln!(
-        "admission_latencies_ms replay={} ready={} B={} dup_before_claim=[{},{}] cli_sync={} dup_after_claim={} C={} webhook_phase1={}",
+        "admission_latencies_ms replay={} ready={} B={} dup_before_claim=[{},{}] cli_sync={} dup_after_claim={} C={} webhook_head={}",
         replay_elapsed.as_millis(),
         ready_elapsed.as_millis(),
         b_elapsed.as_millis(),
@@ -1111,14 +1067,14 @@ async fn e2e_sync_admission() {
         cli_sync_elapsed.as_millis(),
         b_dup_claimed_elapsed.as_millis(),
         c_elapsed.as_millis(),
-        b_phase1_elapsed.as_millis(),
+        b_head_elapsed.as_millis(),
     );
 
     // Full(B) is held, but its foreground slot is already free for C. Releasing
     // the shared Full barrier lets both durable claims settle; exact B must
     // remain addressable after the moving branch advances to C.
-    probe.phase2_entry.release();
-    probe.phase2_entry.disarm();
+    probe.after_head_entry.release();
+    probe.after_head_entry.disarm();
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))
         .await
         .expect("B and C full publications completed");
@@ -1347,7 +1303,7 @@ async fn e2e_sync_admission() {
     let wait_commit = origin.commit(&[("value.txt", "wait\n")], "pinned wait");
     origin.publish();
     reset_probe(&probe);
-    probe.phase2_entry.arm();
+    probe.after_head_entry.arm();
     let wait_client = server.client();
     let wait_task = tokio::spawn(async move {
         wait_client
@@ -1355,7 +1311,7 @@ async fn e2e_sync_admission() {
             .await
             .expect("sync becomes ready")
     });
-    wait_entered(&probe.phase2_entry, 1).await;
+    wait_entered(&probe.after_head_entry, 1).await;
     tokio::time::timeout(Duration::from_secs(10), probe.wait_until_http_trace_len(2))
         .await
         .expect("caller reached pinned GET");
@@ -1371,19 +1327,19 @@ async fn e2e_sync_admission() {
     );
     assert!(
         trace.iter().skip(1).all(|event| event.starts_with(&format!(
-            "GET /v1/repos/{}/refs/main?pinned={wait_commit}&clonepack=full",
+            "GET /v1/repos/{}/refs/main?pinned={wait_commit}&result=full",
             repo_id.storage_key()
         ))),
         "pinned wait used an unpinned or mutating follow-up: {trace:?}"
     );
-    probe.phase2_entry.release();
-    probe.phase2_entry.disarm();
+    probe.after_head_entry.release();
+    probe.after_head_entry.disarm();
     let waited = tokio::time::timeout(Duration::from_secs(60), wait_task)
         .await
         .expect("pinned wait completed")
         .expect("pinned task joined");
     assert_eq!(waited.commit, wait_commit);
-    let settled_wait = sync_until_archive_ready(&server, "acme", "immutable").await;
+    let settled_wait = sync_until_files_ready(&server, "acme", "immutable").await;
     assert_eq!(settled_wait.commit, wait_commit);
 
     // Admit an exact target, make only that object unreachable before the
@@ -1442,8 +1398,16 @@ async fn e2e_sync_admission() {
         .expect("prior ready ref remains");
     assert_eq!(after_unavailable.commit, wait_commit);
     assert_eq!(
-        after_unavailable.build_status,
-        before_unavailable.build_status
+        after_unavailable.head.is_some(),
+        before_unavailable.head.is_some()
+    );
+    assert_eq!(
+        after_unavailable.full.is_some(),
+        before_unavailable.full.is_some()
+    );
+    assert_eq!(
+        after_unavailable.files.is_some(),
+        before_unavailable.files.is_some()
     );
     assert_eq!(
         unavailable_storage,
@@ -1456,17 +1420,10 @@ async fn e2e_sync_admission() {
         .expect("load failed exact row")
         .expect("failed exact row exists before publication");
     assert_eq!(failed.commit, unavailable);
-    assert!(
-        failed
-            .build_status
-            .as_deref()
-            .is_some_and(|status| status.starts_with("failed: ")),
-        "failed exact row records the unavailable target: {failed:?}"
-    );
+    assert!(failed.head.is_none() && failed.full.is_none() && failed.files.is_none());
     reset_probe(&probe);
-    probe.after_claim.arm();
     let retry_url = format!(
-        "{}/v1/repos/github/acme/immutable/refs/main?clonepack=full&pinned={unavailable}",
+        "{}/v1/repos/github/acme/immutable/refs/main?result=full&pinned={unavailable}",
         server.url
     );
     let retry = reqwest::Client::new()
@@ -1476,10 +1433,7 @@ async fn e2e_sync_admission() {
         .send()
         .await
         .expect("retry failed exact target");
-    assert_eq!(retry.status(), reqwest::StatusCode::ACCEPTED);
-    let retry_body: serde_json::Value = retry.json().await.expect("retry exact response");
-    assert_eq!(response_commit(&retry_body), unavailable);
-    wait_entered(&probe.after_claim, 1).await;
+    assert_eq!(retry.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
 
     let duplicate = reqwest::Client::new()
         .get(&retry_url)
@@ -1488,54 +1442,34 @@ async fn e2e_sync_admission() {
         .send()
         .await
         .expect("coalesce duplicate failed exact target");
-    assert_eq!(duplicate.status(), reqwest::StatusCode::ACCEPTED);
-    let duplicate_body: serde_json::Value = duplicate.json().await.expect("duplicate response");
-    assert_eq!(response_commit(&duplicate_body), unavailable);
+    assert_eq!(duplicate.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         probe.queue_inserts.load(Ordering::SeqCst),
-        1,
-        "failed exact target retries as one coalesced job"
+        0,
+        "pinned checks never enqueue"
     );
-    assert_eq!(probe.coalesces.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.coalesces.load(Ordering::SeqCst), 0);
     assert_eq!(probe.tip_probes.load(Ordering::SeqCst), 0);
-    probe.after_claim.release();
-    probe.after_claim.disarm();
-    tokio::time::timeout(Duration::from_secs(30), probe.wait_until_failure(1))
-        .await
-        .expect("exact retry reaches its failure before fixture teardown");
-    assert_eq!(
-        probe.fetch_targets.lock().unwrap().as_slice(),
-        [unavailable.as_str()],
-        "retry fetches only the originally admitted exact target"
-    );
+    assert!(probe.fetch_targets.lock().unwrap().is_empty());
 
     // An evicted completed row is not treated as ready and its historical done
     // job does not block one fresh exact admission.
     let evicted_target = origin.commit(&[("value.txt", "evicted\n")], "evicted target");
     origin.publish();
-    let mut evicted = store
-        .load_result(&repo_id, &wait_commit)
-        .await
-        .expect("load exact completed row before eviction")
-        .expect("exact completed row exists");
-    evicted.commit = evicted_target.clone();
-    evicted.full_clonepack.commit = evicted_target.clone();
-    evicted.shallow_clonepack.commit = evicted_target.clone();
-    evicted.build_status = Some("evicted".to_string());
+    let evicted = ripclone::RefInfo {
+        commit: evicted_target.clone(),
+        ..Default::default()
+    };
     store
         .save_result(&repo_id, &evicted)
         .await
         .expect("mark exact completed row evicted");
-    assert_eq!(
-        store
-            .load_result(&repo_id, &evicted_target)
-            .await
-            .unwrap()
-            .unwrap()
-            .build_status
-            .as_deref(),
-        Some("evicted")
-    );
+    let evicted = store
+        .load_result(&repo_id, &evicted_target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(evicted.head.is_none() && evicted.full.is_none() && evicted.files.is_none());
     reset_probe(&probe);
     probe.before_claim.arm();
     let (evicted_status, evicted_body, evicted_elapsed) = post_sync(&server, None).await;
@@ -1591,10 +1525,10 @@ async fn ordinary_build_publishes_exact_commit_result() {
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
-    let (server, phase_one, phase_one_entered, phase_one_proceed) =
-        start_server_split_storage_phase_one_barrier().await;
+    let (server, head_barrier, head_entered, head_proceed) =
+        start_server_split_storage_head_publish_barrier().await;
     let origin = make_origin("acme", "ordinary-exact-publish");
-    let a = origin.commit(&[("value.txt", "A\n")], "A");
+    origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
     register_added_without_build(&server, "acme/ordinary-exact-publish")
         .await
@@ -1607,9 +1541,9 @@ async fn ordinary_build_publishes_exact_commit_result() {
 
     let probe = Arc::new(AdmissionTestProbe::default());
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
-    phase_one.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    head_barrier.arm_for(&b);
     let admission = server
         .client()
         .admit_sync_repo("acme/ordinary-exact-publish", None)
@@ -1617,26 +1551,24 @@ async fn ordinary_build_publishes_exact_commit_result() {
         .expect("admit B");
     assert!(admission.accepted);
     assert_eq!(admission.commit, b);
-    tokio::time::timeout(Duration::from_secs(20), phase_one_entered)
+    tokio::time::timeout(Duration::from_secs(20), head_entered)
         .await
         .expect("B phase-one publication entered")
         .expect("phase-one barrier sender alive");
 
     let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/ordinary-exact-publish");
-    let phase_one_exact = store
+    let head_exact = store
         .load_result(&repo_id, &b)
         .await
         .expect("load exact phase-one B")
         .expect("ordinary build published exact phase-one B");
-    assert_eq!(phase_one_exact.commit, b);
-    assert_eq!(phase_one_exact.full_clonepack.commit, a);
-    assert_eq!(
-        phase_one_exact.build_status.as_deref(),
-        Some("full history building")
-    );
+    assert_eq!(head_exact.commit, b);
+    assert_eq!(head_exact.head.as_ref().unwrap().clonepack.commit, b);
+    assert!(head_exact.full.is_none());
+    assert!(head_exact.files.is_none());
 
-    phase_one_proceed
+    head_proceed
         .send(())
         .expect("release B phase-one publication");
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
@@ -1796,7 +1728,12 @@ async fn different_names_for_one_commit_share_result_and_job_but_keep_checkout_n
         .expect("shared exact job completes");
     let ready = server
         .client()
-        .resolve_ref_with_clonepack("acme/same-object-names", "release", Some("full"), None)
+        .resolve_exact_result(
+            "acme/same-object-names",
+            "release",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("release name reuses exact result");
     assert_eq!(ready.commit, commit);
@@ -1852,7 +1789,12 @@ async fn default_branch_rename_reuses_commit_and_returns_each_operations_name() 
 
     let before = server
         .client()
-        .resolve_ref_with_clonepack("acme/renamed-default", "HEAD", Some("full"), None)
+        .resolve_exact_result(
+            "acme/renamed-default",
+            "HEAD",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("resolve old default");
     assert_eq!(before.branch, "main");
@@ -1862,7 +1804,12 @@ async fn default_branch_rename_reuses_commit_and_returns_each_operations_name() 
     git(&origin.bare, &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
     let after = server
         .client()
-        .resolve_ref_with_clonepack("acme/renamed-default", "HEAD", Some("full"), None)
+        .resolve_exact_result(
+            "acme/renamed-default",
+            "HEAD",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("resolve renamed default");
     assert_eq!(after.branch, "trunk");
@@ -1889,7 +1836,7 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
         std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "1");
     }
     let probe = Arc::new(AdmissionTestProbe::default());
-    probe.phase2_entry.arm();
+    probe.after_head_entry.arm();
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server_env(&[
         ("RIPCLONE_QUEUE_STALE_SECS", "3"),
@@ -1904,7 +1851,7 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
         .expect("register lost-claim fixture");
     let admitted = admit_repo(&server, "acme/lost-claim").await;
     assert_eq!(response_commit(&admitted), commit);
-    wait_entered(&probe.phase2_entry, 1).await;
+    wait_entered(&probe.after_head_entry, 1).await;
 
     let takeover = ripclone::queue::SqlJobQueue::new(Box::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
@@ -1923,7 +1870,7 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     // Release the old attempt immediately after reclaim, before its next
     // heartbeat can detect ownership loss. The publication itself must reject
     // the stale `(job_id, worker_id)` atomically.
-    probe.phase2_entry.release();
+    probe.after_head_entry.release();
     tokio::time::timeout(Duration::from_secs(20), async {
         while probe.ref_store_writes.load(Ordering::SeqCst) == writes_before_release {
             tokio::task::yield_now().await;
@@ -1935,12 +1882,8 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/lost-claim");
     let exact = store.load_result(&repo_id, &commit).await.unwrap().unwrap();
-    assert!(exact.full_clonepack.manifest.is_empty());
-    assert_eq!(
-        exact.build_status.as_deref(),
-        Some("full history building"),
-        "stale owner cannot mark the exact result ready or failed"
-    );
+    assert!(exact.head.is_some());
+    assert!(exact.full.is_none() && exact.files.is_none());
     assert!(
         takeover
             .ack(
@@ -1982,7 +1925,7 @@ async fn dead_lettered_stale_claim_is_readmitted_by_a_subsequent_exact_clone() {
         .expect("register stale-claim fixture");
     let first = reqwest::Client::new()
         .get(format!(
-            "{}/v1/repos/github/acme/dead-letter-readmit/refs/HEAD?rev={b}&clonepack=full",
+            "{}/v1/repos/github/acme/dead-letter-readmit/refs/HEAD?rev={b}&result=full",
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -2025,14 +1968,14 @@ async fn dead_lettered_stale_claim_is_readmitted_by_a_subsequent_exact_clone() {
         ripclone::queue::JobState::Failed(error) if error.contains("dead-lettered")
     ));
     let repo_id = ripclone::provider::RepoId::github("acme/dead-letter-readmit");
-    let stranded_phase = server_ref_store(&server)
+    let stranded = server_ref_store(&server)
         .await
         .load_result(&repo_id, &b)
         .await
         .unwrap()
         .unwrap();
     assert!(
-        stranded_phase.full_clonepack.manifest.is_empty(),
+        stranded.head.is_none() && stranded.full.is_none() && stranded.files.is_none(),
         "the dead-lettered attempt must leave B non-ready"
     );
 
@@ -2088,7 +2031,7 @@ async fn dead_lettered_stale_claim_is_readmitted_by_a_subsequent_exact_clone() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
+async fn stopped_job_after_full_preserves_full_and_builds_only_files() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
@@ -2097,11 +2040,12 @@ async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
         std::env::set_var("RIPCLONE_QUEUE_MAX_ATTEMPTS", "2");
     }
     let probe = Arc::new(AdmissionTestProbe::default());
-    probe.after_editable_publish.arm();
+    probe.after_full_publish.arm();
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server_env(&[("RIPCLONE_QUEUE_STALE_SECS", "3")]).await;
     let origin = make_origin("acme", "dead-letter-editable-full");
     let b = origin.commit(&[("value.txt", "editable B\n")], "B");
+    probe.fail_files_for(&b);
     origin.publish();
     register_added_without_build(&server, "acme/dead-letter-editable-full")
         .await
@@ -2111,7 +2055,7 @@ async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
         .sync_repo("acme/dead-letter-editable-full", None)
         .await
         .expect("admit B");
-    wait_entered(&probe.after_editable_publish, 1).await;
+    wait_entered(&probe.after_full_publish, 1).await;
 
     let repo_id = ripclone::provider::RepoId::github("acme/dead-letter-editable-full");
     let store = server_ref_store(&server).await;
@@ -2121,16 +2065,17 @@ async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
         .expect("load editable B")
         .expect("editable B remains durable");
     assert_eq!(editable.commit, b);
-    assert_eq!(editable.full_clonepack.commit, b);
-    assert!(!editable.full_clonepack.manifest.is_empty());
-    assert!(editable.archive_chunks.is_empty());
-    assert_eq!(editable.build_status.as_deref(), Some("archive building"));
+    let editable_full = editable.full.as_ref().expect("Full result");
+    assert_eq!(editable_full.clonepack.commit, b);
+    assert!(!editable_full.clonepack.manifest.is_empty());
+    assert!(editable.head.is_some());
+    assert!(editable.files.is_none());
 
     // Full is usable while its archive job is still live. This request must
     // remain a 200 response rather than turning the editable artifact pending.
     let full = reqwest::Client::new()
         .get(format!(
-            "{}/v1/repos/github/acme/dead-letter-editable-full/refs/HEAD?rev={b}&clonepack=full",
+            "{}/v1/repos/github/acme/dead-letter-editable-full/refs/HEAD?rev={b}&result=full",
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -2141,7 +2086,6 @@ async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
     assert_eq!(full.status(), reqwest::StatusCode::OK);
     let full: Value = full.json().await.expect("decode editable Full response");
     assert_eq!(response_commit(&full), b);
-    assert_eq!(full["archive_ready"], false);
     assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
 
     // The original worker is paused immediately after writing Full(B). Reclaim
@@ -2180,13 +2124,20 @@ async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
         .await
         .expect("reload stranded editable B")
         .expect("editable B metadata remains after dead letter");
-    assert_eq!(stranded.full_clonepack, editable.full_clonepack);
-    assert!(stranded.archive_chunks.is_empty());
-    assert_eq!(stranded.build_status.as_deref(), Some("archive building"));
+    assert_eq!(
+        stranded.full.as_ref().unwrap().clonepack,
+        editable.full.as_ref().unwrap().clonepack
+    );
+    assert!(stranded.head.is_some());
+    assert!(stranded.files.is_none());
 
     // Files receives that same 200 Full response with no archive, atomically
     // admits one replacement, and polls it to a usable files checkout.
     probe.before_claim.arm();
+    probe.allow_files_for(&b);
+    let head_builds_before = probe.head_builds.load(Ordering::SeqCst);
+    let full_builds_before = probe.full_builds.load(Ordering::SeqCst);
+    let files_builds_before = probe.files_builds.load(Ordering::SeqCst);
     let output = tempfile::tempdir().expect("files replacement output");
     let target = output.path().join("files");
     let client = server.client();
@@ -2219,8 +2170,8 @@ async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
         1,
         "exactly one replacement archive job is active"
     );
-    probe.after_editable_publish.release();
-    probe.after_editable_publish.disarm();
+    probe.after_full_publish.release();
+    probe.after_full_publish.disarm();
     probe.before_claim.release();
     probe.before_claim.disarm();
 
@@ -2236,8 +2187,13 @@ async fn dead_letter_after_editable_full_rebuilds_files_without_hiding_full() {
         .await
         .expect("load completed replacement")
         .expect("completed replacement result");
-    assert!(!settled.archive_chunks.is_empty());
-    assert!(settled.build_status.is_none());
+    assert!(settled.files.is_some());
+    assert_eq!(probe.head_builds.load(Ordering::SeqCst), head_builds_before);
+    assert_eq!(probe.full_builds.load(Ordering::SeqCst), full_builds_before);
+    assert_eq!(
+        probe.files_builds.load(Ordering::SeqCst),
+        files_builds_before + 1
+    );
 
     unsafe {
         std::env::remove_var("RIPCLONE_QUEUE_MAX_ATTEMPTS");
@@ -2308,9 +2264,7 @@ async fn duplicate_exact_admissions_count_one_queued_build_and_balance_depth() {
     }
 }
 
-/// A historical sync's phase-one row is metadata and shallow readiness only.
-/// Holding phase two at its entry makes the HTTP readiness decision observable:
-/// the first response must be exact pending until Full(commit) is durable.
+/// A historical sync serves Head while Full is still missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn historical_sync_requires_exact_full_before_ready() {
     let _guard = env_lock().lock().await;
@@ -2319,7 +2273,7 @@ async fn historical_sync_requires_exact_full_before_ready() {
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
     let probe = Arc::new(AdmissionTestProbe::default());
-    probe.phase2_entry.arm();
+    probe.after_head_entry.arm();
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server().await;
     let origin = make_origin("acme", "historical-full-ready");
@@ -2339,32 +2293,29 @@ async fn historical_sync_requires_exact_full_before_ready() {
         .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
-        .expect("historical sync phase-one response");
+        .expect("historical sync response");
     assert_eq!(
         response.status(),
         reqwest::StatusCode::ACCEPTED,
-        "phase one cannot report exact Full readiness"
+        "missing Full cannot report readiness"
     );
     let pending: Value = response.json().await.expect("typed exact pending body");
     assert_eq!(pending["commit"], pinned);
     assert_eq!(pending["branch"], "main");
 
-    wait_entered(&probe.phase2_entry, 1).await;
+    wait_entered(&probe.after_head_entry, 1).await;
     let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/historical-full-ready");
-    let phase_one = store
+    let head_only = store
         .load_result(&repo_id, &pinned)
         .await
-        .expect("load historical phase-one row")
-        .expect("historical phase-one row is durable");
-    assert_eq!(phase_one.commit, pinned);
-    assert_eq!(
-        phase_one.build_status.as_deref(),
-        Some("full history building")
-    );
-    assert!(phase_one.full_clonepack.manifest.is_empty());
+        .expect("load historical Head result")
+        .expect("historical Head result is durable");
+    assert_eq!(head_only.commit, pinned);
+    assert!(head_only.head.is_some());
+    assert!(head_only.full.is_none());
 
-    probe.phase2_entry.release();
+    probe.after_head_entry.release();
     let ready = server
         .client()
         .sync_repo_at("acme/historical-full-ready", Some("HEAD~1"), None)
@@ -2376,8 +2327,7 @@ async fn historical_sync_requires_exact_full_before_ready() {
         .await
         .expect("load historical exact result")
         .expect("historical exact result remains durable");
-    assert_eq!(exact.full_clonepack.commit, pinned);
-    assert!(!exact.full_clonepack.manifest.is_empty());
+    assert_eq!(exact.full.as_ref().unwrap().clonepack.commit, pinned);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2387,8 +2337,8 @@ async fn late_b_exact_publish_does_not_mutate_c() {
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
     }
-    let (server, phase_one, phase_one_entered, phase_one_proceed) =
-        start_server_split_storage_phase_one_barrier().await;
+    let (server, head_barrier, head_entered, head_proceed) =
+        start_server_split_storage_head_publish_barrier().await;
     let origin = make_origin("acme", "late-exact-publish");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
@@ -2403,9 +2353,9 @@ async fn late_b_exact_publish_does_not_mutate_c() {
 
     let probe = Arc::new(AdmissionTestProbe::default());
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
-    phase_one.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    head_barrier.arm_for(&b);
     let b_admission = server
         .client()
         .admit_sync_repo("acme/late-exact-publish", None)
@@ -2413,7 +2363,7 @@ async fn late_b_exact_publish_does_not_mutate_c() {
         .expect("admit B");
     assert!(b_admission.accepted);
     assert_eq!(b_admission.commit, b);
-    tokio::time::timeout(Duration::from_secs(20), phase_one_entered)
+    tokio::time::timeout(Duration::from_secs(20), head_entered)
         .await
         .expect("B phase-one publication entered")
         .expect("phase-one barrier sender alive");
@@ -2441,7 +2391,7 @@ async fn late_b_exact_publish_does_not_mutate_c() {
                 .await
                 .expect("load C before delayed B")
                 .expect("exact C row");
-            if exact.build_status.is_none() && !exact.full_clonepack.manifest.is_empty() {
+            if exact.head.is_some() && exact.full.is_some() && exact.files.is_some() {
                 break exact;
             }
             tokio::task::yield_now().await;
@@ -2449,18 +2399,18 @@ async fn late_b_exact_publish_does_not_mutate_c() {
     })
     .await
     .expect("C job reaches its terminal status while B is held");
-    let exact_b_phase_one = store
+    let exact_b_head = store
         .load_result(&repo_id, &b)
         .await
         .expect("load held exact B")
         .expect("held exact B row");
-    assert_eq!(exact_b_phase_one.commit, b);
+    assert_eq!(exact_b_head.commit, b);
     let c_json = serde_json::to_value(&exact_c_before).expect("serialize C before delayed B");
     let storage = ripclone::storage::local(&server.storage_dir).expect("open late storage");
     let c_artifacts = artifact_snapshot(&storage, &exact_c_before);
     assert_full_artifacts(&storage, &exact_c_before, &c);
 
-    phase_one_proceed
+    head_proceed
         .send(())
         .expect("release delayed B publication");
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))

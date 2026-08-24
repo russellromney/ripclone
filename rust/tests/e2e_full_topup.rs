@@ -26,6 +26,14 @@ fn env_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+async fn wait_for_exact_full(client: ripclone::client::Client, repo: &str, commit: &str) {
+    let ready = client
+        .resolve_exact_result(repo, "main", ripclone::ExactResultKind::Full, None)
+        .await
+        .expect("exact Full became ready");
+    assert_eq!(ready.commit, commit);
+}
+
 struct ScopedEnvVar {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -149,7 +157,7 @@ async fn start_authenticated_redirect_source() -> (
     )
 }
 
-async fn wait_for_archive_settled(server: &Server, repo: &str, commit: &str) {
+async fn wait_for_files_job_settled(server: &Server, repo: &str, commit: &str) {
     let url = format!("{}/v1/repos/github/{repo}/status", server.url);
     let client = reqwest::Client::new();
     let mut last = String::new();
@@ -173,12 +181,11 @@ async fn wait_for_archive_settled(server: &Server, repo: &str, commit: &str) {
                 refs.iter().any(|reference| {
                     reference["branch"] != "HEAD"
                         && reference["commit"] == commit
-                        && (reference["build_status"].is_null()
-                            || reference["build_status"] == "done")
+                        && reference["head"] == true
+                        && reference["full"] == true
+                        && reference["files"] == true
+                        && reference["job"] == "done"
                         && reference["warm"] == true
-                        && reference["manifest"]
-                            .as_str()
-                            .is_some_and(|manifest| !manifest.is_empty())
                 })
             }) {
                 return;
@@ -186,7 +193,7 @@ async fn wait_for_archive_settled(server: &Server, repo: &str, commit: &str) {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    panic!("MinIO archive build did not settle for {repo}@{commit}: {last}");
+    panic!("MinIO Files job did not settle for {repo}@{commit}: {last}");
 }
 
 struct MinioAuditProxy {
@@ -541,7 +548,7 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
         })
         .expect("configure counting upstream");
     let (server, barrier, entered, proceed) =
-        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+        start_server_split_storage_head_publish_barrier_with_registry(registry).await;
 
     // SplitMix64 gives this blob deterministic high entropy. Repeated bytes
     // compress too well to detect an accidental retransmission of unchanged
@@ -589,7 +596,12 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
         .client()
         .with_provider_instance(provider.clone())
         .with_upstream_token(upstream_token)
-        .resolve_ref_with_clonepack("acme/full-topup", "main", Some("full"), None)
+        .resolve_exact_result(
+            "acme/full-topup",
+            "main",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("resolve full A");
     assert_eq!(ready_a.commit, a);
@@ -632,7 +644,7 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
     let b = commit_all(&origin.work, "B");
     origin.publish();
 
-    barrier.arm();
+    barrier.arm_for(&b);
     let sync_client = server
         .client()
         .with_provider_instance(provider.clone())
@@ -714,14 +726,14 @@ exec "$real_git" "$@"
     );
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
 
-    // Phase one has already published Shallow(B), while Full(B) remains
+    // Head(B) is already published, while Full(B) remains
     // stopped at the production barrier. Make the real server Git boundary
     // fail: this exact pinned read must still serve B from
     // authenticated metadata without attempting source acquisition.
     let source_forbidden = ScopedEnvVar::set("RIPCLONE_TEST_SOURCE_FORBIDDEN", "1");
     let shallow_response = reqwest::Client::new()
         .get(format!(
-            "{}/v1/repos/counting/acme/full-topup/refs/main?clonepack=shallow&pinned={b}",
+            "{}/v1/repos/counting/acme/full-topup/refs/main?result=head&pinned={b}",
             server.url,
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -729,23 +741,20 @@ exec "$real_git" "$@"
         .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
         .send()
         .await
-        .expect("phase-one shallow metadata request");
+        .expect("Head metadata request");
     assert_eq!(shallow_response.status(), StatusCode::OK);
-    let shallow: serde_json::Value = shallow_response
-        .json()
-        .await
-        .expect("phase-one shallow response");
+    let shallow: serde_json::Value = shallow_response.json().await.expect("Head response");
     assert_eq!(shallow["commit"], b);
-    assert_eq!(shallow["shallow"], true);
+    assert_eq!(shallow["result"], "head");
     assert!(
         shallow["clonepack_manifest"]
             .as_str()
             .is_some_and(|manifest| !manifest.is_empty()),
-        "phase one must publish a usable shallow manifest"
+        "Head must publish a usable manifest"
     );
     assert!(
         std::fs::read_to_string(&source_log)
-            .expect("phase-one shallow source log")
+            .expect("Head source log")
             .is_empty(),
         "published Shallow(B) must not reacquire upstream while Full(B) is active"
     );
@@ -991,7 +1000,7 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
         format!("{}/acme/full-topup.git", origin.url)
     );
 
-    // Restore B only so the intentionally blocked phase-two task can finish
+    // Restore B only so the intentionally blocked Full/Files work can finish
     // during fixture teardown. Exact-B precedence is proven separately while
     // Full(A) is still carried by B's moving phase-one row.
     git(&origin.work, &["reset", "--hard", &b]);
@@ -1053,7 +1062,7 @@ async fn exact_full_b_precedes_available_carried_a_without_manifest_or_upstream(
         })
         .expect("configure counting upstream");
     let (server, barrier, entered, proceed) =
-        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+        start_server_split_storage_head_publish_barrier_with_registry(registry).await;
 
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
@@ -1075,19 +1084,19 @@ async fn exact_full_b_precedes_available_carried_a_without_manifest_or_upstream(
         .client()
         .with_provider_instance(provider.clone())
         .with_upstream_token(upstream_token)
-        .resolve_ref_with_clonepack(
+        .resolve_exact_result(
             "acme/full-topup-exact-precedence",
             "main",
-            Some("full"),
+            ripclone::ExactResultKind::Full,
             None,
         )
         .await
         .expect("resolve exact Full(A)");
     assert_eq!(ready_a.commit, a);
 
-    barrier.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    barrier.arm_for(&b);
     let sync_client = server
         .client()
         .with_provider_instance(provider.clone())
@@ -1159,10 +1168,10 @@ async fn exact_full_b_precedes_available_carried_a_without_manifest_or_upstream(
         .client()
         .with_provider_instance(provider.clone())
         .with_upstream_token(upstream_token)
-        .resolve_ref_with_clonepack(
+        .resolve_exact_result(
             "acme/full-topup-exact-precedence",
             "main",
-            Some("full"),
+            ripclone::ExactResultKind::Full,
             None,
         )
         .await
@@ -1228,7 +1237,7 @@ async fn missing_local_provider_fails_before_base_artifacts_download() {
         })
         .expect("configure server provider");
     let (server, barrier, entered, proceed) =
-        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+        start_server_split_storage_head_publish_barrier_with_registry(registry).await;
     let a = origin.commit(&[("value.txt", "A\\n")], "A");
     origin.publish();
     register_added_without_build_for_provider(&server, "gitea", "acme/full-topup-missing-provider")
@@ -1245,19 +1254,19 @@ async fn missing_local_provider_fails_before_base_artifacts_download() {
         .client()
         .with_provider_instance(provider.clone())
         .with_upstream_token(upstream_token)
-        .resolve_ref_with_clonepack(
+        .resolve_exact_result(
             "acme/full-topup-missing-provider",
             "main",
-            Some("full"),
+            ripclone::ExactResultKind::Full,
             None,
         )
         .await
         .expect("wait for exact Full(A)");
     assert_eq!(ready_a.commit, a);
 
-    barrier.arm();
     let b = origin.commit(&[("value.txt", "B\\n")], "B");
     origin.publish();
+    barrier.arm_for(&b);
     let sync_client = server
         .client()
         .with_provider_instance(provider)
@@ -1331,7 +1340,7 @@ async fn server_named_decoy_is_ignored_for_local_provider_exact_fetch() {
         })
         .expect("configure server-returned decoy");
     let (server, barrier, entered, proceed) =
-        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+        start_server_split_storage_head_publish_barrier_with_registry(registry).await;
     let origin = make_origin("acme", "full-topup-decoy");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
@@ -1344,10 +1353,16 @@ async fn server_named_decoy_is_ignored_for_local_provider_exact_fetch() {
         .sync_repo("acme/full-topup-decoy", None)
         .await
         .expect("publish decoy A through local origin override");
+    wait_for_exact_full(
+        server.client().with_upstream_token("local-only-secret"),
+        "acme/full-topup-decoy",
+        &a,
+    )
+    .await;
 
-    barrier.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    barrier.arm_for(&b);
     let sync_client = server.client().with_upstream_token("local-only-secret");
     let mut sync_b =
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-decoy", None).await });
@@ -1399,7 +1414,8 @@ async fn server_named_decoy_is_ignored_for_local_provider_exact_fetch() {
 async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() {
     let _guard = env_lock().lock().await;
     init(false);
-    let (server, barrier, entered, proceed) = start_server_split_storage_phase_one_barrier().await;
+    let (server, barrier, entered, proceed) =
+        start_server_split_storage_head_publish_barrier().await;
     let origin = make_origin("acme", "full-topup-no-base");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
@@ -1411,10 +1427,11 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
         .sync_repo("acme/full-topup-no-base", None)
         .await
         .expect("publish A");
+    wait_for_exact_full(server.client(), "acme/full-topup-no-base", &a).await;
 
-    barrier.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    barrier.arm_for(&b);
     let sync_client = server.client();
     let mut sync_b =
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-no-base", None).await });
@@ -1425,19 +1442,23 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
 
     let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/full-topup-no-base");
-    let mut exact = store
+    let exact = store
         .load_result(&repo_id, &b)
         .await
         .expect("load exact B")
         .expect("exact B row");
     assert_eq!(exact.commit, b);
-    let carried = exact.full_clonepack.clone();
-    assert_eq!(carried.commit, a);
-    exact.full_clonepack = Default::default();
-    store
-        .save_result(&repo_id, &exact)
+    let mut exact_a = store
+        .load_result(&repo_id, &a)
         .await
-        .expect("remove carried base");
+        .expect("load exact A")
+        .expect("exact A row");
+    let carried = exact_a.full.take().expect("Full(A) ready").clonepack;
+    assert_eq!(carried.commit, a);
+    store
+        .save_result(&repo_id, &exact_a)
+        .await
+        .expect("remove exact Full(A)");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -1476,12 +1497,17 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
     let bad_hash = storage
         .put(&bad.encode_to_vec())
         .expect("store bad manifest");
-    exact.full_clonepack = carried;
-    exact.full_clonepack.manifest = bad_hash;
+    exact_a.full = Some(ripclone::FullResult {
+        clonepack: ripclone::ClonepackArtifacts {
+            manifest: bad_hash,
+            ..carried
+        },
+        ..Default::default()
+    });
     store
-        .save_result(&repo_id, &exact)
+        .save_result(&repo_id, &exact_a)
         .await
-        .expect("install mismatched carried manifest");
+        .expect("install mismatched exact Full(A)");
     let bad_target = output.path().join("bad-clone");
     let bad_error = server
         .client()
@@ -1517,7 +1543,8 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
 async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
     let _guard = env_lock().lock().await;
     init(false);
-    let (server, barrier, entered, proceed) = start_server_split_storage_phase_one_barrier().await;
+    let (server, barrier, entered, proceed) =
+        start_server_split_storage_head_publish_barrier().await;
     let origin = make_origin("acme", "full-topup-unrelated");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
@@ -1529,6 +1556,7 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
         .sync_repo("acme/full-topup-unrelated", None)
         .await
         .expect("publish A");
+    wait_for_exact_full(server.client(), "acme/full-topup-unrelated", &a).await;
 
     git(&origin.work, &["checkout", "-q", "--orphan", "rewritten"]);
     git(&origin.work, &["rm", "-q", "-rf", "."]);
@@ -1538,7 +1566,7 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
     origin.publish();
     assert_ne!(a, x);
 
-    barrier.arm();
+    barrier.arm_for(&b);
     let sync_client = server.client();
     let mut sync_b = tokio::spawn(async move {
         sync_client
@@ -1558,9 +1586,12 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
         .expect("load exact B")
         .expect("exact B row");
     assert_eq!(exact.commit, b);
-    assert_eq!(exact.parent_commit.as_deref(), Some(x.as_str()));
+    assert_eq!(
+        exact.head.as_ref().unwrap().parent_commit.as_deref(),
+        Some(x.as_str())
+    );
     assert!(
-        exact.full_clonepack.commit.is_empty(),
+        exact.full.is_none(),
         "an unrelated history must not carry Full(A) automatically"
     );
     let exact_a = store
@@ -1568,11 +1599,10 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
         .await
         .expect("load exact A")
         .expect("exact A row");
-    assert_eq!(exact_a.full_clonepack.commit, a);
+    assert_eq!(exact_a.full.as_ref().unwrap().clonepack.commit, a);
     // Forge both the first-parent hint and a carried Full(A). The fetched B
     // commit object remains authoritative and must reject this metadata.
-    exact.parent_commit = Some(a.clone());
-    exact.full_clonepack = exact_a.full_clonepack;
+    exact.head.as_mut().unwrap().parent_commit = Some(a.clone());
     store
         .save_result(&repo_id, &exact)
         .await
@@ -1610,7 +1640,8 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
 async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
     let _guard = env_lock().lock().await;
     init(false);
-    let (server, barrier, entered, proceed) = start_server_split_storage_phase_one_barrier().await;
+    let (server, barrier, entered, proceed) =
+        start_server_split_storage_head_publish_barrier().await;
     let origin = make_origin("acme", "full-topup-merge");
     let a = origin.commit(&[("base.txt", "A\n")], "A");
     origin.publish();
@@ -1622,6 +1653,7 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
         .sync_repo("acme/full-topup-merge", None)
         .await
         .expect("publish merge base A");
+    wait_for_exact_full(server.client(), "acme/full-topup-merge", &a).await;
 
     git(&origin.work, &["checkout", "-q", "-b", "side"]);
     origin.commit(&[("side.txt", "side\n")], "side");
@@ -1646,7 +1678,7 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
     assert_ne!(a, b);
     origin.publish();
 
-    barrier.arm();
+    barrier.arm_for(&b);
     let sync_client = server.client();
     let mut sync_b =
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-merge", None).await });
@@ -1663,10 +1695,14 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
         .expect("merge B row");
     assert_eq!(exact.commit, b);
     assert!(
-        exact.full_clonepack.commit.is_empty(),
+        exact.full.is_none(),
         "a merge target must not carry an arbitrary first-parent Full artifact"
     );
-    assert_eq!(exact.parent_commit, None, "merge B has no safe sole parent");
+    assert_eq!(
+        exact.head.as_ref().unwrap().parent_commit,
+        None,
+        "merge B has no safe sole parent"
+    );
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -1706,7 +1742,8 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
 async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
     let _guard = env_lock().lock().await;
     init(false);
-    let (server, barrier, entered, proceed) = start_server_split_storage_phase_one_barrier().await;
+    let (server, barrier, entered, proceed) =
+        start_server_split_storage_head_publish_barrier().await;
     let origin = make_origin("acme", "full-topup-removed");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
@@ -1718,10 +1755,11 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
         .sync_repo("acme/full-topup-removed", None)
         .await
         .expect("publish removed-target A");
+    wait_for_exact_full(server.client(), "acme/full-topup-removed", &a).await;
 
-    barrier.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    barrier.arm_for(&b);
     let sync_client = server.client();
     let mut sync_b =
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-removed", None).await });
@@ -1811,9 +1849,10 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
 async fn cancellation_and_timeout_reap_git_helpers_before_staging_cleanup() {
     let _guard = env_lock().lock().await;
     init(false);
-    let (server, barrier, entered, proceed) = start_server_split_storage_phase_one_barrier().await;
+    let (server, barrier, entered, proceed) =
+        start_server_split_storage_head_publish_barrier().await;
     let origin = make_origin("acme", "full-topup-cancel");
-    origin.commit(&[("value.txt", "A\n")], "A");
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
     register_added_without_build(&server, "acme/full-topup-cancel")
         .await
@@ -1823,9 +1862,10 @@ async fn cancellation_and_timeout_reap_git_helpers_before_staging_cleanup() {
         .sync_repo("acme/full-topup-cancel", None)
         .await
         .expect("publish A");
-    barrier.arm();
-    origin.commit(&[("value.txt", "B\n")], "B");
+    wait_for_exact_full(server.client(), "acme/full-topup-cancel", &a).await;
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    barrier.arm_for(&b);
     let sync_client = server.client();
     let mut sync_b =
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-cancel", None).await });
@@ -1956,7 +1996,7 @@ async fn locally_configured_gitea_token_is_used_only_for_the_exact_fetch() {
         })
         .expect("configure private Gitea provider");
     let (server, barrier, entered, proceed) =
-        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+        start_server_split_storage_head_publish_barrier_with_registry(registry).await;
     let provider = ProviderInstance {
         id: ProviderInstanceId::new("gitea"),
         kind: ProviderKind::Gitea,
@@ -1964,7 +2004,7 @@ async fn locally_configured_gitea_token_is_used_only_for_the_exact_fetch() {
         auth_template: None,
         auth_header_name: None,
     };
-    origin.commit(&[("value.txt", "A\n")], "A");
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
     register_added_without_build_for_provider(&server, "gitea", "acme/full-topup-private")
         .await
@@ -1976,10 +2016,19 @@ async fn locally_configured_gitea_token_is_used_only_for_the_exact_fetch() {
         .sync_repo("acme/full-topup-private", None)
         .await
         .expect("publish private A");
+    wait_for_exact_full(
+        server
+            .client()
+            .with_provider_instance(provider.clone())
+            .with_upstream_token(secret),
+        "acme/full-topup-private",
+        &a,
+    )
+    .await;
 
-    barrier.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    barrier.arm_for(&b);
     let sync_client = server
         .client()
         .with_provider_instance(provider.clone())
@@ -2068,8 +2117,8 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
         })
         .expect("configure redirect provider");
     let (server, barrier, entered, proceed) =
-        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
-    origin.commit(&[("value.txt", "A\n")], "A");
+        start_server_split_storage_head_publish_barrier_with_registry(registry).await;
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
     register_added_without_build_for_provider(&server, "redirect", "acme/full-topup-redirect")
         .await
@@ -2081,10 +2130,19 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
         .sync_repo("acme/full-topup-redirect", None)
         .await
         .expect("publish Full(A)");
+    wait_for_exact_full(
+        server
+            .client()
+            .with_provider_instance(provider.clone())
+            .with_upstream_token(secret),
+        "acme/full-topup-redirect",
+        &a,
+    )
+    .await;
 
-    barrier.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
+    barrier.arm_for(&b);
     let sync_client = server
         .client()
         .with_provider_instance(provider.clone())
@@ -2099,6 +2157,42 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
         .expect("B reached phase-one publication")
         .expect("phase-one barrier alive");
 
+    let plan = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/redirect/acme/full-topup-redirect/refs/main?result=full&pinned={b}&top_up=true",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("X-Upstream-Token", secret)
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("read pinned top-up plan");
+    assert_eq!(plan.status(), StatusCode::ACCEPTED);
+    let plan: serde_json::Value = plan.json().await.expect("top-up plan JSON");
+    assert_eq!(plan["top_up_supported"], true);
+    let store = server_ref_store(&server).await;
+    let repo_id = RepoId {
+        provider: ProviderInstanceId::new("redirect"),
+        path: "acme/full-topup-redirect".to_string(),
+    };
+    let exact_b = store
+        .load_result(&repo_id, &b)
+        .await
+        .expect("load exact B")
+        .expect("exact B exists");
+    assert_eq!(
+        exact_b.head.as_ref().unwrap().parent_commit.as_deref(),
+        Some(a.as_str())
+    );
+    let exact_a = store
+        .load_result(&repo_id, &a)
+        .await
+        .expect("load exact A")
+        .expect("exact A exists");
+    assert!(exact_a.full.is_some(), "exact Full(A) exists: {plan}");
+    assert_eq!(plan["top_up_base"]["commit"], a, "plan: {plan}");
+
     let (redirect_url, source_request, target_requests, source_task, target_task) =
         start_authenticated_redirect_source().await;
     let redirect_provider = ProviderInstance {
@@ -2107,22 +2201,30 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
     };
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
-    let error = server
+    let install_client = server
         .client()
         .with_provider_instance(redirect_provider)
-        .with_upstream_token(secret)
-        .install_repo_with_mode_at(
-            "acme/full-topup-redirect",
-            "HEAD",
-            None,
-            &target,
-            CloneMode::Editable,
-            Some("full"),
-            None,
-        )
-        .await
-        .expect_err("an authenticated redirect must fail closed");
+        .with_upstream_token(secret);
+    let install_target = target.clone();
+    let install = tokio::spawn(async move {
+        install_client
+            .install_repo_with_mode_at(
+                "acme/full-topup-redirect",
+                "HEAD",
+                None,
+                &install_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
     source_task.await.expect("redirect source task joined");
+    proceed.send(()).expect("release Full(B)");
+    let error = install
+        .await
+        .expect("redirect install task joined")
+        .expect_err("an authenticated redirect must fail closed");
     target_task.abort();
 
     let request = source_request
@@ -2147,7 +2249,6 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
         "the failure must retain the pinned B identity"
     );
 
-    proceed.send(()).expect("release Full(B)");
     tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
         .await
         .expect("Full(B) finished after release")
@@ -2191,7 +2292,12 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
         .expect("register and publish MinIO A");
     let ready_a = server
         .client()
-        .resolve_ref_with_clonepack("acme/full-topup-minio", "main", Some("full"), None)
+        .resolve_exact_result(
+            "acme/full-topup-minio",
+            "main",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("wait for MinIO Full(A)");
     assert_eq!(ready_a.commit, a);
@@ -2206,9 +2312,9 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
             .expect("prime base setup artifact in explicit client cache");
     }
 
-    let phase_barrier = controls.path().join("phase-two");
+    let head_barrier = controls.path().join("after-head");
     let staging_barrier = controls.path().join("staging-barrier");
-    let _phase_two_barrier = ScopedEnvVar::set("RIPCLONE_TEST_PHASE2_BARRIER_DIR", &phase_barrier);
+    let _head_barrier = ScopedEnvVar::set("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR", &head_barrier);
     let _signed_url_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
     let _staging_barrier =
@@ -2219,16 +2325,16 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
     let mut sync_b =
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-minio", None).await });
     for _ in 0..800 {
-        if phase_barrier.join("entered").exists() {
+        if head_barrier.join("entered").exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(phase_barrier.join("entered").exists());
+    assert!(head_barrier.join("entered").exists());
 
     let plan = reqwest::Client::new()
         .get(format!(
-            "{}/v1/repos/github/acme/full-topup-minio/refs/main?clonepack=full&pinned={b}&top_up=true",
+            "{}/v1/repos/github/acme/full-topup-minio/refs/main?result=full&pinned={b}&top_up=true",
             server.url
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -2348,7 +2454,7 @@ signed_requests={} authenticated_pinned_requests={} ripclone_auth_requests={}",
             .load(std::sync::atomic::Ordering::SeqCst),
     );
 
-    std::fs::write(phase_barrier.join("proceed"), b"release\n").unwrap();
+    std::fs::write(head_barrier.join("proceed"), b"release\n").unwrap();
     tokio::time::timeout(Duration::from_secs(30), &mut sync_b)
         .await
         .expect("MinIO Full(B) finished after release")
@@ -2356,5 +2462,5 @@ signed_requests={} authenticated_pinned_requests={} ripclone_auth_requests={}",
         .expect("sync MinIO B");
     // `sync_repo` completes after phase one. Keep the local source and the
     // server alive until the detached archive worker reports B fully settled.
-    wait_for_archive_settled(&server, "acme/full-topup-minio", &b).await;
+    wait_for_files_job_settled(&server, "acme/full-topup-minio", &b).await;
 }

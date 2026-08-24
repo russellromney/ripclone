@@ -47,8 +47,7 @@ fn build_branches(origin: &Origin, n: usize, base_depth: usize) -> Vec<(String, 
     out
 }
 
-/// Clone one branch's full (depth=0) artifacts, polling until phase 2 has
-/// published the full clonepack at the expected commit count.
+/// Clone one branch's Full result, polling until it reaches the expected count.
 async fn clone_branch_full(
     server: &Server,
     repo: &str,
@@ -103,7 +102,7 @@ fn assert_branch_isolated(dir: &Path, branch: &str, depth: usize, all: &[(String
 async fn concurrent_distinct_branch_builds_for_one_repo_do_not_interleave() {
     // Make the in-process build pool actually parallelize same-repo builds.
     unsafe { std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "8") };
-    setup(true); // two-phase + LSM + async — production defaults
+    setup(true); // separate exact results + LSM + async — production defaults
     let server = start_server().await;
     let origin = make_origin("acme", "conc");
     origin.commit(&[("base.txt", "base\n")], "c0"); // main, depth 1

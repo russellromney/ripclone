@@ -38,7 +38,7 @@ async fn async_sync_then_clone() {
     assert_eq!(git(&c1, &["rev-list", "--count", "HEAD"]), "1");
     assert_eq!(git(&c1, &["status", "--porcelain"]), "");
 
-    // depth=0 (full) builds in the background under two-phase, so poll for it.
+    // Full builds in the background, so poll for it.
     let (_g0, c0) = clone_full_at(&server, "acme", "aq", "2").await;
     assert_eq!(read(&c0, "a.txt"), "2\n");
     assert!(git_ok(&c0, &["fsck", "--connectivity-only", "HEAD"]));
@@ -75,7 +75,7 @@ async fn async_concurrent_syncs_coalesce() {
         "all coalesced syncs return the same commit: {commits:?}"
     );
 
-    // depth=0 (full) builds in the background under two-phase, so poll for it.
+    // Full builds in the background, so poll for it.
     let (_g, c) = clone_full_at(&server, "acme", "aqc", "2").await;
     assert_eq!(read(&c, "f"), "2\n");
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));

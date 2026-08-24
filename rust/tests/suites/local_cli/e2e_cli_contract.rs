@@ -164,13 +164,11 @@ async fn identity_response_server(
                     "provider": "github",
                     "host": "github.com",
                     "origin_url": "https://github.com/acme/identity.git",
-                    "default_branch": "main",
                     "commit": commit,
                     "parent_commit": null,
                     "clonepack_manifest": "manifest",
                     "metadata_chunk": "metadata",
-                    "shallow": false,
-                    "archive_ready": true
+                    "result": "full"
                 }),
             };
             if let Some(branch) = body_branch {
@@ -393,7 +391,12 @@ async fn release_cli_sync_clone_failure_and_cleanup_contract() {
         .expect("publish ready B");
     server
         .client_with_provider("cli-http", Some("cli-token"))
-        .resolve_ref_with_clonepack("acme/cli-ready", &b, Some("full"), Some(&b))
+        .resolve_exact_result(
+            "acme/cli-ready",
+            &b,
+            ripclone::ExactResultKind::Full,
+            Some(&b),
+        )
         .await
         .expect("settle exact B before the no-write ready probe");
     let durable_before = (

@@ -43,13 +43,10 @@ async fn add_registers_builds_and_makes_repo_cloneable() {
         .find(|entry| entry["commit"] == added.commit)
         .expect("exact commit status");
     assert!(exact.get("branch").is_none());
-    assert_eq!(exact["depth1_ready"], true);
-    assert!(exact["archive_ready"].is_boolean());
-    assert!(
-        ["ready", "building"].contains(&exact["history"].as_str().unwrap()),
-        "unexpected history status: {}",
-        exact["history"]
-    );
+    assert_eq!(exact["head"], true);
+    assert!(exact["full"].is_boolean());
+    assert!(exact["files"].is_boolean());
+    assert!(exact["job"].is_string());
 
     let (_tmp, clone) = clone_only(
         &server,
@@ -73,7 +70,7 @@ async fn non_added_repo_ref_and_sync_are_rejected() {
     let server = start_server().await;
     let resp = reqwest::Client::new()
         .get(format!(
-            "{}/v1/repos/github/{}/{}/refs/HEAD",
+            "{}/v1/repos/github/{}/{}/refs/HEAD?result=full",
             server.url, origin.owner, origin.repo
         ))
         .header("Authorization", format!("Ripclone {}", token_hash()))

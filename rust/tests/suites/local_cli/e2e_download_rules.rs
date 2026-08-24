@@ -160,7 +160,7 @@ async fn files_extraction_writes_an_early_file_while_the_final_archive_chunk_is_
     origin.commit_bytes(&refs, "c1");
     origin.publish();
 
-    let info = sync_until_archive_ready(&server, "acme", "overlap-files").await;
+    let info = sync_until_files_ready(&server, "acme", "overlap-files").await;
     let (manifest, _metadata) = server
         .client()
         .fetch_clonepack(&info)
@@ -248,7 +248,7 @@ async fn editable_installs_an_earlier_pack_while_a_later_pack_is_held() {
     );
     origin.publish();
 
-    let info = sync_until_archive_ready(&server, "acme", "overlap-editable").await;
+    let info = sync_until_full_ready(&server, "acme", "overlap-editable").await;
     let (manifest, metadata) = server
         .client()
         .fetch_clonepack(&info)
@@ -333,7 +333,7 @@ async fn editable_history_pack_streams_to_one_temp_file_then_is_renamed() {
     origin.commit(&[("a.txt", noisy(13, 8192).as_str())], "c3");
     origin.publish();
 
-    let info = sync_until_archive_ready(&server, "acme", "stream-history").await;
+    let info = sync_until_full_ready(&server, "acme", "stream-history").await;
     let (manifest, _metadata) = server
         .client()
         .fetch_clonepack(&info)
@@ -429,7 +429,7 @@ async fn transient_pack_failure_is_retried_and_the_editable_clone_succeeds() {
     origin.commit(&[("a.txt", "one\n")], "c1");
     origin.commit(&[("a.txt", "two\n"), ("dir/b.txt", "x\n")], "c2");
     origin.publish();
-    sync_until_manifest(&server, "acme", "retry-editable").await;
+    sync_until_full_ready(&server, "acme", "retry-editable").await;
 
     let (_out, target) = clone_only(&server, "acme", "retry-editable", 0, CloneMode::Editable)
         .await
@@ -481,10 +481,19 @@ async fn republish_resolved_manifest(
         };
         let mut changed = false;
         for slot in [
-            &mut info.manifest,
-            &mut info.full_clonepack.manifest,
-            &mut info.shallow_clonepack.manifest,
-        ] {
+            info.head
+                .as_mut()
+                .map(|result| &mut result.clonepack.manifest),
+            info.full
+                .as_mut()
+                .map(|result| &mut result.clonepack.manifest),
+            info.files
+                .as_mut()
+                .map(|result| &mut result.clonepack.manifest),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if slot == resolved {
                 *slot = hash.clone();
                 changed = true;
@@ -531,11 +540,16 @@ async fn wrong_archive_chunk_length_fails_without_a_url_refresh() {
     register_added_without_build(&server, "acme/short-chunk")
         .await
         .expect("register the length fixture");
-    sync_until_archive_ready(&server, "acme", "short-chunk").await;
+    sync_until_files_ready(&server, "acme", "short-chunk").await;
 
     let client = server.client();
     let resolved = client
-        .resolve_ref_with_clonepack("acme/short-chunk", "HEAD", Some("full"), None)
+        .resolve_exact_result(
+            "acme/short-chunk",
+            "HEAD",
+            ripclone::ExactResultKind::Files,
+            None,
+        )
         .await
         .expect("resolve before rewriting")
         .clonepack_manifest;
@@ -549,7 +563,12 @@ async fn wrong_archive_chunk_length_fails_without_a_url_refresh() {
         })
         .await;
     let info = client
-        .resolve_ref_with_clonepack("acme/short-chunk", "HEAD", Some("full"), None)
+        .resolve_exact_result(
+            "acme/short-chunk",
+            "HEAD",
+            ripclone::ExactResultKind::Files,
+            None,
+        )
         .await
         .expect("resolve the rewritten ref");
     assert_eq!(
@@ -603,7 +622,7 @@ async fn missing_archive_chunk_fails_without_a_url_refresh() {
     origin.commit(&[("a.txt", noisy(31, 4096).as_str())], "c1");
     origin.publish();
 
-    let info = sync_until_archive_ready(&server, "acme", "gone-chunk").await;
+    let info = sync_until_files_ready(&server, "acme", "gone-chunk").await;
     let client = server.client();
     let (manifest, _metadata) = client
         .fetch_clonepack(&info)
@@ -663,7 +682,7 @@ async fn a_failed_clone_leaves_no_incomplete_cache_object() {
     );
     origin.publish();
 
-    let info = sync_until_archive_ready(&server, "acme", "cache-fail").await;
+    let info = sync_until_files_ready(&server, "acme", "cache-fail").await;
     let (manifest, _metadata) = server
         .client()
         .fetch_clonepack(&info)
@@ -748,7 +767,7 @@ async fn the_authenticated_gateway_receives_the_client_credential() {
     origin.commit(&[("a.txt", noisy(53, 4096).as_str())], "c1");
     origin.publish();
 
-    let info = sync_until_archive_ready(&server, "acme", "gateway-cred").await;
+    let info = sync_until_files_ready(&server, "acme", "gateway-cred").await;
     let (manifest, _metadata) = server
         .client()
         .fetch_clonepack(&info)

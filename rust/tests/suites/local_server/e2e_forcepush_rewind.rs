@@ -11,7 +11,7 @@ use crate::common::*;
 /// tip, sync, and assert the served ref is the shallow tip (byte-correct).
 #[tokio::test]
 async fn forcepush_rewind_to_shallower_tip_serves_new_tip() {
-    setup(true); // two-phase + LSM + async (production defaults)
+    setup(true); // separate exact results + LSM + async (production defaults)
     let server = start_server().await;
     let origin = make_origin("acme", "fprewind");
 
@@ -31,7 +31,7 @@ async fn forcepush_rewind_to_shallower_tip_serves_new_tip() {
         .sync_repo("acme/fprewind", None)
         .await
         .expect("sync c5");
-    // Let phase 2 land so the branch is fully warm at the deep tip (count 5).
+    // Let Full land so the branch is fully warm at the deep tip (count 5).
     let _ = clone_full_at(&server, "acme", "fprewind", "5").await;
 
     // Force-push rewind: reset to c2 and land a fresh tip on top. The new tip has

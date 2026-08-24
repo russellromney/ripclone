@@ -174,11 +174,10 @@ async fn completed_exact_result_rebuilds_after_real_gc_eviction() {
         .await
         .unwrap()
         .expect("load completed exact B");
-    assert!(completed.build_status.is_none());
-    assert!(!completed.full_clonepack.manifest.is_empty());
-    assert!(!completed.archive_chunks.is_empty());
-    let old_manifest = completed.full_clonepack.manifest.clone();
-    let old_archive = completed.archive_chunks[0].clone();
+    let completed_full = completed.full.as_ref().expect("Full(B) ready");
+    let completed_files = completed.files.as_ref().expect("Files(B) ready");
+    let old_manifest = completed_full.clonepack.manifest.clone();
+    let old_archive = completed_files.archive_chunks[0].clone();
 
     // Age only the completed row; RemoteGc performs the real eviction status
     // mutation and removes the now-unreachable artifact objects.
@@ -204,11 +203,7 @@ async fn completed_exact_result_rebuilds_after_real_gc_eviction() {
     assert!(!server.storage_path(&old_manifest).exists());
     assert!(!server.storage_path(&old_archive).exists());
     let evicted = ref_store.load_result(&repo_id, &b).await.unwrap().unwrap();
-    assert_eq!(evicted.build_status.as_deref(), Some("evicted"));
-    assert_eq!(
-        evicted.full_clonepack.manifest, old_manifest,
-        "real eviction retains the production artifact pointers"
-    );
+    assert!(evicted.head.is_none() && evicted.full.is_none() && evicted.files.is_none());
 
     let (_full_guard, full) = clone_only_at(
         &server,
@@ -240,7 +235,7 @@ async fn completed_exact_result_rebuilds_after_real_gc_eviction() {
 
     let rebuilt = ref_store.load_result(&repo_id, &b).await.unwrap().unwrap();
     assert_eq!(rebuilt.commit, b);
-    assert!(rebuilt.build_status.is_none(), "rebuild clears eviction");
-    assert!(!rebuilt.full_clonepack.manifest.is_empty());
-    assert!(!rebuilt.archive_chunks.is_empty());
+    assert!(rebuilt.head.is_some(), "rebuild restores Head");
+    assert!(rebuilt.full.is_some(), "rebuild restores Full");
+    assert!(rebuilt.files.is_some(), "rebuild restores Files");
 }

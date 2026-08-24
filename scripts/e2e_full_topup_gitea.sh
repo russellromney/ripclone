@@ -79,7 +79,7 @@ if [ -n "${CI_ARTIFACTS:-}" ]; then
   }
   run=("$test_bin" --ignored --exact "$TEST_NAME" --nocapture)
 else
-  listed="$(cd "$ROOT/rust" && timeout 60 cargo test --profile ci --locked --test e2e_gitea_provider -- --ignored --list)"
+  listed="$(cd "$ROOT/rust" && timeout 300 cargo test --profile ci --locked --test e2e_gitea_provider -- --ignored --list)"
   grep -Fqx "$TEST_NAME: test" <<<"$listed" || {
     echo "error: exact Gitea test '$TEST_NAME' is missing" >&2
     exit 1
@@ -109,8 +109,8 @@ if grep -Fq "SKIP" "$log"; then
   echo "error: Gitea proof emitted SKIP" >&2
   exit 1
 fi
-if grep -Fq "full clone build failed" "$log"; then
-  echo "error: Gitea proof logged a failed background Full build" >&2
+if grep -Fq "background build failed" "$log" || grep -Fq "fatal:" "$log"; then
+  echo "error: Gitea proof logged an exact-result build failure" >&2
   exit 1
 fi
 rm -f "$log"

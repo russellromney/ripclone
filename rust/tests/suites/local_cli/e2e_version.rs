@@ -50,7 +50,10 @@ async fn server_rejects_explicit_wrong_protocol() {
     let client = reqwest::Client::new();
     for header in ["1", "999", "not-a-number"] {
         let request = client
-            .get(format!("{}/v1/repos/github/acme/x/refs/main", server.url))
+            .get(format!(
+                "{}/v1/repos/github/acme/x/refs/main?result=full",
+                server.url
+            ))
             .header("Authorization", format!("Ripclone {}", token_hash()));
         let request = request.header("x-ripclone-protocol", header);
         let resp = request.send().await.unwrap();

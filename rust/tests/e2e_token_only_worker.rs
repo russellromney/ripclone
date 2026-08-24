@@ -180,8 +180,8 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         .env("RIPCLONE_METADATA_JOB_TOKEN", token)
         .env("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS", "3")
         .env("RIPCLONE_TESTING", "1")
-        .env("RIPCLONE_TEST_PHASE2_BARRIER_DIR", &full_barrier)
-        .env("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT", &commit)
+        .env("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR", &full_barrier)
+        .env("RIPCLONE_TEST_AFTER_HEAD_BARRIER_COMMIT", &commit)
         .env_remove("RIPCLONE_WORKER_HEARTBEAT")
         .env_remove("RIPCLONE_CONTROL_DB_PATH")
         .env_remove("RIPCLONE_TURSO_DATABASE_URL")
@@ -239,8 +239,14 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         .unwrap()
         .expect("Head publication is durable before held Full");
     assert_eq!(exact.commit, commit);
-    assert_eq!(exact.build_status.as_deref(), Some("full history building"));
-    assert!(!exact.shallow_clonepack.manifest.is_empty());
+    assert!(
+        exact.head.is_some(),
+        "Head is published before Full is released"
+    );
+    assert!(
+        exact.full.is_none(),
+        "Full remains unavailable at its barrier"
+    );
 
     // The live repository setting may change while Full is in flight, but the
     // durable job and token-only claim keep the admitted snapshot.

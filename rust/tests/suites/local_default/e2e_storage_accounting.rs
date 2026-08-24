@@ -62,9 +62,9 @@ async fn status_reports_nonzero_bytes_after_sync() {
     let commit = origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
-    // Wait for the full clonepack to publish (phase 2) so all artifacts are
+    // Wait for Full to publish so all artifacts are
     // accounted for in the byte totals.
-    sync_until_manifest(&server, "acme", "storage-accounting").await;
+    sync_until_full_ready(&server, "acme", "storage-accounting").await;
 
     let status = get_status(&server, "acme", "storage-accounting", None).await;
     let refs = status["refs"].as_array().unwrap();
@@ -86,7 +86,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
     let origin = make_origin("acme", "historical-storage-accounting");
     let current = origin.commit(&[("a.txt", "shared artifact bytes\n")], "c1");
     origin.publish();
-    sync_until_manifest(&server, "acme", "historical-storage-accounting").await;
+    sync_until_full_ready(&server, "acme", "historical-storage-accounting").await;
 
     let before = get_status(&server, "acme", "historical-storage-accounting", None).await;
     let store = server_ref_store(&server).await;
@@ -98,7 +98,7 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
         .expect("ordinary sync publishes an exact result");
     let storage = ripclone::storage::local(&server.storage_dir).expect("open local storage");
     let moving_manifest_bytes = storage
-        .get(&info.full_clonepack.manifest)
+        .get(&info.full.as_ref().expect("Full result").clonepack.manifest)
         .expect("read moving full manifest");
     let mut historical_manifest = ClonepackManifest::decode(moving_manifest_bytes.as_slice())
         .expect("decode moving full manifest");
@@ -128,8 +128,9 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
 
     let mut historical_info = info;
     historical_info.commit = historical_commit.clone();
-    historical_info.full_clonepack.commit = historical_commit.clone();
-    historical_info.full_clonepack.manifest = historical_manifest_hash.clone();
+    let historical_full = historical_info.full.as_mut().expect("Full result");
+    historical_full.clonepack.commit = historical_commit.clone();
+    historical_full.clonepack.manifest = historical_manifest_hash.clone();
     store
         .save_result(&repo_id, &historical_info)
         .await
@@ -189,8 +190,8 @@ async fn accepted_sync_reports_build_timings_through_metrics_and_status() {
         .text()
         .await
         .expect("metrics text");
-    let before_publish_p1 =
-        prometheus_value(&before_metrics, "ripclone_sync_publish_p1_ms_total").unwrap_or(0);
+    let before_publish_head =
+        prometheus_value(&before_metrics, "ripclone_sync_publish_head_ms_total").unwrap_or(0);
     // Admission returns before build timing data exists. The completed build
     // publishes those timings through metrics and status instead.
     let sync_url = format!(
@@ -208,7 +209,7 @@ async fn accepted_sync_reports_build_timings_through_metrics_and_status() {
     let accepted: serde_json::Value = sync_resp.json().await.expect("accepted response json");
     assert_eq!(accepted["commit"], c2);
 
-    sync_until_manifest(&server, "acme", "synctiming").await;
+    sync_until_full_ready(&server, "acme", "synctiming").await;
     let metrics = client
         .get(format!("{}/metrics", server.url))
         .send()
@@ -219,28 +220,23 @@ async fn accepted_sync_reports_build_timings_through_metrics_and_status() {
         .text()
         .await
         .expect("metrics text");
-    let after_publish_p1 = prometheus_value(&metrics, "ripclone_sync_publish_p1_ms_total")
-        .expect("publish p1 metric present");
+    let after_publish_head = prometheus_value(&metrics, "ripclone_sync_publish_head_ms_total")
+        .expect("Head publish metric present");
     assert!(
-        after_publish_p1 > before_publish_p1,
-        "completed phase-one timing should feed /metrics without RIPCLONE_BENCH"
+        after_publish_head > before_publish_head,
+        "completed Head timing should feed /metrics without RIPCLONE_BENCH"
     );
 
-    let mut build_ms = None;
-    for _ in 0..80 {
-        let status = get_status(&server, "acme", "synctiming", None).await;
-        build_ms = status["refs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["commit"] == c2)
-            .and_then(|entry| entry["build_ms"].as_u64());
-        if build_ms.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    assert!(build_ms.is_some(), "status should report build_ms");
+    let status = get_status(&server, "acme", "synctiming", None).await;
+    let exact = status["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["commit"] == c2)
+        .expect("status reports exact commit");
+    assert_eq!(exact["head"], true);
+    assert_eq!(exact["full"], true);
+    assert_eq!(exact["files"], true);
 }
 
 #[tokio::test]
