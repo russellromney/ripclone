@@ -1413,6 +1413,7 @@ impl Client {
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
+            let request_was_pinned = pinned.is_some();
             let requested_top_up = allow_top_up && pinned.is_some() && rev.is_none();
             let request_branch = if pinned.is_some() {
                 resolved_branch
@@ -1605,6 +1606,13 @@ impl Client {
                             });
                         }
                     };
+                if request_was_pinned && let Some(unavailable) = unavailable.as_ref() {
+                    anyhow::bail!(
+                        "ref lookup for pinned commit {} failed: {}",
+                        unavailable.commit,
+                        unavailable.error
+                    );
+                }
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }

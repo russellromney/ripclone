@@ -365,7 +365,7 @@ async fn pinned_top_up_requires_the_current_pending_shape() {
 }
 
 #[tokio::test]
-async fn exact_service_unavailable_establishes_and_preserves_the_pin() {
+async fn unpinned_unavailable_establishes_a_pin_and_pinned_failure_is_immediate() {
     let _guard = env_lock().lock().await;
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
@@ -393,14 +393,32 @@ async fn exact_service_unavailable_establishes_and_preserves_the_pin() {
         assert!(pre_pin_requests[1].contains(&format!("pinned={A}")));
     }
 
+    let failed = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "error": "full result failed: forced Full failure",
+            "commit": A,
+            "branch": "main"
+        }),
+    );
     let (url, post_pin_requests, post_pin_task) =
-        scripted_server(vec![pending(A), exact_unavailable(), ready(A)]).await;
-    Client::new(url)
+        scripted_server(vec![pending(A), failed, ready(A)]).await;
+    let error = Client::new(url)
         .resolve_exact_result("acme/demo", "main", ripclone::ExactResultKind::Full, None)
         .await
-        .expect("post-pin 503 retries exact selector");
+        .expect_err("a pinned job failure must stop polling");
     abort_server_task(post_pin_task).await;
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("full result failed: forced Full failure"),
+        "{error}"
+    );
     let post_pin_requests = post_pin_requests.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        post_pin_requests.len(),
+        2,
+        "a pinned failure must not be polled again"
+    );
     assert!(!post_pin_requests[0].contains("pinned="));
     assert!(
         post_pin_requests
