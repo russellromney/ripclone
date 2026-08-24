@@ -7209,9 +7209,10 @@ async fn process_build_job_with_foreground_release(
                     repo_id.storage_key()
                 );
             }
-            // The deterministic failure hook represents a settled build
-            // result. Signal it only after terminal metadata (when applicable)
-            // and cache invalidation are visible to observers.
+            // The deterministic hook observes that artifact work stopped. The
+            // embedded worker acknowledges the job immediately after this
+            // function returns; tests that require the durable Failed state
+            // must observe the queue as well.
             admission_test_build_failure(Some(&job.admitted_commit), classified.message());
             Err(classified)
         }

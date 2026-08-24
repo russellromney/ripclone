@@ -57,6 +57,34 @@ async fn wait_entered(barrier: &ripclone::server::AdmissionTestBarrier, count: u
         .expect("admission barrier entered within 20 seconds");
 }
 
+async fn wait_until_exact_job_failed(server: &Server, repo: &str, commit: &str) -> String {
+    let queue = ripclone::queue::SqlJobQueue::new(Box::new(
+        ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
+            .await
+            .expect("connect exact job observer"),
+    ))
+    .await
+    .expect("open exact job observer");
+    let key = format!(
+        "{}\x1f{commit}",
+        ripclone::provider::RepoId::github(repo).storage_key()
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match ripclone::queue::JobQueue::job_state_for_key(&queue, &key)
+                .await
+                .expect("read exact job state")
+            {
+                ripclone::queue::JobState::Failed(error) => break error,
+                ripclone::queue::JobState::Pending => tokio::task::yield_now().await,
+                state => panic!("exact job left the active path as {state:?}"),
+            }
+        }
+    })
+    .await
+    .expect("exact job reached durable Failed state")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_b_and_c_admissions_create_independent_exact_work() {
     let _guard = env_lock().lock().await;
@@ -1385,6 +1413,12 @@ async fn e2e_sync_admission() {
         "failure retains admitted identity"
     );
     assert!(!failures[0].1.is_empty(), "failure includes a clear cause");
+    let durable_failure =
+        wait_until_exact_job_failed(&server, "acme/immutable", &unavailable).await;
+    assert!(
+        !durable_failure.is_empty(),
+        "durable exact job failure includes a clear cause"
+    );
     assert_eq!(
         probe.fetch_targets.lock().unwrap().as_slice(),
         [unavailable.as_str()],
