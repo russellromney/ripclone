@@ -2066,6 +2066,135 @@ struct WorkerRefReadQuery {
     commit: String,
 }
 
+enum ExactResultRef<'a> {
+    Head(&'a crate::HeadResult),
+    Full(&'a crate::FullResult),
+    Files(&'a crate::FilesResult),
+}
+
+impl ExactResultRef<'_> {
+    fn kind(&self) -> ExactResultKind {
+        match self {
+            Self::Head(_) => ExactResultKind::Head,
+            Self::Full(_) => ExactResultKind::Full,
+            Self::Files(_) => ExactResultKind::Files,
+        }
+    }
+
+    fn artifacts(&self) -> &crate::ClonepackArtifacts {
+        match self {
+            Self::Head(result) => &result.clonepack,
+            Self::Full(result) => &result.clonepack,
+            Self::Files(result) => &result.clonepack,
+        }
+    }
+}
+
+fn manifest_ref_hash(reference: Option<&ChunkRef>) -> String {
+    reference
+        .map(|reference| hash_to_hex(&reference.hash))
+        .unwrap_or_default()
+}
+
+fn validate_manifest_packs(
+    manifest: &ClonepackManifest,
+    reported: &[crate::PackArtifact],
+) -> Result<()> {
+    anyhow::ensure!(
+        manifest.packs.len() == reported.len(),
+        "manifest pack count does not match reported result"
+    );
+    for (index, (manifest_pack, reported_pack)) in
+        manifest.packs.iter().zip(reported.iter()).enumerate()
+    {
+        anyhow::ensure!(
+            manifest_ref_hash(manifest_pack.pack.as_ref()) == reported_pack.pack
+                && manifest_ref_hash(manifest_pack.idx.as_ref()) == reported_pack.idx,
+            "manifest pack {index} does not match reported result"
+        );
+    }
+    Ok(())
+}
+
+/// Validate one authenticated job result before its claim-protected mutation.
+/// The manifest is the only object fetched here: normal readiness remains a
+/// metadata-only check, and content-addressed child uploads remain repeatable.
+async fn validate_claimed_result_manifest(
+    storage: &StorageRef,
+    commit: &str,
+    result: ExactResultRef<'_>,
+) -> Result<()> {
+    let kind = result.kind();
+    let artifacts = result.artifacts();
+    anyhow::ensure!(
+        crate::exact_output_artifacts_ready(commit, kind, artifacts),
+        "invalid {kind} result for exact commit {commit}"
+    );
+
+    let storage = storage.clone();
+    let manifest_hash = artifacts.manifest.clone();
+    let fetch_hash = manifest_hash.clone();
+    let bytes = tokio::task::spawn_blocking(move || storage.get(&fetch_hash))
+        .await
+        .context("fetch claimed result manifest task")?
+        .context("fetch claimed result manifest")?;
+    anyhow::ensure!(
+        crate::cas::hash(&bytes) == manifest_hash,
+        "claimed result manifest digest does not match its artifact ID"
+    );
+    let manifest =
+        ClonepackManifest::decode(bytes.as_slice()).context("decode claimed result manifest")?;
+    anyhow::ensure!(
+        manifest.commit == commit,
+        "claimed result manifest commit does not match exact commit {commit}"
+    );
+    anyhow::ensure!(
+        manifest_ref_hash(manifest.metadata_chunk.as_ref()) == artifacts.metadata_chunk,
+        "claimed result manifest metadata does not match reported result"
+    );
+    anyhow::ensure!(
+        manifest_ref_hash(manifest.midx.as_ref()) == artifacts.midx,
+        "claimed result manifest MIDX does not match reported result"
+    );
+    anyhow::ensure!(
+        manifest_ref_hash(manifest.idx_bundle.as_ref()) == artifacts.idx_bundle,
+        "claimed result manifest idx bundle does not match reported result"
+    );
+
+    match result {
+        ExactResultRef::Head(result) => {
+            validate_manifest_packs(&manifest, &result.packs)?;
+            anyhow::ensure!(
+                manifest.archive_chunks.is_empty(),
+                "Head manifest contains an unreported archive list"
+            );
+        }
+        ExactResultRef::Full(result) => {
+            validate_manifest_packs(&manifest, &result.packs)?;
+            anyhow::ensure!(
+                manifest.archive_chunks.is_empty(),
+                "Full manifest contains an unreported archive list"
+            );
+        }
+        ExactResultRef::Files(result) => {
+            anyhow::ensure!(
+                manifest.packs.is_empty(),
+                "Files manifest contains an unreported pack list"
+            );
+            let manifest_archives: Vec<String> = manifest
+                .archive_chunks
+                .iter()
+                .map(|chunk| hash_to_hex(&chunk.hash))
+                .collect();
+            anyhow::ensure!(
+                manifest_archives == result.archive_chunks,
+                "Files manifest archive list does not match reported result"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `GET /v1/refs` — a worker reads the explicit results already published for
 /// the exact commit it owns. This lets a replacement job skip ready work.
 async fn ref_read_handler(
@@ -2149,12 +2278,17 @@ async fn ref_report_handler(
             head,
             ..
         } => {
-            if !crate::exact_output_artifacts_ready(&commit, ExactResultKind::Head, &head.clonepack)
+            if let Err(error) = validate_claimed_result_manifest(
+                &state.storage,
+                &commit,
+                ExactResultRef::Head(&head),
+            )
+            .await
             {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
-                        error: format!("invalid Head result for exact commit {commit}"),
+                        error: format!("invalid Head result for exact commit {commit}: {error:#}"),
                     }),
                 )
                     .into_response();
@@ -2185,12 +2319,17 @@ async fn ref_report_handler(
             full,
             ..
         } => {
-            if !crate::exact_output_artifacts_ready(&commit, ExactResultKind::Full, &full.clonepack)
+            if let Err(error) = validate_claimed_result_manifest(
+                &state.storage,
+                &commit,
+                ExactResultRef::Full(&full),
+            )
+            .await
             {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
-                        error: format!("invalid Full result for exact commit {commit}"),
+                        error: format!("invalid Full result for exact commit {commit}: {error:#}"),
                     }),
                 )
                     .into_response();
@@ -2220,15 +2359,17 @@ async fn ref_report_handler(
             files,
             ..
         } => {
-            if !crate::exact_output_artifacts_ready(
+            if let Err(error) = validate_claimed_result_manifest(
+                &state.storage,
                 &commit,
-                ExactResultKind::Files,
-                &files.clonepack,
-            ) {
+                ExactResultRef::Files(&files),
+            )
+            .await
+            {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
-                        error: format!("invalid Files result for exact commit {commit}"),
+                        error: format!("invalid Files result for exact commit {commit}: {error:#}"),
                     }),
                 )
                     .into_response();
@@ -4471,8 +4612,7 @@ async fn trigger_build(
         .ref_store
         .load_result(repo_id, &admitted_commit)
         .await
-        .ok()
-        .flatten();
+        .map_err(|e| format!("exact result lookup failed: {e}"))?;
     if let Some(info) = existing
         && exact_result_complete(&info, &admitted_commit)
     {
@@ -7696,6 +7836,43 @@ mod tests {
         }
     }
 
+    fn report_chunk(hash: &str) -> ChunkRef {
+        ChunkRef {
+            hash: hash_from_hex(hash).unwrap(),
+            len: 1,
+        }
+    }
+
+    fn put_report_manifest(
+        storage: &StorageRef,
+        manifest_commit: &str,
+        artifacts: &mut crate::ClonepackArtifacts,
+        packs: &[crate::PackArtifact],
+        archives: &[String],
+    ) {
+        let manifest = ClonepackManifest {
+            commit: manifest_commit.to_string(),
+            metadata_chunk: Some(report_chunk(&artifacts.metadata_chunk)),
+            archive_chunks: archives.iter().map(|hash| report_chunk(hash)).collect(),
+            packs: packs
+                .iter()
+                .map(|pack| crate::clonepack::PackEntry {
+                    pack: Some(report_chunk(&pack.pack)),
+                    idx: Some(report_chunk(&pack.idx)),
+                    ..Default::default()
+                })
+                .collect(),
+            midx: (!artifacts.midx.is_empty()).then(|| report_chunk(&artifacts.midx)),
+            idx_bundle: (!artifacts.idx_bundle.is_empty())
+                .then(|| report_chunk(&artifacts.idx_bundle)),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let hash = crate::cas::hash(&manifest);
+        storage.put(&hash, &manifest).unwrap();
+        artifacts.manifest = hash;
+    }
+
     #[test]
     fn exact_result_requires_the_requested_stored_result() {
         let commit = "a".repeat(40);
@@ -7828,6 +8005,7 @@ mod tests {
     struct TestSqlRefStore {
         path: PathBuf,
         inner: tokio::sync::OnceCell<Arc<crate::meta::SqlRefStore>>,
+        fail_next_result_read: AtomicBool,
     }
 
     impl TestSqlRefStore {
@@ -7835,7 +8013,12 @@ mod tests {
             Self {
                 path,
                 inner: tokio::sync::OnceCell::new(),
+                fail_next_result_read: AtomicBool::new(false),
             }
+        }
+
+        fn fail_next_result_read(&self) {
+            self.fail_next_result_read.store(true, Ordering::SeqCst);
         }
 
         async fn store(&self) -> anyhow::Result<&Arc<crate::meta::SqlRefStore>> {
@@ -7855,6 +8038,9 @@ mod tests {
             repo_id: &RepoId,
             commit: &str,
         ) -> anyhow::Result<Option<RefInfo>> {
+            if self.fail_next_result_read.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected request-path exact-result read failure");
+            }
             self.store().await?.load_result(repo_id, commit).await
         }
         async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> anyhow::Result<()> {
@@ -7998,14 +8184,44 @@ mod tests {
         receiver
     }
 
+    #[tokio::test]
+    async fn request_result_read_failure_returns_error_without_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TestSqlRefStore::new(
+            tmp.path().join("request-read-failure-refs.db"),
+        ));
+        let mut state = test_state_with_ref_store(&tmp, store.clone());
+        let mut dispatched = install_observed_queue(&mut state);
+        let repo_id = RepoId::github("acme/request-read-failure");
+        mark_added(&state, repo_id.clone()).await;
+        store.fail_next_result_read();
+
+        let error = trigger_build(&state, &repo_id, "a".repeat(40))
+            .await
+            .expect_err("request exact-result read failure must be returned");
+        assert!(error.contains("exact result lookup failed"), "{error}");
+        assert!(
+            dispatched.try_recv().is_err(),
+            "failed readiness lookup must not dispatch a job"
+        );
+    }
+
     fn test_state(tmp: &tempfile::TempDir) -> ServerState {
+        let ref_store: Arc<dyn RefStore> = Arc::new(TestSqlRefStore::new(
+            tmp.path().join("repos").join("test-control-refs.db"),
+        ));
+        test_state_with_ref_store(tmp, ref_store)
+    }
+
+    fn test_state_with_ref_store(
+        tmp: &tempfile::TempDir,
+        ref_store: Arc<dyn RefStore>,
+    ) -> ServerState {
         let cas_root = tmp.path().join("cas");
         let cas = Cas::new(&cas_root).unwrap();
         let storage = crate::storage::local(&cas_root).unwrap();
         let repo_root = tmp.path().join("repos");
         std::fs::create_dir_all(&repo_root).unwrap();
-        let ref_store: Arc<dyn RefStore> =
-            Arc::new(TestSqlRefStore::new(repo_root.join("test-control-refs.db")));
         let token_hash = hex::encode(Sha256::digest("secret"));
         let metrics = Metrics::new();
         let retention = Arc::new(Retention::new(cas.clone(), metrics.clone()).unwrap());
@@ -9882,79 +10098,123 @@ mod tests {
             )
             .await
             .unwrap();
+        let storage = state.storage.clone();
         let app = build_app(state);
         let wrong_commit = "b".repeat(40);
 
-        let mut wrong_head = crate::HeadResult {
+        let wrong_head = crate::HeadResult {
             clonepack: ready_artifacts(&wrong_commit, "wrong-head"),
             ..Default::default()
         };
-        wrong_head.clonepack.commit = wrong_commit.clone();
-        let valid_head = crate::HeadResult {
-            clonepack: ready_artifacts(&commit, "valid-head"),
-            ..Default::default()
-        };
-        let head_reports = [
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_head}),
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":crate::HeadResult::default()}),
-        ];
-        for body in &head_reports {
-            let response = app
-                .clone()
-                .oneshot(ref_report_request(Some(&tok), body))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-        let body = serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":valid_head});
-        assert_eq!(
-            app.clone()
-                .oneshot(ref_report_request(Some(&tok), &body))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
-
         let wrong_full = crate::FullResult {
             clonepack: ready_artifacts(&wrong_commit, "wrong-full"),
             ..Default::default()
         };
-        let full_reports = [
-            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_full}),
-            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":crate::FullResult::default()}),
-        ];
-        for body in &full_reports {
-            let response = app
-                .clone()
-                .oneshot(ref_report_request(Some(&tok), body))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-        let valid_full = crate::FullResult {
-            clonepack: ready_artifacts(&commit, "valid-full"),
-            ..Default::default()
-        };
-        let body = serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":valid_full});
-        assert_eq!(
-            app.clone()
-                .oneshot(ref_report_request(Some(&tok), &body))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
-
         let wrong_files = crate::FilesResult {
             clonepack: ready_artifacts(&wrong_commit, "wrong-files"),
             ..Default::default()
         };
-        let files_reports = [
+
+        let missing_head = crate::HeadResult {
+            clonepack: ready_artifacts(&commit, "missing-head-manifest"),
+            ..Default::default()
+        };
+        let missing_full = crate::FullResult {
+            clonepack: ready_artifacts(&commit, "missing-full-manifest"),
+            ..Default::default()
+        };
+        let mut missing_files_artifacts = ready_artifacts(&commit, "missing-files-manifest");
+        missing_files_artifacts.idx_bundle.clear();
+        let missing_files = crate::FilesResult {
+            clonepack: missing_files_artifacts,
+            ..Default::default()
+        };
+
+        let mut wrong_manifest_head = crate::HeadResult {
+            clonepack: ready_artifacts(&commit, "wrong-manifest-commit"),
+            ..Default::default()
+        };
+        put_report_manifest(
+            &storage,
+            &wrong_commit,
+            &mut wrong_manifest_head.clonepack,
+            &[],
+            &[],
+        );
+
+        let mut wrong_metadata_full = crate::FullResult {
+            clonepack: ready_artifacts(&commit, "wrong-manifest-metadata"),
+            ..Default::default()
+        };
+        put_report_manifest(
+            &storage,
+            &commit,
+            &mut wrong_metadata_full.clonepack,
+            &[],
+            &[],
+        );
+        wrong_metadata_full.clonepack.metadata_chunk = crate::cas::hash(b"other metadata");
+
+        let reported_pack = crate::PackArtifact {
+            pack: crate::cas::hash(b"reported pack"),
+            idx: crate::cas::hash(b"reported idx"),
+        };
+        let mut inconsistent_head = crate::HeadResult {
+            clonepack: ready_artifacts(&commit, "inconsistent-head-packs"),
+            packs: vec![reported_pack.clone()],
+            ..Default::default()
+        };
+        put_report_manifest(
+            &storage,
+            &commit,
+            &mut inconsistent_head.clonepack,
+            &[],
+            &[],
+        );
+        let mut inconsistent_full = crate::FullResult {
+            clonepack: ready_artifacts(&commit, "inconsistent-full-packs"),
+            packs: vec![reported_pack],
+            ..Default::default()
+        };
+        put_report_manifest(
+            &storage,
+            &commit,
+            &mut inconsistent_full.clonepack,
+            &[],
+            &[],
+        );
+        let mut inconsistent_files_artifacts = ready_artifacts(&commit, "inconsistent-files");
+        inconsistent_files_artifacts.idx_bundle.clear();
+        let mut inconsistent_files = crate::FilesResult {
+            clonepack: inconsistent_files_artifacts,
+            archive_chunks: vec![crate::cas::hash(b"reported archive")],
+            ..Default::default()
+        };
+        put_report_manifest(
+            &storage,
+            &commit,
+            &mut inconsistent_files.clonepack,
+            &[],
+            &[],
+        );
+
+        let invalid_reports = [
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_head}),
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":crate::HeadResult::default()}),
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":missing_head}),
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_manifest_head}),
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":inconsistent_head}),
+            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_full}),
+            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":crate::FullResult::default()}),
+            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":missing_full}),
+            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_metadata_full}),
+            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":inconsistent_full}),
             serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":wrong_files}),
             serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":crate::FilesResult::default()}),
+            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":missing_files}),
+            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":inconsistent_files}),
         ];
-        for body in &files_reports {
+        for body in &invalid_reports {
             let response = app
                 .clone()
                 .oneshot(ref_report_request(Some(&tok), body))
@@ -9962,18 +10222,49 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
-        let valid_files = crate::FilesResult {
-            clonepack: ready_artifacts(&commit, "valid-files"),
+
+        let unchanged = ref_store
+            .load_result(&rid, &commit)
+            .await
+            .unwrap()
+            .expect("invalid reports preserve the existing result");
+        assert!(unchanged.head.unwrap().clonepack.manifest.is_empty());
+        assert!(unchanged.full.unwrap().clonepack.manifest.is_empty());
+        assert!(unchanged.files.unwrap().clonepack.manifest.is_empty());
+
+        let mut valid_head = crate::HeadResult {
+            clonepack: ready_artifacts(&commit, "valid-head"),
             ..Default::default()
         };
-        let body = serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":valid_files});
-        assert_eq!(
-            app.oneshot(ref_report_request(Some(&tok), &body))
+        put_report_manifest(&storage, &commit, &mut valid_head.clonepack, &[], &[]);
+        let valid_head_manifest = valid_head.clonepack.manifest.clone();
+        let mut valid_full = crate::FullResult {
+            clonepack: ready_artifacts(&commit, "valid-full"),
+            ..Default::default()
+        };
+        put_report_manifest(&storage, &commit, &mut valid_full.clonepack, &[], &[]);
+        let valid_full_manifest = valid_full.clonepack.manifest.clone();
+        let mut valid_files_artifacts = ready_artifacts(&commit, "valid-files");
+        valid_files_artifacts.idx_bundle.clear();
+        let mut valid_files = crate::FilesResult {
+            clonepack: valid_files_artifacts,
+            ..Default::default()
+        };
+        put_report_manifest(&storage, &commit, &mut valid_files.clonepack, &[], &[]);
+        let valid_files_manifest = valid_files.clonepack.manifest.clone();
+        let valid_reports = [
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":valid_head}),
+            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":valid_full}),
+            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":valid_files}),
+        ];
+        for body in &valid_reports {
+            let response = app
+                .clone()
+                .oneshot(ref_report_request(Some(&tok), body))
                 .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
 
         let stored = ref_store
             .load_result(&rid, &commit)
@@ -9981,17 +10272,11 @@ mod tests {
             .unwrap()
             .expect("valid retries must replace invalid stored outputs");
         assert!(crate::exact_result_complete(&stored, &commit));
-        assert_eq!(
-            stored.head.unwrap().clonepack.manifest,
-            crate::cas::hash(b"valid-head-manifest")
-        );
-        assert_eq!(
-            stored.full.unwrap().clonepack.manifest,
-            crate::cas::hash(b"valid-full-manifest")
-        );
+        assert_eq!(stored.head.unwrap().clonepack.manifest, valid_head_manifest);
+        assert_eq!(stored.full.unwrap().clonepack.manifest, valid_full_manifest);
         assert_eq!(
             stored.files.unwrap().clonepack.manifest,
-            crate::cas::hash(b"valid-files-manifest")
+            valid_files_manifest
         );
     }
 
@@ -10027,12 +10312,14 @@ mod tests {
             )
             .await
             .unwrap();
+        let storage = state.storage.clone();
         let app = build_app(state);
 
-        let head = crate::HeadResult {
+        let mut head = crate::HeadResult {
             clonepack: ready_artifacts(&commit, "authorized-head"),
             ..Default::default()
         };
+        put_report_manifest(&storage, &commit, &mut head.clonepack, &[], &[]);
         let body = serde_json::json!({
             "op": "publish_head",
             "job_id": 1,
