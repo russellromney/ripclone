@@ -1,4 +1,4 @@
-//! One-commit Full-clone top-up through real phase-one publication.
+//! One-commit Full-clone top-up through real Head publication.
 
 mod common;
 
@@ -653,8 +653,8 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup", None).await });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("B reached phase-one publication")
-        .expect("phase-one barrier alive");
+        .expect("B reached Head publication")
+        .expect("Head publication barrier alive");
 
     origin.clear_auth_log();
 
@@ -1002,7 +1002,7 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
 
     // Restore B only so the intentionally blocked Full/Files work can finish
     // during fixture teardown. Exact-B precedence is proven separately while
-    // Full(A) is still carried by B's moving phase-one row.
+    // Full(A) remains available through B's exact Head parent.
     git(&origin.work, &["reset", "--hard", &b]);
     origin.publish();
     proceed.send(()).expect("release Full(B)");
@@ -1108,8 +1108,8 @@ async fn exact_full_b_precedes_available_carried_a_without_manifest_or_upstream(
     });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("B reached phase-one publication")
-        .expect("phase-one barrier alive");
+        .expect("B reached Head publication")
+        .expect("Head publication barrier alive");
 
     origin.clear_auth_log();
     let output = tempfile::tempdir().unwrap();
@@ -1155,7 +1155,7 @@ async fn exact_full_b_precedes_available_carried_a_without_manifest_or_upstream(
         "the first ordinary pending response must pin B before exact B publishes"
     );
 
-    // Full(A) is still a coherent carried base on B's phase-one row. Publish
+    // Full(A) is still a coherent exact-parent base for B. Publish
     // Full(B) before the client issues its pinned top-up request, then prove the
     // exact row wins without consulting either the carried manifest or upstream.
     proceed.send(()).expect("release Full(B)");
@@ -1177,7 +1177,7 @@ async fn exact_full_b_precedes_available_carried_a_without_manifest_or_upstream(
         .await
         .expect("wait for exact Full(B) publication");
     assert_eq!(ready_b.commit, b);
-    // Phase-two publication itself legitimately fetched from the real source.
+    // Full(B) publication itself legitimately fetched from the real source.
     // From this point onward, the paused client's exact-B response must use
     // only server artifacts and never either upstream endpoint.
     origin.clear_auth_log();
@@ -1278,8 +1278,8 @@ async fn missing_local_provider_fails_before_base_artifacts_download() {
     });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("B reached phase-one publication")
-        .expect("phase-one barrier alive");
+        .expect("B reached Head publication")
+        .expect("Head publication barrier alive");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -1368,8 +1368,8 @@ async fn server_named_decoy_is_ignored_for_local_provider_exact_fetch() {
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-decoy", None).await });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("decoy B reached phase one")
-        .expect("decoy phase-one barrier alive");
+        .expect("decoy B reached Head publication")
+        .expect("decoy Head barrier alive");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -1437,8 +1437,8 @@ async fn new_server_without_a_safe_carried_base_returns_pending_b_immediately() 
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-no-base", None).await });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("B reached phase one")
-        .expect("phase-one barrier alive");
+        .expect("B reached Head publication")
+        .expect("Head publication barrier alive");
 
     let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/full-topup-no-base");
@@ -1575,8 +1575,8 @@ async fn malformed_parent_hint_cannot_top_up_an_unrelated_target() {
     });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("B reached phase one")
-        .expect("phase-one barrier alive");
+        .expect("B reached Head publication")
+        .expect("Head publication barrier alive");
 
     let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/full-topup-unrelated");
@@ -1684,8 +1684,8 @@ async fn merge_target_has_no_top_up_base_and_returns_typed_pending_b() {
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-merge", None).await });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("merge B reached phase one")
-        .expect("merge phase-one barrier alive");
+        .expect("merge B reached Head publication")
+        .expect("merge Head barrier alive");
 
     let store = server_ref_store(&server).await;
     let exact = store
@@ -1765,8 +1765,8 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-removed", None).await });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("removed B reached phase one")
-        .expect("removed phase-one barrier alive");
+        .expect("removed B reached Head publication")
+        .expect("removed Head barrier alive");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -1871,8 +1871,8 @@ async fn cancellation_and_timeout_reap_git_helpers_before_staging_cleanup() {
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-cancel", None).await });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("B reached phase one")
-        .expect("phase-one barrier alive");
+        .expect("B reached Head publication")
+        .expect("Head publication barrier alive");
 
     let output = tempfile::tempdir().unwrap();
     let cancel_target = output.path().join("cancelled");
@@ -2037,8 +2037,8 @@ async fn locally_configured_gitea_token_is_used_only_for_the_exact_fetch() {
         tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-private", None).await });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("private B reached phase one")
-        .expect("phase-one barrier alive");
+        .expect("private B reached Head publication")
+        .expect("Head publication barrier alive");
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
@@ -2154,8 +2154,8 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
     });
     tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect("B reached phase-one publication")
-        .expect("phase-one barrier alive");
+        .expect("B reached Head publication")
+        .expect("Head publication barrier alive");
 
     let plan = reqwest::Client::new()
         .get(format!(
@@ -2460,7 +2460,7 @@ signed_requests={} authenticated_pinned_requests={} ripclone_auth_requests={}",
         .expect("MinIO Full(B) finished after release")
         .expect("join MinIO B sync")
         .expect("sync MinIO B");
-    // `sync_repo` completes after phase one. Keep the local source and the
-    // server alive until the detached archive worker reports B fully settled.
+    // `sync_repo` completes once Full is ready. Keep the local source and the
+    // server alive until Files and the exact job are fully settled.
     wait_for_files_job_settled(&server, "acme/full-topup-minio", &b).await;
 }

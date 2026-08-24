@@ -126,7 +126,7 @@ The branch-scoped storage details in this historical section were removed by
 the exact-only result model described above. They are retained only as release
 history and do not describe current keys, reads, writes, or worker behavior.
 
-- **Per-stage phase-1 sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, HEAD packs, skeleton build, files table, prebuilt index, phase-1 upload, and ref publish. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with phase timings and per-artifact-class storage amplification for each build.
+- **Per-stage Head sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, Head packs, skeleton build, files table, prebuilt index, Head upload, and result publication. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with timing and per-artifact-class storage amplification for each build.
 - **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under the internal `:{branch}#{commit}` namespace instead of `{branch}#{rev}`. The leading `:` cannot occur in a Git ref, so exact results cannot collide with real source branches. Different revs that resolve to the same commit share a build.
 - **Historical branch-scoped exact results (removed)** (`rust/src/ref_store.rs`): this former implementation gave each branch and commit an internal result. Current results are keyed only by repository and commit.
 - **git index-pack fallback** (`rust/src/git.rs`): when gix fails to index a pack containing ref deltas (e.g. `oven-sh/bun`), ripclone falls back to the stock `git index-pack` subprocess.

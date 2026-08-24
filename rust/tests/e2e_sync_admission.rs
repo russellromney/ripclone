@@ -670,7 +670,10 @@ async fn incomplete_parent_forces_cold_files_build() {
     admit_repo(&server, "acme/incomplete-parent").await;
     wait_entered(&probe.after_head_entry, 1).await;
 
-    let b = origin.commit(&[("stable.txt", "B-only\n")], "B while A is phase one");
+    let b = origin.commit(
+        &[("stable.txt", "B-only\n")],
+        "B while only Head(A) is ready",
+    );
     origin.publish();
     admit_repo(&server, "acme/incomplete-parent").await;
     wait_entered(&probe.after_head_entry, 2).await;
@@ -712,7 +715,7 @@ async fn incomplete_parent_forces_cold_files_build() {
 
 /// Direct local composition: ready no-op, fast accepted response, duplicate
 /// coalescing before and after claim, separate C identity, exact B fetch after
-/// the origin moves, phase-one/full coalescing, and final C publication.
+/// the origin moves, Head/Full coalescing, and final C publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_sync_admission() {
     let _guard = env_lock().lock().await;
@@ -1035,7 +1038,7 @@ async fn e2e_sync_admission() {
     probe.builder_entry.disarm();
     wait_entered(&probe.after_head_entry, 1).await;
 
-    // Phase one has published B, while detached Full(B) is held. A signed
+    // Head(B) is published while Full(B) is held. A signed
     // replay of B is admitted directly by the webhook path and coalesces
     // without probing the moving upstream tip.
     let tip_probes_before_webhook = probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst);
@@ -1553,24 +1556,22 @@ async fn ordinary_build_publishes_exact_commit_result() {
     assert_eq!(admission.commit, b);
     tokio::time::timeout(Duration::from_secs(20), head_entered)
         .await
-        .expect("B phase-one publication entered")
-        .expect("phase-one barrier sender alive");
+        .expect("B Head publication entered")
+        .expect("Head publication barrier sender alive");
 
     let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/ordinary-exact-publish");
     let head_exact = store
         .load_result(&repo_id, &b)
         .await
-        .expect("load exact phase-one B")
-        .expect("ordinary build published exact phase-one B");
+        .expect("load exact Head(B)")
+        .expect("ordinary build published exact Head(B)");
     assert_eq!(head_exact.commit, b);
     assert_eq!(head_exact.head.as_ref().unwrap().clonepack.commit, b);
     assert!(head_exact.full.is_none());
     assert!(head_exact.files.is_none());
 
-    head_proceed
-        .send(())
-        .expect("release B phase-one publication");
+    head_proceed.send(()).expect("release B Head publication");
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
         .await
         .expect("B full publication");
@@ -2365,8 +2366,8 @@ async fn late_b_exact_publish_does_not_mutate_c() {
     assert_eq!(b_admission.commit, b);
     tokio::time::timeout(Duration::from_secs(20), head_entered)
         .await
-        .expect("B phase-one publication entered")
-        .expect("phase-one barrier sender alive");
+        .expect("B Head publication entered")
+        .expect("Head publication barrier sender alive");
 
     git(&origin.work, &["reset", "--hard", &a]);
     let c = origin.commit(&[("value.txt", "C\n")], "divergent C");

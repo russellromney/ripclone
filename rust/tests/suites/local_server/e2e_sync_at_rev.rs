@@ -122,7 +122,7 @@ async fn sync_at_symbolic_revision_stays_pinned_while_branch_advances() {
         .expect("register historical pin fixture");
 
     let controls = tempfile::tempdir().expect("historical pin controls");
-    let barrier = controls.path().join("phase-two");
+    let barrier = controls.path().join("after-head");
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
     let _barrier = ScopedEnvVar::set("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR", &barrier);
     let _target = ScopedEnvVar::set("RIPCLONE_TEST_AFTER_HEAD_BARRIER_COMMIT", &selected);

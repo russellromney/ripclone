@@ -33,7 +33,7 @@ doubles), i.e. it is network-bound, exactly as the model predicts.
 
 ## Cold build (first sync, push→clonable) — one-time cost
 
-| repo | total (publish_p1) | upstream GitHub mirror fetch | ripclone's own build+upload |
+| repo | total (publish_head) | upstream GitHub mirror fetch | ripclone's own build+upload |
 |------|-------------------:|-----------------------------:|----------------------------:|
 | torvalds/linux   | 778 s | 726 s (**93%**) | ~51 s |
 | microsoft/vscode | 87 s  | 82 s (**94%**)  | ~5 s  |

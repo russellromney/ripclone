@@ -147,7 +147,7 @@ curl -sS -X POST \
   -H "Authorization: Ripclone $TOKEN_HASH" \
   "$RIPCLONE_URL/v1/repos/github/$repo/sync?rev=$parent"
 
-# Wait until /tmp/b4-sync.log contains "full clone ready for ${parent:0:7}".
+# Wait until /tmp/b4-sync.log contains "published Full result" for ${parent:0:7}.
 
 curl -sS -X POST \
   -H "Authorization: Ripclone $TOKEN_HASH" \
@@ -157,7 +157,7 @@ kill "$logs_pid" 2>/dev/null || true
 ```
 
 Read the `{"kind":"sync-bench",...}` JSON lines from the log. The target
-commit's `phases.publish_p1_ms` is the B4 tripwire value; `storage_amplification`
+commit's `phases.publish_head_ms` is the B4 tripwire value; `storage_amplification`
 contains the amplification split.
 
 For fork-based incremental testing, use `sync_latency.sh` with `CLIENT_APP`.
