@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ripclone::ExactResultKind;
 use ripclone::client::{Client, RefResponse};
 use sha2::{Digest, Sha256};
 use std::env;
@@ -121,15 +122,15 @@ async fn main() -> Result<()> {
                 } else {
                     &requested_branch
                 };
-                let clonepack_kind = match requested_depth {
-                    Some(1) => Some("shallow"),
-                    _ => Some("full"),
+                let result = match requested_depth {
+                    Some(1) => ExactResultKind::Head,
+                    _ => ExactResultKind::Full,
                 };
                 let info = match resolved {
                     Some(ref info) => info.clone(),
                     None => {
                         client
-                            .resolve_ref_with_clonepack(&repo_path, branch, clonepack_kind, None)
+                            .resolve_exact_result(&repo_path, branch, result, None)
                             .await?
                     }
                 };

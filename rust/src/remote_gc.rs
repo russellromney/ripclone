@@ -19,11 +19,6 @@ const ORPHAN_LEDGER_KEY: &str = "gc/orphans.json";
 /// `hash -> first epoch-second it was seen unreferenced`.
 type OrphanLedger = HashMap<String, u64>;
 
-/// Build status written by the warm-TTL sweep to mark a ref whose artifacts have
-/// been evicted. `get_ref_inner` treats this like a pending build so the next
-/// clone re-triggers sync via the existing 202 path.
-pub(crate) const EVICTED_BUILD_STATUS: &str = "evicted";
-
 /// Default idle time after which a ref's clonepack artifacts may be evicted.
 const DEFAULT_WARM_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -353,7 +348,7 @@ impl RemoteGc {
 
     /// Evict clonepack artifacts for refs that have been idle longer than
     /// `warm_ttl` and are not pinned. The eviction is a metadata-only update
-    /// (`build_status = "evicted"`); the subsequent reachable-hash walk and
+    /// (all explicit results cleared); the subsequent reachable-hash walk and
     /// remote-GC phase delete the now-unreferenced storage objects. Returns the
     /// number of refs evicted this pass.
     async fn evict_idle_warm_refs(&self, now: u64) -> Result<u64> {
@@ -402,8 +397,8 @@ impl RemoteGc {
                 continue;
             }
 
-            for info in infos {
-                if info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
+            for mut info in infos {
+                if info.head.is_none() && info.full.is_none() && info.files.is_none() {
                     continue;
                 }
                 let last_touch = info.last_accessed_at;
@@ -413,14 +408,14 @@ impl RemoteGc {
                 if now.saturating_sub(last_touch) < ttl_secs {
                     continue;
                 }
-                if self
-                    .ref_store
-                    .update_build_status(&repo_id, &info.commit, EVICTED_BUILD_STATUS)
+                info.head = None;
+                info.full = None;
+                info.files = None;
+                self.ref_store
+                    .save_result(&repo_id, &info)
                     .await
-                    .with_context(|| format!("evict warm result {key}@{}", info.commit))?
-                {
-                    evicted += 1;
-                }
+                    .with_context(|| format!("evict warm result {key}@{}", info.commit))?;
+                evicted += 1;
             }
         }
         Ok(evicted)
@@ -473,9 +468,8 @@ pub(crate) async fn reachable_hashes(
         let warm_pinned = infos.iter().any(|info| info.warm_pinned);
 
         for info in infos {
-            // Skip an evicted ref only when the repo is not pinned; a pinned
-            // repo retains even its evicted refs.
-            if !warm_pinned && info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
+            // An empty exact result has no artifacts to retain.
+            if !warm_pinned && info.head.is_none() && info.full.is_none() && info.files.is_none() {
                 continue;
             }
             collect_ref_info_hashes(&info, &mut reachable);
@@ -554,35 +548,31 @@ fn collect_pack_artifact(artifact: &PackArtifact, reachable: &mut HashSet<String
 
 /// Collect every artifact hash referenced directly by a RefInfo.
 fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
-    add_hash(reachable, &info.skeleton_pack);
-    add_hash(reachable, &info.skeleton_idx);
-    add_hash(reachable, &info.head_blobs_idx);
-    for chunk in &info.head_blobs_chunks {
-        add_hash(reachable, chunk);
+    if let Some(head) = &info.head {
+        collect_clonepack_artifacts(&head.clonepack, reachable);
+        for artifact in &head.packs {
+            collect_pack_artifact(artifact, reachable);
+        }
+        for pack in &head.base_packs {
+            collect_sized_pack(pack, reachable);
+        }
     }
-    for artifact in &info.packs {
-        collect_pack_artifact(artifact, reachable);
+    if let Some(full) = &info.full {
+        collect_clonepack_artifacts(&full.clonepack, reachable);
+        for artifact in &full.packs {
+            collect_pack_artifact(artifact, reachable);
+        }
+        collect_history_levels(&full.history_levels, reachable);
     }
-    // HEAD-closure base packs carried for incremental delta reuse. These are also
-    // referenced by the live shallow/full manifests, but listing them here keeps
-    // them reachable through a phase-2 rebase window (when the new base is
-    // persisted before the next sync's shallow manifest references it).
-    for pack in &info.head_base_packs {
-        collect_sized_pack(pack, reachable);
+    if let Some(files) = &info.files {
+        collect_clonepack_artifacts(&files.clonepack, reachable);
+        for chunk in &files.archive_chunks {
+            add_hash(reachable, chunk);
+        }
+        for frame in &files.archive_frames {
+            add_hash(reachable, &frame.chunk_hash);
+        }
     }
-    add_hash(reachable, &info.prebuilt_index);
-    add_hash(reachable, &info.archive);
-    add_hash(reachable, &info.manifest);
-    for chunk in &info.archive_chunks {
-        add_hash(reachable, chunk);
-    }
-    for frame in &info.archive_frames {
-        add_hash(reachable, &frame.chunk_hash);
-    }
-
-    collect_clonepack_artifacts(&info.full_clonepack, reachable);
-    collect_clonepack_artifacts(&info.shallow_clonepack, reachable);
-    collect_history_levels(&info.history_levels, reachable);
 }
 
 #[cfg(test)]
@@ -701,26 +691,16 @@ mod tests {
 
         RefInfo {
             commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: Vec::new(),
-            packs: Vec::new(),
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: String::new(),
-            archive_chunks: vec![archive_hash],
-            full_clonepack: ClonepackArtifacts {
-                manifest: manifest_hash,
-                metadata_chunk: metadata_hash,
-                commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                ..Default::default()
-            },
-            shallow_clonepack: ClonepackArtifacts::default(),
-            history_levels: Vec::new(),
-            build_status: None,
-            build_ms: None,
+            files: Some(crate::FilesResult {
+                clonepack: ClonepackArtifacts {
+                    manifest: manifest_hash,
+                    metadata_chunk: metadata_hash,
+                    commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    ..Default::default()
+                },
+                archive_chunks: vec![archive_hash],
+                archive_frames: Vec::new(),
+            }),
             synced_at: None,
             ..Default::default()
         }
@@ -778,9 +758,10 @@ mod tests {
         assert!(!orphan_path.exists(), "orphan should be deleted");
 
         // Reachable objects should still exist.
-        assert!(cas.path(&info.full_clonepack.manifest).exists());
-        assert!(cas.path(&info.full_clonepack.metadata_chunk).exists());
-        assert!(cas.path(&info.archive_chunks[0]).exists());
+        let files = info.files.as_ref().unwrap();
+        assert!(cas.path(&files.clonepack.manifest).exists());
+        assert!(cas.path(&files.clonepack.metadata_chunk).exists());
+        assert!(cas.path(&files.archive_chunks[0]).exists());
     }
 
     #[tokio::test]
@@ -799,7 +780,7 @@ mod tests {
 
         let reuse_hash = cas.put(b"reuse-frame").unwrap();
         let mut info = make_ref_info_with_manifest(&cas);
-        info.archive_frames = vec![crate::ArchiveFrame {
+        info.files.as_mut().unwrap().archive_frames = vec![crate::ArchiveFrame {
             raw_hash: "raw".to_string(),
             chunk_hash: reuse_hash.clone(),
             compressed_len: 11,
@@ -986,8 +967,9 @@ mod tests {
         // A later exact result references it again before grace expires.
         let mut info_v2 = info.clone();
         info_v2.commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        info_v2.full_clonepack.commit = info_v2.commit.clone();
-        info_v2.head_blobs_chunks = vec![chunk.clone()];
+        let files = info_v2.files.as_mut().unwrap();
+        files.clonepack.commit = info_v2.commit.clone();
+        files.archive_chunks.push(chunk.clone());
         ref_store.save_result(&repo, &info_v2).await.unwrap();
 
         let report = gc.run().await.unwrap();
@@ -1049,8 +1031,9 @@ mod tests {
         // Exact B independently references the reused object.
         let mut info_v2 = info_v1.clone();
         info_v2.commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        info_v2.full_clonepack.commit = info_v2.commit.clone();
-        info_v2.head_blobs_chunks = vec![reused.clone()];
+        let files = info_v2.files.as_mut().unwrap();
+        files.clonepack.commit = info_v2.commit.clone();
+        files.archive_chunks.push(reused.clone());
         ref_store.save_result(&repo, &info_v2).await.unwrap();
 
         // Tombstone the reused object long ago so GC reaches the delete path (and
@@ -1197,25 +1180,13 @@ mod tests {
         let pack = dummy_sized_pack(b"history-pack", &cas);
         let info = RefInfo {
             commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: Vec::new(),
-            packs: Vec::new(),
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: String::new(),
-            archive_chunks: Vec::new(),
-            full_clonepack: ClonepackArtifacts::default(),
-            shallow_clonepack: ClonepackArtifacts::default(),
-            history_levels: vec![HistoryLevel {
-                tip_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                packs: vec![pack],
-            }],
-            build_status: None,
-            build_ms: None,
-            synced_at: None,
+            full: Some(crate::FullResult {
+                history_levels: vec![HistoryLevel {
+                    tip_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    packs: vec![pack],
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
         };
         ref_store
@@ -1247,8 +1218,9 @@ mod tests {
         assert_eq!(report.objects_reachable, 2);
         assert_eq!(report.objects_deleted, 1);
         assert!(!orphan_path.exists());
-        assert!(cas.path(&info.history_levels[0].packs[0].pack).exists());
-        assert!(cas.path(&info.history_levels[0].packs[0].idx).exists());
+        let full = info.full.as_ref().unwrap();
+        assert!(cas.path(&full.history_levels[0].packs[0].pack).exists());
+        assert!(cas.path(&full.history_levels[0].packs[0].idx).exists());
     }
 
     #[tokio::test]
@@ -1274,9 +1246,10 @@ mod tests {
             .await
             .unwrap();
 
-        let manifest_path = cas.path(&info.full_clonepack.manifest);
-        let metadata_path = cas.path(&info.full_clonepack.metadata_chunk);
-        let archive_path = cas.path(&info.archive_chunks[0]);
+        let files = info.files.as_ref().unwrap();
+        let manifest_path = cas.path(&files.clonepack.manifest);
+        let metadata_path = cas.path(&files.clonepack.metadata_chunk);
+        let archive_path = cas.path(&files.archive_chunks[0]);
         assert!(manifest_path.exists());
         assert!(metadata_path.exists());
         assert!(archive_path.exists());
@@ -1305,58 +1278,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
-    }
-
-    #[tokio::test]
-    async fn warm_ttl_evicts_an_aged_exact_admission_placeholder() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cas_root = tmp.path().join("cas");
-        let repo_root = tmp.path().join("repos");
-        std::fs::create_dir_all(&cas_root).unwrap();
-        std::fs::create_dir_all(&repo_root).unwrap();
-
-        let storage: StorageRef = Arc::new(TestRemoteStorage {
-            inner: local(&cas_root).unwrap(),
-        });
-        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
-        let repo_id = RepoId::github("o/pending");
-        let commit = "1".repeat(40);
-        let old = unix_secs(SystemTime::now()).saturating_sub(10);
-        ref_store
-            .save_result(
-                &repo_id,
-                &RefInfo {
-                    commit: commit.clone(),
-                    build_status: Some("building".to_string()),
-                    synced_at: Some(old),
-                    last_accessed_at: Some(old),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        RemoteGc::new(
-            storage,
-            ref_store.clone(),
-            GcConfig {
-                grace_period: Duration::ZERO,
-                warm_ttl: Duration::from_secs(1),
-                dry_run: false,
-            },
-        )
-        .run()
-        .await
-        .unwrap();
-
-        let evicted = ref_store
-            .load_result(&repo_id, &commit)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(evicted.commit, commit);
-        assert_eq!(evicted.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+        assert!(info.head.is_none() && info.full.is_none() && info.files.is_none());
     }
 
     #[tokio::test]
@@ -1382,7 +1304,7 @@ mod tests {
             .await
             .unwrap();
 
-        let manifest_path = cas.path(&info.full_clonepack.manifest);
+        let manifest_path = cas.path(&info.files.as_ref().unwrap().clonepack.manifest);
         assert!(manifest_path.exists());
 
         let gc = RemoteGc::new(
@@ -1407,66 +1329,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+        assert!(info.files.is_some());
     }
-
-    /// Liveness guarantee for pinned repos: a warm-pinned repo whose ref was
-    /// *already* marked evicted (a pin that landed after the eviction, e.g.
-    /// reconciliation lag) must still have its artifacts retained by the
-    /// reachability walk. The pin is repo-scoped, so an evicted ref of a pinned
-    /// repo is not an orphan and its chunks must not be collected.
-    #[tokio::test]
-    async fn reachable_retains_evicted_ref_of_pinned_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cas_root = tmp.path().join("cas");
-        let repo_root = tmp.path().join("repos");
-        std::fs::create_dir_all(&cas_root).unwrap();
-        std::fs::create_dir_all(&repo_root).unwrap();
-
-        let cas = Cas::new(&cas_root).unwrap();
-        let storage: StorageRef = Arc::new(TestRemoteStorage {
-            inner: local(&cas_root).unwrap(),
-        });
-        let ref_store: Arc<dyn RefStore> = test_ref_store(&repo_root).await;
-
-        // The ref is already evicted, but the cloud has since pinned the repo.
-        let mut info = make_ref_info_with_manifest(&cas);
-        info.build_status = Some(EVICTED_BUILD_STATUS.to_string());
-        info.warm_pinned = true;
-        ref_store
-            .save_result(&RepoId::github("o/r"), &info)
-            .await
-            .unwrap();
-
-        let manifest_path = cas.path(&info.full_clonepack.manifest);
-        let metadata_path = cas.path(&info.full_clonepack.metadata_chunk);
-        let archive_path = cas.path(&info.archive_chunks[0]);
-        assert!(manifest_path.exists());
-        assert!(metadata_path.exists());
-        assert!(archive_path.exists());
-
-        // warm_ttl = 0 disables the eviction pass so this isolates the reachability
-        // walk; grace = 0 deletes any genuine orphan this pass.
-        let gc = RemoteGc::new(
-            storage.clone(),
-            ref_store.clone(),
-            GcConfig {
-                grace_period: Duration::from_secs(0),
-                warm_ttl: Duration::from_secs(0),
-                dry_run: false,
-            },
-        );
-        let report = gc.run().await.unwrap();
-
-        assert_eq!(
-            report.objects_deleted, 0,
-            "pinned repo's evicted-ref artifacts must be retained"
-        );
-        assert!(manifest_path.exists(), "manifest retained");
-        assert!(metadata_path.exists(), "metadata retained");
-        assert!(archive_path.exists(), "archive retained");
-    }
-
     #[tokio::test]
     async fn warm_ttl_keeps_recent_ref() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1489,7 +1353,7 @@ mod tests {
             .await
             .unwrap();
 
-        let manifest_path = cas.path(&info.full_clonepack.manifest);
+        let manifest_path = cas.path(&info.files.as_ref().unwrap().clonepack.manifest);
         assert!(manifest_path.exists());
 
         // warm_ttl must comfortably exceed the test's own wall-clock slack. With a
@@ -1520,7 +1384,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+        assert!(info.files.is_some());
     }
 
     #[tokio::test]
@@ -1546,7 +1410,7 @@ mod tests {
             .await
             .unwrap();
 
-        let manifest_path = cas.path(&info.full_clonepack.manifest);
+        let manifest_path = cas.path(&info.files.as_ref().unwrap().clonepack.manifest);
         assert!(manifest_path.exists());
 
         let gc = RemoteGc::new(
@@ -1571,6 +1435,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+        assert!(info.files.is_some());
     }
 }

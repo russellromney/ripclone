@@ -18,9 +18,9 @@ pub struct Metrics {
     sync_skeleton_build_ms_total: AtomicU64,
     sync_files_table_ms_total: AtomicU64,
     sync_prebuilt_index_ms_total: AtomicU64,
-    sync_upload_p1_ms_total: AtomicU64,
+    sync_upload_head_ms_total: AtomicU64,
     sync_ref_publish_ms_total: AtomicU64,
-    sync_publish_p1_ms_total: AtomicU64,
+    sync_publish_head_ms_total: AtomicU64,
     artifact_requests: AtomicU64,
     artifact_bytes_served: AtomicU64,
     errors: AtomicU64,
@@ -57,9 +57,9 @@ impl Metrics {
         Self::add_optional(&self.sync_skeleton_build_ms_total, phases.skeleton_build_ms);
         Self::add_optional(&self.sync_files_table_ms_total, phases.files_table_ms);
         Self::add_optional(&self.sync_prebuilt_index_ms_total, phases.prebuilt_index_ms);
-        Self::add_optional(&self.sync_upload_p1_ms_total, phases.upload_p1_ms);
+        Self::add_optional(&self.sync_upload_head_ms_total, phases.upload_head_ms);
         Self::add_optional(&self.sync_ref_publish_ms_total, phases.ref_publish_ms);
-        Self::add_optional(&self.sync_publish_p1_ms_total, phases.publish_p1_ms);
+        Self::add_optional(&self.sync_publish_head_ms_total, phases.publish_head_ms);
     }
 
     pub fn record_artifact_request(&self, bytes: u64) {
@@ -177,9 +177,9 @@ impl Metrics {
                 s.sync_prebuilt_index_ms_total,
             ),
             (
-                "ripclone_sync_upload_p1_ms_total",
-                "Total phase-1 upload time in milliseconds",
-                s.sync_upload_p1_ms_total,
+                "ripclone_sync_upload_head_ms_total",
+                "Total Head upload time in milliseconds",
+                s.sync_upload_head_ms_total,
             ),
             (
                 "ripclone_sync_ref_publish_ms_total",
@@ -187,9 +187,9 @@ impl Metrics {
                 s.sync_ref_publish_ms_total,
             ),
             (
-                "ripclone_sync_publish_p1_ms_total",
-                "Total phase-1 publish wall time in milliseconds",
-                s.sync_publish_p1_ms_total,
+                "ripclone_sync_publish_head_ms_total",
+                "Total Head publish wall time in milliseconds",
+                s.sync_publish_head_ms_total,
             ),
             (
                 "ripclone_artifact_requests_total",
@@ -276,9 +276,9 @@ impl Metrics {
             sync_skeleton_build_ms_total: self.sync_skeleton_build_ms_total.load(Ordering::Relaxed),
             sync_files_table_ms_total: self.sync_files_table_ms_total.load(Ordering::Relaxed),
             sync_prebuilt_index_ms_total: self.sync_prebuilt_index_ms_total.load(Ordering::Relaxed),
-            sync_upload_p1_ms_total: self.sync_upload_p1_ms_total.load(Ordering::Relaxed),
+            sync_upload_head_ms_total: self.sync_upload_head_ms_total.load(Ordering::Relaxed),
             sync_ref_publish_ms_total: self.sync_ref_publish_ms_total.load(Ordering::Relaxed),
-            sync_publish_p1_ms_total: self.sync_publish_p1_ms_total.load(Ordering::Relaxed),
+            sync_publish_head_ms_total: self.sync_publish_head_ms_total.load(Ordering::Relaxed),
             artifact_requests: self.artifact_requests.load(Ordering::Relaxed),
             artifact_bytes_served: self.artifact_bytes_served.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
@@ -315,9 +315,9 @@ pub struct SyncPhaseMetrics {
     pub skeleton_build_ms: Option<u64>,
     pub files_table_ms: Option<u64>,
     pub prebuilt_index_ms: Option<u64>,
-    pub upload_p1_ms: Option<u64>,
+    pub upload_head_ms: Option<u64>,
     pub ref_publish_ms: Option<u64>,
-    pub publish_p1_ms: Option<u64>,
+    pub publish_head_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -332,9 +332,9 @@ pub struct MetricsSnapshot {
     pub sync_skeleton_build_ms_total: u64,
     pub sync_files_table_ms_total: u64,
     pub sync_prebuilt_index_ms_total: u64,
-    pub sync_upload_p1_ms_total: u64,
+    pub sync_upload_head_ms_total: u64,
     pub sync_ref_publish_ms_total: u64,
-    pub sync_publish_p1_ms_total: u64,
+    pub sync_publish_head_ms_total: u64,
     pub artifact_requests: u64,
     pub artifact_bytes_served: u64,
     pub errors: u64,
@@ -362,7 +362,7 @@ mod tests {
         m.record_sync(std::time::Duration::from_millis(10));
         m.record_sync_phases(SyncPhaseMetrics {
             mirror_fetch_ms: Some(3),
-            publish_p1_ms: Some(7),
+            publish_head_ms: Some(7),
             ..SyncPhaseMetrics::default()
         });
         m.record_artifact_request(1234);
@@ -375,7 +375,7 @@ mod tests {
         assert!(out.contains("# TYPE ripclone_ref_lookups_total counter"));
         assert!(out.contains("\nripclone_ref_lookups_total 2\n"));
         assert!(out.contains("\nripclone_sync_mirror_fetch_ms_total 3\n"));
-        assert!(out.contains("\nripclone_sync_publish_p1_ms_total 7\n"));
+        assert!(out.contains("\nripclone_sync_publish_head_ms_total 7\n"));
         assert!(out.contains("\nripclone_artifact_bytes_served_total 1234\n"));
 
         // Gauge.

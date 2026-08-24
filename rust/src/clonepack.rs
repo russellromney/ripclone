@@ -135,9 +135,19 @@ pub fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for hash in [
-        &info.full_clonepack.manifest,
-        &info.shallow_clonepack.manifest,
-    ] {
+        info.head
+            .as_ref()
+            .map(|result| result.clonepack.manifest.as_str()),
+        info.full
+            .as_ref()
+            .map(|result| result.clonepack.manifest.as_str()),
+        info.files
+            .as_ref()
+            .map(|result| result.clonepack.manifest.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if !hash.is_empty() && seen.insert(hash.to_string()) {
             out.push(hash.to_string());
         }

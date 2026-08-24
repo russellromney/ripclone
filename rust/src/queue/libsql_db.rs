@@ -81,6 +81,21 @@ impl QueueDb for LibsqlDb {
         }
     }
 
+    async fn latest_job_id(&self, key: &str) -> Result<Option<i64>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id FROM jobs WHERE key = ? ORDER BY id DESC LIMIT 1",
+                [key],
+            )
+            .await
+            .context("query latest exact job")?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
+    }
+
     async fn insert_job(
         &self,
         key: &str,

@@ -421,7 +421,7 @@ impl ArchiveBuilder {
     /// packs, not the archive, so they only need this table; the expensive frame
     /// compression ([`build_chunks`]) is only needed for files mode. This still
     /// reads each blob (to hash it) but skips compression, so it is much cheaper
-    /// — letting two-phase publish depth=1 without waiting on the archive.
+    /// — letting Head publish without waiting on Files.
     /// `frames` is left empty.
     pub fn build_files_table(&self, commit: &str) -> Result<MetadataChunk> {
         if !self.mirror.exists() {
@@ -598,7 +598,7 @@ impl ArchiveBuilder {
         // out. On a giant first sync (no reuse) the alternative — returning every
         // frame's `Vec<u8>` and putting them after the walk — would hold the whole
         // compressed archive (hundreds of MiB to GiB) resident at once, which is
-        // the phase-2 OOM. Peak now stays ~one batch of compressed frames.
+        // the archive-build OOM. Peak now stays ~one batch of compressed frames.
         let (mut manifest, bounds, _raw_total, processed) =
             self.stream_cdc(&repo, tree_id, |batch| {
                 use rayon::prelude::*;

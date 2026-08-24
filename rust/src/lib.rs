@@ -200,6 +200,57 @@ pub struct ClonepackArtifacts {
     pub commit: String,
 }
 
+/// Published Head artifacts for one exact commit.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct HeadResult {
+    pub clonepack: ClonepackArtifacts,
+    pub parent_commit: Option<String>,
+    #[serde(default)]
+    pub packs: Vec<PackArtifact>,
+    #[serde(default)]
+    pub base_commit: String,
+    #[serde(default)]
+    pub base_packs: Vec<SizedPack>,
+}
+
+/// Published Full artifacts for one exact commit.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FullResult {
+    pub clonepack: ClonepackArtifacts,
+    #[serde(default)]
+    pub packs: Vec<PackArtifact>,
+    #[serde(default)]
+    pub history_levels: Vec<HistoryLevel>,
+}
+
+/// Published Files artifacts for one exact commit.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FilesResult {
+    pub clonepack: ClonepackArtifacts,
+    #[serde(default)]
+    pub archive_chunks: Vec<String>,
+    #[serde(default)]
+    pub archive_frames: Vec<ArchiveFrame>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExactResultKind {
+    Head,
+    Full,
+    Files,
+}
+
+impl std::fmt::Display for ExactResultKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Head => "head",
+            Self::Full => "full",
+            Self::Files => "files",
+        })
+    }
+}
+
 /// Artifact hashes returned by the server for a single ref.
 ///
 /// Every artifact is stored in the CAS and can be fetched by its hash from
@@ -207,64 +258,9 @@ pub struct ClonepackArtifacts {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefInfo {
     pub commit: String,
-    pub parent_commit: Option<String>,
-    pub skeleton_pack: String,
-    pub skeleton_idx: String,
-    pub head_blobs_idx: String,
-    /// Content-addressed chunks of the head-blobs pack. The full pack is the
-    /// concatenation of these chunks in order. New builds split the pack so the
-    /// client can fetch it in parallel.
-    #[serde(default)]
-    pub head_blobs_chunks: Vec<String>,
-    /// Editable-clone packs (pack + idx hashes), ordered to match the manifest's
-    /// `packs` list. Kept here so the ref endpoint can sign each pack/idx URL
-    /// without decoding the manifest, and for retention protection.
-    #[serde(default)]
-    pub packs: Vec<PackArtifact>,
-    pub prebuilt_index: String,
-    pub archive: String,
-    pub manifest: String,
-    /// Archive chunk hashes referenced by the clonepack manifest. Kept for
-    /// retention protection and debugging.
-    #[serde(default)]
-    pub archive_chunks: Vec<String>,
-    /// Full-history clonepack (all reachable commits/trees).
-    pub full_clonepack: ClonepackArtifacts,
-    /// Shallow clonepack (single commit + HEAD trees). Matches `git clone --depth=1`.
-    pub shallow_clonepack: ClonepackArtifacts,
-    /// LSM sealed history levels (oldest first). Empty unless the LSM build is
-    /// enabled. Each level is immutable and content-addressed; a sync only builds
-    /// the tail past the last level's tip. See ROADMAP "LSM incremental history".
-    #[serde(default)]
-    pub history_levels: Vec<HistoryLevel>,
-    /// The commit whose depth-1 closure the HEAD *base* packs cover. A re-sync
-    /// packs only the objects new since this commit (`closure(HEAD) −
-    /// closure(head_base_commit)`) into a fresh delta pack, so the base and the
-    /// delta are disjoint by construction — no object is ever in two HEAD packs
-    /// (which would double-materialize a worktree file). Empty before the first
-    /// two-phase build. The background phase rebases (rebuilds the base at the
-    /// current commit) once the cumulative delta grows past
-    /// `RIPCLONE_HEAD_REBASE_BYTES`. See [`crate::pack::PackBuilder`].
-    #[serde(default)]
-    pub head_base_commit: String,
-    /// The HEAD base packs (closure of `head_base_commit`), with lengths so a
-    /// re-sync can reference these now-evicted packs in the clonepack manifest
-    /// without re-reading their bytes. Carried unchanged across delta syncs;
-    /// replaced wholesale on a rebase.
-    #[serde(default)]
-    pub head_base_packs: Vec<SizedPack>,
-    /// Content-defined archive frames from the last build, for incremental reuse:
-    /// a re-sync recompresses + re-uploads only the frames whose raw bytes
-    /// changed. See [`ArchiveFrame`].
-    #[serde(default)]
-    pub archive_frames: Vec<ArchiveFrame>,
-    /// Optional build status used by the async /v1/build worker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_status: Option<String>,
-    /// Wall-clock milliseconds for the most recent full build, populated once
-    /// full-history/files artifacts finish and surfaced by `/status`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_ms: Option<u64>,
+    pub head: Option<HeadResult>,
+    pub full: Option<FullResult>,
+    pub files: Option<FilesResult>,
     /// Unix timestamp (seconds) when this exact result was last synced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<u64>,

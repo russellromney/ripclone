@@ -1,4 +1,3 @@
-use crate::RefInfo;
 use crate::archive::ArchiveBuilder;
 use crate::auth::access::{AccessDecision, AccessVerifier, HttpAccessVerifier};
 use crate::auth::broker::{CredentialBroker, broker_from_env};
@@ -13,13 +12,14 @@ use crate::metrics::{Metrics, SyncPhaseMetrics};
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
-use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueue, JobQueueRef, JobState};
+use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
 use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
 use crate::storage::StorageRef;
 use crate::validation;
 use crate::webhook::{EventKind, WebhookConfig};
+use crate::{ExactResultKind, RefInfo};
 use anyhow::{Context, Result};
 use axum::{
     Form, Json, Router,
@@ -207,8 +207,11 @@ pub struct AdmissionTestProbe {
     pub after_claim: AdmissionTestBarrier,
     pub fetch_entry: AdmissionTestBarrier,
     pub builder_entry: AdmissionTestBarrier,
-    pub phase2_entry: AdmissionTestBarrier,
-    pub after_editable_publish: AdmissionTestBarrier,
+    pub after_head_entry: AdmissionTestBarrier,
+    pub before_full_publish: AdmissionTestBarrier,
+    pub before_files_publish: AdmissionTestBarrier,
+    pub after_full_publish: AdmissionTestBarrier,
+    pub after_files_publish: AdmissionTestBarrier,
     pub embedded_idle_wait: AdmissionTestBarrier,
     pub before_admission_tx: AdmissionTestBarrier,
     pub inside_admission_tx: AdmissionTestBarrier,
@@ -219,8 +222,12 @@ pub struct AdmissionTestProbe {
     pub tip_probes: AtomicUsize,
     pub exact_fetches: AtomicUsize,
     pub builder_entries: AtomicUsize,
-    pub files_completion_entries: AtomicUsize,
+    pub head_builds: AtomicUsize,
+    pub full_builds: AtomicUsize,
+    pub files_builds: AtomicUsize,
+    pub head_publishes: AtomicUsize,
     pub full_publishes: AtomicUsize,
+    pub files_publishes: AtomicUsize,
     pub ref_store_writes: AtomicUsize,
     pub artifact_uploads: AtomicUsize,
     pub embedded_notification_wakes: AtomicUsize,
@@ -229,6 +236,8 @@ pub struct AdmissionTestProbe {
     pub fetch_targets: StdMutex<Vec<String>>,
     pub builder_targets: StdMutex<Vec<String>>,
     pub failure_targets: StdMutex<Vec<(String, String)>>,
+    full_failure_targets: StdMutex<std::collections::HashSet<String>>,
+    files_failure_targets: StdMutex<std::collections::HashSet<String>>,
     pub http_trace: StdMutex<Vec<String>>,
     admission_tx_target: StdMutex<Option<String>>,
     inside_admission_tx_target: StdMutex<Option<String>>,
@@ -245,8 +254,11 @@ impl Default for AdmissionTestProbe {
             after_claim: AdmissionTestBarrier::default(),
             fetch_entry: AdmissionTestBarrier::default(),
             builder_entry: AdmissionTestBarrier::default(),
-            phase2_entry: AdmissionTestBarrier::default(),
-            after_editable_publish: AdmissionTestBarrier::default(),
+            after_head_entry: AdmissionTestBarrier::default(),
+            before_full_publish: AdmissionTestBarrier::default(),
+            before_files_publish: AdmissionTestBarrier::default(),
+            after_full_publish: AdmissionTestBarrier::default(),
+            after_files_publish: AdmissionTestBarrier::default(),
             embedded_idle_wait: AdmissionTestBarrier::default(),
             before_admission_tx: AdmissionTestBarrier::default(),
             inside_admission_tx: AdmissionTestBarrier::default(),
@@ -257,8 +269,12 @@ impl Default for AdmissionTestProbe {
             tip_probes: AtomicUsize::new(0),
             exact_fetches: AtomicUsize::new(0),
             builder_entries: AtomicUsize::new(0),
-            files_completion_entries: AtomicUsize::new(0),
+            head_builds: AtomicUsize::new(0),
+            full_builds: AtomicUsize::new(0),
+            files_builds: AtomicUsize::new(0),
+            head_publishes: AtomicUsize::new(0),
             full_publishes: AtomicUsize::new(0),
+            files_publishes: AtomicUsize::new(0),
             ref_store_writes: AtomicUsize::new(0),
             artifact_uploads: AtomicUsize::new(0),
             embedded_notification_wakes: AtomicUsize::new(0),
@@ -267,6 +283,8 @@ impl Default for AdmissionTestProbe {
             fetch_targets: StdMutex::new(Vec::new()),
             builder_targets: StdMutex::new(Vec::new()),
             failure_targets: StdMutex::new(Vec::new()),
+            full_failure_targets: StdMutex::new(std::collections::HashSet::new()),
+            files_failure_targets: StdMutex::new(std::collections::HashSet::new()),
             http_trace: StdMutex::new(Vec::new()),
             admission_tx_target: StdMutex::new(None),
             inside_admission_tx_target: StdMutex::new(None),
@@ -279,6 +297,34 @@ impl Default for AdmissionTestProbe {
 }
 
 impl AdmissionTestProbe {
+    pub fn fail_full_for(&self, commit: &str) {
+        self.full_failure_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(commit.to_string());
+    }
+
+    pub fn allow_full_for(&self, commit: &str) {
+        self.full_failure_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(commit);
+    }
+
+    pub fn fail_files_for(&self, commit: &str) {
+        self.files_failure_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(commit.to_string());
+    }
+
+    pub fn allow_files_for(&self, commit: &str) {
+        self.files_failure_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(commit);
+    }
+
     pub fn hold_admission_transaction(&self, commit: &str) {
         *self
             .admission_tx_target
@@ -367,8 +413,11 @@ impl Drop for AdmissionTestProbeGuard {
         self.probe.after_claim.disarm();
         self.probe.fetch_entry.disarm();
         self.probe.builder_entry.disarm();
-        self.probe.phase2_entry.disarm();
-        self.probe.after_editable_publish.disarm();
+        self.probe.after_head_entry.disarm();
+        self.probe.before_full_publish.disarm();
+        self.probe.before_files_publish.disarm();
+        self.probe.after_full_publish.disarm();
+        self.probe.after_files_publish.disarm();
         self.probe.embedded_idle_wait.disarm();
         self.probe.before_admission_tx.disarm();
         self.probe.inside_admission_tx.disarm();
@@ -476,23 +525,63 @@ async fn admission_test_builder_entry(commit: &str) {
     }
 }
 
-fn admission_test_files_completion_entry() {
+fn admission_test_head_build() {
     if let Some(probe) = admission_test_probe() {
-        probe
-            .files_completion_entries
-            .fetch_add(1, Ordering::SeqCst);
+        probe.head_builds.fetch_add(1, Ordering::SeqCst);
     }
 }
 
-async fn admission_test_phase2_entry() {
+async fn admission_test_after_head_entry() {
     if let Some(probe) = admission_test_probe() {
-        probe.phase2_entry.wait().await;
+        probe.after_head_entry.wait().await;
     }
 }
 
-async fn admission_test_after_editable_publish() {
+fn admission_test_full_build(commit: &str) -> bool {
     if let Some(probe) = admission_test_probe() {
-        probe.after_editable_publish.wait().await;
+        probe.full_builds.fetch_add(1, Ordering::SeqCst);
+        return probe
+            .full_failure_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(commit);
+    }
+    false
+}
+
+fn admission_test_files_build(commit: &str) -> bool {
+    if let Some(probe) = admission_test_probe() {
+        probe.files_builds.fetch_add(1, Ordering::SeqCst);
+        return probe
+            .files_failure_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(commit);
+    }
+    false
+}
+
+async fn admission_test_before_full_publish() {
+    if let Some(probe) = admission_test_probe() {
+        probe.before_full_publish.wait().await;
+    }
+}
+
+async fn admission_test_before_files_publish() {
+    if let Some(probe) = admission_test_probe() {
+        probe.before_files_publish.wait().await;
+    }
+}
+
+async fn admission_test_after_full_publish() {
+    if let Some(probe) = admission_test_probe() {
+        probe.after_full_publish.wait().await;
+    }
+}
+
+async fn admission_test_after_files_publish() {
+    if let Some(probe) = admission_test_probe() {
+        probe.after_files_publish.wait().await;
     }
 }
 
@@ -526,6 +615,18 @@ fn admission_test_full_published(commit: &str) {
         probe.full_publishes.fetch_add(1, Ordering::SeqCst);
         probe.full_notify.notify_waiters();
         tracing::debug!("admission test observed full publication for {commit}");
+    }
+}
+
+fn admission_test_head_published() {
+    if let Some(probe) = admission_test_probe() {
+        probe.head_publishes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn admission_test_files_published() {
+    if let Some(probe) = admission_test_probe() {
+        probe.files_publishes.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -768,10 +869,7 @@ pub struct AddRequest {
 
 #[derive(Deserialize)]
 pub struct RefQuery {
-    /// Clonepack variant to return: "full" (all reachable history) or
-    /// "shallow" (depth=1). Defaults to "full".
-    #[serde(default = "default_clonepack_kind")]
-    pub clonepack: String,
+    pub result: ExactResultKind,
     /// Optional git rev to resolve instead of the branch tip (e.g. "HEAD~5").
     /// Pairs with `sync?rev=...`: clone the artifacts built for that commit.
     #[serde(default)]
@@ -785,10 +883,6 @@ pub struct RefQuery {
     /// Ignored on initial selector, rev-targeted, and non-Full requests.
     #[serde(default)]
     pub top_up: bool,
-}
-
-fn default_clonepack_kind() -> String {
-    "full".to_string()
 }
 
 fn default_added_repo_source() -> AddedRepoSource {
@@ -847,11 +941,11 @@ pub struct SyncPhases {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prebuilt_index_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub upload_p1_ms: Option<u64>,
+    pub upload_head_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_publish_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub publish_p1_ms: Option<u64>,
+    pub publish_head_ms: Option<u64>,
 }
 
 impl From<&SyncPhases> for SyncPhaseMetrics {
@@ -863,9 +957,9 @@ impl From<&SyncPhases> for SyncPhaseMetrics {
             skeleton_build_ms: phases.skeleton_build_ms,
             files_table_ms: phases.files_table_ms,
             prebuilt_index_ms: phases.prebuilt_index_ms,
-            upload_p1_ms: phases.upload_p1_ms,
+            upload_head_ms: phases.upload_head_ms,
             ref_publish_ms: phases.ref_publish_ms,
-            publish_p1_ms: phases.publish_p1_ms,
+            publish_head_ms: phases.publish_head_ms,
         }
     }
 }
@@ -1058,13 +1152,7 @@ pub struct RefResponse {
     /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idx_bundle_url: Option<String>,
-    /// True when the returned clonepack is a shallow (depth=1) snapshot.
-    pub shallow: bool,
-    /// True once the full clonepack's phase two has settled. The server
-    /// publishes editable metadata first and finishes Files data later; a
-    /// committed empty tree settles with zero archive frames. Editable clones
-    /// ignore this flag.
-    pub archive_ready: bool,
+    pub result: ExactResultKind,
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -1090,25 +1178,23 @@ pub struct RepoStatusResponse {
 #[derive(Serialize, Deserialize)]
 pub struct ExactStatusEntry {
     pub commit: String,
-    pub manifest: String,
     pub bytes: u64,
     pub unique_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub built_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_status: Option<String>,
     /// RFC3339 timestamp of the ref's most recent access (build/reuse).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<String>,
-    /// True when the ref currently has non-evicted clonepack artifacts.
+    /// True when this exact commit has any published result.
     pub warm: bool,
     /// True when the warm-TTL sweep is forbidden from evicting this ref.
     pub pinned: bool,
-    pub depth1_ready: bool,
-    pub archive_ready: bool,
-    pub history: String,
+    pub head: bool,
+    pub full: bool,
+    pub files: bool,
+    pub job: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1161,7 +1247,7 @@ pub fn build_app(state: ServerState) -> Router {
         // bearer token (not the shared server token). Standalone workers POST
         // ref writes here; the server holds the DB
         // creds and performs the durable write. Lives outside `protected`.
-        .route("/v1/refs", post(ref_report_handler))
+        .route("/v1/refs", get(ref_read_handler).post(ref_report_handler))
         // Worker queue endpoints: a token-only worker claims, acks, and
         // heartbeats here instead of touching the DB. Same
         // signed-bearer gate as /v1/refs; the server holds the one queue DB.
@@ -1966,7 +2052,55 @@ async fn job_heartbeat_handler(
     }
 }
 
-/// `POST /v1/refs` — farmed-out worker reports a ref write.
+#[derive(Deserialize)]
+struct WorkerRefReadQuery {
+    repo_key: String,
+    commit: String,
+}
+
+/// `GET /v1/refs` — a worker reads the explicit results already published for
+/// the exact commit it owns. This lets a replacement job skip ready work.
+async fn ref_read_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkerRefReadQuery>,
+) -> Response {
+    use crate::provider::parse_storage_key;
+
+    if let Err(resp) = authorize_worker_token("GET /v1/refs", &headers) {
+        return resp;
+    }
+    let Some(repo_id) = parse_storage_key(&query.repo_key) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid repo_key: {}", query.repo_key),
+            }),
+        )
+            .into_response();
+    };
+    if let Err(error) = crate::validation::validate_object_id(&query.commit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid exact commit: {error}"),
+            }),
+        )
+            .into_response();
+    }
+    match state.ref_store.load_result(&repo_id, &query.commit).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("exact result read failed: {error:#}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /v1/refs` — farmed-out worker reports an exact result publication.
 ///
 /// Auth is a signed, expiring HMAC bearer token (`Authorization: Bearer …`), not
 /// the shared server token. Every mutation additionally carries the existing
@@ -2000,24 +2134,25 @@ async fn ref_report_handler(
     };
 
     let result: Result<RefReportResponse, anyhow::Error> = match body {
-        RefReport::SaveResult {
+        RefReport::PublishHead {
             job_id,
             worker_id,
-            info,
+            commit,
+            head,
             ..
         } => {
             admission_test_ref_store_write();
             match state.control_db.as_ref() {
                 Some(control) => {
                     control
-                        .save_result_for_claim(job_id, &worker_id, &repo_id, &info)
+                        .publish_head_for_claim(job_id, &worker_id, &repo_id, &commit, *head)
                         .await
                 }
                 #[cfg(test)]
                 None => {
                     state
                         .ref_store
-                        .save_claimed_result(&repo_id, &info, job_id, &worker_id)
+                        .publish_claimed_head(&repo_id, &commit, *head, job_id, &worker_id)
                         .await
                 }
                 #[cfg(not(test))]
@@ -2025,23 +2160,46 @@ async fn ref_report_handler(
             }
             .map(|updated| RefReportResponse { updated })
         }
-        RefReport::UpdateBuildStatus {
+        RefReport::PublishFull {
             job_id,
             worker_id,
             commit,
-            status,
+            full,
             ..
         } => match state.control_db.as_ref() {
             Some(control) => {
                 control
-                    .update_result_status_for_claim(job_id, &worker_id, &repo_id, &commit, &status)
+                    .publish_full_for_claim(job_id, &worker_id, &repo_id, &commit, *full)
                     .await
             }
             #[cfg(test)]
             None => {
                 state
                     .ref_store
-                    .update_claimed_build_status(&repo_id, &commit, &status, job_id, &worker_id)
+                    .publish_claimed_full(&repo_id, &commit, *full, job_id, &worker_id)
+                    .await
+            }
+            #[cfg(not(test))]
+            None => Err(anyhow::anyhow!("control database unavailable")),
+        }
+        .map(|updated| RefReportResponse { updated }),
+        RefReport::PublishFiles {
+            job_id,
+            worker_id,
+            commit,
+            files,
+            ..
+        } => match state.control_db.as_ref() {
+            Some(control) => {
+                control
+                    .publish_files_for_claim(job_id, &worker_id, &repo_id, &commit, *files)
+                    .await
+            }
+            #[cfg(test)]
+            None => {
+                state
+                    .ref_store
+                    .publish_claimed_files(&repo_id, &commit, *files, job_id, &worker_id)
                     .await
             }
             #[cfg(not(test))]
@@ -2331,12 +2489,23 @@ async fn git_upload_pack_inner(
 
 async fn dispatch_repos_get(
     Path(path): Path<String>,
-    Query(params): Query<RefQuery>,
     headers: HeaderMap,
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
     if let Some((repo_path, branch)) = path.rsplit_once("/refs/") {
+        let params = match Query::<RefQuery>::try_from_uri(&uri) {
+            Ok(query) => query.0,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -2597,59 +2766,30 @@ async fn ensure_mirror(
     .context("ensure mirror task")?
 }
 
-fn exact_clonepack_artifacts<'a>(
-    info: &'a RefInfo,
-    clonepack_kind: &str,
-) -> Option<&'a crate::ClonepackArtifacts> {
-    match clonepack_kind {
-        "shallow" => Some(&info.shallow_clonepack),
-        "full" => Some(&info.full_clonepack),
-        _ => None,
+fn exact_result_clonepack(
+    info: &RefInfo,
+    result: ExactResultKind,
+) -> Option<&crate::ClonepackArtifacts> {
+    match result {
+        ExactResultKind::Head => info.head.as_ref().map(|head| &head.clonepack),
+        ExactResultKind::Full => info.full.as_ref().map(|full| &full.clonepack),
+        ExactResultKind::Files => info.files.as_ref().map(|files| &files.clonepack),
     }
 }
 
-fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
-    if info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS) {
-        return false;
-    }
-    if info.commit != commit {
-        return false;
-    }
-    matches!(
-        exact_clonepack_artifacts(info, clonepack_kind),
-        Some(artifacts)
-            if !artifacts.manifest.is_empty()
-                && !artifacts.metadata_chunk.is_empty()
-                && !artifacts.idx_bundle.is_empty()
-                && artifacts.commit == commit
-    )
+fn exact_result_ready(info: &RefInfo, result: ExactResultKind, commit: &str) -> bool {
+    info.commit == commit && exact_result_clonepack(info, result).is_some()
 }
 
-/// A complete Full has durable editable metadata and a terminal successful
-/// phase-two state. An empty committed tree legitimately has no archive
-/// chunks, so the chunk count is deliberately not a readiness signal.
-fn exact_full_build_settled(info: &RefInfo, commit: &str) -> bool {
-    exact_ref_info_serves_commit(info, "full", commit) && info.build_status.is_none()
+fn exact_result_complete(info: &RefInfo, commit: &str) -> bool {
+    info.commit == commit && info.head.is_some() && info.full.is_some() && info.files.is_some()
 }
 
-/// An editable Full is useful immediately, but Files also needs phase two to
-/// settle. A non-terminal status must therefore retain (or recreate) durable
-/// work even while Full requests continue to receive the usable metadata.
-fn exact_full_files_incomplete(info: &RefInfo, commit: &str) -> bool {
-    exact_ref_info_serves_commit(info, "full", commit) && !exact_full_build_settled(info, commit)
-}
-
-/// Parent reuse is safe only after the parent's exact Full and Files result is
-/// complete. A phase-one row may carry artifacts from its own parent; treating
-/// that row as reusable would relabel those older bytes as the new parent.
+/// Parent reuse is safe only after the parent's exact Full and Files results are
+/// present. An incomplete exact result is never a reusable parent.
 fn exact_parent_ready_for_reuse(info: &RefInfo, commit: &str) -> bool {
-    exact_full_build_settled(info, commit)
+    info.commit == commit && info.full.is_some() && info.files.is_some()
 }
-
-/// `build_status` set on a phase-1 row while the full history + archive build
-/// runs in the background.
-pub(crate) const BUILDING_FULL_HISTORY: &str = "full history building";
-pub(crate) const BUILDING_FILES: &str = "files building";
 
 fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
     artifact_pending_response_with_top_up(commit, branch, queue_depth, None, None)
@@ -2693,10 +2833,8 @@ fn checked_manifest_hash(chunk: &crate::clonepack::ChunkRef) -> Option<String> {
     Some(crate::clonepack::hash_to_hex(&chunk.hash))
 }
 
-/// Build an ordinary Full ref response for the carried base using only hashes
-/// and ordering authenticated by that base manifest. The enclosing phase-one
-/// row's top-level pack/archive lists belong to the pending target and are
-/// intentionally never consulted here.
+/// Build an ordinary Full response for the carried base using only hashes and
+/// ordering authenticated by that base manifest.
 fn ref_response_from_manifest(
     repo_id: &RepoId,
     provider: &ProviderInstance,
@@ -2774,8 +2912,7 @@ fn ref_response_from_manifest(
         pack_chunk_urls: signed_list(&pack_hashes),
         midx_url: midx.as_deref().and_then(signed),
         idx_bundle_url: signed(&idx_bundle),
-        shallow: false,
-        archive_ready: !manifest.archive_chunks.is_empty(),
+        result: ExactResultKind::Full,
     })
 }
 
@@ -2785,20 +2922,21 @@ async fn carried_full_top_up_response(
     provider: &ProviderInstance,
     branch: &str,
     pinned: &str,
+    ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
     private: bool,
 ) -> Option<RefResponse> {
     // The caller supplies the same exact-row snapshot that is still building B.
     // Do not read it again here: Full(B) could publish between reads, which
     // would otherwise turn an exact-ready response into a pending top-up miss.
-    if info.commit != pinned
-        || info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-    {
+    if info.commit != pinned {
         return None;
     }
-    let parent = info.parent_commit.as_deref()?;
-    let artifact = info.full_clonepack.commit.as_str();
-    let manifest_hash = info.full_clonepack.manifest.as_str();
+    let parent = info.head.as_ref()?.parent_commit.as_deref()?;
+    let parent_result = ref_store.load_result(repo_id, parent).await.ok()??;
+    let full = parent_result.full.as_ref()?;
+    let artifact = full.clonepack.commit.as_str();
+    let manifest_hash = full.clonepack.manifest.as_str();
     if parent != artifact
         || artifact.is_empty()
         || manifest_hash.is_empty()
@@ -2853,15 +2991,6 @@ async fn get_ref_inner(
     headers: HeaderMap,
     state: ServerState,
 ) -> Response {
-    if !matches!(params.clonepack.as_str(), "full" | "shallow") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "clonepack must be full or shallow".to_string(),
-            }),
-        )
-            .into_response();
-    }
     if let Some(response) = validation::reject_if_invalid(|| {
         if requested_checkout == "HEAD" {
             Ok(())
@@ -2906,9 +3035,9 @@ async fn get_ref_inner(
     state.metrics.record_ref_lookup();
     let (commit, checkout_name, already_pinned) = if let Some(pinned) = params.pinned.as_deref() {
         admission_test_http(format!(
-            "GET /v1/repos/{}/refs/{requested_checkout}?pinned={pinned}&clonepack={}",
+            "GET /v1/repos/{}/refs/{requested_checkout}?pinned={pinned}&result={}",
             repo_id.storage_key(),
-            params.clonepack
+            params.result
         ));
         let checkout_name = if requested_checkout == "HEAD"
             && params.rev.as_deref() == Some(pinned)
@@ -3053,19 +3182,8 @@ async fn get_ref_inner(
         }
     };
     if let Some(info) = existing.as_ref()
-        && exact_ref_info_serves_commit(info, &params.clonepack, &commit)
+        && exact_result_ready(info, params.result, &commit)
     {
-        if params.clonepack == "full" && exact_full_files_incomplete(info, &commit) {
-            if let Err(error) =
-                ensure_exact_files_completion(&state, &repo_id, &commit, credential.clone()).await
-            {
-                state.metrics.record_error();
-                warn!(
-                    "failed to ensure Files completion for unfinished Full {}@{commit}; serving usable editable metadata: {error}",
-                    repo_id.storage_key()
-                );
-            }
-        }
         if let Err(error) = state
             .ref_store
             .touch_last_accessed_at(&repo_id, &commit)
@@ -3084,16 +3202,82 @@ async fn get_ref_inner(
                 checkout_name,
                 info,
                 &state.storage,
-                &params.clonepack,
+                params.result,
                 private,
             )),
         )
             .into_response();
     }
-    // Metadata phase text is not proof that a live durable job exists. Every
-    // non-ready exact request enters the one atomic admission transaction,
-    // which coalesces an active job or creates replacement work after a stale
-    // claim was dead-lettered.
+    if already_pinned {
+        let key = format!("{}\x1f{}", repo_id.storage_key(), commit);
+        let job_state = match state.build_queue.job_state_for_key(&key).await {
+            Ok(state) => state,
+            Err(error) => {
+                state.metrics.record_error();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ExactRevisionUnavailableResponse {
+                        error: format!("exact job lookup failed: {error:#}"),
+                        commit,
+                        branch: checkout_name,
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        if let JobState::Failed(error) = job_state {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ExactRevisionUnavailableResponse {
+                    error: format!("{} result failed: {error}", params.result),
+                    commit,
+                    branch: checkout_name,
+                }),
+            )
+                .into_response();
+        }
+        if !matches!(job_state, JobState::Pending) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ExactRevisionUnavailableResponse {
+                    error: format!(
+                        "{} result is missing for exact commit and no job is active",
+                        params.result
+                    ),
+                    commit,
+                    branch: checkout_name,
+                }),
+            )
+                .into_response();
+        }
+        if params.top_up && params.result == ExactResultKind::Full {
+            let base = match existing.as_ref() {
+                Some(info) => {
+                    carried_full_top_up_response(
+                        info,
+                        &repo_id,
+                        &provider,
+                        &checkout_name,
+                        &commit,
+                        &state.ref_store,
+                        &state.storage,
+                        private,
+                    )
+                    .await
+                }
+                None => None,
+            };
+            return artifact_pending_response_with_top_up(
+                &commit,
+                &checkout_name,
+                state.build_queue_depth.load(Ordering::Relaxed),
+                Some(true),
+                base,
+            );
+        }
+        return artifact_pending_response(&commit, &checkout_name, 0);
+    }
+
     let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&commit)).await;
     let job = BuildJob {
         repo_id: repo_id.clone(),
@@ -3115,30 +3299,6 @@ async fn get_ref_inner(
             .into_response();
     }
 
-    if already_pinned && params.top_up && params.clonepack == "full" {
-        let base = match existing.as_ref() {
-            Some(info) => {
-                carried_full_top_up_response(
-                    info,
-                    &repo_id,
-                    &provider,
-                    &checkout_name,
-                    &commit,
-                    &state.storage,
-                    private,
-                )
-                .await
-            }
-            None => None,
-        };
-        return artifact_pending_response_with_top_up(
-            &commit,
-            &checkout_name,
-            state.build_queue_depth.load(Ordering::Relaxed),
-            Some(true),
-            base,
-        );
-    }
     artifact_pending_response(
         &commit,
         &checkout_name,
@@ -3174,26 +3334,27 @@ fn explicit_test_mode(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
 
-async fn wait_test_phase_two_barrier(commit: &str) -> Result<()> {
+async fn wait_test_after_head_barrier(commit: &str) -> Result<()> {
     if !explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref()) {
         return Ok(());
     }
-    admission_test_phase2_entry().await;
-    let Some(dir) = std::env::var_os("RIPCLONE_TEST_PHASE2_BARRIER_DIR").map(PathBuf::from) else {
+    admission_test_after_head_entry().await;
+    let Some(dir) = std::env::var_os("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR").map(PathBuf::from)
+    else {
         return Ok(());
     };
-    if let Some(target) = std::env::var_os("RIPCLONE_TEST_PHASE2_BARRIER_COMMIT")
+    if let Some(target) = std::env::var_os("RIPCLONE_TEST_AFTER_HEAD_BARRIER_COMMIT")
         && target.to_str() != Some(commit)
     {
         return Ok(());
     }
-    std::fs::create_dir_all(&dir).context("create test phase-two barrier directory")?;
+    std::fs::create_dir_all(&dir).context("create test after-Head barrier directory")?;
     std::fs::write(dir.join("entered"), format!("{commit}\n"))
-        .context("signal test phase-two barrier")?;
+        .context("signal test after-Head barrier")?;
     let deadline = Instant::now() + Duration::from_secs(60);
     while !dir.join("proceed").exists() {
         if Instant::now() >= deadline {
-            anyhow::bail!("test phase-two barrier was not released within 60 seconds");
+            anyhow::bail!("test after-Head barrier was not released within 60 seconds");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -3243,22 +3404,27 @@ fn ref_response(
     branch: String,
     info: &RefInfo,
     storage: &crate::storage::StorageRef,
-    clonepack_kind: &str,
+    result: ExactResultKind,
     private: bool,
 ) -> RefResponse {
     let ttl = ref_signed_url_ttl(private);
-    let artifacts = exact_clonepack_artifacts(info, clonepack_kind)
-        .expect("clonepack kind is validated before response construction");
+    let artifacts = exact_result_clonepack(info, result)
+        .expect("requested exact result is ready before response construction");
     let clonepack_manifest = artifacts.manifest.clone();
     let metadata_chunk = artifacts.metadata_chunk.clone();
 
     let clonepack_manifest_url = signed_url(storage, ttl, &clonepack_manifest);
     let metadata_chunk_url = signed_url(storage, ttl, &metadata_chunk);
-    let archive_chunk_urls = if info.archive_chunks.is_empty() {
+    let archive_chunks = info
+        .files
+        .as_ref()
+        .filter(|_| result == ExactResultKind::Files)
+        .map(|files| files.archive_chunks.as_slice())
+        .unwrap_or_default();
+    let archive_chunk_urls = if archive_chunks.is_empty() {
         None
     } else {
-        let urls: Vec<Option<String>> = info
-            .archive_chunks
+        let urls: Vec<Option<String>> = archive_chunks
             .iter()
             .map(|h| signed_url(storage, ttl, h))
             .collect();
@@ -3269,30 +3435,22 @@ fn ref_response(
         }
     };
 
-    let head_blobs_chunk_urls = if info.head_blobs_chunks.is_empty() {
-        None
-    } else {
-        let urls: Vec<Option<String>> = info
-            .head_blobs_chunks
-            .iter()
-            .map(|h| signed_url(storage, ttl, h))
-            .collect();
-        if urls.iter().all(|u| u.is_none()) {
-            None
-        } else {
-            Some(urls)
-        }
-    };
-    let head_blobs_idx_url = signed_url(storage, ttl, &info.head_blobs_idx);
+    let head_blobs_chunk_urls = None;
+    let head_blobs_idx_url = None;
 
     // Sign each editable pack so the client fetches it straight from
     // object storage. `None` entries (e.g. local backend) fall back to the
     // gateway. Ordered to match the manifest's `packs` list.
-    let pack_chunk_urls = if info.packs.is_empty() {
+    let packs = match result {
+        ExactResultKind::Head => info.head.as_ref().map(|head| head.packs.as_slice()),
+        ExactResultKind::Full => info.full.as_ref().map(|full| full.packs.as_slice()),
+        ExactResultKind::Files => None,
+    }
+    .unwrap_or_default();
+    let pack_chunk_urls = if packs.is_empty() {
         None
     } else {
-        let packs: Vec<Option<String>> = info
-            .packs
+        let packs: Vec<Option<String>> = packs
             .iter()
             .map(|p| signed_url(storage, ttl, &p.pack))
             .collect();
@@ -3322,7 +3480,10 @@ fn ref_response(
         origin_url,
         branch,
         commit: artifacts.commit.clone(),
-        parent_commit: info.parent_commit.clone(),
+        parent_commit: info
+            .head
+            .as_ref()
+            .and_then(|head| head.parent_commit.clone()),
         clonepack_manifest,
         clonepack_manifest_url,
         metadata_chunk,
@@ -3333,9 +3494,7 @@ fn ref_response(
         pack_chunk_urls,
         midx_url,
         idx_bundle_url,
-        shallow: clonepack_kind == "shallow",
-        archive_ready: clonepack_kind != "full"
-            || exact_full_build_settled(info, &artifacts.commit),
+        result,
     }
 }
 
@@ -3348,20 +3507,12 @@ fn sync_response_without_storage_read(
     branch: String,
     info: &RefInfo,
     storage: &crate::storage::StorageRef,
-    clonepack_kind: &str,
+    result: ExactResultKind,
     private: bool,
     status: impl Into<String>,
 ) -> SyncResponse {
     SyncResponse {
-        ref_info: ref_response(
-            repo_id,
-            provider,
-            branch,
-            info,
-            storage,
-            clonepack_kind,
-            private,
-        ),
+        ref_info: ref_response(repo_id, provider, branch, info, storage, result, private),
         status: status.into(),
         phases: SyncPhases::default(),
         bytes: None,
@@ -3504,45 +3655,26 @@ async fn build_repo_status(
     let commits = state.ref_store.list_commits(repo_id).await?;
     let mut refs = Vec::new();
     let mut unique_chunks: HashMap<String, u64> = HashMap::new();
-
     for commit in commits {
         let Some(info) = state.ref_store.load_result(repo_id, &commit).await? else {
             continue;
         };
-
         let manifest_hashes = collect_manifest_hashes(&info);
-        let is_evicted =
-            info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS);
-        if manifest_hashes.is_empty() && info.history_levels.is_empty() && !is_evicted {
-            continue;
-        }
-
         let mut ref_bytes = 0u64;
-
-        // Evicted refs have no reachable artifacts; do not try to read manifest
-        // or pack hashes that the GC phase already deleted.
-        if !is_evicted {
-            // Manifest-based clonepack variants (shallow and full). Each
-            // manifest is itself a stored artifact and references chunks.
-            for manifest_hash in manifest_hashes {
-                // Read the manifest from the authoritative storage backend rather
-                // than the local CAS, because remote backends remove local copies
-                // after upload to save disk.
-                let manifest_bytes = state.storage.get(&manifest_hash)?;
-                let manifest_len = manifest_bytes.len() as u64;
-                record_chunk(&mut unique_chunks, &manifest_hash, manifest_len);
-                ref_bytes += manifest_len;
-
-                let manifest = ClonepackManifest::decode(manifest_bytes.as_slice())
-                    .context("decode clonepack manifest for status")?;
-                for chunk in manifest_chunk_refs(&manifest) {
-                    ref_bytes += chunk.len;
-                    record_chunk(&mut unique_chunks, &hash_to_hex(&chunk.hash), chunk.len);
-                }
+        for manifest_hash in manifest_hashes {
+            let manifest_bytes = state.storage.get(&manifest_hash)?;
+            let manifest_len = manifest_bytes.len() as u64;
+            record_chunk(&mut unique_chunks, &manifest_hash, manifest_len);
+            ref_bytes += manifest_len;
+            let manifest = ClonepackManifest::decode(manifest_bytes.as_slice())
+                .context("decode clonepack manifest for status")?;
+            for chunk in manifest_chunk_refs(&manifest) {
+                ref_bytes += chunk.len;
+                record_chunk(&mut unique_chunks, &hash_to_hex(&chunk.hash), chunk.len);
             }
-
-            // LSM sealed history levels: each level stores its own pack/idx hashes.
-            for level in &info.history_levels {
+        }
+        if let Some(full) = &info.full {
+            for level in &full.history_levels {
                 for pack in &level.packs {
                     if !pack.pack.is_empty() {
                         record_chunk(&mut unique_chunks, &pack.pack, pack.pack_len);
@@ -3562,56 +3694,29 @@ async fn build_repo_status(
         let last_accessed_at = info.last_accessed_at.and_then(|secs| {
             chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
         });
-
-        // Report the primary manifest: prefer full, then shallow.
-        // Evicted refs have no artifacts, so the manifest hash is meaningless.
-        let primary_manifest = if is_evicted {
-            String::new()
-        } else if !info.full_clonepack.manifest.is_empty() {
-            info.full_clonepack.manifest.clone()
-        } else if !info.shallow_clonepack.manifest.is_empty() {
-            info.shallow_clonepack.manifest.clone()
-        } else {
-            String::new()
+        let job_key = format!("{}\u{1f}{}", repo_id.storage_key(), info.commit);
+        let (job, job_error) = match state.build_queue.job_state_for_key(&job_key).await? {
+            JobState::Pending => ("pending".to_string(), None),
+            JobState::Done => ("done".to_string(), None),
+            JobState::Failed(error) => ("failed".to_string(), Some(error)),
+            JobState::Unknown => ("none".to_string(), None),
         };
-
-        let warm = !is_evicted && ref_bytes > 0;
-        let depth1_ready = !is_evicted && !info.shallow_clonepack.manifest.is_empty();
-        let archive_ready = !is_evicted && exact_full_build_settled(&info, &info.commit);
-        let history = if is_evicted {
-            "cold"
-        } else if info
-            .build_status
-            .as_deref()
-            .is_some_and(|s| s.starts_with("failed: "))
-        {
-            "failed"
-        } else if !info.full_clonepack.manifest.is_empty() {
-            "ready"
-        } else {
-            "building"
-        }
-        .to_string();
-
-        // Public forks of public projects receive zero unique-byte allocation;
-        // every other ref reports its logical bytes for now.
         let is_public_fork = public && fork_of.is_some();
         let branch_unique_bytes = if is_public_fork { 0 } else { ref_bytes };
 
         refs.push(ExactStatusEntry {
             commit: info.commit,
-            manifest: primary_manifest,
             bytes: ref_bytes,
             unique_bytes: branch_unique_bytes,
             built_at,
-            build_ms: info.build_ms,
-            build_status: info.build_status.clone(),
             last_accessed_at,
-            warm,
+            warm: info.head.is_some() || info.full.is_some() || info.files.is_some(),
             pinned: info.warm_pinned,
-            depth1_ready,
-            archive_ready,
-            history,
+            head: info.head.is_some(),
+            full: info.full.is_some(),
+            files: info.files.is_some(),
+            job,
+            job_error,
         });
     }
 
@@ -3743,8 +3848,8 @@ async fn sync_repo_inner(
         requested_branch.clone()
     };
 
-    // A complete exact Full is a read-only no-op. An editable-only Full enters
-    // durable admission so the archive work remains live for Files.
+    // Explicit sync owns every missing result. It is a no-op only when Head,
+    // Full, and Files are all already present.
     let loaded_exact = match state.ref_store.load_result(&repo_id, &commit).await {
         Ok(info) => info,
         Err(e) => {
@@ -3758,10 +3863,9 @@ async fn sync_repo_inner(
                 .into_response();
         }
     };
-    let ready = loaded_exact.as_ref().filter(|info| {
-        exact_ref_info_serves_commit(info, "full", &commit)
-            && !exact_full_files_incomplete(info, &commit)
-    });
+    let ready = loaded_exact
+        .as_ref()
+        .filter(|info| exact_result_complete(info, &commit));
     if let Some(info) = ready {
         state.metrics.record_sync(start.elapsed());
         let resp = sync_response_without_storage_read(
@@ -3770,7 +3874,7 @@ async fn sync_repo_inner(
             effective_branch,
             info,
             &state.storage,
-            "full",
+            ExactResultKind::Full,
             private,
             "no-op",
         );
@@ -3943,16 +4047,12 @@ async fn sync_repo_at_revision(
     };
     let at_rev = selected_commit;
 
-    // A retry after phase one resolves entirely from the local mirror and the
-    // exact result row. Full readiness is the selected artifact's identity,
-    // never the presence of a phase-one row or its top-level fields.
+    // A retry resolves entirely from the local mirror and exact result row. An
+    // explicit sync is a no-op only when every stored result is present.
     {
         let commit = at_rev.clone();
         match state.ref_store.load_result(&repo_id, &commit).await {
-            Ok(Some(info))
-                if exact_ref_info_serves_commit(&info, "full", &commit)
-                    && !exact_full_files_incomplete(&info, &commit) =>
-            {
+            Ok(Some(info)) if exact_result_complete(&info, &commit) => {
                 if let Err(error) = state
                     .ref_store
                     .touch_last_accessed_at(&repo_id, &commit)
@@ -3971,7 +4071,7 @@ async fn sync_repo_at_revision(
                     branch.clone(),
                     &info,
                     &state.storage,
-                    "full",
+                    ExactResultKind::Full,
                     private,
                     "no-op",
                 );
@@ -4204,7 +4304,7 @@ async fn enqueue_admitted_build(
         .map_err(|error| format!("repository config validation failed: {error:#}"))?;
     if let Some(control) = &state.control_db {
         let admission = ExactAdmissionPlan {
-            pending: pending_exact_result(&job, false),
+            pending: pending_exact_result(&job),
         };
         state.metrics.record_build_queued();
         admission_test_before_admission_tx(&job.admitted_commit).await;
@@ -4258,25 +4358,6 @@ async fn enqueue_admitted_build(
     }
 }
 
-/// Preserve a usable exact Full response while atomically joining or starting
-/// the missing Files completion for that same immutable commit.
-async fn ensure_exact_files_completion(
-    state: &ServerState,
-    repo_id: &RepoId,
-    commit: &str,
-    credential: Option<secrecy::SecretString>,
-) -> Result<(), String> {
-    let size_bytes = enqueue_size_bytes(state, repo_id, Some(commit)).await;
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit: commit.to_string(),
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential,
-        size_bytes,
-    };
-    enqueue_admitted_build(state, job).await.map(|_| ())
-}
-
 struct ExactAdmissionPlan {
     pending: RefInfo,
 }
@@ -4291,40 +4372,18 @@ async fn prepare_exact_admission(
         .load_result(&job.repo_id, commit)
         .await
         .map_err(|e| format!("exact admission lookup failed: {e}"))?;
-    if existing.as_ref().is_some_and(|info| {
-        exact_ref_info_serves_commit(info, "full", commit)
-            && info
-                .build_status
-                .as_deref()
-                .is_some_and(|status| status.starts_with("files failed: "))
+    if existing.as_ref().is_some_and(|result| {
+        result.head.is_some() && result.full.is_some() && result.files.is_some()
     }) {
-        // The Files-only job has already exhausted its queue budget. Keep the
-        // ready Full result visible, but never turn every later poll into a
-        // fresh attempt with a reset counter.
         return Ok(None);
     }
-    let active = existing.as_ref().is_some_and(|info| {
-        matches!(
-            info.build_status.as_deref(),
-            None | Some("building")
-                | Some(BUILDING_FULL_HISTORY)
-                | Some("archive building")
-                | Some(BUILDING_FILES)
-        )
-    });
-    if active {
-        return Ok(None);
-    }
-    let evicted = existing.is_some();
-    let mut pending = pending_exact_result(job, evicted);
-    pending.warm_pinned = existing.as_ref().is_some_and(|info| info.warm_pinned);
+    let pending = existing.unwrap_or_else(|| pending_exact_result(job));
     Ok(Some(ExactAdmissionPlan { pending }))
 }
 
-fn pending_exact_result(job: &BuildJob, replacement: bool) -> RefInfo {
+fn pending_exact_result(job: &BuildJob) -> RefInfo {
     RefInfo {
         commit: job.admitted_commit.clone(),
-        build_status: replacement.then(|| crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
         last_accessed_at: Some(
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -4363,8 +4422,9 @@ async fn trigger_build(
         .ok()
         .flatten();
     if let Some(info) = existing
-        && exact_ref_info_serves_commit(&info, "full", &admitted_commit)
-        && !exact_full_files_incomplete(&info, &admitted_commit)
+        && info.head.is_some()
+        && info.full.is_some()
+        && info.files.is_some()
     {
         // A signed replay/poller wakeup for a branch that already serves this
         // exact full commit is a read-only no-op. Do not fetch credentials or
@@ -5243,8 +5303,7 @@ fn load_metadata_files(
     Some(md.files)
 }
 
-/// Build one variant's PackEntry list + concatenated idx bundle. Free-function
-/// form (used by the two-phase sync path and its background phase-2 task).
+/// Build one result's PackEntry list and concatenated idx bundle.
 fn assemble_variant(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
@@ -5294,58 +5353,6 @@ fn assemble_variant(
         }),
         hash,
     ))
-}
-
-/// TEST-ONLY: hand each phase-2 build a distinct sequence number when
-/// `RIPCLONE_TEST_PHASE2_RACE` is set. A regression test uses it to drive two
-/// overlapping same-commit phase-2 builds that produce *different* idx bundles —
-/// reproducing on a small fixture the divergence that `git pack-objects`'
-/// run-to-run non-determinism produces between two concurrent builds of a large
-/// repo on real infra. Returns `None` (no-op) when the hook is unset.
-fn phase2_race_seq() -> Option<u64> {
-    if std::env::var_os("RIPCLONE_TEST_PHASE2_RACE").is_some() {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        Some(SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    } else {
-        None
-    }
-}
-
-/// TEST-ONLY companion to [`phase2_race_seq`]: append the build's sequence number
-/// to the idx bundle so two concurrent same-commit builds store *different*
-/// bundles. The nonce is trailing, so pack idx slices (indexed by offset) are
-/// unchanged; only the bundle `ChunkRef` length grows so the client's size check
-/// still matches. No-op when `seq` is `None`.
-fn phase2_race_salt_bundle(
-    cas: &Cas,
-    bundle_ref: Option<ChunkRef>,
-    bundle_hash: String,
-    seq: Option<u64>,
-) -> Result<(Option<ChunkRef>, String)> {
-    let (Some(seq), Some(mut r)) = (seq, bundle_ref.clone()) else {
-        return Ok((bundle_ref, bundle_hash));
-    };
-    if bundle_hash.is_empty() {
-        return Ok((bundle_ref, bundle_hash));
-    }
-    let mut bytes = cas.get(&bundle_hash)?;
-    bytes.extend_from_slice(&seq.to_le_bytes());
-    let hash = cas.put(&bytes)?;
-    r.hash = hash_from_hex(&hash)?;
-    r.len = bytes.len() as u64;
-    Ok((Some(r), hash))
-}
-
-/// TEST-ONLY: per-sequence `(pre-editable, pre-files)` sleeps (ms) that bracket
-/// build 0's two publishes around build 1's, so the current partial files publish
-/// lands build 0's manifest on top of build 1's idx bundle — the exact divergent
-/// interleave. No-op unless `RIPCLONE_TEST_PHASE2_RACE` is set.
-fn phase2_race_delays(seq: Option<u64>) -> (u64, u64) {
-    match seq {
-        Some(0) => (3000, 8000),
-        Some(1) => (4000, 0),
-        _ => (0, 0),
-    }
 }
 
 /// Build a multi-pack-index over `packs` from local CAS. Free-function form.
@@ -5542,32 +5549,20 @@ async fn do_sync(
     let mut t = t_total;
     let mut phases = SyncPhases::default();
 
-    // If editable Full is already durable, this job exists solely to finish
-    // Files. Do not fetch upstream or rebuild HEAD/full-history packs: the
-    // immutable Full manifest is the source of truth and only the archive is
-    // missing. `process_build_job` marks this kind of claim explicitly so an
-    // ordinary initial build can never take this shortcut.
-    if let Some(existing) = ref_store.load_result(repo_id, admitted_commit).await?
-        && exact_full_files_incomplete(&existing, admitted_commit)
-        && existing.build_status.as_deref() == Some(BUILDING_FILES)
+    let existing_before_fetch = ref_store.load_result(repo_id, admitted_commit).await?;
+    if let Some(existing) = existing_before_fetch.as_ref()
+        && existing.head.is_some()
+        && existing.full.is_some()
+        && existing.files.is_some()
     {
         if let Some(release) = foreground_release.take() {
             let _ = release.send(());
         }
-        return complete_files_from_editable(
-            cas,
-            mirror_dir,
-            repo_id,
-            admitted_commit,
-            ref_store,
-            storage,
-            retention,
-            compression_level,
-            t_total,
+        return Ok(SyncBuildResult {
+            info: existing.clone(),
+            status: "no-op".to_string(),
             phases,
-            existing,
-        )
-        .await;
+        });
     }
 
     // Best-effort: remove stale build temp dirs left by a previously killed
@@ -5639,34 +5634,6 @@ async fn do_sync(
     let commit = admitted_commit.to_string();
     let parent = git::parent_commit(&mirror_dir, &commit).ok().flatten();
 
-    // No-op fast path: if a *completed full* build already exists for exactly
-    // this commit, the prior clonepack artifacts are still valid — reuse them and
-    // build nothing (skips commit-graph/bitmap/skeleton/history/archive), so a
-    // poke-to-check sync of an unchanged repo returns near-instantly.
-    // It is safe only once phase two is terminally successful. The Full
-    // clonepack is published before the archive, so merely matching its commit
-    // would turn a failed archive completion into a no-op forever. Settled empty
-    // trees are intentionally reusable even though their archive list is empty.
-    let reusable = ref_store
-        .load_result(repo_id, &commit)
-        .await?
-        .filter(|info| exact_full_build_settled(info, &commit));
-    if let Some(prev) = reusable {
-        info!(
-            "sync no-op: {} already current at {} (reusing prior clonepack)",
-            repo_id.storage_key(),
-            &commit[..7.min(commit.len())]
-        );
-        if let Some(release) = foreground_release.take() {
-            let _ = release.send(());
-        }
-        return Ok(SyncBuildResult {
-            info: prev,
-            status: "no-op".to_string(),
-            phases,
-        });
-    }
-
     // Write a commit-graph so the rev-list walks in the skeleton + layered-pack
     // builds below are fast (a fresh --mirror clone has none). Best-effort.
     let cg_dir = mirror_dir.clone();
@@ -5674,16 +5641,47 @@ async fn do_sync(
     phases.commit_graph_ms = Some(duration_ms(t.elapsed()));
     info!("sync phase: commit-graph {:?}", t.elapsed());
 
-    info!("building artifacts for {}", &commit[..7]);
+    info!("building missing results for {}", &commit[..7]);
 
-    // Two-phase publish: build + publish the depth=1 clonepack now, build full
-    // history in the background. Removes the dominant history-deltification cost
-    // from "time to clonable". Mirror prep (fetch + commit-graph) is done; the
-    // depth=1 build and the background phase-2 are read-only over the mirror, so
-    // release the lock so other repos' builds (and this repo's resolves) proceed
-    // concurrently.
+    let existing = ref_store.load_result(repo_id, &commit).await?;
+    if let Some(result) = existing
+        && let Some(head) = result.head.clone()
+    {
+        drop(_guard);
+        if let Some(release) = foreground_release.take() {
+            let _ = release.send(());
+        }
+        build_missing_full_and_files(
+            cas,
+            &mirror_dir,
+            repo_id,
+            &commit,
+            head.parent_commit.clone().or(parent),
+            head,
+            ref_store,
+            storage,
+            retention,
+            compression_level,
+            result.full.is_none(),
+            result.files.is_none(),
+        )
+        .await?;
+        ref_store.invalidate(repo_id, &commit).await;
+        let info = ref_store
+            .load_result(repo_id, &commit)
+            .await?
+            .context("exact result vanished after missing result build")?;
+        return Ok(SyncBuildResult {
+            info,
+            status: "built".to_string(),
+            phases,
+        });
+    }
+
+    // Head is built and published first. Full and Files then read the mirror
+    // concurrently, so release the mirror lock before artifact work begins.
     drop(_guard);
-    build_and_publish_two_phase(
+    build_and_publish_results(
         cas,
         &mirror_dir,
         repo_id,
@@ -5711,11 +5709,7 @@ fn pack_artifacts_of(packs: &[(String, u64, String, u64)]) -> Vec<crate::PackArt
         .collect()
 }
 
-/// Two-part publish. The foreground work builds and publishes the depth=1
-/// clonepack, then releases its worker slot. The same durable owner continues
-/// full history and upgrades the full clonepack in the background. depth=0
-/// keeps serving the previous commit until Full finishes.
-/// Result of the phase-1 HEAD-closure build: a small delta pack against the
+/// Result of the Head-closure build: a small delta pack against the
 /// immutable base, or a fresh full base on a cold sync / rebase. See
 /// `build_head_delta_pack` / `build_head_packs`.
 struct HeadBuild {
@@ -5733,7 +5727,7 @@ struct HeadBuild {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_and_publish_two_phase(
+async fn build_and_publish_results(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     repo_id: &RepoId,
@@ -5750,17 +5744,14 @@ async fn build_and_publish_two_phase(
     mut phases: SyncPhases,
     mut foreground_release: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<SyncBuildResult> {
+    admission_test_head_build();
     admission_test_builder_entry(commit).await;
-    let history_target = 512 * 1024 * 1024;
     let upload_conc = upload_concurrency();
 
     // Load the previous synced ref once: used both for the files-table by-diff
     // below and for Option-A full-clonepack carry later in this phase.
     //
-    // Reuse only a completed exact Full/Files parent. Phase one deliberately
-    // carries its own parent's Full/archive artifacts while it builds; those
-    // bytes must never become the base for its child. Evicted and failed rows
-    // are likewise cold.
+    // Reuse only a completed exact Full/Files parent.
     let current = ref_store.load_result(repo_id, commit).await.ok().flatten();
     let prev_loaded = match parent.as_deref() {
         Some(parent_commit) => ref_store
@@ -5785,14 +5776,14 @@ async fn build_and_publish_two_phase(
             .is_some_and(|parent| exact_parent_ready_for_reuse(candidate, parent))
     });
 
-    // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----
+    // Build the Head closure and shallow skeleton, then publish Head.
     let mut t = Instant::now();
     let sk_start = Instant::now();
     let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let shallow_skeleton_handle = tokio::task::spawn_blocking(move || {
         let s = Instant::now();
         let r = PackBuilder::new(&md1, &c1).build_shallow_skeleton_pack(&cm1);
-        info!("p1 sub: shallow skeleton {:?}", s.elapsed());
+        info!("Head skeleton {:?}", s.elapsed());
         r
     });
     // Head-closure packs, incremental by delta against an immutable base: keep the
@@ -5801,16 +5792,18 @@ async fn build_and_publish_two_phase(
     // base and delta are disjoint by construction, so no object is ever in two HEAD
     // packs (which would double-materialize a worktree file). A cold sync (no base)
     // packs the full closure as the base. The cumulative delta grows as HEAD moves
-    // from the base; phase 2 rebases (rebuilds the base at HEAD) once it exceeds
+    // from the base; a later Head build rebases once it exceeds
     // RIPCLONE_HEAD_REBASE_BYTES, off the depth=1 critical path.
     let head_target = 4 * 1024 * 1024;
     let prev_base_commit: Option<String> = prev
         .as_ref()
-        .map(|p| p.head_base_commit.clone())
+        .and_then(|result| result.head.as_ref())
+        .map(|head| head.base_commit.clone())
         .filter(|c| !c.is_empty());
     let prev_base_packs: Vec<crate::SizedPack> = prev
         .as_ref()
-        .map(|p| p.head_base_packs.clone())
+        .and_then(|result| result.head.as_ref())
+        .map(|head| head.base_packs.clone())
         .unwrap_or_default();
     let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let head_handle = tokio::task::spawn_blocking(move || -> Result<HeadBuild> {
@@ -5825,7 +5818,7 @@ async fn build_and_publish_two_phase(
                 all_packs.extend(delta.iter().cloned());
                 let elapsed = s.elapsed();
                 info!(
-                    "p1 sub: head packs (delta vs base: {} new pack(s), {} total) {:?}",
+                    "Head packs (delta vs base: {} new pack(s), {} total) {:?}",
                     delta.len(),
                     all_packs.len(),
                     elapsed
@@ -5844,11 +5837,7 @@ async fn build_and_publish_two_phase(
                 let base = b.build_head_packs(&cm2, head_target)?;
                 let base_packs = base.iter().map(tuple_to_sized).collect();
                 let elapsed = s.elapsed();
-                info!(
-                    "p1 sub: head packs (full base, {} packs) {:?}",
-                    base.len(),
-                    elapsed
-                );
+                info!("Head packs (full base, {} packs) {:?}", base.len(), elapsed);
                 Ok(HeadBuild {
                     all_packs: base.clone(),
                     new_built: base,
@@ -5860,10 +5849,10 @@ async fn build_and_publish_two_phase(
             }
         }
     });
-    // Phase 1 builds only the cheap files table (no zstd frames): editable
+    // Head builds only the cheap files table (no zstd frames): editable
     // depth=1 materializes the worktree from the HEAD-closure packs, so it does
     // not need the archive. The full zstd archive (for files mode) is built in
-    // phase 2, off the time-to-depth=1 critical path.
+    // concurrently afterward, off the time-to-Head critical path.
     //
     // Files-table by-diff: when a prior sync exists, reuse its content hashes for
     // unchanged paths and read+hash only the blobs that changed since the prior
@@ -5871,20 +5860,15 @@ async fn build_and_publish_two_phase(
     // guarantees commit != prev.commit here, so the diff is non-trivial. Falls
     // back to a full table when there is no prior table.
     let prev_files: Option<Vec<crate::clonepack::FileEntry>> = match prev.as_ref() {
-        Some(p) if !p.commit.is_empty() && !p.shallow_clonepack.metadata_chunk.is_empty() => {
-            load_metadata_files(cas, storage, &p.shallow_clonepack.metadata_chunk)
-        }
+        Some(result) if !result.commit.is_empty() => result
+            .head
+            .as_ref()
+            .and_then(|head| load_metadata_files(cas, storage, &head.clonepack.metadata_chunk)),
         _ => None,
     };
     let prev_commit_for_diff = prev.as_ref().map(|p| p.commit.clone());
     // Carry the prior files table + commit so the bounded archive can hash only
     // changed files and reuse frames for the unchanged prefix/suffix.
-    let prev_files_for_archive: Vec<crate::clonepack::FileEntry> =
-        prev_files.clone().unwrap_or_default();
-    let prev_archive_commit: Option<String> = prev
-        .as_ref()
-        .map(|p| p.commit.clone())
-        .filter(|c| !c.is_empty());
     let (md3, cm3) = (mirror_dir.to_path_buf(), commit.to_string());
     let ft_start = Instant::now();
     let files_table_handle = match (prev_files, prev_commit_for_diff) {
@@ -5900,7 +5884,7 @@ async fn build_and_publish_two_phase(
                         let r = ArchiveBuilder::new(&md)
                             .build_files_table_incremental(&cm, &pf, &changed);
                         info!(
-                            "p1 sub: files-table (incremental, {} changed) {:?}",
+                            "Head files table (incremental, {} changed) {:?}",
                             changed.len(),
                             s.elapsed()
                         );
@@ -5909,10 +5893,7 @@ async fn build_and_publish_two_phase(
                     Err(e) => {
                         warn!("files-table diff failed ({e:#}); full rebuild");
                         let r = ArchiveBuilder::new(&md).build_files_table(&cm);
-                        info!(
-                            "p1 sub: files-table (full, diff fallback) {:?}",
-                            s.elapsed()
-                        );
+                        info!("Head files table (full, diff fallback) {:?}", s.elapsed());
                         r
                     }
                 }
@@ -5921,7 +5902,7 @@ async fn build_and_publish_two_phase(
         _ => tokio::task::spawn_blocking(move || {
             let s = Instant::now();
             let r = ArchiveBuilder::new(&md3).build_files_table(&cm3);
-            info!("p1 sub: files-table (full) {:?}", s.elapsed());
+            info!("Head files table (full) {:?}", s.elapsed());
             r
         }),
     };
@@ -5934,10 +5915,7 @@ async fn build_and_publish_two_phase(
     let head_packs = head_built.all_packs.clone();
     let metadata_base = files_table_handle.await.context("files table")??;
     phases.files_table_ms = Some(duration_ms(ft_start.elapsed()));
-    info!(
-        "two-phase p1: head+shallow-skeleton+files-table {:?}",
-        t.elapsed()
-    );
+    info!("Head result: packs+skeleton+files-table {:?}", t.elapsed());
     t = Instant::now();
 
     let (md4, c4, cm4, skp) = (
@@ -5961,8 +5939,7 @@ async fn build_and_publish_two_phase(
     let shallow_meta_data = shallow_meta.encode_to_vec();
     let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
 
-    // No archive frames in phase 1 (files mode is served by the full variant
-    // after phase 2). Editable depth=1 ignores archive chunks.
+    // Head has no archive frames. Files publishes its own archive result.
     let archive_chunks = archive_chunk_refs(&[], &metadata_base)?;
     let head_tagged: Vec<(&(String, u64, String, u64), bool)> =
         head_packs.iter().map(|p| (p, false)).collect();
@@ -5990,65 +5967,35 @@ async fn build_and_publish_two_phase(
     )?;
     let shallow_clonepack_hash = cas.put(&shallow_manifest.encode_to_vec())?;
 
-    // Option A: carry the previous commit's full clonepack so depth=0 keeps
-    // working (one commit stale) until phase 2 publishes the new full. (`prev`
-    // was loaded at the top of this phase.)
-    let carried_full = prev
-        .as_ref()
-        .map(|p| p.full_clonepack.clone())
-        .unwrap_or_default();
-    let carried_levels = prev
-        .as_ref()
-        .map(|p| p.history_levels.clone())
-        .unwrap_or_default();
-    // Prior sealed levels for phase 2's incremental build (reuse from Tigris).
-    let prev_levels_for_p2 = carried_levels.clone();
-    // Carry the prior archive frame index so phase 2 can reuse unchanged frames;
-    // phase 2 overwrites this with the freshly built index.
-    let carried_archive_frames = prev
-        .as_ref()
-        .map(|p| p.archive_frames.clone())
-        .unwrap_or_default();
-    let prev_archive_frames_for_p2 = carried_archive_frames.clone();
-
     let mut info = RefInfo {
         commit: commit.to_string(),
-        parent_commit: parent.clone(),
-        skeleton_pack: shallow_skeleton_pack.clone(),
-        skeleton_idx: shallow_skeleton_idx.clone(),
-        head_blobs_idx: String::new(),
-        head_blobs_chunks: Vec::new(),
-        packs: pack_artifacts_of(&head_packs),
-        prebuilt_index: shallow_prebuilt_index.clone(),
-        archive: String::new(),
-        manifest: shallow_metadata_hash.clone(),
-        archive_chunks: Vec::new(),
-        full_clonepack: carried_full,
-        shallow_clonepack: crate::ClonepackArtifacts {
-            manifest: shallow_clonepack_hash.clone(),
-            metadata_chunk: shallow_metadata_hash.clone(),
-            skeleton_pack: shallow_skeleton_pack.clone(),
-            skeleton_idx: shallow_skeleton_idx.clone(),
-            prebuilt_index: shallow_prebuilt_index.clone(),
-            midx: head_midx_hash.clone(),
-            idx_bundle: head_idx_bundle_hash.clone(),
-            commit: commit.to_string(),
-        },
-        history_levels: carried_levels,
-        head_base_commit: head_built.base_commit.clone(),
-        head_base_packs: head_built.base_packs.clone(),
-        archive_frames: carried_archive_frames,
-        build_status: Some("full history building".to_string()),
-        build_ms: None,
+        head: Some(crate::HeadResult {
+            clonepack: crate::ClonepackArtifacts {
+                manifest: shallow_clonepack_hash.clone(),
+                metadata_chunk: shallow_metadata_hash.clone(),
+                skeleton_pack: shallow_skeleton_pack.clone(),
+                skeleton_idx: shallow_skeleton_idx.clone(),
+                prebuilt_index: shallow_prebuilt_index.clone(),
+                midx: head_midx_hash.clone(),
+                idx_bundle: head_idx_bundle_hash.clone(),
+                commit: commit.to_string(),
+            },
+            parent_commit: parent.clone(),
+            packs: pack_artifacts_of(&head_packs),
+            base_commit: head_built.base_commit.clone(),
+            base_packs: head_built.base_packs.clone(),
+        }),
+        full: None,
+        files: None,
         synced_at: fetched_at,
         last_accessed_at: fetched_at,
         warm_pinned: prev_warm_pinned,
     };
 
-    // Upload phase-1 artifacts (shallow skeleton/index/metadata, head idx-bundle
+    // Upload Head artifacts (shallow skeleton/index/metadata, head idx-bundle
     // + midx, shallow manifest, and only the FRESHLY BUILT head packs+idx).
     // Reused bucket packs are already durable in storage from a prior sync.
-    let mut p1: Vec<String> = vec![
+    let mut head_uploads: Vec<String> = vec![
         shallow_skeleton_pack.clone(),
         shallow_skeleton_idx.clone(),
         shallow_prebuilt_index.clone(),
@@ -6058,127 +6005,84 @@ async fn build_and_publish_two_phase(
         head_midx_hash.clone(),
     ];
     for (p, _, i, _) in &head_built.new_built {
-        p1.push(p.clone());
-        p1.push(i.clone());
+        head_uploads.push(p.clone());
+        head_uploads.push(i.clone());
     }
-    p1.retain(|h| !h.is_empty());
+    head_uploads.retain(|h| !h.is_empty());
     let head_idx_keep: std::collections::HashSet<String> =
         head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
     let upload_start = Instant::now();
     wait_test_build_crash_barrier("before_upload", commit).await?;
     if test_build_crash_barrier_matches("during_upload", commit) {
-        let first = p1
+        let first = head_uploads
             .first()
             .cloned()
-            .context("phase-one upload set is empty")?;
+            .context("Head upload set is empty")?;
         upload_artifacts(cas, storage, vec![first], upload_conc).await?;
         wait_test_build_crash_barrier("during_upload", commit).await?;
         upload_artifacts(
             cas,
             storage,
-            p1.iter().skip(1).cloned().collect(),
+            head_uploads.iter().skip(1).cloned().collect(),
             upload_conc,
         )
         .await?;
     } else {
-        upload_artifacts(cas, storage, p1.clone(), upload_conc).await?;
+        upload_artifacts(cas, storage, head_uploads.clone(), upload_conc).await?;
     }
     wait_test_build_crash_barrier("after_upload", commit).await?;
-    settle_storage(cas, storage, retention, p1, head_idx_keep).await;
-    phases.upload_p1_ms = Some(duration_ms(upload_start.elapsed()));
+    settle_storage(cas, storage, retention, head_uploads, head_idx_keep).await;
+    phases.upload_head_ms = Some(duration_ms(upload_start.elapsed()));
 
     let publish_start = Instant::now();
     wait_test_build_crash_barrier("before_ready_publication", commit).await?;
     admission_test_ref_store_write();
-    ref_store
-        .save_result(repo_id, &info)
-        .await
-        .with_context(|| {
-            format!(
-                "persist depth=1 result for {}@{commit}",
+    let head_result = info
+        .head
+        .clone()
+        .context("Head result missing before publication")?;
+    anyhow::ensure!(
+        ref_store
+            .publish_head(repo_id, commit, head_result.clone())
+            .await
+            .with_context(|| format!(
+                "persist Head result for {}@{commit}",
                 repo_id.storage_key()
-            )
-        })?;
+            ))?,
+        "job no longer owns Head publication for {}@{commit}",
+        repo_id.storage_key()
+    );
+    admission_test_head_published();
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
     info!(
-        "two-phase p1: published depth-1 for {} in {:?} (full history building in background)",
+        "published Head for {} in {:?}",
         &commit[..7.min(commit.len())],
         t_total.elapsed()
     );
-    phases.publish_p1_ms = Some(duration_ms(t_total.elapsed()));
-    let _ = t; // p1 assemble/upload time folded into the total above
+    phases.publish_head_ms = Some(duration_ms(t_total.elapsed()));
+    let _ = t; // Head assemble/upload time is folded into the total above.
     if let Some(release) = foreground_release.take() {
         let _ = release.send(());
     }
-    wait_test_phase_two_barrier(commit).await?;
-
-    // ---- PHASE 2: full history, in the background (survives the request) ----
-    let cas2 = cas.clone();
-    let storage2 = storage.clone();
-    let ref_store2 = ref_store.clone();
-    let retention2 = retention.clone();
-    let mirror2 = mirror_dir.to_path_buf();
-    let repo_id2 = repo_id.clone();
-    let commit2 = commit.to_string();
-    let parent2 = parent.clone();
-    let sk_pack = shallow_skeleton_pack.clone();
-    let sk_idx = shallow_skeleton_idx.clone();
-    let sk_prebuilt = shallow_prebuilt_index.clone();
-    let sk_meta = shallow_metadata_hash.clone();
-    let sk_meta_len = shallow_meta_data.len() as u64;
-    let head_base_pack_count_for_p2 = head_built.base_packs.len();
-    let phase2 = async move {
-        let started = Instant::now();
-        let res = build_full_in_background(
-            &cas2,
-            &mirror2,
-            &repo_id2,
-            &commit2,
-            parent2,
-            &ref_store2,
-            &storage2,
-            &retention2,
-            head_packs,
-            sk_pack,
-            sk_idx,
-            sk_prebuilt,
-            sk_meta,
-            sk_meta_len,
-            head_idx_bundle_hash,
-            head_midx_hash,
-            history_target,
-            upload_conc,
-            prev_levels_for_p2,
-            prev_archive_frames_for_p2,
-            prev_files_for_archive,
-            prev_archive_commit,
-            head_base_pack_count_for_p2,
-            compression_level,
-            t_total,
-        )
-        .await;
-        match &res {
-            Ok(()) => {
-                admission_test_full_published(&commit2);
-                info!(
-                    "full clone ready for {} in {:?}",
-                    &commit2[..7.min(commit2.len())],
-                    started.elapsed()
-                );
-            }
-            Err(e) => {
-                error!(
-                    "full clone build failed for {}: {e:#}",
-                    repo_id2.storage_key()
-                );
-            }
-        }
-        res
-    };
+    wait_test_after_head_barrier(commit).await?;
 
     // Every durable claim owns Head, Files, and Full. A process death before
     // this completes leaves the SQL claim stale for the next worker to reclaim.
-    phase2.await.context("phase 2 (full history) build")?;
+    build_missing_full_and_files(
+        cas,
+        mirror_dir,
+        repo_id,
+        commit,
+        parent,
+        head_result,
+        ref_store,
+        storage,
+        retention,
+        compression_level,
+        true,
+        true,
+    )
+    .await?;
     ref_store.invalidate(repo_id, commit).await;
     if let Some(updated) = ref_store.load_result(repo_id, commit).await?
         && updated.commit == commit
@@ -6254,39 +6158,51 @@ fn measure_storage_amplification(
     };
 
     // Head closure packs (base + delta) and their idx files.
-    for p in &info.packs {
-        add(&p.pack, &mut head_pack_bytes);
-        add(&p.idx, &mut head_pack_bytes);
+    if let Some(head) = &info.head {
+        for pack in &head.packs {
+            add(&pack.pack, &mut head_pack_bytes);
+            add(&pack.idx, &mut head_pack_bytes);
+        }
     }
 
     // Full-history / LSM sealed levels.
-    for level in &info.history_levels {
-        for p in &level.packs {
-            add(&p.pack, &mut history_pack_bytes);
-            add(&p.idx, &mut history_pack_bytes);
+    if let Some(full) = &info.full {
+        for level in &full.history_levels {
+            for pack in &level.packs {
+                add(&pack.pack, &mut history_pack_bytes);
+                add(&pack.idx, &mut history_pack_bytes);
+            }
         }
     }
 
     // Archive chunks referenced directly from the ref.
-    for h in &info.archive_chunks {
-        add(h, &mut archive_chunk_bytes);
+    if let Some(files) = &info.files {
+        for hash in &files.archive_chunks {
+            add(hash, &mut archive_chunk_bytes);
+        }
     }
 
     // Metadata: manifests, metadata chunks, skeleton/index, prebuilt index,
     // idx bundle, and MIDX.
-    for hash in [
-        &info.manifest,
-        &info.shallow_clonepack.manifest,
-        &info.shallow_clonepack.metadata_chunk,
-        &info.shallow_clonepack.skeleton_pack,
-        &info.shallow_clonepack.skeleton_idx,
-        &info.shallow_clonepack.prebuilt_index,
-        &info.shallow_clonepack.idx_bundle,
-        &info.shallow_clonepack.midx,
-        &info.full_clonepack.manifest,
-        &info.full_clonepack.metadata_chunk,
-    ] {
-        add(hash, &mut metadata_bytes);
+    for artifacts in [
+        info.head.as_ref().map(|result| &result.clonepack),
+        info.full.as_ref().map(|result| &result.clonepack),
+        info.files.as_ref().map(|result| &result.clonepack),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for hash in [
+            &artifacts.manifest,
+            &artifacts.metadata_chunk,
+            &artifacts.skeleton_pack,
+            &artifacts.skeleton_idx,
+            &artifacts.prebuilt_index,
+            &artifacts.idx_bundle,
+            &artifacts.midx,
+        ] {
+            add(hash, &mut metadata_bytes);
+        }
     }
 
     let total_storage_bytes = head_pack_bytes
@@ -6342,180 +6258,178 @@ fn report_sync_bench(
     info!("{}", report.to_string());
 }
 
-/// Phase 2 of two-phase publish: build the full-history artifacts and upgrade
-/// the ref's full clonepack. The depth=1 clonepack is already live.
+/// Build every missing result after Head and let Full and Files publish as soon
+/// as their own artifact work completes.
 #[allow(clippy::too_many_arguments)]
-async fn build_full_in_background(
+async fn build_missing_full_and_files(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     repo_id: &RepoId,
     commit: &str,
     parent: Option<String>,
+    head: crate::HeadResult,
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
-    head_packs: Vec<(String, u64, String, u64)>,
-    // Phase 1's shallow skeleton + prebuilt index (HEAD trees + HEAD index). The
-    // full variant reuses these — the full history's commits+trees are already in
-    // the history packs, so a separate full skeleton is redundant. (hashes)
-    shallow_skeleton_pack: String,
-    shallow_skeleton_idx: String,
-    shallow_prebuilt_index: String,
-    // Phase 1's shallow metadata chunk (files table + skeleton, no archive frames).
-    // The editable full clonepack (phase 2a) reuses it verbatim: an editable depth=0
-    // clone reads only the files table + packs, never the archive frames. Phase 2b
-    // builds a frames-bearing metadata for files mode.
-    shallow_metadata_hash: String,
-    shallow_metadata_len: u64,
-    _head_idx_bundle_hash: String,
-    _head_midx_hash: String,
-    history_target: u64,
-    upload_conc: usize,
-    prev_levels: Vec<crate::HistoryLevel>,
-    prev_archive_frames: Vec<crate::ArchiveFrame>,
-    // The prior sync's files table + commit, for the bounded archive: it hashes
-    // only changed files and reuses frames for the unchanged prefix/suffix.
-    prev_files: Vec<crate::clonepack::FileEntry>,
-    prev_archive_commit: Option<String>,
-    // How many of `head_packs` (above) are base packs; the rest are the cumulative
-    // delta. When the delta's byte size exceeds RIPCLONE_HEAD_REBASE_BYTES this
-    // phase rebases — rebuilds a fresh base at the current commit (off the depth=1
-    // critical path) — so the delta never grows unbounded.
-    head_base_pack_count: usize,
-    // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
-    build_started_at: Instant,
+    need_full: bool,
+    need_files: bool,
 ) -> Result<()> {
-    // Incremental history: build only the tail past the last sealed level; prior
-    // levels are reused by hash from object storage (Tigris) — never rebuilt.
-    let lsm_cfg = lsm_config();
-    let sealed_tip: Option<String> = if lsm_cfg.enabled {
-        prev_levels.last().map(|l| l.tip_commit.clone())
-    } else {
-        None
+    let head_manifest_bytes = storage
+        .get(&head.clonepack.manifest)
+        .or_else(|_| cas.get(&head.clonepack.manifest))
+        .context("read Head manifest for remaining results")?;
+    let head_manifest = ClonepackManifest::decode(head_manifest_bytes.as_slice())
+        .context("decode Head manifest for remaining results")?;
+    anyhow::ensure!(
+        head_manifest.commit == commit && head.clonepack.commit == commit,
+        "Head result identity mismatch for {}@{commit}",
+        repo_id.storage_key()
+    );
+    let head_packs = manifest_pack_tuples(&head_manifest)?;
+    let parent_result = match parent.as_deref() {
+        Some(parent_commit) => ref_store
+            .load_result(repo_id, parent_commit)
+            .await?
+            .filter(|result| result.commit == parent_commit),
+        None => None,
     };
-    let archive_bundle_size = crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE;
 
-    // Write a reachability bitmap once, before the heavy full enumerations
-    // (skeleton + history). This is in the background phase, so it never delays
-    // the depth=1 publish. Best-effort.
-    let bm_dir = mirror_dir.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bm_dir)).await;
-
-    // History tail + the full zstd archive (deferred from phase 1), concurrently.
-    // No full skeleton: the full variant reuses phase 1's shallow skeleton, and
-    // the full history's commits+trees live in the history packs.
-    //
-    // The archive reuses unchanged frames (their raw bytes hash the same, so the
-    // prior compressed chunk is reused — no recompress, no re-upload). When a prior
-    // commit + frames are known, the bounded build also skips *reading* the
-    // unchanged prefix/suffix and only touches the changed middle; it falls back to
-    // the full read on its own when that doesn't apply. RIPCLONE_ARCHIVE_BOUNDED=0
-    // forces the full read.
-    let bounded = std::env::var("RIPCLONE_ARCHIVE_BOUNDED")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-        && !prev_archive_frames.is_empty()
-        && prev_archive_commit.is_some();
-    let prev_frame_map: std::collections::HashMap<String, (String, u64)> = prev_archive_frames
-        .iter()
-        .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
-        .collect();
-    let (mda, ca, cma, archive_storage) = (
-        mirror_dir.to_path_buf(),
-        cas.clone(),
-        commit.to_string(),
-        storage.clone(),
-    );
-    let archive_handle = tokio::task::spawn_blocking(move || {
-        let b = ArchiveBuilder::new(&mda);
-        if bounded {
-            b.build_into_cas_bounded(
-                &cma,
-                &ca,
-                Some(&archive_storage),
-                compression_level,
-                None,
-                &prev_archive_frames,
-                &prev_files,
-                prev_archive_commit.as_deref().unwrap_or_default(),
-                archive_bundle_size,
-            )
-        } else {
-            b.build_into_cas_incremental(
-                &cma,
-                &ca,
-                Some(&archive_storage),
-                compression_level,
-                None,
-                &prev_frame_map,
-                archive_bundle_size,
-            )
+    let full = async {
+        if !need_full {
+            return Ok(());
         }
-    });
-    let (md2, c2, cm2, st2, lsm2) = (
-        mirror_dir.to_path_buf(),
-        cas.clone(),
-        commit.to_string(),
-        sealed_tip.clone(),
-        lsm_cfg.enabled,
-    );
-    type BuiltHistory = (Vec<(String, u64, String, u64)>, bool);
-    let history_handle = tokio::task::spawn_blocking(move || -> Result<BuiltHistory> {
-        let b = PackBuilder::new(&md2, &c2);
-        if lsm2 {
-            let tail = b.build_history_tail(&cm2, st2.as_deref(), history_target)?;
-            Ok((tail, true))
-        } else {
-            Ok((b.build_history_packs(&cm2, history_target)?, false))
-        }
-    });
-    // History is enough to publish an editable clone: it reads only the files
-    // table and the packs, never the archive. So publish as soon as history is
-    // ready instead of waiting for the zstd archive (which only files mode needs).
-    let t_editable = Instant::now();
-    let (built_history, is_tail) = history_handle.await.context("history packs")??;
-
-    // Once the cumulative delta grows past the threshold, rebuild a fresh base at
-    // the current commit. depth=1 is already live, so this never blocks a clone.
-    // The fresh base is kept only if the ref still points at our commit.
-    let rebase_bytes = env_u64("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024);
-    let delta_bytes: u64 = head_packs
-        .iter()
-        .skip(head_base_pack_count)
-        .map(|(_, pack_len, _, _)| *pack_len)
-        .sum();
-    let (head_packs, new_head_packs, rebased_base): (
-        Vec<(String, u64, String, u64)>,
-        Vec<(String, u64, String, u64)>,
-        Option<Vec<crate::SizedPack>>,
-    ) = if delta_bytes >= rebase_bytes {
-        let head_target = 4 * 1024 * 1024;
-        let (mdc, cc, cmc) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-        let base = tokio::task::spawn_blocking(move || {
-            PackBuilder::new(&mdc, &cc).build_head_packs(&cmc, head_target)
-        })
+        build_full_result(
+            cas,
+            mirror_dir,
+            repo_id,
+            commit,
+            parent.clone(),
+            &head,
+            head_packs,
+            parent_result
+                .as_ref()
+                .and_then(|result| result.full.as_ref())
+                .map(|full| full.history_levels.clone())
+                .unwrap_or_default(),
+            ref_store,
+            storage,
+            retention,
+        )
         .await
-        .context("rebase head base")??;
-        info!(
-            "rebased HEAD base ({} MiB delta -> fresh base of {} packs)",
-            delta_bytes / (1024 * 1024),
-            base.len()
-        );
-        let sized: Vec<crate::SizedPack> = base.iter().map(tuple_to_sized).collect();
-        (base.clone(), base, Some(sized))
-    } else {
-        (head_packs, Vec::new(), None)
+    };
+    let files_parent = parent.clone();
+    let files = async {
+        if !need_files {
+            return Ok(());
+        }
+        build_files_result(
+            cas,
+            mirror_dir,
+            repo_id,
+            commit,
+            files_parent,
+            &head,
+            parent_result.as_ref(),
+            ref_store,
+            storage,
+            retention,
+            compression_level,
+        )
+        .await
     };
 
-    // Flatten the history levels for the manifest; collect the freshly built packs
-    // to upload and the levels to persist.
-    let (history_packs, new_history_tuples, new_levels) = if is_tail {
+    let (full_result, files_result) = tokio::join!(full, files);
+    match (full_result, files_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(full), Ok(())) => Err(full.context("Full build failed")),
+        (Ok(()), Err(files)) => Err(files.context("Files build failed")),
+        (Err(full), Err(files)) => Err(anyhow::anyhow!(
+            "Full build failed: {full:#}; Files build failed: {files:#}"
+        )),
+    }
+}
+
+fn manifest_pack_tuples(manifest: &ClonepackManifest) -> Result<Vec<(String, u64, String, u64)>> {
+    manifest
+        .packs
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let pack = entry
+                .pack
+                .as_ref()
+                .with_context(|| format!("Head manifest pack {index} missing pack"))?;
+            let idx = entry
+                .idx
+                .as_ref()
+                .with_context(|| format!("Head manifest pack {index} missing idx"))?;
+            Ok((
+                hash_to_hex(&pack.hash),
+                pack.len,
+                hash_to_hex(&idx.hash),
+                idx.len,
+            ))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_full_result(
+    cas: &Cas,
+    mirror_dir: &std::path::Path,
+    repo_id: &RepoId,
+    commit: &str,
+    parent: Option<String>,
+    head: &crate::HeadResult,
+    head_packs: Vec<(String, u64, String, u64)>,
+    previous_levels: Vec<crate::HistoryLevel>,
+    ref_store: &Arc<dyn RefStore>,
+    storage: &crate::storage::StorageRef,
+    retention: &Arc<Retention>,
+) -> Result<()> {
+    if admission_test_full_build(commit) {
+        anyhow::bail!("forced Full failure for {commit}");
+    }
+
+    let history_target = 512 * 1024 * 1024;
+    let lsm_cfg = lsm_config();
+    let sealed_tip = lsm_cfg
+        .enabled
+        .then(|| previous_levels.last().map(|level| level.tip_commit.clone()))
+        .flatten();
+    let history_mirror = mirror_dir.to_path_buf();
+    let history_cas = cas.clone();
+    let history_commit = commit.to_string();
+    let history_sealed_tip = sealed_tip.clone();
+    let lsm_enabled = lsm_cfg.enabled;
+    let (built_history, is_tail) = tokio::task::spawn_blocking(move || {
+        let builder = PackBuilder::new(&history_mirror, &history_cas);
+        if lsm_enabled {
+            Ok::<_, anyhow::Error>((
+                builder.build_history_tail(
+                    &history_commit,
+                    history_sealed_tip.as_deref(),
+                    history_target,
+                )?,
+                true,
+            ))
+        } else {
+            Ok((
+                builder.build_history_packs(&history_commit, history_target)?,
+                false,
+            ))
+        }
+    })
+    .await
+    .context("Full history task")??;
+
+    let (history_packs, new_history, levels) = if is_tail {
         seal_and_compact(
             mirror_dir,
             cas,
             commit,
-            prev_levels,
+            previous_levels,
             sealed_tip,
             built_history,
             history_target,
@@ -6525,327 +6439,107 @@ async fn build_full_in_background(
     } else {
         (built_history.clone(), built_history, Vec::new())
     };
-
-    // Pack entries + idx bundle over head + history. Built once; the files manifest
-    // below reuses them, since the packs are the same. MIDX is omitted (head packs
-    // were evicted) — the client builds it.
-    let full_tagged: Vec<(&(String, u64, String, u64), bool)> = head_packs
+    let tagged: Vec<(&(String, u64, String, u64), bool)> = head_packs
         .iter()
-        .map(|p| (p, false))
-        .chain(history_packs.iter().map(|p| (p, true)))
+        .map(|pack| (pack, false))
+        .chain(history_packs.iter().map(|pack| (pack, true)))
         .collect();
-    let (full_entries, full_idx_bundle_ref, full_idx_bundle_hash) =
-        assemble_variant(cas, storage, &full_tagged)?;
-    // TEST-ONLY: give overlapping same-commit builds distinct idx bundles.
-    let race_seq = phase2_race_seq();
-    let (race_pre_editable_ms, race_pre_files_ms) = phase2_race_delays(race_seq);
-    let (full_idx_bundle_ref, full_idx_bundle_hash) =
-        phase2_race_salt_bundle(cas, full_idx_bundle_ref, full_idx_bundle_hash, race_seq)?;
-
-    // The shallow metadata already has the files table and skeleton, and an
-    // editable clone ignores the archive, so reuse it and leave archive_chunks
-    // empty.
-    let editable_manifest = make_manifest(
+    let (entries, idx_bundle_ref, idx_bundle_hash) = assemble_variant(cas, storage, &tagged)?;
+    let manifest = make_manifest(
         commit,
         &parent,
         &[],
-        &shallow_metadata_hash,
-        shallow_metadata_len,
-        full_entries.clone(),
+        &head.clonepack.metadata_chunk,
+        storage
+            .size(&head.clonepack.metadata_chunk)
+            .context("size Head metadata for Full")?,
+        entries,
         None,
-        full_idx_bundle_ref.clone(),
+        idx_bundle_ref,
     )?;
-    let editable_clonepack_hash = cas.put(&editable_manifest.encode_to_vec())?;
-
-    // Upload the history packs+idx, the idx bundle, the manifest, and any rebase
-    // base. Non-rebase head packs + the shallow skeleton are already in storage.
-    let mut uploads: Vec<String> = vec![
-        editable_clonepack_hash.clone(),
-        full_idx_bundle_hash.clone(),
-    ];
-    for (p, _, i, _) in &new_history_tuples {
-        uploads.push(p.clone());
-        uploads.push(i.clone());
+    let manifest_hash = cas.put(&manifest.encode_to_vec())?;
+    let mut uploads = vec![manifest_hash.clone(), idx_bundle_hash.clone()];
+    for (pack, _, idx, _) in &new_history {
+        uploads.push(pack.clone());
+        uploads.push(idx.clone());
     }
-    for (p, _, i, _) in &new_head_packs {
-        uploads.push(p.clone());
-        uploads.push(i.clone());
-    }
-    uploads.retain(|h| !h.is_empty());
-    let idx_keep: std::collections::HashSet<String> = new_history_tuples
+    uploads.retain(|hash| !hash.is_empty());
+    let keep_idx = new_history
         .iter()
-        .map(|(_, _, ih, _)| ih.clone())
-        .chain(new_head_packs.iter().map(|(_, _, ih, _)| ih.clone()))
+        .map(|(_, _, idx, _)| idx.clone())
         .collect();
-    upload_artifacts(cas, storage, uploads.clone(), upload_conc).await?;
+    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
 
-    if let Ok(delay_for) = std::env::var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT")
-        && delay_for == commit
-        && let Ok(ms) = std::env::var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS")
-        && let Ok(ms) = ms.parse::<u64>()
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-    }
-    // TEST-ONLY: hold this build's editable publish so a concurrent same-commit
-    // build passes its reuse check and starts (see phase2_race_delays).
-    if race_pre_editable_ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(race_pre_editable_ms)).await;
-    }
-
-    // Publish the editable full clonepack. archive_chunks stays empty until the
-    // archive is built below; a files clone waits for it.
-    {
-        let mut info = ref_store
-            .load_result(repo_id, commit)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("result vanished before editable publish"))?;
-        if info.commit == commit {
-            let mut all_packs = head_packs.clone();
-            all_packs.extend(history_packs.iter().cloned());
-            info.packs = pack_artifacts_of(&all_packs);
-            info.skeleton_pack = shallow_skeleton_pack.clone();
-            info.skeleton_idx = shallow_skeleton_idx.clone();
-            info.prebuilt_index = shallow_prebuilt_index.clone();
-            info.manifest = shallow_metadata_hash.clone();
-            info.archive = String::new();
-            info.archive_chunks = Vec::new();
-            info.full_clonepack = crate::ClonepackArtifacts {
-                manifest: editable_clonepack_hash.clone(),
-                metadata_chunk: shallow_metadata_hash.clone(),
-                skeleton_pack: shallow_skeleton_pack.clone(),
-                skeleton_idx: shallow_skeleton_idx.clone(),
-                prebuilt_index: shallow_prebuilt_index.clone(),
-                midx: String::new(),
-                idx_bundle: full_idx_bundle_hash.clone(),
-                commit: commit.to_string(),
-            };
-            info.history_levels = new_levels;
-            if let Some(sized) = rebased_base {
-                info.head_base_commit = commit.to_string();
-                info.head_base_packs = sized;
-            }
-            info.build_status = Some("archive building".to_string());
-            admission_test_ref_store_write();
-            ref_store
-                .save_result(repo_id, &info)
-                .await
-                .with_context(|| {
-                    format!(
-                        "persist editable result for {}@{commit}",
-                        repo_id.storage_key()
-                    )
-                })?;
-        }
-    }
-    // Test-only crash boundary: the editable Full row is durable, but Files
-    // has not yet been published. Production has no corresponding pause.
-    admission_test_after_editable_publish().await;
-    settle_storage(cas, storage, retention, uploads, idx_keep).await;
-    info!(
-        "published editable full clone for {} in {:?}",
-        &commit[..7.min(commit.len())],
-        t_editable.elapsed()
+    let mut all_packs = head_packs;
+    all_packs.extend(history_packs);
+    let full = crate::FullResult {
+        clonepack: crate::ClonepackArtifacts {
+            manifest: manifest_hash,
+            metadata_chunk: head.clonepack.metadata_chunk.clone(),
+            skeleton_pack: head.clonepack.skeleton_pack.clone(),
+            skeleton_idx: head.clonepack.skeleton_idx.clone(),
+            prebuilt_index: head.clonepack.prebuilt_index.clone(),
+            midx: String::new(),
+            idx_bundle: idx_bundle_hash,
+            commit: commit.to_string(),
+        },
+        packs: pack_artifacts_of(&all_packs),
+        history_levels: levels,
+    };
+    admission_test_before_full_publish().await;
+    admission_test_ref_store_write();
+    anyhow::ensure!(
+        ref_store.publish_full(repo_id, commit, full).await?,
+        "job no longer owns Full publication for {}@{commit}",
+        repo_id.storage_key()
     );
-
-    // Test hook: hold the archive back so a test can observe the editable clone
-    // being ready while files mode is not.
-    if let Ok(ms) = std::env::var("RIPCLONE_TEST_ARCHIVE_DELAY_MS")
-        && let Ok(ms) = ms.parse::<u64>()
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-    }
-    if let Ok(fail_for) = std::env::var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT")
-        && fail_for == commit
-    {
-        anyhow::bail!("forced phase-2 failure for {commit}");
-    }
-    // Test hook: panic (rather than return Err) inside the background Full task,
-    // to exercise that a panicking background build is surfaced + marked failed
-    // instead of silently stranding the ref at "full history building".
-    if let Ok(panic_for) = std::env::var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT")
-        && panic_for == commit
-    {
-        panic!("forced phase-2 panic for {commit}");
-    }
-
-    // Now the zstd archive, which files mode needs.
-    let t_archive = Instant::now();
-    let archive_output = archive_handle.await.context("full archive")??;
-    let archive_chunk_hashes = archive_output.download_bundle_hashes;
-    let archive_meta = archive_output.metadata;
-    let new_archive_chunks = archive_output.new_reuse_frame_hashes;
-    let archive_frames = archive_output.archive_frames;
+    settle_storage(cas, storage, retention, uploads, keep_idx).await;
+    admission_test_full_published(commit);
+    admission_test_after_full_publish().await;
     info!(
-        "archive {} frames ({} rebuilt)",
-        archive_frames.len(),
-        new_archive_chunks.len()
-    );
-    let fetch = |h: &str| -> Result<Vec<u8>> { cas.get(h).or_else(|_| storage.get(h)) };
-    let mut full_meta = archive_meta;
-    full_meta.skeleton_pack = fetch(&shallow_skeleton_pack)?;
-    full_meta.skeleton_idx = fetch(&shallow_skeleton_idx)?;
-    full_meta.prebuilt_index = fetch(&shallow_prebuilt_index)?;
-    let full_meta_data = full_meta.encode_to_vec();
-    let files_metadata_hash = cas.put(&full_meta_data)?;
-    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &full_meta)?;
-    // Same packs + idx bundle as the editable manifest, now with the archive.
-    let files_manifest = make_manifest(
-        commit,
-        &parent,
-        &archive_chunks,
-        &files_metadata_hash,
-        full_meta_data.len() as u64,
-        full_entries,
-        None,
-        full_idx_bundle_ref,
-    )?;
-    let files_clonepack_hash = cas.put(&files_manifest.encode_to_vec())?;
-
-    let uploads = archive_publish_upload_hashes(
-        &files_metadata_hash,
-        &files_clonepack_hash,
-        &archive_chunk_hashes,
-        &new_archive_chunks,
-    );
-    upload_artifacts(cas, storage, uploads.clone(), upload_conc).await?;
-
-    // TEST-ONLY: hold this build's files publish so a concurrent same-commit build
-    // completes its editable+files publishes in between (see phase2_race_delays).
-    if race_pre_files_ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(race_pre_files_ms)).await;
-    }
-
-    // Add the archive to the full clonepack only while this exact result still
-    // carries this build's idx bundle. Same-commit background builds may overlap;
-    // this artifact check keeps their independently generated bundles coherent.
-    // This publish
-    // only re-points `manifest`/`metadata_chunk`; it must not do that on top of
-    // another build's `idx_bundle`, or the served idx_bundle_url (that build's
-    // bundle) and manifest.idx_bundle (this build's) would diverge and every
-    // editable clone would fail the idx-bundle hash check. If another same-commit
-    // build now owns the full clonepack, skip — it publishes its own consistent
-    // files variant.
-    {
-        let mut info = ref_store
-            .load_result(repo_id, commit)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("result vanished before archive publish"))?;
-        if info.commit == commit && info.full_clonepack.idx_bundle == full_idx_bundle_hash {
-            info.manifest = files_metadata_hash.clone();
-            info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
-            info.archive_chunks = archive_chunk_hashes.clone();
-            info.full_clonepack.manifest = files_clonepack_hash.clone();
-            info.full_clonepack.metadata_chunk = files_metadata_hash.clone();
-            info.archive_frames = archive_frames;
-            info.build_status = None;
-            info.build_ms = Some(duration_ms(build_started_at.elapsed()));
-            // Loud integrity guard: the served idx_bundle (full_clonepack.idx_bundle,
-            // signed into idx_bundle_url) MUST equal the idx bundle inside the
-            // manifest we now point clients at, or the clone's hash check fails.
-            let manifest_bundle = files_manifest
-                .idx_bundle
-                .as_ref()
-                .map(|c| crate::clonepack::hash_to_hex(&c.hash))
-                .unwrap_or_default();
-            anyhow::ensure!(
-                manifest_bundle == info.full_clonepack.idx_bundle,
-                "full clonepack idx_bundle integrity for {}@{commit}: served {} != manifest {manifest_bundle}",
-                repo_id.storage_key(),
-                info.full_clonepack.idx_bundle,
-            );
-            admission_test_ref_store_write();
-            ref_store
-                .save_result(repo_id, &info)
-                .await
-                .with_context(|| {
-                    format!(
-                        "persist files result for {}@{commit}",
-                        repo_id.storage_key()
-                    )
-                })?;
-        }
-    }
-    settle_storage(
-        cas,
-        storage,
-        retention,
-        uploads,
-        std::collections::HashSet::new(),
-    )
-    .await;
-    info!(
-        "published files archive for {} in {:?}",
-        &commit[..7.min(commit.len())],
-        t_archive.elapsed()
+        "published Full result for {}@{}",
+        repo_id.storage_key(),
+        &commit[..7.min(commit.len())]
     );
     Ok(())
 }
 
-/// Finish Files from an already-published editable Full. This deliberately
-/// reads the existing immutable manifest instead of rebuilding its source
-/// mirror, HEAD closure, or full-history packs. A phase-two failure therefore
-/// costs only the missing archive work on its bounded continuation attempt.
 #[allow(clippy::too_many_arguments)]
-async fn complete_files_from_editable(
+async fn build_files_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     repo_id: &RepoId,
     commit: &str,
+    parent: Option<String>,
+    head: &crate::HeadResult,
+    parent_result: Option<&RefInfo>,
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     compression_level: i32,
-    started_at: Instant,
-    phases: SyncPhases,
-    editable: RefInfo,
-) -> Result<SyncBuildResult> {
-    admission_test_files_completion_entry();
-    info!(
-        "completing Files for {}@{} from existing editable Full",
-        repo_id.storage_key(),
-        &commit[..7.min(commit.len())]
-    );
-    let fetch = |hash: &str| -> Result<Vec<u8>> { cas.get(hash).or_else(|_| storage.get(hash)) };
-    let editable_metadata = crate::clonepack::MetadataChunk::decode_and_validate(
-        fetch(&editable.full_clonepack.metadata_chunk)?.as_slice(),
-    )
-    .context("decode editable Full metadata for Files completion")?;
-    let editable_manifest_hash = editable.full_clonepack.manifest.clone();
-    let editable_manifest = ClonepackManifest::decode(fetch(&editable_manifest_hash)?.as_slice())
-        .context("decode editable Full manifest for Files completion")?;
-    anyhow::ensure!(
-        editable_manifest.commit == commit,
-        "editable Full manifest commit mismatch for {}@{commit}: {}",
-        repo_id.storage_key(),
-        editable_manifest.commit
-    );
-    let manifest_bundle = editable_manifest
-        .idx_bundle
-        .as_ref()
-        .map(|chunk| hash_to_hex(&chunk.hash))
+) -> Result<()> {
+    if admission_test_files_build(commit) {
+        anyhow::bail!("forced Files failure for {commit}");
+    }
+
+    let previous_frames = parent_result
+        .and_then(|result| result.files.as_ref())
+        .map(|files| files.archive_frames.clone())
         .unwrap_or_default();
-    anyhow::ensure!(
-        manifest_bundle == editable.full_clonepack.idx_bundle,
-        "editable Full idx bundle mismatch for {}@{commit}",
-        repo_id.storage_key()
-    );
-
-    // The phase-two fault hook applies to a Files-only continuation as well as
-    // the original phase-two task. This keeps the bounded-attempt regression
-    // deterministic without changing production behavior.
-    if let Ok(fail_for) = std::env::var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT")
-        && fail_for == commit
-    {
-        anyhow::bail!("forced phase-2 failure for {commit}");
-    }
-    if let Ok(panic_for) = std::env::var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT")
-        && panic_for == commit
-    {
-        panic!("forced phase-2 panic for {commit}");
-    }
-
-    let previous_frames: std::collections::HashMap<String, (String, u64)> = editable
-        .archive_frames
+    let previous_files = match parent_result.and_then(|result| result.head.as_ref()) {
+        Some(parent_head) => {
+            load_metadata_files(cas, storage, &parent_head.clonepack.metadata_chunk)
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    let previous_commit = parent_result.map(|result| result.commit.clone());
+    let bounded = std::env::var("RIPCLONE_ARCHIVE_BOUNDED")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+        && !previous_frames.is_empty()
+        && previous_commit.is_some();
+    let previous_frame_map: std::collections::HashMap<String, (String, u64)> = previous_frames
         .iter()
         .map(|frame| {
             (
@@ -6859,88 +6553,83 @@ async fn complete_files_from_editable(
     let archive_storage = storage.clone();
     let archive_commit = commit.to_string();
     let archive_output = tokio::task::spawn_blocking(move || {
-        ArchiveBuilder::new(&archive_mirror).build_into_cas_incremental(
-            &archive_commit,
-            &archive_cas,
-            Some(&archive_storage),
-            compression_level,
-            None,
-            &previous_frames,
-            crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
-        )
+        let builder = ArchiveBuilder::new(&archive_mirror);
+        if bounded {
+            builder.build_into_cas_bounded(
+                &archive_commit,
+                &archive_cas,
+                Some(&archive_storage),
+                compression_level,
+                None,
+                &previous_frames,
+                &previous_files,
+                previous_commit.as_deref().unwrap_or_default(),
+                crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
+        } else {
+            builder.build_into_cas_incremental(
+                &archive_commit,
+                &archive_cas,
+                Some(&archive_storage),
+                compression_level,
+                None,
+                &previous_frame_map,
+                crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
+        }
     })
     .await
     .context("Files archive task")??;
 
     let archive_chunk_hashes = archive_output.download_bundle_hashes;
-    let mut files_metadata = archive_output.metadata;
-    // The archive builder owns the frames/files tables. The editable manifest
-    // already contains the exact skeleton/index bytes needed by both modes.
-    files_metadata.skeleton_pack = editable_metadata.skeleton_pack;
-    files_metadata.skeleton_idx = editable_metadata.skeleton_idx;
-    files_metadata.prebuilt_index = editable_metadata.prebuilt_index;
-    let files_metadata_data = files_metadata.encode_to_vec();
-    let files_metadata_hash = cas.put(&files_metadata_data)?;
-    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &files_metadata)?;
-    let files_manifest = make_manifest(
+    let mut metadata = archive_output.metadata;
+    let fetch = |hash: &str| cas.get(hash).or_else(|_| storage.get(hash));
+    metadata.skeleton_pack = fetch(&head.clonepack.skeleton_pack)?;
+    metadata.skeleton_idx = fetch(&head.clonepack.skeleton_idx)?;
+    metadata.prebuilt_index = fetch(&head.clonepack.prebuilt_index)?;
+    let metadata_bytes = metadata.encode_to_vec();
+    let metadata_hash = cas.put(&metadata_bytes)?;
+    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &metadata)?;
+    let manifest = make_manifest(
         commit,
-        &editable.parent_commit,
+        &parent,
         &archive_chunks,
-        &files_metadata_hash,
-        files_metadata_data.len() as u64,
-        editable_manifest.packs,
-        editable_manifest.midx,
-        editable_manifest.idx_bundle,
+        &metadata_hash,
+        metadata_bytes.len() as u64,
+        Vec::new(),
+        None,
+        None,
     )?;
-    let files_manifest_hash = cas.put(&files_manifest.encode_to_vec())?;
+    let manifest_hash = cas.put(&manifest.encode_to_vec())?;
     let uploads = archive_publish_upload_hashes(
-        &files_metadata_hash,
-        &files_manifest_hash,
+        &metadata_hash,
+        &manifest_hash,
         &archive_chunk_hashes,
         &archive_output.new_reuse_frame_hashes,
     );
     upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
 
-    let mut info = ref_store
-        .load_result(repo_id, commit)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("result vanished before Files publish"))?;
-    // Another owner may have published a coherent Files variant while this
-    // continuation was running. Never mix this archive with that owner's pack
-    // bundle; simply leave its settled publication intact.
-    if info.commit == commit
-        && info.full_clonepack.manifest == editable_manifest_hash
-        && info.full_clonepack.idx_bundle == editable.full_clonepack.idx_bundle
-    {
-        info.manifest = files_metadata_hash.clone();
-        info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
-        info.archive_chunks = archive_chunk_hashes.clone();
-        info.full_clonepack.manifest = files_manifest_hash;
-        info.full_clonepack.metadata_chunk = files_metadata_hash;
-        info.archive_frames = archive_output.archive_frames;
-        info.build_status = None;
-        info.build_ms = Some(duration_ms(started_at.elapsed()));
-        let final_bundle = files_manifest
-            .idx_bundle
-            .as_ref()
-            .map(|chunk| hash_to_hex(&chunk.hash))
-            .unwrap_or_default();
-        anyhow::ensure!(
-            final_bundle == info.full_clonepack.idx_bundle,
-            "Files completion idx bundle mismatch for {}@{commit}",
-            repo_id.storage_key()
-        );
-        admission_test_ref_store_write();
-        ref_store
-            .save_result(repo_id, &info)
-            .await
-            .with_context(|| {
-                format!(
-                    "persist Files completion for {}@{commit}",
-                    repo_id.storage_key()
-                )
-            })?;
-    }
+    let files = crate::FilesResult {
+        clonepack: crate::ClonepackArtifacts {
+            manifest: manifest_hash,
+            metadata_chunk: metadata_hash,
+            skeleton_pack: head.clonepack.skeleton_pack.clone(),
+            skeleton_idx: head.clonepack.skeleton_idx.clone(),
+            prebuilt_index: head.clonepack.prebuilt_index.clone(),
+            midx: String::new(),
+            idx_bundle: String::new(),
+            commit: commit.to_string(),
+        },
+        archive_chunks: archive_chunk_hashes,
+        archive_frames: archive_output.archive_frames,
+    };
+    admission_test_before_files_publish().await;
+    admission_test_ref_store_write();
+    anyhow::ensure!(
+        ref_store.publish_files(repo_id, commit, files).await?,
+        "job no longer owns Files publication for {}@{commit}",
+        repo_id.storage_key()
+    );
     settle_storage(
         cas,
         storage,
@@ -6949,13 +6638,15 @@ async fn complete_files_from_editable(
         std::collections::HashSet::new(),
     )
     .await;
-    Ok(SyncBuildResult {
-        info,
-        status: "files completed".to_string(),
-        phases,
-    })
+    admission_test_files_published();
+    admission_test_after_files_publish().await;
+    info!(
+        "published Files result for {}@{}",
+        repo_id.storage_key(),
+        &commit[..7.min(commit.len())]
+    );
+    Ok(())
 }
-
 struct ClaimScopedRefStore {
     inner: Arc<dyn RefStore>,
     control: Option<Arc<crate::control::ControlDb>>,
@@ -6970,62 +6661,110 @@ impl RefStore for ClaimScopedRefStore {
     }
 
     async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
+        self.inner.save_result(repo_id, info).await
+    }
+
+    async fn publish_head(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        head: crate::HeadResult,
+    ) -> Result<bool> {
+        let mut result = self
+            .load_result(repo_id, commit)
+            .await?
+            .context("exact result missing before Head publication")?;
+        result.head = Some(head.clone());
         self.inner
-            .before_claimed_result_write(repo_id, info)
+            .before_claimed_result_write(repo_id, &result)
             .await?;
         let updated = match &self.control {
             Some(control) => {
                 control
-                    .save_result_for_claim(self.job_id, &self.worker_id, repo_id, info)
+                    .publish_head_for_claim(self.job_id, &self.worker_id, repo_id, commit, head)
                     .await?
             }
             None => {
                 self.inner
-                    .save_claimed_result(repo_id, info, self.job_id, &self.worker_id)
+                    .publish_claimed_head(repo_id, commit, head, self.job_id, &self.worker_id)
                     .await?
             }
         };
         anyhow::ensure!(updated, "worker no longer owns job {}", self.job_id);
-        self.inner.after_claimed_result_write(repo_id, info).await?;
-        Ok(())
+        self.inner
+            .after_claimed_result_write(repo_id, &result)
+            .await?;
+        Ok(true)
+    }
+
+    async fn publish_full(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        full: crate::FullResult,
+    ) -> Result<bool> {
+        let mut result = self
+            .load_result(repo_id, commit)
+            .await?
+            .context("exact result missing before Full publication")?;
+        result.full = Some(full.clone());
+        self.inner
+            .before_claimed_result_write(repo_id, &result)
+            .await?;
+        let updated = match &self.control {
+            Some(control) => {
+                control
+                    .publish_full_for_claim(self.job_id, &self.worker_id, repo_id, commit, full)
+                    .await?
+            }
+            None => {
+                self.inner
+                    .publish_claimed_full(repo_id, commit, full, self.job_id, &self.worker_id)
+                    .await?
+            }
+        };
+        anyhow::ensure!(updated, "worker no longer owns job {}", self.job_id);
+        self.inner
+            .after_claimed_result_write(repo_id, &result)
+            .await?;
+        Ok(true)
+    }
+
+    async fn publish_files(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        files: crate::FilesResult,
+    ) -> Result<bool> {
+        let mut result = self
+            .load_result(repo_id, commit)
+            .await?
+            .context("exact result missing before Files publication")?;
+        result.files = Some(files.clone());
+        self.inner
+            .before_claimed_result_write(repo_id, &result)
+            .await?;
+        let updated = match &self.control {
+            Some(control) => {
+                control
+                    .publish_files_for_claim(self.job_id, &self.worker_id, repo_id, commit, files)
+                    .await?
+            }
+            None => {
+                self.inner
+                    .publish_claimed_files(repo_id, commit, files, self.job_id, &self.worker_id)
+                    .await?
+            }
+        };
+        anyhow::ensure!(updated, "worker no longer owns job {}", self.job_id);
+        self.inner
+            .after_claimed_result_write(repo_id, &result)
+            .await?;
+        Ok(true)
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
         self.inner.list().await
-    }
-
-    async fn update_build_status(
-        &self,
-        repo_id: &RepoId,
-        commit: &str,
-        status: &str,
-    ) -> Result<bool> {
-        let updated = match &self.control {
-            Some(control) => {
-                control
-                    .update_result_status_for_claim(
-                        self.job_id,
-                        &self.worker_id,
-                        repo_id,
-                        commit,
-                        status,
-                    )
-                    .await?
-            }
-            None => {
-                self.inner
-                    .update_claimed_build_status(
-                        repo_id,
-                        commit,
-                        status,
-                        self.job_id,
-                        &self.worker_id,
-                    )
-                    .await?
-            }
-        };
-        anyhow::ensure!(updated, "worker no longer owns job {}", self.job_id);
-        Ok(true)
     }
 
     async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
@@ -7065,10 +6804,7 @@ impl RefStore for ClaimScopedRefStore {
     }
 }
 
-/// Run one durable claim to completion: mark `building`, sync all artifact
-/// phases, then mark `done` or `failed` before acknowledgement.
-///
-/// This is shared by embedded and API-only workers.
+/// Run one durable exact-commit job to completion.
 pub async fn process_build_job(
     state: &ServerState,
     job: &BuildJob,
@@ -7103,51 +6839,12 @@ async fn process_build_job_with_foreground_release(
             "build job has invalid repository config: {error:#}"
         )));
     }
-    // A job admitted after editable Full published owns only the missing Files
-    // archive. Preserve that fact in durable status so a terminal failure can
-    // consume the continuation's budget rather than being mistaken for a new
-    // initial build on every client poll.
-    let completing_files = match ref_store.load_result(repo_id, commit).await {
-        Ok(Some(info)) => exact_full_files_incomplete(&info, commit),
-        Ok(None) => false,
-        Err(error) => {
-            warn!(
-                "failed to inspect exact result before building {}@{commit}: {error:#}",
-                repo_id.storage_key()
-            );
-            false
-        }
-    };
-    let building_status = if completing_files {
-        BUILDING_FILES
-    } else {
-        "building"
-    };
-    if let Err(e) = update_job_build_status(&ref_store, job, building_status).await {
-        error!(
-            "build status update failed for {}@{commit}: {e:#}",
-            repo_id.storage_key()
-        );
-    }
-
     let start = std::time::Instant::now();
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
         Some(p) => p.clone(),
         None => {
             let message = format!("unknown provider {}", repo_id.provider.as_str());
-            if let Err(e) = update_job_build_status(
-                &ref_store,
-                job,
-                &failed_build_status(completing_files, &message),
-            )
-            .await
-            {
-                error!(
-                    "build status update failed for {}@{commit}: {e:#}",
-                    repo_id.storage_key()
-                );
-            }
             warn!(
                 "unknown provider {} for build job",
                 repo_id.provider.as_str()
@@ -7191,20 +6888,9 @@ async fn process_build_job_with_foreground_release(
             Ok(result.clone())
         }
         Err(e) => {
-            // Classify first: only *permanent* failures are terminal in the
-            // metadata store. A retryable error is requeued by `SqlJobQueue::ack`
-            // (bounded by attempts); writing `failed: …` here would make
-            // `/status` look terminal while the queue still has the job — the
-            // stale-until-repushed mode A7 was meant to kill.
             let classified = classify_build_error(e);
-            if let Some(status) = terminal_metadata_status(&classified, completing_files) {
+            if !classified.is_retryable() {
                 state.metrics.record_build_failed();
-                if let Err(status_err) = update_job_build_status(&ref_store, job, &status).await {
-                    error!(
-                        "build status update failed for {}@{commit}: {status_err:#}",
-                        repo_id.storage_key()
-                    );
-                }
                 warn!(
                     "background build failed for {}@{commit}: {e}",
                     repo_id.storage_key()
@@ -7223,67 +6909,6 @@ async fn process_build_job_with_foreground_release(
             Err(classified)
         }
     }
-}
-
-/// Metadata status string for a terminal build failure, or `None` when the
-/// queue may still requeue the job (retryable). Callers must not write a
-/// terminal `failed: …` for retryable errors.
-fn terminal_metadata_status(err: &BuildError, completing_files: bool) -> Option<String> {
-    if err.is_retryable() {
-        None
-    } else {
-        Some(failed_build_status(completing_files, err.message()))
-    }
-}
-
-fn failed_build_status(completing_files: bool, message: &str) -> String {
-    let phase = if completing_files {
-        "files failed"
-    } else {
-        "failed"
-    };
-    format!("{phase}: {message}")
-}
-
-/// Write a terminal `failed: …` build status for the job's admitted commit. Used by the
-/// cross-process worker after `ack` dead-letters a retryable error at the
-/// attempts cap — `process_build_job` intentionally leaves metadata non-terminal
-/// for retryable failures so intermediate retries don't look permanent.
-pub async fn mark_admitted_build_failed(
-    state: &ServerState,
-    job_id: crate::queue::JobId,
-    worker_id: &str,
-    repo_id: &RepoId,
-    admitted_commit: &str,
-    message: &str,
-) -> Result<()> {
-    let completing_files = state
-        .ref_store
-        .load_result(repo_id, admitted_commit)
-        .await?
-        .is_some_and(|info| info.build_status.as_deref() == Some(BUILDING_FILES));
-    let status = failed_build_status(completing_files, message);
-    let updated = match &state.control_db {
-        Some(control) => {
-            control
-                .update_result_status_for_claim(
-                    job_id,
-                    worker_id,
-                    repo_id,
-                    admitted_commit,
-                    &status,
-                )
-                .await?
-        }
-        None => {
-            state
-                .ref_store
-                .update_claimed_build_status(repo_id, admitted_commit, &status, job_id, worker_id)
-                .await?
-        }
-    };
-    anyhow::ensure!(updated, "worker no longer owns job {job_id}");
-    Ok(())
 }
 
 fn classify_build_error(error: &anyhow::Error) -> BuildError {
@@ -7510,30 +7135,10 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                     // An error before Head publication drops the sender here,
                     // releasing the foreground slot before terminal ack.
                     drop(foreground_release);
-                    let retryable = result.as_ref().err().is_some_and(BuildError::is_retryable);
                     match worker_queue
                         .ack(claimed.id, &owner, result.map(|_| ()))
                         .await
                     {
-                        Ok(true) if retryable => {
-                            if let Ok(JobState::Failed(error)) =
-                                worker_queue.job_status(claimed.id).await
-                                && let Err(status_error) = mark_admitted_build_failed(
-                                    &worker_state,
-                                    claimed.id,
-                                    &owner,
-                                    &repo_id,
-                                    &admitted_commit,
-                                    &error,
-                                )
-                                .await
-                            {
-                                error!(
-                                    "failed to mark embedded job {} dead-lettered: {status_error:#}",
-                                    claimed.id
-                                );
-                            }
-                        }
                         Ok(true) => {}
                         Ok(false) => warn!(
                             "embedded job {} lost its claim before acknowledgement",
@@ -7642,65 +7247,6 @@ fn spawn_poll_loop(state: ServerState, interval: Duration) {
             }
         }
     });
-}
-
-async fn update_build_status(
-    ref_store: &Arc<dyn RefStore>,
-    repo_id: &RepoId,
-    commit: &str,
-    status: &str,
-) -> Result<bool> {
-    ref_store
-        .update_build_status(repo_id, commit, status)
-        .await
-        .with_context(|| format!("update build status for {}@{commit}", repo_id.storage_key()))
-}
-
-/// Status writes for every immutable job target only its admitted commit.
-/// A job that fails before artifact publication cannot update any other result.
-async fn update_job_build_status(
-    ref_store: &Arc<dyn RefStore>,
-    job: &BuildJob,
-    status: &str,
-) -> Result<Option<String>> {
-    let commit = job.admitted_commit.as_str();
-    if status == "building" {
-        let existing = ref_store.load_result(&job.repo_id, commit).await?;
-        if existing.as_ref().is_some_and(|info| {
-            info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-                || (!info.full_clonepack.manifest.is_empty()
-                    && info.full_clonepack.commit == commit)
-        }) {
-            return Ok(Some(commit.to_string()));
-        }
-        if existing.is_none() {
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs());
-            let pending = RefInfo {
-                commit: commit.to_string(),
-                build_status: Some(status.to_string()),
-                synced_at: now,
-                last_accessed_at: now,
-                ..Default::default()
-            };
-            ref_store
-                .save_result(&job.repo_id, &pending)
-                .await
-                .with_context(|| {
-                    format!(
-                        "create exact build status for {}@{commit}",
-                        job.repo_id.storage_key()
-                    )
-                })?;
-            return Ok(Some(commit.to_string()));
-        }
-        let updated = update_build_status(ref_store, &job.repo_id, commit, status).await?;
-        return Ok(updated.then(|| commit.to_string()));
-    }
-    let updated = update_build_status(ref_store, &job.repo_id, commit, status).await?;
-    Ok(updated.then(|| commit.to_string()))
 }
 
 /// Hash the auth token, or fail if it is missing/empty. Pure (no env access) so
@@ -7970,85 +7516,28 @@ mod tests {
     use tower::util::ServiceExt;
 
     #[test]
-    fn exact_result_requires_the_requested_clonepack_variant() {
-        let full = crate::ClonepackArtifacts {
-            commit: "a".repeat(40),
-            manifest: "full-manifest".to_string(),
-            metadata_chunk: "full-metadata".to_string(),
-            idx_bundle: "full-idx-bundle".to_string(),
-            ..Default::default()
-        };
-        let shallow = crate::ClonepackArtifacts {
-            commit: "a".repeat(40),
-            manifest: "shallow-manifest".to_string(),
-            metadata_chunk: "shallow-metadata".to_string(),
-            idx_bundle: "shallow-idx-bundle".to_string(),
-            ..Default::default()
-        };
-        let full_only = RefInfo {
-            commit: "a".repeat(40),
-            full_clonepack: full.clone(),
-            ..Default::default()
-        };
-        assert!(!exact_ref_info_serves_commit(
-            &full_only,
-            "shallow",
-            &"a".repeat(40)
-        ));
-        assert!(exact_ref_info_serves_commit(
-            &full_only,
-            "full",
-            &"a".repeat(40)
-        ));
-
-        let shallow_only = RefInfo {
-            commit: "a".repeat(40),
-            shallow_clonepack: shallow,
-            ..Default::default()
-        };
-        assert!(exact_ref_info_serves_commit(
-            &shallow_only,
-            "shallow",
-            &"a".repeat(40)
-        ));
-        assert!(!exact_ref_info_serves_commit(
-            &shallow_only,
-            "full",
-            &"a".repeat(40)
-        ));
-    }
-
-    #[test]
-    fn exact_result_rejects_empty_evicted_and_mismatched_artifacts() {
+    fn exact_result_requires_the_requested_stored_result() {
         let commit = "a".repeat(40);
-        let mut info = RefInfo {
+        let info = RefInfo {
             commit: commit.clone(),
-            full_clonepack: crate::ClonepackArtifacts {
-                commit: commit.clone(),
-                manifest: "manifest".to_string(),
-                metadata_chunk: "metadata".to_string(),
-                idx_bundle: "idx-bundle".to_string(),
+            full: Some(crate::FullResult {
+                clonepack: crate::ClonepackArtifacts {
+                    commit: commit.clone(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         };
-        assert!(exact_ref_info_serves_commit(&info, "full", &commit));
-        info.full_clonepack.manifest.clear();
-        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
-        info.full_clonepack.manifest = "manifest".to_string();
-        info.full_clonepack.metadata_chunk.clear();
-        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
-        info.full_clonepack.metadata_chunk = "metadata".to_string();
-        info.full_clonepack.idx_bundle.clear();
-        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
-        info.full_clonepack.idx_bundle = "idx-bundle".to_string();
-        info.full_clonepack.commit = "b".repeat(40);
-        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
-        info.full_clonepack.commit = commit.clone();
-        info.build_status = Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string());
-        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
+        assert!(!exact_result_ready(&info, ExactResultKind::Head, &commit));
+        assert!(exact_result_ready(&info, ExactResultKind::Full, &commit));
+        assert!(!exact_result_ready(&info, ExactResultKind::Files, &commit));
+        assert!(!exact_result_ready(
+            &info,
+            ExactResultKind::Full,
+            &"b".repeat(40)
+        ));
     }
-
     #[tokio::test]
     async fn pending_body_includes_the_selected_branch() {
         let response = artifact_pending_response(&"a".repeat(40), "rélease/東京", 3);
@@ -8088,24 +7577,6 @@ mod tests {
         })
         .context("S3 get_object");
         assert!(classify_build_error(&e).is_retryable());
-    }
-
-    #[test]
-    fn terminal_metadata_only_for_permanent_build_errors() {
-        // Retryable must not write a terminal metadata status — /status would
-        // look failed while SqlJobQueue::ack still requeues under the cap.
-        assert_eq!(
-            terminal_metadata_status(&BuildError::retryable("storage 503"), false),
-            None
-        );
-        assert_eq!(
-            terminal_metadata_status(&BuildError::permanent("bad repo"), false),
-            Some("failed: bad repo".to_string())
-        );
-        assert_eq!(
-            terminal_metadata_status(&BuildError::permanent("archive failed"), true),
-            Some("files failed: archive failed".to_string())
-        );
     }
 
     #[test]
@@ -8211,19 +7682,41 @@ mod tests {
         async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> anyhow::Result<()> {
             self.store().await?.save_result(repo_id, info).await
         }
-        async fn list(&self) -> anyhow::Result<Vec<RepoId>> {
-            self.store().await?.list().await
-        }
-        async fn update_build_status(
+        async fn publish_head(
             &self,
             repo_id: &RepoId,
             commit: &str,
-            status: &str,
+            head: crate::HeadResult,
         ) -> anyhow::Result<bool> {
             self.store()
                 .await?
-                .update_build_status(repo_id, commit, status)
+                .publish_head(repo_id, commit, head)
                 .await
+        }
+        async fn publish_full(
+            &self,
+            repo_id: &RepoId,
+            commit: &str,
+            full: crate::FullResult,
+        ) -> anyhow::Result<bool> {
+            self.store()
+                .await?
+                .publish_full(repo_id, commit, full)
+                .await
+        }
+        async fn publish_files(
+            &self,
+            repo_id: &RepoId,
+            commit: &str,
+            files: crate::FilesResult,
+        ) -> anyhow::Result<bool> {
+            self.store()
+                .await?
+                .publish_files(repo_id, commit, files)
+                .await
+        }
+        async fn list(&self) -> anyhow::Result<Vec<RepoId>> {
+            self.store().await?.list().await
         }
         async fn touch_last_accessed_at(
             &self,
@@ -8626,30 +8119,15 @@ mod tests {
         let storage = crate::storage::local(tmp.path()).unwrap();
         let info = RefInfo {
             commit: "abc".to_string(),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: Vec::new(),
-            packs: Vec::new(),
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: String::new(),
-            archive_chunks: vec!["chunk1".to_string(), "chunk2".to_string()],
-            full_clonepack: crate::ClonepackArtifacts {
-                manifest: "exact-manifest".to_string(),
-                metadata_chunk: "exact-metadata".to_string(),
-                commit: "exact-commit".to_string(),
+            full: Some(crate::FullResult {
+                clonepack: crate::ClonepackArtifacts {
+                    manifest: "exact-manifest".to_string(),
+                    metadata_chunk: "exact-metadata".to_string(),
+                    commit: "exact-commit".to_string(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            shallow_clonepack: crate::ClonepackArtifacts::default(),
-            history_levels: Vec::new(),
-            head_base_commit: String::new(),
-            head_base_packs: Vec::new(),
-            archive_frames: Vec::new(),
-            build_status: None,
-            build_ms: None,
-            synced_at: None,
+            }),
             ..Default::default()
         };
         let provider = ProviderRegistry::new().default_provider().clone();
@@ -8660,7 +8138,7 @@ mod tests {
             "main".to_string(),
             &info,
             &storage,
-            "full",
+            ExactResultKind::Full,
             false,
         );
         assert_eq!(resp.commit, "exact-commit");
@@ -8774,7 +8252,7 @@ mod tests {
         let resp = app
             .oneshot(request_with_auth(
                 "GET",
-                "/v1/repos/github/o/r/refs/main",
+                "/v1/repos/github/o/r/refs/main?result=full",
                 Some(&auth_header()),
             ))
             .await
@@ -8951,116 +8429,6 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["commit"], commit);
-    }
-
-    #[tokio::test]
-    async fn failed_files_completion_admission_does_not_hide_usable_editable_metadata() {
-        struct FailingQueue;
-
-        #[async_trait::async_trait]
-        impl crate::queue::JobQueue for FailingQueue {
-            async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
-                anyhow::bail!("injected durable admission failure")
-            }
-
-            async fn depth(&self) -> usize {
-                0
-            }
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        state.build_queue = Arc::new(FailingQueue);
-        let repo_id = RepoId::github("acme/files-visible");
-        let commit = "a".repeat(40);
-        mark_added(&state, repo_id.clone()).await;
-        state
-            .ref_store
-            .save_result(
-                &repo_id,
-                &RefInfo {
-                    commit: commit.clone(),
-                    full_clonepack: crate::ClonepackArtifacts {
-                        manifest: "full-manifest".to_string(),
-                        metadata_chunk: "full-metadata".to_string(),
-                        idx_bundle: "full-idx-bundle".to_string(),
-                        commit: commit.clone(),
-                        ..Default::default()
-                    },
-                    build_status: Some("failed: archive upload".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        let response = build_app(state)
-            .oneshot(test_request(
-                "GET",
-                &format!(
-                    "/v1/repos/github/acme/files-visible/refs/HEAD?pinned={commit}&clonepack=full"
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "Files completion admission failure must not hide an already-usable Full"
-        );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["commit"], commit);
-        assert_eq!(body["archive_ready"], false);
-        assert_eq!(body["clonepack_manifest"], "full-manifest");
-    }
-
-    #[tokio::test]
-    async fn dead_lettered_b_cannot_mark_newer_c_failed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-        let repo_id = RepoId::github("acme/fenced-failure");
-        let b = "b".repeat(40);
-        let c = "c".repeat(40);
-        state
-            .ref_store
-            .save_result(
-                &repo_id,
-                &RefInfo {
-                    commit: b.clone(),
-                    build_status: Some("queued".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        state
-            .ref_store
-            .save_result(
-                &repo_id,
-                &RefInfo {
-                    commit: c.clone(),
-                    build_status: Some("done".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        mark_admitted_build_failed(&state, 0, "test-worker", &repo_id, &b, "attempts exhausted")
-            .await
-            .unwrap();
-
-        let current = state
-            .ref_store
-            .load_result(&repo_id, &c)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.commit, c);
-        assert_eq!(current.build_status.as_deref(), Some("done"));
     }
 
     #[tokio::test]
@@ -9304,12 +8672,12 @@ mod tests {
                 .expect("interrupted exact row remains retryable");
             assert_eq!(interrupted.commit, admitted, "{stage}: no wrong commit");
             assert!(
-                interrupted.shallow_clonepack.manifest.is_empty(),
-                "{stage}: interrupted upload must not expose a ready Head result"
+                interrupted.head.is_none(),
+                "{stage}: Head must remain missing"
             );
             assert!(
-                interrupted.full_clonepack.manifest.is_empty(),
-                "{stage}: interrupted upload must not expose a ready Full result"
+                interrupted.full.is_none(),
+                "{stage}: Full must remain missing"
             );
             assert!(
                 state
@@ -9325,14 +8693,14 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| panic!("{stage}: exact retry failed: {error:#}"));
             assert_eq!(recovered.info.commit, admitted);
-            assert!(exact_ref_info_serves_commit(
+            assert!(exact_result_ready(
                 &recovered.info,
-                "shallow",
+                ExactResultKind::Head,
                 &admitted
             ));
-            assert!(exact_ref_info_serves_commit(
+            assert!(exact_result_ready(
                 &recovered.info,
-                "full",
+                ExactResultKind::Full,
                 &admitted
             ));
             assert_eq!(
@@ -9349,100 +8717,6 @@ mod tests {
             std::env::remove_var("RIPCLONE_TESTING");
             std::env::remove_var("RIPCLONE_ORIGIN_BASE");
         }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn historical_source_failure_retries_only_same_exact_commit() {
-        let _env = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        let origin_path = origin_base
-            .path()
-            .join("acme")
-            .join("historical-missing.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let current = crate::test_fixture::commit(&origin, &[("README.md", b"current")]);
-        let missing = "f".repeat(40);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = test_state_with_queue(&tmp);
-        let repo_id = RepoId::github("acme/historical-missing");
-        mark_added(&state, repo_id.clone()).await;
-        state
-            .ref_store
-            .save_result(
-                &repo_id,
-                &RefInfo {
-                    commit: current.clone(),
-                    build_status: Some("done".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let job = BuildJob {
-            repo_id: repo_id.clone(),
-            admitted_commit: missing.clone(),
-            repo_config: crate::repo_config::RepoConfig::default(),
-            credential: None,
-            size_bytes: None,
-        };
-        let plan = prepare_exact_admission(&state, &job)
-            .await
-            .unwrap()
-            .unwrap();
-        state
-            .ref_store
-            .save_result(&repo_id, &plan.pending)
-            .await
-            .unwrap();
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
-        process_build_job(&state, &job, 0, "test-worker")
-            .await
-            .expect_err("missing historical object must fail");
-
-        let failed = state
-            .ref_store
-            .load_result(&repo_id, &missing)
-            .await
-            .unwrap()
-            .expect("terminal exact failure row");
-        assert_eq!(failed.commit, missing);
-        assert!(
-            failed
-                .build_status
-                .as_deref()
-                .is_some_and(|status| status.starts_with("failed: "))
-        );
-        let unchanged = state
-            .ref_store
-            .load_result(&repo_id, &current)
-            .await
-            .unwrap()
-            .expect("existing exact result remains");
-        assert_eq!(unchanged.commit, current);
-        assert_eq!(unchanged.build_status.as_deref(), Some("done"));
-        assert!(state.storage.list_hashes().unwrap().is_empty());
-
-        let response = build_app(state)
-            .oneshot(test_request(
-                "POST",
-                &format!("/v1/repos/github/acme/historical-missing/sync?branch=main&rev={missing}"),
-            ))
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let retry = rx.try_recv().expect("failed exact result is retried");
-        assert_eq!(retry.repo_id, repo_id);
-        assert_eq!(retry.admitted_commit, missing);
-        assert!(
-            rx.try_recv().is_err(),
-            "retry must enqueue exactly one job for the failed commit"
-        );
     }
 
     fn gh_sign(secret: &str, body: &[u8]) -> String {
@@ -10301,962 +9575,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repo_status_reports_warmed_exact_result_bytes() {
+    async fn repo_status_reports_each_stored_result_and_current_job() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
-
-        let metadata = ChunkRef {
-            hash: hash_from_hex(&"a".repeat(64)).unwrap(),
-            len: 100,
-        };
-        let archive = ChunkRef {
-            hash: hash_from_hex(&"b".repeat(64)).unwrap(),
-            len: 200,
-        };
-        let manifest = ClonepackManifest {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            metadata_chunk: Some(metadata),
-            archive_chunks: vec![archive],
-            head_blobs_idx: None,
-            head_blobs_chunks: vec![],
-            ..Default::default()
-        };
-        let manifest_data = manifest.encode_to_vec();
-        let manifest_hash = state.cas.put(&manifest_data).unwrap();
-
-        let info = RefInfo {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: vec![],
-            packs: vec![],
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: manifest_hash.clone(),
-            archive_chunks: vec!["b".repeat(64)],
-            full_clonepack: crate::ClonepackArtifacts {
-                manifest: manifest_hash.clone(),
-                metadata_chunk: "a".repeat(64),
-                skeleton_pack: String::new(),
-                skeleton_idx: String::new(),
-                prebuilt_index: String::new(),
-                midx: String::new(),
-                idx_bundle: String::new(),
-                commit: String::new(),
-            },
-            shallow_clonepack: crate::ClonepackArtifacts::default(),
-            history_levels: Vec::new(),
-            head_base_commit: String::new(),
-            head_base_packs: Vec::new(),
-            archive_frames: Vec::new(),
-            build_status: None,
-            build_ms: None,
-            synced_at: Some(1_718_812_800),
-            ..Default::default()
-        };
-        state
-            .ref_store
-            .save_result(&RepoId::github("acme/secret"), &info)
-            .await
-            .unwrap();
-
-        let app = build_app(state);
-        let response = app
-            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(status.refs.len(), 1);
-        let result = &status.refs[0];
-        assert_eq!(result.commit, "1111111111111111111111111111111111111111");
-        assert_eq!(result.manifest, manifest_hash);
-        let expected_bytes = 300 + manifest_data.len() as u64;
-        assert_eq!(result.bytes, expected_bytes);
-        assert_eq!(result.unique_bytes, expected_bytes); // fallback until cross-repo dedup
-        assert!(result.built_at.is_some());
-        assert_eq!(status.total_bytes, expected_bytes);
-        assert_eq!(status.total_unique_bytes, expected_bytes);
-        assert_eq!(status.regions.len(), 1);
-        assert_eq!(status.regions[0].region, "local");
-        assert_eq!(status.regions[0].unique_bytes, expected_bytes);
-    }
-
-    #[tokio::test]
-    async fn repo_status_lists_same_exact_result_once_and_dedups_shared_chunks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-
-        let metadata_hash = "a".repeat(64);
-        let archive_hash = "b".repeat(64);
-        let metadata = ChunkRef {
-            hash: hash_from_hex(&metadata_hash).unwrap(),
-            len: 100,
-        };
-        let archive = ChunkRef {
-            hash: hash_from_hex(&archive_hash).unwrap(),
-            len: 200,
-        };
-        let manifest = ClonepackManifest {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            metadata_chunk: Some(metadata),
-            archive_chunks: vec![archive],
-            head_blobs_idx: None,
-            head_blobs_chunks: vec![],
-            ..Default::default()
-        };
-        let manifest_data = manifest.encode_to_vec();
-        let manifest_hash = state.cas.put(&manifest_data).unwrap();
-
-        let info = RefInfo {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: vec![],
-            packs: vec![],
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: manifest_hash.clone(),
-            archive_chunks: vec![archive_hash.clone()],
-            full_clonepack: crate::ClonepackArtifacts {
-                manifest: manifest_hash.clone(),
-                metadata_chunk: metadata_hash.clone(),
-                skeleton_pack: String::new(),
-                skeleton_idx: String::new(),
-                prebuilt_index: String::new(),
-                midx: String::new(),
-                idx_bundle: String::new(),
-                commit: String::new(),
-            },
-            shallow_clonepack: crate::ClonepackArtifacts::default(),
-            history_levels: Vec::new(),
-            head_base_commit: String::new(),
-            head_base_packs: Vec::new(),
-            archive_frames: Vec::new(),
-            build_status: None,
-            build_ms: None,
-            synced_at: None,
-            ..Default::default()
-        };
-        state
-            .ref_store
-            .save_result(&RepoId::github("acme/secret"), &info)
-            .await
-            .unwrap();
-        let exact_info = RefInfo { ..info.clone() };
-        state
-            .ref_store
-            .save_result(&RepoId::github("acme/secret"), &exact_info)
-            .await
-            .unwrap();
-
-        let app = build_app(state);
-        let response = app
-            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(status.refs.len(), 1);
-        let expected_total = 300 + manifest_data.len() as u64;
-        assert_eq!(status.total_bytes, expected_total);
-        assert_eq!(status.total_unique_bytes, expected_total); // fallback: no dedup
-        for branch in &status.refs {
-            assert_eq!(branch.bytes, expected_total);
-            assert_eq!(branch.unique_bytes, expected_total); // per-branch fallback
-        }
-        assert_eq!(status.regions.len(), 1);
-        assert_eq!(status.regions[0].unique_bytes, expected_total);
-    }
-
-    #[tokio::test]
-    async fn repo_status_public_fork_has_zero_unique_byte_allocation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-
-        let metadata = ChunkRef {
-            hash: hash_from_hex(&"a".repeat(64)).unwrap(),
-            len: 100,
-        };
-        let archive = ChunkRef {
-            hash: hash_from_hex(&"b".repeat(64)).unwrap(),
-            len: 200,
-        };
-        let manifest = ClonepackManifest {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            metadata_chunk: Some(metadata),
-            archive_chunks: vec![archive],
-            head_blobs_idx: None,
-            head_blobs_chunks: vec![],
-            ..Default::default()
-        };
-        let manifest_data = manifest.encode_to_vec();
-        let manifest_hash = state.cas.put(&manifest_data).unwrap();
-
-        let info = RefInfo {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: vec![],
-            packs: vec![],
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: manifest_hash.clone(),
-            archive_chunks: vec!["b".repeat(64)],
-            full_clonepack: crate::ClonepackArtifacts {
-                manifest: manifest_hash.clone(),
-                metadata_chunk: String::new(),
-                skeleton_pack: String::new(),
-                skeleton_idx: String::new(),
-                prebuilt_index: String::new(),
-                midx: String::new(),
-                idx_bundle: String::new(),
-                commit: String::new(),
-            },
-            shallow_clonepack: crate::ClonepackArtifacts::default(),
-            history_levels: Vec::new(),
-            build_status: None,
-            synced_at: None,
-            ..Default::default()
-        };
-        state
-            .ref_store
-            .save_result(&RepoId::github("acme/fork"), &info)
-            .await
-            .unwrap();
-
-        let app = build_app(state);
-        let response = app
-            .oneshot(test_request(
-                "GET",
-                "/v1/repos/github/acme/fork/status?public=true&fork_of=oven-sh/bun",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
-        let expected_total = 300 + manifest_data.len() as u64;
-        assert_eq!(status.total_bytes, expected_total);
-        assert_eq!(status.total_unique_bytes, 0);
-        assert_eq!(status.refs[0].bytes, expected_total);
-        assert_eq!(status.refs[0].unique_bytes, 0);
-        assert_eq!(status.regions[0].unique_bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn repo_status_counts_history_levels() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-
-        let manifest = ClonepackManifest {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            ..Default::default()
-        };
-        let manifest_data = manifest.encode_to_vec();
-        let manifest_hash = state.cas.put(&manifest_data).unwrap();
-
-        let info = RefInfo {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: vec![],
-            packs: vec![],
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: manifest_hash.clone(),
-            archive_chunks: vec![],
-            full_clonepack: crate::ClonepackArtifacts {
-                manifest: manifest_hash.clone(),
-                metadata_chunk: String::new(),
-                skeleton_pack: String::new(),
-                skeleton_idx: String::new(),
-                prebuilt_index: String::new(),
-                midx: String::new(),
-                idx_bundle: String::new(),
-                commit: String::new(),
-            },
-            shallow_clonepack: crate::ClonepackArtifacts::default(),
-            history_levels: vec![crate::HistoryLevel {
-                tip_commit: "older".to_string(),
-                packs: vec![
-                    crate::SizedPack {
-                        pack: "p1".to_string(),
-                        pack_len: 500,
-                        idx: "i1".to_string(),
-                        idx_len: 50,
-                    },
-                    crate::SizedPack {
-                        pack: "p2".to_string(),
-                        pack_len: 700,
-                        idx: "i2".to_string(),
-                        idx_len: 70,
-                    },
-                ],
-            }],
-            build_status: None,
-            synced_at: None,
-            ..Default::default()
-        };
-        state
-            .ref_store
-            .save_result(&RepoId::github("acme/secret"), &info)
-            .await
-            .unwrap();
-
-        let app = build_app(state);
-        let response = app
-            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
-        let expected = manifest_data.len() as u64 + 500 + 50 + 700 + 70;
-        assert_eq!(status.refs.len(), 1);
-        assert_eq!(status.refs[0].bytes, expected);
-        assert_eq!(status.total_bytes, expected);
-        assert_eq!(status.total_unique_bytes, expected);
-    }
-
-    #[tokio::test]
-    async fn repo_status_counts_pack_entries_in_manifest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-
-        let pack = crate::clonepack::PackEntry {
-            pack: Some(ChunkRef {
-                hash: hash_from_hex(&"c".repeat(64)).unwrap(),
-                len: 400,
-            }),
-            idx: Some(ChunkRef {
-                hash: hash_from_hex(&"d".repeat(64)).unwrap(),
-                len: 40,
-            }),
-            ..Default::default()
-        };
-        let manifest = ClonepackManifest {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            packs: vec![pack],
-            ..Default::default()
-        };
-        let manifest_data = manifest.encode_to_vec();
-        let manifest_hash = state.cas.put(&manifest_data).unwrap();
-
-        let info = RefInfo {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: vec![],
-            packs: vec![],
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: manifest_hash.clone(),
-            archive_chunks: vec![],
-            full_clonepack: crate::ClonepackArtifacts {
-                manifest: manifest_hash.clone(),
-                metadata_chunk: String::new(),
-                skeleton_pack: String::new(),
-                skeleton_idx: String::new(),
-                prebuilt_index: String::new(),
-                midx: String::new(),
-                idx_bundle: String::new(),
-                commit: String::new(),
-            },
-            shallow_clonepack: crate::ClonepackArtifacts::default(),
-            history_levels: Vec::new(),
-            build_status: None,
-            synced_at: None,
-            ..Default::default()
-        };
-        state
-            .ref_store
-            .save_result(&RepoId::github("acme/secret"), &info)
-            .await
-            .unwrap();
-
-        let app = build_app(state);
-        let response = app
-            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
-        let expected = manifest_data.len() as u64 + 400 + 40;
-        assert_eq!(status.refs[0].bytes, expected);
-        assert_eq!(status.total_bytes, expected);
-    }
-
-    #[tokio::test]
-    async fn repo_status_reports_evicted_ref_as_not_warm() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-
-        // Leave a non-empty manifest hash in the evicted ref. The status path
-        // must not try to read the deleted artifact; doing so would fail the
-        // whole repo status request.
-        let info = RefInfo {
-            commit: "1".repeat(40),
-            parent_commit: None,
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: vec![],
-            packs: vec![],
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: String::new(),
-            archive_chunks: vec![],
-            full_clonepack: crate::ClonepackArtifacts {
-                manifest: "0000000000000000000000000000000000000000".to_string(),
-                commit: "1".repeat(40),
-                ..Default::default()
-            },
-            shallow_clonepack: crate::ClonepackArtifacts::default(),
-            history_levels: Vec::new(),
-            build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-            build_ms: None,
-            synced_at: Some(1_718_812_800),
-            last_accessed_at: Some(1_718_812_700),
-            warm_pinned: false,
-            ..Default::default()
-        };
-        state
-            .ref_store
-            .save_result(&RepoId::github("acme/secret"), &info)
-            .await
-            .unwrap();
-
-        let app = build_app(state);
-        let response = app
-            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(status.refs.len(), 1);
-        let result = &status.refs[0];
-        assert_eq!(result.commit, "1111111111111111111111111111111111111111");
-        assert!(!result.warm);
-        assert!(!result.pinned);
-        assert_eq!(result.bytes, 0);
-        assert!(result.manifest.is_empty());
-        assert!(result.last_accessed_at.is_some());
-    }
-
-    #[test]
-    fn exact_ref_info_rejects_evicted_ref() {
-        let info = RefInfo {
-            commit: "commit1".to_string(),
-            build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-            full_clonepack: crate::ClonepackArtifacts {
-                manifest: "manifest-hash".to_string(),
-                commit: "commit1".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(!exact_ref_info_serves_commit(&info, "full", "commit1"));
-    }
-
-    #[tokio::test]
-    async fn carried_top_up_rejects_evicted_row_before_signing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let storage = crate::storage::local(tmp.path()).unwrap();
-        let base = "a".repeat(40);
-        let target = "b".repeat(40);
-        let info = RefInfo {
-            commit: target.clone(),
-            parent_commit: Some(base.clone()),
-            full_clonepack: crate::ClonepackArtifacts {
-                commit: base,
-                manifest: "0".repeat(64),
-                ..Default::default()
-            },
-            build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-            ..Default::default()
-        };
-        let provider = ProviderInstance {
-            id: crate::provider::ProviderInstanceId::new("github"),
-            kind: crate::provider::ProviderKind::GitHub,
-            host: "github.com".to_string(),
-            auth_template: None,
-            auth_header_name: None,
-        };
-        assert!(
-            carried_full_top_up_response(
-                &info,
-                &RepoId::github("acme/widget"),
-                &provider,
-                "main",
-                &target,
-                &storage,
-                false,
-            )
-            .await
-            .is_none(),
-            "an evicted carried row must not issue signed base URLs"
-        );
-    }
-
-    #[test]
-    fn phase_two_barrier_requires_explicit_test_mode() {
-        assert!(!explicit_test_mode(None));
-        assert!(!explicit_test_mode(Some(std::ffi::OsStr::new("0"))));
-        assert!(!explicit_test_mode(Some(std::ffi::OsStr::new("true"))));
-        assert!(explicit_test_mode(Some(std::ffi::OsStr::new("1"))));
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ordinary_evicted_get_enqueues_once_and_becomes_ready() {
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        let origin_path = origin_base.path().join("acme").join("evicted.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let commit = crate::test_fixture::commit(&origin, &[("f.txt", b"ready")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = test_state_with_queue(&tmp);
-        let repo_id = RepoId::github("acme/evicted");
-        mark_added(&state, repo_id.clone()).await;
+        let repo_id = RepoId::github("acme/status-results");
+        let commit = "a".repeat(40);
         state
             .ref_store
             .save_result(
                 &repo_id,
                 &RefInfo {
                     commit: commit.clone(),
-                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+                    head: Some(crate::HeadResult::default()),
+                    full: Some(crate::FullResult::default()),
+                    files: None,
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
-        let app = build_app(state.clone());
-        let first = app
-            .clone()
-            .oneshot(protocol_request(
-                "/v1/repos/github/acme/evicted/refs/main?clonepack=shallow",
-                Some("2"),
-            ))
+        let status = build_repo_status(&state, &repo_id, false, None)
             .await
             .unwrap();
-        assert_eq!(first.status(), StatusCode::ACCEPTED);
-        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let first_body: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
-        assert_eq!(first_body["commit"], commit);
-
-        let job = rx
-            .try_recv()
-            .expect("initial GET must admit the evicted ordinary ref");
-        assert_eq!(job.admitted_commit, commit);
-        assert!(rx.try_recv().is_err(), "exactly one rebuild is admitted");
-
-        let built = process_build_job(&state, &job, 0, "test-worker")
-            .await
-            .expect("admitted evicted ref rebuild");
-        assert_eq!(built.info.commit, commit);
-        let ready = app
-            .oneshot(protocol_request(
-                &format!(
-                    "/v1/repos/github/acme/evicted/refs/main?clonepack=shallow&pinned={commit}"
-                ),
-                Some("2"),
-            ))
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-        assert_eq!(ready.status(), StatusCode::OK);
+        assert_eq!(status.refs.len(), 1);
+        let exact = &status.refs[0];
+        assert!(exact.head);
+        assert!(exact.full);
+        assert!(!exact.files);
+        assert_eq!(exact.job, "none");
+        assert!(exact.job_error.is_none());
     }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn evicted_get_returns_503_when_queue_errors() {
-        struct ErrorQueue {
-            attempts: Arc<AtomicUsize>,
-        }
-
-        #[async_trait::async_trait]
-        impl crate::queue::JobQueue for ErrorQueue {
-            async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
-                self.attempts.fetch_add(1, Ordering::SeqCst);
-                anyhow::bail!("forced queue outage")
-            }
-
-            async fn depth(&self) -> usize {
-                0
-            }
-        }
-
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        let origin_path = origin_base.path().join("acme").join("evicted-error.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let commit = crate::test_fixture::commit(&origin, &[("f.txt", b"ready")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        let attempts = Arc::new(AtomicUsize::new(0));
-        state.build_queue = Arc::new(ErrorQueue {
-            attempts: Arc::clone(&attempts),
-        });
-        let repo_id = RepoId::github("acme/evicted-error");
-        mark_added(&state, repo_id.clone()).await;
-        state
-            .ref_store
-            .save_result(
-                &repo_id,
-                &RefInfo {
-                    commit: commit.clone(),
-                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
-
-        let response = build_app(state.clone())
-            .oneshot(protocol_request(
-                "/v1/repos/github/acme/evicted-error/refs/main?clonepack=shallow",
-                Some("2"),
-            ))
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("forced queue outage"));
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(state.storage.list_hashes().unwrap().is_empty());
-        assert_eq!(
-            state
-                .ref_store
-                .load_result(&repo_id, &commit)
-                .await
-                .unwrap()
-                .unwrap()
-                .build_status
-                .as_deref(),
-            Some(crate::remote_gc::EVICTED_BUILD_STATUS),
-            "queue outage cannot claim that a rebuild started"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ref_read_bumps_last_accessed_at() {
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let base = tempfile::tempdir().unwrap();
-        let origin = base.path().join("acme").join("widget.git");
-        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
-        let repo = crate::test_fixture::init_bare(&origin);
-        let tip = crate::test_fixture::commit(&repo, &[("f.txt", b"v1")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-        let ref_store = state.ref_store.clone();
-        let rid = RepoId::github("acme/widget");
-        mark_added(&state, rid.clone()).await;
-
-        let old_ts = 1_000_000u64;
-        let info = RefInfo {
-            commit: tip.clone(),
-            synced_at: Some(old_ts),
-            last_accessed_at: Some(old_ts),
-            full_clonepack: crate::ClonepackArtifacts {
-                commit: tip.clone(),
-                manifest: "0000000000000000000000000000000000000000".to_string(),
-                metadata_chunk: "1111111111111111111111111111111111111111".to_string(),
-                idx_bundle: "2222222222222222222222222222222222222222".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        ref_store.save_result(&rid, &info).await.unwrap();
-
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        let app = build_app(state);
-        let response = app
-            .oneshot(protocol_request(
-                "/v1/repos/github/acme/widget/refs/main?clonepack=full",
-                Some("2"),
-            ))
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let updated = ref_store.load_result(&rid, &tip).await.unwrap().unwrap();
-        assert!(
-            updated.last_accessed_at.unwrap() > old_ts,
-            "last_accessed_at must advance on a successful ref read"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ref_read_for_evicted_exact_revision_enqueues_rebuild() {
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let base = tempfile::tempdir().unwrap();
-        let origin = base.path().join("acme").join("widget.git");
-        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
-        let repo = crate::test_fixture::init_bare(&origin);
-        let tip = crate::test_fixture::commit(&repo, &[("f.txt", b"v1")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = test_state_with_queue(&tmp);
-        let rid = RepoId::github("acme/widget");
-        mark_added(&state, rid.clone()).await;
-
-        let evicted = RefInfo {
-            commit: tip.clone(),
-            build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-            synced_at: Some(1),
-            last_accessed_at: Some(1),
-            ..Default::default()
-        };
-        state.ref_store.save_result(&rid, &evicted).await.unwrap();
-
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        let app = build_app(state);
-        let response = app
-            .oneshot(request_with_auth(
-                "GET",
-                &format!("/v1/repos/github/acme/widget/refs/main?rev={}", tip),
-                Some(&auth_header()),
-            ))
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let job = rx
-            .try_recv()
-            .expect("evicted ref read must enqueue a rebuild");
-        assert_eq!(job.repo_id, rid);
-        assert_eq!(job.admitted_commit, tip);
-        assert!(
-            rx.try_recv().is_err(),
-            "exactly one rebuild must be enqueued"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn evicted_symbolic_history_is_pinned_and_rebuilds_original_commit() {
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let base = tempfile::tempdir().unwrap();
-        let origin_path = base.path().join("acme").join("history.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let b = crate::test_fixture::commit(&origin, &[("f.txt", b"B")]);
-        let _c = crate::test_fixture::commit(&origin, &[("f.txt", b"C")]);
-        let d = crate::test_fixture::commit(&origin, &[("f.txt", b"D")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = test_state_with_queue(&tmp);
-        let rid = RepoId::github("acme/history");
-        mark_added(&state, rid.clone()).await;
-        state
-            .ref_store
-            .save_result(
-                &rid,
-                &RefInfo {
-                    commit: d.clone(),
-                    build_status: Some("done".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        state
-            .ref_store
-            .save_result(
-                &rid,
-                &RefInfo {
-                    commit: b.clone(),
-                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        let response = build_app(state.clone())
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/acme/history/refs/main?rev=HEAD~2&clonepack=shallow",
-                Some(&auth_header()),
-            ))
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        // The job remains queued (strictly before claim) while upstream moves.
-        // Its historical target must already be the resolved B, not HEAD~2.
-        let e = crate::test_fixture::commit(&origin, &[("f.txt", b"E")]);
-        let job = rx.try_recv().expect("historical B rebuild admitted");
-        assert_eq!(job.admitted_commit, b);
-        let built = process_build_job(&state, &job, 0, "test-worker")
-            .await
-            .expect("historical B rebuild after branch advancement");
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-        assert_eq!(
-            built.info.commit, b,
-            "queued HEAD~2 must remain pinned to B"
-        );
-        assert_eq!(
-            state
-                .ref_store
-                .load_result(&rid, &d)
-                .await
-                .unwrap()
-                .unwrap()
-                .commit,
-            d,
-            "historical admission must not move the current branch"
-        );
-        assert_ne!(
-            built.info.commit, e,
-            "historical B must not fall forward to E"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "exactly one historical job is admitted"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn evicted_exact_revision_uses_the_shared_sql_queue() {
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let base = tempfile::tempdir().unwrap();
-        let origin_path = base.path().join("acme").join("history-sql.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let b = crate::test_fixture::commit(&origin, &[("f.txt", b"B")]);
-        let _c = crate::test_fixture::commit(&origin, &[("f.txt", b"C")]);
-        let d = crate::test_fixture::commit(&origin, &[("f.txt", b"D")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        let queue_path = tmp.path().join("historical-queue.db");
-        let queue = Arc::new(
-            crate::queue::SqlJobQueue::new(Box::new(
-                crate::queue::LibsqlDb::connect(&queue_path.to_string_lossy())
-                    .await
-                    .unwrap(),
-            ))
-            .await
-            .unwrap(),
-        );
-        state.build_queue = queue.clone();
-        state.worker_queue = Some(Arc::clone(&queue));
-        let rid = RepoId::github("acme/history-sql");
-        mark_added(&state, rid.clone()).await;
-        state
-            .ref_store
-            .save_result(
-                &rid,
-                &RefInfo {
-                    commit: d,
-                    build_status: Some("done".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        state
-            .ref_store
-            .save_result(
-                &rid,
-                &RefInfo {
-                    commit: b.clone(),
-                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        let response = build_app(state)
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/acme/history-sql/refs/main?rev=HEAD~2",
-                Some(&auth_header()),
-            ))
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert_eq!(
-            crate::queue::JobQueue::depth(queue.as_ref()).await,
-            1,
-            "explicit and ordinary exact work use the same durable queue"
-        );
-        let claimed = crate::queue::WorkerQueue::claim(queue.as_ref(), "test-worker")
-            .await
-            .unwrap()
-            .expect("exact revision job is claimable");
-        assert_eq!(claimed.admitted_commit, b);
-    }
-
     #[tokio::test]
     async fn sync_rejects_invalid_branch_name() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11306,19 +9655,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
         let ref_store = state.ref_store.clone();
+        let rid = RepoId::github("acme/widget");
+        let commit = "a".repeat(40);
+        ref_store
+            .save_result(
+                &rid,
+                &RefInfo {
+                    commit: commit.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let app = build_app(state);
 
-        let info = RefInfo {
-            commit: "a".repeat(40),
-            manifest: "m1".into(),
+        let head = crate::HeadResult {
+            clonepack: crate::ClonepackArtifacts {
+                commit: commit.clone(),
+                manifest: "m1".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let body = serde_json::json!({
-            "op": "save_result",
+            "op": "publish_head",
             "job_id": 1,
             "worker_id": "test-worker",
             "repo_key": repo_key,
-            "info": info,
+            "commit": commit,
+            "head": head,
         });
         let resp = app
             .oneshot(ref_report_request(Some(&tok), &body))
@@ -11326,13 +9691,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "valid token must write");
 
-        let rid = RepoId::github("acme/widget");
         let stored = ref_store
             .load_result(&rid, &"a".repeat(40))
             .await
             .unwrap()
             .expect("ref must land in store");
-        assert_eq!(stored.commit, "a".repeat(40));
+        assert_eq!(stored.head.unwrap().clonepack.manifest, "m1");
     }
 
     /// Auth gate: wrong / missing token → 401 and no write.
@@ -11355,18 +9719,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
         let ref_store = state.ref_store.clone();
+        let rid = RepoId::github("acme/nope");
+        let commit = "b".repeat(40);
+        ref_store
+            .save_result(
+                &rid,
+                &RefInfo {
+                    commit: commit.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let app = build_app(state);
 
-        let info = RefInfo {
-            commit: "b".repeat(40),
+        let head = crate::HeadResult {
+            clonepack: crate::ClonepackArtifacts {
+                commit: commit.clone(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let body = serde_json::json!({
-            "op": "save_result",
+            "op": "publish_head",
             "job_id": 1,
             "worker_id": "test-worker",
             "repo_key": repo_key,
-            "info": info,
+            "commit": commit,
+            "head": head,
         });
 
         // Missing Authorization.
@@ -11393,13 +9773,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let rid = RepoId::github("acme/nope");
         assert!(
             ref_store
                 .load_result(&rid, &"b".repeat(40))
                 .await
                 .unwrap()
-                .is_none(),
+                .is_some_and(|result| result.head.is_none()),
             "rejected reports must not write"
         );
 
@@ -11414,7 +9793,7 @@ mod tests {
                 .load_result(&rid, &"b".repeat(40))
                 .await
                 .unwrap()
-                .is_some()
+                .is_some_and(|result| result.head.is_some())
         );
     }
 }

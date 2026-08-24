@@ -391,7 +391,13 @@ mod tests {
             Arc::new(crate::meta::SqlRefStore::new(Box::new(meta)).await.unwrap());
         let info = RefInfo {
             commit: "1111111111111111111111111111111111111111".to_string(),
-            head_blobs_chunks: vec![h.clone()],
+            head: Some(crate::HeadResult {
+                packs: vec![crate::PackArtifact {
+                    pack: h.clone(),
+                    idx: String::new(),
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
         };
         ref_store

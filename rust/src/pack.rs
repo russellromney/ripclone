@@ -253,8 +253,7 @@ impl<'a> PackBuilder<'a> {
     }
 
     /// Build just the HEAD closure (undeltified small packs) — the depth=1
-    /// payload. Used by two-phase publish to get a clonable depth=1 fast, before
-    /// the (slow) history packs are built.
+    /// payload. Used to publish Head before the slower Full history is built.
     pub fn build_head_packs(
         &self,
         commit: &str,
@@ -321,8 +320,8 @@ impl<'a> PackBuilder<'a> {
     }
 
     /// Build just the history packs (deltified, everything reachable from
-    /// `commit` minus the HEAD closure). Used by two-phase publish in the
-    /// background after the depth=1 clonepack is already published.
+    /// `commit` minus the HEAD closure). Used to finish Full after Head is
+    /// already published.
     pub fn build_history_packs(
         &self,
         commit: &str,
@@ -383,9 +382,8 @@ impl<'a> PackBuilder<'a> {
 
     /// Build only the deltified *tail* — objects introduced in `(sealed_tip,
     /// commit]` (the whole history when `sealed_tip` is `None`). This is the
-    /// history half of [`build_incremental_packs`], for callers (two-phase
-    /// phase 2) that already built the HEAD closure earlier. Returns the tail
-    /// packs.
+    /// history half of [`build_incremental_packs`], for callers that already
+    /// published the HEAD closure. Returns the tail packs.
     pub fn build_history_tail(
         &self,
         commit: &str,

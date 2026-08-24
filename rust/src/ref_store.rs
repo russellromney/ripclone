@@ -1,7 +1,7 @@
 //! Ref and added-repository contracts backed by the server control database.
 
-use crate::RefInfo;
 use crate::provider::RepoId;
+use crate::{FilesResult, FullResult, HeadResult, RefInfo};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -29,15 +29,43 @@ pub enum AddedRepoSource {
 pub trait RefStore: Send + Sync {
     async fn load_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>>;
     async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()>;
-    async fn save_claimed_result(
+    async fn publish_head(&self, repo_id: &RepoId, commit: &str, head: HeadResult) -> Result<bool>;
+    async fn publish_full(&self, repo_id: &RepoId, commit: &str, full: FullResult) -> Result<bool>;
+    async fn publish_files(
         &self,
         repo_id: &RepoId,
-        info: &RefInfo,
+        commit: &str,
+        files: FilesResult,
+    ) -> Result<bool>;
+    async fn publish_claimed_head(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        head: HeadResult,
         _job_id: i64,
         _worker_id: &str,
     ) -> Result<bool> {
-        self.save_result(repo_id, info).await?;
-        Ok(true)
+        self.publish_head(repo_id, commit, head).await
+    }
+    async fn publish_claimed_full(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        full: FullResult,
+        _job_id: i64,
+        _worker_id: &str,
+    ) -> Result<bool> {
+        self.publish_full(repo_id, commit, full).await
+    }
+    async fn publish_claimed_files(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        files: FilesResult,
+        _job_id: i64,
+        _worker_id: &str,
+    ) -> Result<bool> {
+        self.publish_files(repo_id, commit, files).await
     }
     /// Optional wrapper hooks around an atomically authorized claimed write.
     /// Production stores use the defaults; deterministic test stores use these
@@ -49,22 +77,6 @@ pub trait RefStore: Send + Sync {
         Ok(())
     }
     async fn list(&self) -> Result<Vec<RepoId>>;
-    async fn update_build_status(
-        &self,
-        repo_id: &RepoId,
-        commit: &str,
-        status: &str,
-    ) -> Result<bool>;
-    async fn update_claimed_build_status(
-        &self,
-        repo_id: &RepoId,
-        commit: &str,
-        status: &str,
-        _job_id: i64,
-        _worker_id: &str,
-    ) -> Result<bool> {
-        self.update_build_status(repo_id, commit, status).await
-    }
     async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool>;
     async fn delete_result(&self, _repo_id: &RepoId, _commit: &str) -> Result<()> {
         Ok(())

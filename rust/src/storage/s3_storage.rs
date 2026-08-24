@@ -560,6 +560,11 @@ impl StorageBackend for S3Storage {
     }
 
     fn size(&self, hash: &str) -> Result<u64> {
+        if let Some(cache) = &self.cache
+            && let Ok(len) = cache.verify_object(hash)
+        {
+            return Ok(len);
+        }
         let key = self.key(hash)?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();

@@ -120,6 +120,9 @@ pub trait QueueDb: Send + Sync {
     /// Id of the active (queued or claimed) job for `key`, if any.
     async fn active_job_id(&self, key: &str) -> Result<Option<i64>>;
 
+    /// Newest retained job id for `key`, including settled jobs.
+    async fn latest_job_id(&self, key: &str) -> Result<Option<i64>>;
+
     /// Insert a new queued job and return its id. Errors if a unique constraint
     /// rejects a duplicate active key (the caller treats that as coalesced).
     /// `size_class` is the 0-based rank from the ordered size-class config
@@ -866,6 +869,13 @@ impl JobQueue for SqlJobQueue {
                 "failed" => JobState::Failed(error.unwrap_or_else(|| "build failed".to_string())),
                 _ => JobState::Pending,
             }),
+        }
+    }
+
+    async fn job_state_for_key(&self, key: &str) -> Result<JobState> {
+        match self.db.latest_job_id(key).await? {
+            Some(id) => self.job_status(id).await,
+            None => Ok(JobState::Unknown),
         }
     }
 
