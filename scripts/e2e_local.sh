@@ -31,6 +31,10 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum | awk '{print $1}'
 TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | sha256)
 
 BASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ripclone-e2e-local.XXXXXX")"
+# The binary fixture must not inherit a developer's real Ripclone config. In
+# particular, an intentionally stale config should not make the CI fixture
+# exercise startup validation instead of the scenarios below.
+export RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml"
 ORIGIN_ROOT="$BASE_DIR/origins"
 CAS_DIR="$BASE_DIR/cas"
 REPO_ROOT="$BASE_DIR/repos"
