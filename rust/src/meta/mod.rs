@@ -140,13 +140,14 @@ impl RefStore for SqlRefStore {
     }
 
     async fn publish_head(&self, repo_id: &RepoId, commit: &str, head: HeadResult) -> Result<bool> {
+        let synced_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs());
         self.update_result(repo_id, commit, move |info| {
-            if info.head.is_some() {
-                false
-            } else {
-                info.head = Some(head.clone());
-                true
-            }
+            info.head = Some(head.clone());
+            info.synced_at = synced_at;
+            true
         })
         .await
     }
@@ -178,6 +179,23 @@ impl RefStore for SqlRefStore {
             }
         })
         .await
+    }
+
+    async fn evict_if_unchanged(&self, repo_id: &RepoId, expected: &RefInfo) -> Result<bool> {
+        crate::validation::validate_object_id(&expected.commit)
+            .context("validate exact result selected for eviction")?;
+        let mut evicted = expected.clone();
+        evicted.head = None;
+        evicted.full = None;
+        evicted.files = None;
+        let repo_key = repo_id.storage_key();
+        let expected_data =
+            serde_json::to_string(expected).context("serialize expected exact result")?;
+        let evicted_data = serde_json::to_string(&evicted).context("serialize evicted result")?;
+        self.db
+            .compare_and_swap_result(&repo_key, &expected.commit, &expected_data, &evicted_data)
+            .await
+            .context("conditionally evict exact result")
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
@@ -352,5 +370,43 @@ mod tests {
         assert!(result.full.is_some());
         assert!(result.files.is_some());
         assert!(result.files.unwrap().archive_chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_result_publication_wins_over_stale_eviction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
+        let repo = RepoId::github("acme/eviction-race");
+        let commit = "c".repeat(40);
+        let selected = RefInfo {
+            commit: commit.clone(),
+            head: Some(crate::HeadResult {
+                clonepack: artifacts(&commit, "old-head"),
+                ..Default::default()
+            }),
+            last_accessed_at: Some(1),
+            ..Default::default()
+        };
+        store.save_result(&repo, &selected).await.unwrap();
+
+        store
+            .publish_full(
+                &repo,
+                &commit,
+                crate::FullResult {
+                    clonepack: artifacts(&commit, "new-full"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!store.evict_if_unchanged(&repo, &selected).await.unwrap());
+
+        let result = store.load_result(&repo, &commit).await.unwrap().unwrap();
+        assert_eq!(result.head.unwrap().clonepack.manifest, "old-head");
+        assert_eq!(result.full.unwrap().clonepack.manifest, "new-full");
     }
 }

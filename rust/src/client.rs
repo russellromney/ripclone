@@ -1656,6 +1656,11 @@ impl Client {
                     "ready",
                     repo_path,
                 )?;
+                anyhow::ensure!(
+                    info.result == result,
+                    "ref result mismatch for {repo_path}: requested {result}, server returned {}",
+                    info.result
+                );
                 *pinned = Some(info.commit.clone());
                 *resolved_branch = Some(info.branch.clone());
                 *cold |= polled;

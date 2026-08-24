@@ -333,6 +333,10 @@ impl RefStore for ApiRefStore {
         bail!("standalone workers require claimed Files publication")
     }
 
+    async fn evict_if_unchanged(&self, _repo_id: &RepoId, _expected: &RefInfo) -> Result<bool> {
+        bail!("standalone workers cannot evict exact results")
+    }
+
     async fn publish_claimed_head(
         &self,
         repo_id: &RepoId,
@@ -358,7 +362,7 @@ impl RefStore for ApiRefStore {
                     commit: commit.to_string(),
                     ..Default::default()
                 });
-            result.head.get_or_insert(head);
+            result.head = Some(head);
         }
         Ok(response.updated)
     }

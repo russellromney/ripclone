@@ -67,6 +67,9 @@ pub trait RefStore: Send + Sync {
     ) -> Result<bool> {
         self.publish_files(repo_id, commit, files).await
     }
+    /// Clear an idle exact result only if it has not changed since the caller
+    /// selected it for eviction. A concurrent publication or access wins.
+    async fn evict_if_unchanged(&self, repo_id: &RepoId, expected: &RefInfo) -> Result<bool>;
     /// Optional wrapper hooks around an atomically authorized claimed write.
     /// Production stores use the defaults; deterministic test stores use these
     /// without moving the authority check outside the control transaction.

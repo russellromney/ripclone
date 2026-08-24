@@ -339,6 +339,14 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         Ok(())
     }
 
+    async fn evict_if_unchanged(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        expected: &ripclone::RefInfo,
+    ) -> anyhow::Result<bool> {
+        self.inner.evict_if_unchanged(repo_id, expected).await
+    }
+
     async fn publish_head(
         &self,
         repo_id: &ripclone::provider::RepoId,
@@ -1008,6 +1016,20 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
             );
         }
         self.inner.save_result(repo_id, info).await
+    }
+
+    async fn evict_if_unchanged(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        expected: &ripclone::RefInfo,
+    ) -> anyhow::Result<bool> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected exact result eviction failure for {}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.evict_if_unchanged(repo_id, expected).await
     }
 
     async fn publish_head(

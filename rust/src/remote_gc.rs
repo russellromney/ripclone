@@ -397,7 +397,7 @@ impl RemoteGc {
                 continue;
             }
 
-            for mut info in infos {
+            for info in infos {
                 if info.head.is_none() && info.full.is_none() && info.files.is_none() {
                     continue;
                 }
@@ -408,14 +408,12 @@ impl RemoteGc {
                 if now.saturating_sub(last_touch) < ttl_secs {
                     continue;
                 }
-                info.head = None;
-                info.full = None;
-                info.files = None;
-                self.ref_store
-                    .save_result(&repo_id, &info)
+                let did_evict = self
+                    .ref_store
+                    .evict_if_unchanged(&repo_id, &info)
                     .await
                     .with_context(|| format!("evict warm result {key}@{}", info.commit))?;
-                evicted += 1;
+                evicted += u64::from(did_evict);
             }
         }
         Ok(evicted)

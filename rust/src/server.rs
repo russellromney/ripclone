@@ -225,6 +225,7 @@ pub struct AdmissionTestProbe {
     pub head_builds: AtomicUsize,
     pub full_builds: AtomicUsize,
     pub files_builds: AtomicUsize,
+    pub bitmap_writes: AtomicUsize,
     pub head_publishes: AtomicUsize,
     pub full_publishes: AtomicUsize,
     pub files_publishes: AtomicUsize,
@@ -272,6 +273,7 @@ impl Default for AdmissionTestProbe {
             head_builds: AtomicUsize::new(0),
             full_builds: AtomicUsize::new(0),
             files_builds: AtomicUsize::new(0),
+            bitmap_writes: AtomicUsize::new(0),
             head_publishes: AtomicUsize::new(0),
             full_publishes: AtomicUsize::new(0),
             files_publishes: AtomicUsize::new(0),
@@ -559,6 +561,12 @@ fn admission_test_files_build(commit: &str) -> bool {
             .contains(commit);
     }
     false
+}
+
+fn admission_test_bitmap_write() {
+    if let Some(probe) = admission_test_probe() {
+        probe.bitmap_writes.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 async fn admission_test_before_full_publish() {
@@ -2785,10 +2793,8 @@ fn exact_result_complete(info: &RefInfo, commit: &str) -> bool {
     info.commit == commit && info.head.is_some() && info.full.is_some() && info.files.is_some()
 }
 
-/// Parent reuse is safe only after the parent's exact Full and Files results are
-/// present. An incomplete exact result is never a reusable parent.
-fn exact_parent_ready_for_reuse(info: &RefInfo, commit: &str) -> bool {
-    info.commit == commit && info.full.is_some() && info.files.is_some()
+fn exact_parent_head_ready(info: &RefInfo, commit: &str) -> bool {
+    info.commit == commit && info.head.is_some()
 }
 
 fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
@@ -5605,12 +5611,6 @@ async fn do_sync(
     .await
     .context("sync task")??;
     drop(fetch_permit);
-    // Record when this exact source acquisition completed for status and
-    // retention accounting. Completion order never selects another result.
-    let fetched_at = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs());
     phases.mirror_fetch_ms = Some(duration_ms(t.elapsed()));
     info!("sync phase: mirror fetch {:?}", t.elapsed());
     t = Instant::now();
@@ -5664,6 +5664,7 @@ async fn do_sync(
             compression_level,
             result.full.is_none(),
             result.files.is_none(),
+            false,
         )
         .await?;
         ref_store.invalidate(repo_id, &commit).await;
@@ -5691,7 +5692,6 @@ async fn do_sync(
         storage,
         retention,
         t_total,
-        fetched_at,
         compression_level,
         phases,
         foreground_release,
@@ -5737,8 +5737,6 @@ async fn build_and_publish_results(
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     t_total: Instant,
-    // Publish-ordering key, stamped at fetch time by the caller (see do_sync).
-    fetched_at: Option<u64>,
     // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
     mut phases: SyncPhases,
@@ -5751,7 +5749,8 @@ async fn build_and_publish_results(
     // Load the previous synced ref once: used both for the files-table by-diff
     // below and for Option-A full-clonepack carry later in this phase.
     //
-    // Reuse only a completed exact Full/Files parent.
+    // Head construction needs only the parent's exact Head result. Full and
+    // Files select their own parent outputs independently below.
     let current = ref_store.load_result(repo_id, commit).await.ok().flatten();
     let prev_loaded = match parent.as_deref() {
         Some(parent_commit) => ref_store
@@ -5773,7 +5772,7 @@ async fn build_and_publish_results(
     let prev = prev_loaded.filter(|candidate| {
         parent
             .as_deref()
-            .is_some_and(|parent| exact_parent_ready_for_reuse(candidate, parent))
+            .is_some_and(|parent| exact_parent_head_ready(candidate, parent))
     });
 
     // Build the Head closure and shallow skeleton, then publish Head.
@@ -5987,8 +5986,16 @@ async fn build_and_publish_results(
         }),
         full: None,
         files: None,
-        synced_at: fetched_at,
-        last_accessed_at: fetched_at,
+        synced_at: None,
+        last_accessed_at: current
+            .as_ref()
+            .and_then(|result| result.last_accessed_at)
+            .or_else(|| {
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs())
+            }),
         warm_pinned: prev_warm_pinned,
     };
 
@@ -6068,6 +6075,8 @@ async fn build_and_publish_results(
 
     // Every durable claim owns Head, Files, and Full. A process death before
     // this completes leaves the SQL claim stale for the next worker to reclaim.
+    let need_full = current.as_ref().is_none_or(|result| result.full.is_none());
+    let need_files = current.as_ref().is_none_or(|result| result.files.is_none());
     build_missing_full_and_files(
         cas,
         mirror_dir,
@@ -6079,7 +6088,8 @@ async fn build_and_publish_results(
         storage,
         retention,
         compression_level,
-        true,
+        need_full,
+        need_files,
         true,
     )
     .await?;
@@ -6274,6 +6284,7 @@ async fn build_missing_full_and_files(
     compression_level: i32,
     need_full: bool,
     need_files: bool,
+    allow_head_compaction: bool,
 ) -> Result<()> {
     let head_manifest_bytes = storage
         .get(&head.clonepack.manifest)
@@ -6315,6 +6326,7 @@ async fn build_missing_full_and_files(
             ref_store,
             storage,
             retention,
+            allow_head_compaction,
         )
         .await
     };
@@ -6387,10 +6399,18 @@ async fn build_full_result(
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
+    allow_head_compaction: bool,
 ) -> Result<()> {
     if admission_test_full_build(commit) {
         anyhow::bail!("forced Full failure for {commit}");
     }
+
+    // Full history walks are substantially faster on large repositories when
+    // Git can use a reachability bitmap. This is best-effort and happens only
+    // when Full itself is missing.
+    admission_test_bitmap_write();
+    let bitmap_mirror = mirror_dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bitmap_mirror)).await;
 
     let history_target = 512 * 1024 * 1024;
     let lsm_cfg = lsm_config();
@@ -6439,6 +6459,91 @@ async fn build_full_result(
     } else {
         (built_history.clone(), built_history, Vec::new())
     };
+    let mut head = head.clone();
+    let mut head_packs = head_packs;
+    let rebase_bytes = env_u64("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024);
+    let delta_bytes: u64 = head_packs
+        .iter()
+        .skip(head.base_packs.len())
+        .map(|(_, pack_len, _, _)| *pack_len)
+        .sum();
+    if allow_head_compaction && delta_bytes >= rebase_bytes {
+        let compact_mirror = mirror_dir.to_path_buf();
+        let compact_cas = cas.clone();
+        let compact_commit = commit.to_string();
+        let compact_packs = tokio::task::spawn_blocking(move || {
+            PackBuilder::new(&compact_mirror, &compact_cas)
+                .build_head_packs(&compact_commit, 4 * 1024 * 1024)
+        })
+        .await
+        .context("compact Head packs")??;
+        let compact_tagged: Vec<(&(String, u64, String, u64), bool)> =
+            compact_packs.iter().map(|pack| (pack, false)).collect();
+        let (compact_entries, compact_idx_ref, compact_idx_hash) =
+            assemble_variant(cas, storage, &compact_tagged)?;
+        let (compact_midx_ref, compact_midx_hash) = assemble_midx(cas, &compact_packs)?;
+        let compact_manifest = make_manifest(
+            commit,
+            &parent,
+            &[],
+            &head.clonepack.metadata_chunk,
+            storage
+                .size(&head.clonepack.metadata_chunk)
+                .context("size Head metadata for compaction")?,
+            compact_entries,
+            compact_midx_ref,
+            compact_idx_ref,
+        )?;
+        let compact_manifest_hash = cas.put(&compact_manifest.encode_to_vec())?;
+        let mut compact_uploads = vec![
+            compact_manifest_hash.clone(),
+            compact_idx_hash.clone(),
+            compact_midx_hash.clone(),
+        ];
+        for (pack, _, idx, _) in &compact_packs {
+            compact_uploads.push(pack.clone());
+            compact_uploads.push(idx.clone());
+        }
+        compact_uploads.retain(|hash| !hash.is_empty());
+        let compact_idx_keep = compact_packs
+            .iter()
+            .map(|(_, _, idx, _)| idx.clone())
+            .collect();
+        upload_artifacts(cas, storage, compact_uploads.clone(), upload_concurrency()).await?;
+        let compact_head = crate::HeadResult {
+            clonepack: crate::ClonepackArtifacts {
+                manifest: compact_manifest_hash,
+                metadata_chunk: head.clonepack.metadata_chunk.clone(),
+                skeleton_pack: head.clonepack.skeleton_pack.clone(),
+                skeleton_idx: head.clonepack.skeleton_idx.clone(),
+                prebuilt_index: head.clonepack.prebuilt_index.clone(),
+                midx: compact_midx_hash,
+                idx_bundle: compact_idx_hash,
+                commit: commit.to_string(),
+            },
+            parent_commit: parent.clone(),
+            packs: pack_artifacts_of(&compact_packs),
+            base_commit: commit.to_string(),
+            base_packs: compact_packs.iter().map(tuple_to_sized).collect(),
+        };
+        admission_test_ref_store_write();
+        anyhow::ensure!(
+            ref_store
+                .publish_head(repo_id, commit, compact_head.clone())
+                .await?,
+            "job no longer owns compacted Head publication for {}@{commit}",
+            repo_id.storage_key()
+        );
+        settle_storage(cas, storage, retention, compact_uploads, compact_idx_keep).await;
+        info!(
+            "compacted Head result ({} MiB delta -> {} packs)",
+            delta_bytes / (1024 * 1024),
+            compact_packs.len()
+        );
+        head = compact_head;
+        head_packs = compact_packs;
+    }
+
     let tagged: Vec<(&(String, u64, String, u64), bool)> = head_packs
         .iter()
         .map(|pack| (pack, false))
@@ -6522,14 +6627,13 @@ async fn build_files_result(
         anyhow::bail!("forced Files failure for {commit}");
     }
 
-    let previous_frames = parent_result
-        .and_then(|result| result.files.as_ref())
+    let parent_files = parent_result.and_then(|result| result.files.as_ref());
+    let previous_frames = parent_files
         .map(|files| files.archive_frames.clone())
         .unwrap_or_default();
-    let previous_files = match parent_result.and_then(|result| result.head.as_ref()) {
-        Some(parent_head) => {
-            load_metadata_files(cas, storage, &parent_head.clonepack.metadata_chunk)
-                .unwrap_or_default()
+    let previous_files = match parent_files {
+        Some(files) => {
+            load_metadata_files(cas, storage, &files.clonepack.metadata_chunk).unwrap_or_default()
         }
         None => Vec::new(),
     };
@@ -6662,6 +6766,10 @@ impl RefStore for ClaimScopedRefStore {
 
     async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
         self.inner.save_result(repo_id, info).await
+    }
+
+    async fn evict_if_unchanged(&self, repo_id: &RepoId, expected: &RefInfo) -> Result<bool> {
+        self.inner.evict_if_unchanged(repo_id, expected).await
     }
 
     async fn publish_head(
@@ -7681,6 +7789,16 @@ mod tests {
         }
         async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> anyhow::Result<()> {
             self.store().await?.save_result(repo_id, info).await
+        }
+        async fn evict_if_unchanged(
+            &self,
+            repo_id: &RepoId,
+            expected: &RefInfo,
+        ) -> anyhow::Result<bool> {
+            self.store()
+                .await?
+                .evict_if_unchanged(repo_id, expected)
+                .await
         }
         async fn publish_head(
             &self,
@@ -9594,6 +9712,11 @@ mod tests {
             )
             .await
             .unwrap();
+        state
+            .ref_store
+            .publish_head(&repo_id, &commit, crate::HeadResult::default())
+            .await
+            .unwrap();
 
         let status = build_repo_status(&state, &repo_id, false, None)
             .await
@@ -9603,6 +9726,7 @@ mod tests {
         assert!(exact.head);
         assert!(exact.full);
         assert!(!exact.files);
+        assert!(exact.built_at.is_some());
         assert_eq!(exact.job, "none");
         assert!(exact.job_error.is_none());
     }
