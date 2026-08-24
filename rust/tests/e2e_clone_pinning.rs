@@ -129,6 +129,15 @@ fn ready(commit: &str) -> (StatusCode, serde_json::Value) {
     )
 }
 
+fn ready_result(
+    commit: &str,
+    result: ripclone::ExactResultKind,
+) -> (StatusCode, serde_json::Value) {
+    let (status, mut body) = ready(commit);
+    body["result"] = json!(result.to_string());
+    (status, body)
+}
+
 fn ready_on(commit: &str, branch: &str) -> (StatusCode, serde_json::Value) {
     let (status, mut body) = ready(commit);
     body["branch"] = json!(branch);
@@ -321,6 +330,39 @@ async fn malformed_pending_commit_is_a_protocol_error() {
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(requests.len(), 1, "malformed response never retries");
     assert!(!requests[0].contains("pinned="));
+}
+
+#[tokio::test]
+async fn ready_response_must_match_each_requested_result() {
+    let _guard = env_lock().lock().await;
+    for (requested, returned) in [
+        (
+            ripclone::ExactResultKind::Head,
+            ripclone::ExactResultKind::Full,
+        ),
+        (
+            ripclone::ExactResultKind::Full,
+            ripclone::ExactResultKind::Files,
+        ),
+        (
+            ripclone::ExactResultKind::Files,
+            ripclone::ExactResultKind::Head,
+        ),
+    ] {
+        let (url, requests, task) = scripted_server(vec![ready_result(A, returned)]).await;
+        let error = Client::new(url)
+            .resolve_exact_result("acme/demo", "main", requested, None)
+            .await
+            .expect_err("a different exact result must be rejected");
+        abort_server_task(task).await;
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "requested {requested}, server returned {returned}"
+            )),
+            "mismatch error names both results: {error:#}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

@@ -184,6 +184,11 @@ async fn head_is_ready_while_full_and_files_are_running_and_both_publications_su
     probe.before_files_publish.release();
     wait_count(&probe.full_publishes, 1).await;
     wait_count(&probe.files_publishes, 1).await;
+    assert_eq!(
+        probe.bitmap_writes.load(Ordering::SeqCst),
+        1,
+        "the missing Full result writes one reachability bitmap"
+    );
     let complete = exact_result(&server, "acme/head-first", &commit).await;
     assert!(complete.head.is_some() && complete.full.is_some() && complete.files.is_some());
 }
@@ -234,6 +239,46 @@ async fn full_can_publish_while_files_is_running() {
     );
     probe.before_files_publish.release();
     wait_count(&probe.files_publishes, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parent_head_is_reused_while_parent_full_and_files_are_running() {
+    let _lock = env_lock().lock().await;
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    setup(false);
+    let probe = Arc::new(AdmissionTestProbe::default());
+    probe.before_full_publish.arm();
+    probe.before_files_publish.arm();
+    let _probe = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let (server, origin, parent) = fixture("parent-head", &[("value.txt", "B\n")]).await;
+
+    admit(&server, "acme/parent-head").await;
+    let ((), ()) = tokio::join!(
+        wait_barrier(&probe.before_full_publish, 1),
+        wait_barrier(&probe.before_files_publish, 1),
+    );
+    let child = origin.commit(&[("value.txt", "C\n")], "C");
+    origin.publish();
+    assert_eq!(admit(&server, "acme/parent-head").await, child);
+    wait_count(&probe.head_publishes, 2).await;
+
+    let parent_result = exact_result(&server, "acme/parent-head", &parent).await;
+    assert!(parent_result.head.is_some());
+    assert!(parent_result.full.is_none() && parent_result.files.is_none());
+    let child_head = exact_result(&server, "acme/parent-head", &child)
+        .await
+        .head
+        .expect("child Head result");
+    assert_eq!(child_head.parent_commit.as_deref(), Some(parent.as_str()));
+    assert_eq!(
+        child_head.base_commit, parent,
+        "the child Head reuses the ready parent Head base"
+    );
+
+    probe.before_full_publish.release();
+    probe.before_files_publish.release();
+    wait_count(&probe.full_publishes, 2).await;
+    wait_count(&probe.files_publishes, 2).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -454,4 +499,35 @@ async fn committed_empty_tree_has_ready_files_with_zero_archive_chunks() {
         .await
         .expect("clone committed empty tree as Files");
     assert!(std::fs::read_dir(checkout).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_head_preserves_ready_full_and_files() {
+    let _lock = env_lock().lock().await;
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    setup(false);
+    let probe = Arc::new(AdmissionTestProbe::default());
+    let _probe = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
+    let (server, _origin, commit) = fixture("missing-head", &[("value.txt", "B\n")]).await;
+
+    admit(&server, "acme/missing-head").await;
+    wait_count(&probe.full_publishes, 1).await;
+    wait_count(&probe.files_publishes, 1).await;
+    let repo_id = RepoId::github("acme/missing-head");
+    let store = server_ref_store(&server).await;
+    let mut malformed = store.load_result(&repo_id, &commit).await.unwrap().unwrap();
+    malformed.head = None;
+    store.delete_result(&repo_id, &commit).await.unwrap();
+    store.save_result(&repo_id, &malformed).await.unwrap();
+
+    let head_builds = probe.head_builds.load(Ordering::SeqCst);
+    let full_builds = probe.full_builds.load(Ordering::SeqCst);
+    let files_builds = probe.files_builds.load(Ordering::SeqCst);
+    admit(&server, "acme/missing-head").await;
+    wait_count(&probe.head_builds, head_builds + 1).await;
+    wait_count(&probe.head_publishes, 2).await;
+    let rebuilt = exact_result(&server, "acme/missing-head", &commit).await;
+    assert!(rebuilt.head.is_some() && rebuilt.full.is_some() && rebuilt.files.is_some());
+    assert_eq!(probe.full_builds.load(Ordering::SeqCst), full_builds);
+    assert_eq!(probe.files_builds.load(Ordering::SeqCst), files_builds);
 }

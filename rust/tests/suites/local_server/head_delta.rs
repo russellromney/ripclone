@@ -12,6 +12,7 @@
 
 use crate::common::*;
 use ripclone::mode::CloneMode;
+use ripclone::provider::RepoId;
 use std::sync::Once;
 use std::time::Duration;
 
@@ -216,6 +217,18 @@ async fn head_compaction_keeps_clones_complete() {
 
         // Wait for Full and any compaction to land before the next sync.
         let (_g0, d0) = clone_full_at(&server, "acme", "compact", &i.to_string()).await;
+        let commit = git(&origin.work, &["rev-parse", "HEAD"]);
+        let exact = server_ref_store(&server)
+            .await
+            .load_result(&RepoId::github("acme/compact"), &commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exact.head.expect("Head result").base_commit,
+            commit,
+            "the 1-byte threshold compacts every non-empty Head delta"
+        );
         for j in 2..=i {
             assert!(
                 d0.join(format!("f{j}.txt")).exists(),
