@@ -32,14 +32,18 @@ ripclone builds the content three ways so each clone takes only what it needs:
 
 ***Archive.*** The same `HEAD` file bytes, zstd-compressed and split into chunks. Each chunk is made of independent frames, so the client can download many at once and start writing files as the first bytes land. It's the fastest path to a working tree, but the files don't go into `.git`, so git content commands don't work. This is what **files** mode uses.
 
-### Two-phase publish
+### Separate exact results
 
-Most clones just want the latest `HEAD`, so a sync builds that first and the rest later.
+Each exact commit stores three independent results: **Head**, **Full**, and
+**Files**. A sync builds and publishes Head first. It then builds missing Full
+history and Files archive work concurrently, publishing each as soon as it is
+complete. A later job checks these fields and never rebuilds a result that is
+already present.
 
-- **Phase 1.** The server builds everything a `--depth 1` clone needs: the skeleton, the index, and a pack with `HEAD`'s files. This is ready fast and served right away. The ref says `build_status: "full history building"` so clients know more is coming.
-- **Phase 2.** In the background, the server builds the full history, then the archive — reusing whatever didn't change since the last sync. When it's done, it clears `build_status`.
-
-A clone that only wants `HEAD` is ready as soon as phase 1 finishes. An editable full clone (`--depth 0`) is ready once the history lands — it reads the working tree from the packs and never touches the archive, so only `files` mode waits for the archive. While a phase is still building, the server returns `202` and the client retries on its own.
+A depth-1 editable clone requests Head, a full editable clone requests Full,
+and files mode requests Files. A missing result returns `202` while the one job
+for that exact commit is active. Readiness comes only from the requested stored
+result; job state reports pending or failed work.
 
 ### Content-defined chunking and cheap re-syncs
 
@@ -59,12 +63,17 @@ Measured on a Fly `performance-8x` client (Newark) against a ripclone server in 
 
 How long a sync takes to build the artifacts (server-side, the same hardware as the clone numbers). There's no git equivalent — git builds nothing ahead of time.
 
-| repo | phase 1 (depth=1 clone-ready) | phase 2 (full history, background) |
+| repo | Head ready | Full and Files background work |
 |---|---|---|
 | `facebook/react` | 5.4 s | +32 s |
 | `oven-sh/bun` | ~8 s | +13 s |
 | `torvalds/linux` | ~40 s | very large |
 
-Phase 1 is what a `--depth 1` clone waits for; phase 2 runs in the background and only gates full clones. react's phase 2 is a cold first build; bun's is much shorter because the incremental re-sync reuses unchanged history levels and archive frames. linux's phase 1 is dominated by building the HEAD-closure pack for its ~95k-file tree, and its full history is large enough that we don't pre-build it on the dev box.
+Head is what a `--depth 1` clone waits for. Full and Files run concurrently in
+the background and gate only their matching clone modes. React's measurement
+is a cold first build; Bun's is much shorter because the incremental re-sync
+reuses unchanged history levels and archive frames. Linux's Head build is
+dominated by its ~95k-file tree, and its full history is large enough that we
+don't pre-build it on the dev box.
 
 > In production the server syncs on push, so this happens once per commit, ahead of any clone — by the time a CI runner or agent asks for the repo, the artifacts are already built.

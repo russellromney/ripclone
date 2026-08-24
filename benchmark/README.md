@@ -39,8 +39,8 @@ This directory contains standalone benchmarks and verification scripts. They ass
   any clone timer. Set `BENCH_MODES` to a space-separated subset of `full`,
   `depth1`, `files`, `git-full`, `git-depth1`, and `github-files` (GitHub's
   extracted source archive). For a shallow-only run, set
-  `RIPCLONE_BENCH_READY_CLONEPACK=shallow` so readiness does not wait for the
-  background full-history build. The harness reports p50 and nearest-rank p90.
+  `RIPCLONE_BENCH_READY_RESULTS=head` so readiness does not wait for the
+  background Full or Files build. The harness reports p50 and nearest-rank p90.
   Every files/archive result is checked outside the timer against a precomputed
   exact-tree digest. Every editable result must point at the admitted commit,
   be clean, and have the requested history depth; its first sample per mode
@@ -94,14 +94,14 @@ This directory contains standalone benchmarks and verification scripts. They ass
   readiness probes from the Fly client app. Remote incremental runs reset a
   real GitHub fork to `BENCH_REF`, push one synthetic commit per run, and read
   phase timings plus amplification from the server's `sync-bench` log lines.
-  `COLD_RUNS` and `INCREMENTAL_RUNS` can override `RUNS` for the two phases.
+  `COLD_RUNS` and `INCREMENTAL_RUNS` can override `RUNS` for the two run classes.
 - **`plot_ratios.py`** — generates the `shaped_ratios.png` graph from the sweep data.
 
 ## B4 sync-latency guide
 
 Use the `--at` path for B4 parent-to-target measurements. Sync the parent commit
 first, wait for the background full-history build to finish, then sync the
-target commit. This measures the one-commit-later phase-1 path without creating
+target commit. This measures the one-commit-later Head path without creating
 GitHub forks or triggering fork CI.
 
 Before running against Fly:
@@ -206,8 +206,9 @@ Most scripts read:
 - `SKIP_ADD` — set to `1` only when the repository was explicitly admitted
   before this invocation; admission is otherwise always performed outside the
   clone timer.
-- `RIPCLONE_BENCH_READY_CLONEPACK` — `full` (default) or `shallow`; controls
-  the pre-timing readiness gate.
+- `RIPCLONE_BENCH_READY_RESULTS` — space-separated `head`, `full`, and/or
+  `files`; controls the pre-timing readiness gates. By default the harness waits
+  for every Ripclone result used by `BENCH_MODES`.
 - `SHAPED` — set to `0` to disable traffic shaping.
 - `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads.
 - `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — extraction parallelism.

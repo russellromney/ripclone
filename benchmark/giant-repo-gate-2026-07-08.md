@@ -42,7 +42,7 @@ The honest headline: a giant's cold build is dominated (93–94%) by the **one-t
 `git clone --mirror` from GitHub**, not by ripclone. The full-history editable build's own
 bottleneck is the reachability-**bitmap / multi-pack-index write** (the B6 "lever").
 
-## Storage amplification (phase-1)
+## Storage amplification (Head)
 
 | repo | stored (CAS) | source repo | amplification |
 |------|-------------:|------------:|--------------:|

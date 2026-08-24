@@ -83,7 +83,7 @@ readiness-oriented return values. After the first `202`, they
 poll only the authenticated exact pinned metadata path:
 
 ```text
-GET /v1/repos/<provider>/<repo>/refs/<branch>?pinned=<B>&clonepack=full
+GET /v1/repos/<provider>/<repo>/refs/<branch>?pinned=<B>&result=full
 ```
 
 They do not repeat a moving `POST /sync` or `POST /add`, re-resolve the branch,

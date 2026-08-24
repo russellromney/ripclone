@@ -15,13 +15,14 @@ exact branch commit was admitted or coalesced into background work; those
 commands return without waiting for the build. Blocking library methods
 poll the pinned commit's metadata after that first `202`, so they do not repeat
 a moving-tip POST. A `202` from a clone/ref request means the artifacts for the
-requested commit are still being built. On every push the server builds a
-depth-1 clonepack first (ready fast) and the full history + archive in the
-background; while a phase is still building, the ref response carries
-`build_status` and the server returns `202`.
+requested commit are still being built. On every push the server publishes
+Head first, then builds missing Full history and Files archive work
+concurrently. The requested stored result is the readiness signal; the job
+reports pending or failed work.
 
-- A depth-1 or `files` clone is ready as soon as phase 1 finishes.
-- A full editable clone (`--depth 0`) waits for the history build.
+- A depth-1 clone waits for Head.
+- A full editable clone (`--depth 0`) waits for Full.
+- A files clone waits for Files, independently of Full.
 - If it never clears, the build is stuck or failing — check the server logs and `GET /readyz`. The 5-minute polling fallback (`RIPCLONE_POLL_INTERVAL_SECS`, on by default) re-checks known repos so a missed or stuck build self-heals.
 
 ## `401 Unauthorized` vs `403 Forbidden`
