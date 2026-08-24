@@ -90,25 +90,51 @@ async fn pinned_status(
         .status()
 }
 
-async fn stop_current_job(server: &Server, worker: &str) {
+async fn stop_current_job(server: &Server, repo: &str, commit: &str) {
+    let database = libsql::Builder::new_local(&server.control_db)
+        .build()
+        .await
+        .expect("open exact job database");
+    let connection = database.connect().expect("connect to exact job database");
+    let key = format!("{}\x1f{commit}", RepoId::github(repo).storage_key());
+    let mut rows = connection
+        .query(
+            "SELECT id, worker_id FROM jobs WHERE key = ?1 AND status = 'claimed'",
+            [key.as_str()],
+        )
+        .await
+        .expect("read exact claimed job");
+    let row = rows
+        .next()
+        .await
+        .expect("read exact claimed job row")
+        .expect("exact job is claimed at the result barrier");
+    let job_id = row.get::<i64>(0).expect("claimed job id");
+    let worker_id = row
+        .get::<Option<String>>(1)
+        .expect("claimed worker id column")
+        .expect("claimed job has an owner");
+    assert!(
+        rows.next()
+            .await
+            .expect("read duplicate exact claimed job")
+            .is_none(),
+        "one exact commit must have at most one claimed job"
+    );
+    drop(rows);
+
     let queue = ripclone::queue::SqlJobQueue::new(Box::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
-            .expect("connect takeover queue"),
+            .expect("connect exact job queue"),
     ))
     .await
-    .expect("open takeover queue")
-    .with_stale_claim_secs(0);
-    let job = queue
-        .claim(worker)
-        .await
-        .expect("take current job")
-        .expect("current job is claimed");
+    .expect("open exact job queue");
     assert!(
         queue
             .ack(
-                job.id,
-                worker,
+                job_id,
+                &worker_id,
                 Err(ripclone::queue::BuildError::permanent(
                     "stopped by deterministic result test",
                 )),
@@ -318,7 +344,7 @@ async fn stopped_after_head_restarts_without_rebuilding_head() {
     wait_barrier(&probe.after_head_entry, 1).await;
     let held = exact_result(&server, "acme/stopped-head", &commit).await;
     assert!(held.head.is_some() && held.full.is_none() && held.files.is_none());
-    stop_current_job(&server, "head-stop-owner").await;
+    stop_current_job(&server, "acme/stopped-head", &commit).await;
     probe.after_head_entry.release();
     probe.after_head_entry.disarm();
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_failure(1))
@@ -349,7 +375,7 @@ async fn stopped_after_full_restarts_without_rebuilding_head_or_full() {
     wait_barrier(&probe.after_full_publish, 1).await;
     let held = exact_result(&server, "acme/stopped-full", &commit).await;
     assert!(held.head.is_some() && held.full.is_some() && held.files.is_none());
-    stop_current_job(&server, "full-stop-owner").await;
+    stop_current_job(&server, "acme/stopped-full", &commit).await;
     probe.allow_files_for(&commit);
     probe.after_full_publish.release();
     probe.after_full_publish.disarm();
@@ -382,7 +408,7 @@ async fn stopped_after_files_restarts_without_rebuilding_head_or_files() {
     wait_barrier(&probe.after_files_publish, 1).await;
     let held = exact_result(&server, "acme/stopped-files", &commit).await;
     assert!(held.head.is_some() && held.files.is_some() && held.full.is_none());
-    stop_current_job(&server, "files-stop-owner").await;
+    stop_current_job(&server, "acme/stopped-files", &commit).await;
     probe.allow_full_for(&commit);
     probe.after_files_publish.release();
     probe.after_files_publish.disarm();
