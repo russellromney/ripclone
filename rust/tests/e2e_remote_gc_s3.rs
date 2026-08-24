@@ -4,6 +4,8 @@
 mod common;
 
 use common::*;
+use prost::Message;
+use ripclone::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex};
 use ripclone::provider::RepoId;
 use ripclone::remote_gc::{GcConfig, RemoteGc};
 use ripclone::storage::{S3Storage, StorageBackend, StorageRef};
@@ -112,17 +114,39 @@ async fn remote_gc_uses_sqlite_refs_for_s3_reachability() {
     let orphan_bytes = b"unreachable S3 artifact";
     let live = ripclone::cas::hash(live_bytes);
     let orphan = ripclone::cas::hash(orphan_bytes);
+    let metadata_bytes = b"reachable metadata";
+    let metadata = ripclone::cas::hash(metadata_bytes);
+    let commit = "1111111111111111111111111111111111111111";
+    let manifest = ClonepackManifest {
+        commit: commit.to_string(),
+        metadata_chunk: Some(ChunkRef {
+            hash: hash_from_hex(&metadata).unwrap(),
+            len: metadata_bytes.len() as u64,
+        }),
+        archive_chunks: vec![ChunkRef {
+            hash: hash_from_hex(&live).unwrap(),
+            len: live_bytes.len() as u64,
+        }],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let manifest_hash = ripclone::cas::hash(&manifest);
     storage.put_async(&live, live_bytes).await.unwrap();
     storage.put_async(&orphan, orphan_bytes).await.unwrap();
+    storage.put_async(&metadata, metadata_bytes).await.unwrap();
+    storage.put_async(&manifest_hash, &manifest).await.unwrap();
     refs.save_result(
         &RepoId::github("acme/gc"),
         &ripclone::RefInfo {
-            commit: "1111111111111111111111111111111111111111".to_string(),
-            head: Some(ripclone::HeadResult {
-                packs: vec![ripclone::PackArtifact {
-                    pack: live.clone(),
-                    idx: String::new(),
-                }],
+            commit: commit.to_string(),
+            files: Some(ripclone::FilesResult {
+                clonepack: ripclone::ClonepackArtifacts {
+                    manifest: manifest_hash,
+                    metadata_chunk: metadata,
+                    commit: commit.to_string(),
+                    ..Default::default()
+                },
+                archive_chunks: vec![live.clone()],
                 ..Default::default()
             }),
             ..Default::default()
