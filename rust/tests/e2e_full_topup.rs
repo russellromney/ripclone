@@ -2262,7 +2262,7 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
     assert_eq!(
         std::env::var("RIPCLONE_REQUIRE_MINIO").as_deref(),
         Ok("1"),
-        "run through scripts/e2e_clone_pinning_minio.sh"
+        "run through scripts/e2e_full_topup_minio.sh"
     );
     init(false);
     let controls = tempfile::tempdir().unwrap();
