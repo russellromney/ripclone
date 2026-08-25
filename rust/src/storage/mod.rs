@@ -63,6 +63,10 @@ pub trait StorageBackend: Send + Sync {
     /// without downloading the whole object.
     fn size(&self, hash: &str) -> Result<u64>;
 
+    /// Confirm that the durable backend contains this object without consulting
+    /// a disposable local cache.
+    fn verify_durable_copy(&self, hash: &str) -> Result<()>;
+
     /// Return a signed URL valid for `expires_in`, if the backend supports
     /// direct client reads. `None` means the server must proxy bytes itself.
     fn signed_url(&self, _hash: &str, _expires_in: Duration) -> Option<String> {
@@ -140,6 +144,10 @@ impl StorageBackend for LocalStorage {
         Ok(meta.len())
     }
 
+    fn verify_durable_copy(&self, hash: &str) -> Result<()> {
+        self.size(hash).map(|_| ())
+    }
+
     fn health(&self) -> Result<()> {
         // Write+read+remove a tiny probe file under the CAS root. This catches
         // the realistic production failures a dir-stat misses: the data volume
@@ -200,6 +208,10 @@ mod tests {
         }
 
         fn size(&self, _hash: &str) -> Result<u64> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn verify_durable_copy(&self, _hash: &str) -> Result<()> {
             anyhow::bail!("unsupported")
         }
     }

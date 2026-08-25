@@ -12,10 +12,33 @@ use ripclone::ref_store::{AddedRepo, AddedRepoSource};
 use ripclone::server::{RateLimiter, ServerState, build_app};
 use ripclone::{ClonepackArtifacts, RefInfo};
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
 
 fn record_clonepack_hashes(hashes: &mut BTreeSet<String>, clonepack: &ClonepackArtifacts) {
     for hash in [
@@ -118,6 +141,10 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     let cas_dir = dir.path().join("cas");
     let repo_root = dir.path().join("repos");
     let control_path = dir.path().join("control.db");
+    let _s3_cache =
+        require_turso.then(|| ScopedEnvVar::set("RIPCLONE_S3_CACHE_DIR", cas_dir.as_os_str()));
+    let _cache_max_age =
+        require_turso.then(|| ScopedEnvVar::set("RIPCLONE_RETENTION_MAX_AGE_DAYS", "1"));
     // A short lease makes the real child prove renewal repeatedly while Full
     // is held. The worker command intentionally does not enable optional idle
     // fleet heartbeats.
@@ -163,8 +190,46 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     )
     .await
     .unwrap();
+    let cache_retention = backends.cache_retention.clone();
     let queue = control.queue();
     let artifact_storage = backends.storage.clone();
+    if require_turso {
+        let bytes = b"cache-only object without a durable remote copy";
+        let cache_only_hash = backends.cas.put(bytes).unwrap();
+        let cache_only_path = backends.cas.path(&cache_only_hash);
+        filetime::set_file_mtime(&cache_only_path, filetime::FileTime::from_unix_time(1, 0))
+            .unwrap();
+
+        assert_eq!(
+            artifact_storage.size(&cache_only_hash).unwrap(),
+            bytes.len() as u64,
+            "ordinary size lookup deliberately sees the shared local S3 cache"
+        );
+        assert!(
+            artifact_storage
+                .verify_durable_copy(&cache_only_hash)
+                .is_err(),
+            "cache-only bytes must not count as a durable remote copy"
+        );
+        cache_retention.run_once().await.unwrap();
+        assert!(
+            cache_only_path.exists(),
+            "cleanup must retain bytes that exist only in the local S3 cache"
+        );
+
+        artifact_storage.put(&cache_only_hash, bytes).unwrap();
+        artifact_storage
+            .verify_durable_copy(&cache_only_hash)
+            .expect("uploaded cache fixture has a durable remote copy");
+        cache_retention.run_once().await.unwrap();
+        assert!(
+            !cache_only_path.exists(),
+            "cleanup may remove the local copy after direct remote confirmation"
+        );
+        artifact_storage
+            .verify_durable_copy(&cache_only_hash)
+            .expect("local cleanup retained the remote object");
+    }
     let provider_registry = ripclone::provider::ProviderRegistry::new();
     let state = ServerState {
         cas: backends.cas,

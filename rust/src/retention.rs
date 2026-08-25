@@ -88,7 +88,7 @@ impl LocalCacheRetention {
         let (deleted_age_bytes, deleted_size_bytes, deleted_count) =
             tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64)> {
                 let entries = list_cas_entries(cas.root())?;
-                let is_durable = |hash: &str| durable_storage.size(hash).is_ok();
+                let is_durable = |hash: &str| durable_storage.verify_durable_copy(hash).is_ok();
 
                 let mut deleted_age_bytes = 0u64;
                 let mut deleted_age_count = 0u64;

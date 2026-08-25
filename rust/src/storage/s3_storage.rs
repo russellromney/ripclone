@@ -373,6 +373,24 @@ impl S3Storage {
             Err(_) => run_on_global(make_future),
         }
     }
+
+    fn remote_size(&self, hash: &str) -> Result<u64> {
+        let key = self.key(hash)?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.clone();
+        let output = self.block_on(move || async move {
+            client
+                .objects()
+                .head(&bucket, &key_owned)
+                .send()
+                .await
+                .context("S3 head_object")
+        })?;
+        output
+            .content_length
+            .ok_or_else(|| anyhow::anyhow!("S3 head_object missing Content-Length"))
+    }
 }
 
 #[async_trait::async_trait]
@@ -555,21 +573,11 @@ impl StorageBackend for S3Storage {
         {
             return Ok(len);
         }
-        let key = self.key(hash)?;
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key_owned = key.clone();
-        let output = self.block_on(move || async move {
-            client
-                .objects()
-                .head(&bucket, &key_owned)
-                .send()
-                .await
-                .context("S3 head_object")
-        })?;
-        output
-            .content_length
-            .ok_or_else(|| anyhow::anyhow!("S3 head_object missing Content-Length"))
+        self.remote_size(hash)
+    }
+
+    fn verify_durable_copy(&self, hash: &str) -> Result<()> {
+        self.remote_size(hash).map(|_| ())
     }
 
     fn signed_url(&self, hash: &str, expires_in: Duration) -> Option<String> {

@@ -862,6 +862,10 @@ impl StorageBackend for RemoteLocalStorage {
         self.inner.size(hash)
     }
 
+    fn verify_durable_copy(&self, hash: &str) -> anyhow::Result<()> {
+        self.inner.verify_durable_copy(hash)
+    }
+
     fn is_remote(&self) -> bool {
         true
     }
@@ -1119,6 +1123,10 @@ impl StorageBackend for FailingPutStorage {
 
     fn size(&self, hash: &str) -> anyhow::Result<u64> {
         self.inner.size(hash)
+    }
+
+    fn verify_durable_copy(&self, hash: &str) -> anyhow::Result<()> {
+        self.inner.verify_durable_copy(hash)
     }
 
     fn is_remote(&self) -> bool {

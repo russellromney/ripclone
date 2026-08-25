@@ -1853,6 +1853,10 @@ mod tests {
         fn size(&self, _hash: &str) -> Result<u64> {
             anyhow::bail!("unsupported")
         }
+
+        fn verify_durable_copy(&self, _hash: &str) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
     }
 
     fn commit_files(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
