@@ -31,7 +31,7 @@ Internal tuning knobs use code constants at their current defaults.
 - `RIPCLONE_SERVER_TOKEN` / `RIPCLONE_SERVER_TOKEN_HASH` - server auth for
   clients and self-hosted servers.
 - `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`,
-  `RIPCLONE_S3_PREFIX`, `RIPCLONE_S3_CACHE_DIR` - object storage backend.
+  `RIPCLONE_S3_PREFIX` - object storage backend.
 - `RIPCLONE_RETENTION_INTERVAL_SECS`, `RIPCLONE_RETENTION_MAX_AGE_DAYS`,
   `RIPCLONE_RETENTION_MAX_GB` - age/size trimming for the local build cache when
   S3-compatible storage is configured. These settings never delete local

@@ -53,6 +53,15 @@ impl LocalCacheRetention {
         self.durable_storage.is_none() || (self.max_age.is_none() && self.max_size_bytes.is_none())
     }
 
+    pub fn spawn_from_env(self) {
+        let interval = std::env::var("RIPCLONE_RETENTION_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(300));
+        self.spawn(interval);
+    }
+
     pub fn spawn(self, interval: Duration) {
         if interval.is_zero() || self.disabled() {
             info!(
@@ -282,5 +291,46 @@ mod tests {
         retention.run_once().await.unwrap();
         assert!(!cas.path(&hash).exists());
         assert_eq!(remote.get(&hash).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn size_limit_removes_only_confirmed_remote_objects() {
+        let local = tempfile::tempdir().unwrap();
+        let durable = tempfile::tempdir().unwrap();
+        let cas = Cas::new(local.path()).unwrap();
+        let remote = crate::storage::local(durable.path()).unwrap();
+        let local_only_hash = cas.put(b"local-only").unwrap();
+        let remote_hash = cas.put(b"remote-copy").unwrap();
+        remote.put(&remote_hash, b"remote-copy").unwrap();
+
+        filetime::set_file_mtime(
+            cas.path(&local_only_hash),
+            filetime::FileTime::from_unix_time(1, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            cas.path(&remote_hash),
+            filetime::FileTime::from_unix_time(2, 0),
+        )
+        .unwrap();
+
+        let retention = LocalCacheRetention::with_config(
+            cas.clone(),
+            Metrics::new(),
+            None,
+            Some(1),
+            Some(remote.clone()),
+        );
+        retention.run_once().await.unwrap();
+
+        assert!(
+            cas.path(&local_only_hash).exists(),
+            "size cleanup must retain an object without a durable copy"
+        );
+        assert!(
+            !cas.path(&remote_hash).exists(),
+            "size cleanup may remove an object with a confirmed durable copy"
+        );
+        assert_eq!(remote.get(&remote_hash).unwrap(), b"remote-copy");
     }
 }

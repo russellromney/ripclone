@@ -62,7 +62,7 @@ context; it is not current operational guidance.
 ## Cold-history pack and benchmark performance
 
 - **Cold full-history builds preserve Git's existing delta graph** (`rust/src/pack.rs`, `rust/src/git.rs`): the bitmap-backed history pack is no longer split with `git pack-objects --max-pack-size`. Splitting forced Git to discard cross-pack deltas, making large repositories substantially larger and slower to build. Local storage keeps the compact pack as one file; large remote uploads are handled by the storage transport.
-- **Large S3-compatible uploads use bounded multipart streaming** (`rust/src/storage/s3_storage.rs`): files at least 100 MiB use 128 MiB parts with one backend-wide, CPU-scaled budget of at most eight uploads in flight, automatically increasing part size to remain within the 10,000-part limit. Failed uploads are aborted, and local cache publication still occurs only after the remote object completes.
+- **Large S3-compatible uploads use bounded multipart streaming** (`rust/src/storage/s3_storage.rs`): files at least 100 MiB use 128 MiB parts with one backend-wide, CPU-scaled budget of at most eight uploads in flight, automatically increasing part size to remain within the 10,000-part limit. Failed uploads are aborted, and a build removes its local artifact copy only after the remote object completes.
 - **The shaped benchmark times cloning, not repository admission** (`benchmark/fly_shaped_benchmark.sh`): add/readiness happens before each sample set, every run is pinned to one resolved commit, validation happens after the timer, failures propagate, and summaries report p50 and nearest-rank p90.
 
 ## Worker heartbeat / registry (superseded implementation history)
@@ -478,11 +478,10 @@ history and do not describe current keys, reads, writes, or worker behavior.
 - **`S3Storage` backend** (`rust/src/storage/s3_storage.rs`)
   - Implements the `StorageBackend` trait for S3, R2, Tigris, and MinIO.
   - Configured with `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`,
-    `RIPCLONE_S3_BUCKET`, `RIPCLONE_S3_PREFIX`, and `RIPCLONE_S3_CACHE_DIR`.
+    `RIPCLONE_S3_BUCKET`, and `RIPCLONE_S3_PREFIX`.
   - Credentials come from standard `AWS_*` environment variables via the `s3`
     crate's `Auth::from_env()`.
-  - Reads the local cache first; on miss fetches the full object or a byte range
-    from S3 and writes it into the local cache.
+  - Reads full objects and byte ranges directly from durable storage.
   - Supports `Range: bytes=start-end` via `get_range` so the server can still
     proxy partial requests when signed URLs are unavailable.
 

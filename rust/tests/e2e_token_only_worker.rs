@@ -141,8 +141,6 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     let cas_dir = dir.path().join("cas");
     let repo_root = dir.path().join("repos");
     let control_path = dir.path().join("control.db");
-    let _s3_cache =
-        require_turso.then(|| ScopedEnvVar::set("RIPCLONE_S3_CACHE_DIR", cas_dir.as_os_str()));
     let _cache_max_age =
         require_turso.then(|| ScopedEnvVar::set("RIPCLONE_RETENTION_MAX_AGE_DAYS", "1"));
     // A short lease makes the real child prove renewal repeatedly while Full
@@ -190,46 +188,35 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     )
     .await
     .unwrap();
-    let cache_retention = backends.cache_retention.clone();
     let queue = control.queue();
     let artifact_storage = backends.storage.clone();
-    if require_turso {
-        let bytes = b"cache-only object without a durable remote copy";
-        let cache_only_hash = backends.cas.put(bytes).unwrap();
+    let cache_cleanup_fixture = if require_turso {
+        let cache_only_hash = backends
+            .cas
+            .put(b"cache-only object without a durable remote copy")
+            .unwrap();
         let cache_only_path = backends.cas.path(&cache_only_hash);
+        let durable_bytes = b"old local object with a durable remote copy";
+        let durable_hash = backends.cas.put(durable_bytes).unwrap();
+        let durable_path = backends.cas.path(&durable_hash);
         filetime::set_file_mtime(&cache_only_path, filetime::FileTime::from_unix_time(1, 0))
             .unwrap();
+        filetime::set_file_mtime(&durable_path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
 
-        assert_eq!(
-            artifact_storage.size(&cache_only_hash).unwrap(),
-            bytes.len() as u64,
-            "ordinary size lookup deliberately sees the shared local S3 cache"
-        );
         assert!(
             artifact_storage
                 .verify_durable_copy(&cache_only_hash)
                 .is_err(),
             "cache-only bytes must not count as a durable remote copy"
         );
-        cache_retention.run_once().await.unwrap();
-        assert!(
-            cache_only_path.exists(),
-            "cleanup must retain bytes that exist only in the local S3 cache"
-        );
-
-        artifact_storage.put(&cache_only_hash, bytes).unwrap();
+        artifact_storage.put(&durable_hash, durable_bytes).unwrap();
         artifact_storage
-            .verify_durable_copy(&cache_only_hash)
+            .verify_durable_copy(&durable_hash)
             .expect("uploaded cache fixture has a durable remote copy");
-        cache_retention.run_once().await.unwrap();
-        assert!(
-            !cache_only_path.exists(),
-            "cleanup may remove the local copy after direct remote confirmation"
-        );
-        artifact_storage
-            .verify_durable_copy(&cache_only_hash)
-            .expect("local cleanup retained the remote object");
-    }
+        Some((cache_only_path, durable_path, durable_hash))
+    } else {
+        None
+    };
     let provider_registry = ripclone::provider::ProviderRegistry::new();
     let state = ServerState {
         cas: backends.cas,
@@ -349,6 +336,22 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     unsafe { std::env::set_var("RIPCLONE_CONTROL_DB_PATH", &decoy) };
     let mut child = command.spawn().unwrap();
     unsafe { std::env::remove_var("RIPCLONE_CONTROL_DB_PATH") };
+    if let Some((cache_only_path, durable_path, durable_hash)) = &cache_cleanup_fixture {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while durable_path.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("API worker cleaned its old remote-backed CAS object");
+        assert!(
+            cache_only_path.exists(),
+            "API worker cleanup must retain bytes without a durable remote copy"
+        );
+        artifact_storage
+            .verify_durable_copy(durable_hash)
+            .expect("API worker cleanup retained the durable MinIO object");
+    }
     let client = ripclone::client::Client::new_with_token(server_url.clone(), Some(token_hash()));
     let admission = tokio::time::timeout(
         Duration::from_secs(30),
@@ -458,7 +461,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     if require_turso {
         for hash in &b_hashes {
             artifact_storage
-                .size(hash)
+                .verify_durable_copy(hash)
                 .unwrap_or_else(|error| panic!("published B object {hash} is missing: {error:#}"));
         }
 
@@ -547,7 +550,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         assert_eq!(serde_json::to_string(&unchanged).unwrap(), first_json);
         for hash in &b_hashes {
             artifact_storage
-                .size(hash)
+                .verify_durable_copy(hash)
                 .unwrap_or_else(|error| panic!("B object {hash} disappeared: {error:#}"));
         }
 
@@ -607,7 +610,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         assert_eq!(serde_json::to_string(&unchanged).unwrap(), first_json);
         for hash in &b_hashes {
             artifact_storage
-                .size(hash)
+                .verify_durable_copy(hash)
                 .unwrap_or_else(|error| panic!("B object {hash} missing after C: {error:#}"));
         }
     }

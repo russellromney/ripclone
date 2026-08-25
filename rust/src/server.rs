@@ -7559,12 +7559,7 @@ async fn run_server_with_barrier_at_control(
         control_db.ref_store(),
     )
     .await?;
-    let retention_interval: Duration = env::var("RIPCLONE_RETENTION_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(300));
-    b.cache_retention.clone().spawn(retention_interval);
+    b.cache_retention.clone().spawn_from_env();
 
     let oidc_audience = env::var("RIPCLONE_OIDC_AUDIENCE")
         .ok()

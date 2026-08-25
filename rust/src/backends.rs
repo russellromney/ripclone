@@ -40,7 +40,7 @@ impl Backends {
             S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
         let storage: StorageRef = if let Some(s3) = s3_storage {
             info!(
-                "using S3-compatible storage with local cache at {}",
+                "using S3-compatible storage with build CAS at {}",
                 cas_dir.display()
             );
             Arc::new(s3)

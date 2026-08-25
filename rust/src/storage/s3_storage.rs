@@ -1,10 +1,9 @@
-use crate::cas::Cas;
 use crate::storage::StorageBackend;
 use anyhow::{Context, Result};
 use futures::{StreamExt, TryStreamExt};
 use s3::{Auth, Client};
 use sha2::Digest;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
@@ -47,16 +46,12 @@ fn multipart_upload_part_bytes(len: u64) -> Result<u64> {
     Ok(part_bytes)
 }
 
-/// S3-compatible storage backend with an optional local filesystem cache.
-///
-/// Reads check the local cache first and fall back to S3. Writes go to S3
-/// and are also cached locally if a cache directory is configured.
+/// S3-compatible durable artifact storage.
 pub struct S3Storage {
     client: Client,
     region: String,
     bucket: String,
     prefix: String,
-    cache: Option<Cas>,
     multipart_upload_slots: tokio::sync::Semaphore,
 }
 
@@ -67,7 +62,6 @@ impl S3Storage {
         bucket: &str,
         prefix: Option<&str>,
         auth: Auth,
-        cache_dir: Option<&Path>,
     ) -> Result<Self> {
         // Per-request timeout. The client default (~10s) is too tight for the
         // cold first sync of a huge repo: that build uploads the whole history at
@@ -110,7 +104,6 @@ impl S3Storage {
             .max_retry_delay(max_retry_delay)
             .build()
             .context("create S3 client")?;
-        let cache = cache_dir.map(Cas::new).transpose()?;
         // The server also uploads distinct artifacts concurrently. Keep one
         // backend-wide multipart budget so those outer tasks cannot each open
         // an independent window. Parts stream from disk, so this bounds live
@@ -122,21 +115,20 @@ impl S3Storage {
             region: region.to_string(),
             bucket: bucket.to_string(),
             prefix: prefix.unwrap_or("").to_string(),
-            cache,
             multipart_upload_slots: tokio::sync::Semaphore::new(multipart_upload_concurrency),
         })
     }
 
     /// Construct an S3 client from environment variables:
     ///   RIPCLONE_S3_ENDPOINT, RIPCLONE_S3_REGION, RIPCLONE_S3_BUCKET,
-    ///   RIPCLONE_S3_PREFIX, RIPCLONE_S3_CACHE_DIR, plus AWS_* credentials.
+    ///   RIPCLONE_S3_PREFIX, plus AWS_* credentials.
     pub fn from_env() -> Result<Option<Self>> {
         Self::from_env_or_config(&crate::config::StorageConfig::default())
     }
 
     /// Like [`from_env`](Self::from_env), but falls back to the `[storage]`
     /// section of `config.toml` for the non-secret settings (endpoint, region,
-    /// bucket, prefix, cache dir). The env vars always win. Credentials
+    /// bucket, prefix). The env vars always win. Credentials
     /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) are read from the
     /// environment only — never from config. `backend = "local"` forces local
     /// storage (returns `None`) even if S3 settings are present.
@@ -174,18 +166,8 @@ impl S3Storage {
         let bucket = pick("RIPCLONE_S3_BUCKET", Some("BUCKET_NAME"), cfg.bucket.as_deref())
             .context("RIPCLONE_S3_BUCKET or BUCKET_NAME (or [storage].bucket) is required when S3 is enabled")?;
         let prefix = pick("RIPCLONE_S3_PREFIX", None, cfg.prefix.as_deref());
-        let cache_dir: Option<PathBuf> =
-            pick("RIPCLONE_S3_CACHE_DIR", None, cfg.cache_dir.as_deref()).map(PathBuf::from);
         let auth = Auth::from_env().context("read S3 credentials from environment")?;
-        Self::new(
-            &endpoint,
-            &region,
-            &bucket,
-            prefix.as_deref(),
-            auth,
-            cache_dir.as_deref(),
-        )
-        .map(Some)
+        Self::new(&endpoint, &region, &bucket, prefix.as_deref(), auth).map(Some)
     }
 
     fn key(&self, hash: &str) -> Result<String> {
@@ -396,11 +378,6 @@ impl S3Storage {
 #[async_trait::async_trait]
 impl StorageBackend for S3Storage {
     fn get(&self, hash: &str) -> Result<Vec<u8>> {
-        if let Some(cache) = &self.cache
-            && let Ok(data) = cache.get(hash)
-        {
-            return Ok(data);
-        }
         let key = self.key(hash)?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
@@ -431,9 +408,6 @@ impl StorageBackend for S3Storage {
         let actual_hash = hex::encode(sha2::Sha256::digest(&data));
         if actual_hash != hash {
             anyhow::bail!("S3 object {} hash mismatch: actual {}", hash, actual_hash);
-        }
-        if let Some(cache) = &self.cache {
-            let _ = cache.put_with_hash(hash, &data);
         }
         Ok(data)
     }
@@ -498,9 +472,6 @@ impl StorageBackend for S3Storage {
             }
         }
         result.context("S3 put_object")?;
-        if let Some(cache) = &self.cache {
-            cache.put_with_hash(hash, data)?;
-        }
         Ok(())
     }
 
@@ -516,9 +487,6 @@ impl StorageBackend for S3Storage {
             .send()
             .await
             .with_context(|| format!("S3 put_object {key}"))?;
-        if let Some(cache) = &self.cache {
-            cache.put_with_hash(hash, data)?;
-        }
         Ok(())
     }
 
@@ -556,23 +524,10 @@ impl StorageBackend for S3Storage {
                 .await
                 .with_context(|| format!("S3 put_object {key}"))?;
         }
-        if let Some(cache) = &self.cache {
-            let cache = cache.clone();
-            let hash = hash.to_string();
-            let path = path.to_path_buf();
-            tokio::task::spawn_blocking(move || cache.put_file_with_hash(&hash, &path))
-                .await
-                .context("S3 cache put_file task")??;
-        }
         Ok(())
     }
 
     fn size(&self, hash: &str) -> Result<u64> {
-        if let Some(cache) = &self.cache
-            && let Ok(len) = cache.verify_object(hash)
-        {
-            return Ok(len);
-        }
         self.remote_size(hash)
     }
 

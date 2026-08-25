@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
     let metrics = Metrics::new();
     let b = Backends::from_env_with_ref_store(&args.cas_dir, &args.repo_root, &metrics, ref_store)
         .await?;
+    b.cache_retention.clone().spawn_from_env();
     let state = ServerState::for_worker(b, build_queue, metrics)?;
 
     // Fleet-unique id (host/machine + pid + start nanos). PID-only collides

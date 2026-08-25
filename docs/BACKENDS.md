@@ -103,7 +103,7 @@ export AWS_SECRET_ACCESS_KEY=...
 ```
 
 Configuration-file fields are `[storage].backend`, `endpoint`, `region`,
-`bucket`, `prefix`, and `cache_dir`. Credentials remain environment-only.
+`bucket`, and `prefix`. Credentials remain environment-only.
 Supported services include AWS S3, Cloudflare R2, Tigris, and MinIO.
 
 S3 stores clonepack artifacts only. It never stores refs, repository build
