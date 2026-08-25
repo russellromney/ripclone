@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
                 }
                 // The server is authoritative between jobs. A previous job may
                 // have populated this worker's process-local exact-result cache
-                // before server-side eviction admitted the same commit again.
+                // before a later new request admitted the same commit again.
                 state.ref_store.invalidate(&repo_id, &admitted_commit).await;
                 // Prefer the per-job upstream credential the enqueuer persisted
                 // (the cloud's per-request X-Upstream-Token, for a private repo

@@ -132,7 +132,7 @@ async fn files_mode_materializes_worktree() {
 }
 
 #[tokio::test]
-async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_artifacts() {
+async fn files_mode_resync_works_after_remote_storage_clears_local_archive_cache() {
     init(false);
     let server = start_server_split_storage().await;
     let origin = make_origin("acme", "remotecontract");
@@ -155,7 +155,7 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
     );
     assert!(
         !c1.join(".git").exists(),
-        "files mode should not create .git before remote artifact eviction"
+        "files mode should not create .git before local cache cleanup"
     );
 
     let info1 = wait_archive_ref(&server, "acme", "remotecontract", &commit1).await;
@@ -175,7 +175,7 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
     {
         assert!(
             !server.cas_path(hash).exists(),
-            "remote storage settlement should evict local CAS artifact {hash}"
+            "remote storage settlement should remove local cache artifact {hash}"
         );
         assert!(
             server.storage_path(hash).exists(),
@@ -274,7 +274,7 @@ async fn corrupt_artifact_fails_clone() {
     assert!(res.is_err(), "corrupt manifest must fail the clone, got Ok");
 }
 
-/// Negative: a missing artifact (evicted/deleted) must fail the clone.
+/// Negative: a missing artifact must fail the clone.
 #[tokio::test]
 async fn missing_artifact_fails_clone() {
     init(false);
