@@ -32,6 +32,10 @@ Internal tuning knobs use code constants at their current defaults.
   clients and self-hosted servers.
 - `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`,
   `RIPCLONE_S3_PREFIX`, `RIPCLONE_S3_CACHE_DIR` - object storage backend.
+- `RIPCLONE_RETENTION_INTERVAL_SECS`, `RIPCLONE_RETENTION_MAX_AGE_DAYS`,
+  `RIPCLONE_RETENTION_MAX_GB` - age/size trimming for the local build cache when
+  S3-compatible storage is configured. These settings never delete local
+  durable storage, S3 objects, or exact results.
 - `RIPCLONE_CONTROL_DB_PATH` - server-owned SQLite database path.
 - `RIPCLONE_TURSO_DATABASE_URL`, `RIPCLONE_TURSO_AUTH_TOKEN` - paired Turso
   primary settings enabling embedded-replica control mode.
@@ -51,9 +55,6 @@ Internal tuning knobs use code constants at their current defaults.
   default branch admits exact work.
 - `RIPCLONE_POLL_INTERVAL_SECS` - fallback polling interval, default `300`
   (on); `0` disables it.
-- `RIPCLONE_REMOTE_GC_INTERVAL_SECS`, `RIPCLONE_REMOTE_GC_GRACE_SECS`,
-  `RIPCLONE_REMOTE_GC_DRY_RUN` - remote object garbage collection.
-
 ## Expert
 
 These remain because tests or deployment safety need them, but they should not

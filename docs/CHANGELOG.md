@@ -4,6 +4,18 @@ This file tracks what has already landed in ripclone. The old planning snapshot
 in [`internal/ROADMAP.md`](internal/ROADMAP.md) is retained for historical
 context; it is not current operational guidance.
 
+## Published artifacts remain durable
+
+- **Published exact Head, Full, and Files results no longer expire.** Their
+  SQLite rows and durable local or S3-compatible artifact bytes are retained.
+- **Only S3-backed local build caches are disposable.** Age/size trimming reads
+  no exact metadata, confirms each remote copy before deleting its local cache
+  copy, and never sends a remote delete.
+- **Removed lifecycle machinery:** warm timestamps and pins, warm eviction,
+  remote GC, the orphan ledger, reachability walks used by deletion, eviction
+  transactions, status fields, remote-delete storage methods, and their CI
+  suites and configuration.
+
 ## One client install and fetch path
 
 - **The experimental `worktree` command is deleted** (`rust/src/bin/cli.rs`, `rust/src/client.rs`, `rust/src/extract.rs`, `README.md`, `docs/BACKENDS.md`, `docs/BUILD_OPTIONS.md`): `ripclone worktree` is now an unknown subcommand, and its client methods (`add_worktree`, `install_worktree_files`) and the `extract.rs` URL-fetch path that only it used are gone. `extract.rs` performs no network request. Use `git worktree add` for a second checkout. `clone --mode editable` and `clone --mode files` are the two materialize surfaces.
@@ -399,24 +411,6 @@ history and do not describe current keys, reads, writes, or worker behavior.
   - `sync_bare_mirror` embeds the token in the HTTPS URL as
     `https://x-access-token:<token>@github.com/<owner>/<repo>.git`, which works
     for both personal access tokens and GitHub App installation tokens.
-
-## Local CAS retention / eviction
-
-- **Retention manager** (`rust/src/retention.rs`)
-  - Scans the local content-addressed store on a configurable interval.
-  - Keeps a persisted set of "protected" hashes (artifacts referenced by the
-    current HEAD of each synced repo).
-  - Evicts unprotected objects by age (`RIPCLONE_RETENTION_MAX_AGE_DAYS`,
-    default 7 days) and by disk pressure (`RIPCLONE_RETENTION_MAX_GB`,
-    default 100 GB), removing oldest unprotected objects first.
-  - Tunable interval via `RIPCLONE_RETENTION_INTERVAL_SECS` (default 300 s).
-  - Exposes retention counters on `/metrics`: runs, evicted bytes/objects,
-    errors.
-
-- **Server integration** (`rust/src/server.rs`)
-  - The retention task starts automatically when the server boots.
-  - After each successful sync, the current HEAD's artifact hashes are marked
-    protected so they survive the next eviction pass.
 
 ## Server hardening (auth, metrics, rate limiting)
 

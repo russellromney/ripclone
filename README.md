@@ -314,7 +314,7 @@ ripclone is host-agnostic: point it at GitHub (built in), GitLab, Gitea/Forgejo/
 
 ripclone splits into a **server** — it resolves refs, serves artifacts, and atomically admits exact work — and workers that fetch the upstream and build clonepacks. Embedded workers claim the server's durable jobs table. Standalone `ripclone-worker` processes are authenticated API-only and receive no database credential (see [Running workers at scale](docs/SCALING_WORKERS.md)).
 
-- **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Local disk also caches hot artifacts in front of object storage. A background GC drops artifacts nothing references (after a grace period, so an in-flight upload is never deleted).
+- **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Published exact results and their durable artifacts do not expire. With object storage, the local CAS and Git mirror are disposable build caches; local-storage deployments keep the artifact bytes on disk.
 - **Control database.** One server-owned SQLite database stores refs, added repositories, jobs, claims, attempts, and heartbeats. Plain local SQLite is the default; a Turso embedded replica is the replicated mode. Exact-result creation and job admission are one transaction.
 
 **Your git host stays the source of truth** for repos, refs, permissions, and writes. Clients download artifacts (signed URL or server proxy), decompress, and write files straight to disk. Public endpoints are rate-limited.
