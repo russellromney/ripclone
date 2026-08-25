@@ -27,9 +27,9 @@ path = "/var/lib/ripclone/control.db"
 ```
 
 Only one server process may own a control path. A second server fails before it
-binds its listener or starts storage, GC, polling, or worker tasks. Accepted jobs
-survive restart, and claims abandoned by a dead worker become eligible for
-recovery after `RIPCLONE_QUEUE_STALE_SECS`.
+binds its listener or starts storage, local cache cleanup, polling, or worker
+tasks. Accepted jobs survive restart, and claims abandoned by a dead worker
+become eligible for recovery after `RIPCLONE_QUEUE_STALE_SECS`.
 
 An existing database without the current control schema marker is rejected. The
 server does not rewrite or automatically migrate it.

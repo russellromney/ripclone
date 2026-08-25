@@ -96,7 +96,7 @@ Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `fu
 
 **Shipped** (`rust/src/repo_config.rs`, admin endpoint + build wiring in `rust/src/server.rs`):
 
-- One repository-config record lives in the server-owned SQLite/Turso control database. Admission validates it and snapshots the resolved settings into the durable job; embedded and API workers use that snapshot without a live configuration read. Artifact storage contains only artifact bytes and GC bookkeeping, not live repository settings.
+- One repository-config record lives in the server-owned SQLite/Turso control database. Admission validates it and snapshots the resolved settings into the durable job; embedded and API workers use that snapshot without a live configuration read. Artifact storage contains only immutable artifact bytes, not live repository settings.
 - The current config schema: `clonepack_depths: Vec<DepthSpec>` (`{ name, depth: Option<usize> }`), `compression_level`, `dictionary_id`, `archive_chunk_size`, and `head_blobs_chunk_size`. Unknown fields are rejected rather than ignored.
 - Admin read/write endpoint: `GET`/`POST /v1/admin/config/{owner}/{repo}`. Branch overrides are not supported; a `?branch=` request fails without changing state.
 - The build reads the effective config and applies `compression_level` to the archive build (single-phase and two-phase paths).
