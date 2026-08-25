@@ -9850,7 +9850,6 @@ mod tests {
                         ..Default::default()
                     }),
                     files: None,
-                    ..Default::default()
                 },
             )
             .await
@@ -9932,7 +9931,6 @@ mod tests {
                     head: Some(crate::HeadResult::default()),
                     full: Some(crate::FullResult::default()),
                     files: Some(crate::FilesResult::default()),
-                    ..Default::default()
                 },
             )
             .await
