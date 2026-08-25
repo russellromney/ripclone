@@ -415,7 +415,7 @@ impl Cas {
     }
 
     /// Remove a local object. Best-effort: a missing object is not an error
-    /// (used to evict build scratch once it is durable in remote storage).
+    /// (used to discard a cached build copy once remote storage is durable).
     pub fn remove(&self, hash: &str) -> Result<()> {
         let path = self.object_path(hash)?;
         match std::fs::remove_file(&path) {

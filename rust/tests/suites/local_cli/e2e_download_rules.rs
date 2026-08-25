@@ -502,10 +502,6 @@ async fn republish_resolved_manifest(
         if changed {
             patched += 1;
             store
-                .delete_result(&repo_id, &commit)
-                .await
-                .expect("remove exact result before installing corrupt fixture");
-            store
                 .save_result(&repo_id, &info)
                 .await
                 .expect("publish rewritten exact result");

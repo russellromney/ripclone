@@ -11,7 +11,7 @@ use ripclone::client::Client;
 use ripclone::server::{
     ArtifactBarrier, RateLimiter, ServerState, build_app, run_server_with_barrier,
 };
-use ripclone::storage::{HashEntry, StorageBackend, StorageRef};
+use ripclone::storage::{StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -339,14 +339,6 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         Ok(())
     }
 
-    async fn evict_if_unchanged(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        expected: &ripclone::RefInfo,
-    ) -> anyhow::Result<bool> {
-        self.inner.evict_if_unchanged(repo_id, expected).await
-    }
-
     async fn publish_head(
         &self,
         repo_id: &ripclone::provider::RepoId,
@@ -400,29 +392,6 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
             barrier.after_head(&info.commit).await;
         }
         Ok(())
-    }
-
-    async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
-        if self.probe.is_armed() {
-            panic!("pinned metadata lookup must not scan repositories");
-        }
-        self.inner.list().await
-    }
-
-    async fn touch_last_accessed_at(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-    ) -> anyhow::Result<bool> {
-        self.inner.touch_last_accessed_at(repo_id, commit).await
-    }
-
-    async fn delete_result(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-    ) -> anyhow::Result<()> {
-        self.inner.delete_result(repo_id, commit).await
     }
 
     async fn list_commits(
@@ -531,10 +500,6 @@ pub async fn replace_full_manifest_commit(
         .put(&hash, &bytes)
         .expect("publish mismatched manifest fixture");
     full.clonepack.manifest = hash.clone();
-    store
-        .delete_result(&repo_id, &pinned)
-        .await
-        .expect("remove exact result before installing corrupt fixture");
     store
         .save_result(&repo_id, &info)
         .await
@@ -756,17 +721,6 @@ async fn start_server_split_storage_inner(
         head_publish_barrier,
     });
     let metrics = ripclone::metrics::Metrics::new();
-    let retention = Arc::new(
-        ripclone::retention::Retention::with_config_and_storage(
-            cas.clone(),
-            metrics.clone(),
-            None,
-            None,
-            Some(storage.clone()),
-        )
-        .unwrap()
-        .with_ref_store(ref_store.clone(), storage.clone()),
-    );
     let durable_queue = control_db.queue();
     let build_queue: ripclone::queue::JobQueueRef = Arc::new(ProbedJobQueue {
         inner: durable_queue.clone(),
@@ -787,7 +741,6 @@ async fn start_server_split_storage_inner(
         jwt: None,
         metrics,
         rate_limiter: RateLimiter::new(1000000, 1000000.0),
-        retention,
         build_queue,
         control_db: Some(control_db),
         worker_queue: Some(durable_queue.clone()),
@@ -872,7 +825,7 @@ async fn start_server_split_storage_inner(
 }
 
 /// A local filesystem storage backend that reports `is_remote() = true` so
-/// `RemoteGc` can be exercised in tests without an S3-compatible store.
+/// split-storage tests exercise disposable build-cache behavior without S3.
 pub struct RemoteLocalStorage {
     inner: StorageRef,
 }
@@ -905,14 +858,6 @@ impl StorageBackend for RemoteLocalStorage {
         self.inner.put_file_async(hash, path).await
     }
 
-    async fn get_meta(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        self.inner.get_meta(key).await
-    }
-
-    async fn put_meta(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
-        self.inner.put_meta(key, data).await
-    }
-
     fn size(&self, hash: &str) -> anyhow::Result<u64> {
         self.inner.size(hash)
     }
@@ -923,18 +868,6 @@ impl StorageBackend for RemoteLocalStorage {
 
     fn regions(&self) -> Vec<String> {
         vec!["test-remote-local".to_string()]
-    }
-
-    fn delete(&self, hash: &str) -> anyhow::Result<()> {
-        self.inner.delete(hash)
-    }
-
-    fn delete_batch(&self, hashes: &[String]) -> anyhow::Result<u64> {
-        self.inner.delete_batch(hashes)
-    }
-
-    fn list_hashes(&self) -> anyhow::Result<Vec<HashEntry>> {
-        self.inner.list_hashes()
     }
 
     fn health(&self) -> anyhow::Result<()> {
@@ -1055,20 +988,6 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
         self.inner.save_result(repo_id, info).await
     }
 
-    async fn evict_if_unchanged(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        expected: &ripclone::RefInfo,
-    ) -> anyhow::Result<bool> {
-        if self.should_fail_write() {
-            anyhow::bail!(
-                "injected exact result eviction failure for {}",
-                repo_id.storage_key()
-            );
-        }
-        self.inner.evict_if_unchanged(repo_id, expected).await
-    }
-
     async fn publish_head(
         &self,
         repo_id: &ripclone::provider::RepoId,
@@ -1136,10 +1055,6 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
         self.inner.after_claimed_result_write(repo_id, info).await
     }
 
-    async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
-        self.inner.list().await
-    }
-
     async fn add_repo(&self, repo: &ripclone::ref_store::AddedRepo) -> anyhow::Result<()> {
         self.inner.add_repo(repo).await
     }
@@ -1153,22 +1068,6 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
 
     async fn list_added_repos(&self) -> anyhow::Result<Vec<ripclone::ref_store::AddedRepo>> {
         self.inner.list_added_repos().await
-    }
-
-    async fn touch_last_accessed_at(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-    ) -> anyhow::Result<bool> {
-        self.inner.touch_last_accessed_at(repo_id, commit).await
-    }
-
-    async fn delete_result(
-        &self,
-        repo_id: &ripclone::provider::RepoId,
-        commit: &str,
-    ) -> anyhow::Result<()> {
-        self.inner.delete_result(repo_id, commit).await
     }
 
     async fn list_commits(
@@ -1218,14 +1117,6 @@ impl StorageBackend for FailingPutStorage {
         self.inner.put_file_async(hash, path).await
     }
 
-    async fn get_meta(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        self.inner.get_meta(key).await
-    }
-
-    async fn put_meta(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
-        self.inner.put_meta(key, data).await
-    }
-
     fn size(&self, hash: &str) -> anyhow::Result<u64> {
         self.inner.size(hash)
     }
@@ -1236,18 +1127,6 @@ impl StorageBackend for FailingPutStorage {
 
     fn regions(&self) -> Vec<String> {
         self.inner.regions()
-    }
-
-    fn delete(&self, hash: &str) -> anyhow::Result<()> {
-        self.inner.delete(hash)
-    }
-
-    fn delete_batch(&self, hashes: &[String]) -> anyhow::Result<u64> {
-        self.inner.delete_batch(hashes)
-    }
-
-    fn list_hashes(&self) -> anyhow::Result<Vec<HashEntry>> {
-        self.inner.list_hashes()
     }
 
     fn health(&self) -> anyhow::Result<()> {

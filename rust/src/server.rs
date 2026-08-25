@@ -14,8 +14,6 @@ use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
 use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore};
-use crate::remote_gc::{GcConfig, RemoteGc};
-use crate::retention::Retention;
 use crate::storage::StorageRef;
 use crate::validation;
 use crate::webhook::{EventKind, WebhookConfig};
@@ -691,7 +689,6 @@ pub struct ServerState {
     pub jwt: Option<Arc<crate::auth::jwt::JwtKeys>>,
     pub metrics: Arc<Metrics>,
     pub rate_limiter: RateLimiter,
-    pub retention: Arc<Retention>,
     pub build_queue: JobQueueRef,
     /// Holds the server's process-ownership lock and concrete control driver.
     /// Standalone API workers never construct this value.
@@ -758,7 +755,6 @@ impl ServerState {
             jwt: None,
             metrics,
             rate_limiter: RateLimiter::new(60, 10.0),
-            retention: b.retention,
             build_queue: queue,
             control_db: None,
             // A worker never serves the farm-out endpoints itself.
@@ -1188,15 +1184,6 @@ pub struct ExactStatusEntry {
     pub commit: String,
     pub bytes: u64,
     pub unique_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub built_at: Option<String>,
-    /// RFC3339 timestamp of the ref's most recent access (build/reuse).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_accessed_at: Option<String>,
-    /// True when this exact commit has any published result.
-    pub warm: bool,
-    /// True when the warm-TTL sweep is forbidden from evicting this ref.
-    pub pinned: bool,
     pub head: bool,
     pub full: bool,
     pub files: bool,
@@ -3371,16 +3358,6 @@ async fn get_ref_inner(
     if let Some(info) = existing.as_ref()
         && exact_result_ready(info, params.result, &commit)
     {
-        if let Err(error) = state
-            .ref_store
-            .touch_last_accessed_at(&repo_id, &commit)
-            .await
-        {
-            warn!(
-                "failed to touch exact result {}@{commit}: {error:#}",
-                repo_id.storage_key()
-            );
-        }
         return (
             StatusCode::OK,
             Json(ref_response(
@@ -3877,12 +3854,6 @@ async fn build_repo_status(
             }
         }
 
-        let built_at = info.synced_at.and_then(|secs| {
-            chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
-        });
-        let last_accessed_at = info.last_accessed_at.and_then(|secs| {
-            chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
-        });
         let job_key = format!("{}\u{1f}{}", repo_id.storage_key(), info.commit);
         let (job, job_error) = match state.build_queue.job_state_for_key(&job_key).await? {
             JobState::Pending => ("pending".to_string(), None),
@@ -3900,10 +3871,6 @@ async fn build_repo_status(
             commit: info.commit,
             bytes: ref_bytes,
             unique_bytes: branch_unique_bytes,
-            built_at,
-            last_accessed_at,
-            warm: head_ready || full_ready || files_ready,
-            pinned: info.warm_pinned,
             head: head_ready,
             full: full_ready,
             files: files_ready,
@@ -4245,17 +4212,6 @@ async fn sync_repo_at_revision(
         let commit = at_rev.clone();
         match state.ref_store.load_result(&repo_id, &commit).await {
             Ok(Some(info)) if exact_result_complete(&info, &commit) => {
-                if let Err(error) = state
-                    .ref_store
-                    .touch_last_accessed_at(&repo_id, &commit)
-                    .await
-                {
-                    warn!(
-                        "failed to touch historical exact result {}@{}: {error:#}",
-                        repo_id.storage_key(),
-                        commit
-                    );
-                }
                 state.metrics.record_sync(start.elapsed());
                 let response = sync_response_without_storage_read(
                     &repo_id,
@@ -4577,12 +4533,6 @@ async fn prepare_exact_admission(
 fn pending_exact_result(job: &BuildJob) -> RefInfo {
     RefInfo {
         commit: job.admitted_commit.clone(),
-        last_accessed_at: Some(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ),
         ..Default::default()
     }
 }
@@ -5402,8 +5352,8 @@ fn lsm_config() -> LsmConfig {
 /// `max_levels`. Returns `(history_packs, new_pack_tuples, new_levels)` where
 /// `history_packs` is every history pack this manifest references (all levels
 /// flattened — prior levels reused by hash), `new_pack_tuples` is the packs
-/// freshly built this sync (the tail plus any compaction output — what to
-/// upload/evict), and `new_levels` is the levels to persist for the next sync.
+/// freshly built this sync (the tail plus any compaction output to upload), and
+/// `new_levels` is the levels to persist for the next sync.
 /// `head_packs` is not included here (the caller handles the HEAD closure).
 #[allow(clippy::too_many_arguments)]
 async fn seal_and_compact(
@@ -5476,8 +5426,8 @@ async fn seal_and_compact(
 }
 
 /// Load and decode a prior sync's metadata chunk and return its files table.
-/// Bytes come from local CAS or object storage (the metadata may have been
-/// evicted locally after a prior upload). Returns `None` on any failure — the
+/// Bytes come from local CAS or object storage (the disposable local cache may
+/// have been cleared after a prior upload). Returns `None` on any failure — the
 /// caller then falls back to a full (non-incremental) build, so this is purely
 /// best-effort optimization, never a correctness dependency.
 fn load_metadata_files(
@@ -5550,7 +5500,7 @@ fn assemble_variant(
 /// Reads each pack's bytes from the *local* CAS (no object-storage fallback), so
 /// only call this when every pack was built this sync and is still local — e.g.
 /// the head MIDX is shipped only when all head buckets were freshly built. For a
-/// set with reused (already-evicted) packs, omit the MIDX and let the client
+/// set with reused packs absent from the local cache, omit the MIDX and let the client
 /// build its own.
 fn assemble_midx(
     cas: &Cas,
@@ -5686,13 +5636,12 @@ fn archive_publish_upload_hashes(
     uploads
 }
 
-/// After upload: on a remote backend drop local pack copies (keeping the tiny
-/// idx files for future bundle/MIDX rebuilds); on a local backend protect them
-/// from retention instead.
+/// After upload, a remote backend may drop local pack copies while keeping the
+/// tiny idx files used by later bundle and MIDX builds. Local storage owns the
+/// durable copy and keeps every uploaded artifact.
 async fn settle_storage(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
-    retention: &Arc<Retention>,
     uploaded: Vec<String>,
     keep_idx: std::collections::HashSet<String>,
 ) {
@@ -5700,8 +5649,6 @@ async fn settle_storage(
         for h in uploaded.iter().filter(|h| !keep_idx.contains(*h)) {
             let _ = cas.remove(h);
         }
-    } else {
-        retention.protect(uploaded).await;
     }
 }
 
@@ -5714,7 +5661,6 @@ async fn do_sync(
     admitted_commit: &str,
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
-    retention: &Arc<Retention>,
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
     // Validated repository config snapshotted into the durable job at admission.
@@ -5843,7 +5789,6 @@ async fn do_sync(
             head,
             ref_store,
             storage,
-            retention,
             compression_level,
             !exact_result_ready(&result, ExactResultKind::Full, &commit),
             !exact_result_ready(&result, ExactResultKind::Files, &commit),
@@ -5873,7 +5818,6 @@ async fn do_sync(
         parent,
         ref_store,
         storage,
-        retention,
         t_total,
         compression_level,
         phases,
@@ -5918,7 +5862,6 @@ async fn build_and_publish_results(
     parent: Option<String>,
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
-    retention: &Arc<Retention>,
     t_total: Instant,
     // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
@@ -5944,14 +5887,6 @@ async fn build_and_publish_results(
             .filter(|info| info.commit == parent_commit),
         None => None,
     };
-    // Preserve the repo's warm pin across a cold rebuild. The pin is an
-    // out-of-band flag an operator or external control plane may set; an evicted
-    // `prev` (whose
-    // artifacts GC already reclaimed) is treated as absent for artifact carry
-    // below, but dropping its pin would let the freshly rebuilt ref come back
-    // un-pinned and be re-evicted every idle cycle. Read the pin from the raw
-    // prev, before the evicted filter.
-    let prev_warm_pinned = current.as_ref().is_some_and(|info| info.warm_pinned);
     let prev = prev_loaded.filter(|candidate| {
         parent
             .as_deref()
@@ -6128,7 +6063,7 @@ async fn build_and_publish_results(
     let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
         assemble_variant(cas, storage, &head_tagged)?;
     // Ship the head MIDX only on a cold full base (all pack bytes still local).
-    // On a delta re-sync the base packs are already evicted, so omit it — the
+    // On a delta re-sync the base packs may be absent from local cache, so omit it — the
     // client builds its own MIDX from the per-pack idxs.
     let all_built = head_built.all_local;
     let (head_midx_ref, head_midx_hash) = if all_built {
@@ -6169,17 +6104,6 @@ async fn build_and_publish_results(
         }),
         full: None,
         files: None,
-        synced_at: None,
-        last_accessed_at: current
-            .as_ref()
-            .and_then(|result| result.last_accessed_at)
-            .or_else(|| {
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .ok()
-                    .map(|duration| duration.as_secs())
-            }),
-        warm_pinned: prev_warm_pinned,
     };
 
     // Upload Head artifacts (shallow skeleton/index/metadata, head idx-bundle
@@ -6221,7 +6145,7 @@ async fn build_and_publish_results(
         upload_artifacts(cas, storage, head_uploads.clone(), upload_conc).await?;
     }
     wait_test_build_crash_barrier("after_upload", commit).await?;
-    settle_storage(cas, storage, retention, head_uploads, head_idx_keep).await;
+    settle_storage(cas, storage, head_uploads, head_idx_keep).await;
     phases.upload_head_ms = Some(duration_ms(upload_start.elapsed()));
 
     let publish_start = Instant::now();
@@ -6273,7 +6197,6 @@ async fn build_and_publish_results(
         head_result,
         ref_store,
         storage,
-        retention,
         compression_level,
         need_full,
         need_files,
@@ -6467,7 +6390,6 @@ async fn build_missing_full_and_files(
     head: crate::HeadResult,
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
-    retention: &Arc<Retention>,
     compression_level: i32,
     need_full: bool,
     need_files: bool,
@@ -6518,7 +6440,6 @@ async fn build_missing_full_and_files(
                 .unwrap_or_default(),
             ref_store,
             storage,
-            retention,
             allow_head_compaction,
         )
         .await
@@ -6538,7 +6459,6 @@ async fn build_missing_full_and_files(
             parent_result.as_ref(),
             ref_store,
             storage,
-            retention,
             compression_level,
         )
         .await
@@ -6591,7 +6511,6 @@ async fn build_full_result(
     previous_levels: Vec<crate::HistoryLevel>,
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
-    retention: &Arc<Retention>,
     allow_head_compaction: bool,
 ) -> Result<()> {
     if admission_test_full_build(commit) {
@@ -6727,7 +6646,7 @@ async fn build_full_result(
             "job no longer owns compacted Head publication for {}@{commit}",
             repo_id.storage_key()
         );
-        settle_storage(cas, storage, retention, compact_uploads, compact_idx_keep).await;
+        settle_storage(cas, storage, compact_uploads, compact_idx_keep).await;
         info!(
             "compacted Head result ({} MiB delta -> {} packs)",
             delta_bytes / (1024 * 1024),
@@ -6791,7 +6710,7 @@ async fn build_full_result(
         "job no longer owns Full publication for {}@{commit}",
         repo_id.storage_key()
     );
-    settle_storage(cas, storage, retention, uploads, keep_idx).await;
+    settle_storage(cas, storage, uploads, keep_idx).await;
     admission_test_full_published(commit);
     admission_test_after_full_publish().await;
     info!(
@@ -6813,7 +6732,6 @@ async fn build_files_result(
     parent_result: Option<&RefInfo>,
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
-    retention: &Arc<Retention>,
     compression_level: i32,
 ) -> Result<()> {
     if admission_test_files_build(commit) {
@@ -6933,14 +6851,7 @@ async fn build_files_result(
         "job no longer owns Files publication for {}@{commit}",
         repo_id.storage_key()
     );
-    settle_storage(
-        cas,
-        storage,
-        retention,
-        uploads,
-        std::collections::HashSet::new(),
-    )
-    .await;
+    settle_storage(cas, storage, uploads, std::collections::HashSet::new()).await;
     admission_test_files_published();
     admission_test_after_files_publish().await;
     info!(
@@ -6965,10 +6876,6 @@ impl RefStore for ClaimScopedRefStore {
 
     async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
         self.inner.save_result(repo_id, info).await
-    }
-
-    async fn evict_if_unchanged(&self, repo_id: &RepoId, expected: &RefInfo) -> Result<bool> {
-        self.inner.evict_if_unchanged(repo_id, expected).await
     }
 
     async fn publish_head(
@@ -7070,18 +6977,6 @@ impl RefStore for ClaimScopedRefStore {
         Ok(true)
     }
 
-    async fn list(&self) -> Result<Vec<RepoId>> {
-        self.inner.list().await
-    }
-
-    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
-        self.inner.touch_last_accessed_at(repo_id, commit).await
-    }
-
-    async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
-        self.inner.delete_result(repo_id, commit).await
-    }
-
     async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
         self.inner.list_commits(repo_id).await
     }
@@ -7174,7 +7069,6 @@ async fn process_build_job_with_foreground_release(
         &job.admitted_commit,
         &ref_store,
         &state.storage,
-        &state.retention,
         &provider,
         job.credential.as_ref(),
         &job.repo_config,
@@ -7536,8 +7430,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
     triggered
 }
 
-/// Spawn the polling-fallback loop. `interval == 0` disables it. Mirrors the
-/// retention/remote-gc interval-loop pattern.
+/// Spawn the polling-fallback loop. `interval == 0` disables it.
 fn spawn_poll_loop(state: ServerState, interval: Duration) {
     if interval.is_zero() {
         info!("poll fallback disabled (RIPCLONE_POLL_INTERVAL_SECS=0)");
@@ -7671,27 +7564,7 @@ async fn run_server_with_barrier_at_control(
         .and_then(|s| s.parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(300));
-    Retention::clone(&b.retention).spawn(retention_interval);
-
-    const DEFAULT_REMOTE_GC_INTERVAL_SECS: u64 = 3600;
-    let remote_gc_interval: Duration = env::var("RIPCLONE_REMOTE_GC_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(DEFAULT_REMOTE_GC_INTERVAL_SECS));
-    let mut gc_config = GcConfig::from_env();
-    // Floor the grace at the longest signed-URL lifetime, read from the same
-    // place ref responses sign URLs, so a client still holding a valid URL can
-    // always finish its clone before any of its chunks become collectible.
-    let url_ttl_floor = ref_signed_url_ttl(false).max(ref_signed_url_ttl(true));
-    let configured_grace = gc_config.grace_period;
-    gc_config.floor_grace(url_ttl_floor);
-    info!(
-        "remote GC effective grace = {:?} (configured {:?}, signed-URL TTL floor {:?}), warm TTL = {:?}",
-        gc_config.grace_period, configured_grace, url_ttl_floor, gc_config.warm_ttl
-    );
-    let remote_gc = RemoteGc::new(b.storage.clone(), b.ref_store.clone(), gc_config);
-    remote_gc.spawn(remote_gc_interval);
+    b.cache_retention.clone().spawn(retention_interval);
 
     let oidc_audience = env::var("RIPCLONE_OIDC_AUDIENCE")
         .ok()
@@ -7719,7 +7592,6 @@ async fn run_server_with_barrier_at_control(
         jwt,
         metrics,
         rate_limiter,
-        retention: b.retention,
         build_queue,
         control_db: Some(control_db),
         worker_queue: Some(worker_queue.clone()),
@@ -8047,16 +7919,6 @@ mod tests {
         async fn save_result(&self, repo_id: &RepoId, info: &RefInfo) -> anyhow::Result<()> {
             self.store().await?.save_result(repo_id, info).await
         }
-        async fn evict_if_unchanged(
-            &self,
-            repo_id: &RepoId,
-            expected: &RefInfo,
-        ) -> anyhow::Result<bool> {
-            self.store()
-                .await?
-                .evict_if_unchanged(repo_id, expected)
-                .await
-        }
         async fn publish_head(
             &self,
             repo_id: &RepoId,
@@ -8089,22 +7951,6 @@ mod tests {
                 .await?
                 .publish_files(repo_id, commit, files)
                 .await
-        }
-        async fn list(&self) -> anyhow::Result<Vec<RepoId>> {
-            self.store().await?.list().await
-        }
-        async fn touch_last_accessed_at(
-            &self,
-            repo_id: &RepoId,
-            commit: &str,
-        ) -> anyhow::Result<bool> {
-            self.store()
-                .await?
-                .touch_last_accessed_at(repo_id, commit)
-                .await
-        }
-        async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> anyhow::Result<()> {
-            self.store().await?.delete_result(repo_id, commit).await
         }
         async fn list_commits(&self, repo_id: &RepoId) -> anyhow::Result<Vec<String>> {
             self.store().await?.list_commits(repo_id).await
@@ -8225,7 +8071,6 @@ mod tests {
         std::fs::create_dir_all(&repo_root).unwrap();
         let token_hash = hex::encode(Sha256::digest("secret"));
         let metrics = Metrics::new();
-        let retention = Arc::new(Retention::new(cas.clone(), metrics.clone()).unwrap());
         let build_queue: JobQueueRef = Arc::new(TestSqlQueue::new(
             repo_root.join("test-control-jobs.db"),
             None,
@@ -8245,7 +8090,6 @@ mod tests {
             jwt: None,
             metrics,
             rate_limiter: RateLimiter::new(100, 100.0),
-            retention,
             build_queue,
             control_db: None,
             worker_queue: None,
@@ -8962,7 +8806,6 @@ mod tests {
             &missing,
             &state.ref_store,
             &state.storage,
-            &state.retention,
             &provider,
             None,
             &crate::repo_config::RepoConfig::default(),
@@ -8989,10 +8832,6 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "an unavailable exact target must not publish branch metadata"
-        );
-        assert!(
-            state.storage.list_hashes().unwrap().is_empty(),
-            "an unavailable exact target must not publish artifacts"
         );
     }
 
@@ -10030,7 +9869,6 @@ mod tests {
         assert!(exact.head);
         assert!(exact.full);
         assert!(!exact.files);
-        assert!(exact.built_at.is_some());
         assert_eq!(exact.job, "none");
         assert!(exact.job_error.is_none());
     }
@@ -10143,6 +9981,17 @@ mod tests {
             &[],
         );
 
+        let corrupt_manifest = [0x80];
+        let corrupt_manifest_hash = crate::cas::hash(&corrupt_manifest);
+        storage
+            .put(&corrupt_manifest_hash, &corrupt_manifest)
+            .unwrap();
+        let mut corrupt_manifest_head = crate::HeadResult {
+            clonepack: ready_artifacts(&commit, "corrupt-manifest"),
+            ..Default::default()
+        };
+        corrupt_manifest_head.clonepack.manifest = corrupt_manifest_hash;
+
         let mut wrong_metadata_full = crate::FullResult {
             clonepack: ready_artifacts(&commit, "wrong-manifest-metadata"),
             ..Default::default()
@@ -10203,6 +10052,7 @@ mod tests {
             serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_head}),
             serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":crate::HeadResult::default()}),
             serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":missing_head}),
+            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":corrupt_manifest_head}),
             serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_manifest_head}),
             serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":inconsistent_head}),
             serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_full}),

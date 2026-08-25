@@ -7,8 +7,6 @@ mod common;
 mod lsm_off_e2e_equivalence;
 #[path = "suites/local_server/e2e_freshness.rs"]
 mod lsm_off_e2e_freshness;
-#[path = "suites/local_server/e2e_gc_race.rs"]
-mod lsm_off_e2e_gc_race;
 #[path = "suites/local_server/e2e_sync_head_timing.rs"]
 mod lsm_off_e2e_sync_head_timing;
 #[path = "suites/local_server/exact_results.rs"]

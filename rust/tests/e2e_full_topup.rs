@@ -185,7 +185,6 @@ async fn wait_for_files_job_settled(server: &Server, repo: &str, commit: &str) {
                         && reference["full"] == true
                         && reference["files"] == true
                         && reference["job"] == "done"
-                        && reference["warm"] == true
                 })
             }) {
                 return;

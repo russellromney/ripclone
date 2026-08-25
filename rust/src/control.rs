@@ -340,13 +340,7 @@ impl ControlDb {
             result.commit == commit,
             "stored exact result identity mismatch"
         );
-        let published_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|duration| duration.as_secs());
         result.head = Some(head);
-        result.synced_at = published_at;
-        result.last_accessed_at = published_at;
         let data = serde_json::to_string(&result).context("encode claimed Head result")?;
         tx.execute(
             "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
@@ -409,10 +403,6 @@ impl ControlDb {
         );
         if !crate::exact_output_ready(&result, crate::ExactResultKind::Full, commit) {
             result.full = Some(full);
-            result.last_accessed_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs());
             let data = serde_json::to_string(&result).context("encode claimed Full")?;
             tx.execute(
                 "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
@@ -476,10 +466,6 @@ impl ControlDb {
         );
         if !crate::exact_output_ready(&result, crate::ExactResultKind::Files, commit) {
             result.files = Some(files);
-            result.last_accessed_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs());
             let data = serde_json::to_string(&result).context("encode claimed Files")?;
             tx.execute(
                 "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
@@ -598,7 +584,7 @@ impl ControlDb {
             )
             .await
             .context("read exact result during durable admission")?;
-        let mut existing = match existing_rows.next().await? {
+        let existing = match existing_rows.next().await? {
             Some(row) => Some(
                 serde_json::from_str::<crate::RefInfo>(&row.get::<String>(0)?)
                     .context("decode exact result during durable admission")?,
@@ -606,17 +592,6 @@ impl ControlDb {
             None => None,
         };
         drop(existing_rows);
-        if let Some(result) = existing.as_mut() {
-            result.last_accessed_at = pending.last_accessed_at.or(result.last_accessed_at);
-            let data = serde_json::to_string(result)
-                .context("encode exact result access during durable admission")?;
-            tx.execute(
-                "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
-                libsql::params![data, repo_key.as_str(), job.admitted_commit.as_str()],
-            )
-            .await
-            .context("refresh exact result access during durable admission")?;
-        }
         let mut rows = tx
             .query(
                 "SELECT id FROM jobs WHERE key = ?1 AND status IN ('queued', 'claimed') LIMIT 1",
@@ -1179,52 +1154,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readmission_refreshes_an_existing_exact_result_access_time() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("control.db");
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
-        let commit = "3434343434343434343434343434343434343434";
-        let mut first_result = pending(commit);
-        first_result.last_accessed_at = Some(1);
-        let first_id = control
-            .admit_exact_and_job(&job(commit, "main"), &first_result)
-            .await
-            .unwrap()
-            .job_id
-            .unwrap();
-        let claimed = control.queue().claim("first").await.unwrap().unwrap();
-        assert_eq!(claimed.id, first_id);
-        assert!(
-            control
-                .queue()
-                .ack(
-                    first_id,
-                    "first",
-                    Err(crate::queue::BuildError::permanent("stopped")),
-                )
-                .await
-                .unwrap()
-        );
-
-        let mut later_result = pending(commit);
-        later_result.last_accessed_at = Some(200);
-        let second = control
-            .admit_exact_and_job(&job(commit, "main"), &later_result)
-            .await
-            .unwrap();
-        assert_eq!(second.outcome, EnqueueOutcome::Enqueued);
-        let stored = control
-            .ref_store()
-            .load_result(&job(commit, "main").repo_id, commit)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.last_accessed_at, Some(200));
-    }
-
-    #[tokio::test]
     async fn stale_job_cannot_overwrite_any_ready_result() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
@@ -1250,17 +1179,6 @@ mod tests {
                 .publish_head_for_claim(first.id, "first-owner", &repo_id, commit, head.clone())
                 .await
                 .unwrap()
-        );
-        assert!(
-            control
-                .ref_store()
-                .load_result(&repo_id, commit)
-                .await
-                .unwrap()
-                .unwrap()
-                .synced_at
-                .is_some(),
-            "Head publication persists the status build timestamp"
         );
         assert!(
             control

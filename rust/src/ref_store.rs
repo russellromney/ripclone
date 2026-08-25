@@ -67,10 +67,6 @@ pub trait RefStore: Send + Sync {
     ) -> Result<bool> {
         self.publish_files(repo_id, commit, files).await
     }
-    /// Clear an idle exact result only if it has not changed since selection
-    /// and no queued or claimed job owns that commit. Publication, access, and
-    /// active work all win over eviction.
-    async fn evict_if_unchanged(&self, repo_id: &RepoId, expected: &RefInfo) -> Result<bool>;
     /// Optional wrapper hooks around an atomically authorized claimed write.
     /// Production stores use the defaults; deterministic test stores use these
     /// without moving the authority check outside the control transaction.
@@ -78,11 +74,6 @@ pub trait RefStore: Send + Sync {
         Ok(())
     }
     async fn after_claimed_result_write(&self, _repo_id: &RepoId, _info: &RefInfo) -> Result<()> {
-        Ok(())
-    }
-    async fn list(&self) -> Result<Vec<RepoId>>;
-    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool>;
-    async fn delete_result(&self, _repo_id: &RepoId, _commit: &str) -> Result<()> {
         Ok(())
     }
     async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>>;

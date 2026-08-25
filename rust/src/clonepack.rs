@@ -37,10 +37,9 @@ pub fn hash_to_hex(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }
 
-/// Return every chunk reference contained in a clonepack manifest. This is the
-/// single shared definition used by status reporting, remote GC, and local
-/// retention so a new manifest field can never be added in one place and
-/// forgotten in another.
+/// Return every chunk reference contained in a clonepack manifest. Status
+/// accounting uses this single definition so a new manifest field cannot be
+/// omitted from its byte totals.
 pub fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&ChunkRef> {
     let mut refs = Vec::new();
     if let Some(ref meta) = manifest.metadata_chunk {
@@ -130,7 +129,7 @@ where
 }
 
 /// Collect the distinct clonepack manifest hashes referenced by a `RefInfo`.
-/// Shared by `/status` and GC reachability so both agree on what is reachable.
+/// Used by `/status` to avoid counting a shared manifest more than once.
 pub fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();

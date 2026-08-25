@@ -1853,14 +1853,6 @@ mod tests {
         fn size(&self, _hash: &str) -> Result<u64> {
             anyhow::bail!("unsupported")
         }
-
-        fn delete(&self, _hash: &str) -> Result<()> {
-            anyhow::bail!("unsupported")
-        }
-
-        fn list_hashes(&self) -> Result<Vec<crate::storage::HashEntry>> {
-            Ok(Vec::new())
-        }
     }
 
     fn commit_files(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
