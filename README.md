@@ -122,13 +122,14 @@ export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
 ./target/release/ripclone-server
 ```
 
-The server defaults to storing its local cache and bare mirrors under
-`~/.local/share/ripclone/` (`cache`, `repos`, and `control.db`). Use `--cas-dir`,
-`--repo-root`, and `--control-db` to override. `--host` (default `0.0.0.0`) and
-`--port` (default `8000`) set the listen address. Object storage
-(S3/R2/Tigris/MinIO) and most
-other tuning are set with environment variables — see [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md)
-and [`docs/BACKENDS.md`](docs/BACKENDS.md).
+The server defaults to storing its local artifact CAS and bare mirrors under
+`~/.local/share/ripclone/` (`cache`, `repos`, and `control.db`). With the default
+local artifact backend, `cache` is the durable artifact store and must be
+preserved. Use `--cas-dir`, `--repo-root`, and `--control-db` to override.
+`--host` (default `0.0.0.0`) and `--port` (default `8000`) set the listen address.
+Object storage (S3/R2/Tigris/MinIO) and most other tuning are set with
+environment variables — see [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md) and
+[`docs/BACKENDS.md`](docs/BACKENDS.md).
 
 Point the CLI at your server. `--server` is a **global** flag, so it goes
 *before* the subcommand — but the cleanest way is the `RIPCLONE_SERVER` env var,

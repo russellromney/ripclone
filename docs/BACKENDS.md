@@ -8,8 +8,8 @@ Artifact bytes are separate: use local disk or any S3-compatible service.
 
 ## Plain SQLite (default)
 
-The server creates `control.db` beside its default cache and repository
-directories. Set an explicit path with either:
+The server creates `control.db` beside its default local artifact CAS and
+repository directories. Set an explicit path with either:
 
 ```bash
 ripclone-server --control-db /var/lib/ripclone/control.db
