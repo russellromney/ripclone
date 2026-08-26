@@ -90,7 +90,7 @@ pub fn resolve_mode(cli: Option<CloneMode>, config: Option<&str>) -> anyhow::Res
 /// history) → the full clonepack.
 ///
 /// Only depths 0 and 1 are meaningful: arbitrary depth-N shallow clones are not
-/// implemented, and callers (the CLI and the git remote helper) reject `N > 1`
+/// implemented, and the CLI rejects `N > 1`
 /// with a clear error rather than silently serving full history that git would
 /// record as a complete, non-shallow clone (P1). This mapping still treats any
 /// other value as full as a defensive default.

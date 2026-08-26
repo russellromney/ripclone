@@ -18,7 +18,7 @@ TOKEN_HASH=$(printf '%s' "${RIPCLONE_SERVER_TOKEN:-}" | sha256sum | awk '{print 
 # fail with EBUSY, and free tmpfs staging directories so each run starts with
 # the full /dev/shm budget available.
 cleanup_staging() {
-  for d in /tmp/bun-install /tmp/bun-install-rootfs /tmp/bun-archive /tmp/bun-ripclone /tmp/bun-http /tmp/bun-github; do
+  for d in /tmp/bun-install /tmp/bun-install-rootfs /tmp/bun-archive /tmp/bun-http /tmp/bun-github; do
     umount -l "$d" 2>/dev/null || true
   done
   rm -rf /dev/shm/ripclone-overlay-* 2>/dev/null || true
@@ -80,7 +80,7 @@ run_clone() {
 }
 
 # Show the filesystem speed gap explicitly.
-echo "==> [0/6] filesystem sanity check"
+echo "==> [0/5] filesystem sanity check"
 echo -n "rootfs (/tmp):  "
 dd if=/dev/zero of=/tmp/fsspeed bs=1M count=50 oflag=direct 2>&1 | tail -1
 rm -f /tmp/fsspeed
@@ -88,7 +88,7 @@ echo -n "tmpfs (/dev/shm):  "
 dd if=/dev/zero of=/dev/shm/fsspeed bs=1M count=50 oflag=direct 2>&1 | tail -1
 rm -f /dev/shm/fsspeed
 
-echo "==> [1/6] ripclone direct-install (overlay staging, default)"
+echo "==> [1/5] ripclone direct-install (overlay staging, default)"
 run_clone \
   "ripclone direct-install (overlay)" \
   "/tmp/bun-install" \
@@ -97,7 +97,7 @@ run_clone \
   install_overlay_ms \
   install_overlay_cpu
 
-echo "==> [2/6] ripclone direct-install (overlay staging, archive extraction)"
+echo "==> [2/5] ripclone direct-install (overlay staging, archive extraction)"
 run_clone \
   "ripclone archive-extraction (overlay)" \
   "/tmp/bun-archive" \
@@ -106,7 +106,7 @@ run_clone \
   install_archive_ms \
   install_archive_cpu
 
-echo "==> [3/6] ripclone direct-install (no overlay, rootfs)"
+echo "==> [3/5] ripclone direct-install (no overlay, rootfs)"
 run_clone \
   "ripclone direct-install (rootfs)" \
   "/tmp/bun-install-rootfs" \
@@ -115,16 +115,7 @@ run_clone \
   install_rootfs_ms \
   install_rootfs_cpu
 
-echo "==> [4/6] git-remote-ripclone clone"
-run_clone \
-  "git-remote-ripclone" \
-  "/tmp/bun-ripclone" \
-  "" \
-  "git clone ripclone://${REPO}.git /tmp/bun-ripclone" \
-  helper_ms \
-  helper_cpu
-
-echo "==> [5/6] smart-HTTP fallback clone"
+echo "==> [4/5] smart-HTTP fallback clone"
 run_clone \
   "smart-HTTP fallback" \
   "/tmp/bun-http" \
@@ -133,7 +124,7 @@ run_clone \
   http_ms \
   http_cpu
 
-echo "==> [6/6] baseline: git clone --depth 1 from GitHub"
+echo "==> [5/5] baseline: git clone --depth 1 from GitHub"
 rm -rf /tmp/bun-github
 start=$(now_ms)
 if git clone --depth 1 "https://github.com/${REPO}.git" /tmp/bun-github >/dev/null 2>&1; then
@@ -153,7 +144,6 @@ echo "Fly client clone timings ($REPO -> $SERVER)"
 echo "  ripclone direct-install (overlay):   ${install_overlay_ms:-0}ms (CPU ${install_overlay_cpu:-0}s)"
 echo "  ripclone archive-extraction (overlay): ${install_archive_ms:-0}ms (CPU ${install_archive_cpu:-0}s)"
 echo "  ripclone direct-install (rootfs):    ${install_rootfs_ms:-0}ms (CPU ${install_rootfs_cpu:-0}s)"
-echo "  git-remote-ripclone:                 ${helper_ms:-0}ms (CPU ${helper_cpu:-0}s)"
 echo "  smart-HTTP fallback:                 ${http_ms:-0}ms (CPU ${http_cpu:-0}s)"
 echo "  GitHub depth-1 baseline:             ${gh_ms:-0}ms"
 echo "=========================================================="

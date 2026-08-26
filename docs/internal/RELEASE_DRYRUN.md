@@ -107,8 +107,8 @@ Fix whatever breaks, re-tag (`-rc.2`, …), rerun sections 2–6. Only cut the r
 F2 landed, so the earlier open items are closed:
 
 - **`ripclone-worker` ships in the tarball.** `release.yml` and `install.sh` copy
-  all four binaries (`ripclone`, `ripclone-server`, `ripclone-worker`,
-  `git-remote-ripclone`), matching the README Install line.
+  all three binaries (`ripclone`, `ripclone-server`, `ripclone-worker`),
+  matching the README Install line.
 - **Linux binaries are fully static musl** (`x86_64` and `aarch64`, via
   cargo-zigbuild), with the C deps (`zstd`, `zlib-ng`, `mimalloc`) vendored and
   statically linked — no libgit2/openssl/libc dependency at all. Sections 2–4

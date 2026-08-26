@@ -39,7 +39,7 @@ pick_lib_test_exe() {
 }
 
 # writer_bench: Dockerfile.client.ci COPY only (not product runtime).
-BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone writer_bench)
+BINS=(ripclone ripclone-server ripclone-worker writer_bench)
 
 TESTS=(
   e2e_full_topup

@@ -12,7 +12,6 @@ WORKDIR /app
 
 # Binaries staged by the workflow into ci-bins/ (rust/target/ is .dockerignored).
 COPY ci-bins/ripclone /usr/local/bin/ripclone
-COPY ci-bins/git-remote-ripclone /usr/local/bin/git-remote-ripclone
 COPY ci-bins/ripclone-server /usr/local/bin/ripclone-server
 COPY ci-bins/writer_bench /usr/local/bin/writer_bench
 COPY scripts/fly_client_test.sh /run-tests.sh

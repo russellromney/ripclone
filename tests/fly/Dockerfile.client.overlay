@@ -7,7 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY dist/ripclone /usr/local/bin/ripclone
-COPY dist/git-remote-ripclone /usr/local/bin/git-remote-ripclone
 COPY scripts/fly_client_test.sh /run-tests.sh
 RUN chmod +x /run-tests.sh
 

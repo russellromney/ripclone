@@ -57,7 +57,7 @@ mkdir -p "$BIN_DIR"
 # The tarball contains a top-level dir; install the binaries from it.
 src="$(find "$tmp" -type f -name ripclone -perm -u+x | head -n1)"
 src_dir="$(dirname "$src")"
-for b in ripclone ripclone-server ripclone-worker git-remote-ripclone; do
+for b in ripclone ripclone-server ripclone-worker; do
   if [ -f "$src_dir/$b" ]; then
     install -m 0755 "$src_dir/$b" "$BIN_DIR/$b"
   fi

@@ -23,7 +23,7 @@ pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 // keeps glibc-class throughput. Scoped to musl only: glibc and macOS already
 // ship capable allocators, so those builds are left untouched. Defined here in
 // the library crate so every binary that links it (ripclone, ripclone-server,
-// ripclone-worker, git-remote-ripclone) picks it up. NOTE: this cfg path only
+// ripclone-worker) picks it up. NOTE: this cfg path only
 // compiles on a musl build — the host `cargo check` never sees it. It is built
 // and run by the `musl` CI job (scripts/musl-smoke.sh).
 #[cfg(target_env = "musl")]

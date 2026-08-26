@@ -175,9 +175,9 @@ history and do not describe current keys, reads, writes, or worker behavior.
 
 ## Multi-provider auth (Phases 1 & 2)
 
-- **Breaking: explicit-provider addressing** (`rust/src/server.rs`, `rust/src/client.rs`, `rust/src/bin/cli.rs`, `rust/src/bin/git-remote-ripclone.rs`)
+- **Breaking: explicit-provider addressing** (`rust/src/server.rs`, `rust/src/client.rs`, `rust/src/bin/cli.rs`)
   - Legacy `/v1/repos/{owner}/{repo}/...` routes are removed. All repos are now addressed as `/v1/repos/{provider}/{repo-path}/...`, including GitHub (`/v1/repos/github/owner/repo/...`).
-  - The CLI and git remote helper accept provider-qualified paths (`github/owner/repo`, `gitlab/group/sub/project`).
+  - The CLI accepts provider-qualified paths (`github/owner/repo`, `gitlab/group/sub/project`).
 - **Provider registry + presets** (`rust/src/provider.rs`)
   - New `ProviderKind` enum: `github`, `gitlab`, `gitea`, `generic`.
   - `ProviderRegistry::load()` reads instances from `RIPCLONE_PROVIDERS` JSON or `config.toml`, merged with the built-in `github` default.
@@ -298,7 +298,7 @@ history and do not describe current keys, reads, writes, or worker behavior.
 
 ## Roadmap cleanup
 
-- Moved completed roadmap items to this changelog: clonepack format, integration tests, overlay staging, S3/storage backend, retention, smart-HTTP fallback, git remote helper, token auth, rate limiting, metrics, and health endpoints.
+- Moved completed roadmap items to this changelog: clonepack format, integration tests, overlay staging, S3/storage backend, retention, smart-HTTP fallback, token auth, rate limiting, metrics, and health endpoints.
 - Added the four cloud-session changes to the active plan in `ROADMAP.md`.
 
 ## Protobuf clonepack format
@@ -344,7 +344,6 @@ history and do not describe current keys, reads, writes, or worker behavior.
 
 - **Cleaned up legacy `RefResponse` fields** (`rust/src/server.rs`, `rust/src/client.rs`)
   - Removed `skeleton_pack`, `skeleton_idx`, `head_blobs_pack`, `head_blobs_idx`, `prebuilt_index`, `archive`, and `manifest` from the public `/v1/repos/.../refs/...` JSON response.
-  - Wired `install_git_dir` and `skeleton_clone` through `fetch_clonepack` so the git remote helper no longer relies on the legacy `manifest` field.
   - Updated benchmark scripts to use `clonepack_manifest` instead of the removed fields.
 
 - **Integration test for clonepack round-trip** (`scripts/e2e_clonepack.sh`)
@@ -371,7 +370,7 @@ history and do not describe current keys, reads, writes, or worker behavior.
 
 ## Client auth and cache cleanup
 
-- **Pre-hashed token support** (`rust/src/bin/cli.rs`, `rust/src/bin/git-remote-ripclone.rs`)
+- **Pre-hashed token support** (`rust/src/bin/cli.rs`)
   - Added `RIPCLONE_SERVER_TOKEN_HASH` env var so CI and 1Password users can provide the
     SHA-256 hash directly instead of the raw secret.
   - `RIPCLONE_SERVER_TOKEN` is still hashed before sending.
@@ -398,7 +397,7 @@ history and do not describe current keys, reads, writes, or worker behavior.
   - `POST /v1/git/github/{owner}/{repo}/git-upload-pack` runs `git upload-pack
     --stateless-rpc` against the mirror so a plain `git clone
     http://server/v1/git/github/owner/repo` works without the archive-first path.
-  - Useful for cold caches or clients that cannot use the remote helper.
+  - Useful for cold caches or clients that need ordinary Git transport.
 
 - **Validation**
   - `scripts/e2e_smart_http.sh` verifies `git clone` through the fallback
@@ -437,32 +436,6 @@ history and do not describe current keys, reads, writes, or worker behavior.
     `RIPCLONE_RATE_LIMIT_PER_SEC` (default 10.0).
   - Returns `429 Too Many Requests` with a `Retry-After` header when the bucket
     is empty.
-
-## Native git remote helper
-
-- **`git-remote-ripclone`** (`rust/src/bin/git-remote-ripclone.rs`)
-  - Speaks the git remote-helper protocol (`capabilities`, `list`, `option`,
-    `connect git-upload-pack`).
-  - Parses `ripclone://owner/repo.git` and `ripclone://owner/repo.git#branch`.
-  - Resolves the ref through the ripclone server, downloads the prebuilt
-    skeleton pack, head-blobs pack, and prebuilt `.git/index`, and seeds the
-    local object database so `git clone` can finish with its normal checkout.
-  - Runs a local `git upload-pack` against the seeded repo so the rest of the
-    clone is a normal git transport.
-  - Reads `RIPCLONE_SERVER` and hashes `RIPCLONE_SERVER_TOKEN` with SHA-256 before
-    sending it in the `Authorization` header.
-
-- **`Client` additions** (`rust/src/client.rs`)
-  - `Client::new_with_token` builds an HTTP client that sends the ripclone
-    token on every request.
-  - `Client::install_git_dir` downloads only the `.git` artifacts needed by
-    the remote helper.
-  - Ref responses now include `default_branch` so the helper can create the
-    correct local branch ref for `HEAD` clones.
-
-- **Validation**
-  - `scripts/e2e_remote_helper.sh` verifies `git clone ripclone://oven-sh/bun.git`
-    end-to-end; the resulting repo has a clean `git status` and working `git log`.
 
 ## Direct index mutation
 

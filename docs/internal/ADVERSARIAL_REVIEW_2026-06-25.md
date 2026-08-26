@@ -56,7 +56,7 @@ A note on the auth findings: several are architecture/deployment assumptions (th
 6. **Add a per-repo authorization check and stop fanning out a single shared token.** Carry a gateway-signed principal and authorize `(principal, repo)` before signing URLs / serving content; at minimum document that the backend must be network-isolated and never multi-tenant-shared. *(server.rs:581, 1525, 2685-2745)*
 7. **Fix the rate limiter for the real topology.** Key on a validated forwarded-for / authenticated token, collapse IPv6 to /64; today it keys on the raw socket IP and is a no-op behind the gateway. *(server.rs:643-650)*
 8. **Make the worktree writer durable (or document that it isn't).** No `fsync` on files or parent dirs before the clone reports success and writes the index stat cache → a crash can leave a torn tree that `git status` calls clean. Batch `IORING_OP_FSYNC` or fsync on the POSIX path. *(worktree_writer.rs, extract.rs index-stat path)*
-9. **Handle the symlink and depth correctness gaps.** Build symlink targets from raw bytes (mirror the path handling) instead of `str::from_utf8` so non-UTF-8 targets clone; either implement real `--depth N` (the pack builders exist) or reject N>1 with a clear error instead of silently serving full history with no `.git/shallow`. *(worktree_writer.rs:750 / extract.rs:788; git-remote-ripclone.rs:101, mode.rs:96)*
+9. **Handle the symlink correctness gap.** Build symlink targets from raw bytes (mirror the path handling) instead of `str::from_utf8` so non-UTF-8 targets clone. *(worktree_writer.rs:750 / extract.rs:788)*
 10. **Cap the unbounded decompression path and stop the per-artifact / per-frame copies.** Use the bounded `Decompressor::decompress(_, raw_len)` in the no-dictionary branch (the one the clone actually uses); return `bytes::Bytes` from `fetch_artifact_*` instead of `.to_vec()`, borrow the fragment-pair map instead of `.cloned()`, and poll the writer error flag with an `AtomicBool`. *(extract.rs:433; client.rs:283, extract.rs:446/1603)*
 
 ---
@@ -111,7 +111,6 @@ A note on the auth findings: several are architecture/deployment assumptions (th
 - **Verified-safe (strong):** three independent integrity anchors (per-chunk SHA-256, per-file SHA-1, manifest geometry); zip-slip blocked (`validate_relative_path`, `O_NOFOLLOW`, no-descend-through-symlink); mode allowlist; clone is temp-dir + atomic rename (crash-safe); empty/zero-byte boundaries covered.
 
 ### Track — Pack / git-object correctness
-- **P1 [Med] `--depth N` (N>1) silently ignored** → full history, no `.git/shallow`; the depth-N builders exist but are unreachable. *(git-remote-ripclone.rs:101, mode.rs:96)*
 - **P2 [Med] `HashingWriter` double-hashes on a short write** (hashes full `buf`, writes a possibly-short count; `write_all` re-hashes the remainder) → bad pack trailer → `index_pack` rejects, for blobs compressing >256 KiB. *(blob_pack.rs:380-384)*
 - **P3 [Med] Head-delta build has no cold-base fallback** when the immutable base is gc'd after a force-push (contrast `build_history_tail`, which does fall back). *(server.rs:4032, pack.rs:309)*
 - **P4 [Low] SHA-256 repos hardcoded to `Kind::Sha1`** → opaque index failure.
@@ -143,7 +142,7 @@ A note on the auth findings: several are architecture/deployment assumptions (th
 3. **io_uring fault injection:** force `submit_and_wait` to return `EINTR` with ≥2 windows in flight, run under KASAN/ASan; catch the UAF on `statx_buffers` (U1).
 4. **Files-mode fidelity property test:** random tree (exec bits, symlinks incl. non-UTF-8 targets, empty files, chunk-boundary sizes) → clone byte-identical to `git checkout` (F1).
 5. **Authz:** server with token T, request a repo the caller has no claim to → must be 403 (currently 200) (AU1); two IPv6 addrs in one /64 each exhaust the burst (AU2).
-8. **Depth + short-write:** remote-helper `--depth 3` asserts history length + `.git/shallow` (P1); >256 KiB-compressing blob through `StreamingBlobPackBuilder` behind a short-writing `Write` (P2).
+8. **Short-write:** >256 KiB-compressing blob through `StreamingBlobPackBuilder` behind a short-writing `Write` (P2).
 
 ## Track coverage map
 | Track | Findings |
