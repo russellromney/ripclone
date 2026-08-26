@@ -75,7 +75,6 @@ pub struct StorageConfig {
     pub region: Option<String>,
     pub bucket: Option<String>,
     pub prefix: Option<String>,
-    pub cache_dir: Option<String>,
 }
 
 /// Server-owned SQLite control database. A Turso URL and token together enable
@@ -244,7 +243,6 @@ fn merge(overrides: Config, base: Config) -> Config {
             region: overrides.storage.region.or(base.storage.region),
             bucket: overrides.storage.bucket.or(base.storage.bucket),
             prefix: overrides.storage.prefix.or(base.storage.prefix),
-            cache_dir: overrides.storage.cache_dir.or(base.storage.cache_dir),
         },
         control: ControlConfig {
             path: overrides.control.path.or(base.control.path),

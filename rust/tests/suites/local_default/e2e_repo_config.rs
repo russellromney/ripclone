@@ -55,6 +55,14 @@ async fn admin_get(
 }
 
 async fn spawn_persistent_server(root: &Path, port: u16) -> tokio::process::Child {
+    spawn_persistent_server_env(root, port, &[]).await
+}
+
+async fn spawn_persistent_server_env(
+    root: &Path,
+    port: u16,
+    extra_env: &[(&str, &str)],
+) -> tokio::process::Child {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-server"));
     command
         .env_clear()
@@ -82,6 +90,9 @@ async fn spawn_persistent_server(root: &Path, port: u16) -> tokio::process::Chil
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     let child = command.spawn().unwrap();
     let ready = format!("http://127.0.0.1:{port}/readyz");
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -98,6 +109,27 @@ async fn spawn_persistent_server(root: &Path, port: u16) -> tokio::process::Chil
     .await
     .expect("persistent server became ready within the bound");
     child
+}
+
+async fn exact_row_json(control_path: &Path, repo_key: &str, commit: &str) -> String {
+    let database = libsql::Builder::new_local(control_path)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    let mut rows = connection
+        .query(
+            "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+            libsql::params![repo_key, commit],
+        )
+        .await
+        .unwrap();
+    rows.next()
+        .await
+        .unwrap()
+        .expect("exact result row exists")
+        .get::<String>(0)
+        .unwrap()
 }
 
 async fn control_counts(path: &Path) -> (i64, i64, i64, i64) {
@@ -495,6 +527,129 @@ async fn repository_config_survives_server_restart_and_drives_embedded_job_snaps
             .iter()
             .all(|path| !path.to_string_lossy().contains("repo-config"))
     );
+    second.kill().await.unwrap();
+    second.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn published_local_results_and_artifacts_survive_cache_retention_restart() {
+    init(false);
+    let root = tempfile::tempdir().unwrap();
+    let origin = make_origin("acme", "durable-local");
+    let commit = origin.commit(
+        &[
+            ("value.txt", "durable B\n"),
+            ("nested/file.txt", "files B\n"),
+        ],
+        "B",
+    );
+    origin.publish();
+
+    let first_port = free_port();
+    let first_url = format!("http://127.0.0.1:{first_port}");
+    let mut first = spawn_persistent_server(root.path(), first_port).await;
+    let first_client = ripclone::client::Client::new_with_token(first_url, Some(token_hash()));
+    first_client
+        .add_repo("acme/durable-local")
+        .await
+        .expect("build durable local B");
+    for result in [
+        ripclone::ExactResultKind::Head,
+        ripclone::ExactResultKind::Full,
+        ripclone::ExactResultKind::Files,
+    ] {
+        let ready = first_client
+            .resolve_exact_result("acme/durable-local", "HEAD", result, Some(&commit))
+            .await
+            .expect("all exact B results become ready");
+        assert_eq!(ready.commit, commit);
+        assert_eq!(ready.result, result);
+    }
+    first.kill().await.unwrap();
+    first.wait().await.unwrap();
+
+    let control_path = root.path().join("control.db");
+    let repo_key = ripclone::provider::RepoId::github("acme/durable-local").storage_key();
+    let row_before = exact_row_json(&control_path, &repo_key, &commit).await;
+    let artifacts_before = files_under(&root.path().join("cas"));
+    assert!(
+        !artifacts_before.is_empty(),
+        "local build published artifacts"
+    );
+    let old = filetime::FileTime::from_system_time(
+        std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60),
+    );
+    for artifact in &artifacts_before {
+        filetime::set_file_mtime(artifact, old).unwrap();
+    }
+
+    let second_port = free_port();
+    let second_url = format!("http://127.0.0.1:{second_port}");
+    let mut second = spawn_persistent_server_env(
+        root.path(),
+        second_port,
+        &[
+            ("RIPCLONE_RETENTION_INTERVAL_SECS", "1"),
+            ("RIPCLONE_RETENTION_MAX_AGE_DAYS", "1"),
+            ("RIPCLONE_RETENTION_MAX_GB", "1"),
+        ],
+    )
+    .await;
+    let client = ripclone::client::Client::new_with_token(second_url.clone(), Some(token_hash()));
+    for (name, mode, clonepack) in [
+        ("head", CloneMode::Editable, "shallow"),
+        ("full", CloneMode::Editable, "full"),
+        ("files", CloneMode::Files, "full"),
+    ] {
+        let target = root.path().join(format!("clone-{name}"));
+        let outcome = client
+            .install_repo_with_mode_at(
+                "acme/durable-local",
+                "HEAD",
+                Some(&commit),
+                &target,
+                mode,
+                Some(clonepack),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("clone exact B {name}: {error:#}"));
+        assert_eq!(outcome.commit, commit);
+        assert_eq!(read(&target, "value.txt"), "durable B\n");
+    }
+
+    assert_eq!(
+        exact_row_json(&control_path, &repo_key, &commit).await,
+        row_before,
+        "restart and exact clones must not mutate published B"
+    );
+    for artifact in &artifacts_before {
+        assert!(
+            artifact.exists(),
+            "local cache settings must not delete durable artifact {}",
+            artifact.display()
+        );
+    }
+
+    let removed = reqwest::Client::new()
+        .delete(format!(
+            "{second_url}/v1/repos/github/acme/durable-local/add"
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .unwrap();
+    assert!(removed.status().is_success());
+    assert_eq!(
+        exact_row_json(&control_path, &repo_key, &commit).await,
+        row_before,
+        "removing repository admission must retain exact B"
+    );
+    for artifact in &artifacts_before {
+        assert!(artifact.exists());
+    }
+
     second.kill().await.unwrap();
     second.wait().await.unwrap();
 }

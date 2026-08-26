@@ -8,8 +8,8 @@ Artifact bytes are separate: use local disk or any S3-compatible service.
 
 ## Plain SQLite (default)
 
-The server creates `control.db` beside its default cache and repository
-directories. Set an explicit path with either:
+The server creates `control.db` beside its default local artifact CAS and
+repository directories. Set an explicit path with either:
 
 ```bash
 ripclone-server --control-db /var/lib/ripclone/control.db
@@ -27,9 +27,9 @@ path = "/var/lib/ripclone/control.db"
 ```
 
 Only one server process may own a control path. A second server fails before it
-binds its listener or starts storage, GC, polling, or worker tasks. Accepted jobs
-survive restart, and claims abandoned by a dead worker become eligible for
-recovery after `RIPCLONE_QUEUE_STALE_SECS`.
+binds its listener or starts storage, local cache cleanup, polling, or worker
+tasks. Accepted jobs survive restart, and claims abandoned by a dead worker
+become eligible for recovery after `RIPCLONE_QUEUE_STALE_SECS`.
 
 An existing database without the current control schema marker is rejected. The
 server does not rewrite or automatically migrate it.
@@ -103,7 +103,7 @@ export AWS_SECRET_ACCESS_KEY=...
 ```
 
 Configuration-file fields are `[storage].backend`, `endpoint`, `region`,
-`bucket`, `prefix`, and `cache_dir`. Credentials remain environment-only.
+`bucket`, and `prefix`. Credentials remain environment-only.
 Supported services include AWS S3, Cloudflare R2, Tigris, and MinIO.
 
 S3 stores clonepack artifacts only. It never stores refs, repository build

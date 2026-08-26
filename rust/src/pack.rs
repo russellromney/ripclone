@@ -28,7 +28,7 @@ pub struct IncrementalPacks {
 
 /// Result of compacting LSM levels: the new (bounded) level set, plus the pack
 /// tuples that were freshly built by the merges (to upload). Packs that were
-/// merged away are now unreferenced and left for GC.
+/// merged away remain immutable in durable content-addressed storage.
 pub struct CompactResult {
     pub levels: Vec<crate::HistoryLevel>,
     pub new_packs: Vec<(String, u64, String, u64)>,

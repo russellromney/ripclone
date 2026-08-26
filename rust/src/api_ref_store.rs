@@ -334,10 +334,6 @@ impl RefStore for ApiRefStore {
         bail!("standalone workers require claimed Files publication")
     }
 
-    async fn evict_if_unchanged(&self, _repo_id: &RepoId, _expected: &RefInfo) -> Result<bool> {
-        bail!("standalone workers cannot evict exact results")
-    }
-
     async fn publish_claimed_head(
         &self,
         repo_id: &RepoId,
@@ -366,10 +362,6 @@ impl RefStore for ApiRefStore {
             result.head = Some(head);
         }
         Ok(response.updated)
-    }
-
-    async fn list(&self) -> Result<Vec<RepoId>> {
-        Ok(Vec::new())
     }
 
     async fn publish_claimed_full(
@@ -430,16 +422,6 @@ impl RefStore for ApiRefStore {
             result.files = Some(files);
         }
         Ok(response.updated)
-    }
-
-    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
-        let _ = (repo_id, commit);
-        bail!("ApiRefStore does not support access touches (server-only operation)")
-    }
-
-    async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
-        let _ = (repo_id, commit);
-        bail!("ApiRefStore does not support result deletion (server-only operation)")
     }
 
     async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {

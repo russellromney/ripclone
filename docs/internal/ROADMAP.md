@@ -3,8 +3,8 @@
 > **Historical design snapshot.** This document records an earlier
 > branch-pointer and multi-ref-store design. It is not an implementation plan
 > or deployment guide. Current behavior uses immutable exact results in the
-> server-owned control database; exact-result retention and GC are documented
-> in [`../GC.md`](../GC.md).
+> server-owned control database. Published exact results and their durable
+> artifacts remain available indefinitely.
 
 > Goal: the fastest practical way to clone a GitHub repo and be ready to work on it (`git status`, `git diff`, `git edit`, `git commit`) without rebuilding git or leaving GitHub.
 >
@@ -22,7 +22,8 @@ See `CHANGELOG.md` for the full list. The important baseline for current work:
 - **Client paths**: direct-install (`git checkout-index` using a head-blobs pack) and archive extraction (zstd frames written directly) are both implemented and A/B tested.
 - **Multi-provider**: GitHub, GitLab, and Gitea/Forgejo, with push-webhook receivers (`/v1/webhooks/{provider}`), the GitHub Actions trigger, a polling fallback, and a post-build freshness re-check (build-before-clone).
 - **Incremental builds**: a re-sync packs only the depth-1 objects new since the prior commit into a small HEAD delta pack over an immutable base, with background base-rebuild/compaction (LSM-style).
-- **Remote storage hygiene**: local retention plus a safe (off-by-default) remote GC with an unreachable-since orphan ledger.
+- **Artifact ownership**: durable local or S3 artifacts do not expire; only an
+  S3-backed local build cache may be trimmed.
 - **Tests + CI**: ~250 unit tests and a large `rust/tests/e2e_*` integration suite, run by GitHub Actions (`cargo test`/`clippy`/`fmt`, Docker build, e2e, DB matrix) plus `cargo-deny`. No fuzz/property tests yet.
 
 ## Current plan
@@ -95,7 +96,7 @@ Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `fu
 
 **Shipped** (`rust/src/repo_config.rs`, admin endpoint + build wiring in `rust/src/server.rs`):
 
-- One repository-config record lives in the server-owned SQLite/Turso control database. Admission validates it and snapshots the resolved settings into the durable job; embedded and API workers use that snapshot without a live configuration read. Artifact storage contains only artifact bytes and GC bookkeeping, not live repository settings.
+- One repository-config record lives in the server-owned SQLite/Turso control database. Admission validates it and snapshots the resolved settings into the durable job; embedded and API workers use that snapshot without a live configuration read. Artifact storage contains only immutable artifact bytes, not live repository settings.
 - The current config schema: `clonepack_depths: Vec<DepthSpec>` (`{ name, depth: Option<usize> }`), `compression_level`, `dictionary_id`, `archive_chunk_size`, and `head_blobs_chunk_size`. Unknown fields are rejected rather than ignored.
 - Admin read/write endpoint: `GET`/`POST /v1/admin/config/{owner}/{repo}`. Branch overrides are not supported; a `?branch=` request fails without changing state.
 - The build reads the effective config and applies `compression_level` to the archive build (single-phase and two-phase paths).
@@ -202,10 +203,10 @@ path and is a rare case (only freshly created, never-pushed repos).
 ## Storage model
 
 - **Tigris Global object storage is the source of truth.** No separate CDN.
-- **Local NVMe disk on the ripclone server is a hot cache** for recently built and recently accessed artifacts.
+- **Local NVMe disk on the ripclone server is a disposable build cache.**
 - **Cache warmers in Fly regions pull objects into Tigris edge caches** after each build.
-- Retention evicts local-only objects only after confirming they exist in Tigris.
-- Remote GC reclaims unreferenced durable chunks via an unreachable-since orphan ledger, floored at the signed-URL TTL so an in-flight clone can't lose its chunks. Safe to enable but **off by default** (`RIPCLONE_REMOTE_GC_INTERVAL_SECS`); see `docs/GC.md`.
+- Local cache trimming removes an object only after confirming it exists in
+  Tigris. Published exact rows and remote artifacts are not deleted.
 
 ## Success metrics
 

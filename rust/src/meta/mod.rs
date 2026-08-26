@@ -1,11 +1,10 @@
 //! Exact results in the server-owned SQLite control database.
 
-use crate::provider::{RepoId, parse_storage_key};
+use crate::provider::RepoId;
 use crate::ref_store::{AddedRepo, RefStore};
 use crate::{ExactResultKind, FilesResult, FullResult, HeadResult, RefInfo};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use std::time::SystemTime;
 
 pub mod libsql;
 
@@ -28,16 +27,7 @@ pub trait MetaDb: Send + Sync {
         expected_data: &str,
         new_data: &str,
     ) -> Result<bool>;
-    async fn compare_and_swap_result_if_job_inactive(
-        &self,
-        repo_key: &str,
-        commit: &str,
-        expected_data: &str,
-        new_data: &str,
-    ) -> Result<bool>;
-    async fn list_repos(&self) -> Result<Vec<String>>;
     async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>>;
-    async fn delete_result(&self, repo_key: &str, commit: &str) -> Result<()>;
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()>;
     async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>>;
     async fn remove_added_repo(&self, repo_key: &str) -> Result<()>;
@@ -89,13 +79,6 @@ impl SqlRefStore {
             .await;
         }
         anyhow::bail!("exact result {repo_key}@{commit}: repeated write conflicts")
-    }
-
-    fn publication_time() -> Option<u64> {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()
-            .map(|duration| duration.as_secs())
     }
 }
 
@@ -158,11 +141,8 @@ impl RefStore for SqlRefStore {
             crate::exact_output_artifacts_ready(commit, ExactResultKind::Head, &head.clonepack),
             "invalid Head result for {commit}"
         );
-        let published_at = Self::publication_time();
         self.update_result(repo_id, commit, move |info| {
             info.head = Some(head.clone());
-            info.synced_at = published_at;
-            info.last_accessed_at = published_at;
             true
         })
         .await
@@ -173,13 +153,11 @@ impl RefStore for SqlRefStore {
             crate::exact_output_artifacts_ready(commit, ExactResultKind::Full, &full.clonepack),
             "invalid Full result for {commit}"
         );
-        let published_at = Self::publication_time();
         self.update_result(repo_id, commit, move |info| {
             if crate::exact_output_ready(info, ExactResultKind::Full, commit) {
                 false
             } else {
                 info.full = Some(full.clone());
-                info.last_accessed_at = published_at;
                 true
             }
         })
@@ -196,64 +174,15 @@ impl RefStore for SqlRefStore {
             crate::exact_output_artifacts_ready(commit, ExactResultKind::Files, &files.clonepack),
             "invalid Files result for {commit}"
         );
-        let published_at = Self::publication_time();
         self.update_result(repo_id, commit, move |info| {
             if crate::exact_output_ready(info, ExactResultKind::Files, commit) {
                 false
             } else {
                 info.files = Some(files.clone());
-                info.last_accessed_at = published_at;
                 true
             }
         })
         .await
-    }
-
-    async fn evict_if_unchanged(&self, repo_id: &RepoId, expected: &RefInfo) -> Result<bool> {
-        crate::validation::validate_object_id(&expected.commit)
-            .context("validate exact result selected for eviction")?;
-        let mut evicted = expected.clone();
-        evicted.head = None;
-        evicted.full = None;
-        evicted.files = None;
-        let repo_key = repo_id.storage_key();
-        let expected_data =
-            serde_json::to_string(expected).context("serialize expected exact result")?;
-        let evicted_data = serde_json::to_string(&evicted).context("serialize evicted result")?;
-        self.db
-            .compare_and_swap_result_if_job_inactive(
-                &repo_key,
-                &expected.commit,
-                &expected_data,
-                &evicted_data,
-            )
-            .await
-            .context("conditionally evict inactive exact result")
-    }
-
-    async fn list(&self) -> Result<Vec<RepoId>> {
-        Ok(self
-            .db
-            .list_repos()
-            .await?
-            .into_iter()
-            .filter_map(|key| parse_storage_key(&key))
-            .collect())
-    }
-
-    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
-        self.update_result(repo_id, commit, |info| {
-            info.last_accessed_at = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs());
-            true
-        })
-        .await
-    }
-
-    async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
-        self.db.delete_result(&repo_id.storage_key(), commit).await
     }
 
     async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
@@ -415,49 +344,5 @@ mod tests {
         assert!(result.full.is_some());
         assert!(result.files.is_some());
         assert!(result.files.unwrap().archive_chunks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn exact_result_publication_wins_over_stale_eviction() {
-        let tmp = tempfile::tempdir().unwrap();
-        let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
-            .await
-            .unwrap();
-        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
-        let repo = RepoId::github("acme/eviction-race");
-        let commit = "c".repeat(40);
-        let selected = RefInfo {
-            commit: commit.clone(),
-            head: Some(crate::HeadResult {
-                clonepack: artifacts(&commit, "old-head"),
-                ..Default::default()
-            }),
-            last_accessed_at: Some(1),
-            ..Default::default()
-        };
-        store.save_result(&repo, &selected).await.unwrap();
-
-        store
-            .publish_full(
-                &repo,
-                &commit,
-                crate::FullResult {
-                    clonepack: artifacts(&commit, "new-full"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(!store.evict_if_unchanged(&repo, &selected).await.unwrap());
-
-        let result = store.load_result(&repo, &commit).await.unwrap().unwrap();
-        assert_eq!(
-            result.head.unwrap().clonepack.manifest,
-            crate::cas::hash(b"old-head-manifest")
-        );
-        assert_eq!(
-            result.full.unwrap().clonepack.manifest,
-            crate::cas::hash(b"new-full-manifest")
-        );
     }
 }

@@ -25,8 +25,14 @@ storage. Local filesystem storage uses the same hash-checked file install path;
 S3-compatible storage uses sized streaming uploads.
 
 For remote storage, the local CAS is a build cache. After successful upload and
-retention protection, large local artifacts may be evicted. Future syncs can
-rebuild archive bundles from durable per-frame chunks in storage.
+durable-copy verification, large local artifacts may be removed immediately or
+trimmed later by age or size. The local Git mirror is also disposable. A later
+build may fetch Git again or read a published parent artifact from S3.
+
+Published exact Head, Full, and Files results do not expire. Local-storage
+deployments keep their published artifact bytes on local disk. S3-compatible
+deployments keep the published bytes in S3; local cache cleanup never changes
+exact-result metadata and never deletes remote objects.
 
 ## Serve
 
@@ -43,6 +49,7 @@ from the HEAD-closure pack while history-only packs remain on disk for Git.
 
 - A hash mismatch is corruption and must fail closed.
 - A missing local CAS object may fall back to durable storage.
+- Local cache cleanup removes an object only after confirming its remote copy.
 - A corrupt local CAS object must not be silently replaced after its bytes have
   entered an output artifact.
 - Metadata and manifests are small enough to use buffered APIs; large packs,

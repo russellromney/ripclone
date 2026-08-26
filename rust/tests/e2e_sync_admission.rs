@@ -85,6 +85,34 @@ async fn wait_until_exact_job_failed(server: &Server, repo: &str, commit: &str) 
     .expect("exact job reached durable Failed state")
 }
 
+async fn wait_until_exact_job_done(server: &Server, repo: &str, commit: &str) {
+    let queue = ripclone::queue::SqlJobQueue::new(Box::new(
+        ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
+            .await
+            .expect("connect exact job observer"),
+    ))
+    .await
+    .expect("open exact job observer");
+    let key = format!(
+        "{}\x1f{commit}",
+        ripclone::provider::RepoId::github(repo).storage_key()
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match ripclone::queue::JobQueue::job_state_for_key(&queue, &key)
+                .await
+                .expect("read exact job state")
+            {
+                ripclone::queue::JobState::Done => break,
+                ripclone::queue::JobState::Pending => tokio::task::yield_now().await,
+                state => panic!("exact job settled as {state:?}"),
+            }
+        }
+    })
+    .await
+    .expect("exact job reached durable Done state");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_b_and_c_admissions_create_independent_exact_work() {
     let _guard = env_lock().lock().await;
@@ -1109,6 +1137,8 @@ async fn e2e_sync_admission() {
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))
         .await
         .expect("B and C full publications completed");
+    wait_until_exact_job_done(&server, "acme/immutable", &b).await;
+    wait_until_exact_job_done(&server, "acme/immutable", &c).await;
 
     let store = server_ref_store(&server).await;
     let repo_id = ripclone::provider::RepoId::github("acme/immutable");
@@ -1489,40 +1519,26 @@ async fn e2e_sync_admission() {
     assert_eq!(probe.tip_probes.load(Ordering::SeqCst), 0);
     assert!(probe.fetch_targets.lock().unwrap().is_empty());
 
-    // An evicted completed row is not treated as ready and its historical done
-    // job does not block one fresh exact admission.
-    let evicted_target = origin.commit(&[("value.txt", "evicted\n")], "evicted target");
+    // Hold an ordinary new exact job before claim so the CLI add path below
+    // proves registration and admission do not wait for unrelated build work.
+    let blocked_target = origin.commit(&[("value.txt", "blocked\n")], "blocked target");
     origin.publish();
-    let evicted = ripclone::RefInfo {
-        commit: evicted_target.clone(),
-        ..Default::default()
-    };
-    store
-        .save_result(&repo_id, &evicted)
-        .await
-        .expect("mark exact completed row evicted");
-    let evicted = store
-        .load_result(&repo_id, &evicted_target)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(evicted.head.is_none() && evicted.full.is_none() && evicted.files.is_none());
     reset_probe(&probe);
     probe.before_claim.arm();
-    let (evicted_status, evicted_body, evicted_elapsed) = post_sync(&server, None).await;
-    assert_eq!(evicted_status, reqwest::StatusCode::ACCEPTED);
-    assert_eq!(response_commit(&evicted_body), evicted_target);
+    let (blocked_status, blocked_body, blocked_elapsed) = post_sync(&server, None).await;
+    assert_eq!(blocked_status, reqwest::StatusCode::ACCEPTED);
+    assert_eq!(response_commit(&blocked_body), blocked_target);
     assert_eq!(
         probe
             .queue_inserts
             .load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "evicted target admitted exactly one fresh active job"
+        "new target admitted exactly one active job"
     );
     wait_entered(&probe.before_claim, 1).await;
 
     // The normal CLI add path returns after registration and admission while
-    // the real worker remains held at the evicted job's before-claim barrier.
+    // the real worker remains held at the earlier job's before-claim barrier.
     let add_origin = make_origin("acme", "cli-add");
     let add_commit = add_origin.commit(&[("added.txt", "added\n")], "CLI add");
     add_origin.publish();
@@ -1543,14 +1559,16 @@ async fn e2e_sync_admission() {
             .queue_inserts
             .load(std::sync::atomic::Ordering::SeqCst),
         2,
-        "evicted sync and CLI add each admitted one exact job"
+        "blocked sync and CLI add each admitted one exact job"
     );
     probe.before_claim.release();
     probe.before_claim.disarm();
+    wait_until_exact_job_done(&server, "acme/immutable", &blocked_target).await;
+    wait_until_exact_job_done(&server, "acme/cli-add", &add_commit).await;
     eprintln!(
-        "closed_gap_timings_ms cancellation={} evicted_readmission={} cli_add={} active_rows_evicted=1 active_rows_cli_add=1",
+        "closed_gap_timings_ms cancellation={} blocked_admission={} cli_add={} active_rows_blocked=1 active_rows_cli_add=1",
         cancel_started.elapsed().as_millis(),
-        evicted_elapsed.as_millis(),
+        blocked_elapsed.as_millis(),
         cli_add_elapsed.as_millis(),
     );
 }

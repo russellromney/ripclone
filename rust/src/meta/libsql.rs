@@ -111,73 +111,6 @@ impl MetaDb for LibsqlMeta {
         Ok(changed == 1)
     }
 
-    async fn compare_and_swap_result_if_job_inactive(
-        &self,
-        repo_key: &str,
-        commit: &str,
-        expected_data: &str,
-        new_data: &str,
-    ) -> Result<bool> {
-        let conn = self.conn().await?;
-        let tx = conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await
-            .context("begin inactive-result eviction")?;
-        let mut table_rows = tx
-            .query(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs' LIMIT 1",
-                (),
-            )
-            .await
-            .context("check job table for exact-result eviction")?;
-        let jobs_exist = table_rows.next().await?.is_some();
-        drop(table_rows);
-
-        if jobs_exist {
-            let job_key = format!("{repo_key}\x1f{commit}");
-            let mut active_rows = tx
-                .query(
-                    "SELECT 1 FROM jobs
-                     WHERE key = ?1 AND status IN ('queued', 'claimed') LIMIT 1",
-                    [job_key.as_str()],
-                )
-                .await
-                .context("check active job for exact-result eviction")?;
-            let active = active_rows.next().await?.is_some();
-            drop(active_rows);
-            if active {
-                tx.rollback().await.ok();
-                return Ok(false);
-            }
-        }
-
-        let changed = tx
-            .execute(
-                "UPDATE results SET data = ?1
-                 WHERE repo_key = ?2 AND commit_id = ?3 AND data = ?4",
-                libsql::params![new_data, repo_key, commit, expected_data],
-            )
-            .await
-            .context("compare-and-swap inactive exact result")?;
-        tx.commit()
-            .await
-            .context("commit inactive-result eviction")?;
-        Ok(changed == 1)
-    }
-
-    async fn list_repos(&self) -> Result<Vec<String>> {
-        let conn = self.conn().await?;
-        let mut rows = conn
-            .query("SELECT DISTINCT repo_key FROM results", ())
-            .await
-            .context("list result repositories")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(row.get::<String>(0)?);
-        }
-        Ok(out)
-    }
-
     async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -192,18 +125,6 @@ impl MetaDb for LibsqlMeta {
             out.push(row.get::<String>(0)?);
         }
         Ok(out)
-    }
-
-    async fn delete_result(&self, repo_key: &str, commit: &str) -> Result<()> {
-        self.conn()
-            .await?
-            .execute(
-                "DELETE FROM results WHERE repo_key = ? AND commit_id = ?",
-                libsql::params![repo_key, commit],
-            )
-            .await
-            .context("delete exact result")?;
-        Ok(())
     }
 
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {

@@ -1854,12 +1854,8 @@ mod tests {
             anyhow::bail!("unsupported")
         }
 
-        fn delete(&self, _hash: &str) -> Result<()> {
+        fn verify_durable_copy(&self, _hash: &str) -> Result<()> {
             anyhow::bail!("unsupported")
-        }
-
-        fn list_hashes(&self) -> Result<Vec<crate::storage::HashEntry>> {
-            Ok(Vec::new())
         }
     }
 

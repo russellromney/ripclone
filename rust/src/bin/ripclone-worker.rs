@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
     let metrics = Metrics::new();
     let b = Backends::from_env_with_ref_store(&args.cas_dir, &args.repo_root, &metrics, ref_store)
         .await?;
+    b.cache_retention.clone().spawn_from_env();
     let state = ServerState::for_worker(b, build_queue, metrics)?;
 
     // Fleet-unique id (host/machine + pid + start nanos). PID-only collides
@@ -249,7 +250,7 @@ async fn main() -> Result<()> {
                 }
                 // The server is authoritative between jobs. A previous job may
                 // have populated this worker's process-local exact-result cache
-                // before server-side eviction admitted the same commit again.
+                // before a later new request admitted the same commit again.
                 state.ref_store.invalidate(&repo_id, &admitted_commit).await;
                 // Prefer the per-job upstream credential the enqueuer persisted
                 // (the cloud's per-request X-Upstream-Token, for a private repo

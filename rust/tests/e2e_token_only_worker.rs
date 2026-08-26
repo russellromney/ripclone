@@ -10,11 +10,104 @@ use ripclone::provider::RepoId;
 use ripclone::queue::{BuildJob, JobQueue, JobState};
 use ripclone::ref_store::{AddedRepo, AddedRepoSource};
 use ripclone::server::{RateLimiter, ServerState, build_app};
-use ripclone::storage::StorageBackend;
+use ripclone::{ClonepackArtifacts, RefInfo};
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+fn record_clonepack_hashes(hashes: &mut BTreeSet<String>, clonepack: &ClonepackArtifacts) {
+    for hash in [
+        &clonepack.manifest,
+        &clonepack.metadata_chunk,
+        &clonepack.skeleton_pack,
+        &clonepack.skeleton_idx,
+        &clonepack.prebuilt_index,
+        &clonepack.midx,
+        &clonepack.idx_bundle,
+    ] {
+        if !hash.is_empty() {
+            hashes.insert(hash.clone());
+        }
+    }
+}
+
+fn published_hashes(result: &RefInfo) -> BTreeSet<String> {
+    let mut hashes = BTreeSet::new();
+    if let Some(head) = &result.head {
+        record_clonepack_hashes(&mut hashes, &head.clonepack);
+        for pack in &head.packs {
+            hashes.insert(pack.pack.clone());
+            hashes.insert(pack.idx.clone());
+        }
+        for pack in &head.base_packs {
+            hashes.insert(pack.pack.clone());
+            hashes.insert(pack.idx.clone());
+        }
+    }
+    if let Some(full) = &result.full {
+        record_clonepack_hashes(&mut hashes, &full.clonepack);
+        for pack in &full.packs {
+            hashes.insert(pack.pack.clone());
+            hashes.insert(pack.idx.clone());
+        }
+        for level in &full.history_levels {
+            for pack in &level.packs {
+                hashes.insert(pack.pack.clone());
+                hashes.insert(pack.idx.clone());
+            }
+        }
+    }
+    if let Some(files) = &result.files {
+        record_clonepack_hashes(&mut hashes, &files.clonepack);
+        hashes.extend(files.archive_chunks.iter().cloned());
+        hashes.extend(
+            files
+                .archive_frames
+                .iter()
+                .map(|frame| frame.chunk_hash.clone()),
+        );
+    }
+    hashes.retain(|hash| !hash.is_empty());
+    hashes
+}
+
+async fn job_count(control_path: &std::path::Path, repo: &str) -> i64 {
+    let database = libsql::Builder::new_local(control_path)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    let mut rows = connection
+        .query("SELECT COUNT(*) FROM jobs WHERE path = ?1", [repo])
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+}
 
 // Hosted embedded replicas bootstrap through libsql's blocking bridge, matching
 // the server binary's multi-thread Tokio runtime.
@@ -48,6 +141,8 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     let cas_dir = dir.path().join("cas");
     let repo_root = dir.path().join("repos");
     let control_path = dir.path().join("control.db");
+    let _cache_max_age =
+        require_turso.then(|| ScopedEnvVar::set("RIPCLONE_RETENTION_MAX_AGE_DAYS", "1"));
     // A short lease makes the real child prove renewal repeatedly while Full
     // is held. The worker command intentionally does not enable optional idle
     // fleet heartbeats.
@@ -95,6 +190,33 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     .unwrap();
     let queue = control.queue();
     let artifact_storage = backends.storage.clone();
+    let cache_cleanup_fixture = if require_turso {
+        let cache_only_hash = backends
+            .cas
+            .put(b"cache-only object without a durable remote copy")
+            .unwrap();
+        let cache_only_path = backends.cas.path(&cache_only_hash);
+        let durable_bytes = b"old local object with a durable remote copy";
+        let durable_hash = backends.cas.put(durable_bytes).unwrap();
+        let durable_path = backends.cas.path(&durable_hash);
+        filetime::set_file_mtime(&cache_only_path, filetime::FileTime::from_unix_time(1, 0))
+            .unwrap();
+        filetime::set_file_mtime(&durable_path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+
+        assert!(
+            artifact_storage
+                .verify_durable_copy(&cache_only_hash)
+                .is_err(),
+            "cache-only bytes must not count as a durable remote copy"
+        );
+        artifact_storage.put(&durable_hash, durable_bytes).unwrap();
+        artifact_storage
+            .verify_durable_copy(&durable_hash)
+            .expect("uploaded cache fixture has a durable remote copy");
+        Some((cache_only_path, durable_path, durable_hash))
+    } else {
+        None
+    };
     let provider_registry = ripclone::provider::ProviderRegistry::new();
     let state = ServerState {
         cas: backends.cas,
@@ -107,7 +229,6 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         jwt: None,
         metrics,
         rate_limiter: RateLimiter::new(1_000_000, 1_000_000.0),
-        retention: backends.retention,
         build_queue: queue.clone(),
         control_db: Some(control.clone()),
         worker_queue: Some(queue.clone()),
@@ -167,7 +288,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         .arg("--idle-poll-ms")
         .arg("20")
         .arg("--max-jobs")
-        .arg("2")
+        .arg("1")
         .env("RIPCLONE_QUEUE_API_URL", &server_url)
         .env(
             "RIPCLONE_CONFIG",
@@ -215,7 +336,23 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     unsafe { std::env::set_var("RIPCLONE_CONTROL_DB_PATH", &decoy) };
     let mut child = command.spawn().unwrap();
     unsafe { std::env::remove_var("RIPCLONE_CONTROL_DB_PATH") };
-    let client = ripclone::client::Client::new_with_token(server_url, Some(token_hash()));
+    if let Some((cache_only_path, durable_path, durable_hash)) = &cache_cleanup_fixture {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while durable_path.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("API worker cleaned its old remote-backed CAS object");
+        assert!(
+            cache_only_path.exists(),
+            "API worker cleanup must retain bytes without a durable remote copy"
+        );
+        artifact_storage
+            .verify_durable_copy(durable_hash)
+            .expect("API worker cleanup retained the durable MinIO object");
+    }
+    let client = ripclone::client::Client::new_with_token(server_url.clone(), Some(token_hash()));
     let admission = tokio::time::timeout(
         Duration::from_secs(30),
         client.admit_sync_repo("acme/api-only", None),
@@ -299,46 +436,6 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         .unwrap()
         .expect("first API worker job published the exact result");
     assert!(first.head.is_some() && first.full.is_some() && first.files.is_some());
-    assert!(
-        refs.evict_if_unchanged(&RepoId::github("acme/api-only"), &first)
-            .await
-            .unwrap(),
-        "completed exact result is evicted between jobs"
-    );
-    let evicted = refs
-        .load_result(&RepoId::github("acme/api-only"), &commit)
-        .await
-        .unwrap()
-        .expect("evicted exact row remains available for readmission");
-    assert!(evicted.head.is_none() && evicted.full.is_none() && evicted.files.is_none());
-
-    std::fs::remove_file(full_barrier.join("entered")).unwrap();
-    std::fs::remove_file(full_barrier.join("proceed")).unwrap();
-    let replacement = tokio::time::timeout(
-        Duration::from_secs(30),
-        client.admit_sync_repo("acme/api-only", None),
-    )
-    .await
-    .expect("replacement API worker job admitted within the bound")
-    .expect("replacement API worker admission succeeded");
-    assert_eq!(replacement.commit, commit);
-
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !full_barrier.join("entered").exists() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("same API worker rebuilt Head after server-side eviction");
-    let rebuilt = refs
-        .load_result(&RepoId::github("acme/api-only"), &commit)
-        .await
-        .unwrap()
-        .expect("same API worker republished Head");
-    assert!(rebuilt.head.is_some(), "replacement job rebuilt Head");
-    assert!(rebuilt.full.is_none(), "replacement Full remains held");
-    std::fs::write(full_barrier.join("proceed"), b"proceed\n").unwrap();
-
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -347,7 +444,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         }
         assert!(
             Instant::now() < deadline,
-            "same worker did not finish both API jobs"
+            "API worker did not finish its job"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -356,6 +453,167 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         0,
         "settled API work must not leave a fresh worker-registry row"
     );
+
+    let first_json = serde_json::to_string(&first).unwrap();
+    let b_hashes = published_hashes(&first);
+    assert!(!b_hashes.is_empty());
+
+    if require_turso {
+        for hash in &b_hashes {
+            artifact_storage
+                .verify_durable_copy(hash)
+                .unwrap_or_else(|error| panic!("published B object {hash} is missing: {error:#}"));
+        }
+
+        std::fs::remove_dir_all(&cas_dir).expect("remove worker local CAS");
+        std::fs::remove_dir_all(&worker_repos).expect("remove worker local mirror");
+        assert!(!cas_dir.exists());
+        assert!(!worker_repos.exists());
+
+        let offline_bare = origin.bare.with_extension("git.offline");
+        std::fs::rename(&origin.bare, &offline_bare).expect("make upstream unavailable");
+
+        let second_token = mint_job_token(&secret, Duration::from_secs(300)).unwrap();
+        let mut second_command = Command::new(cargo_bin("ripclone-worker"));
+        second_command
+            .arg("--cas-dir")
+            .arg(&worker_cas)
+            .arg("--repo-root")
+            .arg(&worker_repos)
+            .arg("--idle-poll-ms")
+            .arg("20")
+            .arg("--max-jobs")
+            .arg("1")
+            .env("RIPCLONE_QUEUE_API_URL", &server_url)
+            .env(
+                "RIPCLONE_CONFIG",
+                dir.path().join("worker-config-missing.toml"),
+            )
+            .env(
+                "RIPCLONE_METADATA_REPORT_URL",
+                format!("{server_url}/v1/refs"),
+            )
+            .env("RIPCLONE_METADATA_JOB_TOKEN", second_token)
+            .env("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS", "3")
+            .env("RIPCLONE_TESTING", "1")
+            .env_remove("RIPCLONE_WORKER_HEARTBEAT")
+            .env_remove("RIPCLONE_CONTROL_DB_PATH")
+            .env_remove("RIPCLONE_TURSO_DATABASE_URL")
+            .env_remove("RIPCLONE_TURSO_AUTH_TOKEN")
+            .env_remove("RIPCLONE_METADATA_DB_URL")
+            .env_remove("RIPCLONE_METADATA_DB_TOKEN")
+            .env_remove("RIPCLONE_QUEUE_DB_URL")
+            .env_remove("RIPCLONE_QUEUE_DB_TOKEN")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let mut second_worker = second_command.spawn().unwrap();
+
+        let jobs_before_clones = job_count(&control_path, "acme/api-only").await;
+        assert_eq!(jobs_before_clones, 1);
+        for (name, mode, clonepack) in [
+            ("head", CloneMode::Editable, "shallow"),
+            ("full", CloneMode::Editable, "full"),
+            ("files", CloneMode::Files, "full"),
+        ] {
+            let target = dir.path().join(format!("empty-cache-b-{name}"));
+            let outcome = client
+                .install_repo_with_mode_at(
+                    "acme/api-only",
+                    "main",
+                    Some(&commit),
+                    &target,
+                    mode,
+                    Some(clonepack),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("clone exact B {name}: {error:#}"));
+            assert_eq!(outcome.commit, commit);
+            assert_eq!(
+                std::fs::read_to_string(target.join("value.txt")).unwrap(),
+                "built by API worker\n"
+            );
+            if mode == CloneMode::Editable {
+                assert_eq!(git(&target, &["rev-parse", "HEAD"]), commit);
+            }
+        }
+        assert_eq!(
+            job_count(&control_path, "acme/api-only").await,
+            jobs_before_clones,
+            "ready exact B clones must enqueue no job"
+        );
+        let unchanged = refs
+            .load_result(&RepoId::github("acme/api-only"), &commit)
+            .await
+            .unwrap()
+            .expect("B remains published after empty-cache clones");
+        assert_eq!(serde_json::to_string(&unchanged).unwrap(), first_json);
+        for hash in &b_hashes {
+            artifact_storage
+                .verify_durable_copy(hash)
+                .unwrap_or_else(|error| panic!("B object {hash} disappeared: {error:#}"));
+        }
+
+        std::fs::rename(&offline_bare, &origin.bare).expect("restore upstream for C");
+        let c = origin.commit(&[("value.txt", "built C from empty caches\n")], "C");
+        origin.publish();
+        let c_admission = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.admit_sync_repo("acme/api-only", None),
+        )
+        .await
+        .expect("C admitted within the bound")
+        .expect("C admission succeeds from empty caches");
+        assert_eq!(c_admission.commit, c);
+
+        let c_key = format!("{}\x1f{c}", RepoId::github("acme/api-only").storage_key());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if matches!(
+                    queue.job_state_for_key(&c_key).await.unwrap(),
+                    JobState::Done
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("C API worker job settled");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = second_worker.try_wait().unwrap() {
+                assert!(status.success(), "restarted worker exited {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restarted worker did not build C"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let c_result = refs
+            .load_result(&RepoId::github("acme/api-only"), &c)
+            .await
+            .unwrap()
+            .expect("C exact result exists");
+        assert!(
+            c_result.head.is_some() && c_result.full.is_some() && c_result.files.is_some(),
+            "C builds every output from empty local caches"
+        );
+        assert_eq!(job_count(&control_path, "acme/api-only").await, 2);
+        let unchanged = refs
+            .load_result(&RepoId::github("acme/api-only"), &commit)
+            .await
+            .unwrap()
+            .expect("B remains published after C");
+        assert_eq!(serde_json::to_string(&unchanged).unwrap(), first_json);
+        for hash in &b_hashes {
+            artifact_storage
+                .verify_durable_copy(hash)
+                .unwrap_or_else(|error| panic!("B object {hash} missing after C: {error:#}"));
+        }
+    }
 
     let snapshot_database = libsql::Builder::new_local(&control_path)
         .build()
@@ -380,23 +638,13 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     }
     assert_eq!(
         snapshots.len(),
-        2,
-        "one long-lived API worker must settle the initial and replacement jobs"
+        if require_turso { 2 } else { 1 },
+        "each API-worker build must have exactly one durable job"
     );
     assert_eq!(snapshots[0], admitted_config);
-    assert_eq!(snapshots[1].compression_level, Some(19));
-    let removed_config_key = format!(
-        "repo-config/{}.json",
-        RepoId::github("acme/api-only").storage_key()
-    );
-    assert!(
-        artifact_storage
-            .get_meta(&removed_config_key)
-            .await
-            .unwrap()
-            .is_none(),
-        "artifact storage must not receive repository configuration metadata"
-    );
+    if require_turso {
+        assert_eq!(snapshots[1].compression_level, Some(19));
+    }
 
     let clone = dir.path().join("clone");
     client
@@ -417,17 +665,6 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
     );
     assert_eq!(git(&clone, &["rev-parse", "HEAD"]), commit);
     assert_eq!(control.is_turso_replica(), require_turso);
-    if require_turso {
-        let s3 = ripclone::storage::S3Storage::from_env()
-            .expect("configure required S3 fixture")
-            .expect("required S3 fixture is enabled");
-        assert!(
-            !s3.list_hashes()
-                .expect("list required S3 artifacts")
-                .is_empty(),
-            "API worker uploaded artifacts to S3"
-        );
-    }
     assert!(!decoy.exists(), "worker opened the decoy control database");
     assert!(
         control_path.exists(),

@@ -24,10 +24,10 @@ pub struct Metrics {
     artifact_requests: AtomicU64,
     artifact_bytes_served: AtomicU64,
     errors: AtomicU64,
-    retention_runs: AtomicU64,
-    retention_evicted_bytes: AtomicU64,
-    retention_evicted_objects: AtomicU64,
-    retention_errors: AtomicU64,
+    local_cache_cleanup_runs: AtomicU64,
+    local_cache_removed_bytes: AtomicU64,
+    local_cache_removed_objects: AtomicU64,
+    local_cache_cleanup_errors: AtomicU64,
     builds_queued: AtomicU64,
     builds_completed: AtomicU64,
     builds_failed: AtomicU64,
@@ -72,16 +72,18 @@ impl Metrics {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_retention_run(&self, evicted_bytes: u64, evicted_objects: u64) {
-        self.retention_runs.fetch_add(1, Ordering::Relaxed);
-        self.retention_evicted_bytes
-            .fetch_add(evicted_bytes, Ordering::Relaxed);
-        self.retention_evicted_objects
-            .fetch_add(evicted_objects, Ordering::Relaxed);
+    pub fn record_local_cache_cleanup(&self, removed_bytes: u64, removed_objects: u64) {
+        self.local_cache_cleanup_runs
+            .fetch_add(1, Ordering::Relaxed);
+        self.local_cache_removed_bytes
+            .fetch_add(removed_bytes, Ordering::Relaxed);
+        self.local_cache_removed_objects
+            .fetch_add(removed_objects, Ordering::Relaxed);
     }
 
-    pub fn record_retention_error(&self) {
-        self.retention_errors.fetch_add(1, Ordering::Relaxed);
+    pub fn record_local_cache_cleanup_error(&self) {
+        self.local_cache_cleanup_errors
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment the queue-depth gauge when a job is accepted into (or about
@@ -203,24 +205,24 @@ impl Metrics {
             ),
             ("ripclone_errors_total", "Request errors", s.errors),
             (
-                "ripclone_retention_runs_total",
-                "Retention runs",
-                s.retention_runs,
+                "ripclone_local_cache_cleanup_runs_total",
+                "Local cache cleanup runs",
+                s.local_cache_cleanup_runs,
             ),
             (
-                "ripclone_retention_evicted_bytes_total",
-                "Bytes evicted by retention",
-                s.retention_evicted_bytes,
+                "ripclone_local_cache_removed_bytes_total",
+                "Bytes removed from the local build cache",
+                s.local_cache_removed_bytes,
             ),
             (
-                "ripclone_retention_evicted_objects_total",
-                "Objects evicted by retention",
-                s.retention_evicted_objects,
+                "ripclone_local_cache_removed_objects_total",
+                "Objects removed from the local build cache",
+                s.local_cache_removed_objects,
             ),
             (
-                "ripclone_retention_errors_total",
-                "Retention errors",
-                s.retention_errors,
+                "ripclone_local_cache_cleanup_errors_total",
+                "Local cache cleanup errors",
+                s.local_cache_cleanup_errors,
             ),
             (
                 "ripclone_builds_queued_total",
@@ -282,10 +284,10 @@ impl Metrics {
             artifact_requests: self.artifact_requests.load(Ordering::Relaxed),
             artifact_bytes_served: self.artifact_bytes_served.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
-            retention_runs: self.retention_runs.load(Ordering::Relaxed),
-            retention_evicted_bytes: self.retention_evicted_bytes.load(Ordering::Relaxed),
-            retention_evicted_objects: self.retention_evicted_objects.load(Ordering::Relaxed),
-            retention_errors: self.retention_errors.load(Ordering::Relaxed),
+            local_cache_cleanup_runs: self.local_cache_cleanup_runs.load(Ordering::Relaxed),
+            local_cache_removed_bytes: self.local_cache_removed_bytes.load(Ordering::Relaxed),
+            local_cache_removed_objects: self.local_cache_removed_objects.load(Ordering::Relaxed),
+            local_cache_cleanup_errors: self.local_cache_cleanup_errors.load(Ordering::Relaxed),
             builds_queued: self.builds_queued.load(Ordering::Relaxed),
             builds_completed,
             build_avg_ms: if builds_completed == 0 {
@@ -338,10 +340,10 @@ pub struct MetricsSnapshot {
     pub artifact_requests: u64,
     pub artifact_bytes_served: u64,
     pub errors: u64,
-    pub retention_runs: u64,
-    pub retention_evicted_bytes: u64,
-    pub retention_evicted_objects: u64,
-    pub retention_errors: u64,
+    pub local_cache_cleanup_runs: u64,
+    pub local_cache_removed_bytes: u64,
+    pub local_cache_removed_objects: u64,
+    pub local_cache_cleanup_errors: u64,
     pub builds_queued: u64,
     pub builds_completed: u64,
     pub build_avg_ms: u64,

@@ -185,7 +185,6 @@ async fn wait_for_files_job_settled(server: &Server, repo: &str, commit: &str) {
                         && reference["full"] == true
                         && reference["files"] == true
                         && reference["job"] == "done"
-                        && reference["warm"] == true
                 })
             }) {
                 return;
@@ -2256,14 +2255,14 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
         .expect("sync Full(B)");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires digest-pinned MinIO runner"]
 async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
     let _guard = env_lock().lock().await;
     assert_eq!(
         std::env::var("RIPCLONE_REQUIRE_MINIO").as_deref(),
         Ok("1"),
-        "run through scripts/e2e_clone_pinning_minio.sh"
+        "run through scripts/e2e_full_topup_minio.sh"
     );
     init(false);
     let controls = tempfile::tempdir().unwrap();
@@ -2273,15 +2272,9 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
     // URLs are rewritten through this audit hop, which records the artifact
     // request headers before forwarding them byte-for-byte to MinIO.
     let _signed_url_proxy = ScopedEnvVar::set("RIPCLONE_TEST_SIGNED_URL_PROXY", &audit.url);
-    // Production's optional local cache keeps server-side build reads off the
-    // single-threaded fixture runtime. Client artifact reads still use real
-    // MinIO presigned URLs through `audit`.
-    let server_cache_dir =
-        ScopedEnvVar::set("RIPCLONE_S3_CACHE_DIR", controls.path().join("s3-cache"));
     let server = start_server().await;
     let (clone_proxy, refresh_entered, refresh_proceed) =
         start_clone_id_proxy_with_pinned_pause(&server.url, 2).await;
-    drop(server_cache_dir);
     let origin = make_origin("acme", "full-topup-minio");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
@@ -2301,16 +2294,21 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
         .await
         .expect("wait for MinIO Full(A)");
     assert_eq!(ready_a.commit, a);
-    let server_cas =
-        Cas::new(controls.path().join("s3-cache")).expect("open production S3 local cache");
     let client_cache_dir = controls.path().join("client-cache");
-    let client_cache = Cas::new(&client_cache_dir).expect("open explicit client cache");
+    let priming_client = ripclone::client::Client::new_with_token_and_cache(
+        server.url.clone(),
+        Some(token_hash()),
+        Some(&client_cache_dir),
+    );
     for hash in [&ready_a.clonepack_manifest, &ready_a.metadata_chunk] {
-        let bytes = server_cas.get(hash).expect("read base setup artifact");
-        client_cache
-            .put_with_hash(hash, &bytes)
-            .expect("prime base setup artifact in explicit client cache");
+        priming_client
+            .fetch_artifact(hash)
+            .await
+            .expect("prime base setup artifact from MinIO");
     }
+    audit
+        .signed_requests
+        .store(0, std::sync::atomic::Ordering::SeqCst);
 
     let head_barrier = controls.path().join("after-head");
     let staging_barrier = controls.path().join("staging-barrier");
