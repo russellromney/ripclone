@@ -2192,6 +2192,205 @@ signed_requests_without_ripclone_auth={}",
             .all(|request| request.contains("signed=true ripclone_authorization=false")),
     );
 
+    // Buffered Files chunks and Head packs restart only themselves from byte
+    // zero after obtaining a fresh exact-C URL. Both pauses occur before the
+    // real MinIO request, so the initial signed URL genuinely expires.
+    let ready_c_files = server
+        .client()
+        .resolve_exact_result(
+            "acme/resume-minio",
+            "main",
+            ripclone::ExactResultKind::Files,
+            Some(&c),
+        )
+        .await
+        .expect("resolve exact Files(C)");
+    let (c_files_manifest, _) = server
+        .client()
+        .fetch_clonepack(&ready_c_files)
+        .await
+        .expect("fetch Files(C) manifest");
+    let archive_hash = ripclone::clonepack::hash_to_hex(
+        &c_files_manifest
+            .archive_chunks
+            .first()
+            .expect("Files(C) publishes an archive chunk")
+            .hash,
+    );
+    {
+        let pause = controls.path().join("buffered-files-pause");
+        let buffered_audit = controls.path().join("buffered-files-audit.log");
+        let _pause_hash = ScopedEnvVar::set("RIPCLONE_TEST_PAUSE_BUFFERED_ARTIFACT", &archive_hash);
+        let _pause_dir = ScopedEnvVar::set("RIPCLONE_TEST_PAUSE_BUFFERED_DIR", &pause);
+        let _buffered_audit = ScopedEnvVar::set("RIPCLONE_TEST_DOWNLOAD_AUDIT", &buffered_audit);
+        let files_output = tempfile::tempdir().expect("buffered Files output");
+        let files_target = files_output.path().join("clone");
+        let files_target_task = files_target.clone();
+        let files_client = server.client();
+        let files_commit = c.clone();
+        let files_clone = tokio::spawn(async move {
+            files_client
+                .install_repo_with_mode_at(
+                    "acme/resume-minio",
+                    "main",
+                    Some(&files_commit),
+                    files_target_task,
+                    CloneMode::Files,
+                    Some("full"),
+                    None,
+                )
+                .await
+        });
+        for _ in 0..800 {
+            if pause.join("entered").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(pause.join("entered").exists(), "archive chunk paused");
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let trace_start = probe
+            .http_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        std::fs::write(pause.join("proceed"), b"request expired archive URL\n").unwrap();
+        let files_outcome = tokio::time::timeout(Duration::from_secs(30), files_clone)
+            .await
+            .expect("buffered Files clone completed")
+            .expect("buffered Files task joined")
+            .expect("expired archive URL refreshed");
+        assert_eq!(files_outcome.commit, c);
+        assert_eq!(
+            std::fs::read_to_string(files_target.join("large.txt")).unwrap(),
+            c_text
+        );
+        let trace = probe
+            .http_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        assert_eq!(
+            trace[trace_start..]
+                .iter()
+                .filter(|event| event.contains(&format!("pinned={c}")))
+                .count(),
+            1,
+            "one exact-C archive URL refresh: {:?}",
+            &trace[trace_start..]
+        );
+        let audit_text = std::fs::read_to_string(&buffered_audit).expect("Files audit");
+        let requests: Vec<_> = audit_text
+            .lines()
+            .filter(|line| line.contains(&format!("hash={archive_hash}")))
+            .collect();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expired and refreshed archive: {requests:?}"
+        );
+        assert!(requests.iter().all(|request| request.contains("offset=0")));
+    }
+
+    let ready_c_head = server
+        .client()
+        .resolve_exact_result(
+            "acme/resume-minio",
+            "main",
+            ripclone::ExactResultKind::Head,
+            Some(&c),
+        )
+        .await
+        .expect("resolve exact Head(C)");
+    let (c_head_manifest, _) = server
+        .client()
+        .fetch_clonepack(&ready_c_head)
+        .await
+        .expect("fetch Head(C) manifest");
+    let head_pack_hash = c_head_manifest
+        .packs
+        .iter()
+        .find(|pack| !pack.history_only)
+        .and_then(|pack| pack.pack.as_ref())
+        .map(|pack| ripclone::clonepack::hash_to_hex(&pack.hash))
+        .expect("Head(C) publishes a head pack");
+    {
+        let pause = controls.path().join("buffered-head-pause");
+        let buffered_audit = controls.path().join("buffered-head-audit.log");
+        let _pause_hash =
+            ScopedEnvVar::set("RIPCLONE_TEST_PAUSE_BUFFERED_ARTIFACT", &head_pack_hash);
+        let _pause_dir = ScopedEnvVar::set("RIPCLONE_TEST_PAUSE_BUFFERED_DIR", &pause);
+        let _buffered_audit = ScopedEnvVar::set("RIPCLONE_TEST_DOWNLOAD_AUDIT", &buffered_audit);
+        let head_output = tempfile::tempdir().expect("buffered Head output");
+        let head_target = head_output.path().join("clone");
+        let head_target_task = head_target.clone();
+        let head_client = server.client();
+        let head_commit = c.clone();
+        let head_clone = tokio::spawn(async move {
+            head_client
+                .install_repo_with_mode_at(
+                    "acme/resume-minio",
+                    "main",
+                    Some(&head_commit),
+                    head_target_task,
+                    CloneMode::Editable,
+                    Some("shallow"),
+                    None,
+                )
+                .await
+        });
+        for _ in 0..800 {
+            if pause.join("entered").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(pause.join("entered").exists(), "head pack paused");
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let trace_start = probe
+            .http_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        std::fs::write(pause.join("proceed"), b"request expired head URL\n").unwrap();
+        let head_outcome = tokio::time::timeout(Duration::from_secs(30), head_clone)
+            .await
+            .expect("buffered Head clone completed")
+            .expect("buffered Head task joined")
+            .expect("expired head-pack URL refreshed");
+        assert_eq!(head_outcome.commit, c);
+        assert_eq!(git(&head_target, &["rev-parse", "HEAD"]), c);
+        let trace = probe
+            .http_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        assert_eq!(
+            trace[trace_start..]
+                .iter()
+                .filter(|event| event.contains(&format!("pinned={c}")))
+                .count(),
+            1,
+            "one exact-C head-pack URL refresh: {:?}",
+            &trace[trace_start..]
+        );
+        let audit_text = std::fs::read_to_string(&buffered_audit).expect("Head audit");
+        let requests: Vec<_> = audit_text
+            .lines()
+            .filter(|line| line.contains(&format!("hash={head_pack_hash}")))
+            .collect();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expired and refreshed head pack: {requests:?}"
+        );
+        assert!(requests.iter().all(|request| request.contains("offset=0")));
+    }
+    println!(
+        "MINIO_BUFFERED_REFRESH_EVIDENCE files_restart_offset=0 head_restart_offset=0 \
+exact_c_refreshes=2 no_whole_clone_restart=true"
+    );
+
     // Negative row: the signed transfer starts while repository access is
     // valid, but that access is actively revoked before the expired URL is
     // refreshed. The private staging tree must disappear without publishing a
@@ -2301,5 +2500,205 @@ signed_requests_without_ripclone_auth={}",
     probe.allow_repo_reads();
     println!(
         "MINIO_REVOCATION_EVIDENCE commit={c} active_revocation=true no_target=true cleanup=true"
+    );
+
+    // Top-up race: acquire a Full(A) plan while Full(B) is pending, interrupt
+    // A's real signed history response, then let Full(B) become ready before
+    // the expired URL is refreshed. Refresh must address immutable A directly;
+    // ready B must neither replace it nor make the clone fail.
+    let topup_server = start_server().await;
+    let topup_origin = make_origin("acme", "topup-refresh-minio");
+    let topup_a1 = noise(307);
+    topup_origin.commit(&[("large.txt", topup_a1.as_str())], "A1");
+    let topup_a2 = noise(311);
+    topup_origin.commit(&[("large.txt", topup_a2.as_str())], "A2");
+    let topup_a3 = noise(313);
+    let topup_a = topup_origin.commit(&[("large.txt", topup_a3.as_str())], "A3");
+    topup_origin.publish();
+    topup_server
+        .client()
+        .add_repo("acme/topup-refresh-minio")
+        .await
+        .expect("publish MinIO Full(A)");
+    let ready_topup_a = topup_server
+        .client()
+        .resolve_exact_result(
+            "acme/topup-refresh-minio",
+            "main",
+            ripclone::ExactResultKind::Full,
+            Some(&topup_a),
+        )
+        .await
+        .expect("resolve exact Full(A)");
+    let (topup_a_manifest, _) = topup_server
+        .client()
+        .fetch_clonepack(&ready_topup_a)
+        .await
+        .expect("fetch Full(A) manifest");
+    let topup_a_history = topup_a_manifest
+        .packs
+        .iter()
+        .find(|pack| pack.history_only)
+        .and_then(|pack| pack.pack.as_ref())
+        .expect("Full(A) publishes a history pack");
+    assert!(topup_a_history.len > 64 * 1024);
+    let topup_a_history_hash = ripclone::clonepack::hash_to_hex(&topup_a_history.hash);
+
+    let topup_b_text = noise(317);
+    let topup_b = topup_origin.commit(&[("large.txt", topup_b_text.as_str())], "B");
+    topup_origin.publish();
+    let topup_head_barrier = controls.path().join("topup-head-barrier");
+    let _topup_head_barrier =
+        ScopedEnvVar::set("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR", &topup_head_barrier);
+    let _topup_head_commit = ScopedEnvVar::set("RIPCLONE_TEST_AFTER_HEAD_BARRIER_COMMIT", &topup_b);
+    let topup_sync_client = topup_server.client();
+    let topup_b_for_sync = topup_b.clone();
+    let topup_sync = tokio::spawn(async move {
+        let ready = topup_sync_client
+            .sync_repo("acme/topup-refresh-minio", None)
+            .await?;
+        anyhow::ensure!(ready.commit == topup_b_for_sync);
+        Ok::<_, anyhow::Error>(ready)
+    });
+    for _ in 0..1_200 {
+        if topup_head_barrier.join("entered").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        topup_head_barrier.join("entered").exists(),
+        "Full(B) reached Head publication"
+    );
+
+    let topup_interrupt = controls.path().join("topup-interrupt");
+    let topup_audit = controls.path().join("topup-audit.log");
+    let _topup_hash = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_ARTIFACT", &topup_a_history_hash);
+    let _topup_dir = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_DIR", &topup_interrupt);
+    let _topup_audit = ScopedEnvVar::set("RIPCLONE_TEST_DOWNLOAD_AUDIT", &topup_audit);
+    let topup_output = tempfile::tempdir().expect("top-up refresh output");
+    let topup_target = topup_output.path().join("clone");
+    let topup_target_task = topup_target.clone();
+    let topup_client = topup_server.client();
+    let topup_clone = tokio::spawn(async move {
+        topup_client
+            .install_repo_with_mode_at(
+                "acme/topup-refresh-minio",
+                "HEAD",
+                None,
+                topup_target_task,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    for _ in 0..800 {
+        if topup_interrupt.join("entered").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        topup_interrupt.join("entered").exists(),
+        "top-up clone must interrupt Full(A)'s signed history pack"
+    );
+    let topup_saved = std::fs::read_to_string(topup_interrupt.join("entered"))
+        .expect("read top-up interruption offset")
+        .parse::<u64>()
+        .expect("top-up interruption offset");
+
+    std::fs::write(topup_head_barrier.join("proceed"), b"release Full(B)\n")
+        .expect("release Full(B)");
+    tokio::time::timeout(Duration::from_secs(30), topup_sync)
+        .await
+        .expect("Full(B) completed before refresh")
+        .expect("Full(B) sync task joined")
+        .expect("Full(B) sync succeeded");
+    wait_for_files_job_settled(&topup_server, "acme/topup-refresh-minio", &topup_b).await;
+    let topup_counters_before_refresh = (
+        probe.tip_probes.load(Ordering::SeqCst),
+        probe.exact_fetches.load(Ordering::SeqCst),
+        probe.builder_entries.load(Ordering::SeqCst),
+        probe.head_builds.load(Ordering::SeqCst),
+        probe.full_builds.load(Ordering::SeqCst),
+        probe.files_builds.load(Ordering::SeqCst),
+        probe.queue_inserts.load(Ordering::SeqCst),
+    );
+    let topup_trace_before_refresh = probe
+        .http_trace
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .len();
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    std::fs::write(
+        topup_interrupt.join("proceed"),
+        b"refresh immutable A after Full(B) became ready\n",
+    )
+    .unwrap();
+    let topup_outcome = tokio::time::timeout(Duration::from_secs(60), topup_clone)
+        .await
+        .expect("top-up refresh clone completed")
+        .expect("top-up refresh clone task joined")
+        .expect("ready Full(B) did not replace refreshed Full(A)");
+    assert_eq!(topup_outcome.commit, topup_b);
+    assert_eq!(git(&topup_target, &["rev-parse", "HEAD"]), topup_b);
+    assert!(git_ok(
+        &topup_target,
+        &["fsck", "--connectivity-only", "HEAD"]
+    ));
+    assert_eq!(
+        topup_counters_before_refresh,
+        (
+            probe.tip_probes.load(Ordering::SeqCst),
+            probe.exact_fetches.load(Ordering::SeqCst),
+            probe.builder_entries.load(Ordering::SeqCst),
+            probe.head_builds.load(Ordering::SeqCst),
+            probe.full_builds.load(Ordering::SeqCst),
+            probe.files_builds.load(Ordering::SeqCst),
+            probe.queue_inserts.load(Ordering::SeqCst),
+        ),
+        "refreshing immutable A must create no source fetch, build, or job"
+    );
+    let topup_trace = probe
+        .http_trace
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let topup_refresh_trace = &topup_trace[topup_trace_before_refresh..];
+    assert_eq!(
+        topup_refresh_trace
+            .iter()
+            .filter(|event| event.contains(&format!("pinned={topup_a}")))
+            .count(),
+        1,
+        "top-up URL refresh must read exact A once: {topup_refresh_trace:?}"
+    );
+    assert!(
+        topup_refresh_trace
+            .iter()
+            .all(|event| !event.contains(&format!("pinned={topup_b}"))),
+        "top-up URL refresh must not depend on ready B: {topup_refresh_trace:?}"
+    );
+    let topup_audit_text =
+        std::fs::read_to_string(&topup_audit).expect("read top-up download audit");
+    let topup_history_requests: Vec<_> = topup_audit_text
+        .lines()
+        .filter(|line| line.contains(&format!("hash={topup_a_history_hash}")))
+        .collect();
+    assert_eq!(
+        topup_history_requests.len(),
+        3,
+        "{topup_history_requests:?}"
+    );
+    assert!(topup_history_requests[0].contains("offset=0"));
+    assert!(
+        topup_history_requests[1].contains(&format!("offset={topup_saved}"))
+            && topup_history_requests[2].contains(&format!("offset={topup_saved}"))
+    );
+    println!(
+        "MINIO_TOPUP_REFRESH_EVIDENCE target={topup_b} artifact={topup_a} \
+saved={topup_saved} full_b_ready_before_refresh=true exact_a_refreshes=1 \
+exact_b_refreshes=0 no_build_or_fetch_on_refresh=true"
     );
 }

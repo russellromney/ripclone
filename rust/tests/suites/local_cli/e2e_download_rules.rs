@@ -178,6 +178,17 @@ where
     (false, last)
 }
 
+async fn wait_for_empty_clone_parent(parent: &Path) -> bool {
+    let end = Instant::now() + OVERLAP_DEADLINE;
+    while Instant::now() < end {
+        if std::fs::read_dir(parent).is_ok_and(|mut entries| entries.next().is_none()) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
 fn pack_dir_entries(staging: &Path, suffix: &str) -> Vec<String> {
     let pack_dir = staging.join(".git").join("objects").join("pack");
     let Ok(entries) = std::fs::read_dir(&pack_dir) else {
@@ -466,6 +477,125 @@ async fn editable_history_pack_streams_to_one_temp_file_then_is_renamed() {
         "every pack is installed exactly once: {installed:?}"
     );
     assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "3");
+}
+
+/// Cancelling while the streamed history pack owns its private download file
+/// must abort the downloader tasks and remove the complete staging tree. The
+/// released server response must not cause a retry or resurrect output.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancellation_removes_an_active_history_download_and_staging() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, false, ArtifactRangeBehavior::Normal);
+    let server = start_server_with_barrier(barrier).await;
+    let (history_hash, _) =
+        prepare_resumable_history_fixture(&server, "cancel-active-download", &control).await;
+    control.clear_artifact_requests();
+
+    let output = tempfile::tempdir().expect("clone output");
+    let target = output.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/cancel-active-download",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+
+    control
+        .entered
+        .await
+        .expect("history response reached cancellation boundary");
+    let (active, staging) = wait_for_staging(output.path(), |staging| {
+        pack_dir_entries(staging, ".ripclone-download").len() == 1
+    })
+    .await;
+    assert!(
+        active,
+        "cancellation fixture must observe an active .ripclone-download file: {staging:?}"
+    );
+
+    let artifact_requests = Arc::clone(&control.artifact_requests);
+    clone.abort();
+    assert!(clone.await.is_err(), "clone task must report cancellation");
+    let _ = control.proceed.send(());
+    assert!(
+        wait_for_empty_clone_parent(output.path()).await,
+        "cancellation must remove the target and private staging tree"
+    );
+    assert!(!target.exists());
+    let counts = artifact_request_counts(&artifact_requests);
+    assert_eq!(
+        counts.get(&history_hash),
+        Some(&1),
+        "an aborted downloader must not retry in background: {counts:?}"
+    );
+}
+
+/// Corruption in the bytes of a genuinely streamed history response must be
+/// detected by the final SHA-256 check before rename. It is deterministic and
+/// therefore must not retry, publish a target, or retain its temp file.
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupted_streamed_history_pack_fails_before_installation() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, false, ArtifactRangeBehavior::CorruptBody);
+    let server = start_server_with_barrier(barrier).await;
+    let (history_hash, _) =
+        prepare_resumable_history_fixture(&server, "corrupt-stream", &control).await;
+    control.clear_artifact_requests();
+
+    let output = tempfile::tempdir().expect("clone output");
+    let target = output.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/corrupt-stream",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+
+    control
+        .entered
+        .await
+        .expect("corrupt history response reached its barrier");
+    let artifact_requests = Arc::clone(&control.artifact_requests);
+    control.proceed.send(()).expect("finish corrupt response");
+    let error = clone
+        .await
+        .expect("corrupt clone task joined")
+        .expect_err("corrupt streamed history pack must fail");
+    assert!(
+        format!("{error:#}").contains("artifact hash mismatch"),
+        "unexpected corrupt stream error: {error:#}"
+    );
+    assert!(
+        wait_for_empty_clone_parent(output.path()).await,
+        "corrupt stream must remove private staging"
+    );
+    assert!(!target.exists());
+    let counts = artifact_request_counts(&artifact_requests);
+    assert_eq!(
+        counts.get(&history_hash),
+        Some(&1),
+        "a hash mismatch is permanent and must not retry: {counts:?}"
+    );
 }
 
 async fn prepare_resumable_history_fixture(

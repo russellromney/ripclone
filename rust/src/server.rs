@@ -74,6 +74,7 @@ pub enum ArtifactRangeBehavior {
     Normal,
     Ignore,
     InvalidContentRange,
+    CorruptBody,
 }
 
 /// Which artifact the barrier holds.
@@ -5153,6 +5154,10 @@ fn artifact_body(
         use tokio::io::AsyncReadExt;
 
         let mut sent = 0u64;
+        let corrupt_body = barrier.as_ref().is_some_and(|barrier| {
+            matches!(barrier.range_behavior, ArtifactRangeBehavior::CorruptBody)
+        });
+        let mut corrupted = false;
         let barrier_after = barrier.as_ref().map(|barrier| {
             u64::try_from(barrier.after_bytes)
                 .unwrap_or(u64::MAX)
@@ -5239,11 +5244,18 @@ fn artifact_body(
                 }
             };
             match read {
-                Ok(bytes) => {
+                Ok(mut bytes) => {
                     if let Some(barrier) = barrier.as_ref() {
                         barrier
                             .max_chunk_sent
                             .fetch_max(bytes.len(), Ordering::SeqCst);
+                    }
+                    if corrupt_body
+                        && !corrupted
+                        && let Some(byte) = bytes.first_mut()
+                    {
+                        *byte ^= 0x01;
+                        corrupted = true;
                     }
                     sent += bytes.len() as u64;
                     if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
