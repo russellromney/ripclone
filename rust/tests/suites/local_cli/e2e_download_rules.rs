@@ -36,6 +36,7 @@ struct HashBarrier {
     entered: oneshot::Receiver<()>,
     proceed: oneshot::Sender<()>,
     range_requests: Arc<StdMutex<Vec<String>>>,
+    artifact_requests: Arc<StdMutex<Vec<(String, Option<String>)>>>,
     max_chunk_sent: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -52,6 +53,7 @@ fn hash_barrier_with_behavior(
     let (proceed_tx, proceed_rx) = oneshot::channel();
     let slot = Arc::new(StdMutex::new(None));
     let range_requests = Arc::new(StdMutex::new(Vec::new()));
+    let artifact_requests = Arc::new(StdMutex::new(Vec::new()));
     let max_chunk_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let barrier = ArtifactBarrier {
         after_bytes,
@@ -61,6 +63,7 @@ fn hash_barrier_with_behavior(
         close_on_proceed,
         range_behavior,
         range_requests: Arc::clone(&range_requests),
+        artifact_requests: Arc::clone(&artifact_requests),
         max_chunk_sent: Arc::clone(&max_chunk_sent),
         consumed: Arc::new(AtomicBool::new(false)),
     };
@@ -71,6 +74,7 @@ fn hash_barrier_with_behavior(
             entered: entered_rx,
             proceed: proceed_tx,
             range_requests,
+            artifact_requests,
             max_chunk_sent,
         },
     )
@@ -80,6 +84,35 @@ impl HashBarrier {
     fn arm(&self, hash: &str) {
         *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash.to_string());
     }
+
+    fn disarm(&self) {
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn clear_artifact_requests(&self) {
+        self.artifact_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    fn artifact_request_counts(&self) -> std::collections::HashMap<String, usize> {
+        artifact_request_counts(&self.artifact_requests)
+    }
+}
+
+fn artifact_request_counts(
+    requests: &StdMutex<Vec<(String, Option<String>)>>,
+) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for (hash, _) in requests
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+    {
+        *counts.entry(hash.clone()).or_default() += 1;
+    }
+    counts
 }
 
 /// Deterministic, poorly-compressible bytes. The archive chunk size is a fixed
@@ -469,6 +502,53 @@ async fn prepare_resumable_history_fixture(
     (hash, history.len)
 }
 
+/// The uninterrupted history path retains the pre-resume fast path: every
+/// artifact is requested exactly once, including the large history pack.
+#[tokio::test(flavor = "multi_thread")]
+async fn normal_history_download_uses_one_request_per_artifact() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::Normal);
+    let server = start_server_with_barrier(barrier).await;
+    let (history_hash, _) =
+        prepare_resumable_history_fixture(&server, "resume-normal-path", &control).await;
+    control.disarm();
+    control.clear_artifact_requests();
+
+    let out = tempfile::tempdir().expect("clone output");
+    let target = out.path().join("clone");
+    server
+        .client()
+        .install_repo_with_mode_at(
+            "acme/resume-normal-path",
+            "HEAD",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("normal full clone");
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
+
+    let counts = control.artifact_request_counts();
+    assert_eq!(counts.get(&history_hash), Some(&1));
+    assert!(
+        counts.values().all(|count| *count == 1),
+        "normal path must request every artifact once: {counts:?}"
+    );
+    assert!(
+        control
+            .artifact_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .all(|(_, range)| range.is_none()),
+        "normal path must send no Range request"
+    );
+}
+
 /// A real local-storage response closes after persisted bytes. The next request
 /// must start at that exact count and the final verified pack must install with
 /// a complete, fsck-clean checkout.
@@ -478,7 +558,9 @@ async fn local_history_pack_interruption_resumes_from_the_saved_byte_count() {
     let (barrier, control) =
         hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::Normal);
     let server = start_server_with_barrier(barrier).await;
-    let (_hash, _len) = prepare_resumable_history_fixture(&server, "resume-local", &control).await;
+    let (history_hash, _len) =
+        prepare_resumable_history_fixture(&server, "resume-local", &control).await;
+    control.clear_artifact_requests();
 
     let out = tempfile::tempdir().expect("clone output");
     let target = out.path().join("clone");
@@ -497,6 +579,7 @@ async fn local_history_pack_interruption_resumes_from_the_saved_byte_count() {
             )
             .await
     });
+    let artifact_requests = Arc::clone(&control.artifact_requests);
     control
         .entered
         .await
@@ -520,6 +603,15 @@ async fn local_history_pack_interruption_resumes_from_the_saved_byte_count() {
         control.max_chunk_sent.load(Ordering::SeqCst) <= 64 * 1024,
         "local server chunks must stay bounded independently of artifact size"
     );
+    let counts = artifact_request_counts(&artifact_requests);
+    assert_eq!(counts.get(&history_hash), Some(&2));
+    assert!(
+        counts
+            .iter()
+            .filter(|(hash, _)| *hash != &history_hash)
+            .all(|(_, count)| *count == 1),
+        "resuming the history pack must not repeat completed artifacts: {counts:?}"
+    );
 }
 
 /// A server that ignores Range must make the client truncate and restart only
@@ -531,7 +623,9 @@ async fn range_unsupported_restarts_only_the_failed_history_pack() {
     let (barrier, control) =
         hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::Ignore);
     let server = start_server_with_barrier(barrier).await;
-    prepare_resumable_history_fixture(&server, "resume-ignore-range", &control).await;
+    let (history_hash, _) =
+        prepare_resumable_history_fixture(&server, "resume-ignore-range", &control).await;
+    control.clear_artifact_requests();
 
     let out = tempfile::tempdir().expect("clone output");
     let target = out.path().join("clone");
@@ -550,6 +644,7 @@ async fn range_unsupported_restarts_only_the_failed_history_pack() {
             )
             .await
     });
+    let artifact_requests = Arc::clone(&control.artifact_requests);
     control.entered.await.expect("initial response interrupted");
     control.proceed.send(()).expect("close initial response");
     clone
@@ -565,6 +660,15 @@ async fn range_unsupported_restarts_only_the_failed_history_pack() {
             .unwrap_or_else(|error| error.into_inner())
             .as_slice(),
         ["bytes=65536-"]
+    );
+    let counts = artifact_request_counts(&artifact_requests);
+    assert_eq!(counts.get(&history_hash), Some(&2));
+    assert!(
+        counts
+            .iter()
+            .filter(|(hash, _)| *hash != &history_hash)
+            .all(|(_, count)| *count == 1),
+        "ignored Range may restart only the failed history pack: {counts:?}"
     );
 }
 
@@ -800,10 +904,6 @@ async fn wrong_archive_chunk_length_fails_without_a_url_refresh() {
         rendered.contains("size mismatch"),
         "expected a length failure, got: {rendered}"
     );
-    assert!(
-        !ripclone::client::is_stale_signed_url(&error),
-        "a wrong length must not enter the signed-URL refresh loop: {rendered}"
-    );
     assert!(!target.exists(), "a failed clone must publish no target");
     let leftovers: Vec<String> = std::fs::read_dir(out.path())
         .expect("read clone parent")
@@ -860,10 +960,6 @@ async fn missing_archive_chunk_fails_without_a_url_refresh() {
     assert!(
         rendered.contains("404"),
         "a missing artifact must surface its 404: {rendered}"
-    );
-    assert!(
-        !ripclone::client::is_stale_signed_url(&error),
-        "a missing artifact must not enter the signed-URL refresh loop: {rendered}"
     );
     assert!(!target.exists(), "a failed clone must publish no target");
 }
@@ -1016,11 +1112,6 @@ async fn the_authenticated_gateway_receives_the_client_credential() {
         assert!(
             rendered.contains("401") || rendered.contains("403"),
             "a {label} must be refused by the artifact route, got: {rendered}"
-        );
-        assert!(
-            !ripclone::client::is_stale_signed_url(&error),
-            "the gateway has no signed URL to refresh, so a refused credential is \
-             permanent: {rendered}"
         );
     }
 }

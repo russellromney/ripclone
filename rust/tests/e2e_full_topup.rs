@@ -3,7 +3,6 @@
 mod common;
 
 use axum::http::StatusCode;
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::*;
 use prost::Message;
 use ripclone::cas::Cas;
@@ -51,39 +50,6 @@ impl Drop for ScopedEnvVar {
             None => unsafe { std::env::remove_var(self.key) },
         }
     }
-}
-
-async fn mint_session_token(server: &Server) -> String {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build no-redirect login client");
-    let response = client
-        .post(format!("{}/v1/auth/login", server.url))
-        .form(&[
-            ("secret", TOKEN),
-            ("callback", "http://127.0.0.1:0/"),
-            ("state", "resume"),
-        ])
-        .send()
-        .await
-        .expect("mint session token");
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    response
-        .headers()
-        .get("location")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|location| location.split_once("token=").map(|(_, token)| token))
-        .and_then(|token| token.split('&').next())
-        .map(str::to_string)
-        .expect("session token in login redirect")
-}
-
-fn session_token_exp(token: &str) -> u64 {
-    let payload = token.split('.').nth(1).expect("JWT payload");
-    let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url payload");
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("JWT claims");
-    claims["exp"].as_u64().expect("JWT exp claim")
 }
 
 async fn start_failing_upstream_decoy() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -2226,9 +2192,10 @@ signed_requests_without_ripclone_auth={}",
             .all(|request| request.contains("signed=true ripclone_authorization=false")),
     );
 
-    // Negative row: the signed transfer starts while access is valid, but the
-    // session expires before URL refresh. The refresh must be refused and the
-    // private staging tree must disappear without publishing a target.
+    // Negative row: the signed transfer starts while repository access is
+    // valid, but that access is actively revoked before the expired URL is
+    // refreshed. The private staging tree must disappear without publishing a
+    // target.
     let c_manifest = server
         .client()
         .resolve_exact_result(
@@ -2256,14 +2223,10 @@ signed_requests_without_ripclone_auth={}",
     let _revoked_hash = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_ARTIFACT", &c_history_hash);
     let _revoked_dir = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_DIR", &revoked_interrupt);
     let _revoked_audit = ScopedEnvVar::set("RIPCLONE_TEST_DOWNLOAD_AUDIT", &revoked_audit);
-    let _jwt_ttl = ScopedEnvVar::set("RIPCLONE_JWT_TTL_SECS", "2");
-    let session = mint_session_token(&server).await;
-    let session_expires = session_token_exp(&session);
     let revoked_output = tempfile::tempdir().expect("revoked clone output");
     let revoked_target = revoked_output.path().join("clone");
     let revoked_target_task = revoked_target.clone();
-    let revoked_client = ripclone::client::Client::new_with_bearer(server.url.clone(), session)
-        .with_provider("github");
+    let revoked_client = server.client();
     let revoked_commit = c.clone();
     let revoked_clone = tokio::spawn(async move {
         revoked_client
@@ -2288,14 +2251,17 @@ signed_requests_without_ripclone_auth={}",
         revoked_interrupt.join("entered").exists(),
         "revoked clone reached its deterministic interruption"
     );
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_secs();
-    if session_expires >= now {
-        tokio::time::sleep(Duration::from_secs(session_expires - now + 1)).await;
-    }
-    std::fs::write(revoked_interrupt.join("proceed"), b"expire access\n").unwrap();
+    let revoked_saved = std::fs::read_to_string(revoked_interrupt.join("entered"))
+        .expect("read revoked interruption offset")
+        .parse::<u64>()
+        .expect("revoked interruption offset");
+    probe.deny_repo_reads();
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    std::fs::write(
+        revoked_interrupt.join("proceed"),
+        b"retry after revocation\n",
+    )
+    .unwrap();
     let error = tokio::time::timeout(Duration::from_secs(30), revoked_clone)
         .await
         .expect("revoked clone stopped")
@@ -2316,5 +2282,24 @@ signed_requests_without_ripclone_auth={}",
             .is_none(),
         "revoked clone removes private staging"
     );
-    println!("MINIO_REVOCATION_EVIDENCE commit={c} no_target=true cleanup=true");
+    let revoked_audit_text =
+        std::fs::read_to_string(&revoked_audit).expect("read revoked download audit");
+    let revoked_requests: Vec<_> = revoked_audit_text
+        .lines()
+        .filter(|line| line.contains(&format!("hash={c_history_hash}")))
+        .collect();
+    assert_eq!(
+        revoked_requests.len(),
+        2,
+        "revoked clone makes the initial and expired-URL requests only: {revoked_requests:?}"
+    );
+    assert!(revoked_requests[0].contains("offset=0"));
+    assert!(
+        revoked_requests[1].contains(&format!("offset={revoked_saved}")),
+        "expired request must begin at the saved byte count: {revoked_requests:?}"
+    );
+    probe.allow_repo_reads();
+    println!(
+        "MINIO_REVOCATION_EVIDENCE commit={c} active_revocation=true no_target=true cleanup=true"
+    );
 }

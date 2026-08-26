@@ -201,25 +201,6 @@ fn validate_manifest_commit(manifest: &ClonepackManifest, pinned: &str) -> Resul
     Ok(())
 }
 
-/// A presigned URL for a buffered artifact was rejected with 401 or 403.
-/// Streamed history packs refresh their own URL in place; this error remains for
-/// small buffered artifacts, which fail without restarting the clone.
-#[derive(Debug)]
-pub struct StaleSignedUrl;
-
-impl std::fmt::Display for StaleSignedUrl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "a presigned artifact URL failed (likely expired)")
-    }
-}
-
-impl std::error::Error for StaleSignedUrl {}
-
-/// True if `err` (or any cause in its chain) is a [`StaleSignedUrl`].
-pub fn is_stale_signed_url(err: &anyhow::Error) -> bool {
-    err.chain().any(|e| e.is::<StaleSignedUrl>())
-}
-
 /// The innermost cause of a reqwest transport error — e.g. "Connection refused
 /// (os error 61)" — without the noisy "error sending request for url (...)"
 /// wrapper that hides the real reason a first-run user can't reach the server.
@@ -564,8 +545,8 @@ fn pseudo_rand_u64() -> u64 {
 enum FetchFailure {
     /// Transport error, 408, 429, or 5xx — retry the same URL.
     Retry(anyhow::Error),
-    /// 401 or 403 from a signed object URL — the clone driver refreshes the
-    /// URLs for the same pinned commit.
+    /// 401 or 403 from a signed object URL — the streamed downloader refreshes
+    /// this artifact's URL for the same pinned commit.
     RefreshUrl(anyhow::Error),
     /// 404, wrong length, wrong hash, or a local I/O failure — fail now.
     Permanent(anyhow::Error),
@@ -576,15 +557,14 @@ impl FetchFailure {
         matches!(self, FetchFailure::Retry(_))
     }
 
-    /// Surface the failure to the caller. Only a refreshable failure becomes a
-    /// [`StaleSignedUrl`], so a missing, short, or corrupt object fails the
-    /// clone instead of entering the outer re-resolve loop.
+    /// Surface the underlying failure to the caller. The streamed downloader
+    /// handles `RefreshUrl` before conversion; buffered artifacts fail without
+    /// an outer clone retry.
     fn into_error(self) -> anyhow::Error {
         match self {
-            FetchFailure::Retry(err) | FetchFailure::Permanent(err) => err,
-            FetchFailure::RefreshUrl(err) => {
-                anyhow::Error::new(StaleSignedUrl).context(format!("{err:#}"))
-            }
+            FetchFailure::Retry(err)
+            | FetchFailure::RefreshUrl(err)
+            | FetchFailure::Permanent(err) => err,
         }
     }
 }
@@ -746,6 +726,9 @@ fn validate_content_range(
 }
 
 fn record_test_download_request(hash: &str, offset: u64, signed: bool, url: &str) {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
     let Some(path) = std::env::var_os("RIPCLONE_TEST_DOWNLOAD_AUDIT").map(PathBuf::from) else {
         return;
     };
@@ -2008,10 +1991,9 @@ impl Client {
     /// manifest promised, when the caller knows one.
     ///
     /// On a failed signed URL we do NOT fall back to a by-hash gateway fetch —
-    /// the cloud no longer serves content by hash. An expired or revoked
-    /// signature surfaces as [`StaleSignedUrl`] so the clone driver re-resolves
-    /// the same pinned commit for fresh URLs; a missing, short, or corrupt
-    /// object fails instead.
+    /// the cloud no longer serves content by hash. Buffered artifacts fail in
+    /// place; a missing, short, or corrupt object also fails without restarting
+    /// the clone.
     async fn fetch_verified_artifact(
         &self,
         hash: &str,
@@ -3499,9 +3481,9 @@ impl Client {
                     let client = self.clone();
                     let tx = tx.clone();
                     async move {
-                        // No by-hash gateway fallback: an expired or revoked signed
-                        // URL surfaces as StaleSignedUrl and the clone driver
-                        // re-resolves the same pin for fresh URLs.
+                        // No by-hash gateway fallback: buffered archive chunks
+                        // fail in place without restarting or re-resolving the
+                        // clone.
                         let fetch_start = Instant::now();
                         let bytes = client
                             .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
@@ -4166,22 +4148,17 @@ mod tests {
         }
     }
 
-    /// Only a refreshable failure may become a `StaleSignedUrl`. If a permanent
-    /// one did, a missing or corrupt object would re-resolve the ref forever.
+    /// Refresh is consumed only by the streamed downloader. Converting any
+    /// failure for a buffered caller preserves the concrete HTTP error without
+    /// requesting an outer clone retry.
     #[test]
-    fn only_a_refreshable_failure_asks_for_fresh_urls() {
+    fn converted_fetch_failures_preserve_their_concrete_errors() {
         let refresh = FetchFailure::RefreshUrl(anyhow::anyhow!("expired")).into_error();
-        assert!(is_stale_signed_url(&refresh), "{refresh:#}");
-        for failure in [
-            FetchFailure::Retry(anyhow::anyhow!("503")),
-            FetchFailure::Permanent(anyhow::anyhow!("404")),
-        ] {
-            let error = failure.into_error();
-            assert!(
-                !is_stale_signed_url(&error),
-                "must not ask for fresh URLs: {error:#}"
-            );
-        }
+        assert_eq!(format!("{refresh:#}"), "expired");
+        let retry = FetchFailure::Retry(anyhow::anyhow!("503")).into_error();
+        assert_eq!(format!("{retry:#}"), "503");
+        let permanent = FetchFailure::Permanent(anyhow::anyhow!("404")).into_error();
+        assert_eq!(format!("{permanent:#}"), "404");
     }
 
     /// The shared verification rule: length first, then the content address, and
@@ -4201,23 +4178,6 @@ mod tests {
             .expect_err("a wrong content address is rejected");
         assert!(matches!(wrong, FetchFailure::Permanent(_)));
         assert!(format!("{:#}", wrong.into_error()).contains("hash mismatch"));
-    }
-
-    #[test]
-    fn detects_stale_signed_url_through_the_error_chain() {
-        // As surfaced from fetch_artifact_with_url, then wrapped with context as
-        // it propagates up through the install pipeline.
-        let err = anyhow::Error::new(StaleSignedUrl)
-            .context("signed-URL fetch for abc123 failed")
-            .context("fetch archive chunk 4")
-            .context("install editable packs");
-        assert!(is_stale_signed_url(&err));
-    }
-
-    #[test]
-    fn ordinary_errors_are_not_stale() {
-        let err = anyhow::anyhow!("ref lookup failed: 404").context("clone");
-        assert!(!is_stale_signed_url(&err));
     }
 
     #[tokio::test]

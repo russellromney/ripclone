@@ -61,6 +61,9 @@ pub struct ArtifactBarrier {
     pub close_on_proceed: bool,
     pub range_behavior: ArtifactRangeBehavior,
     pub range_requests: Arc<StdMutex<Vec<String>>>,
+    /// Every artifact request observed while the fixture is installed. The
+    /// optional string is the request's Range header.
+    pub artifact_requests: Arc<StdMutex<Vec<(String, Option<String>)>>>,
     pub max_chunk_sent: Arc<AtomicUsize>,
     pub consumed: Arc<AtomicBool>,
 }
@@ -243,6 +246,7 @@ pub struct AdmissionTestProbe {
     pub embedded_notification_wakes: AtomicUsize,
     pub embedded_fallback_polls: AtomicUsize,
     pub claim_losses: AtomicUsize,
+    repo_reads_denied: AtomicBool,
     pub fetch_targets: StdMutex<Vec<String>>,
     pub builder_targets: StdMutex<Vec<String>>,
     pub failure_targets: StdMutex<Vec<(String, String)>>,
@@ -291,6 +295,7 @@ impl Default for AdmissionTestProbe {
             embedded_notification_wakes: AtomicUsize::new(0),
             embedded_fallback_polls: AtomicUsize::new(0),
             claim_losses: AtomicUsize::new(0),
+            repo_reads_denied: AtomicBool::new(false),
             fetch_targets: StdMutex::new(Vec::new()),
             builder_targets: StdMutex::new(Vec::new()),
             failure_targets: StdMutex::new(Vec::new()),
@@ -308,6 +313,17 @@ impl Default for AdmissionTestProbe {
 }
 
 impl AdmissionTestProbe {
+    /// Make subsequent repository authorization checks fail. This models an
+    /// active access revocation after a clone has already received a signed
+    /// artifact URL.
+    pub fn deny_repo_reads(&self) {
+        self.repo_reads_denied.store(true, Ordering::SeqCst);
+    }
+
+    pub fn allow_repo_reads(&self) {
+        self.repo_reads_denied.store(false, Ordering::SeqCst);
+    }
+
     pub fn fail_full_for(&self, commit: &str) {
         self.full_failure_targets
             .lock()
@@ -3756,6 +3772,9 @@ async fn authorize_repo_read(
     credential: Option<&secrecy::SecretString>,
     headers: &HeaderMap,
 ) -> Result<bool, Response> {
+    if admission_test_probe().is_some_and(|probe| probe.repo_reads_denied.load(Ordering::SeqCst)) {
+        return Err(forbidden_repo_response());
+    }
     if !state.require_repo_auth {
         return Ok(visibility_is_private(headers));
     }
@@ -5246,6 +5265,19 @@ async fn serve_artifact(
     state: ServerState,
     headers: Option<axum::http::HeaderMap>,
 ) -> impl IntoResponse {
+    if let Some(barrier) = state.artifact_barrier.as_ref() {
+        let range = headers.as_ref().and_then(|headers| {
+            headers
+                .get(axum::http::header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
+        barrier
+            .artifact_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((hash.clone(), range));
+    }
     // If the backend can hand out a signed URL, redirect the client there.
     // The client can then use its own Range requests against the CDN/object store.
     // Use the same visibility-aware TTL as the ref path (a private repo gets a
