@@ -28,6 +28,8 @@ use tuning::ClientTuning;
 /// Sent on every request so the server can attribute usage and nudge upgrades.
 const USER_AGENT: &str = concat!("ripclone/", env!("CARGO_PKG_VERSION"));
 
+static TEST_DOWNLOAD_AUDIT_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Debug, Deserialize)]
 struct ServerError {
     #[serde(default)]
@@ -751,6 +753,9 @@ fn record_test_download_request(hash: &str, offset: u64, signed: bool, url: &str
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| "invalid".to_string());
+    let Ok(_guard) = TEST_DOWNLOAD_AUDIT_LOCK.lock() else {
+        return;
+    };
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -759,10 +764,9 @@ fn record_test_download_request(hash: &str, offset: u64, signed: bool, url: &str
         use std::io::Write;
         let _ = writeln!(
             file,
-            "hash={hash} offset={offset} signed={signed} ripclone_authorization={}",
-            !signed
+            "hash={hash} offset={offset} signed={signed} ripclone_authorization={} host={host}",
+            !signed,
         );
-        let _ = writeln!(file, "host={host}");
     }
 }
 
