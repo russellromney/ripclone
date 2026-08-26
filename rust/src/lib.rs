@@ -109,7 +109,6 @@ pub mod provider_config;
 #[doc(hidden)]
 pub mod queue;
 pub mod ref_store;
-pub mod remote_gc;
 pub mod repo_config;
 #[doc(hidden)]
 pub mod retention;
@@ -151,7 +150,7 @@ pub struct PackArtifact {
 }
 
 /// A pack + idx with their byte lengths. Used for LSM sealed levels, where the
-/// lengths must be remembered (the bytes have been evicted from local CAS) so a
+/// lengths must be remembered (the bytes may be absent from local CAS) so a
 /// later sync can reference them in the manifest without re-reading them.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SizedPack {
@@ -184,7 +183,7 @@ pub struct ArchiveFrame {
 }
 
 /// Artifact hashes for one clonepack variant (e.g. shallow depth=1 or full).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClonepackArtifacts {
     pub manifest: String,
     pub metadata_chunk: String,
@@ -200,163 +199,112 @@ pub struct ClonepackArtifacts {
     pub commit: String,
 }
 
+/// Published Head artifacts for one exact commit.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct HeadResult {
+    pub clonepack: ClonepackArtifacts,
+    pub parent_commit: Option<String>,
+    #[serde(default)]
+    pub packs: Vec<PackArtifact>,
+    #[serde(default)]
+    pub base_commit: String,
+    #[serde(default)]
+    pub base_packs: Vec<SizedPack>,
+}
+
+/// Published Full artifacts for one exact commit.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FullResult {
+    pub clonepack: ClonepackArtifacts,
+    #[serde(default)]
+    pub packs: Vec<PackArtifact>,
+    #[serde(default)]
+    pub history_levels: Vec<HistoryLevel>,
+}
+
+/// Published Files artifacts for one exact commit.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FilesResult {
+    pub clonepack: ClonepackArtifacts,
+    #[serde(default)]
+    pub archive_chunks: Vec<String>,
+    #[serde(default)]
+    pub archive_frames: Vec<ArchiveFrame>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExactResultKind {
+    Head,
+    Full,
+    Files,
+}
+
+/// Return whether one stored output is structurally usable for `commit`.
+///
+/// Files may validly contain zero archive chunks (for an empty committed tree),
+/// and MIDX is optional for every result. The remaining hashes are required by
+/// the corresponding clone/install or follow-on build path.
+pub(crate) fn exact_output_artifacts_ready(
+    commit: &str,
+    result: ExactResultKind,
+    artifacts: &ClonepackArtifacts,
+) -> bool {
+    let valid_hash = |hash: &str| crate::cas::Cas::validate_artifact_id(hash).is_ok();
+    if artifacts.commit != commit
+        || !valid_hash(&artifacts.manifest)
+        || !valid_hash(&artifacts.metadata_chunk)
+    {
+        return false;
+    }
+
+    match result {
+        ExactResultKind::Head | ExactResultKind::Full => {
+            valid_hash(&artifacts.skeleton_pack)
+                && valid_hash(&artifacts.skeleton_idx)
+                && valid_hash(&artifacts.prebuilt_index)
+                && valid_hash(&artifacts.idx_bundle)
+        }
+        ExactResultKind::Files => true,
+    }
+}
+
+pub(crate) fn exact_output_ready(info: &RefInfo, result: ExactResultKind, commit: &str) -> bool {
+    if info.commit != commit {
+        return false;
+    }
+    let artifacts = match result {
+        ExactResultKind::Head => info.head.as_ref().map(|output| &output.clonepack),
+        ExactResultKind::Full => info.full.as_ref().map(|output| &output.clonepack),
+        ExactResultKind::Files => info.files.as_ref().map(|output| &output.clonepack),
+    };
+    artifacts.is_some_and(|artifacts| exact_output_artifacts_ready(commit, result, artifacts))
+}
+
+pub(crate) fn exact_result_complete(info: &RefInfo, commit: &str) -> bool {
+    exact_output_ready(info, ExactResultKind::Head, commit)
+        && exact_output_ready(info, ExactResultKind::Full, commit)
+        && exact_output_ready(info, ExactResultKind::Files, commit)
+}
+
+impl std::fmt::Display for ExactResultKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Head => "head",
+            Self::Full => "full",
+            Self::Files => "files",
+        })
+    }
+}
+
 /// Artifact hashes returned by the server for a single ref.
 ///
 /// Every artifact is stored in the CAS and can be fetched by its hash from
 /// `/v1/artifacts/{hash}`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefInfo {
-    /// Internal commit-addressed result rows are retained and garbage-collected
-    /// like every other ref, but are not source branches in the public status
-    /// model.
-    pub internal_exact_result: bool,
-    /// A moving projection carrying this flag may replace only its own commit or
-    /// one listed in `moving_publication_predecessors`. Stores enforce the check
-    /// atomically with the write.
-    pub require_matching_commit: bool,
-    /// Earlier ordinary admissions that this exact result may replace in the
-    /// moving projection. The first ordinary admission carries an internal
-    /// non-object bootstrap marker; the chain is empty for explicit-only work.
-    /// Stores compare it atomically with the current moving commit, so later
-    /// admitted work can finish before or after its predecessors without being
-    /// regressed.
-    pub moving_publication_predecessors: Vec<String>,
-    /// Later ordinary admissions linked directly from this exact result. New
-    /// admissions follow this chain from the current moving projection instead
-    /// of scanning stored refs. The chain covers only work admitted before the
-    /// moving projection advances past this result.
-    pub moving_admission_successors: Vec<String>,
     pub commit: String,
-    pub parent_commit: Option<String>,
-    pub default_branch: String,
-    pub skeleton_pack: String,
-    pub skeleton_idx: String,
-    pub head_blobs_idx: String,
-    /// Content-addressed chunks of the head-blobs pack. The full pack is the
-    /// concatenation of these chunks in order. New builds split the pack so the
-    /// client can fetch it in parallel.
-    #[serde(default)]
-    pub head_blobs_chunks: Vec<String>,
-    /// Editable-clone packs (pack + idx hashes), ordered to match the manifest's
-    /// `packs` list. Kept here so the ref endpoint can sign each pack/idx URL
-    /// without decoding the manifest, and for retention protection.
-    #[serde(default)]
-    pub packs: Vec<PackArtifact>,
-    pub prebuilt_index: String,
-    pub archive: String,
-    pub manifest: String,
-    /// Archive chunk hashes referenced by the clonepack manifest. Kept for
-    /// retention protection and debugging.
-    #[serde(default)]
-    pub archive_chunks: Vec<String>,
-    /// Full-history clonepack (all reachable commits/trees).
-    pub full_clonepack: ClonepackArtifacts,
-    /// Shallow clonepack (single commit + HEAD trees). Matches `git clone --depth=1`.
-    pub shallow_clonepack: ClonepackArtifacts,
-    /// LSM sealed history levels (oldest first). Empty unless the LSM build is
-    /// enabled. Each level is immutable and content-addressed; a sync only builds
-    /// the tail past the last level's tip. See ROADMAP "LSM incremental history".
-    #[serde(default)]
-    pub history_levels: Vec<HistoryLevel>,
-    /// The commit whose depth-1 closure the HEAD *base* packs cover. A re-sync
-    /// packs only the objects new since this commit (`closure(HEAD) −
-    /// closure(head_base_commit)`) into a fresh delta pack, so the base and the
-    /// delta are disjoint by construction — no object is ever in two HEAD packs
-    /// (which would double-materialize a worktree file). Empty before the first
-    /// two-phase build. The background phase rebases (rebuilds the base at the
-    /// current commit) once the cumulative delta grows past
-    /// `RIPCLONE_HEAD_REBASE_BYTES`. See [`crate::pack::PackBuilder`].
-    #[serde(default)]
-    pub head_base_commit: String,
-    /// The HEAD base packs (closure of `head_base_commit`), with lengths so a
-    /// re-sync can reference these now-evicted packs in the clonepack manifest
-    /// without re-reading their bytes. Carried unchanged across delta syncs;
-    /// replaced wholesale on a rebase.
-    #[serde(default)]
-    pub head_base_packs: Vec<SizedPack>,
-    /// Content-defined archive frames from the last build, for incremental reuse:
-    /// a re-sync recompresses + re-uploads only the frames whose raw bytes
-    /// changed. See [`ArchiveFrame`].
-    #[serde(default)]
-    pub archive_frames: Vec<ArchiveFrame>,
-    /// Optional build status used by the async /v1/build worker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_status: Option<String>,
-    /// Wall-clock milliseconds for the most recent full build, populated once
-    /// full-history/files artifacts finish and surfaced by `/status`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_ms: Option<u64>,
-    /// Unix timestamp (seconds) when this ref was last synced. It is the atomic
-    /// ordering tie-break when either side has no Git generation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub synced_at: Option<u64>,
-    /// Unix timestamp (seconds) when this ref was last considered "warm".
-    /// The periodic warm-TTL sweep uses this to decide when a ref's clonepack
-    /// artifacts have gone idle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_accessed_at: Option<u64>,
-    /// When true, the warm-TTL sweep never evicts this ref's artifacts. An
-    /// operator or external control plane may set this flag for repos that should
-    /// stay warm; the server simply honors it.
-    #[serde(default)]
-    pub warm_pinned: bool,
-    /// The commit's depth in git history (`git rev-list --count`). This is the
-    /// primary ordering signal for "a newer sync never loses": recency follows
-    /// the commit's place in history, not the builder's clock, so two builders
-    /// with skewed clocks still order correctly. `None` selects the current
-    /// authoritative `synced_at` tie-break.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RefInfo;
-
-    #[test]
-    fn ref_info_rejects_missing_internal_exact_identity() {
-        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("internal_exact_result");
-
-        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
-        assert!(
-            error.to_string().contains("internal_exact_result"),
-            "missing identity must be named clearly: {error}"
-        );
-    }
-
-    #[test]
-    fn ref_info_rejects_missing_moving_publication_identity() {
-        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("moving_publication_predecessors");
-
-        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("moving_publication_predecessors"),
-            "missing publication identity must be named clearly: {error}"
-        );
-    }
-
-    #[test]
-    fn ref_info_rejects_missing_moving_admission_identity() {
-        let mut value = serde_json::to_value(RefInfo::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("moving_admission_successors");
-
-        let error = serde_json::from_value::<RefInfo>(value).unwrap_err();
-        assert!(
-            error.to_string().contains("moving_admission_successors"),
-            "missing admission identity must be named clearly: {error}"
-        );
-    }
+    pub head: Option<HeadResult>,
+    pub full: Option<FullResult>,
+    pub files: Option<FilesResult>,
 }

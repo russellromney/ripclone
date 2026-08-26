@@ -1968,6 +1968,14 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
 
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
     let auth_header = upstream_auth_header(provider, credential);
+    // Exact jobs deliberately leave branch authority out of the mirror. When a
+    // request needs symbolic HEAD, learn the upstream default at that request
+    // boundary and refresh the local symbolic ref before resolving it.
+    let default_branch = if branch == "HEAD" {
+        ls_remote_tip(provider, repo_id, "HEAD", credential)?.and_then(|tip| tip.default_branch)
+    } else {
+        None
+    };
     // The mirror is always a *complete* clone. The "full" (depth=0) clonepack is
     // built from `rev-list HEAD` over this mirror, so any shallow boundary would
     // silently truncate it and break `git rev-list`/`fsck` on the client. We
@@ -1978,14 +1986,9 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // the selector, obtain its symbolic target through one bounded `ls-remote`
     // first and retain that identity locally after the exact fetch. This keeps
     // historical behavior portable without downloading unrelated branches or
-    // tags. Ordinary admitted work uses `sync_bare_mirror_admitted` and gets the
-    // same identity from its existing admission advertisement.
+    // tags. Ordinary admitted work uses `sync_bare_mirror_admitted` and retains
+    // only the exact object; it never installs checkout-name state.
     if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev)) {
-        let default_branch = if branch == "HEAD" {
-            ls_remote_tip(provider, repo_id, "HEAD", credential)?.and_then(|tip| tip.default_branch)
-        } else {
-            None
-        };
         sync_bare_mirror_rev(
             mirror_dir.as_ref(),
             &url,
@@ -1995,9 +1998,6 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             rev,
             true,
         )?;
-        if let Some(default_branch) = default_branch.as_deref() {
-            set_bare_default_branch(mirror_dir.as_ref(), default_branch)?;
-        }
     } else if mirror_dir.as_ref().exists() {
         // A `--mirror` clone is configured with `+refs/*:refs/*` (and prunes), so
         // a plain `git fetch origin` advances every branch + HEAD to the latest.
@@ -2055,6 +2055,9 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         // given git version applied `clone --config`.
         disable_auto_gc(mirror_dir.as_ref())?;
     }
+    if let Some(default_branch) = default_branch.as_deref() {
+        set_bare_default_branch(mirror_dir.as_ref(), default_branch)?;
+    }
     Ok(())
 }
 
@@ -2066,7 +2069,6 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
     provider: &ProviderInstance,
     repo_id: &RepoId,
     commit: &str,
-    default_branch: Option<&str>,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<()> {
     crate::validation::validate_repo_path(provider, repo_id)
@@ -2090,16 +2092,6 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
         false,
     )?;
 
-    // An exact-only fetch intentionally does not create the moving branch ref,
-    // but a newly initialized bare repository otherwise keeps Git's platform
-    // default (often `master`) as HEAD. Retain the default branch discovered by
-    // the admission probe so a later historical expression such as `HEAD~2`
-    // resolves against the right branch after the ordinary mirror fetch fills
-    // it. This is a local symbolic-ref update only; it neither fetches nor
-    // publishes the moving branch.
-    if let Some(default_branch) = default_branch.filter(|branch| *branch != "HEAD") {
-        set_bare_default_branch(mirror_dir.as_ref(), default_branch)?;
-    }
     Ok(())
 }
 
@@ -2786,8 +2778,7 @@ mod tests {
 
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, Some("main"), None)
-            .unwrap();
+        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, None).unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
@@ -2799,14 +2790,8 @@ mod tests {
             resolve_commit(&mirror, "main").is_err(),
             "an immutable fetch must not update the moving branch ref"
         );
-        assert_eq!(
-            default_branch(&mirror).unwrap(),
-            "main",
-            "exact admission retains the probed default branch without fetching it"
-        );
-
-        // A later historical sync fills the moving refs. HEAD must then use the
-        // admission-time default branch rather than the bare-init default.
+        // A later symbolic sync updates the mirror. HEAD must use the
+        // request-time upstream default branch rather than the bare-init default.
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
         sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", Some("HEAD~1"), None).unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
@@ -2847,8 +2832,7 @@ mod tests {
         let repo_id = RepoId::github("acme/deleted");
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, Some("main"), None)
-            .unwrap();
+        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, None).unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);

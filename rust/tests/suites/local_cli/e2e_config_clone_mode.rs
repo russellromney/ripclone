@@ -69,18 +69,13 @@ async fn project_config_drives_clone_mode_and_default_provider() {
         "auth_template": "token {token}",
     }]
     });
-    unsafe {
-        std::env::set_var("RIPCLONE_PROVIDERS", providers.to_string());
-    }
-
-    let server = start_server().await;
+    let providers_json = providers.to_string();
+    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_json)]).await;
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write_project_config(project.path());
 
     let bin = ripclone_bin();
-    let providers_json = providers.to_string();
-
     let add_out = run_ripclone(
         &bin,
         home.path(),

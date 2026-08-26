@@ -62,29 +62,19 @@ async fn status_reports_nonzero_bytes_after_sync() {
     let commit = origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
-    // Wait for the full clonepack to publish (phase 2) so all artifacts are
+    // Wait for Full to publish so all artifacts are
     // accounted for in the byte totals.
-    sync_until_manifest(&server, "acme", "storage-accounting").await;
+    sync_until_full_ready(&server, "acme", "storage-accounting").await;
 
     let status = get_status(&server, "acme", "storage-accounting", None).await;
-    // Ordinary publication persists only the resolved moving branch (`main`)
-    // and the literal `HEAD` selector used by other processes. Immutable job
-    // identity must not become a public synthetic branch.
     let refs = status["refs"].as_array().unwrap();
-    assert_eq!(refs.len(), 2, "HEAD plus the moving source branch");
-    let branch = refs
-        .iter()
-        .find(|r| r["branch"] == "main")
-        .expect("resolved main ref present");
-    assert!(
-        refs.iter()
-            .all(|r| r["branch"] != ripclone::ref_store::exact_ref_key("main", &commit)),
-        "internal exact result must not appear in public status"
-    );
-    assert!(branch["bytes"].as_u64().unwrap() > 0);
-    assert_eq!(branch["bytes"], branch["unique_bytes"]);
+    assert_eq!(refs.len(), 1, "one exact result for the synced commit");
+    let result = &refs[0];
+    assert_eq!(result["commit"], commit);
+    assert!(result.get("branch").is_none());
+    assert!(result["bytes"].as_u64().unwrap() > 0);
+    assert_eq!(result["bytes"], result["unique_bytes"]);
     assert!(status["total_bytes"].as_u64().unwrap() > 0);
-    // HEAD and main share the same artifacts, so the repo total dedups them.
     assert_eq!(status["total_bytes"], status["total_unique_bytes"]);
     assert!(status["regions"][0]["unique_bytes"].as_u64().unwrap() > 0);
 }
@@ -94,29 +84,21 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "historical-storage-accounting");
-    origin.commit(&[("a.txt", "shared artifact bytes\n")], "c1");
+    let current = origin.commit(&[("a.txt", "shared artifact bytes\n")], "c1");
     origin.publish();
-    sync_until_manifest(&server, "acme", "historical-storage-accounting").await;
+    sync_until_full_ready(&server, "acme", "historical-storage-accounting").await;
 
     let before = get_status(&server, "acme", "historical-storage-accounting", None).await;
     let store = server_ref_store(&server).await;
     let repo_id = RepoId::github("acme/historical-storage-accounting");
     let info = store
-        .load_branch(&repo_id, "main")
+        .load_result(&repo_id, &current)
         .await
-        .expect("load moving main")
-        .expect("moving main exists");
-    let historical_key = ripclone::ref_store::exact_ref_key("main", &info.commit);
-    let ordinary_exact = store
-        .load_branch(&repo_id, &historical_key)
-        .await
-        .expect("load ordinary exact row")
+        .expect("load exact result")
         .expect("ordinary sync publishes an exact result");
-    assert!(ordinary_exact.internal_exact_result);
-    assert_eq!(ordinary_exact.commit, info.commit);
     let storage = ripclone::storage::local(&server.storage_dir).expect("open local storage");
     let moving_manifest_bytes = storage
-        .get(&info.full_clonepack.manifest)
+        .get(&info.full.as_ref().expect("Full result").clonepack.manifest)
         .expect("read moving full manifest");
     let mut historical_manifest = ClonepackManifest::decode(moving_manifest_bytes.as_slice())
         .expect("decode moving full manifest");
@@ -136,33 +118,40 @@ async fn status_includes_retained_historical_artifacts_in_deduplicated_union() {
         hash: hash_from_hex(&historical_only_hash).expect("decode historical-only hash"),
         len: historical_only_bytes.len() as u64,
     });
+    let historical_commit = "f".repeat(40);
+    historical_manifest.commit = historical_commit.clone();
     let historical_manifest_bytes = historical_manifest.encode_to_vec();
     let historical_manifest_hash = ripclone::cas::hash(&historical_manifest_bytes);
     storage
         .put(&historical_manifest_hash, &historical_manifest_bytes)
         .expect("store historical-only manifest");
 
-    let mut historical_info = ordinary_exact;
-    historical_info.full_clonepack.manifest = historical_manifest_hash.clone();
+    let mut historical_info = info;
+    historical_info.commit = historical_commit.clone();
+    let historical_full = historical_info.full.as_mut().expect("Full result");
+    historical_full.clonepack.commit = historical_commit.clone();
+    historical_full.clonepack.manifest = historical_manifest_hash.clone();
     store
-        .save_branch(&repo_id, &historical_key, &historical_info)
+        .save_result(&repo_id, &historical_info)
         .await
         .expect("seed retained historical row");
 
     let after = get_status(&server, "acme", "historical-storage-accounting", None).await;
     let refs = after["refs"].as_array().expect("status refs");
-    assert!(refs.iter().any(|entry| entry["branch"] == "main"));
+    assert_eq!(refs.len(), 2);
+    assert!(refs.iter().any(|entry| entry["commit"] == current));
     assert!(
-        refs.iter().all(|entry| entry["branch"] != historical_key),
-        "internal exact rows must not appear as source refs: {refs:?}"
+        refs.iter()
+            .any(|entry| entry["commit"] == historical_commit)
     );
+    assert!(refs.iter().all(|entry| entry.get("branch").is_none()));
     let expected_delta =
         historical_manifest_bytes.len() as u64 + historical_only_bytes.len() as u64;
     let expected_total = before["total_bytes"].as_u64().unwrap() + expected_delta;
     assert_eq!(
         after["total_bytes"].as_u64().unwrap(),
         expected_total,
-        "internal exact artifacts count in the deduplicated union while shared hashes count once"
+        "exact result artifacts count in the deduplicated union while shared hashes count once"
     );
     assert_eq!(
         after["total_unique_bytes"].as_u64().unwrap(),
@@ -201,8 +190,8 @@ async fn accepted_sync_reports_build_timings_through_metrics_and_status() {
         .text()
         .await
         .expect("metrics text");
-    let before_publish_p1 =
-        prometheus_value(&before_metrics, "ripclone_sync_publish_p1_ms_total").unwrap_or(0);
+    let before_publish_head =
+        prometheus_value(&before_metrics, "ripclone_sync_publish_head_ms_total").unwrap_or(0);
     // Admission returns before build timing data exists. The completed build
     // publishes those timings through metrics and status instead.
     let sync_url = format!(
@@ -220,7 +209,7 @@ async fn accepted_sync_reports_build_timings_through_metrics_and_status() {
     let accepted: serde_json::Value = sync_resp.json().await.expect("accepted response json");
     assert_eq!(accepted["commit"], c2);
 
-    sync_until_manifest(&server, "acme", "synctiming").await;
+    sync_until_full_ready(&server, "acme", "synctiming").await;
     let metrics = client
         .get(format!("{}/metrics", server.url))
         .send()
@@ -231,28 +220,23 @@ async fn accepted_sync_reports_build_timings_through_metrics_and_status() {
         .text()
         .await
         .expect("metrics text");
-    let after_publish_p1 = prometheus_value(&metrics, "ripclone_sync_publish_p1_ms_total")
-        .expect("publish p1 metric present");
+    let after_publish_head = prometheus_value(&metrics, "ripclone_sync_publish_head_ms_total")
+        .expect("Head publish metric present");
     assert!(
-        after_publish_p1 > before_publish_p1,
-        "completed phase-one timing should feed /metrics without RIPCLONE_BENCH"
+        after_publish_head > before_publish_head,
+        "completed Head timing should feed /metrics without RIPCLONE_BENCH"
     );
 
-    let mut build_ms = None;
-    for _ in 0..80 {
-        let status = get_status(&server, "acme", "synctiming", None).await;
-        build_ms = status["refs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["branch"] == "main")
-            .and_then(|entry| entry["build_ms"].as_u64());
-        if build_ms.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    assert!(build_ms.is_some(), "status should report build_ms");
+    let status = get_status(&server, "acme", "synctiming", None).await;
+    let exact = status["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["commit"] == c2)
+        .expect("status reports exact commit");
+    assert_eq!(exact["head"], true);
+    assert_eq!(exact["full"], true);
+    assert_eq!(exact["files"], true);
 }
 
 #[tokio::test]
@@ -287,7 +271,7 @@ async fn status_public_fork_has_zero_unique_byte_allocation() {
 }
 
 #[tokio::test]
-async fn status_shape_reports_current_source_refs_and_storage() {
+async fn status_shape_reports_exact_results_and_storage() {
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "compat");
@@ -299,9 +283,9 @@ async fn status_shape_reports_current_source_refs_and_storage() {
     client.sync_repo("acme/compat", None).await.expect("sync");
 
     let status = get_status(&server, "acme", "compat", None).await;
-    // Fields downstream consumers of the status endpoint parse must exist.
+    // Exact-result and storage-accounting fields must exist without a checkout name.
     assert!(status["refs"].is_array());
-    assert!(status["refs"][0]["branch"].is_string());
+    assert!(status["refs"][0].get("branch").is_none());
     assert!(status["refs"][0]["commit"].is_string());
     assert!(status["refs"][0]["bytes"].is_u64());
     assert!(status["total_bytes"].is_u64());

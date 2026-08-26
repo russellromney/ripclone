@@ -1,4 +1,4 @@
-//! Provider-agnostic webhook receiver: a provider push → enqueue a sync → warm.
+//! Provider-agnostic webhook receiver: a signed default-branch push → exact admission.
 //!
 //! A webhook is a thin **front door**. Everything heavy already exists — the
 //! build queue, the worker, storage, the metadata store. The receiver does
@@ -55,7 +55,7 @@ pub struct CanonicalEvent {
 pub enum EventKind {
     /// A branch advanced — warm it.
     Push,
-    /// A branch was deleted — clean up its stored ref, do not build.
+    /// A branch was deleted — acknowledge without changing durable exact results.
     BranchDelete,
     /// A provider connectivity check — acknowledge with `200`.
     Ping,
@@ -97,10 +97,6 @@ pub struct WebhookConfig {
     /// Allowlist of repo storage keys that may be warmed. `None` ⇒ allow all
     /// (single-tenant trust); `Some` ⇒ only listed repos.
     allowlist: Option<HashSet<String>>,
-    /// When true, warm every pushed branch (the original receiver's behavior)
-    /// instead of the default policy (default branch always; others only if
-    /// already tracked). Set by `RIPCLONE_WEBHOOK_WARM_ALL=1`.
-    warm_all: bool,
 }
 
 impl WebhookConfig {
@@ -121,7 +117,6 @@ impl WebhookConfig {
         Self {
             secrets,
             allowlist: None,
-            warm_all: false,
         }
     }
 
@@ -129,12 +124,6 @@ impl WebhookConfig {
     /// natural key (`owner/repo` for github, `provider/path` otherwise).
     pub fn with_allowlist(mut self, repos: impl IntoIterator<Item = String>) -> Self {
         self.allowlist = Some(repos.into_iter().collect());
-        self
-    }
-
-    /// Set the warm-all policy (chainable).
-    pub fn with_warm_all(mut self, warm_all: bool) -> Self {
-        self.warm_all = warm_all;
         self
     }
 
@@ -146,7 +135,8 @@ impl WebhookConfig {
     ///
     /// Allowlist: `RIPCLONE_WEBHOOK_ALLOWLIST`, a comma-separated list of repo
     /// storage keys (e.g. `owner/repo,other/repo`). Unset or empty ⇒ allow all,
-    /// with a loud startup log so the operator knows every pushed repo warms.
+    /// with a loud startup log so the operator knows every added repository is
+    /// eligible for default-branch push admission.
     pub fn from_env(registry: &ProviderRegistry) -> Self {
         let mut secrets = HashMap::new();
         for instance in registry.iter() {
@@ -159,10 +149,6 @@ impl WebhookConfig {
         }
 
         let allowlist = parse_allowlist(std::env::var("RIPCLONE_WEBHOOK_ALLOWLIST").ok());
-        let warm_all = std::env::var("RIPCLONE_WEBHOOK_WARM_ALL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
         // Resolve the open questions with the recommended defaults, loudly.
         if secrets.is_empty() {
             info!(
@@ -179,16 +165,12 @@ impl WebhookConfig {
                 ),
                 None => warn!(
                     "webhooks: NO allowlist (RIPCLONE_WEBHOOK_ALLOWLIST unset) — \
-                     warming ALL repos pushed via configured providers"
+                     every added repo is eligible for default-branch push admission"
                 ),
             }
         }
 
-        Self {
-            secrets,
-            allowlist,
-            warm_all,
-        }
+        Self { secrets, allowlist }
     }
 
     /// The configured secret for a provider instance, if any. No secret ⇒ the
@@ -197,13 +179,8 @@ impl WebhookConfig {
         self.secrets.get(provider_id)
     }
 
-    /// Whether to warm every pushed branch (vs the default-or-tracked policy).
-    pub fn warm_all(&self) -> bool {
-        self.warm_all
-    }
-
-    /// Whether a repo (by its natural key — see [`RepoId::natural_key`]) may be
-    /// warmed. Allow-all when no allowlist is configured.
+    /// Whether a repo (by its natural key — see [`RepoId::natural_key`]) may
+    /// admit a signed default-branch push. Allow-all when no allowlist is configured.
     ///
     /// [`RepoId::natural_key`]: crate::provider::RepoId::natural_key
     pub fn allows(&self, repo_key: &str) -> bool {
@@ -283,7 +260,6 @@ mod tests {
         let cfg = WebhookConfig {
             secrets: HashMap::new(),
             allowlist: Some(HashSet::from(["acme/widget".to_string()])),
-            warm_all: false,
         };
         assert!(cfg.allows("acme/widget"));
         assert!(!cfg.allows("acme/other"));

@@ -2,7 +2,7 @@
 //! and the polling fallback each cause a real build that a clone then reads.
 //!
 //! The unit tests in server.rs check the webhook handler's status codes against a
-//! fake queue. These run the *whole* path: trigger → real two-phase + LSM build →
+//! fake queue. These run the *whole* path: trigger → real exact-result LSM build →
 //! clone the pushed commit and verify it byte-for-byte. That's the actual
 //! "artifacts are ready before the clone" claim.
 
@@ -40,8 +40,7 @@ fn sign_gitea(body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Clone one branch's full (depth=0) artifacts, polling until phase 2 has
-/// published the full clonepack at the expected commit count. This is how we
+/// Clone one branch's Full result at the expected commit count. This is how we
 /// wait for an async, fire-and-forget build to finish.
 async fn clone_branch_full(
     server: &Server,
@@ -104,7 +103,7 @@ async fn clone_branch_full_with_client(
 /// pushed commit — without any per-repo Actions workflow.
 #[tokio::test]
 async fn webhook_push_builds_before_clone() {
-    setup(true); // two-phase + LSM + async (production defaults)
+    setup(true); // separate exact results + LSM + async (production defaults)
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", SECRET)]).await;
     let origin = make_origin("acme", "hook");
     let commit = origin.commit(&[("f.txt", "v1\n")], "c1");
@@ -156,11 +155,11 @@ fn parse_metric(text: &str, name: &str) -> u64 {
     0
 }
 
-/// A webhook and a `/sync` for the SAME branch key, fired concurrently, coalesce
+/// A webhook and a `/sync` for the same exact commit, fired concurrently, coalesce
 /// into one build (no corruption, no double-build). Proves the coalescing gate
 /// unifies the two entry points — not just `/sync`-vs-`/sync`.
 #[tokio::test]
-async fn webhook_and_sync_same_branch_coalesce() {
+async fn webhook_and_sync_same_commit_coalesce() {
     setup(true);
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", SECRET)]).await;
     let origin = make_origin("acme", "coal");
@@ -182,7 +181,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
     .into_bytes();
     let url = server.url.clone();
 
-    // Fire a webhook and a branch-targeted sync for the same key at once.
+    // Fire a webhook and a branch-targeted sync for the same commit at once.
     let webhook = {
         let (url, body, sig) = (url.clone(), body.clone(), sign_github(&body));
         tokio::spawn(async move {
@@ -497,9 +496,9 @@ async fn gitea_webhook_push_builds_before_clone() {
     assert_repo_usable(&c, "1");
 }
 
-/// A Gitea `delete` webhook removes the stored ref for a deleted branch.
+/// A Gitea `delete` webhook is acknowledged without resurrecting the deleted name.
 #[tokio::test]
-async fn gitea_webhook_branch_delete_cleans_up_ref() {
+async fn gitea_webhook_branch_delete_is_ignored_without_resurrection() {
     setup(true);
     let origin = make_http_origin("acme/hook");
     origin.commit(&[("main.txt", "m\n")], "main commit");

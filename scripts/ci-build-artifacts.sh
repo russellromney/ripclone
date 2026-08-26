@@ -44,7 +44,6 @@ BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone writer_bench)
 TESTS=(
   e2e_full_topup
   e2e_gitea_provider
-  e2e_remote_gc_s3
   e2e_token_only_worker
 )
 

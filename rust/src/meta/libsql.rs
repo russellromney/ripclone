@@ -1,6 +1,6 @@
-//! [`MetaDb`] over the server's Turso embedded-replica handle.
+//! Exact-result metadata over the server's Turso embedded-replica handle.
 
-use super::{MetaDb, RefRow};
+use super::{MetaDb, ResultRow};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use libsql::{Connection, Database};
@@ -38,19 +38,16 @@ impl MetaDb for LibsqlMeta {
         self.conn()
             .await?
             .execute(
-                "CREATE TABLE IF NOT EXISTS refs (
+                "CREATE TABLE IF NOT EXISTS results (
                     repo_key TEXT NOT NULL,
-                    branch TEXT NOT NULL,
                     commit_id TEXT NOT NULL,
-                    synced_at BIGINT,
-                    generation BIGINT,
                     data TEXT NOT NULL,
-                    PRIMARY KEY (repo_key, branch)
+                    PRIMARY KEY (repo_key, commit_id)
                 )",
                 (),
             )
             .await
-            .context("create refs table")?;
+            .context("create exact results table")?;
         self.conn()
             .await?
             .execute(
@@ -65,151 +62,69 @@ impl MetaDb for LibsqlMeta {
         Ok(())
     }
 
-    async fn get(&self, repo_key: &str, branch: &str) -> Result<Option<RefRow>> {
+    async fn get_result(&self, repo_key: &str, commit: &str) -> Result<Option<ResultRow>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT data, commit_id, synced_at FROM refs
-                 WHERE repo_key = ? AND branch = ?",
-                libsql::params![repo_key, branch],
+                "SELECT data FROM results WHERE repo_key = ? AND commit_id = ?",
+                libsql::params![repo_key, commit],
             )
             .await
-            .context("get ref")?;
+            .context("get exact result")?;
         match rows.next().await? {
-            Some(row) => Ok(Some(RefRow {
+            Some(row) => Ok(Some(ResultRow {
                 data: row.get::<String>(0)?,
-                commit_id: row.get::<String>(1)?,
-                synced_at: row.get::<Option<i64>>(2)?,
             })),
             None => Ok(None),
         }
     }
 
-    async fn save_ordered(
-        &self,
-        repo_key: &str,
-        branch: &str,
-        data: &str,
-        commit_id: &str,
-        synced_at: Option<i64>,
-        generation: Option<i64>,
-        require_matching_commit: bool,
-        internal_exact_result: bool,
-        moving_publication_predecessor: Option<&str>,
-    ) -> Result<()> {
-        let insert_only = i64::from(internal_exact_result && require_matching_commit);
-        let require_match = i64::from(require_matching_commit);
-        let expected = moving_publication_predecessor.unwrap_or(commit_id);
-        // DO UPDATE ... WHERE makes the ordering check atomic with the write;
-        // a losing write is a silent no-op. Same policy as the sqlite adapter.
-        self.conn()
+    async fn insert_result(&self, repo_key: &str, commit: &str, data: &str) -> Result<bool> {
+        let changed = self
+            .conn()
             .await?
             .execute(
-                "INSERT INTO refs (repo_key, branch, commit_id, synced_at, generation, data)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT (repo_key, branch) DO UPDATE SET
-                     commit_id = excluded.commit_id,
-                     synced_at = excluded.synced_at,
-                     generation = excluded.generation,
-                     data = excluded.data
-                 WHERE ? = 0 AND (
-                    (? = 1 AND (excluded.commit_id = refs.commit_id OR refs.commit_id = ?))
-                    OR (? = 0 AND (excluded.commit_id = refs.commit_id
-                        OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
-                            AND excluded.generation >= refs.generation)
-                        OR ((refs.generation IS NULL OR excluded.generation IS NULL)
-                            AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
-                                 OR excluded.synced_at >= refs.synced_at)))))",
-                libsql::params![
-                    repo_key,
-                    branch,
-                    commit_id,
-                    synced_at,
-                    generation,
-                    data,
-                    insert_only,
-                    require_match,
-                    expected,
-                    require_match
-                ],
+                "INSERT OR IGNORE INTO results(repo_key, commit_id, data) VALUES (?, ?, ?)",
+                libsql::params![repo_key, commit, data],
             )
             .await
-            .context("save_ordered ref")?;
-        Ok(())
+            .context("insert exact result")?;
+        Ok(changed == 1)
     }
 
-    async fn compare_and_swap_ref(
+    async fn compare_and_swap_result(
         &self,
         repo_key: &str,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
         expected_data: &str,
         new_data: &str,
-        new_commit: &str,
-        new_synced_at: Option<i64>,
-        new_generation: Option<i64>,
     ) -> Result<bool> {
         let changed = self
             .conn()
             .await?
             .execute(
-                "UPDATE refs SET data = ?, commit_id = ?, synced_at = ?, generation = ?
-                 WHERE repo_key = ? AND branch = ? AND commit_id = ? AND data = ?",
-                libsql::params![
-                    new_data,
-                    new_commit,
-                    new_synced_at,
-                    new_generation,
-                    repo_key,
-                    branch,
-                    expected_commit,
-                    expected_data
-                ],
+                "UPDATE results SET data = ? WHERE repo_key = ? AND commit_id = ? AND data = ?",
+                libsql::params![new_data, repo_key, commit, expected_data],
             )
             .await
-            .context("compare-and-swap ref data")?;
-        Ok(changed > 0)
+            .context("compare-and-swap exact result")?;
+        Ok(changed == 1)
     }
 
-    async fn list_repos(&self) -> Result<Vec<String>> {
-        let conn = self.conn().await?;
-        let mut rows = conn
-            .query("SELECT DISTINCT repo_key FROM refs", ())
-            .await
-            .context("list repos")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(row.get::<String>(0)?);
-        }
-        Ok(out)
-    }
-
-    async fn list_branches(&self, repo_key: &str) -> Result<Vec<String>> {
+    async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT branch FROM refs WHERE repo_key = ?",
+                "SELECT commit_id FROM results WHERE repo_key = ? ORDER BY commit_id",
                 libsql::params![repo_key],
             )
             .await
-            .context("list branches")?;
+            .context("list exact result commits")?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(row.get::<String>(0)?);
         }
         Ok(out)
-    }
-
-    async fn delete_ref(&self, repo_key: &str, branch: &str) -> Result<()> {
-        self.conn()
-            .await?
-            .execute(
-                "DELETE FROM refs WHERE repo_key = ? AND branch = ?",
-                libsql::params![repo_key, branch],
-            )
-            .await
-            .context("delete ref")?;
-        Ok(())
     }
 
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {
@@ -266,8 +181,9 @@ impl MetaDb for LibsqlMeta {
     }
 
     async fn health(&self) -> Result<()> {
-        let conn = self.conn().await?;
-        conn.query("SELECT 1", ())
+        self.conn()
+            .await?
+            .query("SELECT 1", ())
             .await
             .context("libsql metadata health")?;
         Ok(())

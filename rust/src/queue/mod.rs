@@ -25,18 +25,13 @@ pub use sql::{
     worker_heartbeat_interval_secs, worker_heartbeat_interval_secs_from,
 };
 
-/// A request to build (sync) one repo's branch.
+/// A request to build one repository at one admitted commit.
 #[derive(Clone)]
 pub struct BuildJob {
     pub repo_id: RepoId,
-    /// Concrete result branch selected before enqueue.
-    pub branch: String,
     /// Exact commit admitted for this build. Every selector is resolved before
     /// enqueue, so ordinary and explicit requests for the same result coalesce.
     pub admitted_commit: String,
-    /// Trusted concrete upstream default branch learned alongside a HEAD tip
-    /// admission. This is publication metadata, not part of the active key.
-    pub admitted_default_branch: Option<String>,
     /// Validated repository build settings captured by the server at
     /// admission. Workers use this immutable snapshot and never read live
     /// repository configuration.
@@ -91,16 +86,9 @@ impl fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 impl BuildJob {
-    /// Coalescing key for one immutable exact result. The unit-separator is
-    /// accepted by all supported SQL text columns (unlike NUL) and keeps the
-    /// key unambiguous for valid branch names.
+    /// Coalescing key for one immutable exact result.
     pub fn key(&self) -> String {
-        format!(
-            "{}\x1f{}\x1f{}",
-            self.repo_id.storage_key(),
-            self.branch,
-            self.admitted_commit
-        )
+        format!("{}\x1f{}", self.repo_id.storage_key(), self.admitted_commit)
     }
 }
 
@@ -148,6 +136,11 @@ pub trait JobQueue: Send + Sync {
 
     /// Poll a durable job's lifecycle.
     async fn job_status(&self, _job_id: JobId) -> Result<JobState> {
+        Ok(JobState::Unknown)
+    }
+
+    /// Lifecycle of the newest job for one exact-result key.
+    async fn job_state_for_key(&self, _key: &str) -> Result<JobState> {
         Ok(JobState::Unknown)
     }
 

@@ -26,7 +26,7 @@ lint() {
 # while io_uring is the default writer.
 #
 # This job self-compiles (ci profile + sccache/rust-cache). Fan-out jobs
-# (gitea/s3gc/e2e/…) use prebuilt binaries from ci-build instead;
+# (gitea/e2e/…) use prebuilt binaries from ci-build instead;
 # staging the full suite there was ~30m cold before integration-test
 # consolidation and is not worth it.
 run_tests() {
@@ -110,89 +110,9 @@ benchmark() {
 }
 
 # Compile-once fan-out: product bins + integration tests for
-# gitea/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
+# gitea/docker/e2e/benchmark. See scripts/ci-build-artifacts.sh.
 ci_build() {
   bash "$ROOT/scripts/ci-build-artifacts.sh"
-}
-
-# Run the S3-backed remote GC end-to-end suite against a local MinIO container
-# (or any S3-compatible store pointed at by RIPCLONE_S3_ENDPOINT). This is the
-# only place these #[ignored] tests are executed in CI.
-#
-# Optional $1: a single test name to run (CI shards one test per runner).
-# Omit it to run the whole suite locally, same as before.
-#
-# When S3GC_TEST_BIN is set, runs that prebuilt binary directly (compile-once
-# fan-out). Otherwise compiles + runs via cargo test.
-s3gc() {
-  local test_name="${1:-}"
-  export RIPCLONE_S3_ENDPOINT="${RIPCLONE_S3_ENDPOINT:-http://127.0.0.1:9000}"
-  export RIPCLONE_S3_BUCKET="${RIPCLONE_S3_BUCKET:-ripclone-test}"
-  export RIPCLONE_S3_REGION="${RIPCLONE_S3_REGION:-us-east-1}"
-  export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
-  export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
-
-  local -a filter=(--ignored)
-  if [ -n "$test_name" ]; then
-    filter+=(--exact "$test_name")
-  fi
-
-  if [ -n "$test_name" ]; then
-    local listed
-    if [ -n "${S3GC_TEST_BIN:-}" ]; then
-      listed="$(timeout 60 "$S3GC_TEST_BIN" --ignored --list)"
-    else
-      listed="$(cd "$ROOT/rust" && timeout 60 cargo test --profile ci --locked --test e2e_remote_gc_s3 -- --ignored --list)"
-    fi
-    if ! grep -Fqx "$test_name: test" <<<"$listed"; then
-      echo "error: exact S3 test '$test_name' is missing" >&2
-      exit 1
-    fi
-  fi
-
-  local log
-  log="$(mktemp "${TMPDIR:-/tmp}/ripclone-s3gc.XXXXXX")"
-  local rc
-  local timeout_secs="${S3GC_TIMEOUT_SECS:-300}"
-  if [ -n "${S3GC_TEST_BIN:-}" ]; then
-    if [ ! -x "$S3GC_TEST_BIN" ]; then
-      echo "error: S3GC_TEST_BIN=$S3GC_TEST_BIN is not executable" >&2
-      exit 1
-    fi
-    echo "s3gc: running prebuilt $S3GC_TEST_BIN ${filter[*]}"
-    # Liberate from cargo so the binary's cwd/tmp behavior matches a direct run.
-    set +e
-    (cd "$ROOT/rust" && timeout "$timeout_secs" "$S3GC_TEST_BIN" "${filter[@]}") 2>&1 | tee "$log"
-    rc=${PIPESTATUS[0]}
-    set -e
-  else
-    set +e
-    (cd "$ROOT/rust" && timeout "$timeout_secs" cargo test --profile ci --locked --test e2e_remote_gc_s3 -- "${filter[@]}") 2>&1 | tee "$log"
-    rc=${PIPESTATUS[0]}
-    set -e
-  fi
-  if [ "$rc" -ne 0 ]; then
-    rm -f "$log"
-    return "$rc"
-  fi
-  if grep -Fq "SKIP" "$log"; then
-    echo "error: S3 proof emitted SKIP" >&2
-    rm -f "$log"
-    exit 1
-  fi
-  if [ -n "$test_name" ]; then
-    grep -Fq "running 1 test" "$log" || {
-      echo "error: exact S3 filter ran zero or multiple tests" >&2
-      rm -f "$log"
-      exit 1
-    }
-    grep -Eq "test result: ok\. 1 passed; 0 failed;" "$log" || {
-      echo "error: exact S3 proof did not report one passing test" >&2
-      rm -f "$log"
-      exit 1
-    }
-  fi
-  rm -f "$log"
 }
 
 case "$STAGE" in
@@ -201,15 +121,11 @@ case "$STAGE" in
   e2e) e2e ;;
   flake) flake ;;
   databases) databases ;;
-  ci-build|s3gc-build) ci_build ;;
-  # Pass through any remaining args (e.g. a single test name for sharding).
-  # Without this, `scripts/ci.sh s3gc some_test` ignored the name and every
-  # "shard" re-ran the full suite (PR #126).
-  s3gc) s3gc "${2:-}" ;;
+  ci-build) ci_build ;;
   gitea) gitea ;;
   benchmark) benchmark ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|ci-build|s3gc|gitea|benchmark|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|ci-build|gitea|benchmark|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"

@@ -32,7 +32,7 @@ async fn compaction_keeps_full_clone_correct() {
         origin.publish();
         client.sync_repo("acme/cmp", None).await.unwrap();
 
-        // The full clone builds in the background under two-phase, so poll until
+        // Full builds in the background, so poll until
         // it reaches the expected commit count (clone_full_at asserts the count).
         let want = (i + 1).to_string();
         let (_g, c) = clone_full_at(&server, "acme", "cmp", &want).await;

@@ -31,7 +31,11 @@ Internal tuning knobs use code constants at their current defaults.
 - `RIPCLONE_SERVER_TOKEN` / `RIPCLONE_SERVER_TOKEN_HASH` - server auth for
   clients and self-hosted servers.
 - `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`,
-  `RIPCLONE_S3_PREFIX`, `RIPCLONE_S3_CACHE_DIR` - object storage backend.
+  `RIPCLONE_S3_PREFIX` - object storage backend.
+- `RIPCLONE_RETENTION_INTERVAL_SECS`, `RIPCLONE_RETENTION_MAX_AGE_DAYS`,
+  `RIPCLONE_RETENTION_MAX_GB` - age/size trimming for the local build cache when
+  S3-compatible storage is configured. These settings never delete local
+  durable storage, S3 objects, or exact results.
 - `RIPCLONE_CONTROL_DB_PATH` - server-owned SQLite database path.
 - `RIPCLONE_TURSO_DATABASE_URL`, `RIPCLONE_TURSO_AUTH_TOKEN` - paired Turso
   primary settings enabling embedded-replica control mode.
@@ -46,13 +50,11 @@ Internal tuning knobs use code constants at their current defaults.
   `small` (≤1 GiB) | `large` (catch-all). Worker flag:
   `ripclone-worker --max-size-class <name>` claims only jobs at or below that
   class; omit the flag to claim everything (single-worker self-host unchanged).
-- `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>`, `RIPCLONE_WEBHOOK_ALLOWLIST`,
-  `RIPCLONE_WEBHOOK_WARM_ALL` - webhook authentication and warming policy.
+- `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>`, `RIPCLONE_WEBHOOK_ALLOWLIST` - webhook
+  authentication and added-repository allowlist. Only the payload-identified
+  default branch admits exact work.
 - `RIPCLONE_POLL_INTERVAL_SECS` - fallback polling interval, default `300`
   (on); `0` disables it.
-- `RIPCLONE_REMOTE_GC_INTERVAL_SECS`, `RIPCLONE_REMOTE_GC_GRACE_SECS`,
-  `RIPCLONE_REMOTE_GC_DRY_RUN` - remote object garbage collection.
-
 ## Expert
 
 These remain because tests or deployment safety need them, but they should not

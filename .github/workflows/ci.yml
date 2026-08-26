@@ -161,83 +161,9 @@ jobs:
           chmod +x bin/*
           bash scripts/ci.sh e2e
 
-  # Discover the individual #[ignore = "requires S3 credentials"] test names in
-  # e2e_remote_gc_s3.rs so the s3gc job below can shard one-test-per-runner.
-  s3gc-tests:
-    needs: changes
-    if: ${{ needs.changes.outputs.docker == 'true' }}
-    runs-on: ubuntu-latest
-    outputs:
-      tests: ${{ steps.list.outputs.tests }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: List ignored S3 test names
-        id: list
-        run: |
-          set -euo pipefail
-          names=$(grep -A2 '#\[ignore = "requires S3 credentials"\]' rust/tests/e2e_remote_gc_s3.rs \
-            | grep -oP 'async fn \K[a-zA-Z0-9_]+(?=\()')
-          json=$(printf '%s\n' "$names" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "found: $json"
-          test "$(echo "$json" | jq 'length')" -ge 1
-          echo "tests=$json" >> "$GITHUB_OUTPUT"
-
-  # S3-backed remote GC e2e — prebuilt binary from ci-build, one test per shard.
-  s3gc:
-    needs: [changes, s3gc-tests, ci-build]
-    if: ${{ needs.changes.outputs.docker == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    strategy:
-      fail-fast: false
-      matrix:
-        test: ${{ fromJSON(needs.s3gc-tests.outputs.tests) }}
-    services:
-      minio:
-        image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-        command: server /data
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports:
-          - 9000:9000
-    steps:
-      - uses: actions/checkout@v7
-      - name: Download ci artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: ci-artifacts
-          path: bin
-      - name: Wait for MinIO and create per-shard bucket
-        env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          STRATEGY_JOB_INDEX: ${{ strategy.job-index }}
-        run: |
-          set -euo pipefail
-          SHARD_BUCKET="ripclone-${GITHUB_RUN_ID}-${STRATEGY_JOB_INDEX:-0}"
-          for i in {1..30}; do
-            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null
-          aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb "s3://${SHARD_BUCKET}"
-          echo "RIPCLONE_S3_BUCKET=${SHARD_BUCKET}" >> "$GITHUB_ENV"
-      - name: S3 GC e2e against MinIO (${{ matrix.test }})
-        timeout-minutes: 6
-        env:
-          S3GC_TEST_BIN: ${{ github.workspace }}/bin/e2e_remote_gc_s3
-          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
-        run: |
-          set -euo pipefail
-          chmod +x "$S3GC_TEST_BIN" "$CARGO_BIN_EXE_ripclone"
-          bash scripts/ci.sh s3gc "${{ matrix.test }}"
-
-  # Product composition surrogate: the server uses an embedded replica against
-  # the official libsql server fixture, the standalone worker is API-only, and
-  # artifact bytes use digest-pinned MinIO. Real Turso is recorded separately.
+  # Durable artifact lifecycle: the server uses an embedded replica against the
+  # official libsql fixture, the standalone worker is API-only, and published
+  # bytes remain in digest-pinned MinIO after its local caches are removed.
   turso-api-worker-minio:
     needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
@@ -280,7 +206,7 @@ jobs:
           done
           curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:9000/minio/health/live >/dev/null
           aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb "s3://ripclone-${GITHUB_RUN_ID}-turso-worker"
-      - name: Turso-replica API worker with S3 artifacts (official local surrogate)
+      - name: API worker keeps published S3 artifacts across empty local caches
         timeout-minutes: 6
         env:
           RIPCLONE_REQUIRE_TURSO: "1"

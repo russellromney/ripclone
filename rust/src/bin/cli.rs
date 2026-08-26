@@ -103,9 +103,8 @@ enum Commands {
         /// depth limit (full history). Defaults to the server's configured default.
         #[arg(short, long)]
         depth: Option<usize>,
-        /// Build at this git rev instead of the branch tip (e.g. "HEAD~5" or a
-        /// SHA). The branch is still the ref key; only the build commit changes.
-        /// Lets you exercise the incremental path without upstream advancing.
+        /// Resolve this git rev instead of the branch tip (e.g. "HEAD~5" or a
+        /// SHA). The resolved commit is the build and result identity.
         #[arg(long)]
         at: Option<String>,
         /// Wait for the admitted commit's Full artifacts before returning.
@@ -1011,8 +1010,8 @@ async fn main() -> Result<()> {
                 let test_client = client.with_provider(&id);
                 let info = test_client.resolve_ref(&repo, &branch).await?;
                 println!(
-                    "provider '{}' resolved {}@{} → {} (default: {})",
-                    id, repo, branch, info.commit, info.default_branch
+                    "provider '{}' resolved {}@{} → {} (checkout: {})",
+                    id, repo, branch, info.commit, info.branch
                 );
             }
         },
@@ -1167,8 +1166,18 @@ async fn main() -> Result<()> {
                 .await?;
             let total_ms = clone_started.elapsed().as_millis() as u64;
             println!("installed {} into {}", repo_path, target.display());
-            verify_upstream_snapshot(&target, &outcome.commit, upstream_snapshot.as_deref())
-                .await?;
+            if let Err(error) =
+                verify_upstream_snapshot(&target, &outcome.commit, upstream_snapshot.as_deref())
+                    .await
+            {
+                tokio::fs::remove_dir_all(&target).await.with_context(|| {
+                    format!(
+                        "remove clone target {} after upstream verification failed",
+                        target.display()
+                    )
+                })?;
+                return Err(error);
+            }
             if enable_bench {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1199,7 +1208,12 @@ async fn main() -> Result<()> {
                 info.commit
             } else {
                 client
-                    .resolve_ref_with_clonepack(&repo_path, &branch, None, None)
+                    .resolve_exact_result(
+                        &repo_path,
+                        &branch,
+                        ripclone::ExactResultKind::Full,
+                        None,
+                    )
                     .await?
                     .commit
             };
@@ -1276,7 +1290,12 @@ async fn main() -> Result<()> {
                 info.commit
             } else {
                 client
-                    .resolve_ref_with_clonepack(&repo_path, &branch, None, None)
+                    .resolve_exact_result(
+                        &repo_path,
+                        &branch,
+                        ripclone::ExactResultKind::Full,
+                        None,
+                    )
                     .await?
                     .commit
             };

@@ -312,7 +312,7 @@ async fn run_oracle(io_uring: bool) {
     git_clone(&origin, &git_full_dir, None);
     configure_lfs(&git_full_dir);
 
-    // Sync the origin once; two-phase publish makes depth=1 immediate and full
+    // Sync the origin once; Head becomes available before Full
     // available shortly after.
     server
         .client()

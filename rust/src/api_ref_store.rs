@@ -2,23 +2,24 @@
 //!
 //! A standalone worker holds only a report URL and a signed, expiring bearer
 //! token — never database credentials. The token
-//! carries no repo/job scope (the worker pool claims any repo); the write
-//! target is the `repo_key` in each report body. The server that holds the real
-//! control database performs the durable write after checking the token
-//! (`POST /v1/refs`).
+//! carries no repo/job scope (the worker pool claims any repo); each report
+//! carries the already-issued `(job_id, worker_id)` claim plus its `repo_key`.
+//! The server that holds the real control database performs the durable write
+//! only when that owner still holds that exact job (`POST /v1/refs`).
 //!
-//! Reads return empty: a farmed-out worker builds cold and only needs the write
-//! path for publish. A failed report is never swallowed — network/5xx map to
-//! retryable errors so the job requeues, and 401/403 to an unauthorized error so
-//! the worker exits cleanly without refreshing credentials locally.
+//! Reads come from the server at the beginning of each claimed job, then use a
+//! process-local write-through cache while that job publishes its results. A
+//! failed report is never swallowed — network/5xx map to retryable errors so
+//! the job requeues, and 401/403 to an unauthorized error so the worker exits
+//! cleanly without refreshing credentials locally.
 //!
 //! The token is a durable, operator-provisioned value (`ripclone
 //! mint-worker-token`). The queue-side twin is
 //! [`ApiJobQueue`](crate::api_job_queue).
 
-use crate::RefInfo;
 use crate::provider::RepoId;
 use crate::ref_store::{AddedRepo, RefStore};
+use crate::{FilesResult, FullResult, HeadResult, RefInfo};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -91,35 +92,35 @@ impl std::error::Error for ApiReportError {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RefReport {
-    SaveBranch {
+    PublishHead {
+        job_id: i64,
+        worker_id: String,
         repo_key: String,
-        branch: String,
-        info: Box<RefInfo>,
+        commit: String,
+        head: Box<HeadResult>,
     },
-    UpdateBuildStatus {
+    PublishFull {
+        job_id: i64,
+        worker_id: String,
         repo_key: String,
-        branch: String,
-        expected_commit: String,
-        status: String,
+        commit: String,
+        full: Box<FullResult>,
     },
-    DeleteBranch {
+    PublishFiles {
+        job_id: i64,
+        worker_id: String,
         repo_key: String,
-        branch: String,
-    },
-    TouchLastAccessed {
-        repo_key: String,
-        branch: String,
-        expected_commit: String,
+        commit: String,
+        files: Box<FilesResult>,
     },
 }
 
 impl RefReport {
     pub fn repo_key(&self) -> &str {
         match self {
-            Self::SaveBranch { repo_key, .. }
-            | Self::UpdateBuildStatus { repo_key, .. }
-            | Self::DeleteBranch { repo_key, .. }
-            | Self::TouchLastAccessed { repo_key, .. } => repo_key,
+            Self::PublishHead { repo_key, .. }
+            | Self::PublishFull { repo_key, .. }
+            | Self::PublishFiles { repo_key, .. } => repo_key,
         }
     }
 }
@@ -133,8 +134,8 @@ pub struct RefReportResponse {
 
 /// Worker-side `RefStore`: every write is a POST to the report URL.
 ///
-/// Keeps a process-local write-through map so multi-step publish (phase 1 save
-/// → phase 2 load → save) can re-read what this worker just reported. The map
+/// Keeps a process-local write-through map so one job can re-read what it has
+/// just reported. The map
 /// is not shared with other workers and is not authoritative — the server is.
 pub struct ApiRefStore {
     report_url: String,
@@ -192,8 +193,8 @@ impl ApiRefStore {
         })
     }
 
-    fn local_key(repo_id: &RepoId, branch: &str) -> (String, String) {
-        (repo_id.storage_key(), branch.to_string())
+    fn local_key(repo_id: &RepoId, commit: &str) -> (String, String) {
+        (repo_id.storage_key(), commit.to_string())
     }
 
     async fn post_report(&self, body: &RefReport) -> Result<RefReportResponse> {
@@ -241,101 +242,195 @@ impl ApiRefStore {
             )
         }
     }
+
+    async fn get_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        let resp = self
+            .client
+            .get(&self.report_url)
+            .header("Authorization", format!("Bearer {}", self.job_token))
+            .query(&[
+                ("repo_key", repo_id.storage_key()),
+                ("commit", commit.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| ApiReportError::retryable(format!("metadata read: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return resp.json::<Option<RefInfo>>().await.map_err(|e| {
+                ApiReportError::permanent(format!("decode metadata read: {e}")).into()
+            });
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            Err(ApiReportError::unauthorized(format!(
+                "metadata read unauthorized ({status}): {body}"
+            ))
+            .into())
+        } else if status.is_server_error() || status.as_u16() == 429 {
+            Err(
+                ApiReportError::retryable(format!("metadata read retryable HTTP {status}: {body}"))
+                    .into(),
+            )
+        } else {
+            Err(
+                ApiReportError::permanent(format!("metadata read rejected ({status}): {body}"))
+                    .into(),
+            )
+        }
+    }
 }
 
 #[async_trait]
 impl RefStore for ApiRefStore {
-    async fn load(&self, repo_id: &RepoId) -> Result<Option<RefInfo>> {
-        self.load_branch(repo_id, "HEAD").await
-    }
-
-    async fn save(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
-        self.save_branch(repo_id, "HEAD", info).await
-    }
-
-    async fn list(&self) -> Result<Vec<RepoId>> {
-        Ok(Vec::new())
-    }
-
-    async fn load_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RefInfo>> {
-        // Only what this worker has written this process — no remote reads.
-        let map = self.local.read().await;
-        Ok(map.get(&Self::local_key(repo_id, branch)).cloned())
-    }
-
-    async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
-        self.post_report(&RefReport::SaveBranch {
-            repo_key: repo_id.storage_key(),
-            branch: branch.to_string(),
-            info: Box::new(info.clone()),
-        })
-        .await?;
-        // Write-through: phase 2 reloads the phase-1 ref from this map.
-        let mut map = self.local.write().await;
-        map.insert(Self::local_key(repo_id, branch), info.clone());
-        Ok(())
-    }
-
-    async fn update_build_status(
-        &self,
-        repo_id: &RepoId,
-        branch: &str,
-        expected_commit: &str,
-        status: &str,
-    ) -> Result<bool> {
-        let r = self
-            .post_report(&RefReport::UpdateBuildStatus {
-                repo_key: repo_id.storage_key(),
-                branch: branch.to_string(),
-                expected_commit: expected_commit.to_string(),
-                status: status.to_string(),
-            })
-            .await?;
-        if r.updated {
-            let mut map = self.local.write().await;
-            if let Some(info) = map.get_mut(&Self::local_key(repo_id, branch))
-                && info.commit == expected_commit
-            {
-                info.build_status = Some(status.to_string());
-            }
+    async fn load_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        if let Some(result) = self
+            .local
+            .read()
+            .await
+            .get(&Self::local_key(repo_id, commit))
+            .cloned()
+        {
+            return Ok(Some(result));
         }
-        Ok(r.updated)
+        let result = self.get_result(repo_id, commit).await?;
+        if let Some(result) = &result {
+            self.local
+                .write()
+                .await
+                .insert(Self::local_key(repo_id, commit), result.clone());
+        }
+        Ok(result)
     }
 
-    async fn touch_last_accessed_at(
+    async fn save_result(&self, _repo_id: &RepoId, _info: &RefInfo) -> Result<()> {
+        bail!("standalone worker result writes require claim identity")
+    }
+
+    async fn publish_head(
+        &self,
+        _repo_id: &RepoId,
+        _commit: &str,
+        _head: HeadResult,
+    ) -> Result<bool> {
+        bail!("standalone workers require claimed Head publication")
+    }
+
+    async fn publish_full(
+        &self,
+        _repo_id: &RepoId,
+        _commit: &str,
+        _full: FullResult,
+    ) -> Result<bool> {
+        bail!("standalone workers require claimed Full publication")
+    }
+
+    async fn publish_files(
+        &self,
+        _repo_id: &RepoId,
+        _commit: &str,
+        _files: FilesResult,
+    ) -> Result<bool> {
+        bail!("standalone workers require claimed Files publication")
+    }
+
+    async fn publish_claimed_head(
         &self,
         repo_id: &RepoId,
-        branch: &str,
-        expected_commit: &str,
+        commit: &str,
+        head: HeadResult,
+        job_id: i64,
+        worker_id: &str,
     ) -> Result<bool> {
-        let r = self
-            .post_report(&RefReport::TouchLastAccessed {
+        let response = self
+            .post_report(&RefReport::PublishHead {
+                job_id,
+                worker_id: worker_id.to_string(),
                 repo_key: repo_id.storage_key(),
-                branch: branch.to_string(),
-                expected_commit: expected_commit.to_string(),
+                commit: commit.to_string(),
+                head: Box::new(head.clone()),
             })
             .await?;
-        Ok(r.updated)
+        if response.updated {
+            let mut map = self.local.write().await;
+            let result = map
+                .entry(Self::local_key(repo_id, commit))
+                .or_insert_with(|| RefInfo {
+                    commit: commit.to_string(),
+                    ..Default::default()
+                });
+            result.head = Some(head);
+        }
+        Ok(response.updated)
     }
 
-    async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
-        self.post_report(&RefReport::DeleteBranch {
-            repo_key: repo_id.storage_key(),
-            branch: branch.to_string(),
-        })
-        .await?;
-        let mut map = self.local.write().await;
-        map.remove(&Self::local_key(repo_id, branch));
-        Ok(())
+    async fn publish_claimed_full(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        full: FullResult,
+        job_id: i64,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let response = self
+            .post_report(&RefReport::PublishFull {
+                job_id,
+                worker_id: worker_id.to_string(),
+                repo_key: repo_id.storage_key(),
+                commit: commit.to_string(),
+                full: Box::new(full.clone()),
+            })
+            .await?;
+        if response.updated {
+            let mut map = self.local.write().await;
+            let result = map
+                .entry(Self::local_key(repo_id, commit))
+                .or_insert_with(|| RefInfo {
+                    commit: commit.to_string(),
+                    ..Default::default()
+                });
+            result.full = Some(full);
+        }
+        Ok(response.updated)
     }
 
-    async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
+    async fn publish_claimed_files(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        files: FilesResult,
+        job_id: i64,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let response = self
+            .post_report(&RefReport::PublishFiles {
+                job_id,
+                worker_id: worker_id.to_string(),
+                repo_key: repo_id.storage_key(),
+                commit: commit.to_string(),
+                files: Box::new(files.clone()),
+            })
+            .await?;
+        if response.updated {
+            let mut map = self.local.write().await;
+            let result = map
+                .entry(Self::local_key(repo_id, commit))
+                .or_insert_with(|| RefInfo {
+                    commit: commit.to_string(),
+                    ..Default::default()
+                });
+            result.files = Some(files);
+        }
+        Ok(response.updated)
+    }
+
+    async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
         let key = repo_id.storage_key();
         let map = self.local.read().await;
         Ok(map
             .keys()
             .filter(|(r, _)| r == &key)
-            .map(|(_, b)| b.clone())
+            .map(|(_, commit)| commit.clone())
             .collect())
     }
 
@@ -350,6 +445,13 @@ impl RefStore for ApiRefStore {
 
     async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
         Ok(Vec::new())
+    }
+
+    async fn invalidate(&self, repo_id: &RepoId, commit: &str) {
+        self.local
+            .write()
+            .await
+            .remove(&Self::local_key(repo_id, commit));
     }
 
     async fn health(&self) -> Result<()> {
@@ -373,12 +475,10 @@ mod tests {
         )
         .unwrap();
         let repo = RepoId::github("acme/dead");
-        let info = RefInfo {
-            commit: "abc".into(),
-            default_branch: "main".into(),
-            ..Default::default()
-        };
-        let err = store.save_branch(&repo, "main", &info).await.unwrap_err();
+        let err = store
+            .publish_claimed_head(&repo, "abc", HeadResult::default(), 7, "worker-test")
+            .await
+            .unwrap_err();
         let api = err
             .downcast_ref::<ApiReportError>()
             .expect("ApiReportError in chain");

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TursoReplicaConfig {
@@ -291,6 +291,193 @@ impl ControlDb {
         self.admission_notify.clone()
     }
 
+    pub async fn publish_head_for_claim(
+        &self,
+        job_id: i64,
+        worker_id: &str,
+        repo_id: &crate::provider::RepoId,
+        commit: &str,
+        head: crate::HeadResult,
+    ) -> Result<bool> {
+        crate::validation::validate_object_id(commit).context("validate claimed result commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Head,
+                &head.clonepack,
+            ),
+            "invalid claimed Head result for {commit}"
+        );
+        let connection = self
+            .database
+            .connect()
+            .context("connect for claimed result write")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .context("begin claimed result write")?;
+        if !claim_authorizes(&tx, job_id, worker_id, repo_id, commit).await? {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        let repo_key = repo_id.storage_key();
+        let mut rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), commit],
+            )
+            .await
+            .context("read claimed exact result")?;
+        let Some(row) = rows.next().await? else {
+            tx.rollback().await.ok();
+            return Ok(false);
+        };
+        let mut result: crate::RefInfo =
+            serde_json::from_str(&row.get::<String>(0)?).context("decode claimed exact result")?;
+        drop(rows);
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        result.head = Some(head);
+        let data = serde_json::to_string(&result).context("encode claimed Head result")?;
+        tx.execute(
+            "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
+            libsql::params![data, repo_key, commit],
+        )
+        .await
+        .context("write claimed Head result")?;
+        tx.commit().await.context("commit claimed Head result")?;
+        Ok(true)
+    }
+
+    pub async fn publish_full_for_claim(
+        &self,
+        job_id: i64,
+        worker_id: &str,
+        repo_id: &crate::provider::RepoId,
+        commit: &str,
+        full: crate::FullResult,
+    ) -> Result<bool> {
+        crate::validation::validate_object_id(commit).context("validate claimed Full commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Full,
+                &full.clonepack,
+            ),
+            "invalid claimed Full result for {commit}"
+        );
+        let connection = self
+            .database
+            .connect()
+            .context("connect for claimed Full write")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .context("begin claimed Full write")?;
+        if !claim_authorizes(&tx, job_id, worker_id, repo_id, commit).await? {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        let repo_key = repo_id.storage_key();
+        let mut rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), commit],
+            )
+            .await
+            .context("read exact result for claimed Full")?;
+        let Some(row) = rows.next().await? else {
+            tx.rollback().await.ok();
+            return Ok(false);
+        };
+        let mut result: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
+            .context("decode exact result for claimed Full")?;
+        drop(rows);
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        if !crate::exact_output_ready(&result, crate::ExactResultKind::Full, commit) {
+            result.full = Some(full);
+            let data = serde_json::to_string(&result).context("encode claimed Full")?;
+            tx.execute(
+                "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
+                libsql::params![data, repo_key, commit],
+            )
+            .await
+            .context("write claimed Full")?;
+        }
+        tx.commit().await.context("commit claimed Full write")?;
+        Ok(true)
+    }
+
+    pub async fn publish_files_for_claim(
+        &self,
+        job_id: i64,
+        worker_id: &str,
+        repo_id: &crate::provider::RepoId,
+        commit: &str,
+        files: crate::FilesResult,
+    ) -> Result<bool> {
+        crate::validation::validate_object_id(commit).context("validate claimed Files commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Files,
+                &files.clonepack,
+            ),
+            "invalid claimed Files result for {commit}"
+        );
+        let connection = self
+            .database
+            .connect()
+            .context("connect for claimed Files write")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .context("begin claimed Files write")?;
+        if !claim_authorizes(&tx, job_id, worker_id, repo_id, commit).await? {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        let repo_key = repo_id.storage_key();
+        let mut rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), commit],
+            )
+            .await
+            .context("read exact result for claimed Files")?;
+        let Some(row) = rows.next().await? else {
+            tx.rollback().await.ok();
+            return Ok(false);
+        };
+        let mut result: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
+            .context("decode exact result for claimed Files")?;
+        drop(rows);
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        if !crate::exact_output_ready(&result, crate::ExactResultKind::Files, commit) {
+            result.files = Some(files);
+            let data = serde_json::to_string(&result).context("encode claimed Files")?;
+            tx.execute(
+                "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
+                libsql::params![data, repo_key, commit],
+            )
+            .await
+            .context("write claimed Files")?;
+        }
+        tx.commit().await.context("commit claimed Files write")?;
+        Ok(true)
+    }
+
     /// Load the single repository-level build configuration record. Only a
     /// genuinely absent row returns `None`; database, decode, and validation
     /// failures are propagated so admission cannot silently select defaults.
@@ -352,31 +539,19 @@ impl ControlDb {
         Ok(())
     }
 
-    /// Atomically create/replace the exact pending row, link the temporary
-    /// moving-publication fence when supplied, and enqueue or join the durable
-    /// job. No worker can observe the job without its exact result row.
+    /// Atomically create the exact pending result and enqueue or join its one
+    /// durable job. No worker can observe a job without its exact result row.
     pub(crate) async fn admit_exact_and_job(
         &self,
         job: &BuildJob,
-        exact_branch: &str,
         pending: &crate::RefInfo,
-        moving_authorized: bool,
     ) -> Result<Enqueued> {
         job.repo_config
             .validate()
             .context("validate admitted repository config")?;
         let repo_config =
             serde_json::to_string(&job.repo_config).context("encode admitted repository config")?;
-        let result = self
-            .admit(
-                &self.database,
-                job,
-                &repo_config,
-                exact_branch,
-                pending,
-                moving_authorized,
-            )
-            .await;
+        let result = self.admit(&self.database, job, &repo_config, pending).await;
         if result.is_ok() {
             self.admission_notify.notify_one();
         }
@@ -388,9 +563,7 @@ impl ControlDb {
         database: &Database,
         job: &BuildJob,
         repo_config: &str,
-        exact_branch: &str,
         pending: &crate::RefInfo,
-        moving_authorized: bool,
     ) -> Result<Enqueued> {
         let connection = database
             .connect()
@@ -403,33 +576,62 @@ impl ControlDb {
             .await
             .context("begin durable admission")?;
         crate::server::admission_test_inside_admission_tx(&job.admitted_commit).await;
-        let mut pending = pending.clone();
-        let tail = if moving_authorized {
-            discover_moving_admission_tail(&tx, job, &mut pending).await?
-        } else {
-            None
+        let repo_key = job.repo_id.storage_key();
+        let mut existing_rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), job.admitted_commit.as_str()],
+            )
+            .await
+            .context("read exact result during durable admission")?;
+        let existing = match existing_rows.next().await? {
+            Some(row) => Some(
+                serde_json::from_str::<crate::RefInfo>(&row.get::<String>(0)?)
+                    .context("decode exact result during durable admission")?,
+            ),
+            None => None,
         };
-        upsert_exact(&tx, job, exact_branch, &pending).await?;
-        if let Some((tail_branch, tail_info)) = tail.as_ref() {
-            update_tail(&tx, job, tail_branch, tail_info).await?;
+        drop(existing_rows);
+        let mut rows = tx
+            .query(
+                "SELECT id FROM jobs WHERE key = ?1 AND status IN ('queued', 'claimed') LIMIT 1",
+                [job.key().as_str()],
+            )
+            .await
+            .context("load active job for exact result")?;
+        let active_job_id = match rows.next().await? {
+            Some(row) => Some(row.get::<i64>(0)?),
+            None => None,
+        };
+        drop(rows);
+        let all_results_ready = existing
+            .as_ref()
+            .is_some_and(|result| crate::exact_result_complete(result, &job.admitted_commit));
+        if all_results_ready || active_job_id.is_some() {
+            tx.commit()
+                .await
+                .context("commit coalesced exact admission")?;
+            return Ok(Enqueued {
+                outcome: EnqueueOutcome::Coalesced,
+                job_id: active_job_id,
+            });
         }
+        insert_exact_result(&tx, job, pending).await?;
         let key = job.key();
         let size_class = crate::queue::classify_rank(job.size_bytes, &self.size_classes);
         let credential = crate::queue::sql::encode_credential(job.credential.as_ref());
         let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO jobs
-                 (key, provider, path, branch, status, created_at, admitted_commit,
-                  admitted_default_branch, repo_config, credential, attempts, size_class)
-                 VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+                 (key, provider, path, status, created_at, admitted_commit,
+                  repo_config, credential, attempts, size_class)
+                 VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, 0, ?8)",
                 libsql::params![
                     key.clone(),
                     job.repo_id.provider.as_str(),
                     job.repo_id.path.as_str(),
-                    job.branch.as_str(),
                     crate::queue::sql::now_secs(),
                     job.admitted_commit.as_str(),
-                    job.admitted_default_branch.as_deref(),
                     repo_config,
                     credential.as_deref(),
                     size_class
@@ -471,206 +673,52 @@ impl ControlDb {
     }
 }
 
-/// Discover and extend the ordinary-publication chain under the same immediate
-/// transaction that creates the exact result and durable job. Request-side
-/// snapshots are advisory only: concurrent admissions serialize here and the
-/// later transaction follows every successor committed by the earlier one.
-async fn discover_moving_admission_tail(
+async fn claim_authorizes(
     tx: &libsql::Transaction,
-    job: &BuildJob,
-    pending: &mut crate::RefInfo,
-) -> Result<Option<(String, crate::RefInfo)>> {
-    let result_branch = if job.branch == "HEAD" {
-        job.admitted_default_branch
-            .as_deref()
-            .unwrap_or(job.branch.as_str())
-    } else {
-        job.branch.as_str()
-    };
-    let moving = load_transaction_ref(tx, job, result_branch).await?;
-    if let Some(moving) = moving {
-        if moving.commit == job.admitted_commit {
-            pending.moving_publication_predecessors = moving.moving_publication_predecessors;
-            return Ok(None);
-        }
-        let mut predecessors = vec![moving.commit.clone()];
-        let mut tail_commit = moving.commit;
-        let mut seen = std::collections::HashSet::new();
-        loop {
-            anyhow::ensure!(
-                seen.insert(tail_commit.clone()),
-                "ordinary admission chain contains a cycle"
-            );
-            let tail_branch = crate::ref_store::exact_ref_key(result_branch, &tail_commit);
-            let mut tail = load_transaction_ref(tx, job, &tail_branch)
-                .await?
-                .with_context(|| {
-                    format!("ordinary admission chain is missing exact {tail_commit}")
-                })?;
-            let Some(next) = tail.moving_admission_successors.last().cloned() else {
-                pending.moving_publication_predecessors = predecessors;
-                tail.require_matching_commit = false;
-                tail.moving_admission_successors
-                    .push(job.admitted_commit.clone());
-                return Ok(Some((tail_branch, tail)));
-            };
-            crate::validation::validate_object_id(&next)
-                .context("ordinary admission chain has invalid successor")?;
-            if next == job.admitted_commit {
-                pending.moving_publication_predecessors = predecessors;
-                return Ok(None);
-            }
-            predecessors.push(next.clone());
-            tail_commit = next;
-        }
-    }
-
-    // Before the first moving projection publishes, concurrent initial
-    // admissions are rooted at the explicit initial marker. Find the sole
-    // outstanding tail from rows committed by earlier admission transactions.
-    pending.moving_publication_predecessors =
-        vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
-    let prefix = crate::ref_store::exact_ref_key(result_branch, "");
+    job_id: i64,
+    worker_id: &str,
+    repo_id: &crate::provider::RepoId,
+    commit: &str,
+) -> Result<bool> {
     let mut rows = tx
         .query(
-            "SELECT branch, data FROM refs
-             WHERE repo_key = ?1 AND substr(branch, 1, length(?2)) = ?2",
-            libsql::params![job.repo_id.storage_key(), prefix],
+            "SELECT provider, path, admitted_commit, status, key FROM jobs
+             WHERE id = ?1 AND worker_id = ?2",
+            libsql::params![job_id, worker_id],
         )
         .await
-        .context("load initial ordinary-admission chain")?;
-    let mut tails = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let branch = row.get::<String>(0)?;
-        let info: crate::RefInfo =
-            serde_json::from_str(&row.get::<String>(1)?).context("parse admission-chain ref")?;
-        if info.commit != job.admitted_commit
-            && info.internal_exact_result
-            && info
-                .moving_publication_predecessors
-                .iter()
-                .any(|commit| commit == crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR)
-            && info.moving_admission_successors.is_empty()
-        {
-            tails.push((branch, info));
-        }
-    }
+        .context("verify claimed result owner")?;
+    let Some(row) = rows.next().await? else {
+        return Ok(false);
+    };
+    let provider = row.get::<String>(0)?;
+    let path = row.get::<String>(1)?;
+    let admitted_commit = row.get::<String>(2)?;
+    let status = row.get::<String>(3)?;
+    let _key = row.get::<String>(4)?;
     drop(rows);
-    let Some((branch, mut tail)) = tails.pop() else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        tails.is_empty(),
-        "ordinary admission has multiple initial chain tails"
-    );
-    for predecessor in tail
-        .moving_publication_predecessors
-        .iter()
-        .chain(std::iter::once(&tail.commit))
-    {
-        if !pending
-            .moving_publication_predecessors
-            .contains(predecessor)
-        {
-            pending
-                .moving_publication_predecessors
-                .push(predecessor.clone());
-        }
-    }
-    tail.require_matching_commit = false;
-    tail.moving_admission_successors
-        .push(job.admitted_commit.clone());
-    Ok(Some((branch, tail)))
+    let identity_matches =
+        provider == repo_id.provider.as_str() && path == repo_id.path && admitted_commit == commit;
+    Ok(identity_matches && status == "claimed")
 }
 
-async fn load_transaction_ref(
+async fn insert_exact_result(
     tx: &libsql::Transaction,
     job: &BuildJob,
-    branch: &str,
-) -> Result<Option<crate::RefInfo>> {
-    let mut rows = tx
-        .query(
-            "SELECT data FROM refs WHERE repo_key = ?1 AND branch = ?2",
-            libsql::params![job.repo_id.storage_key(), branch],
-        )
-        .await
-        .with_context(|| format!("load transactional ref {branch}"))?;
-    let info = match rows.next().await? {
-        Some(row) => Some(
-            serde_json::from_str(&row.get::<String>(0)?)
-                .with_context(|| format!("parse transactional ref {branch}"))?,
-        ),
-        None => None,
-    };
-    Ok(info)
-}
-
-fn ref_times(info: &crate::RefInfo) -> (Option<i64>, Option<i64>) {
-    (
-        info.synced_at.and_then(|value| i64::try_from(value).ok()),
-        info.generation.and_then(|value| i64::try_from(value).ok()),
-    )
-}
-
-async fn upsert_exact(
-    tx: &libsql::Transaction,
-    job: &BuildJob,
-    exact_branch: &str,
     info: &crate::RefInfo,
 ) -> Result<()> {
     let data = serde_json::to_string(info).context("serialize exact admission")?;
-    let (synced_at, generation) = ref_times(info);
-    let changed = tx
-        .execute(
-            "INSERT INTO refs(repo_key, branch, commit_id, synced_at, generation, data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(repo_key, branch) DO UPDATE SET
-                 commit_id=excluded.commit_id, synced_at=excluded.synced_at,
-                 generation=excluded.generation, data=excluded.data
-             WHERE refs.commit_id = excluded.commit_id",
-            libsql::params![
-                job.repo_id.storage_key(),
-                exact_branch,
-                job.admitted_commit.as_str(),
-                synced_at,
-                generation,
-                data
-            ],
-        )
-        .await
-        .context("create exact admission row")?;
-    if changed != 1 {
-        bail!("exact admission key contains a different commit");
-    }
-    Ok(())
-}
-
-async fn update_tail(
-    tx: &libsql::Transaction,
-    job: &BuildJob,
-    tail_branch: &str,
-    info: &crate::RefInfo,
-) -> Result<()> {
-    let data = serde_json::to_string(info).context("serialize admission tail")?;
-    let (synced_at, generation) = ref_times(info);
-    let changed = tx
-        .execute(
-            "UPDATE refs SET synced_at=?1, generation=?2, data=?3
-             WHERE repo_key=?4 AND branch=?5 AND commit_id=?6",
-            libsql::params![
-                synced_at,
-                generation,
-                data,
-                job.repo_id.storage_key(),
-                tail_branch,
-                info.commit.as_str()
-            ],
-        )
-        .await
-        .context("link moving admission tail")?;
-    if changed != 1 {
-        bail!("ordinary admission tail disappeared");
-    }
+    tx.execute(
+        "INSERT OR IGNORE INTO results(repo_key, commit_id, data)
+             VALUES (?1, ?2, ?3)",
+        libsql::params![
+            job.repo_id.storage_key(),
+            job.admitted_commit.as_str(),
+            data
+        ],
+    )
+    .await
+    .context("create exact admission row")?;
     Ok(())
 }
 
@@ -847,16 +895,21 @@ impl ControlPathLock {
     }
 }
 
-#[cfg(not(unix))]
-struct ControlPathLock;
+#[cfg(unix)]
+impl Drop for ControlPathLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
 
-#[cfg(not(unix))]
-impl ControlPathLock {
-    fn acquire(path: &Path) -> Result<Self> {
-        bail!(
-            "exclusive control database ownership is unsupported on this platform: {}",
-            path.display()
-        )
+        // A concurrently spawned test/helper process can briefly inherit this
+        // descriptor between fork and exec. Explicitly unlock the shared file
+        // description so ownership ends with ControlDb even if that child has
+        // not exited yet; closing our descriptor alone would leave the inherited
+        // duplicate holding the lock.
+        // SAFETY: `_file` owns a live descriptor for this lock file, and
+        // `flock(LOCK_UN)` neither dereferences memory nor transfers ownership.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 
@@ -865,12 +918,10 @@ mod tests {
     use super::*;
     use crate::queue::{JobQueue, JobState};
 
-    fn job(commit: &str) -> BuildJob {
+    fn job(commit: &str, _checkout_name: &str) -> BuildJob {
         BuildJob {
             repo_id: crate::provider::RepoId::github("acme/control"),
-            branch: "main".to_string(),
             admitted_commit: commit.to_string(),
-            admitted_default_branch: Some("main".to_string()),
             repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,
@@ -880,9 +931,20 @@ mod tests {
     fn pending(commit: &str) -> crate::RefInfo {
         crate::RefInfo {
             commit: commit.to_string(),
-            default_branch: "main".to_string(),
-            internal_exact_result: true,
-            build_status: Some("queued".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn ready_artifacts(commit: &str, label: &str) -> crate::ClonepackArtifacts {
+        let hash = |suffix: &str| crate::cas::hash(format!("{label}-{suffix}").as_bytes());
+        crate::ClonepackArtifacts {
+            manifest: hash("manifest"),
+            metadata_chunk: hash("metadata"),
+            skeleton_pack: hash("skeleton-pack"),
+            skeleton_idx: hash("skeleton-idx"),
+            prebuilt_index: hash("index"),
+            idx_bundle: hash("idx-bundle"),
+            commit: commit.to_string(),
             ..Default::default()
         }
     }
@@ -898,27 +960,15 @@ mod tests {
             archive_chunk_size: Some(1024),
             ..Default::default()
         };
-        {
-            let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-                .await
-                .unwrap();
-            assert!(control.repository_config(&missing).await.unwrap().is_none());
-            control
-                .put_repository_config(&repo_id, &config)
-                .await
-                .unwrap();
-
-            let connection = control.database.connect().unwrap();
-            let mut rows = connection
-                .query("SELECT COUNT(*) FROM repository_configs", ())
-                .await
-                .unwrap();
-            assert_eq!(
-                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-                1
-            );
-        }
-
+        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        assert!(control.repository_config(&missing).await.unwrap().is_none());
+        control
+            .put_repository_config(&repo_id, &config)
+            .await
+            .unwrap();
+        drop(control);
         let reopened = ControlDb::open(&path, None, crate::queue::default_size_classes())
             .await
             .unwrap();
@@ -951,9 +1001,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let decode = control.repository_config(&repo_id).await.unwrap_err();
-        assert!(decode.to_string().contains("decode repository config"));
-
+        assert!(
+            control
+                .repository_config(&repo_id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("decode repository config")
+        );
         connection
             .execute(
                 "UPDATE repository_configs SET data = ?1 WHERE repo_key = ?2",
@@ -961,12 +1016,18 @@ mod tests {
             )
             .await
             .unwrap();
-        let invalid = control.repository_config(&repo_id).await.unwrap_err();
-        assert!(invalid.to_string().contains("validate repository config"));
+        assert!(
+            control
+                .repository_config(&repo_id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("validate repository config")
+        );
     }
 
     #[tokio::test]
-    async fn admission_snapshots_repository_config_without_materializing_defaults() {
+    async fn admission_snapshots_repository_config() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
         let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
@@ -982,15 +1043,10 @@ mod tests {
             .await
             .unwrap();
         let commit = "dddddddddddddddddddddddddddddddddddddddd";
-        let mut admitted_job = job(commit);
+        let mut admitted_job = job(commit, "main");
         admitted_job.repo_config = control.repository_config(&repo_id).await.unwrap().unwrap();
         control
-            .admit_exact_and_job(
-                &admitted_job,
-                &crate::ref_store::exact_ref_key("main", commit),
-                &pending(commit),
-                false,
-            )
+            .admit_exact_and_job(&admitted_job, &pending(commit))
             .await
             .unwrap();
         control
@@ -1010,25 +1066,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claimed.repo_config, admitted_config);
-
-        let missing = crate::provider::RepoId::github("acme/no-config-row");
-        assert!(control.repository_config(&missing).await.unwrap().is_none());
-        let mut default_job = job("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
-        default_job.repo_id = missing.clone();
-        control
-            .admit_exact_and_job(
-                &default_job,
-                &crate::ref_store::exact_ref_key("main", &default_job.admitted_commit),
-                &pending(&default_job.admitted_commit),
-                false,
-            )
-            .await
-            .unwrap();
-        assert!(control.repository_config(&missing).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn atomic_admission_coalesces_duplicates_and_keeps_later_commits_distinct() {
+    async fn same_commit_different_names_share_one_result_and_job() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
         let control = Arc::new(
@@ -1036,307 +1077,63 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let first_commit = "1111111111111111111111111111111111111111";
-        let first_job = job(first_commit);
-        let first_pending = pending(first_commit);
-        let exact = format!("main@{first_commit}");
-
+        let commit = "1111111111111111111111111111111111111111";
+        let names = ["main", "release", "HEAD"];
         let mut admissions = Vec::new();
-        for _ in 0..32 {
+        for index in 0..32 {
             let control = control.clone();
-            let job = first_job.clone();
-            let pending = first_pending.clone();
-            let exact = exact.clone();
+            let admitted = job(commit, names[index % names.len()]);
+            let pending = pending(commit);
             admissions.push(tokio::spawn(async move {
                 control
-                    .admit_exact_and_job(&job, &exact, &pending, false)
+                    .admit_exact_and_job(&admitted, &pending)
                     .await
                     .unwrap()
             }));
         }
         let mut enqueued = 0;
-        let mut coalesced = 0;
-        let mut first_id = None;
+        let mut job_ids = std::collections::HashSet::new();
         for admission in admissions {
             let admission = admission.await.unwrap();
-            first_id.get_or_insert(admission.job_id.unwrap());
-            match admission.outcome {
-                EnqueueOutcome::Enqueued => enqueued += 1,
-                EnqueueOutcome::Coalesced => coalesced += 1,
-                EnqueueOutcome::Full => panic!("durable admission is not capacity bounded"),
-            }
+            enqueued += usize::from(admission.outcome == EnqueueOutcome::Enqueued);
+            job_ids.insert(admission.job_id.unwrap());
         }
         assert_eq!(enqueued, 1);
-        assert_eq!(coalesced, 31);
+        assert_eq!(job_ids.len(), 1);
         assert_eq!(control.queue().depth().await, 1);
         assert_eq!(
             control
                 .ref_store()
-                .load_branch(&first_job.repo_id, &exact)
+                .list_commits(&job(commit, "main").repo_id)
                 .await
-                .unwrap()
-                .unwrap()
-                .commit,
-            first_commit
+                .unwrap(),
+            vec![commit.to_string()]
         );
 
-        let second_commit = "2222222222222222222222222222222222222222";
-        let second = control
-            .admit_exact_and_job(
-                &job(second_commit),
-                &format!("main@{second_commit}"),
-                &pending(second_commit),
-                false,
-            )
+        let later = "2222222222222222222222222222222222222222";
+        let admitted = control
+            .admit_exact_and_job(&job(later, "main"), &pending(later))
             .await
             .unwrap();
-        assert_eq!(second.outcome, EnqueueOutcome::Enqueued);
-        assert_ne!(second.job_id, first_id);
+        assert_eq!(admitted.outcome, EnqueueOutcome::Enqueued);
         assert_eq!(control.queue().depth().await, 2);
     }
 
     #[tokio::test]
-    async fn first_admissions_form_one_fenced_publication_chain() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("control.db");
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
-        let first_commit = "1111111111111111111111111111111111111111";
-        let second_commit = "2222222222222222222222222222222222222222";
-        let mut first_pending = pending(first_commit);
-        first_pending.require_matching_commit = true;
-        first_pending.moving_publication_predecessors =
-            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
-        let mut second_pending = pending(second_commit);
-        second_pending.require_matching_commit = true;
-        second_pending.moving_publication_predecessors =
-            vec![crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string()];
-        let first_exact = crate::ref_store::exact_ref_key("main", first_commit);
-        let second_exact = crate::ref_store::exact_ref_key("main", second_commit);
-
-        control
-            .admit_exact_and_job(&job(first_commit), &first_exact, &first_pending, true)
-            .await
-            .unwrap();
-        control
-            .admit_exact_and_job(&job(second_commit), &second_exact, &second_pending, true)
-            .await
-            .unwrap();
-
-        let store = control.ref_store();
-        let first = store
-            .load_branch(&job(first_commit).repo_id, &first_exact)
-            .await
-            .unwrap()
-            .unwrap();
-        let second = store
-            .load_branch(&job(second_commit).repo_id, &second_exact)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            first.moving_admission_successors,
-            vec![second_commit.to_string()]
-        );
-        assert_eq!(
-            second.moving_publication_predecessors,
-            vec![
-                crate::ref_store::INITIAL_MOVING_PROJECTION_PREDECESSOR.to_string(),
-                first_commit.to_string(),
-            ]
-        );
-
-        let mut first_projection = first;
-        first_projection.internal_exact_result = false;
-        first_projection.require_matching_commit = true;
-        let mut second_projection = second;
-        second_projection.internal_exact_result = false;
-        second_projection.require_matching_commit = true;
-        store
-            .save_branch(&job(first_commit).repo_id, "main", &first_projection)
-            .await
-            .unwrap();
-        store
-            .save_branch(&job(second_commit).repo_id, "main", &second_projection)
-            .await
-            .unwrap();
-        store
-            .save_branch(&job(first_commit).repo_id, "main", &first_projection)
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .load_branch(&job(first_commit).repo_id, "main")
-                .await
-                .unwrap()
-                .unwrap()
-                .commit,
-            second_commit,
-            "the older first admission must not replace its admitted successor"
-        );
-    }
-
-    #[tokio::test]
-    async fn established_tail_is_extended_transactionally_for_later_admissions() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("control.db");
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
-        let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let c = "cccccccccccccccccccccccccccccccccccccccc";
-        let store = control.ref_store();
-        let moving_a = crate::RefInfo {
-            commit: a.to_string(),
-            default_branch: "main".to_string(),
-            ..Default::default()
-        };
-        let mut exact_a = moving_a.clone();
-        exact_a.internal_exact_result = true;
-        store
-            .save_branch(&job(a).repo_id, "main", &moving_a)
-            .await
-            .unwrap();
-        store
-            .save_branch(
-                &job(a).repo_id,
-                &crate::ref_store::exact_ref_key("main", a),
-                &exact_a,
-            )
-            .await
-            .unwrap();
-
-        // Both request-side preparations may have observed A. The database is
-        // authoritative: serialized immediate transactions must extend the
-        // committed tail to A -> B -> C instead of overwriting A twice.
-        control
-            .admit_exact_and_job(
-                &job(b),
-                &crate::ref_store::exact_ref_key("main", b),
-                &pending(b),
-                true,
-            )
-            .await
-            .unwrap();
-        control
-            .admit_exact_and_job(
-                &job(c),
-                &crate::ref_store::exact_ref_key("main", c),
-                &pending(c),
-                true,
-            )
-            .await
-            .unwrap();
-
-        let mut projection_b = store
-            .load_branch(&job(b).repo_id, &crate::ref_store::exact_ref_key("main", b))
-            .await
-            .unwrap()
-            .unwrap();
-        projection_b.internal_exact_result = false;
-        projection_b.require_matching_commit = true;
-        store
-            .save_branch(&job(b).repo_id, "main", &projection_b)
-            .await
-            .unwrap();
-        let mut projection_c = store
-            .load_branch(&job(c).repo_id, &crate::ref_store::exact_ref_key("main", c))
-            .await
-            .unwrap()
-            .unwrap();
-        projection_c.internal_exact_result = false;
-        projection_c.require_matching_commit = true;
-        store
-            .save_branch(&job(c).repo_id, "main", &projection_c)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store
-                .load_branch(&job(c).repo_id, "main")
-                .await
-                .unwrap()
-                .unwrap()
-                .commit,
-            c,
-            "completing B then C must leave the established moving branch at C"
-        );
-        let exact_b = store
-            .load_branch(&job(b).repo_id, &crate::ref_store::exact_ref_key("main", b))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(exact_b.moving_admission_successors, vec![c.to_string()]);
-        assert_eq!(
-            projection_c.moving_publication_predecessors,
-            vec![a.to_string(), b.to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_admission_rolls_back_exact_result_and_job() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("control.db");
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
-        let commit = "3333333333333333333333333333333333333333";
-        let job = job(commit);
-        let exact = format!("main@{commit}");
-        let missing_commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let moving = crate::RefInfo {
-            commit: missing_commit.to_string(),
-            default_branch: "main".to_string(),
-            ..Default::default()
-        };
-        control
-            .ref_store()
-            .save_branch(&job.repo_id, "main", &moving)
-            .await
-            .unwrap();
-        let error = control
-            .admit_exact_and_job(&job, &exact, &pending(commit), true)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("ordinary admission chain is missing exact")
-        );
-        assert!(
-            control
-                .ref_store()
-                .load_branch(&job.repo_id, &exact)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(control.queue().depth().await, 0);
-    }
-
-    #[tokio::test]
-    async fn accepted_job_survives_server_restart() {
+    async fn accepted_job_and_exact_result_survive_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
         let commit = "4444444444444444444444444444444444444444";
-        let admitted_id = {
-            let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-                .await
-                .unwrap();
-            control
-                .admit_exact_and_job(
-                    &job(commit),
-                    &format!("main@{commit}"),
-                    &pending(commit),
-                    false,
-                )
-                .await
-                .unwrap()
-                .job_id
-                .unwrap()
-        };
+        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        let admitted_id = control
+            .admit_exact_and_job(&job(commit, "main"), &pending(commit))
+            .await
+            .unwrap()
+            .job_id
+            .unwrap();
+        drop(control);
         let reopened = ControlDb::open(&path, None, crate::queue::default_size_classes())
             .await
             .unwrap();
@@ -1344,7 +1141,160 @@ mod tests {
             reopened.queue().job_status(admitted_id).await.unwrap(),
             JobState::Pending
         ));
-        assert_eq!(reopened.queue().depth().await, 1);
+        assert_eq!(
+            reopened
+                .ref_store()
+                .load_result(&job(commit, "main").repo_id, commit)
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            commit
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_job_cannot_overwrite_any_ready_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        let commit = "5555555555555555555555555555555555555555";
+        let repo_id = job(commit, "main").repo_id;
+        let first_id = control
+            .admit_exact_and_job(&job(commit, "main"), &pending(commit))
+            .await
+            .unwrap()
+            .job_id
+            .unwrap();
+        let first = control.queue().claim("first-owner").await.unwrap().unwrap();
+        assert_eq!(first.id, first_id);
+        let head = crate::HeadResult {
+            clonepack: ready_artifacts(commit, "ready-head"),
+            ..Default::default()
+        };
+        assert!(
+            control
+                .publish_head_for_claim(first.id, "first-owner", &repo_id, commit, head.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            control
+                .queue()
+                .ack(
+                    first.id,
+                    "first-owner",
+                    Err(crate::queue::BuildError::permanent("stopped")),
+                )
+                .await
+                .unwrap()
+        );
+
+        let second_id = control
+            .admit_exact_and_job(&job(commit, "main"), &pending(commit))
+            .await
+            .unwrap()
+            .job_id
+            .unwrap();
+        let second = control
+            .queue()
+            .claim("second-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id, second_id);
+        let full = crate::FullResult {
+            clonepack: ready_artifacts(commit, "ready-full"),
+            ..Default::default()
+        };
+        let files = crate::FilesResult {
+            clonepack: ready_artifacts(commit, "ready-files"),
+            ..Default::default()
+        };
+        assert!(
+            control
+                .publish_full_for_claim(second.id, "second-owner", &repo_id, commit, full.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            control
+                .publish_files_for_claim(
+                    second.id,
+                    "second-owner",
+                    &repo_id,
+                    commit,
+                    files.clone(),
+                )
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            !control
+                .publish_head_for_claim(
+                    first.id,
+                    "first-owner",
+                    &repo_id,
+                    commit,
+                    crate::HeadResult {
+                        clonepack: ready_artifacts(commit, "stale-head"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !control
+                .publish_full_for_claim(
+                    first.id,
+                    "first-owner",
+                    &repo_id,
+                    commit,
+                    crate::FullResult {
+                        clonepack: ready_artifacts(commit, "stale-full"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !control
+                .publish_files_for_claim(
+                    first.id,
+                    "first-owner",
+                    &repo_id,
+                    commit,
+                    crate::FilesResult {
+                        clonepack: ready_artifacts(commit, "stale-files"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        let stored = control
+            .ref_store()
+            .load_result(&repo_id, commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.head.unwrap().clonepack.manifest,
+            head.clonepack.manifest
+        );
+        assert_eq!(
+            stored.full.unwrap().clonepack.manifest,
+            full.clonepack.manifest
+        );
+        assert_eq!(
+            stored.files.unwrap().clonepack.manifest,
+            files.clonepack.manifest
+        );
     }
 
     #[tokio::test]
@@ -1357,7 +1307,7 @@ mod tests {
         let error = ControlDb::open(&path, None, crate::queue::default_size_classes())
             .await
             .err()
-            .expect("second server must fail before opening the database");
+            .unwrap();
         assert!(
             error
                 .to_string()
@@ -1378,17 +1328,28 @@ mod tests {
             .unwrap();
         drop(database);
         let before = std::fs::read(&path).unwrap();
-
         let error = ControlDb::open(&path, None, crate::queue::default_size_classes())
             .await
             .err()
-            .expect("old database must fail");
-
+            .unwrap();
         assert!(
             error
                 .to_string()
                 .contains("automatic migration is not supported")
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[cfg(not(unix))]
+struct ControlPathLock;
+
+#[cfg(not(unix))]
+impl ControlPathLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        bail!(
+            "exclusive control database ownership is unsupported on this platform: {}",
+            path.display()
+        )
     }
 }

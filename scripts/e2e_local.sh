@@ -20,9 +20,9 @@ for bin in "$SERVER_BIN" "$CLI_BIN"; do
 done
 
 export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-e2e-local-token}"
-# This script does `sync` then `clone`. Builds are always asynchronous and
-# two-phase: depth=1 is ready when `sync` returns, but the full/files variants
-# finish in the background, so the clone helpers below retry until ready.
+# This script does `sync` then `clone`. Builds are always asynchronous: Head
+# publishes first, while Full and Files finish concurrently in the background,
+# so the clone helpers below retry until their requested result is ready.
 # Per-repo access enforcement (AU1) probes the provider over HTTP and can't
 # reach this file:// origin. This is a single-tenant local e2e, so use the
 # documented trust-mode escape hatch (the shared token is the only auth here).
@@ -31,6 +31,10 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum | awk '{print $1}'
 TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | sha256)
 
 BASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ripclone-e2e-local.XXXXXX")"
+# The binary fixture must not inherit a developer's real Ripclone config. In
+# particular, an intentionally stale config should not make the CI fixture
+# exercise startup validation instead of the scenarios below.
+export RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml"
 ORIGIN_ROOT="$BASE_DIR/origins"
 CAS_DIR="$BASE_DIR/cas"
 REPO_ROOT="$BASE_DIR/repos"
@@ -118,9 +122,8 @@ sync_repo() {
   add_repo "$1" "$2"
   "$CLI_BIN" --server "$SERVER_URL" sync "$1/$2" >/dev/null
 }
-# Builds are two-phase: depth=1 is ready as soon as `sync` returns, but the full
-# and files variants finish in the background, and on a re-sync the full variant
-# briefly serves the previous commit. So retry the clone until it succeeds.
+# Head can be ready as soon as `sync` returns, while Full and Files finish in
+# the background. Retry the clone until its requested result succeeds.
 clone_repo() { # owner repo dir [extra cli args...]
   local i
   for i in $(seq 1 80); do

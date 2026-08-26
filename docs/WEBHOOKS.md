@@ -99,9 +99,9 @@ Per provider instance:
   provider-prefixed for others (`gitlab/group/sub/proj`, `gitea/owner/repo`) —
   *not* the slash-escaped storage key. (For GitHub the prefixed
   `github/owner/repo` form is also accepted, so the asymmetry isn't a footgun.)
-- **Branch policy** — always warm the default branch (from the payload, or the
-  local mirror's HEAD if the provider omits it); warm other branches only if
-  already tracked. `RIPCLONE_WEBHOOK_WARM_ALL=1` warms every pushed branch.
+- **Branch policy** — admit only a push whose signed payload identifies the
+  pushed branch as the repository's default branch. A missing default-branch
+  identity or a non-default push is acknowledged without work.
 
 ### Per-provider setup notes
 
@@ -112,21 +112,20 @@ Per provider instance:
   this receiver does not implement — it would be rejected (fail-closed), never
   silently accepted. Set `RIPCLONE_WEBHOOK_SECRET_GITLAB` to the same value.
 - **Gitea / Forgejo** — the `X-Gitea-Signature` HMAC secret is
-  `RIPCLONE_WEBHOOK_SECRET_GITEA`. **Enable the "Delete" event** on the webhook:
-  unlike GitHub, Gitea fires a dedicated `delete` event for branch deletions (not
-  a zero-`after` push), so without it branch-delete cleanup won't fire.
+  `RIPCLONE_WEBHOOK_SECRET_GITEA`. Its dedicated `delete` event is normalized
+  and acknowledged without changing exact results.
 
 ## Action
 
-- **Push** to an eligible ref → validate `after` as a full object ID and enqueue
-  `(provider, owner, repo, branch, after)` with the configured credential.
+- **Push** to the payload-identified default branch → validate `after` as a full
+  object ID and enqueue `(repository, after)` with the configured credential.
   **Reuse the shared exact enqueue path**: the webhook calls the same admission
   function used by `/v1/build` and the poll loop. It performs zero additional
   `ls-remote` probes, coalesces exact duplicates in queued/claimed/embedded
   Full work, and keeps a later commit as a separate job. Do **not** duplicate
   build logic.
-- **Branch delete** (`after` all-zeros / `deleted: true`) → clean up that ref's
-  metadata; do not try to build a ref that no longer exists.
+- **Branch delete** (`after` all-zeros / `deleted: true`) → acknowledge without
+  work. Exact results outlive checkout-name deletion and remain commit keyed.
 - **Ping** → `200`. **Other** → ignore.
 
 ## Security
@@ -142,22 +141,23 @@ Per provider instance:
 
 ## Events — phase 1 vs later
 
-- **Phase 1:** push (warm), branch-delete (cleanup), ping. This is the whole
-  value — push → warm — for self-host.
+- **Phase 1:** default-branch push (exact admission), delete (ignore), and ping.
+  This is the whole webhook value for self-host.
 - **Later:** provider repo-lifecycle events where available (visibility change →
-  re-gate access / retune signed-URL TTL, rename → re-key, delete → purge);
+  re-gate access / retune signed-URL TTL, rename → re-key, delete → stop future
+  admission while retaining published exact results);
   tag/release pre-warm. These differ a lot per provider; keep them out of phase 1.
 
 ## Explicit add — the added-repo set
 
-The `RIPCLONE_WEBHOOK_ALLOWLIST` above is a *static* gate: it answers "is this
-pushed repo allowed to warm?" but it lives in config and needs a restart to
-change. For a server you keep running, you manage which repos warm **at runtime**
-by *adding* them. A push warms a repo only if that repo has been added — the
+The `RIPCLONE_WEBHOOK_ALLOWLIST` above is a *static* gate: it answers "may this
+pushed repo admit exact work?" but it lives in config and needs a restart to
+change. For a server you keep running, you manage eligibility **at runtime** by
+*adding* repositories. A push admits work only if its repo has been added—the
 added-repo set is the dynamic watch-list.
 
-An added repo is one the server keeps warm: its default branch (plus any branches
-that are already built) rebuilds on every push, and the set survives restarts.
+An added repo is eligible for exact admission from a signed default-branch push,
+and the set survives restarts.
 
 ### API
 
@@ -170,14 +170,14 @@ Authenticated with the server token (the same `RIPCLONE_SERVER_TOKEN` that gates
 `add` is idempotent and admits an initial exact build. Its HTTP response and CLI
 return after ready detection or queue acceptance; `202` does not mean the first
 clonepack is complete. There is no separate `track`/`untrack`/`tracked` verb —
-adding a repo is what makes it both cloneable and warm-on-push.
+adding a repo is what makes it both cloneable and eligible for push admission.
 
 ### CLI
 
 The CLI wraps the API against the configured server:
 
 ```
-ripclone add owner/repo          # make it cloneable and keep it warm
+ripclone add owner/repo          # make it cloneable and eligible for exact pushes
 ```
 
 Provider-prefixed forms — `gitlab:group/proj`, `gitea:owner/repo` — use the same
@@ -186,11 +186,11 @@ natural-key convention as the allowlist. Removal is server-token-gated via the
 
 ### Storage
 
-The added-repo set is a small table in the **pluggable metadata store** (the same
-store that holds `RefInfo`), so it inherits whatever backend you configured
-(files or SQL). No new infrastructure.
+The added-repo set is a table in the server-owned SQLite/Turso control database,
+alongside exact results and durable jobs. Artifact bytes remain in the selected
+local or S3-compatible storage backend.
 
-### How it combines with the allowlist and warm-all
+### How it combines with the allowlist
 
 On a push, the receiver enqueues a sync only when **both** hold:
 
@@ -200,9 +200,8 @@ On a push, the receiver enqueues a sync only when **both** hold:
 
 So the allowlist is the optional "set it and forget it" restriction, and the
 added-repo set is the "manage it as you go" gate. With no repos added, a push
-warms nothing: **explicit by default.** An added repo's default branch always
-warms; other branches warm only if already built, unless
-`RIPCLONE_WEBHOOK_WARM_ALL=1`.
+admits nothing: **explicit by default.** For an added, allowed repo, only a
+signed push identifying its default branch admits the payload's exact commit.
 
 ## Implementation checklist
 
@@ -210,7 +209,7 @@ Phase 1 (GitHub) is implemented:
 
 - [x] `webhook` module: `WebhookProvider` trait + `CanonicalEvent`
       (`rust/src/webhook/mod.rs`).
-- [x] GitHub adapter (HMAC-256; push / branch-delete / ping) in
+- [x] GitHub adapter (HMAC-256; push / delete / ping) in
       `rust/src/webhook/github.rs`.
 - [x] GitLab adapter (`X-Gitlab-Token` constant-time equality; `Push Hook`) in
       `rust/src/webhook/gitlab.rs`.
@@ -222,14 +221,13 @@ Phase 1 (GitHub) is implemented:
 - [x] Admit the validated exact `after` through the shared trigger path (also
       used by `/v1/build` and the poll loop), with no second tip probe and no
       duplicated build logic.
-- [x] Config: per-provider webhook secret (`RIPCLONE_WEBHOOK_SECRET_<ID>`) + `StaticBroker`
-      credential for private clones + optional `RIPCLONE_WEBHOOK_ALLOWLIST` +
-      `RIPCLONE_WEBHOOK_WARM_ALL` to warm every pushed branch.
-- [x] Branch-delete cleanup path (`RefStore::delete_branch`, file + S3 + caching
-      impls).
+- [x] Config: per-provider webhook secret (`RIPCLONE_WEBHOOK_SECRET_<ID>`) +
+      `StaticBroker` credential for private clones + optional
+      `RIPCLONE_WEBHOOK_ALLOWLIST`.
+- [x] Delete events are acknowledged without deleting commit-keyed results.
 - [x] Tests: signature verify (valid / invalid / missing), GitHub parse, enqueue
-      invoked on push, delete → cleanup, allowlist gating, no-secret ⇒ 503,
-      tracked/untracked non-default branch.
+      invoked on default-branch push, delete ignored, allowlist gating,
+      no-secret ⇒ 503, and non-default push ignored.
 - [x] Docs: README "Webhooks" section; cross-links below.
 
 **Follow-ups:** Repo-lifecycle events (visibility/rename/delete) and tag/release
@@ -238,12 +236,11 @@ pre-warm (see [Events](#events--phase-1-vs-later)).
 ## Open questions — resolved
 
 - **Allowlist default:** allow-all (single-tenant trust) with a loud startup log
-  warning that all pushed repos warm. Set `RIPCLONE_WEBHOOK_ALLOWLIST` to
-  restrict. **Done.**
-- **Non-default-branch policy:** always warm the default branch (from the payload
-  or, if absent, the local mirror's HEAD); warm other branches only if a build for
-  them already exists (`ref_store.load_branch`). `RIPCLONE_WEBHOOK_WARM_ALL=1`
-  opts into warming every pushed branch instead. **Done.**
+  warning that every added repo is eligible for default-branch push admission.
+  Set `RIPCLONE_WEBHOOK_ALLOWLIST` to restrict. **Done.**
+- **Non-default-branch policy:** only the payload-identified default branch
+  admits exact work. Missing identity and non-default pushes are acknowledged
+  without a build. **Done.**
 - **Multi-instance routing:** `{provider}` in the path is the `ProviderInstance`
   id (same lookup as `/v1/repos/{provider}/…`), and the secret is keyed per
   instance id — so several instances of the same kind each get their own
@@ -251,7 +248,7 @@ pre-warm (see [Events](#events--phase-1-vs-later)).
 
 ## See also
 
-- [`GITHUB_INTEGRATION.md`](internal/GITHUB_INTEGRATION.md) — GitHub auth / token setup
-  the webhook reuses for private clones (`StaticBroker`).
+- [`CONFIG.md`](CONFIG.md) — current provider credential configuration for
+  private clone and webhook builds.
 - [`BACKENDS.md`](BACKENDS.md) — the build queue + worker the receiver enqueues
   onto.

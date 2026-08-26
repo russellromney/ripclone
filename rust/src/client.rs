@@ -1,3 +1,4 @@
+use crate::ExactResultKind;
 use crate::bench::Benchmark;
 use crate::cas::{Cas, hash as cas_hash};
 use crate::clonepack::{
@@ -81,13 +82,19 @@ fn observe_sync_at_identity(
 ) -> Result<()> {
     crate::validation::validate_object_id(commit)
         .with_context(|| format!("validate commit in exact revision {response_kind} response"))?;
-    if branch.is_empty() {
+    let detached_allowed = pin
+        .as_ref()
+        .is_some_and(|identity| identity.branch.as_deref().is_none_or(str::is_empty));
+    if branch.is_empty() && !detached_allowed {
         anyhow::bail!(
             "sync integrity error: exact revision {response_kind} response omitted branch"
         );
     }
-    crate::validation::validate_git_rev(branch)
-        .with_context(|| format!("validate branch in exact revision {response_kind} response"))?;
+    if !branch.is_empty() {
+        crate::validation::validate_checkout_name(branch).with_context(|| {
+            format!("validate branch in exact revision {response_kind} response")
+        })?;
+    }
 
     if let Some(expected) = pin {
         if expected.commit != commit
@@ -117,6 +124,7 @@ fn observe_sync_at_identity(
 fn validate_ref_response_identity(
     expected_commit: Option<&str>,
     expected_branch: Option<&str>,
+    detached_checkout_allowed: bool,
     commit: &str,
     branch: &str,
     response_kind: &str,
@@ -124,8 +132,13 @@ fn validate_ref_response_identity(
 ) -> Result<()> {
     crate::validation::validate_object_id(commit)
         .with_context(|| format!("invalid {response_kind} commit for {repo_path}"))?;
-    crate::validation::validate_git_rev(branch)
-        .with_context(|| format!("invalid {response_kind} branch for {repo_path}"))?;
+    if branch.is_empty() && !detached_checkout_allowed {
+        anyhow::bail!("invalid {response_kind} branch for {repo_path}: checkout name is empty");
+    }
+    if !branch.is_empty() {
+        crate::validation::validate_checkout_name(branch)
+            .with_context(|| format!("invalid {response_kind} branch for {repo_path}"))?;
+    }
     if let Some(expected) = expected_commit
         && commit != expected
     {
@@ -308,7 +321,6 @@ pub struct RefResponse {
     pub host: String,
     pub origin_url: String,
     pub branch: String,
-    pub default_branch: String,
     pub commit: String,
     pub parent_commit: Option<String>,
     pub clonepack_manifest: String,
@@ -332,10 +344,7 @@ pub struct RefResponse {
     /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
     #[serde(default)]
     pub idx_bundle_url: Option<String>,
-    /// True when the returned clonepack is a shallow (depth=1) snapshot.
-    pub shallow: bool,
-    /// True once the full clonepack's archive is built (files mode can clone).
-    pub archive_ready: bool,
+    pub result: ExactResultKind,
     /// The hosted server's per-clone id, captured from the `X-Ripclone-Clone-Id`
     /// response header (not part of the JSON body). `None` when the server does
     /// not mint one; in that case the post-clone metrics report is skipped.
@@ -939,7 +948,7 @@ pub struct CloneOutcome {
     pub owner: String,
     pub name: String,
     pub commit: String,
-    /// `files` | `depth1` | `full`.
+    /// `head` | `full` | `files`.
     pub mode: &'static str,
     /// True when the resolve had to poll a cold build (202) before succeeding.
     pub cold: bool,
@@ -1346,15 +1355,15 @@ impl Client {
 
 impl Client {
     pub async fn resolve_ref(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
-        self.resolve_ref_with_clonepack(repo_path, branch, None, None)
+        self.resolve_exact_result(repo_path, branch, ExactResultKind::Full, None)
             .await
     }
 
-    pub async fn resolve_ref_with_clonepack(
+    pub async fn resolve_exact_result(
         &self,
         repo_path: &str,
         branch: &str,
-        clonepack: Option<&str>,
+        result: ExactResultKind,
         rev: Option<&str>,
     ) -> Result<RefResponse> {
         let expected_commit = exact_commit_from_revision(rev);
@@ -1366,12 +1375,12 @@ impl Client {
             .resolve_ref_for_operation(
                 repo_path,
                 branch,
-                clonepack,
+                result,
                 rev,
                 expected_commit.as_deref(),
                 &mut pinned,
                 &mut resolved_branch,
-                clonepack.unwrap_or("full"),
+                &result.to_string(),
                 false,
                 &mut clone_id,
                 &mut cold,
@@ -1387,7 +1396,7 @@ impl Client {
         &self,
         repo_path: &str,
         branch: &str,
-        clonepack: Option<&str>,
+        result: ExactResultKind,
         rev: Option<&str>,
         expected_commit: Option<&str>,
         pinned: &mut Option<String>,
@@ -1398,13 +1407,19 @@ impl Client {
         cold: &mut bool,
     ) -> Result<InstallPlan> {
         let (max_attempts, poll_delay) = ref_poll_config();
+        let detached_checkout_allowed = branch == "HEAD"
+            && rev.is_some_and(|value| crate::validation::validate_object_id(value).is_ok());
         // Track whether any attempt polled a cold build (202/503) before
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
+            let request_was_pinned = pinned.is_some();
             let requested_top_up = allow_top_up && pinned.is_some() && rev.is_none();
             let request_branch = if pinned.is_some() {
-                resolved_branch.as_deref().unwrap_or(branch)
+                resolved_branch
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(branch)
             } else {
                 branch
             };
@@ -1415,9 +1430,7 @@ impl Client {
             let encoded_branch = urlencoding::encode(request_branch);
             let mut url = self.repo_url(repo_path, &format!("/refs/{encoded_branch}"));
             let mut q: Vec<String> = Vec::new();
-            if let Some(kind) = clonepack {
-                q.push(format!("clonepack={kind}"));
-            }
+            q.push(format!("result={result}"));
             if let Some(commit) = pinned.as_deref() {
                 q.push(format!("pinned={commit}"));
                 if requested_top_up {
@@ -1474,6 +1487,7 @@ impl Client {
                 validate_ref_response_identity(
                     pinned.as_deref().or(expected_commit),
                     resolved_branch.as_deref().or(Some(branch)),
+                    detached_checkout_allowed,
                     &pending.commit,
                     &pending.branch,
                     "pending",
@@ -1508,12 +1522,8 @@ impl Client {
                     };
                     crate::validation::validate_object_id(&base_response.commit)
                         .with_context(|| format!("invalid top-up base commit for {repo_path}"))?;
-                    crate::validation::validate_git_rev(&base_response.branch)
+                    crate::validation::validate_checkout_name(&base_response.branch)
                         .with_context(|| format!("invalid top-up base branch for {repo_path}"))?;
-                    crate::validation::validate_git_rev(&base_response.default_branch)
-                        .with_context(|| {
-                            format!("invalid top-up base default branch for {repo_path}")
-                        })?;
                     if let Some(expected) = resolved_branch.as_deref()
                         && base_response.branch != expected
                     {
@@ -1522,7 +1532,9 @@ impl Client {
                             base_response.branch
                         );
                     }
-                    if base_response.shallow || base_response.clonepack_manifest.is_empty() {
+                    if base_response.result != ExactResultKind::Full
+                        || base_response.clonepack_manifest.is_empty()
+                    {
                         anyhow::bail!(
                             "invalid top-up plan for pinned commit {target}: base is not a complete Full artifact"
                         );
@@ -1566,24 +1578,41 @@ impl Client {
             }
             if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
                 polled = true;
-                let unavailable = if pinned.is_some() || expected_commit.is_some() {
-                    let unavailable: ExactRevisionUnavailableResponse = resp
-                        .json()
-                        .await
-                        .with_context(|| format!("invalid unavailable response for {repo_path}"))?;
-                    validate_ref_response_identity(
-                        pinned.as_deref().or(expected_commit),
-                        resolved_branch.as_deref().or(Some(branch)),
-                        &unavailable.commit,
-                        &unavailable.branch,
-                        "503",
-                        repo_path,
-                    )?;
-                    *resolved_branch = Some(unavailable.branch.clone());
-                    Some(unavailable)
-                } else {
-                    None
-                };
+                let body = resp
+                    .bytes()
+                    .await
+                    .with_context(|| format!("read unavailable response for {repo_path}"))?;
+                let unavailable =
+                    match serde_json::from_slice::<ExactRevisionUnavailableResponse>(&body) {
+                        Ok(unavailable) => {
+                            validate_ref_response_identity(
+                                pinned.as_deref().or(expected_commit),
+                                resolved_branch.as_deref().or(Some(branch)),
+                                detached_checkout_allowed,
+                                &unavailable.commit,
+                                &unavailable.branch,
+                                "503",
+                                repo_path,
+                            )?;
+                            if pinned.is_none() {
+                                *pinned = Some(unavailable.commit.clone());
+                            }
+                            *resolved_branch = Some(unavailable.branch.clone());
+                            Some(unavailable)
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("invalid unavailable response for {repo_path}")
+                            });
+                        }
+                    };
+                if request_was_pinned && let Some(unavailable) = unavailable.as_ref() {
+                    anyhow::bail!(
+                        "ref lookup for pinned commit {} failed: {}",
+                        unavailable.commit,
+                        unavailable.error
+                    );
+                }
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
@@ -1621,11 +1650,17 @@ impl Client {
                 validate_ref_response_identity(
                     pinned.as_deref().or(expected_commit),
                     resolved_branch.as_deref().or(Some(branch)),
+                    detached_checkout_allowed,
                     &info.commit,
                     &info.branch,
                     "ready",
                     repo_path,
                 )?;
+                anyhow::ensure!(
+                    info.result == result,
+                    "ref result mismatch for {repo_path}: requested {result}, server returned {}",
+                    info.result
+                );
                 *pinned = Some(info.commit.clone());
                 *resolved_branch = Some(info.branch.clone());
                 *cold |= polled;
@@ -1888,7 +1923,7 @@ impl Client {
     }
 
     /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of
-    /// the branch tip. The resolved commit is used as the ref-store key, so
+    /// the branch tip. The resolved commit is the result and job identity, so
     /// different revs that resolve to the same commit share a build. Useful for
     /// exercising the incremental build path deterministically without waiting for
     /// upstream to advance.
@@ -1905,9 +1940,9 @@ impl Client {
         }
     }
 
-    /// Sync a specific branch instead of the repo's default. Each branch is its
-    /// own ref + clonepack, so this lets several distinct builds for one repo run
-    /// at once (unlike `?rev=`, which the server keys by resolved commit).
+    /// Resolve a specific branch once instead of using the repo's default, then
+    /// admit its exact commit. Checkout names are request-local: two names that
+    /// resolve to the same commit share one durable result and job.
     pub async fn sync_branch(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
         self.sync_inner(repo_path, Some(branch), None).await
     }
@@ -1961,8 +1996,10 @@ impl Client {
         let branch = accepted.branch;
         crate::validation::validate_object_id(&commit)
             .context("server returned invalid admitted commit")?;
-        crate::validation::validate_git_rev(&branch)
-            .context("server returned invalid admitted branch")?;
+        if branch != "HEAD" {
+            crate::validation::validate_checkout_name(&branch)
+                .context("server returned invalid admitted branch")?;
+        }
         Ok(SyncAdmission {
             commit,
             branch,
@@ -1990,7 +2027,7 @@ impl Client {
             .resolve_ref_for_operation(
                 repo_path,
                 &admission.branch,
-                Some("full"),
+                ExactResultKind::Full,
                 None,
                 None,
                 &mut pinned,
@@ -2078,7 +2115,7 @@ impl Client {
                 }
                 observe_sync_at_identity(&mut pin, &pending.commit, &pending.branch, "202")?;
                 selected_rev = pending.commit;
-                selected_branch = Some(pending.branch);
+                selected_branch = (!pending.branch.is_empty()).then_some(pending.branch);
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(poll).await;
                     continue;
@@ -2097,7 +2134,7 @@ impl Client {
                     "503",
                 )?;
                 selected_rev = unavailable.commit;
-                selected_branch = Some(unavailable.branch);
+                selected_branch = (!unavailable.branch.is_empty()).then_some(unavailable.branch);
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(poll).await;
                     continue;
@@ -2232,25 +2269,28 @@ impl Client {
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
-        // `files` | `depth1` | `full`, derived from the mode and requested
-        // clonepack variant (depth=1 ⇒ "shallow").
-        let metric_mode: &'static str = if mode.needs_archive() {
-            "files"
+        let result = if mode.needs_archive() {
+            ExactResultKind::Files
         } else if clonepack == Some("shallow") {
-            "depth1"
+            ExactResultKind::Head
         } else {
-            "full"
+            ExactResultKind::Full
+        };
+        let metric_mode = match result {
+            ExactResultKind::Head => "head",
+            ExactResultKind::Full => "full",
+            ExactResultKind::Files => "files",
         };
         // 1. Resolve the moving selector once. A pending or ready response
         // establishes `identity.pinned`; every later poll and retry uses the
         // metadata-only pinned query.
         let allow_top_up =
-            rev.is_none() && mode == CloneMode::Editable && clonepack.unwrap_or("full") == "full";
+            rev.is_none() && mode == CloneMode::Editable && result == ExactResultKind::Full;
         let plan = self
             .resolve_ref_for_operation(
                 repo_path,
                 branch,
-                clonepack,
+                result,
                 rev,
                 expected_commit.as_deref(),
                 &mut identity.pinned,
@@ -2262,7 +2302,7 @@ impl Client {
             )
             .await?;
         bench.mark_resolve();
-        let (plan_target, artifact, mut info, top_up) = plan.into_parts();
+        let (plan_target, artifact, info, top_up) = plan.into_parts();
         let pinned = identity
             .pinned
             .clone()
@@ -2290,48 +2330,6 @@ impl Client {
             if top_up { "base" } else { "exact" },
             &artifact[..7]
         );
-
-        // Files mode needs the zstd archive. The server publishes an editable
-        // clonepack first and adds the archive a moment later, so wait for it
-        // (editable clones don't need it and skip this). Waiting here means the
-        // archive is being built on demand — a cold build — which the
-        // ref-resolve 202 poll above doesn't capture for files mode, so record
-        // it for the metrics label.
-        if mode.needs_archive() && !info.archive_ready {
-            identity.cold = true;
-            let (max, poll_delay) = ref_poll_config();
-            for _ in 0..max {
-                tokio::time::sleep(poll_delay).await;
-                info = match self
-                    .resolve_ref_for_operation(
-                        repo_path,
-                        branch,
-                        clonepack,
-                        rev,
-                        expected_commit.as_deref(),
-                        &mut identity.pinned,
-                        &mut identity.resolved_branch,
-                        metric_mode,
-                        false,
-                        &mut identity.clone_id,
-                        &mut identity.cold,
-                    )
-                    .await?
-                {
-                    InstallPlan::Exact { response, .. } => response,
-                    InstallPlan::TopUp { .. } => unreachable!("files mode does not request top-up"),
-                };
-                if info.archive_ready {
-                    break;
-                }
-            }
-            if !info.archive_ready {
-                return Err(anyhow::Error::new(ArtifactPending {
-                    commit: pinned.clone(),
-                    mode: metric_mode.to_string(),
-                }));
-            }
-        }
 
         if info.clonepack_manifest.is_empty() {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
@@ -2486,36 +2484,24 @@ impl Client {
             std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
             std::fs::create_dir_all(git_dir.join("info"))?;
 
-            let branch_name = if branch == "HEAD" {
-                // The pinned B response establishes the resolved branch. A
-                // carried Full(A) manifest can predate an upstream default-
-                // branch rename, so never attach B to its stale default name.
-                identity
-                    .resolved_branch
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| {
-                        if info.default_branch.is_empty() {
-                            "main"
-                        } else {
-                            &info.default_branch
-                        }
-                    })
+            let branch_name = identity.resolved_branch.as_deref().unwrap_or(branch);
+            if branch_name.is_empty() {
+                std::fs::write(git_dir.join("HEAD"), format!("{}\n", info.commit))?;
             } else {
-                branch
-            };
-
-            std::fs::write(
-                git_dir.join("HEAD"),
-                format!("ref: refs/heads/{branch_name}\n"),
-            )?;
-            let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
-            if let Some(parent) = branch_ref.parent() {
-                std::fs::create_dir_all(parent)?;
+                crate::validation::validate_checkout_name(branch_name)
+                    .context("server returned invalid checkout branch")?;
+                std::fs::write(
+                    git_dir.join("HEAD"),
+                    format!("ref: refs/heads/{branch_name}\n"),
+                )?;
+                let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
+                if let Some(parent) = branch_ref.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(branch_ref, format!("{}\n", info.commit))?;
             }
-            std::fs::write(branch_ref, format!("{}\n", info.commit))?;
             std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
-            if info.shallow {
+            if info.result == ExactResultKind::Head {
                 // Mark HEAD as a shallow boundary so git does not try to traverse
                 // missing parents.
                 std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
@@ -3715,26 +3701,27 @@ impl Client {
         std::fs::create_dir_all(git_dir.join("info"))?;
 
         let branch_name = if branch == "HEAD" {
-            if info.default_branch.is_empty() {
-                "main"
-            } else {
-                &info.default_branch
-            }
+            &info.branch
         } else {
             branch
         };
-
-        std::fs::write(
-            git_dir.join("HEAD"),
-            format!("ref: refs/heads/{}\n", branch_name),
-        )?;
-        let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
-        if let Some(parent) = branch_ref.parent() {
-            std::fs::create_dir_all(parent)?;
+        if branch_name.is_empty() {
+            std::fs::write(git_dir.join("HEAD"), format!("{}\n", info.commit))?;
+        } else {
+            crate::validation::validate_checkout_name(branch_name)
+                .context("server returned invalid checkout branch")?;
+            std::fs::write(
+                git_dir.join("HEAD"),
+                format!("ref: refs/heads/{}\n", branch_name),
+            )?;
+            let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
+            if let Some(parent) = branch_ref.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(branch_ref, format!("{}\n", info.commit))?;
         }
-        std::fs::write(branch_ref, format!("{}\n", info.commit))?;
         std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
-        if info.shallow {
+        if info.result == ExactResultKind::Head {
             std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
         }
 

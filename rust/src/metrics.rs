@@ -18,16 +18,16 @@ pub struct Metrics {
     sync_skeleton_build_ms_total: AtomicU64,
     sync_files_table_ms_total: AtomicU64,
     sync_prebuilt_index_ms_total: AtomicU64,
-    sync_upload_p1_ms_total: AtomicU64,
+    sync_upload_head_ms_total: AtomicU64,
     sync_ref_publish_ms_total: AtomicU64,
-    sync_publish_p1_ms_total: AtomicU64,
+    sync_publish_head_ms_total: AtomicU64,
     artifact_requests: AtomicU64,
     artifact_bytes_served: AtomicU64,
     errors: AtomicU64,
-    retention_runs: AtomicU64,
-    retention_evicted_bytes: AtomicU64,
-    retention_evicted_objects: AtomicU64,
-    retention_errors: AtomicU64,
+    local_cache_cleanup_runs: AtomicU64,
+    local_cache_removed_bytes: AtomicU64,
+    local_cache_removed_objects: AtomicU64,
+    local_cache_cleanup_errors: AtomicU64,
     builds_queued: AtomicU64,
     builds_completed: AtomicU64,
     builds_failed: AtomicU64,
@@ -57,9 +57,9 @@ impl Metrics {
         Self::add_optional(&self.sync_skeleton_build_ms_total, phases.skeleton_build_ms);
         Self::add_optional(&self.sync_files_table_ms_total, phases.files_table_ms);
         Self::add_optional(&self.sync_prebuilt_index_ms_total, phases.prebuilt_index_ms);
-        Self::add_optional(&self.sync_upload_p1_ms_total, phases.upload_p1_ms);
+        Self::add_optional(&self.sync_upload_head_ms_total, phases.upload_head_ms);
         Self::add_optional(&self.sync_ref_publish_ms_total, phases.ref_publish_ms);
-        Self::add_optional(&self.sync_publish_p1_ms_total, phases.publish_p1_ms);
+        Self::add_optional(&self.sync_publish_head_ms_total, phases.publish_head_ms);
     }
 
     pub fn record_artifact_request(&self, bytes: u64) {
@@ -72,16 +72,18 @@ impl Metrics {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_retention_run(&self, evicted_bytes: u64, evicted_objects: u64) {
-        self.retention_runs.fetch_add(1, Ordering::Relaxed);
-        self.retention_evicted_bytes
-            .fetch_add(evicted_bytes, Ordering::Relaxed);
-        self.retention_evicted_objects
-            .fetch_add(evicted_objects, Ordering::Relaxed);
+    pub fn record_local_cache_cleanup(&self, removed_bytes: u64, removed_objects: u64) {
+        self.local_cache_cleanup_runs
+            .fetch_add(1, Ordering::Relaxed);
+        self.local_cache_removed_bytes
+            .fetch_add(removed_bytes, Ordering::Relaxed);
+        self.local_cache_removed_objects
+            .fetch_add(removed_objects, Ordering::Relaxed);
     }
 
-    pub fn record_retention_error(&self) {
-        self.retention_errors.fetch_add(1, Ordering::Relaxed);
+    pub fn record_local_cache_cleanup_error(&self) {
+        self.local_cache_cleanup_errors
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment the queue-depth gauge when a job is accepted into (or about
@@ -90,9 +92,9 @@ impl Metrics {
         self.build_queue_depth.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Roll back a queue-depth increment when the queue is full and the job is
-    /// rejected.
-    pub fn record_build_rejected(&self) {
+    /// Roll back a provisional queue-depth increment when admission does not
+    /// create a new job (coalesced, full, or failed).
+    pub fn rollback_build_queued(&self) {
         Self::dec_saturating(&self.build_queue_depth);
     }
 
@@ -177,9 +179,9 @@ impl Metrics {
                 s.sync_prebuilt_index_ms_total,
             ),
             (
-                "ripclone_sync_upload_p1_ms_total",
-                "Total phase-1 upload time in milliseconds",
-                s.sync_upload_p1_ms_total,
+                "ripclone_sync_upload_head_ms_total",
+                "Total Head upload time in milliseconds",
+                s.sync_upload_head_ms_total,
             ),
             (
                 "ripclone_sync_ref_publish_ms_total",
@@ -187,9 +189,9 @@ impl Metrics {
                 s.sync_ref_publish_ms_total,
             ),
             (
-                "ripclone_sync_publish_p1_ms_total",
-                "Total phase-1 publish wall time in milliseconds",
-                s.sync_publish_p1_ms_total,
+                "ripclone_sync_publish_head_ms_total",
+                "Total Head publish wall time in milliseconds",
+                s.sync_publish_head_ms_total,
             ),
             (
                 "ripclone_artifact_requests_total",
@@ -203,24 +205,24 @@ impl Metrics {
             ),
             ("ripclone_errors_total", "Request errors", s.errors),
             (
-                "ripclone_retention_runs_total",
-                "Retention runs",
-                s.retention_runs,
+                "ripclone_local_cache_cleanup_runs_total",
+                "Local cache cleanup runs",
+                s.local_cache_cleanup_runs,
             ),
             (
-                "ripclone_retention_evicted_bytes_total",
-                "Bytes evicted by retention",
-                s.retention_evicted_bytes,
+                "ripclone_local_cache_removed_bytes_total",
+                "Bytes removed from the local build cache",
+                s.local_cache_removed_bytes,
             ),
             (
-                "ripclone_retention_evicted_objects_total",
-                "Objects evicted by retention",
-                s.retention_evicted_objects,
+                "ripclone_local_cache_removed_objects_total",
+                "Objects removed from the local build cache",
+                s.local_cache_removed_objects,
             ),
             (
-                "ripclone_retention_errors_total",
-                "Retention errors",
-                s.retention_errors,
+                "ripclone_local_cache_cleanup_errors_total",
+                "Local cache cleanup errors",
+                s.local_cache_cleanup_errors,
             ),
             (
                 "ripclone_builds_queued_total",
@@ -276,16 +278,16 @@ impl Metrics {
             sync_skeleton_build_ms_total: self.sync_skeleton_build_ms_total.load(Ordering::Relaxed),
             sync_files_table_ms_total: self.sync_files_table_ms_total.load(Ordering::Relaxed),
             sync_prebuilt_index_ms_total: self.sync_prebuilt_index_ms_total.load(Ordering::Relaxed),
-            sync_upload_p1_ms_total: self.sync_upload_p1_ms_total.load(Ordering::Relaxed),
+            sync_upload_head_ms_total: self.sync_upload_head_ms_total.load(Ordering::Relaxed),
             sync_ref_publish_ms_total: self.sync_ref_publish_ms_total.load(Ordering::Relaxed),
-            sync_publish_p1_ms_total: self.sync_publish_p1_ms_total.load(Ordering::Relaxed),
+            sync_publish_head_ms_total: self.sync_publish_head_ms_total.load(Ordering::Relaxed),
             artifact_requests: self.artifact_requests.load(Ordering::Relaxed),
             artifact_bytes_served: self.artifact_bytes_served.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
-            retention_runs: self.retention_runs.load(Ordering::Relaxed),
-            retention_evicted_bytes: self.retention_evicted_bytes.load(Ordering::Relaxed),
-            retention_evicted_objects: self.retention_evicted_objects.load(Ordering::Relaxed),
-            retention_errors: self.retention_errors.load(Ordering::Relaxed),
+            local_cache_cleanup_runs: self.local_cache_cleanup_runs.load(Ordering::Relaxed),
+            local_cache_removed_bytes: self.local_cache_removed_bytes.load(Ordering::Relaxed),
+            local_cache_removed_objects: self.local_cache_removed_objects.load(Ordering::Relaxed),
+            local_cache_cleanup_errors: self.local_cache_cleanup_errors.load(Ordering::Relaxed),
             builds_queued: self.builds_queued.load(Ordering::Relaxed),
             builds_completed,
             build_avg_ms: if builds_completed == 0 {
@@ -315,9 +317,9 @@ pub struct SyncPhaseMetrics {
     pub skeleton_build_ms: Option<u64>,
     pub files_table_ms: Option<u64>,
     pub prebuilt_index_ms: Option<u64>,
-    pub upload_p1_ms: Option<u64>,
+    pub upload_head_ms: Option<u64>,
     pub ref_publish_ms: Option<u64>,
-    pub publish_p1_ms: Option<u64>,
+    pub publish_head_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -332,16 +334,16 @@ pub struct MetricsSnapshot {
     pub sync_skeleton_build_ms_total: u64,
     pub sync_files_table_ms_total: u64,
     pub sync_prebuilt_index_ms_total: u64,
-    pub sync_upload_p1_ms_total: u64,
+    pub sync_upload_head_ms_total: u64,
     pub sync_ref_publish_ms_total: u64,
-    pub sync_publish_p1_ms_total: u64,
+    pub sync_publish_head_ms_total: u64,
     pub artifact_requests: u64,
     pub artifact_bytes_served: u64,
     pub errors: u64,
-    pub retention_runs: u64,
-    pub retention_evicted_bytes: u64,
-    pub retention_evicted_objects: u64,
-    pub retention_errors: u64,
+    pub local_cache_cleanup_runs: u64,
+    pub local_cache_removed_bytes: u64,
+    pub local_cache_removed_objects: u64,
+    pub local_cache_cleanup_errors: u64,
     pub builds_queued: u64,
     pub builds_completed: u64,
     pub build_avg_ms: u64,
@@ -362,7 +364,7 @@ mod tests {
         m.record_sync(std::time::Duration::from_millis(10));
         m.record_sync_phases(SyncPhaseMetrics {
             mirror_fetch_ms: Some(3),
-            publish_p1_ms: Some(7),
+            publish_head_ms: Some(7),
             ..SyncPhaseMetrics::default()
         });
         m.record_artifact_request(1234);
@@ -375,7 +377,7 @@ mod tests {
         assert!(out.contains("# TYPE ripclone_ref_lookups_total counter"));
         assert!(out.contains("\nripclone_ref_lookups_total 2\n"));
         assert!(out.contains("\nripclone_sync_mirror_fetch_ms_total 3\n"));
-        assert!(out.contains("\nripclone_sync_publish_p1_ms_total 7\n"));
+        assert!(out.contains("\nripclone_sync_publish_head_ms_total 7\n"));
         assert!(out.contains("\nripclone_artifact_bytes_served_total 1234\n"));
 
         // Gauge.

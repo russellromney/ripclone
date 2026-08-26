@@ -62,7 +62,7 @@ pub struct CloneMetric {
     pub clone_id: String,
     pub repo: RepoId,
     pub commit: String,
-    /// `files` | `depth1` | `full`.
+    /// `head` | `full` | `files`.
     pub mode: String,
     /// Was this a cold build (a 202 + poll) rather than an already-warm repo.
     pub cold: bool,
@@ -91,7 +91,7 @@ mod tests {
                 name: "bun".to_string(),
             },
             commit: "deadbeef".to_string(),
-            mode: "depth1".to_string(),
+            mode: "head".to_string(),
             cold: true,
             total_ms: 1234,
             bytes: 5678,
@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(v["repo"]["owner"], "oven-sh");
         assert_eq!(v["repo"]["name"], "bun");
         assert_eq!(v["commit"], "deadbeef");
-        assert_eq!(v["mode"], "depth1");
+        assert_eq!(v["mode"], "head");
         assert_eq!(v["cold"], true);
         assert_eq!(v["totalMs"], 1234);
         assert_eq!(v["bytes"], 5678);

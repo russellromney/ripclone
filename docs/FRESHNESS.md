@@ -7,7 +7,8 @@ database transaction.
 - Duplicate requests for commit B coalesce while B is queued or claimed.
 - A later commit C has a different active key and receives its own job.
 - Workers fetch and verify only the admitted commit.
-- Moving branch publication is fenced so a late B build cannot replace C.
+- Results and jobs are keyed only by `(repository, commit)`, so B and C publish
+  independently and different checkout names resolving to B share its work.
 
 ## After a build
 

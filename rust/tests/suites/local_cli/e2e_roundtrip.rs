@@ -10,26 +10,34 @@ fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap()
 }
 
-async fn wait_archive_ref(server: &Server, owner: &str, repo: &str) -> ripclone::RefInfo {
+async fn wait_archive_ref(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    commit: &str,
+) -> ripclone::RefInfo {
     let store = server_ref_store(server).await;
     let repo_id = ripclone::provider::RepoId::github(format!("{owner}/{repo}"));
     let mut last = String::from("<not read>");
     for _ in 0..160 {
-        match store.load_branch(&repo_id, "main").await {
+        match store.load_result(&repo_id, commit).await {
             Ok(Some(info))
-                if !info.archive_chunks.is_empty() && !info.archive_frames.is_empty() =>
+                if info.files.as_ref().is_some_and(|files| {
+                    !files.archive_chunks.is_empty() && !files.archive_frames.is_empty()
+                }) =>
             {
                 return info;
             }
             Ok(Some(info)) => {
+                let files = info.files.as_ref();
                 last = format!(
                     "archive_chunks={} archive_frames={} commit={}",
-                    info.archive_chunks.len(),
-                    info.archive_frames.len(),
+                    files.map_or(0, |files| files.archive_chunks.len()),
+                    files.map_or(0, |files| files.archive_frames.len()),
                     info.commit
                 );
             }
-            Ok(None) => last = String::from("no main ref in control database"),
+            Ok(None) => last = format!("exact result {commit} was absent"),
             Err(error) => last = format!("control database read: {error}"),
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -113,8 +121,7 @@ async fn files_mode_materializes_worktree() {
     origin.commit(&[("only.txt", "hello\n"), ("nested/x", "y\n")], "c1");
     origin.publish();
 
-    // The archive (and thus files mode) is carried by the full clonepack under
-    // two-phase publish; the shallow snapshot has no archive.
+    // Files mode consumes the separately published Files result.
     let (_g, c) = sync_and_clone(&server, &origin, 0, CloneMode::Files).await;
     assert_eq!(read(&c, "only.txt"), "hello\n");
     assert_eq!(read(&c, "nested/x"), "y\n");
@@ -125,13 +132,13 @@ async fn files_mode_materializes_worktree() {
 }
 
 #[tokio::test]
-async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_artifacts() {
+async fn files_mode_resync_works_after_remote_storage_clears_local_archive_cache() {
     init(false);
     let server = start_server_split_storage().await;
     let origin = make_origin("acme", "remotecontract");
     let big = vec![b'a'; 17 * 1024 * 1024];
 
-    origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"one\n")], "c1");
+    let commit1 = origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"one\n")], "c1");
     origin.publish();
     register_added_without_build(&server, "acme/remotecontract")
         .await
@@ -148,26 +155,27 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
     );
     assert!(
         !c1.join(".git").exists(),
-        "files mode should not create .git before remote artifact eviction"
+        "files mode should not create .git before local cache cleanup"
     );
 
-    let info1 = wait_archive_ref(&server, "acme", "remotecontract").await;
+    let info1 = wait_archive_ref(&server, "acme", "remotecontract", &commit1).await;
+    let files1 = info1.files.as_ref().expect("Files result");
     assert!(
-        !info1.archive_chunks.is_empty(),
+        !files1.archive_chunks.is_empty(),
         "files archive bundles should be published"
     );
     assert!(
-        !info1.archive_frames.is_empty(),
+        !files1.archive_frames.is_empty(),
         "per-frame reuse metadata should be persisted"
     );
-    for hash in info1
+    for hash in files1
         .archive_chunks
         .iter()
-        .chain(info1.archive_frames.iter().map(|f| &f.chunk_hash))
+        .chain(files1.archive_frames.iter().map(|f| &f.chunk_hash))
     {
         assert!(
             !server.cas_path(hash).exists(),
-            "remote storage settlement should evict local CAS artifact {hash}"
+            "remote storage settlement should remove local cache artifact {hash}"
         );
         assert!(
             server.storage_path(hash).exists(),
@@ -175,7 +183,7 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
         );
     }
 
-    origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"two\n")], "c2");
+    let commit2 = origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"two\n")], "c2");
     origin.publish();
     server
         .client()
@@ -192,10 +200,11 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
         "files mode should not create .git after rebuilding from durable storage"
     );
 
-    let info2 = wait_archive_ref(&server, "acme", "remotecontract").await;
+    let info2 = wait_archive_ref(&server, "acme", "remotecontract", &commit2).await;
+    let files2 = info2.files.as_ref().expect("Files result");
     assert_eq!(info2.commit, git(&origin.bare, &["rev-parse", "HEAD"]));
     assert!(
-        info2.archive_frames.iter().any(|f| info1
+        files2.archive_frames.iter().any(|f| files1
             .archive_frames
             .iter()
             .any(|p| p.chunk_hash == f.chunk_hash)),
@@ -237,11 +246,9 @@ async fn corrupt_artifact_fails_clone() {
     origin.publish();
 
     let client = server.client();
-    // Wait until the build fully settles (archive published) so `clonepack_manifest`
-    // is the final, stable full-clone hash. Stopping at the first non-empty manifest
-    // would capture the transient editable hash, which phase-2b then replaces with a
-    // distinct files hash — the clone would fetch the uncorrupted replacement.
-    let resp = sync_until_archive_ready(&server, "acme", "corrupt").await;
+    // Resolve the Files result so this mutation targets the same manifest the
+    // subsequent Files clone consumes.
+    let resp = sync_until_files_ready(&server, "acme", "corrupt").await;
 
     // Corrupt the clonepack manifest artifact in the server's CAS.
     let manifest_hash = resp.clonepack_manifest.clone();
@@ -250,7 +257,7 @@ async fn corrupt_artifact_fails_clone() {
     assert!(p.exists(), "manifest should be in local CAS");
     std::fs::write(&p, b"garbage not a manifest").unwrap();
 
-    // Clone the same (full) variant whose manifest we corrupted, so the
+    // Clone the same Files result whose manifest we corrupted, so the
     // hash-verification path is exercised on the tampered artifact.
     let out = tempfile::tempdir().unwrap();
     let res = client
@@ -259,7 +266,7 @@ async fn corrupt_artifact_fails_clone() {
             "HEAD",
             None,
             out.path().join("clone"),
-            CloneMode::Editable,
+            CloneMode::Files,
             Some("full"),
             None,
         )
@@ -267,7 +274,7 @@ async fn corrupt_artifact_fails_clone() {
     assert!(res.is_err(), "corrupt manifest must fail the clone, got Ok");
 }
 
-/// Negative: a missing artifact (evicted/deleted) must fail the clone.
+/// Negative: a missing artifact must fail the clone.
 #[tokio::test]
 async fn missing_artifact_fails_clone() {
     init(false);
@@ -277,13 +284,12 @@ async fn missing_artifact_fails_clone() {
     origin.publish();
 
     let client = server.client();
-    // Wait for the settled (archive-published) manifest so we remove the exact hash
-    // the clone will resolve, not the transient editable hash phase-2b supersedes.
-    let resp = sync_until_archive_ready(&server, "acme", "missing").await;
+    // Resolve the Files result so we remove the exact manifest the clone consumes.
+    let resp = sync_until_files_ready(&server, "acme", "missing").await;
     let p = server.cas_path(&resp.clonepack_manifest);
     std::fs::remove_file(&p).unwrap();
 
-    // Clone the same (full) variant whose manifest we removed.
+    // Clone the same Files result whose manifest we removed.
     let out = tempfile::tempdir().unwrap();
     let res = client
         .install_repo_with_mode_at(
@@ -291,7 +297,7 @@ async fn missing_artifact_fails_clone() {
             "HEAD",
             None,
             out.path().join("clone"),
-            CloneMode::Editable,
+            CloneMode::Files,
             Some("full"),
             None,
         )
@@ -319,7 +325,7 @@ async fn transient_fetch_failure_is_retried() {
     // Wait for the full clonepack (with archive) to publish without consuming the
     // fault budget on not-yet-ready poll attempts, then do a single files clone:
     // the default retry budget (3 attempts) recovers from the injected faults.
-    sync_until_manifest(&server, "acme", "retry").await;
+    sync_until_full_ready(&server, "acme", "retry").await;
     let (_g, c) = clone_only(&server, "acme", "retry", 0, CloneMode::Files)
         .await
         .expect("retried fetches must still materialize the tree");
@@ -367,9 +373,9 @@ async fn persistent_fetch_failure_fails_clone() {
     let origin = make_origin("acme", "retryfail");
     origin.commit(&[("a", "1\n")], "c1");
     origin.publish();
-    // sync talks to the server directly (not artifact GETs), so it succeeds; wait
-    // for the full clonepack (with archive) to publish in phase 2.
-    sync_until_manifest(&server, "acme", "retryfail").await;
+    // Sync talks to the server directly (not artifact GETs), so it succeeds;
+    // wait for Files to publish.
+    sync_until_full_ready(&server, "acme", "retryfail").await;
     let client = server.client();
 
     let out = tempfile::tempdir().unwrap();
@@ -424,14 +430,17 @@ async fn failed_clone_after_temp_dir_leaves_nothing() {
     origin.commit(&[("a.txt", "hello\n")], "c1");
     origin.publish();
     let client = server.client();
-    // The archive builds in phase 2; wait until the clonepack manifest is
-    // published, then resolve the shallow clonepack and poll until its archive
-    // chunk is available to corrupt.
-    sync_until_manifest(&server, "acme", "notemp").await;
+    // Wait for Files to publish, then resolve its manifest and corrupt a chunk.
+    sync_until_full_ready(&server, "acme", "notemp").await;
     let mut manifest = None;
     for _ in 0..160 {
         let info = client
-            .resolve_ref_with_clonepack("acme/notemp", "HEAD", Some("full"), None)
+            .resolve_exact_result(
+                "acme/notemp",
+                "HEAD",
+                ripclone::ExactResultKind::Files,
+                None,
+            )
             .await
             .unwrap();
         let (man, _meta) = client.fetch_clonepack(&info).await.unwrap();
@@ -482,22 +491,25 @@ fn ref_info_history_levels_serde() {
     use ripclone::{HistoryLevel, RefInfo, SizedPack};
     let mut info = RefInfo {
         commit: "c".to_string(),
-        default_branch: "main".to_string(),
         ..Default::default()
     };
 
-    info.history_levels.push(HistoryLevel {
-        tip_commit: "deadbeef".into(),
-        packs: vec![SizedPack {
-            pack: "p".into(),
-            pack_len: 10,
-            idx: "i".into(),
-            idx_len: 5,
+    info.full = Some(ripclone::FullResult {
+        history_levels: vec![HistoryLevel {
+            tip_commit: "deadbeef".into(),
+            packs: vec![SizedPack {
+                pack: "p".into(),
+                pack_len: 10,
+                idx: "i".into(),
+                idx_len: 5,
+            }],
         }],
+        ..Default::default()
     });
     let json = serde_json::to_string(&info).unwrap();
     let back: RefInfo = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.history_levels.len(), 1);
-    assert_eq!(back.history_levels[0].tip_commit, "deadbeef");
-    assert_eq!(back.history_levels[0].packs[0].pack_len, 10);
+    let levels = &back.full.expect("Full result").history_levels;
+    assert_eq!(levels.len(), 1);
+    assert_eq!(levels[0].tip_commit, "deadbeef");
+    assert_eq!(levels[0].packs[0].pack_len, 10);
 }

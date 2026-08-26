@@ -81,14 +81,27 @@ impl QueueDb for LibsqlDb {
         }
     }
 
+    async fn latest_job_id(&self, key: &str) -> Result<Option<i64>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id FROM jobs WHERE key = ? ORDER BY id DESC LIMIT 1",
+                [key],
+            )
+            .await
+            .context("query latest exact job")?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
+    }
+
     async fn insert_job(
         &self,
         key: &str,
         provider: &str,
         path: &str,
-        branch: &str,
         admitted_commit: &str,
-        admitted_default_branch: Option<&str>,
         repo_config: &str,
         credential: Option<&str>,
         size_class: i64,
@@ -100,15 +113,13 @@ impl QueueDb for LibsqlDb {
             None => libsql::Value::Null,
         };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, branch, admitted_commit, admitted_default_branch, repo_config, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+            "INSERT INTO jobs (key, provider, path, admitted_commit, repo_config, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
             libsql::params![
                 key,
                 provider,
                 path,
-                branch,
                 admitted_commit,
-                admitted_default_branch,
                 repo_config,
                 cred_val,
                 size_class,
@@ -246,21 +257,11 @@ impl QueueDb for LibsqlDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<
-        Option<(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-        )>,
-    > {
+    ) -> Result<Option<(String, String, String, String, Option<String>)>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT provider, path, branch, admitted_commit, admitted_default_branch, repo_config, credential FROM jobs WHERE id = ?",
+                "SELECT provider, path, admitted_commit, repo_config, credential FROM jobs WHERE id = ?",
                 [id],
             )
             .await
@@ -272,8 +273,6 @@ impl QueueDb for LibsqlDb {
                 row.get::<String>(2)?,
                 row.get::<String>(3)?,
                 row.get::<Option<String>>(4)?,
-                row.get::<String>(5)?,
-                row.get::<Option<String>>(6)?,
             ))),
             None => Ok(None),
         }

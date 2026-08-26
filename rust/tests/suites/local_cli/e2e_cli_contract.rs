@@ -7,13 +7,10 @@ use axum::http::{Response, StatusCode};
 use axum::routing::any;
 use ripclone::client::Client;
 use ripclone::mode::CloneMode;
-use ripclone::server::AdmissionTestProbe;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 fn cli_binary() -> PathBuf {
@@ -167,13 +164,11 @@ async fn identity_response_server(
                     "provider": "github",
                     "host": "github.com",
                     "origin_url": "https://github.com/acme/identity.git",
-                    "default_branch": "main",
                     "commit": commit,
                     "parent_commit": null,
                     "clonepack_manifest": "manifest",
                     "metadata_chunk": "metadata",
-                    "shallow": false,
-                    "archive_ready": true
+                    "result": "full"
                 }),
             };
             if let Some(branch) = body_branch {
@@ -371,10 +366,6 @@ fn git_processes_for(origin: &str) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn release_cli_sync_clone_failure_and_cleanup_contract() {
     setup(false);
-    // Enables the production-boundary counters in this one-test executable.
-    unsafe { std::env::set_var("RIPCLONE_TESTING", "1") };
-    let probe = Arc::new(AdmissionTestProbe::default());
-    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let home = tempfile::tempdir().expect("CLI home");
     let work = tempfile::tempdir().expect("CLI work");
 
@@ -398,19 +389,21 @@ async fn release_cli_sync_clone_failure_and_cleanup_contract() {
         .sync_repo("acme/cli-ready", None)
         .await
         .expect("publish ready B");
+    server
+        .client_with_provider("cli-http", Some("cli-token"))
+        .resolve_exact_result(
+            "acme/cli-ready",
+            &b,
+            ripclone::ExactResultKind::Full,
+            Some(&b),
+        )
+        .await
+        .expect("settle exact B before the no-write ready probe");
     let durable_before = (
         snapshot_files(&server.cas_dir),
         snapshot_files(&server.repo_root),
     );
     origin.clear_auth_log();
-    let before = (
-        probe.tip_probes.load(Ordering::SeqCst),
-        probe.queue_inserts.load(Ordering::SeqCst),
-        probe.exact_fetches.load(Ordering::SeqCst),
-        probe.builder_entries.load(Ordering::SeqCst),
-        probe.ref_store_writes.load(Ordering::SeqCst),
-        probe.artifact_uploads.load(Ordering::SeqCst),
-    );
     let (ready, ready_elapsed) = run_cli(
         &server.url,
         work.path(),
@@ -426,12 +419,6 @@ async fn release_cli_sync_clone_failure_and_cleanup_contract() {
         output_text(&ready)
     );
     assert!(ready_elapsed < Duration::from_secs(5));
-    assert_eq!(probe.tip_probes.load(Ordering::SeqCst), before.0 + 1);
-    assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), before.1);
-    assert_eq!(probe.exact_fetches.load(Ordering::SeqCst), before.2);
-    assert_eq!(probe.builder_entries.load(Ordering::SeqCst), before.3);
-    assert_eq!(probe.ref_store_writes.load(Ordering::SeqCst), before.4);
-    assert_eq!(probe.artifact_uploads.load(Ordering::SeqCst), before.5);
     assert_eq!(
         (
             snapshot_files(&server.cas_dir),
@@ -512,7 +499,6 @@ async fn release_cli_sync_clone_failure_and_cleanup_contract() {
     register_added_without_build_for_provider(&timeout_server, "hanging", "acme/timeout")
         .await
         .expect("register timeout repo");
-    let timeout_queue_inserts = probe.queue_inserts.load(Ordering::SeqCst);
     assert!(git_processes_for(&hanging_url).is_empty());
     unsafe { std::env::set_var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", "1") };
     let (timed_out, timeout_elapsed) = run_cli(
@@ -552,14 +538,26 @@ async fn release_cli_sync_clone_failure_and_cleanup_contract() {
         "timed-out git ls-remote survived: {:?}",
         git_processes_for(&hanging_url)
     );
-    assert_eq!(
-        probe.queue_inserts.load(Ordering::SeqCst),
-        timeout_queue_inserts
-    );
+    let timeout_status: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/hanging/acme/timeout/status",
+            timeout_server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("timeout status request")
+        .error_for_status()
+        .expect("timeout status response")
+        .json()
+        .await
+        .expect("timeout status JSON");
+    assert_eq!(timeout_status["refs"], serde_json::json!([]));
     assert!(snapshot_files(&timeout_server.cas_dir).is_empty());
 
     println!(
-        "CLI_CONTRACT_EVIDENCE ready_ms={} pending_ms={} timeout_ms={} timeout_queue_inserts=0",
+        "CLI_CONTRACT_EVIDENCE ready_ms={} pending_ms={} timeout_ms={} timeout_exact_results=0",
         ready_elapsed.as_millis(),
         pending_elapsed.as_millis(),
         timeout_elapsed.as_millis()

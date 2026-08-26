@@ -33,7 +33,7 @@ doubles), i.e. it is network-bound, exactly as the model predicts.
 
 ## Cold build (first sync, push→clonable) — one-time cost
 
-| repo | total (publish_p1) | upstream GitHub mirror fetch | ripclone's own build+upload |
+| repo | total (publish_head) | upstream GitHub mirror fetch | ripclone's own build+upload |
 |------|-------------------:|-----------------------------:|----------------------------:|
 | torvalds/linux   | 778 s | 726 s (**93%**) | ~51 s |
 | microsoft/vscode | 87 s  | 82 s (**94%**)  | ~5 s  |
@@ -42,7 +42,7 @@ The honest headline: a giant's cold build is dominated (93–94%) by the **one-t
 `git clone --mirror` from GitHub**, not by ripclone. The full-history editable build's own
 bottleneck is the reachability-**bitmap / multi-pack-index write** (the B6 "lever").
 
-## Storage amplification (phase-1)
+## Storage amplification (Head)
 
 | repo | stored (CAS) | source repo | amplification |
 |------|-------------:|------------:|--------------:|

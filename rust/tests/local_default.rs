@@ -16,8 +16,8 @@ mod e2e_async_build;
 mod e2e_config_global_and_overrides;
 #[path = "suites/local_default/e2e_failure_injection.rs"]
 mod e2e_failure_injection;
-#[path = "suites/local_default/e2e_matrix_twophase_full.rs"]
-mod e2e_matrix_twophase_full;
+#[path = "suites/local_default/e2e_matrix_exact_results_full.rs"]
+mod e2e_matrix_exact_results_full;
 #[path = "suites/local_default/e2e_multi_provider.rs"]
 mod e2e_multi_provider;
 #[path = "suites/local_default/e2e_repo_config.rs"]

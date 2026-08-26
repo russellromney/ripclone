@@ -1,7 +1,7 @@
-# Phase-1 sync latency profile
+# Head sync latency profile
 
 Instrumentation is gated by `RIPCLONE_BENCH=1`. When set, every `/sync` that
-builds artifacts emits one JSON `sync-bench` log line per phase-1 publish with
+builds artifacts emits one JSON `sync-bench` log line per Head publication with
 per-stage millisecond timings and storage amplification split by artifact
 class.
 
@@ -15,9 +15,9 @@ class.
 - Storage amplification = bytes attributable to the ref in object storage /
   upstream bare-mirror size on disk.
 
-## Small fixture (`acme/phasescold` / `acme/phasesinc`)
+## Small fixture
 
-Phase-1 stage timings (milliseconds):
+Head stage timings (milliseconds):
 
 | Stage | Cold | Incremental |
 |-------|------:|-------------:|
@@ -27,9 +27,9 @@ Phase-1 stage timings (milliseconds):
 | skeleton build | 39 | 27 |
 | files table | 39 | 32 |
 | prebuilt index | 106 | 90 |
-| upload p1 | 2 | 0 |
+| upload Head | 2 | 0 |
 | ref publish | 0 | 0 |
-| **push→clonable (publish_p1_ms)** | **321** | **256** |
+| **push→clonable (publish_head_ms)** | **321** | **256** |
 
 Storage amplification for the incremental ref after the background full-history
 build completed:
@@ -76,7 +76,7 @@ metadata were cleared before each repo sequence. CAS objects from prior
 benchmarking can still remain in object storage, so upload timings remain lower
 bounds rather than first-time object-storage upload costs.
 
-Amplification below is the target ref's phase-1 artifact bytes reported by the
+Amplification below is the target ref's Head artifact bytes reported by the
 `sync-bench` line divided by the server's targeted bare-mirror size for that
 target commit. It is not the full warm-family bucket total across parent and
 target refs.
@@ -94,9 +94,9 @@ Parent `86d32c8bb66d503ccbcc1d2e40d25b11679eeede`; target
 | skeleton build | 387 | 304 |
 | files table | 1,368 | 1,042 |
 | prebuilt index | 279 | 263 |
-| upload p1 | 1,057 | 1,005 |
+| upload Head | 1,057 | 1,005 |
 | ref publish | 171 | 141 |
-| **push->clonable (publish_p1_ms)** | **28,707** | **3,582** |
+| **push->clonable (publish_head_ms)** | **28,707** | **3,582** |
 
 Target storage amplification:
 
@@ -123,9 +123,9 @@ Parent `98aeac9b1b559178ef4f6a0a112a09b1741d11d1`; target
 | skeleton build | 108 | 117 |
 | files table | 289 | 332 |
 | prebuilt index | 92 | 101 |
-| upload p1 | 651 | 364 |
+| upload Head | 651 | 364 |
 | ref publish | 144 | 195 |
-| **push->clonable (publish_p1_ms)** | **25,950** | **1,598** |
+| **push->clonable (publish_head_ms)** | **25,950** | **1,598** |
 
 Target storage amplification:
 

@@ -191,9 +191,7 @@ async fn rejected_startup_neither_contacts_s3_nor_mutates_existing_control_rows(
     let job_id = queue
         .enqueue(BuildJob {
             repo_id: RepoId::github("acme/preserved"),
-            branch: "main".to_string(),
             admitted_commit: "1111111111111111111111111111111111111111".to_string(),
-            admitted_default_branch: Some("main".to_string()),
             repo_config: ripclone::repo_config::RepoConfig::default(),
             credential: None,
             size_bytes: None,

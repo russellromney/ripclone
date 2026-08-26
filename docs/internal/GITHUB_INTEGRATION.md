@@ -1,4 +1,9 @@
-# GitHub-native fast clone service
+# Historical GitHub-native fast clone service design (superseded)
+
+> **Historical design snapshot.** This document describes a former
+> branch-pointer cache architecture and is not current ripclone behavior or
+> setup guidance. For the implemented provider and webhook contract, use
+> [`../WEBHOOKS.md`](../WEBHOOKS.md) and [`../CONFIG.md`](../CONFIG.md).
 
 This doc designs a fast git clone service that sits **on top of GitHub** rather
 than beside it. GitHub remains the source of truth for repos, permissions,

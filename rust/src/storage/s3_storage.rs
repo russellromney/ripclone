@@ -1,16 +1,13 @@
-use crate::cas::Cas;
-use crate::storage::{HashEntry, StorageBackend};
+use crate::storage::StorageBackend;
 use anyhow::{Context, Result};
-use chrono::DateTime;
 use futures::{StreamExt, TryStreamExt};
 use s3::{Auth, Client};
 use sha2::Digest;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-const DELETE_BATCH_SIZE: usize = 1000;
 #[cfg(not(test))]
 const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 #[cfg(not(test))]
@@ -49,16 +46,12 @@ fn multipart_upload_part_bytes(len: u64) -> Result<u64> {
     Ok(part_bytes)
 }
 
-/// S3-compatible storage backend with an optional local filesystem cache.
-///
-/// Reads check the local cache first and fall back to S3. Writes go to S3
-/// and are also cached locally if a cache directory is configured.
+/// S3-compatible durable artifact storage.
 pub struct S3Storage {
     client: Client,
     region: String,
     bucket: String,
     prefix: String,
-    cache: Option<Cas>,
     multipart_upload_slots: tokio::sync::Semaphore,
 }
 
@@ -69,7 +62,6 @@ impl S3Storage {
         bucket: &str,
         prefix: Option<&str>,
         auth: Auth,
-        cache_dir: Option<&Path>,
     ) -> Result<Self> {
         // Per-request timeout. The client default (~10s) is too tight for the
         // cold first sync of a huge repo: that build uploads the whole history at
@@ -112,7 +104,6 @@ impl S3Storage {
             .max_retry_delay(max_retry_delay)
             .build()
             .context("create S3 client")?;
-        let cache = cache_dir.map(Cas::new).transpose()?;
         // The server also uploads distinct artifacts concurrently. Keep one
         // backend-wide multipart budget so those outer tasks cannot each open
         // an independent window. Parts stream from disk, so this bounds live
@@ -124,21 +115,20 @@ impl S3Storage {
             region: region.to_string(),
             bucket: bucket.to_string(),
             prefix: prefix.unwrap_or("").to_string(),
-            cache,
             multipart_upload_slots: tokio::sync::Semaphore::new(multipart_upload_concurrency),
         })
     }
 
     /// Construct an S3 client from environment variables:
     ///   RIPCLONE_S3_ENDPOINT, RIPCLONE_S3_REGION, RIPCLONE_S3_BUCKET,
-    ///   RIPCLONE_S3_PREFIX, RIPCLONE_S3_CACHE_DIR, plus AWS_* credentials.
+    ///   RIPCLONE_S3_PREFIX, plus AWS_* credentials.
     pub fn from_env() -> Result<Option<Self>> {
         Self::from_env_or_config(&crate::config::StorageConfig::default())
     }
 
     /// Like [`from_env`](Self::from_env), but falls back to the `[storage]`
     /// section of `config.toml` for the non-secret settings (endpoint, region,
-    /// bucket, prefix, cache dir). The env vars always win. Credentials
+    /// bucket, prefix). The env vars always win. Credentials
     /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) are read from the
     /// environment only — never from config. `backend = "local"` forces local
     /// storage (returns `None`) even if S3 settings are present.
@@ -176,18 +166,8 @@ impl S3Storage {
         let bucket = pick("RIPCLONE_S3_BUCKET", Some("BUCKET_NAME"), cfg.bucket.as_deref())
             .context("RIPCLONE_S3_BUCKET or BUCKET_NAME (or [storage].bucket) is required when S3 is enabled")?;
         let prefix = pick("RIPCLONE_S3_PREFIX", None, cfg.prefix.as_deref());
-        let cache_dir: Option<PathBuf> =
-            pick("RIPCLONE_S3_CACHE_DIR", None, cfg.cache_dir.as_deref()).map(PathBuf::from);
         let auth = Auth::from_env().context("read S3 credentials from environment")?;
-        Self::new(
-            &endpoint,
-            &region,
-            &bucket,
-            prefix.as_deref(),
-            auth,
-            cache_dir.as_deref(),
-        )
-        .map(Some)
+        Self::new(&endpoint, &region, &bucket, prefix.as_deref(), auth).map(Some)
     }
 
     fn key(&self, hash: &str) -> Result<String> {
@@ -324,7 +304,7 @@ impl S3Storage {
         T: Send + 'static,
     {
         // We may be called from a Tokio worker thread (e.g. do_sync), from a
-        // spawn_blocking thread (e.g. artifact handlers / RemoteGc), or from a
+        // spawn_blocking thread (e.g. artifact handlers), or from a
         // non-Tokio thread (e.g. CLI before a runtime exists). Use the right
         // blocking strategy for each, but always execute the actual S3 request
         // on a long-lived runtime so that hyper connection dispatch tasks are
@@ -375,16 +355,29 @@ impl S3Storage {
             Err(_) => run_on_global(make_future),
         }
     }
+
+    fn remote_size(&self, hash: &str) -> Result<u64> {
+        let key = self.key(hash)?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.clone();
+        let output = self.block_on(move || async move {
+            client
+                .objects()
+                .head(&bucket, &key_owned)
+                .send()
+                .await
+                .context("S3 head_object")
+        })?;
+        output
+            .content_length
+            .ok_or_else(|| anyhow::anyhow!("S3 head_object missing Content-Length"))
+    }
 }
 
 #[async_trait::async_trait]
 impl StorageBackend for S3Storage {
     fn get(&self, hash: &str) -> Result<Vec<u8>> {
-        if let Some(cache) = &self.cache
-            && let Ok(data) = cache.get(hash)
-        {
-            return Ok(data);
-        }
         let key = self.key(hash)?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
@@ -415,9 +408,6 @@ impl StorageBackend for S3Storage {
         let actual_hash = hex::encode(sha2::Sha256::digest(&data));
         if actual_hash != hash {
             anyhow::bail!("S3 object {} hash mismatch: actual {}", hash, actual_hash);
-        }
-        if let Some(cache) = &self.cache {
-            let _ = cache.put_with_hash(hash, &data);
         }
         Ok(data)
     }
@@ -482,9 +472,6 @@ impl StorageBackend for S3Storage {
             }
         }
         result.context("S3 put_object")?;
-        if let Some(cache) = &self.cache {
-            cache.put_with_hash(hash, data)?;
-        }
         Ok(())
     }
 
@@ -500,9 +487,6 @@ impl StorageBackend for S3Storage {
             .send()
             .await
             .with_context(|| format!("S3 put_object {key}"))?;
-        if let Some(cache) = &self.cache {
-            cache.put_with_hash(hash, data)?;
-        }
         Ok(())
     }
 
@@ -540,41 +524,15 @@ impl StorageBackend for S3Storage {
                 .await
                 .with_context(|| format!("S3 put_object {key}"))?;
         }
-        if let Some(cache) = &self.cache {
-            let cache = cache.clone();
-            let hash = hash.to_string();
-            let path = path.to_path_buf();
-            tokio::task::spawn_blocking(move || cache.put_file_with_hash(&hash, &path))
-                .await
-                .context("S3 cache put_file task")??;
-        }
         Ok(())
     }
 
-    async fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.get_object(key).await?.map(|(_, data)| data))
-    }
-
-    async fn put_meta(&self, key: &str, data: &[u8]) -> Result<()> {
-        self.put_object(key, data, None).await
-    }
-
     fn size(&self, hash: &str) -> Result<u64> {
-        let key = self.key(hash)?;
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key_owned = key.clone();
-        let output = self.block_on(move || async move {
-            client
-                .objects()
-                .head(&bucket, &key_owned)
-                .send()
-                .await
-                .context("S3 head_object")
-        })?;
-        output
-            .content_length
-            .ok_or_else(|| anyhow::anyhow!("S3 head_object missing Content-Length"))
+        self.remote_size(hash)
+    }
+
+    fn verify_durable_copy(&self, hash: &str) -> Result<()> {
+        self.remote_size(hash).map(|_| ())
     }
 
     fn signed_url(&self, hash: &str, expires_in: Duration) -> Option<String> {
@@ -609,107 +567,6 @@ impl StorageBackend for S3Storage {
         vec![self.region.clone()]
     }
 
-    fn delete(&self, hash: &str) -> Result<()> {
-        let key = self.key(hash)?;
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key_owned = key.clone();
-        self.block_on(move || async move {
-            client
-                .objects()
-                .delete(&bucket, &key_owned)
-                .send()
-                .await
-                .context("S3 delete_object")
-        })?;
-        Ok(())
-    }
-
-    fn delete_batch(&self, hashes: &[String]) -> Result<u64> {
-        let mut total = 0u64;
-        for chunk in hashes.chunks(DELETE_BATCH_SIZE) {
-            let keys: Vec<String> = chunk.iter().map(|h| self.key(h)).collect::<Result<_>>()?;
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
-            let output = self.block_on(move || async move {
-                client
-                    .objects()
-                    .delete_objects(&bucket)
-                    .objects(&keys)
-                    .context("set S3 delete_objects keys")?
-                    .send()
-                    .await
-                    .context("S3 delete_objects")
-            })?;
-            if !output.errors.is_empty() {
-                let sample = output
-                    .errors
-                    .iter()
-                    .map(|e| format!("{}: {:?}", e.key.as_deref().unwrap_or("?"), e.message))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow::bail!("S3 delete_objects returned errors: {}", sample);
-            }
-            total += output.deleted.len() as u64;
-        }
-        Ok(total)
-    }
-
-    fn list_hashes(&self) -> Result<Vec<HashEntry>> {
-        let prefix = self.prefix.clone();
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let mut out = Vec::new();
-        let mut continuation = None::<String>;
-        loop {
-            let prefix = prefix.clone();
-            let prefix_for_hash = prefix.clone();
-            let client = client.clone();
-            let bucket = bucket.clone();
-            let token = continuation.take();
-            let output = self.block_on(move || async move {
-                let mut req = client
-                    .objects()
-                    .list_v2(&bucket)
-                    .prefix(&prefix)
-                    .context("set S3 list prefix")?;
-                if let Some(token) = token {
-                    req = req
-                        .continuation_token(token)
-                        .context("set S3 list continuation token")?;
-                }
-                req.send().await.context("S3 list_objects_v2")
-            })?;
-            for obj in output.contents {
-                let hash = match Self::hash_from_key(&prefix_for_hash, &obj.key) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::debug!("skipping non-hash S3 key {}: {}", obj.key, e);
-                        continue;
-                    }
-                };
-                let modified = obj
-                    .last_modified
-                    .as_deref()
-                    .and_then(parse_s3_time)
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                out.push(HashEntry {
-                    hash,
-                    size: obj.size,
-                    modified,
-                });
-            }
-            if !output.is_truncated {
-                break;
-            }
-            continuation = output.next_continuation_token;
-            if continuation.is_none() {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
     fn health(&self) -> Result<()> {
         // Reachability probe: list with a prefix that matches nothing. Reachable
         // + authorized => Ok (even if empty); unreachable / bad creds => Err.
@@ -725,23 +582,6 @@ impl StorageBackend for S3Storage {
         self.block_on(move || async move { req.send().await.context("S3 storage unreachable") })
             .map(|_| ())
     }
-}
-
-impl S3Storage {
-    fn hash_from_key(prefix: &str, key: &str) -> Result<String> {
-        let rest = key
-            .strip_prefix(prefix)
-            .ok_or_else(|| anyhow::anyhow!("key {} does not start with prefix {}", key, prefix))?;
-        crate::cas::Cas::validate_artifact_id(rest)
-            .with_context(|| format!("key {} is not a valid artifact id", key))?;
-        Ok(rest.to_string())
-    }
-}
-
-fn parse_s3_time(s: &str) -> Option<SystemTime> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc).into())
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
@@ -769,143 +609,12 @@ fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
     Duration::from_millis(ms)
 }
 
-fn scoped_key(prefix: &str, key: &str) -> String {
-    format!("{prefix}{key}")
-}
-
-fn unscoped_key<'a>(prefix: &str, key: &'a str) -> Option<&'a str> {
-    key.strip_prefix(prefix)
-}
-
-impl S3Storage {
-    /// Read an arbitrary object by key. Returns `Ok(None)` when the object does
-    /// not exist, and `(etag, bytes)` when it does.
-    pub async fn get_object(&self, key: &str) -> Result<Option<(String, Vec<u8>)>> {
-        let scoped = scoped_key(&self.prefix, key);
-        let output = match self
-            .client
-            .objects()
-            .get(&self.bucket, &scoped)
-            .send()
-            .await
-        {
-            Ok(out) => out,
-            Err(e) if e.code() == Some("NoSuchKey") => return Ok(None),
-            Err(e) => return Err(anyhow::anyhow!("S3 get_object {scoped}: {e}")),
-        };
-        let etag = output.etag.clone().unwrap_or_default();
-        let data = Self::collect_stream(output.body)
-            .await
-            .with_context(|| format!("read S3 object {scoped}"))?;
-        Ok(Some((etag, data)))
-    }
-
-    /// Write an arbitrary object by key, optionally requiring a matching ETag.
-    pub async fn put_object(&self, key: &str, data: &[u8], if_match: Option<&str>) -> Result<()> {
-        let scoped = scoped_key(&self.prefix, key);
-        let mut req = self
-            .client
-            .objects()
-            .put(&self.bucket, &scoped)
-            .body_bytes(data.to_vec());
-        if let Some(etag) = if_match {
-            req = req
-                .if_match(etag)
-                .with_context(|| format!("set If-Match for S3 put_object {scoped}"))?;
-        }
-        req.send()
-            .await
-            .with_context(|| format!("S3 put_object {scoped}"))?;
-        Ok(())
-    }
-
-    /// Conditional write for compare-and-swap callers (the ref store's ETag
-    /// ordering). Like [`put_object`](Self::put_object) but a precondition
-    /// failure (the `If-Match` ETag no longer matches because someone else
-    /// wrote first) is returned as `Ok(false)` instead of an error, so the
-    /// caller can re-read and retry. Returns `Ok(true)` when the write landed.
-    pub async fn put_object_cas(
-        &self,
-        key: &str,
-        data: &[u8],
-        if_match: Option<&str>,
-    ) -> Result<bool> {
-        let scoped = scoped_key(&self.prefix, key);
-        let mut req = self
-            .client
-            .objects()
-            .put(&self.bucket, &scoped)
-            .body_bytes(data.to_vec());
-        req = match if_match {
-            Some(etag) => req
-                .if_match(etag)
-                .with_context(|| format!("set If-Match for S3 put_object_cas {scoped}"))?,
-            None => req
-                .if_none_match("*")
-                .with_context(|| format!("set If-None-Match for S3 put_object_cas {scoped}"))?,
-        };
-        match req.send().await {
-            Ok(_) => Ok(true),
-            Err(e) if e.code() == Some("PreconditionFailed") => Ok(false),
-            Err(e) => Err(anyhow::anyhow!("S3 put_object_cas {scoped}: {e}")),
-        }
-    }
-
-    /// Delete an arbitrary object by key. Deleting a missing key is not an
-    /// error (S3 delete is idempotent), so this is safe to call blindly.
-    pub async fn delete_object(&self, key: &str) -> Result<()> {
-        let scoped = scoped_key(&self.prefix, key);
-        self.client
-            .objects()
-            .delete(&self.bucket, &scoped)
-            .send()
-            .await
-            .with_context(|| format!("S3 delete_object {scoped}"))?;
-        Ok(())
-    }
-
-    /// List object keys under a prefix.
-    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        let scoped_prefix = scoped_key(&self.prefix, prefix);
-        let mut keys = Vec::new();
-        let mut continuation = None::<String>;
-        loop {
-            let mut req = self
-                .client
-                .objects()
-                .list_v2(&self.bucket)
-                .prefix(&scoped_prefix)
-                .context("set S3 list prefix")?;
-            if let Some(token) = continuation.take() {
-                req = req
-                    .continuation_token(token)
-                    .context("set S3 list continuation token")?;
-            }
-            let output = req.send().await.context("S3 list_objects_v2")?;
-            for obj in output.contents {
-                if let Some(key) = unscoped_key(&self.prefix, &obj.key) {
-                    keys.push(key.to_string());
-                }
-            }
-            if !output.is_truncated {
-                break;
-            }
-            continuation = output.next_continuation_token;
-            if continuation.is_none() {
-                break;
-            }
-        }
-        Ok(keys)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         MULTIPART_UPLOAD_MAX_OBJECT_BYTES, MULTIPART_UPLOAD_MAX_PART_BYTES,
         MULTIPART_UPLOAD_PART_BYTES, S3Storage, env_duration_ms, env_duration_secs, env_u32,
-        multipart_upload_concurrency_for_cores, multipart_upload_part_bytes, scoped_key,
-        unscoped_key,
+        multipart_upload_concurrency_for_cores, multipart_upload_part_bytes,
     };
     use crate::storage::StorageBackend;
     use std::io::Write;
@@ -956,45 +665,9 @@ mod tests {
             .put_file_async(&hash, source.path())
             .await
             .expect("multipart upload");
-        let (_, downloaded) = storage
-            .get_object(&hash)
-            .await
-            .expect("download multipart object")
-            .expect("multipart object exists");
+        let downloaded = storage.get(&hash).expect("download multipart object");
         assert_eq!(downloaded.len() as u64, len);
         assert_eq!(crate::cas::hash(&downloaded), hash);
-        storage
-            .delete_object(&hash)
-            .await
-            .expect("delete multipart fixture");
-    }
-
-    #[test]
-    fn arbitrary_object_keys_are_scoped_and_listed_as_logical_keys() {
-        assert_eq!(
-            scoped_key("deploy-a/", "refs/acme/widget.json"),
-            "deploy-a/refs/acme/widget.json"
-        );
-        assert_eq!(
-            unscoped_key("deploy-a/", "deploy-a/refs/acme/widget.json"),
-            Some("refs/acme/widget.json")
-        );
-        assert_eq!(
-            unscoped_key("deploy-a/", "deploy-b/refs/acme/widget.json"),
-            None
-        );
-    }
-
-    #[test]
-    fn empty_prefix_leaves_object_keys_unchanged() {
-        assert_eq!(
-            scoped_key("", "refs/acme/widget.json"),
-            "refs/acme/widget.json"
-        );
-        assert_eq!(
-            unscoped_key("", "refs/acme/widget.json"),
-            Some("refs/acme/widget.json")
-        );
     }
 
     #[test]

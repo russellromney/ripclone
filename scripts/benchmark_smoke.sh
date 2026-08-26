@@ -90,7 +90,8 @@ run_current_server() {
   port="$(free_port)"
   url="http://127.0.0.1:$port"
 
-  RUST_LOG=warn RIPCLONE_ORIGIN_BASE="file://$ORIGIN_ROOT" \
+  RUST_LOG=warn RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml" \
+    RIPCLONE_ORIGIN_BASE="file://$ORIGIN_ROOT" \
     "$SERVER_BIN" --cas-dir "$BASE_DIR/cas" --repo-root "$BASE_DIR/repos" \
     --host 127.0.0.1 --port "$port" >"$BASE_DIR/server.log" 2>&1 &
   SERVER_PID=$!
@@ -109,6 +110,7 @@ run_current_server() {
   log="$BASE_DIR/current-server.log"
   if ! env -u BENCH_REF SHAPED=0 RUNS=1 SKIP_GIT=1 \
       RIPCLONE_URL="$url" RIPCLONE="$CLI_BIN" \
+      RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml" \
       BENCH_SOURCE_URL="file://$ORIGIN_ROOT/$REPO.git" \
       bash "$BENCH" "$REPO" 1000 1 "$BASE_DIR/target2" >"$log" 2>&1; then
     cat "$log" >&2
