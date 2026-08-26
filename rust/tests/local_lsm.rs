@@ -5,7 +5,7 @@ mod common;
 
 #[path = "suites/local_lsm/e2e_lsm.rs"]
 mod e2e_lsm;
-#[path = "suites/local_lsm/e2e_matrix_twophase_lsm.rs"]
-mod e2e_matrix_twophase_lsm;
+#[path = "suites/local_lsm/e2e_matrix_exact_results_lsm.rs"]
+mod e2e_matrix_exact_results_lsm;
 #[path = "suites/local_lsm/e2e_webhook.rs"]
 mod e2e_webhook;

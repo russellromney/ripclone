@@ -80,7 +80,6 @@ export RIPCLONE_S3_ENDPOINT="http://127.0.0.1:$MINIO_API_PORT"
 export RIPCLONE_S3_REGION="us-east-1"
 export RIPCLONE_S3_BUCKET="$BUCKET"
 export RIPCLONE_S3_PREFIX="test/"
-export RIPCLONE_S3_CACHE_DIR="$CAS_DIR"
 
 "$SERVER" \
   --cas-dir "$CAS_DIR" \

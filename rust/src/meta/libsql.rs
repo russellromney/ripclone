@@ -111,19 +111,6 @@ impl MetaDb for LibsqlMeta {
         Ok(changed == 1)
     }
 
-    async fn list_repos(&self) -> Result<Vec<String>> {
-        let conn = self.conn().await?;
-        let mut rows = conn
-            .query("SELECT DISTINCT repo_key FROM results", ())
-            .await
-            .context("list result repositories")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(row.get::<String>(0)?);
-        }
-        Ok(out)
-    }
-
     async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -138,18 +125,6 @@ impl MetaDb for LibsqlMeta {
             out.push(row.get::<String>(0)?);
         }
         Ok(out)
-    }
-
-    async fn delete_result(&self, repo_key: &str, commit: &str) -> Result<()> {
-        self.conn()
-            .await?
-            .execute(
-                "DELETE FROM results WHERE repo_key = ? AND commit_id = ?",
-                libsql::params![repo_key, commit],
-            )
-            .await
-            .context("delete exact result")?;
-        Ok(())
     }
 
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {

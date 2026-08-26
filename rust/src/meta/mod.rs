@@ -1,11 +1,10 @@
 //! Exact results in the server-owned SQLite control database.
 
-use crate::RefInfo;
-use crate::provider::{RepoId, parse_storage_key};
+use crate::provider::RepoId;
 use crate::ref_store::{AddedRepo, RefStore};
+use crate::{ExactResultKind, FilesResult, FullResult, HeadResult, RefInfo};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use std::time::SystemTime;
 
 pub mod libsql;
 
@@ -28,9 +27,7 @@ pub trait MetaDb: Send + Sync {
         expected_data: &str,
         new_data: &str,
     ) -> Result<bool>;
-    async fn list_repos(&self) -> Result<Vec<String>>;
     async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>>;
-    async fn delete_result(&self, repo_key: &str, commit: &str) -> Result<()>;
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()>;
     async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>>;
     async fn remove_added_repo(&self, repo_key: &str) -> Result<()>;
@@ -85,61 +82,6 @@ impl SqlRefStore {
     }
 }
 
-fn variant_ready(variant: &crate::ClonepackArtifacts, commit: &str) -> bool {
-    variant.commit == commit && !variant.manifest.is_empty()
-}
-
-/// Merge one worker publication without allowing a duplicate or stale report
-/// to replace an already accepted ready variant. Ordered phase enrichment is
-/// accepted only when it carries the same previously-published variant bytes.
-pub(crate) fn merge_publication(existing: &RefInfo, incoming: &RefInfo) -> RefInfo {
-    let commit = existing.commit.as_str();
-    // GC deliberately retains artifact pointers on an evicted row so its
-    // accounting remains inspectable after the objects are removed. Those
-    // pointers are not ready variants and must not defeat a rebuilt exact
-    // publication merely because their manifests differ from the new bytes.
-    let existing_evicted =
-        existing.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS);
-    let shallow_ready = !existing_evicted && variant_ready(&existing.shallow_clonepack, commit);
-    let full_ready = !existing_evicted && variant_ready(&existing.full_clonepack, commit);
-    let files_enrichment = full_ready
-        && existing.archive_chunks.is_empty()
-        && incoming.full_clonepack.commit == commit
-        && !existing.full_clonepack.idx_bundle.is_empty()
-        && incoming.full_clonepack.idx_bundle == existing.full_clonepack.idx_bundle
-        && incoming.build_status.is_none();
-    let exact_retry_completed = full_ready
-        && incoming.full_clonepack == existing.full_clonepack
-        && incoming.shallow_clonepack == existing.shallow_clonepack
-        && existing
-            .build_status
-            .as_deref()
-            .is_some_and(|status| status.starts_with("failed: "))
-        && incoming.build_status.is_none();
-
-    if (shallow_ready && existing.shallow_clonepack.manifest != incoming.shallow_clonepack.manifest)
-        || (full_ready
-            && existing.full_clonepack.manifest != incoming.full_clonepack.manifest
-            && !files_enrichment)
-    {
-        let mut kept = existing.clone();
-        kept.last_accessed_at = kept.last_accessed_at.max(incoming.last_accessed_at);
-        kept.warm_pinned |= incoming.warm_pinned;
-        return kept;
-    }
-
-    let mut merged = incoming.clone();
-    if shallow_ready {
-        merged.shallow_clonepack = existing.shallow_clonepack.clone();
-    }
-    if full_ready && !files_enrichment && !exact_retry_completed {
-        merged = existing.clone();
-    }
-    merged.last_accessed_at = existing.last_accessed_at.max(incoming.last_accessed_at);
-    merged.warm_pinned |= existing.warm_pinned;
-    merged
-}
-
 #[async_trait]
 impl RefStore for SqlRefStore {
     async fn load_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
@@ -175,18 +117,10 @@ impl RefStore for SqlRefStore {
                 .get_result(&repo_key, &info.commit)
                 .await?
                 .context("exact result disappeared after insert conflict")?;
-            let existing: RefInfo =
-                serde_json::from_str(&row.data).context("parse stored exact result")?;
-            ensure!(
-                existing.commit == info.commit,
-                "stored exact result identity mismatch"
-            );
-            let merged = merge_publication(&existing, info);
-            let merged_data = serde_json::to_string(&merged).context("serialize exact result")?;
-            if merged_data == row.data
+            if data == row.data
                 || self
                     .db
-                    .compare_and_swap_result(&repo_key, &info.commit, &row.data, &merged_data)
+                    .compare_and_swap_result(&repo_key, &info.commit, &row.data, &data)
                     .await?
             {
                 return Ok(());
@@ -202,46 +136,53 @@ impl RefStore for SqlRefStore {
         )
     }
 
-    async fn list(&self) -> Result<Vec<RepoId>> {
-        Ok(self
-            .db
-            .list_repos()
-            .await?
-            .into_iter()
-            .filter_map(|key| parse_storage_key(&key))
-            .collect())
+    async fn publish_head(&self, repo_id: &RepoId, commit: &str, head: HeadResult) -> Result<bool> {
+        ensure!(
+            crate::exact_output_artifacts_ready(commit, ExactResultKind::Head, &head.clonepack),
+            "invalid Head result for {commit}"
+        );
+        self.update_result(repo_id, commit, move |info| {
+            info.head = Some(head.clone());
+            true
+        })
+        .await
     }
 
-    async fn update_build_status(
-        &self,
-        repo_id: &RepoId,
-        commit: &str,
-        status: &str,
-    ) -> Result<bool> {
-        self.update_result(repo_id, commit, |info| {
-            if info.build_status.as_deref() == Some(status) {
+    async fn publish_full(&self, repo_id: &RepoId, commit: &str, full: FullResult) -> Result<bool> {
+        ensure!(
+            crate::exact_output_artifacts_ready(commit, ExactResultKind::Full, &full.clonepack),
+            "invalid Full result for {commit}"
+        );
+        self.update_result(repo_id, commit, move |info| {
+            if crate::exact_output_ready(info, ExactResultKind::Full, commit) {
                 false
             } else {
-                info.build_status = Some(status.to_string());
+                info.full = Some(full.clone());
                 true
             }
         })
         .await
     }
 
-    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
-        self.update_result(repo_id, commit, |info| {
-            info.last_accessed_at = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs());
-            true
+    async fn publish_files(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        files: FilesResult,
+    ) -> Result<bool> {
+        ensure!(
+            crate::exact_output_artifacts_ready(commit, ExactResultKind::Files, &files.clonepack),
+            "invalid Files result for {commit}"
+        );
+        self.update_result(repo_id, commit, move |info| {
+            if crate::exact_output_ready(info, ExactResultKind::Files, commit) {
+                false
+            } else {
+                info.files = Some(files.clone());
+                true
+            }
         })
         .await
-    }
-
-    async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
-        self.db.delete_result(&repo_id.storage_key(), commit).await
     }
 
     async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
@@ -284,8 +225,22 @@ impl RefStore for SqlRefStore {
 mod tests {
     use super::*;
 
+    fn artifacts(commit: &str, manifest: &str) -> crate::ClonepackArtifacts {
+        let hash = |suffix: &str| crate::cas::hash(format!("{manifest}-{suffix}").as_bytes());
+        crate::ClonepackArtifacts {
+            commit: commit.to_string(),
+            manifest: hash("manifest"),
+            metadata_chunk: hash("metadata"),
+            skeleton_pack: hash("skeleton-pack"),
+            skeleton_idx: hash("skeleton-idx"),
+            prebuilt_index: hash("index"),
+            idx_bundle: hash("idx-bundle"),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
-    async fn stale_publication_cannot_regress_ready_result() {
+    async fn each_publication_updates_only_its_result() {
         let tmp = tempfile::tempdir().unwrap();
         let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
             .await
@@ -293,125 +248,101 @@ mod tests {
         let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
         let repo = RepoId::github("acme/widget");
         let commit = "a".repeat(40);
-        let mut ready = RefInfo {
-            commit: commit.clone(),
-            build_status: Some("done".into()),
-            ..Default::default()
-        };
-        ready.shallow_clonepack.commit = commit.clone();
-        ready.shallow_clonepack.manifest = "ready".into();
-        store.save_result(&repo, &ready).await.unwrap();
+        store
+            .save_result(
+                &repo,
+                &RefInfo {
+                    commit: commit.clone(),
+                    head: Some(crate::HeadResult {
+                        clonepack: artifacts(&commit, "head"),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
-        let stale = RefInfo {
-            commit: commit.clone(),
-            build_status: Some("building".into()),
-            ..Default::default()
-        };
-        store.save_result(&repo, &stale).await.unwrap();
-
-        let stored = store.load_result(&repo, &commit).await.unwrap().unwrap();
-        assert_eq!(stored.shallow_clonepack.manifest, "ready");
-        assert_eq!(stored.build_status.as_deref(), Some("done"));
+        store
+            .publish_full(
+                &repo,
+                &commit,
+                crate::FullResult {
+                    clonepack: artifacts(&commit, "full"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let result = store.load_result(&repo, &commit).await.unwrap().unwrap();
+        assert_eq!(
+            result.head.unwrap().clonepack.manifest,
+            crate::cas::hash(b"head-manifest")
+        );
+        assert_eq!(
+            result.full.unwrap().clonepack.manifest,
+            crate::cas::hash(b"full-manifest")
+        );
+        assert!(result.files.is_none());
     }
 
     #[tokio::test]
-    async fn files_enrichment_requires_the_accepted_full_build() {
+    async fn simultaneous_full_and_files_preserve_both_results() {
         let tmp = tempfile::tempdir().unwrap();
         let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
             .await
             .unwrap();
-        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
-        let repo = RepoId::github("acme/files");
+        let store = std::sync::Arc::new(SqlRefStore::new(Box::new(meta)).await.unwrap());
+        let repo = RepoId::github("acme/concurrent");
         let commit = "b".repeat(40);
-        let mut editable = RefInfo {
-            commit: commit.clone(),
-            build_status: Some("archive building".into()),
-            ..Default::default()
-        };
-        editable.full_clonepack.commit = commit.clone();
-        editable.full_clonepack.manifest = "editable".into();
-        editable.full_clonepack.idx_bundle = "accepted-bundle".into();
-        store.save_result(&repo, &editable).await.unwrap();
-
-        let mut wrong_attempt = editable.clone();
-        wrong_attempt.full_clonepack.manifest = "wrong-files".into();
-        wrong_attempt.full_clonepack.idx_bundle = "other-bundle".into();
-        wrong_attempt.archive_chunks = vec!["wrong-archive".into()];
-        wrong_attempt.build_status = None;
-        store.save_result(&repo, &wrong_attempt).await.unwrap();
-        let kept = store.load_result(&repo, &commit).await.unwrap().unwrap();
-        assert_eq!(kept.full_clonepack.manifest, "editable");
-        assert!(kept.archive_chunks.is_empty());
-
-        let mut files = editable;
-        files.full_clonepack.manifest = "files".into();
-        files.archive_chunks = vec!["archive".into()];
-        files.build_status = None;
-        store.save_result(&repo, &files).await.unwrap();
-        let ready = store.load_result(&repo, &commit).await.unwrap().unwrap();
-        assert_eq!(ready.full_clonepack.manifest, "files");
-        assert_eq!(ready.archive_chunks, vec!["archive"]);
-        assert!(ready.build_status.is_none());
-    }
-
-    #[tokio::test]
-    async fn empty_tree_files_enrichment_settles_without_archive_chunks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
+        store
+            .save_result(
+                &repo,
+                &RefInfo {
+                    commit: commit.clone(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
-        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
-        let repo = RepoId::github("acme/empty-files");
-        let commit = "e".repeat(40);
-        let mut editable = RefInfo {
-            commit: commit.clone(),
-            build_status: Some("archive building".into()),
-            ..Default::default()
-        };
-        editable.full_clonepack.commit = commit.clone();
-        editable.full_clonepack.manifest = "editable".into();
-        editable.full_clonepack.idx_bundle = "accepted-bundle".into();
-        store.save_result(&repo, &editable).await.unwrap();
-
-        let mut settled = editable;
-        settled.full_clonepack.manifest = "empty-files".into();
-        settled.build_status = None;
-        store.save_result(&repo, &settled).await.unwrap();
-
-        let stored = store.load_result(&repo, &commit).await.unwrap().unwrap();
-        assert_eq!(stored.full_clonepack.manifest, "empty-files");
-        assert!(stored.archive_chunks.is_empty());
-        assert!(stored.build_status.is_none());
-    }
-
-    #[tokio::test]
-    async fn exact_retry_can_clear_failure_without_replacing_artifacts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
-            .await
-            .unwrap();
-        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
-        let repo = RepoId::github("acme/retry");
-        let commit = "c".repeat(40);
-        let mut failed = RefInfo {
-            commit: commit.clone(),
-            build_status: Some("failed: transient source".into()),
-            ..Default::default()
-        };
-        failed.full_clonepack.commit = commit.clone();
-        failed.full_clonepack.manifest = "same-full".into();
-        failed.full_clonepack.metadata_chunk = "same-metadata".into();
-        failed.full_clonepack.idx_bundle = "same-bundle".into();
-        failed.shallow_clonepack.commit = commit.clone();
-        failed.shallow_clonepack.manifest = "same-shallow".into();
-        store.save_result(&repo, &failed).await.unwrap();
-
-        let mut recovered = failed.clone();
-        recovered.build_status = None;
-        store.save_result(&repo, &recovered).await.unwrap();
-        let stored = store.load_result(&repo, &commit).await.unwrap().unwrap();
-        assert!(stored.build_status.is_none());
-        assert_eq!(stored.full_clonepack, failed.full_clonepack);
-        assert_eq!(stored.shallow_clonepack, failed.shallow_clonepack);
+        let full_store = store.clone();
+        let files_store = store.clone();
+        let full_repo = repo.clone();
+        let files_repo = repo.clone();
+        let full_commit = commit.clone();
+        let files_commit = commit.clone();
+        let (full, files) = tokio::join!(
+            async move {
+                full_store
+                    .publish_full(
+                        &full_repo,
+                        &full_commit,
+                        crate::FullResult {
+                            clonepack: artifacts(&full_commit, "full"),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            },
+            async move {
+                files_store
+                    .publish_files(
+                        &files_repo,
+                        &files_commit,
+                        crate::FilesResult {
+                            clonepack: artifacts(&files_commit, "files"),
+                            archive_chunks: Vec::new(),
+                            archive_frames: Vec::new(),
+                        },
+                    )
+                    .await
+            }
+        );
+        assert!(full.unwrap());
+        assert!(files.unwrap());
+        let result = store.load_result(&repo, &commit).await.unwrap().unwrap();
+        assert!(result.full.is_some());
+        assert!(result.files.is_some());
+        assert!(result.files.unwrap().archive_chunks.is_empty());
     }
 }

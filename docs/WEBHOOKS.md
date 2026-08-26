@@ -144,7 +144,8 @@ Per provider instance:
 - **Phase 1:** default-branch push (exact admission), delete (ignore), and ping.
   This is the whole webhook value for self-host.
 - **Later:** provider repo-lifecycle events where available (visibility change →
-  re-gate access / retune signed-URL TTL, rename → re-key, delete → purge);
+  re-gate access / retune signed-URL TTL, rename → re-key, delete → stop future
+  admission while retaining published exact results);
   tag/release pre-warm. These differ a lot per provider; keep them out of phase 1.
 
 ## Explicit add — the added-repo set

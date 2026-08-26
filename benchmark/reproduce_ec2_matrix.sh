@@ -47,7 +47,7 @@ run_case() {
   BENCH_MODES="$modes" \
   RIPCLONE_RUNS="$ripclone_runs" \
   NATIVE_RUNS="$native_runs" \
-  RIPCLONE_BENCH_READY_CLONEPACK=full \
+  RIPCLONE_BENCH_READY_RESULTS="head full files" \
   VERIFY_EVERY_RUN="${VERIFY_EVERY_RUN:-0}" \
   SHAPED="$shaped" \
     "$BENCH" "$repo" "$rate" "$ripclone_runs" "$TARGET" 2>&1 | tee -a "$LOG"

@@ -139,6 +139,11 @@ pub trait JobQueue: Send + Sync {
         Ok(JobState::Unknown)
     }
 
+    /// Lifecycle of the newest job for one exact-result key.
+    async fn job_state_for_key(&self, _key: &str) -> Result<JobState> {
+        Ok(JobState::Unknown)
+    }
+
     /// Best-effort count of queued (not-yet-running) jobs, for metrics and
     /// backpressure reporting.
     async fn depth(&self) -> usize;

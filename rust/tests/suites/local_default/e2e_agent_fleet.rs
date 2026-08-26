@@ -281,7 +281,7 @@ async fn two_materialize_surfaces_are_distinct() {
     };
 
     assert_ok("add", &run(&["add", "acme/surfaces"]).await);
-    let ready = sync_until_archive_ready(&server, "acme", "surfaces").await;
+    let ready = sync_until_files_ready(&server, "acme", "surfaces").await;
     assert_eq!(
         ready.commit,
         git(&origin.work, &["rev-parse", "HEAD"]),

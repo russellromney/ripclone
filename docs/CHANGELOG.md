@@ -4,6 +4,18 @@ This file tracks what has already landed in ripclone. The old planning snapshot
 in [`internal/ROADMAP.md`](internal/ROADMAP.md) is retained for historical
 context; it is not current operational guidance.
 
+## Published artifacts remain durable
+
+- **Published exact Head, Full, and Files results no longer expire.** Their
+  SQLite rows and durable local or S3-compatible artifact bytes are retained.
+- **Only S3-backed local build caches are disposable.** Age/size trimming reads
+  no exact metadata, confirms each remote copy before deleting its local cache
+  copy, and never sends a remote delete.
+- **Removed lifecycle machinery:** warm timestamps and pins, warm eviction,
+  remote GC, the orphan ledger, reachability walks used by deletion, eviction
+  transactions, status fields, remote-delete storage methods, and their CI
+  suites and configuration.
+
 ## One client install and fetch path
 
 - **The experimental `worktree` command is deleted** (`rust/src/bin/cli.rs`, `rust/src/client.rs`, `rust/src/extract.rs`, `README.md`, `docs/BACKENDS.md`, `docs/BUILD_OPTIONS.md`): `ripclone worktree` is now an unknown subcommand, and its client methods (`add_worktree`, `install_worktree_files`) and the `extract.rs` URL-fetch path that only it used are gone. `extract.rs` performs no network request. Use `git worktree add` for a second checkout. `clone --mode editable` and `clone --mode files` are the two materialize surfaces.
@@ -50,7 +62,7 @@ context; it is not current operational guidance.
 ## Cold-history pack and benchmark performance
 
 - **Cold full-history builds preserve Git's existing delta graph** (`rust/src/pack.rs`, `rust/src/git.rs`): the bitmap-backed history pack is no longer split with `git pack-objects --max-pack-size`. Splitting forced Git to discard cross-pack deltas, making large repositories substantially larger and slower to build. Local storage keeps the compact pack as one file; large remote uploads are handled by the storage transport.
-- **Large S3-compatible uploads use bounded multipart streaming** (`rust/src/storage/s3_storage.rs`): files at least 100 MiB use 128 MiB parts with one backend-wide, CPU-scaled budget of at most eight uploads in flight, automatically increasing part size to remain within the 10,000-part limit. Failed uploads are aborted, and local cache publication still occurs only after the remote object completes.
+- **Large S3-compatible uploads use bounded multipart streaming** (`rust/src/storage/s3_storage.rs`): files at least 100 MiB use 128 MiB parts with one backend-wide, CPU-scaled budget of at most eight uploads in flight, automatically increasing part size to remain within the 10,000-part limit. Failed uploads are aborted, and a build removes its local artifact copy only after the remote object completes.
 - **The shaped benchmark times cloning, not repository admission** (`benchmark/fly_shaped_benchmark.sh`): add/readiness happens before each sample set, every run is pinned to one resolved commit, validation happens after the timer, failures propagate, and summaries report p50 and nearest-rank p90.
 
 ## Worker heartbeat / registry (superseded implementation history)
@@ -126,7 +138,7 @@ The branch-scoped storage details in this historical section were removed by
 the exact-only result model described above. They are retained only as release
 history and do not describe current keys, reads, writes, or worker behavior.
 
-- **Per-stage phase-1 sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, HEAD packs, skeleton build, files table, prebuilt index, phase-1 upload, and ref publish. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with phase timings and per-artifact-class storage amplification for each build.
+- **Per-stage Head sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, Head packs, skeleton build, files table, prebuilt index, Head upload, and result publication. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with timing and per-artifact-class storage amplification for each build.
 - **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under the internal `:{branch}#{commit}` namespace instead of `{branch}#{rev}`. The leading `:` cannot occur in a Git ref, so exact results cannot collide with real source branches. Different revs that resolve to the same commit share a build.
 - **Historical branch-scoped exact results (removed)** (`rust/src/ref_store.rs`): this former implementation gave each branch and commit an internal result. Current results are keyed only by repository and commit.
 - **git index-pack fallback** (`rust/src/git.rs`): when gix fails to index a pack containing ref deltas (e.g. `oven-sh/bun`), ripclone falls back to the stock `git index-pack` subprocess.
@@ -400,24 +412,6 @@ history and do not describe current keys, reads, writes, or worker behavior.
     `https://x-access-token:<token>@github.com/<owner>/<repo>.git`, which works
     for both personal access tokens and GitHub App installation tokens.
 
-## Local CAS retention / eviction
-
-- **Retention manager** (`rust/src/retention.rs`)
-  - Scans the local content-addressed store on a configurable interval.
-  - Keeps a persisted set of "protected" hashes (artifacts referenced by the
-    current HEAD of each synced repo).
-  - Evicts unprotected objects by age (`RIPCLONE_RETENTION_MAX_AGE_DAYS`,
-    default 7 days) and by disk pressure (`RIPCLONE_RETENTION_MAX_GB`,
-    default 100 GB), removing oldest unprotected objects first.
-  - Tunable interval via `RIPCLONE_RETENTION_INTERVAL_SECS` (default 300 s).
-  - Exposes retention counters on `/metrics`: runs, evicted bytes/objects,
-    errors.
-
-- **Server integration** (`rust/src/server.rs`)
-  - The retention task starts automatically when the server boots.
-  - After each successful sync, the current HEAD's artifact hashes are marked
-    protected so they survive the next eviction pass.
-
 ## Server hardening (auth, metrics, rate limiting)
 
 - **Token auth** (`rust/src/server.rs`)
@@ -484,11 +478,10 @@ history and do not describe current keys, reads, writes, or worker behavior.
 - **`S3Storage` backend** (`rust/src/storage/s3_storage.rs`)
   - Implements the `StorageBackend` trait for S3, R2, Tigris, and MinIO.
   - Configured with `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`,
-    `RIPCLONE_S3_BUCKET`, `RIPCLONE_S3_PREFIX`, and `RIPCLONE_S3_CACHE_DIR`.
+    `RIPCLONE_S3_BUCKET`, and `RIPCLONE_S3_PREFIX`.
   - Credentials come from standard `AWS_*` environment variables via the `s3`
     crate's `Auth::from_env()`.
-  - Reads the local cache first; on miss fetches the full object or a byte range
-    from S3 and writes it into the local cache.
+  - Reads full objects and byte ranges directly from durable storage.
   - Supports `Range: bytes=start-end` via `get_range` so the server can still
     proxy partial requests when signed URLs are unavailable.
 

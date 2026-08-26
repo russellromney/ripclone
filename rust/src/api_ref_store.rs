@@ -7,18 +7,19 @@
 //! The server that holds the real control database performs the durable write
 //! only when that owner still holds that exact job (`POST /v1/refs`).
 //!
-//! Reads return empty: a farmed-out worker builds cold and only needs the write
-//! path for publish. A failed report is never swallowed — network/5xx map to
-//! retryable errors so the job requeues, and 401/403 to an unauthorized error so
-//! the worker exits cleanly without refreshing credentials locally.
+//! Reads come from the server at the beginning of each claimed job, then use a
+//! process-local write-through cache while that job publishes its results. A
+//! failed report is never swallowed — network/5xx map to retryable errors so
+//! the job requeues, and 401/403 to an unauthorized error so the worker exits
+//! cleanly without refreshing credentials locally.
 //!
 //! The token is a durable, operator-provisioned value (`ripclone
 //! mint-worker-token`). The queue-side twin is
 //! [`ApiJobQueue`](crate::api_job_queue).
 
-use crate::RefInfo;
 use crate::provider::RepoId;
 use crate::ref_store::{AddedRepo, RefStore};
+use crate::{FilesResult, FullResult, HeadResult, RefInfo};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -91,27 +92,35 @@ impl std::error::Error for ApiReportError {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RefReport {
-    SaveResult {
-        job_id: i64,
-        worker_id: String,
-        repo_key: String,
-        info: Box<RefInfo>,
-    },
-    UpdateBuildStatus {
+    PublishHead {
         job_id: i64,
         worker_id: String,
         repo_key: String,
         commit: String,
-        status: String,
+        head: Box<HeadResult>,
+    },
+    PublishFull {
+        job_id: i64,
+        worker_id: String,
+        repo_key: String,
+        commit: String,
+        full: Box<FullResult>,
+    },
+    PublishFiles {
+        job_id: i64,
+        worker_id: String,
+        repo_key: String,
+        commit: String,
+        files: Box<FilesResult>,
     },
 }
 
 impl RefReport {
     pub fn repo_key(&self) -> &str {
         match self {
-            Self::SaveResult { repo_key, .. } | Self::UpdateBuildStatus { repo_key, .. } => {
-                repo_key
-            }
+            Self::PublishHead { repo_key, .. }
+            | Self::PublishFull { repo_key, .. }
+            | Self::PublishFiles { repo_key, .. } => repo_key,
         }
     }
 }
@@ -125,8 +134,8 @@ pub struct RefReportResponse {
 
 /// Worker-side `RefStore`: every write is a POST to the report URL.
 ///
-/// Keeps a process-local write-through map so multi-step publish (phase 1 save
-/// → phase 2 load → save) can re-read what this worker just reported. The map
+/// Keeps a process-local write-through map so one job can re-read what it has
+/// just reported. The map
 /// is not shared with other workers and is not authoritative — the server is.
 pub struct ApiRefStore {
     report_url: String,
@@ -233,87 +242,186 @@ impl ApiRefStore {
             )
         }
     }
+
+    async fn get_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        let resp = self
+            .client
+            .get(&self.report_url)
+            .header("Authorization", format!("Bearer {}", self.job_token))
+            .query(&[
+                ("repo_key", repo_id.storage_key()),
+                ("commit", commit.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| ApiReportError::retryable(format!("metadata read: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return resp.json::<Option<RefInfo>>().await.map_err(|e| {
+                ApiReportError::permanent(format!("decode metadata read: {e}")).into()
+            });
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            Err(ApiReportError::unauthorized(format!(
+                "metadata read unauthorized ({status}): {body}"
+            ))
+            .into())
+        } else if status.is_server_error() || status.as_u16() == 429 {
+            Err(
+                ApiReportError::retryable(format!("metadata read retryable HTTP {status}: {body}"))
+                    .into(),
+            )
+        } else {
+            Err(
+                ApiReportError::permanent(format!("metadata read rejected ({status}): {body}"))
+                    .into(),
+            )
+        }
+    }
 }
 
 #[async_trait]
 impl RefStore for ApiRefStore {
     async fn load_result(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // Only what this worker has written this process — no remote reads.
-        let map = self.local.read().await;
-        Ok(map.get(&Self::local_key(repo_id, commit)).cloned())
+        if let Some(result) = self
+            .local
+            .read()
+            .await
+            .get(&Self::local_key(repo_id, commit))
+            .cloned()
+        {
+            return Ok(Some(result));
+        }
+        let result = self.get_result(repo_id, commit).await?;
+        if let Some(result) = &result {
+            self.local
+                .write()
+                .await
+                .insert(Self::local_key(repo_id, commit), result.clone());
+        }
+        Ok(result)
     }
 
     async fn save_result(&self, _repo_id: &RepoId, _info: &RefInfo) -> Result<()> {
         bail!("standalone worker result writes require claim identity")
     }
 
-    async fn save_claimed_result(
-        &self,
-        repo_id: &RepoId,
-        info: &RefInfo,
-        job_id: i64,
-        worker_id: &str,
-    ) -> Result<bool> {
-        self.post_report(&RefReport::SaveResult {
-            job_id,
-            worker_id: worker_id.to_string(),
-            repo_key: repo_id.storage_key(),
-            info: Box::new(info.clone()),
-        })
-        .await?;
-        // Write-through: phase 2 reloads the phase-1 ref from this map.
-        let mut map = self.local.write().await;
-        map.insert(Self::local_key(repo_id, &info.commit), info.clone());
-        Ok(true)
-    }
-
-    async fn list(&self) -> Result<Vec<RepoId>> {
-        Ok(Vec::new())
-    }
-
-    async fn update_build_status(
+    async fn publish_head(
         &self,
         _repo_id: &RepoId,
         _commit: &str,
-        _status: &str,
+        _head: HeadResult,
     ) -> Result<bool> {
-        bail!("standalone worker status writes require claim identity")
+        bail!("standalone workers require claimed Head publication")
     }
 
-    async fn update_claimed_build_status(
+    async fn publish_full(
+        &self,
+        _repo_id: &RepoId,
+        _commit: &str,
+        _full: FullResult,
+    ) -> Result<bool> {
+        bail!("standalone workers require claimed Full publication")
+    }
+
+    async fn publish_files(
+        &self,
+        _repo_id: &RepoId,
+        _commit: &str,
+        _files: FilesResult,
+    ) -> Result<bool> {
+        bail!("standalone workers require claimed Files publication")
+    }
+
+    async fn publish_claimed_head(
         &self,
         repo_id: &RepoId,
         commit: &str,
-        status: &str,
+        head: HeadResult,
         job_id: i64,
         worker_id: &str,
     ) -> Result<bool> {
-        let r = self
-            .post_report(&RefReport::UpdateBuildStatus {
+        let response = self
+            .post_report(&RefReport::PublishHead {
                 job_id,
                 worker_id: worker_id.to_string(),
                 repo_key: repo_id.storage_key(),
                 commit: commit.to_string(),
-                status: status.to_string(),
+                head: Box::new(head.clone()),
             })
             .await?;
-        if r.updated {
+        if response.updated {
             let mut map = self.local.write().await;
-            if let Some(info) = map.get_mut(&Self::local_key(repo_id, commit)) {
-                info.build_status = Some(status.to_string());
-            }
+            let result = map
+                .entry(Self::local_key(repo_id, commit))
+                .or_insert_with(|| RefInfo {
+                    commit: commit.to_string(),
+                    ..Default::default()
+                });
+            result.head = Some(head);
         }
-        Ok(r.updated)
+        Ok(response.updated)
     }
 
-    async fn touch_last_accessed_at(&self, repo_id: &RepoId, commit: &str) -> Result<bool> {
-        let _ = (repo_id, commit);
-        bail!("ApiRefStore does not support access touches (server-only operation)")
+    async fn publish_claimed_full(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        full: FullResult,
+        job_id: i64,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let response = self
+            .post_report(&RefReport::PublishFull {
+                job_id,
+                worker_id: worker_id.to_string(),
+                repo_key: repo_id.storage_key(),
+                commit: commit.to_string(),
+                full: Box::new(full.clone()),
+            })
+            .await?;
+        if response.updated {
+            let mut map = self.local.write().await;
+            let result = map
+                .entry(Self::local_key(repo_id, commit))
+                .or_insert_with(|| RefInfo {
+                    commit: commit.to_string(),
+                    ..Default::default()
+                });
+            result.full = Some(full);
+        }
+        Ok(response.updated)
     }
 
-    async fn delete_result(&self, repo_id: &RepoId, commit: &str) -> Result<()> {
-        let _ = (repo_id, commit);
-        bail!("ApiRefStore does not support result deletion (server-only operation)")
+    async fn publish_claimed_files(
+        &self,
+        repo_id: &RepoId,
+        commit: &str,
+        files: FilesResult,
+        job_id: i64,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let response = self
+            .post_report(&RefReport::PublishFiles {
+                job_id,
+                worker_id: worker_id.to_string(),
+                repo_key: repo_id.storage_key(),
+                commit: commit.to_string(),
+                files: Box::new(files.clone()),
+            })
+            .await?;
+        if response.updated {
+            let mut map = self.local.write().await;
+            let result = map
+                .entry(Self::local_key(repo_id, commit))
+                .or_insert_with(|| RefInfo {
+                    commit: commit.to_string(),
+                    ..Default::default()
+                });
+            result.files = Some(files);
+        }
+        Ok(response.updated)
     }
 
     async fn list_commits(&self, repo_id: &RepoId) -> Result<Vec<String>> {
@@ -339,6 +447,13 @@ impl RefStore for ApiRefStore {
         Ok(Vec::new())
     }
 
+    async fn invalidate(&self, repo_id: &RepoId, commit: &str) {
+        self.local
+            .write()
+            .await
+            .remove(&Self::local_key(repo_id, commit));
+    }
+
     async fn health(&self) -> Result<()> {
         // A cheap GET to the report URL is not defined; connectivity is proven
         // on the first write. Report healthy so /readyz is not used on workers.
@@ -360,12 +475,8 @@ mod tests {
         )
         .unwrap();
         let repo = RepoId::github("acme/dead");
-        let info = RefInfo {
-            commit: "abc".into(),
-            ..Default::default()
-        };
         let err = store
-            .save_claimed_result(&repo, &info, 7, "worker-test")
+            .publish_claimed_head(&repo, "abc", HeadResult::default(), 7, "worker-test")
             .await
             .unwrap_err();
         let api = err

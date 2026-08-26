@@ -27,7 +27,6 @@ async fn sqlite_control_keeps_every_exact_commit_independent() {
                     &repo,
                     &ripclone::RefInfo {
                         commit: format!("{ordinal:040x}"),
-                        synced_at: Some(1000 - ordinal),
                         ..Default::default()
                     },
                 )

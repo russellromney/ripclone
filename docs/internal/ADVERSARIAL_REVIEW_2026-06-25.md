@@ -12,6 +12,10 @@ The three top findings below were **independently surfaced by multiple track age
 
 ---
 
+> **Historical review snapshot.** File names, line numbers, architecture, and
+> proposed fixes below describe the June 2026 implementation and are not
+> current operational guidance.
+
 ## Executive summary by risk boundary
 
 | Boundary | Top risk | Key findings |
@@ -20,7 +24,7 @@ The three top findings below were **independently surfaced by multiple track age
 | **Build/sync lifecycle & queue** | **High** | `finish`/`ack` is an unguarded `UPDATE … WHERE id=?` → double-settle after a time-based reclaim; no `attempts` column → a SIGKILL/OOM build crash-loops forever with no dead-letter; two-phase build acks `done` then fires phase 2 into a detached `tokio::spawn` that an ephemeral worker loses. |
 | **io_uring writer (unsafe)** | **High** | On any harvest/submit error with windows in flight, `PendingDirectWindow` buffers (incl. kernel-written `statx`) are freed while the kernel still owns them → UAF/data-race with the kernel. The most safety-critical `unsafe` has no SAFETY note. |
 | **Auth / multi-tenant trust** | **High** | No per-repo/per-tenant authz in the backend — one shared bearer token reads any tenant's cached artifacts and signs URLs for any repo; rate limiter keyed on raw socket IP (useless behind the gateway, bypassable over IPv6); private-vs-public TTL read from a client-trusted header that fails open. |
-| **Storage / GC / retention** | **High** | GC grace period is anchored on object **mtime**, not reference time; a *reused* (not re-uploaded) artifact keeps its old mtime and can be deleted out from under a concurrent sync. Local-backend retention can delete the only copy of a still-referenced artifact. |
+| **Artifact ownership** | **Resolved** | Automatic exact-result and durable-artifact deletion was removed. Only S3-backed local build-cache copies may be trimmed after their remote copy is confirmed. |
 | **Clone correctness (files mode)** | **Medium** | Non-UTF-8 symlink targets abort the whole clone (forced through `str::from_utf8`); one decompression path is unbounded where its sibling is capped. Integrity model is otherwise strong (3 independent hash anchors). |
 | **Pack / git-object correctness** | **Medium** | `--depth N` (N>1) is silently ignored → full clone, no `.git/shallow`; `HashingWriter` double-hashes on a short write → bad pack trailer; head-delta build has no fallback when its immutable base is gc'd after a force-push. |
 | **Rust perf (the project's whole point)** | **Medium** | Per-artifact `.to_vec()` copy, per-frame `Vec` clone in the writer loop, and a `std::Mutex` locked once per file just to poll an error flag — all on the core download/extract hot path; all cheap mechanical fixes. |
@@ -36,7 +40,7 @@ A note on the auth findings: several are architecture/deployment assumptions (th
 3. **A claim is owned by exactly one worker until its window elapses.** Time-based reclaim with no liveness check reclaims a slow-but-alive worker → concurrent double-build on a shared mirror.
 4. **Status never reports ready before artifacts are durable.** Two-phase acks `done` after phase 1; phase 2 is fire-and-forget.
 5. **io_uring SQE buffers stay alive + pinned until their CQEs are reaped.** Holds on the success path; violated on every harvest/submit/Drop error path.
-6. **GC never deletes a referenced or in-flight artifact.** Holds for freshly-*written* objects; violated for *reused* objects whose mtime is stale.
+6. **Published artifacts remain durable.** The current implementation has no background remote deletion or exact-result eviction.
 7. **A client may only read artifacts for repos it is authorized for.** No per-repo authz exists in the backend.
 8. **The working tree is byte-exact vs `git checkout`.** Violated for non-UTF-8 symlink targets (clone aborts).
 
@@ -44,11 +48,11 @@ A note on the auth findings: several are architecture/deployment assumptions (th
 
 ## Ranked top 10 fixes
 
-1. **Make the ref-write ordering atomic and present on every backend.** Hoist the compare-policy into one shared helper; give `FileRefStore::save*` the read-compare-then-rename it lacks; make `SqlRefStore::save_branch` a single conditional upsert (`… DO UPDATE … WHERE excluded.synced_at >= refs.synced_at OR excluded.commit_id = refs.commit_id`; MySQL has no WHERE on `ON DUPLICATE KEY` — use `IF(...)` column expressions or `SELECT … FOR UPDATE`); route S3 branch saves through the same ETag CAS as HEAD. *(verified: ref_store.rs:126/188, meta/mod.rs:119)*
+1. **Historical branch-write ordering finding.** The branch-pointer and multi-ref-store design reviewed here was replaced by server-owned exact results.
 2. **Guard job settlement and bound attempts.** Make `finish`/`ack` conditional: `UPDATE … WHERE id=? AND worker_id=? AND status='claimed'`, check rows-affected; add an `attempts` column and route `attempts >= MAX` reclaims to terminal `failed` (dead-letter) instead of back to `queued`. *(verified: sqlite_db.rs:97/151 — and the sibling pg/mysql/libsql adapters)*
 3. **Don't ack two-phase `done` until phase 2 is durable.** Run phase 2 inline before returning, or model it as a second retryable `queued` row that survives worker death; re-acquire `repo_lock` inside the phase-2 task. *(server.rs:4314-4357, ripclone-worker.rs:122-130)*
 4. **Drain the io_uring ring before freeing buffers on every error/Drop path.** On any harvest/submit error with windows outstanding, loop `submit_and_wait`/drain the CQ to quiescence before dropping `PendingDirectWindow`; make `Drop` drain-to-quiescent, not best-effort flush; add the missing SAFETY note tying SQE-buffer lifetime to `pending_windows`. *(worktree_writer.rs:1486-1516, 1639-1648, 1710-1716, 1792-1796)*
-5. **Anchor GC grace on reference time, not object mtime.** Touch/re-PUT (or copy-in-place) every artifact a sync references even when reused, or re-check each delete candidate's owning-ref version after computing the reachable set and skip anything that changed during the pass. *(remote_gc.rs:140-208)*
+5. **Resolved later by deleting automatic durable-artifact collection.**
 6. **Add a per-repo authorization check and stop fanning out a single shared token.** Carry a gateway-signed principal and authorize `(principal, repo)` before signing URLs / serving content; at minimum document that the backend must be network-isolated and never multi-tenant-shared. *(server.rs:581, 1525, 2685-2745)*
 7. **Fix the rate limiter for the real topology.** Key on a validated forwarded-for / authenticated token, collapse IPv6 to /64; today it keys on the raw socket IP and is a no-op behind the gateway. *(server.rs:643-650)*
 8. **Make the worktree writer durable (or document that it isn't).** No `fsync` on files or parent dirs before the clone reports success and writes the index stat cache → a crash can leave a torn tree that `git status` calls clean. Batch `IORING_OP_FSYNC` or fsync on the POSIX path. *(worktree_writer.rs, extract.rs index-stat path)*
@@ -76,10 +80,10 @@ A note on the auth findings: several are architecture/deployment assumptions (th
 - **M7 [Med] Backend-selection footgun** — `RIPCLONE_QUEUE=postgres` + no S3 + unset metadata silently picks a *per-host* file ref store; shared queue, unshared metadata, no error. *(backends.rs:107-168)*
 - **Verified-safe:** no SQL injection anywhere (all bound params; only static DDL is formatted).
 
-### Track — Storage / signed URLs / GC / retention
-- **S1 [High] GC grace anchored on mtime, not reference time** — reused (not re-PUT) artifacts keep old mtime and can be deleted under a concurrent sync; the authors already patched one instance (`head_base_packs`) but the general race remains. *(remote_gc.rs:140-208)*
-- **S2 [High] Local-backend retention can delete the only copy** of a referenced artifact — protected set is a best-effort side file, not derived from the ref store; `is_durable` returns true when `durable_storage is None`. *(retention.rs:73-160)*
-- **S3 [Med] Transient manifest-fetch error during GC silently shrinks the reachable set** (warn-and-continue while siblings abort) — latent today because chunks are also added from `RefInfo`, dangerous the moment any chunk becomes manifest-only. *(remote_gc.rs:237-246)*
+### Track — Storage / signed URLs / historical lifecycle
+- **S1–S3 [Resolved]** Automatic exact-result eviction and remote artifact
+  deletion were removed; local storage is durable, and only S3-backed local
+  cache copies may be trimmed after confirming the remote copy.
 - **S4 [Med] Whole-object in-RAM fetch, no range/resume; signed-URL TTL can be shorter than a large pack's download** → 403 → full restart, no progress; blows client memory. *(client.rs:263-300, server.rs:1508)*
 - **Verified-safe:** freshly-written objects are protected by grace; downloaded content is hash-verified; CAS writes are tmp+atomic-rename.
 
@@ -134,13 +138,11 @@ A note on the auth findings: several are architecture/deployment assumptions (th
 - The middle of the io_uring window machinery (`worktree_writer.rs:1563-2380`) and the server HTTP handlers were only partially read by the perf track.
 
 ## Suggested tests (highest value first)
-1. **Concurrency/ordering property test:** N tasks race `save_branch` with shuffled `synced_at` against each meta engine + `FileRefStore` + `S3RefStore` branch path; assert max-`synced_at` always wins (fails M1/M2/M3 today).
-2. **Worker hard-kill:** claim, simulate SIGKILL (no ack), assert bounded attempts → `failed`; assert a reclaimed slow worker's late `ack` is rejected (A1/A2).
-3. **Two-phase durability:** process exits right after phase-1 ack → assert a durable full clonepack exists and the job is retryable (A3).
-4. **GC reuse race:** interleave a sync that re-references an aged reused object with `RemoteGc::run()`; assert the object survives (S1).
-5. **io_uring fault injection:** force `submit_and_wait` to return `EINTR` with ≥2 windows in flight, run under KASAN/ASan; catch the UAF on `statx_buffers` (U1).
-6. **Files-mode fidelity property test:** random tree (exec bits, symlinks incl. non-UTF-8 targets, empty files, chunk-boundary sizes) → clone byte-identical to `git checkout` (F1).
-7. **Authz:** server with token T, request a repo the caller has no claim to → must be 403 (currently 200) (AU1); two IPv6 addrs in one /64 each exhaust the burst (AU2).
+1. **Worker hard-kill:** claim, simulate SIGKILL (no ack), assert bounded attempts → `failed`; assert a reclaimed slow worker's late `ack` is rejected (A1/A2).
+2. **Two-phase durability:** process exits right after phase-1 ack → assert a durable full clonepack exists and the job is retryable (A3).
+3. **io_uring fault injection:** force `submit_and_wait` to return `EINTR` with ≥2 windows in flight, run under KASAN/ASan; catch the UAF on `statx_buffers` (U1).
+4. **Files-mode fidelity property test:** random tree (exec bits, symlinks incl. non-UTF-8 targets, empty files, chunk-boundary sizes) → clone byte-identical to `git checkout` (F1).
+5. **Authz:** server with token T, request a repo the caller has no claim to → must be 403 (currently 200) (AU1); two IPv6 addrs in one /64 each exhaust the burst (AU2).
 8. **Depth + short-write:** remote-helper `--depth 3` asserts history length + `.git/shallow` (P1); >256 KiB-compressing blob through `StreamingBlobPackBuilder` behind a short-writing `Write` (P2).
 
 ## Track coverage map

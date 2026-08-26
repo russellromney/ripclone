@@ -220,7 +220,7 @@ async fn clone_id_header_triggers_metrics_post_with_correct_body() {
 
     // The header flowed through to the outcome.
     assert_eq!(outcome.clone_id.as_deref(), Some(gw.clone_id.as_str()));
-    assert_eq!(outcome.mode, "depth1");
+    assert_eq!(outcome.mode, "head");
     assert!(!outcome.cold, "warm repo, no 202 poll");
     assert!(outcome.bytes > 0, "downloaded some bytes");
 
@@ -252,7 +252,7 @@ async fn clone_id_header_triggers_metrics_post_with_correct_body() {
     assert_eq!(body["repo"]["owner"], "acme");
     assert_eq!(body["repo"]["name"], "metrics-on");
     assert_eq!(body["commit"], commit);
-    assert_eq!(body["mode"], "depth1");
+    assert_eq!(body["mode"], "head");
     assert_eq!(body["cold"], false);
     assert_eq!(body["totalMs"], 4242);
     assert!(body["bytes"].as_u64().unwrap() > 0);
@@ -399,9 +399,9 @@ async fn run_cli_clone(
 
 /// Poll the gateway (proxying to the OSS server) until the requested clonepack
 /// is warm, so the CLI doesn't spend the test waiting on 202s.
-async fn warm_through_gateway(gw_url: &str, repo: &str, clonepack_kind: Option<&str>) {
+async fn warm_through_gateway(gw_url: &str, repo: &str, result: ripclone::ExactResultKind) {
     gateway_client(gw_url)
-        .resolve_ref_with_clonepack(repo, "HEAD", clonepack_kind, None)
+        .resolve_exact_result(repo, "HEAD", result, None)
         .await
         .expect("warm repo through gateway");
 }
@@ -413,7 +413,12 @@ async fn no_metrics_flag_suppresses_post() {
     seed_repo(&server, "acme", "metrics-no-flag").await;
 
     let gw = spawn_gateway(&server.url, true, 202).await;
-    warm_through_gateway(&gw.url, "acme/metrics-no-flag", Some("shallow")).await;
+    warm_through_gateway(
+        &gw.url,
+        "acme/metrics-no-flag",
+        ripclone::ExactResultKind::Head,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -450,7 +455,12 @@ async fn no_metrics_env_var_suppresses_post() {
     seed_repo(&server, "acme", "metrics-no-env").await;
 
     let gw = spawn_gateway(&server.url, true, 202).await;
-    warm_through_gateway(&gw.url, "acme/metrics-no-env", Some("shallow")).await;
+    warm_through_gateway(
+        &gw.url,
+        "acme/metrics-no-env",
+        ripclone::ExactResultKind::Head,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");

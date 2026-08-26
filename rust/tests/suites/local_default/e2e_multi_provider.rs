@@ -61,7 +61,7 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
 
 /// Poll a full clone through an explicit-provider client until it reaches the
 /// expected upstream commit. The full clonepack builds in the background, so
-/// this retries until phase 2 lands.
+/// this retries until Full lands.
 async fn clone_full_with_provider(
     client: &Client,
     repo_path: &str,

@@ -246,7 +246,7 @@ fn assert_ripclone_ok(out: &std::process::Output, what: &str) {
     );
 }
 
-async fn wait_for_editable_full_b_to_settle(
+async fn wait_for_exact_job_to_settle(
     server: &Server,
     repo_path: &str,
     upstream_token: &str,
@@ -254,10 +254,7 @@ async fn wait_for_editable_full_b_to_settle(
 ) {
     let mut last = String::from("no response");
     for _ in 0..80 {
-        let url = format!(
-            "{}/v1/repos/gitea/{repo_path}/refs/main?clonepack=full&pinned={target}",
-            server.url
-        );
+        let url = format!("{}/v1/repos/gitea/{repo_path}/status", server.url);
         match reqwest::Client::new()
             .get(url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -270,10 +267,15 @@ async fn wait_for_editable_full_b_to_settle(
                 let status = response.status();
                 match response.json::<serde_json::Value>().await {
                     Ok(body)
-                        if body["commit"] == target
-                            && body["clonepack_manifest"]
-                                .as_str()
-                                .is_some_and(|manifest| !manifest.is_empty()) =>
+                        if body["refs"].as_array().is_some_and(|refs| {
+                            refs.iter().any(|result| {
+                                result["commit"] == target
+                                    && result["head"] == true
+                                    && result["full"] == true
+                                    && result["files"] == true
+                                    && result["job"] == "done"
+                            })
+                        }) =>
                     {
                         return;
                     }
@@ -286,9 +288,7 @@ async fn wait_for_editable_full_b_to_settle(
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    panic!(
-        "private editable Full(B) never settled through pinned metadata before fixture teardown: {last}"
-    );
+    panic!("private exact job never settled before fixture teardown: {last}");
 }
 
 // Multi-threaded runtime is required: the test body makes BLOCKING subprocess
@@ -386,8 +386,8 @@ async fn gitea_server_side_token_end_to_end() {
     // the real token survives; pre-fix it clobbered and every sync 401'd.
     let registry = ripclone::provider::ProviderRegistry::load()
         .expect("load server registry with real Gitea token and blank config token");
-    let (server, phase_one_barrier, phase_one_entered, phase_one_proceed) =
-        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+    let (server, head_barrier, head_entered, head_proceed) =
+        start_server_split_storage_head_publish_barrier_with_registry(registry).await;
 
     // --- Clone through ripclone with NO client-side token --------------------
     let work = tempfile::tempdir().unwrap();
@@ -462,10 +462,10 @@ async fn gitea_server_side_token_end_to_end() {
     );
     server
         .client_with_provider("gitea", Some(&env.token))
-        .resolve_ref_with_clonepack(
+        .resolve_exact_result(
             &format!("{}/{}", env.user, repo),
             "main",
-            Some("full"),
+            ripclone::ExactResultKind::Full,
             None,
         )
         .await
@@ -514,16 +514,16 @@ async fn gitea_server_side_token_end_to_end() {
     assert_ripclone_ok(&add_local_token, "configure local Gitea token");
 
     let top_up_target = push_commit(&env, &repo, "top-up.txt", "private B\n");
-    phase_one_barrier.arm();
+    head_barrier.arm_for(&top_up_target.0);
     let sync_client = server.client_with_provider("gitea", Some(&env.token));
     let repo_for_sync = format!("{}/{}", env.user, repo);
     let repo_for_pending_sync = repo_for_sync.clone();
     let mut pending_sync =
         tokio::spawn(async move { sync_client.sync_repo(&repo_for_pending_sync, None).await });
-    tokio::time::timeout(std::time::Duration::from_secs(20), phase_one_entered)
+    tokio::time::timeout(std::time::Duration::from_secs(20), head_entered)
         .await
-        .expect("private B reached phase-one publication")
-        .expect("private phase-one barrier alive");
+        .expect("private B reached Head publication")
+        .expect("private Head publication barrier alive");
 
     let top_up_dir = cwd.join("top-up-clone");
     assert_ripclone_ok(
@@ -604,13 +604,13 @@ async fn gitea_server_side_token_end_to_end() {
         String::from_utf8_lossy(&missing.stderr)
     );
 
-    phase_one_proceed.send(()).expect("release private Full(B)");
+    head_proceed.send(()).expect("release private Head(B)");
     tokio::time::timeout(std::time::Duration::from_secs(20), &mut pending_sync)
         .await
         .expect("private Full(B) finished after release")
         .expect("join private B sync")
         .expect("sync private B");
-    wait_for_editable_full_b_to_settle(&server, &repo_for_sync, &env.token, &top_up_target.0).await;
+    wait_for_exact_job_to_settle(&server, &repo_for_sync, &env.token, &top_up_target.0).await;
 
     delete_repo(&http, &env, &repo).await;
 }

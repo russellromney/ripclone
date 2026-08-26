@@ -231,10 +231,10 @@ async fn run_clone_with_token(
 /// for. `sync_repo` returns as soon as the sync job is enqueued/accepted, so a
 /// directly following CLI clone can otherwise poll the 202 path for many
 /// seconds.
-async fn wait_for_warm(server: &Server, repo: &str, clonepack_kind: Option<&str>) {
+async fn wait_for_warm(server: &Server, repo: &str, result: ripclone::ExactResultKind) {
     server
         .client()
-        .resolve_ref_with_clonepack(repo, "HEAD", clonepack_kind, None)
+        .resolve_exact_result(repo, "HEAD", result, None)
         .await
         .expect("warm repo");
 }
@@ -256,7 +256,12 @@ async fn verify_upstream_default_succeeds_for_public() {
         .sync_repo("acme/verify-default", None)
         .await
         .expect("sync");
-    wait_for_warm(&server, "acme/verify-default", Some("shallow")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-default",
+        ripclone::ExactResultKind::Head,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -297,7 +302,12 @@ async fn upstream_snapshot_a_rejects_later_pinned_install_b_without_repinning() 
         .sync_repo("acme/verify-snapshot-mismatch", None)
         .await
         .expect("sync A");
-    wait_for_warm(&server, "acme/verify-snapshot-mismatch", Some("full")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-snapshot-mismatch",
+        ripclone::ExactResultKind::Full,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -312,10 +322,20 @@ async fn upstream_snapshot_a_rejects_later_pinned_install_b_without_repinning() 
         .sync_repo("acme/verify-snapshot-mismatch", None)
         .await
         .expect("publish B before release CLI resolves its ref");
-    wait_for_warm(&server, "acme/verify-snapshot-mismatch", Some("full")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-snapshot-mismatch",
+        ripclone::ExactResultKind::Full,
+    )
+    .await;
     let ready_b = server
         .client()
-        .resolve_ref_with_clonepack("acme/verify-snapshot-mismatch", "main", Some("full"), None)
+        .resolve_exact_result(
+            "acme/verify-snapshot-mismatch",
+            "main",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("full B ready");
     assert_eq!(ready_b.commit, b);
@@ -353,7 +373,12 @@ async fn verify_upstream_succeeds_for_shallow_clone_with_history() {
         .sync_repo("acme/verify-shallow-history", None)
         .await
         .expect("sync");
-    wait_for_warm(&server, "acme/verify-shallow-history", Some("shallow")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-shallow-history",
+        ripclone::ExactResultKind::Head,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -399,7 +424,12 @@ async fn verify_upstream_auto_uses_the_new_exact_tip() {
         .expect("sync");
     server
         .client()
-        .resolve_ref_with_clonepack("acme/verify-auto-stale", "main", Some("full"), None)
+        .resolve_exact_result(
+            "acme/verify-auto-stale",
+            "main",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("publish exact A");
 
@@ -412,7 +442,12 @@ async fn verify_upstream_auto_uses_the_new_exact_tip() {
         .sync_repo("acme/verify-auto-stale", None)
         .await
         .expect("admit exact B");
-    wait_for_warm(&server, "acme/verify-auto-stale", Some("full")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-auto-stale",
+        ripclone::ExactResultKind::Full,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -452,7 +487,12 @@ async fn verify_upstream_always_uses_the_new_exact_tip() {
         .expect("sync");
     server
         .client()
-        .resolve_ref_with_clonepack("acme/verify-stale", "main", Some("full"), None)
+        .resolve_exact_result(
+            "acme/verify-stale",
+            "main",
+            ripclone::ExactResultKind::Full,
+            None,
+        )
         .await
         .expect("publish exact A");
 
@@ -465,7 +505,12 @@ async fn verify_upstream_always_uses_the_new_exact_tip() {
         .sync_repo("acme/verify-stale", None)
         .await
         .expect("admit exact B");
-    wait_for_warm(&server, "acme/verify-stale", Some("full")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-stale",
+        ripclone::ExactResultKind::Full,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -503,7 +548,12 @@ async fn verify_upstream_always_fails_when_unreachable() {
         .sync_repo("acme/verify-unreachable", None)
         .await
         .expect("sync");
-    wait_for_warm(&server, "acme/verify-unreachable", Some("shallow")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-unreachable",
+        ripclone::ExactResultKind::Head,
+    )
+    .await;
 
     // Remove the origin so the upstream ls-remote fails. The server's cached
     // mirror is still fresh, so the clone itself would succeed without
@@ -549,7 +599,12 @@ async fn verify_upstream_never_does_not_bypass_exact_symbolic_resolution() {
         .sync_repo("acme/verify-never", None)
         .await
         .expect("sync");
-    wait_for_warm(&server, "acme/verify-never", Some("shallow")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-never",
+        ripclone::ExactResultKind::Head,
+    )
+    .await;
 
     // Make upstream unreachable. With --verify-upstream=never the clone must
     // still succeed and emit no verification messages.
@@ -595,7 +650,12 @@ async fn verify_upstream_auto_warns_and_skips_unreachable() {
         .sync_repo("acme/verify-auto-unreachable", None)
         .await
         .expect("sync");
-    wait_for_warm(&server, "acme/verify-auto-unreachable", Some("shallow")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-auto-unreachable",
+        ripclone::ExactResultKind::Head,
+    )
+    .await;
 
     // Remove the origin so the anonymous upstream probe fails. Default auto mode
     // (no credential) must degrade with a warning rather than failing the clone.
@@ -638,7 +698,7 @@ async fn verify_upstream_auto_with_token_warns_and_skips_unreachable() {
     wait_for_warm(
         &server,
         "acme/verify-auto-token-unreachable",
-        Some("shallow"),
+        ripclone::ExactResultKind::Head,
     )
     .await;
 
@@ -687,7 +747,12 @@ async fn verify_upstream_files_mode_warns_and_skips() {
         .sync_repo("acme/verify-files", None)
         .await
         .expect("sync");
-    wait_for_warm(&server, "acme/verify-files", Some("full")).await;
+    wait_for_warm(
+        &server,
+        "acme/verify-files",
+        ripclone::ExactResultKind::Full,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("clone");
@@ -738,7 +803,12 @@ async fn verify_upstream_auto_skips_non_tip_rev() {
         .expect("sync at HEAD~1");
     server
         .client()
-        .resolve_ref_with_clonepack("acme/verify-at-auto", "HEAD", Some("full"), Some("HEAD~1"))
+        .resolve_exact_result(
+            "acme/verify-at-auto",
+            "HEAD",
+            ripclone::ExactResultKind::Full,
+            Some("HEAD~1"),
+        )
         .await
         .expect("warm full at HEAD~1");
 
@@ -789,10 +859,10 @@ async fn verify_upstream_always_fails_non_tip_rev() {
         .expect("sync at HEAD~1");
     server
         .client()
-        .resolve_ref_with_clonepack(
+        .resolve_exact_result(
             "acme/verify-at-always",
             "HEAD",
-            Some("full"),
+            ripclone::ExactResultKind::Full,
             Some("HEAD~1"),
         )
         .await

@@ -122,13 +122,14 @@ export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
 ./target/release/ripclone-server
 ```
 
-The server defaults to storing its local cache and bare mirrors under
-`~/.local/share/ripclone/` (`cache`, `repos`, and `control.db`). Use `--cas-dir`,
-`--repo-root`, and `--control-db` to override. `--host` (default `0.0.0.0`) and
-`--port` (default `8000`) set the listen address. Object storage
-(S3/R2/Tigris/MinIO) and most
-other tuning are set with environment variables — see [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md)
-and [`docs/BACKENDS.md`](docs/BACKENDS.md).
+The server defaults to storing its local artifact CAS and bare mirrors under
+`~/.local/share/ripclone/` (`cache`, `repos`, and `control.db`). With the default
+local artifact backend, `cache` is the durable artifact store and must be
+preserved. Use `--cas-dir`, `--repo-root`, and `--control-db` to override.
+`--host` (default `0.0.0.0`) and `--port` (default `8000`) set the listen address.
+Object storage (S3/R2/Tigris/MinIO) and most other tuning are set with
+environment variables — see [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md) and
+[`docs/BACKENDS.md`](docs/BACKENDS.md).
 
 Point the CLI at your server. `--server` is a **global** flag, so it goes
 *before* the subcommand — but the cleanest way is the `RIPCLONE_SERVER` env var,
@@ -314,7 +315,7 @@ ripclone is host-agnostic: point it at GitHub (built in), GitLab, Gitea/Forgejo/
 
 ripclone splits into a **server** — it resolves refs, serves artifacts, and atomically admits exact work — and workers that fetch the upstream and build clonepacks. Embedded workers claim the server's durable jobs table. Standalone `ripclone-worker` processes are authenticated API-only and receive no database credential (see [Running workers at scale](docs/SCALING_WORKERS.md)).
 
-- **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Local disk also caches hot artifacts in front of object storage. A background GC drops artifacts nothing references (after a grace period, so an in-flight upload is never deleted).
+- **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Published exact results and their durable artifacts do not expire. With object storage, the local CAS and Git mirror are disposable build caches; local-storage deployments keep the artifact bytes on disk.
 - **Control database.** One server-owned SQLite database stores refs, added repositories, jobs, claims, attempts, and heartbeats. Plain local SQLite is the default; a Turso embedded replica is the replicated mode. Exact-result creation and job admission are one transaction.
 
 **Your git host stays the source of truth** for repos, refs, permissions, and writes. Clients download artifacts (signed URL or server proxy), decompress, and write files straight to disk. Public endpoints are rate-limited.

@@ -124,16 +124,22 @@ pub fn rank_ceiling(name: &str, classes: &[SizeClass]) -> Result<i64> {
 /// contribute — those need a storage round-trip the enqueue path avoids.)
 pub fn prior_clonepack_bytes(info: &crate::RefInfo) -> u64 {
     let mut total = 0u64;
-    for p in &info.head_base_packs {
-        total = total.saturating_add(p.pack_len).saturating_add(p.idx_len);
-    }
-    for level in &info.history_levels {
-        for p in &level.packs {
+    if let Some(head) = &info.head {
+        for p in &head.base_packs {
             total = total.saturating_add(p.pack_len).saturating_add(p.idx_len);
         }
     }
-    for f in &info.archive_frames {
-        total = total.saturating_add(f.compressed_len);
+    if let Some(full) = &info.full {
+        for level in &full.history_levels {
+            for p in &level.packs {
+                total = total.saturating_add(p.pack_len).saturating_add(p.idx_len);
+            }
+        }
+    }
+    if let Some(files) = &info.files {
+        for f in &files.archive_frames {
+            total = total.saturating_add(f.compressed_len);
+        }
     }
     total
 }
@@ -326,27 +332,36 @@ mod tests {
     #[test]
     fn prior_clonepack_bytes_sums_sized_fields() {
         let info = crate::RefInfo {
-            head_base_packs: vec![crate::SizedPack {
-                pack: "p".into(),
-                pack_len: 1000,
-                idx: "i".into(),
-                idx_len: 10,
-            }],
-            history_levels: vec![crate::HistoryLevel {
-                tip_commit: "c".into(),
-                packs: vec![crate::SizedPack {
-                    pack: "hp".into(),
-                    pack_len: 500,
-                    idx: "hi".into(),
-                    idx_len: 5,
+            head: Some(crate::HeadResult {
+                base_packs: vec![crate::SizedPack {
+                    pack: "p".into(),
+                    pack_len: 1000,
+                    idx: "i".into(),
+                    idx_len: 10,
                 }],
-            }],
-            archive_frames: vec![crate::ArchiveFrame {
-                raw_hash: "r".into(),
-                chunk_hash: "ch".into(),
-                compressed_len: 200,
-                raw_len: 400,
-            }],
+                ..Default::default()
+            }),
+            full: Some(crate::FullResult {
+                history_levels: vec![crate::HistoryLevel {
+                    tip_commit: "c".into(),
+                    packs: vec![crate::SizedPack {
+                        pack: "hp".into(),
+                        pack_len: 500,
+                        idx: "hi".into(),
+                        idx_len: 5,
+                    }],
+                }],
+                ..Default::default()
+            }),
+            files: Some(crate::FilesResult {
+                archive_frames: vec![crate::ArchiveFrame {
+                    raw_hash: "r".into(),
+                    chunk_hash: "ch".into(),
+                    compressed_len: 200,
+                    raw_len: 400,
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert_eq!(prior_clonepack_bytes(&info), 1000 + 10 + 500 + 5 + 200);

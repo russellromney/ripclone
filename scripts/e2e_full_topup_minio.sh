@@ -66,7 +66,7 @@ if [ -n "${CI_ARTIFACTS:-}" ]; then
   listed="$(timeout 60 "$test_bin" --ignored --list)"
   run=("$test_bin" --ignored --exact "$TEST_NAME" --nocapture)
 else
-  listed="$(cd "$ROOT/rust" && timeout 60 cargo test --profile ci --locked --test e2e_full_topup -- --ignored --list)"
+  listed="$(cd "$ROOT/rust" && timeout 300 cargo test --profile ci --locked --test e2e_full_topup -- --ignored --list)"
   run=(cargo test --profile ci --locked --test e2e_full_topup -- --ignored --exact "$TEST_NAME" --nocapture)
 fi
 grep -Fqx "$TEST_NAME: test" <<<"$listed" || {
@@ -92,8 +92,8 @@ if grep -Fq "SKIP" "$log"; then
   echo "error: MinIO proof emitted SKIP" >&2
   exit 1
 fi
-if grep -Fq "full clone build failed" "$log" || grep -Fq "fatal:" "$log"; then
-  echo "error: MinIO proof logged a detached full-clone build failure" >&2
+if grep -Fq "background build failed" "$log" || grep -Fq "fatal:" "$log"; then
+  echo "error: MinIO proof logged an exact-result build failure" >&2
   exit 1
 fi
 rm -f "$log"

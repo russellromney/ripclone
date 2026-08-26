@@ -24,13 +24,11 @@ struct RefResponse {
     host: String,
     origin_url: String,
     branch: String,
-    default_branch: String,
     commit: String,
     parent_commit: Option<String>,
     clonepack_manifest: String,
     metadata_chunk: String,
-    shallow: bool,
-    archive_ready: bool,
+    result: String,
 }
 
 #[derive(Clone, Default)]
@@ -54,13 +52,11 @@ async fn sync_capture(
         host: "gitea.example.com".into(),
         origin_url: "https://gitea.example.com/owner/repo.git".into(),
         branch: "main".into(),
-        default_branch: "main".into(),
         commit: "abc123".into(),
         parent_commit: None,
         clonepack_manifest: "manifest".into(),
         metadata_chunk: "metadata".into(),
-        shallow: false,
-        archive_ready: true,
+        result: "full".into(),
     })
 }
 

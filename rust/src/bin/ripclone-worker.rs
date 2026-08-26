@@ -55,10 +55,10 @@ use ripclone::api_ref_store::ApiReportError;
 use ripclone::backends::Backends;
 use ripclone::metrics::Metrics;
 use ripclone::queue::{
-    BuildError, BuildJob, JobQueueRef, JobState, WorkerQueueRef, make_worker_id,
-    validate_heartbeat_timing, worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
+    BuildError, BuildJob, JobQueueRef, WorkerQueueRef, make_worker_id, validate_heartbeat_timing,
+    worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
 };
-use ripclone::server::{ServerState, mark_admitted_build_failed, process_build_job};
+use ripclone::server::{ServerState, process_build_job};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
     let metrics = Metrics::new();
     let b = Backends::from_env_with_ref_store(&args.cas_dir, &args.repo_root, &metrics, ref_store)
         .await?;
+    b.cache_retention.clone().spawn_from_env();
     let state = ServerState::for_worker(b, build_queue, metrics)?;
 
     // Fleet-unique id (host/machine + pid + start nanos). PID-only collides
@@ -247,6 +248,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                // The server is authoritative between jobs. A previous job may
+                // have populated this worker's process-local exact-result cache
+                // before a later new request admitted the same commit again.
+                state.ref_store.invalidate(&repo_id, &admitted_commit).await;
                 // Prefer the per-job upstream credential the enqueuer persisted
                 // (the cloud's per-request X-Upstream-Token, for a private repo
                 // the worker has no standing credential for); fall back to the
@@ -257,7 +262,6 @@ async fn main() -> Result<()> {
                     .with_context(|| {
                         format!("fetch credential for queued job {}", repo_id.storage_key())
                     })?;
-                let terminal_commit = admitted_commit.clone();
                 let job = BuildJob {
                     repo_id: repo_id.clone(),
                     admitted_commit,
@@ -306,39 +310,8 @@ async fn main() -> Result<()> {
                     );
                     break;
                 }
-                // Retryable errors leave metadata non-terminal (so intermediate
-                // retries don't look permanent). If ack dead-letters at the
-                // attempts cap, surface that as a terminal failed status.
-                let maybe_retryable_msg = result
-                    .as_ref()
-                    .err()
-                    .filter(|e| e.is_retryable())
-                    .map(|e| e.message().to_string());
                 match queue.ack(job_id, &worker_id, result.map(|_| ())).await {
-                    Ok(true) => {
-                        // Only when the build error was retryable: permanent
-                        // failures already wrote terminal metadata in
-                        // process_build_job. Dead-letter at the attempts cap
-                        // is the case that still needs a terminal write.
-                        if maybe_retryable_msg.is_some()
-                            && let Ok(JobState::Failed(err)) = queue.job_status(job_id).await
-                            && let Err(e) = mark_admitted_build_failed(
-                                &state,
-                                job_id,
-                                &worker_id,
-                                &repo_id,
-                                &terminal_commit,
-                                &err,
-                            )
-                            .await
-                        {
-                            error!(
-                                "failed to mark {}@{} terminal after dead-letter: {e:#}",
-                                repo_id.storage_key(),
-                                terminal_commit
-                            );
-                        }
-                    }
+                    Ok(true) => {}
                     Ok(false) => warn!(
                         "job {job_id} was reclaimed (or dead-lettered) before this worker \
                          finished; claim-scoped publication rejected the stale result"

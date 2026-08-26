@@ -12,8 +12,8 @@ set -euo pipefail
 # Set BENCH_MODES to a space-separated subset of full, depth1, files,
 # git-full, git-depth1, and github-files. The default remains the complete
 # editable-clone matrix. Set
-# RIPCLONE_BENCH_READY_CLONEPACK=shallow for a depth-one-only run so readiness
-# does not wait for background full-history artifacts.
+# RIPCLONE_BENCH_READY_RESULTS=head for a depth-one-only run so readiness does
+# not wait for background Full or Files artifacts.
 #
 # Compared modes (each run uses a fresh dir with the client cache disabled):
 #   * ripclone full (depth=0)
@@ -27,12 +27,7 @@ RATE_MBPS="${2:?rate in Mbps required}"
 RUNS="${3:-3}"
 TARGET="${4:-/data}"
 BENCH_MODES="${BENCH_MODES:-full depth1 files git-full git-depth1}"
-READY_CLONEPACK="${RIPCLONE_BENCH_READY_CLONEPACK:-full}"
-
-case "$READY_CLONEPACK" in
-  full|shallow) ;;
-  *) echo "error: RIPCLONE_BENCH_READY_CLONEPACK must be full or shallow" >&2; exit 2 ;;
-esac
+READY_RESULTS="${RIPCLONE_BENCH_READY_RESULTS:-}"
 
 mode_enabled() {
   case " $BENCH_MODES " in
@@ -45,6 +40,19 @@ for mode in $BENCH_MODES; do
   case "$mode" in
     full|depth1|files|git-full|git-depth1|github-files) ;;
     *) echo "error: unknown BENCH_MODES entry: $mode" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$READY_RESULTS" ]; then
+  mode_enabled depth1 && READY_RESULTS="head"
+  mode_enabled full && READY_RESULTS="${READY_RESULTS:+$READY_RESULTS }full"
+  mode_enabled files && READY_RESULTS="${READY_RESULTS:+$READY_RESULTS }files"
+  READY_RESULTS="${READY_RESULTS:-full}"
+fi
+for result in $READY_RESULTS; do
+  case "$result" in
+    head|full|files) ;;
+    *) echo "error: RIPCLONE_BENCH_READY_RESULTS entries must be head, full, or files" >&2; exit 2 ;;
   esac
 done
 
@@ -233,24 +241,28 @@ ensure_repo_added() {
 }
 
 get_default_branch() {
-  curl --connect-timeout 5 --max-time 30 -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/HEAD" 2>/dev/null \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch","HEAD"))'
+  curl --connect-timeout 5 --max-time 30 -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/HEAD?result=head" 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("branch","HEAD"))'
 }
 
 head_ref_json() {
   local branch="${1:-HEAD}"
+  local result="${2:-full}"
   # The server path already includes /refs/, so strip a leading "refs/" from
   # the caller's branch name (e.g. "refs/tags/v2.2.2" -> "tags/v2.2.2").
   branch="${branch#refs/}"
-  curl --connect-timeout 5 --max-time 30 -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/$branch" 2>/dev/null
+  curl --connect-timeout 5 --max-time 30 -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/$branch?result=$result" 2>/dev/null
 }
 
 probe_ready_clone() {
+  local result="$1"
   local dir="$TARGET/probe.$$"
   rm -rf "$dir"
   local depth=0
-  if [ "$READY_CLONEPACK" = "shallow" ]; then depth=1; fi
-  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$dir" --at "$REF" --depth "$depth" >/dev/null 2>&1; then
+  if [ "$result" = "head" ]; then depth=1; fi
+  local mode_args=()
+  if [ "$result" = "files" ]; then mode_args=(--mode files); fi
+  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$dir" --at "$REF" --depth "$depth" "${mode_args[@]}" >/dev/null 2>&1; then
     rm -rf "$dir"
     return 0
   else
@@ -263,10 +275,14 @@ wait_for_artifacts() {
   local timeout="${1:-1200}"
   local start end
   start=$(now_ms)
-  echo "  waiting for $READY_CLONEPACK clonepack artifacts to be consistent ..."
+  echo "  waiting for results [$READY_RESULTS] to be consistent ..."
   while true; do
-    if probe_ready_clone; then
-      echo "  artifacts ready ($READY_CLONEPACK clone succeeded)"
+    local all_ready=1 result
+    for result in $READY_RESULTS; do
+      if ! probe_ready_clone "$result"; then all_ready=0; break; fi
+    done
+    if [ "$all_ready" -eq 1 ]; then
+      echo "  artifacts ready (all requested clones succeeded)"
       return 0
     fi
     end=$(now_ms)
@@ -283,13 +299,14 @@ wait_for_artifacts() {
 # clonepack manifest. Normal admission passes the exact commit from /add and
 # uses the pinned branch below, which cannot drift while upstream moves; this
 # unpinned path remains for an explicitly requested BENCH_REF branch or tag.
-wait_for_ref_ready() {
+wait_for_one_result_ready() {
   local branch="${1:-HEAD}"
   local timeout="${2:-1200}"
   local pinned="${3:-}"
+  local ready_result="$4"
   local start end
   start=$(now_ms)
-  echo "  waiting for $READY_CLONEPACK clonepack artifacts to be consistent ..." >&2
+  echo "  waiting for $ready_result result to be consistent ..." >&2
   while true; do
     local out commit ready status tmp
     if [ -n "$pinned" ]; then
@@ -298,7 +315,7 @@ wait_for_ref_ready() {
       status=$(curl --connect-timeout 5 --max-time 30 -sS -o "$tmp" -w '%{http_code}' \
         -H "$(auth_header)" \
         -H 'x-ripclone-protocol: 2' \
-        "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/${branch#refs/}?clonepack=$READY_CLONEPACK&pinned=$pinned") || status="000"
+        "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/${branch#refs/}?result=$ready_result&pinned=$pinned") || status="000"
       out="$(cat "$tmp")"
       rm -f "$tmp"
       if [ "$status" = "200" ]; then
@@ -315,19 +332,9 @@ wait_for_ref_ready() {
         return 1
       fi
     else
-      if [ "$READY_CLONEPACK" = "shallow" ]; then
-        out="$(curl --connect-timeout 5 --max-time 30 -fsS \
-          -H "$(auth_header)" \
-          -H 'x-ripclone-protocol: 2' \
-          "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/${branch#refs/}?clonepack=shallow" \
-          2>/dev/null || true)"
-      else
-        out="$(head_ref_json "$branch" || true)"
-      fi
+      out="$(head_ref_json "$branch" "$ready_result" || true)"
       commit="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))' 2>/dev/null || true)"
-      # A full editable clone is ready only when the current metadata contract
-      # advertises its clonepack manifest and full-history archive.
-      ready="$(printf '%s' "$out" | READY_CLONEPACK="$READY_CLONEPACK" python3 -c 'import os,sys,json; d=json.load(sys.stdin); mode=os.environ["READY_CLONEPACK"]; print("1" if d.get("clonepack_manifest") and (mode == "shallow" or d.get("archive_ready")) else "")' 2>/dev/null || true)"
+      ready="$(printf '%s' "$out" | READY_RESULT="$ready_result" python3 -c 'import os,sys,json; d=json.load(sys.stdin); print("1" if d.get("clonepack_manifest") and d.get("result") == os.environ["READY_RESULT"] else "")' 2>/dev/null || true)"
       if [ -n "$commit" ] && [ -n "$ready" ]; then
         echo "  artifacts ready for $commit" >&2
         echo "$commit"
@@ -342,6 +349,17 @@ wait_for_ref_ready() {
     echo "    not ready yet, retrying in 10s ..." >&2
     sleep 10
   done
+}
+
+wait_for_ref_ready() {
+  local branch="${1:-HEAD}"
+  local timeout="${2:-1200}"
+  local selected="${3:-}"
+  local result
+  for result in $READY_RESULTS; do
+    selected="$(wait_for_one_result_ready "$branch" "$timeout" "$selected" "$result")"
+  done
+  echo "$selected"
 }
 
 warm_server() {
@@ -673,7 +691,7 @@ ensure_repo_added
 warm_server
 prepare_expected_tree
 
-echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps ripclone_runs=${RIPCLONE_RUNS:-$RUNS} native_runs=${NATIVE_RUNS:-$RUNS} modes=[$BENCH_MODES] ready=$READY_CLONEPACK shaped=${SHAPED:-1} host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
+echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps ripclone_runs=${RIPCLONE_RUNS:-$RUNS} native_runs=${NATIVE_RUNS:-$RUNS} modes=[$BENCH_MODES] ready=[$READY_RESULTS] shaped=${SHAPED:-1} host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
 if [ "${SHAPED:-1}" = "1" ]; then
   apply_shape "$RATE_MBPS"
 else

@@ -1208,7 +1208,12 @@ async fn main() -> Result<()> {
                 info.commit
             } else {
                 client
-                    .resolve_ref_with_clonepack(&repo_path, &branch, None, None)
+                    .resolve_exact_result(
+                        &repo_path,
+                        &branch,
+                        ripclone::ExactResultKind::Full,
+                        None,
+                    )
                     .await?
                     .commit
             };
@@ -1285,7 +1290,12 @@ async fn main() -> Result<()> {
                 info.commit
             } else {
                 client
-                    .resolve_ref_with_clonepack(&repo_path, &branch, None, None)
+                    .resolve_exact_result(
+                        &repo_path,
+                        &branch,
+                        ripclone::ExactResultKind::Full,
+                        None,
+                    )
                     .await?
                     .commit
             };

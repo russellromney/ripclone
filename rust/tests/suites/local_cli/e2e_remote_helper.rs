@@ -105,7 +105,7 @@ async fn remote_helper_rejects_manifest_for_another_commit_without_partial_clone
     register_added_without_build(&server, "acme/helper-integrity")
         .await
         .expect("register helper integrity fixture");
-    sync_until_archive_ready(&server, "acme", "helper-integrity").await;
+    sync_until_files_ready(&server, "acme", "helper-integrity").await;
     let (pinned, _) = replace_full_manifest_commit(
         &server,
         "acme/helper-integrity",

@@ -13,6 +13,8 @@ for bin in "$SERVER_BIN" git curl; do
 done
 
 BASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ripclone-smart-http.XXXXXX")"
+# Keep this binary fixture independent of the invoking user's configuration.
+export RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml"
 ORIGIN_ROOT="$BASE_DIR/origins"
 WORK="$BASE_DIR/work"
 PORT=$((20000 + RANDOM % 40000))

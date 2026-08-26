@@ -2,7 +2,7 @@
 //! and the polling fallback each cause a real build that a clone then reads.
 //!
 //! The unit tests in server.rs check the webhook handler's status codes against a
-//! fake queue. These run the *whole* path: trigger → real two-phase + LSM build →
+//! fake queue. These run the *whole* path: trigger → real exact-result LSM build →
 //! clone the pushed commit and verify it byte-for-byte. That's the actual
 //! "artifacts are ready before the clone" claim.
 
@@ -40,8 +40,7 @@ fn sign_gitea(body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Clone one branch's full (depth=0) artifacts, polling until phase 2 has
-/// published the full clonepack at the expected commit count. This is how we
+/// Clone one branch's Full result at the expected commit count. This is how we
 /// wait for an async, fire-and-forget build to finish.
 async fn clone_branch_full(
     server: &Server,
@@ -104,7 +103,7 @@ async fn clone_branch_full_with_client(
 /// pushed commit — without any per-repo Actions workflow.
 #[tokio::test]
 async fn webhook_push_builds_before_clone() {
-    setup(true); // two-phase + LSM + async (production defaults)
+    setup(true); // separate exact results + LSM + async (production defaults)
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", SECRET)]).await;
     let origin = make_origin("acme", "hook");
     let commit = origin.commit(&[("f.txt", "v1\n")], "c1");

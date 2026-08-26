@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# B4: phase-1 sync latency + storage amplification measurement.
+# B4: Head sync latency + storage amplification measurement.
 #
 # Reuses the release-server pattern from benchmark/profile_one.sh and the
 # shaped-sweep environment conventions in benchmark/README.md.
@@ -614,14 +614,14 @@ run_incremental_remote() {
 # ---------------------------------------------------------------------------
 
 print_markdown() {
-  local cold_p1 inc_p1
-  cold_p1=""
+  local cold_head inc_head
+  cold_head=""
   if [ "$COLD_RUNS" -gt 0 ]; then
-    cold_p1=$(stage_values cold publish_p1_ms)
+    cold_head=$(stage_values cold publish_head_ms)
   fi
-  inc_p1=$(stage_values incremental publish_p1_ms)
+  inc_head=$(stage_values incremental publish_head_ms)
   local under_over
-  if awk "BEGIN {exit ($inc_p1 < 5000) ? 0 : 1}"; then
+  if awk "BEGIN {exit ($inc_head < 5000) ? 0 : 1}"; then
     under_over="UNDER"
   else
     under_over="OVER"
@@ -660,9 +660,9 @@ EOF
 | skeleton build | $(stage_values cold skeleton_build_ms) |
 | files table | $(stage_values cold files_table_ms) |
 | prebuilt index | $(stage_values cold prebuilt_index_ms) |
-| upload p1 | $(stage_values cold upload_p1_ms) |
+| upload Head | $(stage_values cold upload_head_ms) |
 | ref publish | $(stage_values cold ref_publish_ms) |
-| **push→clonable** | **$cold_p1** |
+| **push→clonable** | **$cold_head** |
 
 $(amplification_table cold)
 EOF
@@ -687,13 +687,13 @@ EOF
 | skeleton build | $(stage_values incremental skeleton_build_ms) |
 | files table | $(stage_values incremental files_table_ms) |
 | prebuilt index | $(stage_values incremental prebuilt_index_ms) |
-| upload p1 | $(stage_values incremental upload_p1_ms) |
+| upload Head | $(stage_values incremental upload_head_ms) |
 | ref publish | $(stage_values incremental ref_publish_ms) |
-| **push→clonable** | **$inc_p1** |
+| **push→clonable** | **$inc_head** |
 
 $(amplification_table incremental)
 
-- **TRIPWIRE: incremental push→clonable p50 = ${inc_p1}ms — $under_over the 5 s threshold**
+- **TRIPWIRE: incremental push→clonable p50 = ${inc_head}ms — $under_over the 5 s threshold**
 EOF
 }
 
@@ -730,7 +730,7 @@ fi
 
 echo "" >&2
 echo "=== STAGE MEDIANS (ms) ===" >&2
-for key in mirror_fetch_ms commit_graph_ms head_packs_ms skeleton_build_ms files_table_ms prebuilt_index_ms upload_p1_ms ref_publish_ms publish_p1_ms; do
+for key in mirror_fetch_ms commit_graph_ms head_packs_ms skeleton_build_ms files_table_ms prebuilt_index_ms upload_head_ms ref_publish_ms publish_head_ms; do
   printf "  %-20s cold=%6s inc=%6s\n" "$key" "$(stage_values cold "$key")" "$(stage_values incremental "$key")" >&2
 done
 

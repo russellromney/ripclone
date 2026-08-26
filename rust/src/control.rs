@@ -291,18 +291,23 @@ impl ControlDb {
         self.admission_notify.clone()
     }
 
-    /// Publish exact-result metadata only while `(job_id, worker_id)` owns the
-    /// admitted job. Ownership validation and the result mutation share one
-    /// immediate transaction, so stale workers have no check/write window.
-    pub async fn save_result_for_claim(
+    pub async fn publish_head_for_claim(
         &self,
         job_id: i64,
         worker_id: &str,
         repo_id: &crate::provider::RepoId,
-        info: &crate::RefInfo,
+        commit: &str,
+        head: crate::HeadResult,
     ) -> Result<bool> {
-        crate::validation::validate_object_id(&info.commit)
-            .context("validate claimed result commit")?;
+        crate::validation::validate_object_id(commit).context("validate claimed result commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Head,
+                &head.clonepack,
+            ),
+            "invalid claimed Head result for {commit}"
+        );
         let connection = self
             .database
             .connect()
@@ -312,71 +317,7 @@ impl ControlDb {
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .context("begin claimed result write")?;
-        if !claim_authorizes(&tx, job_id, worker_id, repo_id, &info.commit, false).await? {
-            tx.rollback().await.ok();
-            return Ok(false);
-        }
-        let repo_key = repo_id.storage_key();
-        let mut rows = tx
-            .query(
-                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
-                libsql::params![repo_key.as_str(), info.commit.as_str()],
-            )
-            .await
-            .context("read claimed exact result")?;
-        let merged = match rows.next().await? {
-            Some(row) => {
-                let existing: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
-                    .context("decode claimed exact result")?;
-                crate::meta::merge_publication(&existing, info)
-            }
-            None => info.clone(),
-        };
-        drop(rows);
-        let data = serde_json::to_string(&merged).context("encode claimed exact result")?;
-        tx.execute(
-            "INSERT INTO results(repo_key, commit_id, data) VALUES (?1, ?2, ?3)
-             ON CONFLICT(repo_key, commit_id) DO UPDATE SET data = excluded.data",
-            libsql::params![repo_key, info.commit.as_str(), data],
-        )
-        .await
-        .context("write claimed exact result")?;
-        tx.commit().await.context("commit claimed result write")?;
-        Ok(true)
-    }
-
-    /// Update status under the same claim authority. A terminal failed status
-    /// is also allowed immediately after that owner has dead-lettered the job;
-    /// the jobs row retains its worker id, while a reclaimed row does not.
-    pub async fn update_result_status_for_claim(
-        &self,
-        job_id: i64,
-        worker_id: &str,
-        repo_id: &crate::provider::RepoId,
-        commit: &str,
-        status: &str,
-    ) -> Result<bool> {
-        let connection = self
-            .database
-            .connect()
-            .context("connect for claimed status write")?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        let tx = connection
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await
-            .context("begin claimed status write")?;
-        let allow_settled_failure =
-            status.starts_with("failed: ") || status.starts_with("files failed: ");
-        if !claim_authorizes(
-            &tx,
-            job_id,
-            worker_id,
-            repo_id,
-            commit,
-            allow_settled_failure,
-        )
-        .await?
-        {
+        if !claim_authorizes(&tx, job_id, worker_id, repo_id, commit).await? {
             tx.rollback().await.ok();
             return Ok(false);
         }
@@ -387,31 +328,153 @@ impl ControlDb {
                 libsql::params![repo_key.as_str(), commit],
             )
             .await
-            .context("read exact result for claimed status")?;
+            .context("read claimed exact result")?;
         let Some(row) = rows.next().await? else {
             tx.rollback().await.ok();
             return Ok(false);
         };
-        let mut info: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
-            .context("decode exact result for claimed status")?;
+        let mut result: crate::RefInfo =
+            serde_json::from_str(&row.get::<String>(0)?).context("decode claimed exact result")?;
         drop(rows);
-        if allow_settled_failure
-            && info.build_status.is_none()
-            && info.full_clonepack.commit == commit
-            && !info.full_clonepack.manifest.is_empty()
-        {
-            tx.rollback().await.ok();
-            return Ok(false);
-        }
-        info.build_status = Some(status.to_string());
-        let data = serde_json::to_string(&info).context("encode claimed status")?;
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        result.head = Some(head);
+        let data = serde_json::to_string(&result).context("encode claimed Head result")?;
         tx.execute(
             "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
             libsql::params![data, repo_key, commit],
         )
         .await
-        .context("write claimed status")?;
-        tx.commit().await.context("commit claimed status write")?;
+        .context("write claimed Head result")?;
+        tx.commit().await.context("commit claimed Head result")?;
+        Ok(true)
+    }
+
+    pub async fn publish_full_for_claim(
+        &self,
+        job_id: i64,
+        worker_id: &str,
+        repo_id: &crate::provider::RepoId,
+        commit: &str,
+        full: crate::FullResult,
+    ) -> Result<bool> {
+        crate::validation::validate_object_id(commit).context("validate claimed Full commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Full,
+                &full.clonepack,
+            ),
+            "invalid claimed Full result for {commit}"
+        );
+        let connection = self
+            .database
+            .connect()
+            .context("connect for claimed Full write")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .context("begin claimed Full write")?;
+        if !claim_authorizes(&tx, job_id, worker_id, repo_id, commit).await? {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        let repo_key = repo_id.storage_key();
+        let mut rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), commit],
+            )
+            .await
+            .context("read exact result for claimed Full")?;
+        let Some(row) = rows.next().await? else {
+            tx.rollback().await.ok();
+            return Ok(false);
+        };
+        let mut result: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
+            .context("decode exact result for claimed Full")?;
+        drop(rows);
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        if !crate::exact_output_ready(&result, crate::ExactResultKind::Full, commit) {
+            result.full = Some(full);
+            let data = serde_json::to_string(&result).context("encode claimed Full")?;
+            tx.execute(
+                "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
+                libsql::params![data, repo_key, commit],
+            )
+            .await
+            .context("write claimed Full")?;
+        }
+        tx.commit().await.context("commit claimed Full write")?;
+        Ok(true)
+    }
+
+    pub async fn publish_files_for_claim(
+        &self,
+        job_id: i64,
+        worker_id: &str,
+        repo_id: &crate::provider::RepoId,
+        commit: &str,
+        files: crate::FilesResult,
+    ) -> Result<bool> {
+        crate::validation::validate_object_id(commit).context("validate claimed Files commit")?;
+        anyhow::ensure!(
+            crate::exact_output_artifacts_ready(
+                commit,
+                crate::ExactResultKind::Files,
+                &files.clonepack,
+            ),
+            "invalid claimed Files result for {commit}"
+        );
+        let connection = self
+            .database
+            .connect()
+            .context("connect for claimed Files write")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .context("begin claimed Files write")?;
+        if !claim_authorizes(&tx, job_id, worker_id, repo_id, commit).await? {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        let repo_key = repo_id.storage_key();
+        let mut rows = tx
+            .query(
+                "SELECT data FROM results WHERE repo_key = ?1 AND commit_id = ?2",
+                libsql::params![repo_key.as_str(), commit],
+            )
+            .await
+            .context("read exact result for claimed Files")?;
+        let Some(row) = rows.next().await? else {
+            tx.rollback().await.ok();
+            return Ok(false);
+        };
+        let mut result: crate::RefInfo = serde_json::from_str(&row.get::<String>(0)?)
+            .context("decode exact result for claimed Files")?;
+        drop(rows);
+        anyhow::ensure!(
+            result.commit == commit,
+            "stored exact result identity mismatch"
+        );
+        if !crate::exact_output_ready(&result, crate::ExactResultKind::Files, commit) {
+            result.files = Some(files);
+            let data = serde_json::to_string(&result).context("encode claimed Files")?;
+            tx.execute(
+                "UPDATE results SET data = ?1 WHERE repo_key = ?2 AND commit_id = ?3",
+                libsql::params![data, repo_key, commit],
+            )
+            .await
+            .context("write claimed Files")?;
+        }
+        tx.commit().await.context("commit claimed Files write")?;
         Ok(true)
     }
 
@@ -541,29 +604,10 @@ impl ControlDb {
             None => None,
         };
         drop(rows);
-        let result_ready = existing.as_ref().is_some_and(|info| {
-            info.commit == job.admitted_commit
-                && info.full_clonepack.commit == job.admitted_commit
-                && !info.full_clonepack.manifest.is_empty()
-                && !info.full_clonepack.metadata_chunk.is_empty()
-                && !info.full_clonepack.idx_bundle.is_empty()
-                && info.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-                && info.build_status.is_none()
-        });
-        // A failed Files-only completion has already consumed its queue retry
-        // budget. Coalesce subsequent polls instead of creating a fresh job
-        // whose attempts start at zero. The usable Full metadata remains
-        // available to the caller either way.
-        let files_completion_failed = existing.as_ref().is_some_and(|info| {
-            info.commit == job.admitted_commit
-                && info.full_clonepack.commit == job.admitted_commit
-                && !info.full_clonepack.manifest.is_empty()
-                && info
-                    .build_status
-                    .as_deref()
-                    .is_some_and(|status| status.starts_with("files failed: "))
-        });
-        if result_ready || active_job_id.is_some() || files_completion_failed {
+        let all_results_ready = existing
+            .as_ref()
+            .is_some_and(|result| crate::exact_result_complete(result, &job.admitted_commit));
+        if all_results_ready || active_job_id.is_some() {
             tx.commit()
                 .await
                 .context("commit coalesced exact admission")?;
@@ -635,7 +679,6 @@ async fn claim_authorizes(
     worker_id: &str,
     repo_id: &crate::provider::RepoId,
     commit: &str,
-    allow_settled_failure: bool,
 ) -> Result<bool> {
     let mut rows = tx
         .query(
@@ -652,28 +695,11 @@ async fn claim_authorizes(
     let path = row.get::<String>(1)?;
     let admitted_commit = row.get::<String>(2)?;
     let status = row.get::<String>(3)?;
-    let key = row.get::<String>(4)?;
+    let _key = row.get::<String>(4)?;
     drop(rows);
     let identity_matches =
         provider == repo_id.provider.as_str() && path == repo_id.path && admitted_commit == commit;
-    if !identity_matches || (status != "claimed" && !(allow_settled_failure && status == "failed"))
-    {
-        return Ok(false);
-    }
-    if status == "failed" {
-        let mut newer = tx
-            .query(
-                "SELECT 1 FROM jobs WHERE key = ?1 AND id != ?2
-                 AND status IN ('queued', 'claimed') LIMIT 1",
-                libsql::params![key, job_id],
-            )
-            .await
-            .context("check newer active attempt before terminal status")?;
-        if newer.next().await?.is_some() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(identity_matches && status == "claimed")
 }
 
 async fn insert_exact_result(
@@ -905,7 +931,20 @@ mod tests {
     fn pending(commit: &str) -> crate::RefInfo {
         crate::RefInfo {
             commit: commit.to_string(),
-            build_status: Some("queued".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn ready_artifacts(commit: &str, label: &str) -> crate::ClonepackArtifacts {
+        let hash = |suffix: &str| crate::cas::hash(format!("{label}-{suffix}").as_bytes());
+        crate::ClonepackArtifacts {
+            manifest: hash("manifest"),
+            metadata_chunk: hash("metadata"),
+            skeleton_pack: hash("skeleton-pack"),
+            skeleton_idx: hash("skeleton-idx"),
+            prebuilt_index: hash("index"),
+            idx_bundle: hash("idx-bundle"),
+            commit: commit.to_string(),
             ..Default::default()
         }
     }
@@ -1111,6 +1150,150 @@ mod tests {
                 .unwrap()
                 .commit,
             commit
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_job_cannot_overwrite_any_ready_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
+            .await
+            .unwrap();
+        let commit = "5555555555555555555555555555555555555555";
+        let repo_id = job(commit, "main").repo_id;
+        let first_id = control
+            .admit_exact_and_job(&job(commit, "main"), &pending(commit))
+            .await
+            .unwrap()
+            .job_id
+            .unwrap();
+        let first = control.queue().claim("first-owner").await.unwrap().unwrap();
+        assert_eq!(first.id, first_id);
+        let head = crate::HeadResult {
+            clonepack: ready_artifacts(commit, "ready-head"),
+            ..Default::default()
+        };
+        assert!(
+            control
+                .publish_head_for_claim(first.id, "first-owner", &repo_id, commit, head.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            control
+                .queue()
+                .ack(
+                    first.id,
+                    "first-owner",
+                    Err(crate::queue::BuildError::permanent("stopped")),
+                )
+                .await
+                .unwrap()
+        );
+
+        let second_id = control
+            .admit_exact_and_job(&job(commit, "main"), &pending(commit))
+            .await
+            .unwrap()
+            .job_id
+            .unwrap();
+        let second = control
+            .queue()
+            .claim("second-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id, second_id);
+        let full = crate::FullResult {
+            clonepack: ready_artifacts(commit, "ready-full"),
+            ..Default::default()
+        };
+        let files = crate::FilesResult {
+            clonepack: ready_artifacts(commit, "ready-files"),
+            ..Default::default()
+        };
+        assert!(
+            control
+                .publish_full_for_claim(second.id, "second-owner", &repo_id, commit, full.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            control
+                .publish_files_for_claim(
+                    second.id,
+                    "second-owner",
+                    &repo_id,
+                    commit,
+                    files.clone(),
+                )
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            !control
+                .publish_head_for_claim(
+                    first.id,
+                    "first-owner",
+                    &repo_id,
+                    commit,
+                    crate::HeadResult {
+                        clonepack: ready_artifacts(commit, "stale-head"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !control
+                .publish_full_for_claim(
+                    first.id,
+                    "first-owner",
+                    &repo_id,
+                    commit,
+                    crate::FullResult {
+                        clonepack: ready_artifacts(commit, "stale-full"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !control
+                .publish_files_for_claim(
+                    first.id,
+                    "first-owner",
+                    &repo_id,
+                    commit,
+                    crate::FilesResult {
+                        clonepack: ready_artifacts(commit, "stale-files"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        let stored = control
+            .ref_store()
+            .load_result(&repo_id, commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.head.unwrap().clonepack.manifest,
+            head.clonepack.manifest
+        );
+        assert_eq!(
+            stored.full.unwrap().clonepack.manifest,
+            full.clonepack.manifest
+        );
+        assert_eq!(
+            stored.files.unwrap().clonepack.manifest,
+            files.clonepack.manifest
         );
     }
 

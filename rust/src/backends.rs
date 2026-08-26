@@ -8,7 +8,7 @@ use crate::cas::Cas;
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::ref_store::RefStore;
-use crate::retention::Retention;
+use crate::retention::LocalCacheRetention;
 use crate::storage::{S3Storage, StorageRef, local};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ pub struct Backends {
     pub cas: Cas,
     pub storage: StorageRef,
     pub ref_store: Arc<dyn RefStore>,
-    pub retention: Arc<Retention>,
+    pub cache_retention: LocalCacheRetention,
     pub repo_root: PathBuf,
 }
 
@@ -40,7 +40,7 @@ impl Backends {
             S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
         let storage: StorageRef = if let Some(s3) = s3_storage {
             info!(
-                "using S3-compatible storage with local cache at {}",
+                "using S3-compatible storage with build CAS at {}",
                 cas_dir.display()
             );
             Arc::new(s3)
@@ -48,21 +48,13 @@ impl Backends {
             info!("using local storage at {}", cas_dir.display());
             local(cas_dir)?
         };
-        let retention = Arc::new(
-            Retention::with_config_and_storage(
-                cas.clone(),
-                metrics.clone(),
-                Retention::parse_age(),
-                Retention::parse_size(),
-                Some(storage.clone()),
-            )?
-            .with_ref_store(ref_store.clone(), storage.clone()),
-        );
+        let cache_retention =
+            LocalCacheRetention::from_env(cas.clone(), metrics.clone(), storage.clone());
         Ok(Self {
             cas,
             storage,
             ref_store,
-            retention,
+            cache_retention,
             repo_root: repo_root.to_path_buf(),
         })
     }

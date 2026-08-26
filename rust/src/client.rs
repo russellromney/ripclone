@@ -1,3 +1,4 @@
+use crate::ExactResultKind;
 use crate::bench::Benchmark;
 use crate::cas::{Cas, hash as cas_hash};
 use crate::clonepack::{
@@ -343,10 +344,7 @@ pub struct RefResponse {
     /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
     #[serde(default)]
     pub idx_bundle_url: Option<String>,
-    /// True when the returned clonepack is a shallow (depth=1) snapshot.
-    pub shallow: bool,
-    /// True once the full clonepack's archive is built (files mode can clone).
-    pub archive_ready: bool,
+    pub result: ExactResultKind,
     /// The hosted server's per-clone id, captured from the `X-Ripclone-Clone-Id`
     /// response header (not part of the JSON body). `None` when the server does
     /// not mint one; in that case the post-clone metrics report is skipped.
@@ -950,7 +948,7 @@ pub struct CloneOutcome {
     pub owner: String,
     pub name: String,
     pub commit: String,
-    /// `files` | `depth1` | `full`.
+    /// `head` | `full` | `files`.
     pub mode: &'static str,
     /// True when the resolve had to poll a cold build (202) before succeeding.
     pub cold: bool,
@@ -1357,15 +1355,15 @@ impl Client {
 
 impl Client {
     pub async fn resolve_ref(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
-        self.resolve_ref_with_clonepack(repo_path, branch, None, None)
+        self.resolve_exact_result(repo_path, branch, ExactResultKind::Full, None)
             .await
     }
 
-    pub async fn resolve_ref_with_clonepack(
+    pub async fn resolve_exact_result(
         &self,
         repo_path: &str,
         branch: &str,
-        clonepack: Option<&str>,
+        result: ExactResultKind,
         rev: Option<&str>,
     ) -> Result<RefResponse> {
         let expected_commit = exact_commit_from_revision(rev);
@@ -1377,12 +1375,12 @@ impl Client {
             .resolve_ref_for_operation(
                 repo_path,
                 branch,
-                clonepack,
+                result,
                 rev,
                 expected_commit.as_deref(),
                 &mut pinned,
                 &mut resolved_branch,
-                clonepack.unwrap_or("full"),
+                &result.to_string(),
                 false,
                 &mut clone_id,
                 &mut cold,
@@ -1398,7 +1396,7 @@ impl Client {
         &self,
         repo_path: &str,
         branch: &str,
-        clonepack: Option<&str>,
+        result: ExactResultKind,
         rev: Option<&str>,
         expected_commit: Option<&str>,
         pinned: &mut Option<String>,
@@ -1415,6 +1413,7 @@ impl Client {
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
+            let request_was_pinned = pinned.is_some();
             let requested_top_up = allow_top_up && pinned.is_some() && rev.is_none();
             let request_branch = if pinned.is_some() {
                 resolved_branch
@@ -1431,9 +1430,7 @@ impl Client {
             let encoded_branch = urlencoding::encode(request_branch);
             let mut url = self.repo_url(repo_path, &format!("/refs/{encoded_branch}"));
             let mut q: Vec<String> = Vec::new();
-            if let Some(kind) = clonepack {
-                q.push(format!("clonepack={kind}"));
-            }
+            q.push(format!("result={result}"));
             if let Some(commit) = pinned.as_deref() {
                 q.push(format!("pinned={commit}"));
                 if requested_top_up {
@@ -1535,7 +1532,9 @@ impl Client {
                             base_response.branch
                         );
                     }
-                    if base_response.shallow || base_response.clonepack_manifest.is_empty() {
+                    if base_response.result != ExactResultKind::Full
+                        || base_response.clonepack_manifest.is_empty()
+                    {
                         anyhow::bail!(
                             "invalid top-up plan for pinned commit {target}: base is not a complete Full artifact"
                         );
@@ -1607,6 +1606,13 @@ impl Client {
                             });
                         }
                     };
+                if request_was_pinned && let Some(unavailable) = unavailable.as_ref() {
+                    anyhow::bail!(
+                        "ref lookup for pinned commit {} failed: {}",
+                        unavailable.commit,
+                        unavailable.error
+                    );
+                }
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
@@ -1650,6 +1656,11 @@ impl Client {
                     "ready",
                     repo_path,
                 )?;
+                anyhow::ensure!(
+                    info.result == result,
+                    "ref result mismatch for {repo_path}: requested {result}, server returned {}",
+                    info.result
+                );
                 *pinned = Some(info.commit.clone());
                 *resolved_branch = Some(info.branch.clone());
                 *cold |= polled;
@@ -2016,7 +2027,7 @@ impl Client {
             .resolve_ref_for_operation(
                 repo_path,
                 &admission.branch,
-                Some("full"),
+                ExactResultKind::Full,
                 None,
                 None,
                 &mut pinned,
@@ -2258,25 +2269,28 @@ impl Client {
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
-        // `files` | `depth1` | `full`, derived from the mode and requested
-        // clonepack variant (depth=1 ⇒ "shallow").
-        let metric_mode: &'static str = if mode.needs_archive() {
-            "files"
+        let result = if mode.needs_archive() {
+            ExactResultKind::Files
         } else if clonepack == Some("shallow") {
-            "depth1"
+            ExactResultKind::Head
         } else {
-            "full"
+            ExactResultKind::Full
+        };
+        let metric_mode = match result {
+            ExactResultKind::Head => "head",
+            ExactResultKind::Full => "full",
+            ExactResultKind::Files => "files",
         };
         // 1. Resolve the moving selector once. A pending or ready response
         // establishes `identity.pinned`; every later poll and retry uses the
         // metadata-only pinned query.
         let allow_top_up =
-            rev.is_none() && mode == CloneMode::Editable && clonepack.unwrap_or("full") == "full";
+            rev.is_none() && mode == CloneMode::Editable && result == ExactResultKind::Full;
         let plan = self
             .resolve_ref_for_operation(
                 repo_path,
                 branch,
-                clonepack,
+                result,
                 rev,
                 expected_commit.as_deref(),
                 &mut identity.pinned,
@@ -2288,7 +2302,7 @@ impl Client {
             )
             .await?;
         bench.mark_resolve();
-        let (plan_target, artifact, mut info, top_up) = plan.into_parts();
+        let (plan_target, artifact, info, top_up) = plan.into_parts();
         let pinned = identity
             .pinned
             .clone()
@@ -2316,48 +2330,6 @@ impl Client {
             if top_up { "base" } else { "exact" },
             &artifact[..7]
         );
-
-        // Files mode needs the zstd archive. The server publishes an editable
-        // clonepack first and adds the archive a moment later, so wait for it
-        // (editable clones don't need it and skip this). Waiting here means the
-        // archive is being built on demand — a cold build — which the
-        // ref-resolve 202 poll above doesn't capture for files mode, so record
-        // it for the metrics label.
-        if mode.needs_archive() && !info.archive_ready {
-            identity.cold = true;
-            let (max, poll_delay) = ref_poll_config();
-            for _ in 0..max {
-                tokio::time::sleep(poll_delay).await;
-                info = match self
-                    .resolve_ref_for_operation(
-                        repo_path,
-                        branch,
-                        clonepack,
-                        rev,
-                        expected_commit.as_deref(),
-                        &mut identity.pinned,
-                        &mut identity.resolved_branch,
-                        metric_mode,
-                        false,
-                        &mut identity.clone_id,
-                        &mut identity.cold,
-                    )
-                    .await?
-                {
-                    InstallPlan::Exact { response, .. } => response,
-                    InstallPlan::TopUp { .. } => unreachable!("files mode does not request top-up"),
-                };
-                if info.archive_ready {
-                    break;
-                }
-            }
-            if !info.archive_ready {
-                return Err(anyhow::Error::new(ArtifactPending {
-                    commit: pinned.clone(),
-                    mode: metric_mode.to_string(),
-                }));
-            }
-        }
 
         if info.clonepack_manifest.is_empty() {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
@@ -2529,7 +2501,7 @@ impl Client {
                 std::fs::write(branch_ref, format!("{}\n", info.commit))?;
             }
             std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
-            if info.shallow {
+            if info.result == ExactResultKind::Head {
                 // Mark HEAD as a shallow boundary so git does not try to traverse
                 // missing parents.
                 std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
@@ -3749,7 +3721,7 @@ impl Client {
             std::fs::write(branch_ref, format!("{}\n", info.commit))?;
         }
         std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
-        if info.shallow {
+        if info.result == ExactResultKind::Head {
             std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
         }
 
