@@ -30,13 +30,15 @@ use tokio::sync::oneshot;
 /// bounds is how long a genuine failure takes to report.
 const OVERLAP_DEADLINE: Duration = Duration::from_secs(60);
 
+type ArtifactRequestLog = Arc<StdMutex<Vec<(String, Option<String>)>>>;
+
 /// An [`ArtifactBarrier`] whose target hash is chosen after the repo is built.
 struct HashBarrier {
     slot: Arc<StdMutex<Option<String>>>,
     entered: oneshot::Receiver<()>,
     proceed: oneshot::Sender<()>,
     range_requests: Arc<StdMutex<Vec<String>>>,
-    artifact_requests: Arc<StdMutex<Vec<(String, Option<String>)>>>,
+    artifact_requests: ArtifactRequestLog,
     max_chunk_sent: Arc<std::sync::atomic::AtomicUsize>,
 }
 
