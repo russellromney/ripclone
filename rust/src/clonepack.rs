@@ -8,7 +8,6 @@ pub use pb::{
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use std::path::Path;
 
 impl FileEntry {
     /// Total uncompressed size of the file across all fragments.
@@ -94,38 +93,6 @@ pub fn manifest_pack_idx_bytes(
         anyhow::bail!("idx {index} bundle slice hash mismatch: expected {want}, got {got}");
     }
     Ok(slice)
-}
-
-/// Install manifest pack/idx bytes into a git objects/pack directory.
-///
-/// Git pack file names are derived from the pack trailer hash, matching the
-/// existing client reconstruction path and letting a later `git fetch` negotiate
-/// against the seeded object database as an ordinary local mirror.
-pub fn install_manifest_pack_bytes<I>(pack_dir: &Path, packs: I) -> Result<u64>
-where
-    I: IntoIterator<Item = (Bytes, Bytes)>,
-{
-    std::fs::create_dir_all(pack_dir)
-        .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
-
-    let mut total = 0u64;
-    for (pack_bytes, idx_bytes) in packs {
-        if pack_bytes.len() < 20 {
-            anyhow::bail!("pack too short ({} bytes)", pack_bytes.len());
-        }
-        let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-        std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), &pack_bytes)
-            .with_context(|| format!("write pack {}", name))?;
-        std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
-            .with_context(|| format!("write idx {}", name))?;
-        let pack_len = u64::try_from(pack_bytes.len()).context("pack length overflows u64")?;
-        let idx_len = u64::try_from(idx_bytes.len()).context("idx length overflows u64")?;
-        total = total
-            .checked_add(pack_len)
-            .and_then(|total| total.checked_add(idx_len))
-            .context("installed pack byte total overflow")?;
-    }
-    Ok(total)
 }
 
 /// Collect the distinct clonepack manifest hashes referenced by a `RefInfo`.

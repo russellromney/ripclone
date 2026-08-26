@@ -23,10 +23,6 @@ name = "ripclone-proxy"
 path = "src/bin/ripclone-proxy.rs"
 
 [[bin]]
-name = "git-remote-ripclone"
-path = "src/bin/git-remote-ripclone.rs"
-
-[[bin]]
 name = "writer_bench"
 path = "src/bin/writer_bench.rs"
 

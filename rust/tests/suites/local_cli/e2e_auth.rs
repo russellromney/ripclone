@@ -283,6 +283,9 @@ async fn expired_bearer_token_fails_clone_cleanly() {
         entered: Arc::new(std::sync::Mutex::new(Some(entered_tx))),
         proceed: Arc::new(std::sync::Mutex::new(Some(proceed_rx))),
         close_on_proceed: true,
+        range_behavior: ripclone::server::ArtifactRangeBehavior::Normal,
+        range_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        max_chunk_sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         consumed: Arc::new(AtomicBool::new(false)),
     };
     let server = start_server_with_barrier(barrier).await;

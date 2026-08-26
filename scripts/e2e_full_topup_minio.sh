@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MINIO_IMAGE="minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
 CONTAINER="ripclone-topup-minio-$$"
 BUCKET="ripclone-topup-$$"
-TEST_NAME="minio_signed_base_stale_url_refresh_remains_pinned_to_b"
+TEST_NAME="minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes"
 
 : "${RIPCLONE_BIN_DIR:?RIPCLONE_BIN_DIR must name the release binary directory}"
 test -x "$RIPCLONE_BIN_DIR/ripclone" || {

@@ -16,11 +16,11 @@ use crate::common;
 
 use common::*;
 use ripclone::mode::CloneMode;
-use ripclone::server::{ArtifactBarrier, BarrierTarget};
+use ripclone::server::{ArtifactBarrier, ArtifactRangeBehavior, BarrierTarget};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -35,18 +35,33 @@ struct HashBarrier {
     slot: Arc<StdMutex<Option<String>>>,
     entered: oneshot::Receiver<()>,
     proceed: oneshot::Sender<()>,
+    range_requests: Arc<StdMutex<Vec<String>>>,
+    max_chunk_sent: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn hash_barrier(after_bytes: usize) -> (ArtifactBarrier, HashBarrier) {
+    hash_barrier_with_behavior(after_bytes, false, ArtifactRangeBehavior::Normal)
+}
+
+fn hash_barrier_with_behavior(
+    after_bytes: usize,
+    close_on_proceed: bool,
+    range_behavior: ArtifactRangeBehavior,
+) -> (ArtifactBarrier, HashBarrier) {
     let (entered_tx, entered_rx) = oneshot::channel();
     let (proceed_tx, proceed_rx) = oneshot::channel();
     let slot = Arc::new(StdMutex::new(None));
+    let range_requests = Arc::new(StdMutex::new(Vec::new()));
+    let max_chunk_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let barrier = ArtifactBarrier {
         after_bytes,
         target: BarrierTarget::Hash(Arc::clone(&slot)),
         entered: Arc::new(StdMutex::new(Some(entered_tx))),
         proceed: Arc::new(StdMutex::new(Some(proceed_rx))),
-        close_on_proceed: false,
+        close_on_proceed,
+        range_behavior,
+        range_requests: Arc::clone(&range_requests),
+        max_chunk_sent: Arc::clone(&max_chunk_sent),
         consumed: Arc::new(AtomicBool::new(false)),
     };
     (
@@ -55,6 +70,8 @@ fn hash_barrier(after_bytes: usize) -> (ArtifactBarrier, HashBarrier) {
             slot,
             entered: entered_rx,
             proceed: proceed_tx,
+            range_requests,
+            max_chunk_sent,
         },
     )
 }
@@ -414,6 +431,198 @@ async fn editable_history_pack_streams_to_one_temp_file_then_is_renamed() {
         "every pack is installed exactly once: {installed:?}"
     );
     assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "3");
+}
+
+async fn prepare_resumable_history_fixture(
+    server: &Server,
+    repo: &str,
+    control: &HashBarrier,
+) -> (String, u64) {
+    let origin = make_origin("acme", repo);
+    let c1 = noisy(101, 384 * 1024);
+    let c2 = noisy(103, 384 * 1024);
+    let c3 = noisy(107, 384 * 1024);
+    origin.commit(&[("large.txt", c1.as_str())], "c1");
+    origin.commit(&[("large.txt", c2.as_str())], "c2");
+    origin.commit(&[("large.txt", c3.as_str())], "c3");
+    origin.publish();
+
+    let info = sync_until_full_ready(server, "acme", repo).await;
+    let (manifest, _) = server
+        .client()
+        .fetch_clonepack(&info)
+        .await
+        .expect("fetch resumable fixture manifest");
+    let history = manifest
+        .packs
+        .iter()
+        .find(|pack| pack.history_only)
+        .and_then(|pack| pack.pack.as_ref())
+        .expect("fixture publishes a history-only pack");
+    let hash = ripclone::clonepack::hash_to_hex(&history.hash);
+    assert!(
+        history.len > 64 * 1024,
+        "history pack must exceed the interruption boundary: {}",
+        history.len
+    );
+    control.arm(&hash);
+    (hash, history.len)
+}
+
+/// A real local-storage response closes after persisted bytes. The next request
+/// must start at that exact count and the final verified pack must install with
+/// a complete, fsck-clean checkout.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_history_pack_interruption_resumes_from_the_saved_byte_count() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::Normal);
+    let server = start_server_with_barrier(barrier).await;
+    let (_hash, _len) = prepare_resumable_history_fixture(&server, "resume-local", &control).await;
+
+    let out = tempfile::tempdir().expect("clone output");
+    let target = out.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/resume-local",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    control
+        .entered
+        .await
+        .expect("history response reached interruption boundary");
+    control.proceed.send(()).expect("close initial response");
+    let outcome = clone
+        .await
+        .expect("clone task joined")
+        .expect("resumed local clone succeeds");
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), outcome.commit);
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
+    assert_eq!(
+        *control
+            .range_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        vec!["bytes=65536-"],
+        "the retry must start at the exact persisted byte count"
+    );
+    assert!(
+        control.max_chunk_sent.load(Ordering::SeqCst) <= 64 * 1024,
+        "local server chunks must stay bounded independently of artifact size"
+    );
+}
+
+/// A server that ignores Range must make the client truncate and restart only
+/// the interrupted history pack. The operation remains in its original staging
+/// tree and still publishes a correct checkout.
+#[tokio::test(flavor = "multi_thread")]
+async fn range_unsupported_restarts_only_the_failed_history_pack() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::Ignore);
+    let server = start_server_with_barrier(barrier).await;
+    prepare_resumable_history_fixture(&server, "resume-ignore-range", &control).await;
+
+    let out = tempfile::tempdir().expect("clone output");
+    let target = out.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/resume-ignore-range",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    control.entered.await.expect("initial response interrupted");
+    control.proceed.send(()).expect("close initial response");
+    clone
+        .await
+        .expect("clone task joined")
+        .expect("ignored Range falls back to one-artifact restart");
+    assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "3");
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
+    assert_eq!(
+        control
+            .range_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_slice(),
+        ["bytes=65536-"]
+    );
+}
+
+/// A 206 response is accepted only when its Content-Range begins at the exact
+/// saved byte count and names the manifest length. Invalid range metadata is a
+/// permanent integrity failure and private staging is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_content_range_fails_without_publishing_or_looping() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::InvalidContentRange);
+    let server = start_server_with_barrier(barrier).await;
+    prepare_resumable_history_fixture(&server, "resume-bad-range", &control).await;
+
+    let out = tempfile::tempdir().expect("clone output");
+    let target = out.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/resume-bad-range",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    control.entered.await.expect("initial response interrupted");
+    control.proceed.send(()).expect("close initial response");
+    let error = clone
+        .await
+        .expect("clone task joined")
+        .expect_err("invalid Content-Range must fail");
+    assert!(
+        format!("{error:#}").contains("invalid Content-Range"),
+        "unexpected error: {error:#}"
+    );
+    assert!(!target.exists(), "failed clone must publish no target");
+    assert!(
+        std::fs::read_dir(out.path())
+            .expect("read clone parent")
+            .next()
+            .is_none(),
+        "failed clone must remove private staging"
+    );
+    assert_eq!(
+        control
+            .range_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len(),
+        1,
+        "invalid range metadata is permanent, not an endless retry"
+    );
 }
 
 /// A transient 503 on artifact GETs must be retried on the same URL and the

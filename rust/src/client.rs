@@ -2,8 +2,7 @@ use crate::ExactResultKind;
 use crate::bench::Benchmark;
 use crate::cas::{Cas, hash as cas_hash};
 use crate::clonepack::{
-    ChunkRef, ClonepackManifest, MetadataChunk, PackEntry, hash_to_hex,
-    install_manifest_pack_bytes, manifest_pack_idx_bytes,
+    ChunkRef, ClonepackManifest, MetadataChunk, PackEntry, hash_to_hex, manifest_pack_idx_bytes,
 };
 use crate::extract::extract_archive_from_chunk_receiver;
 use crate::mode::CloneMode;
@@ -200,22 +199,15 @@ fn validate_manifest_commit(manifest: &ClonepackManifest, pinned: &str) -> Resul
     Ok(())
 }
 
-/// A presigned artifact URL was rejected with 401 or 403 (most likely expired
-/// mid-clone). The bytes are served ONLY by the signed URLs in the ref response
-/// — the hosted server no longer serves content by bare hash — so the right
-/// recovery is to re-resolve the ref for fresh URLs and retry, which also
-/// re-runs the server's access check. Surfaced as a typed error so the clone
-/// driver can detect it. A missing object, wrong length, or wrong hash is NOT
-/// this error: those fail the clone instead of entering the refresh loop.
+/// A presigned URL for a buffered artifact was rejected with 401 or 403.
+/// Streamed history packs refresh their own URL in place; this error remains for
+/// small buffered artifacts, which fail without restarting the clone.
 #[derive(Debug)]
 pub struct StaleSignedUrl;
 
 impl std::fmt::Display for StaleSignedUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "a presigned artifact URL failed (likely expired); re-resolve the ref for fresh URLs"
-        )
+        write!(f, "a presigned artifact URL failed (likely expired)")
     }
 }
 
@@ -224,14 +216,6 @@ impl std::error::Error for StaleSignedUrl {}
 /// True if `err` (or any cause in its chain) is a [`StaleSignedUrl`].
 pub fn is_stale_signed_url(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<StaleSignedUrl>())
-}
-
-/// The clone driver's retry decision, factored out so it is unit-testable: retry
-/// the next attempt only when this one failed with a stale signed URL and we are
-/// still under `max_retries`. `attempt` is the number of retries already taken
-/// (0 on the first failure).
-pub fn should_retry_stale(attempt: u32, max_retries: u32, err: &anyhow::Error) -> bool {
-    attempt < max_retries && is_stale_signed_url(err)
 }
 
 /// The innermost cause of a reqwest transport error — e.g. "Connection refused
@@ -355,6 +339,24 @@ pub struct RefResponse {
     /// JSON body.
     #[serde(skip)]
     pub cold: bool,
+}
+
+/// Immutable identity used when one streamed artifact needs a fresh signed
+/// URL. This is operation-local and contains no durable clone state: every
+/// refresh asks the existing ref endpoint for the exact target already pinned
+/// by the initial response.
+#[derive(Clone)]
+struct PinnedArtifactRefresh {
+    repo_path: String,
+    request_branch: String,
+    checkout_branch: String,
+    rev: Option<String>,
+    result: ExactResultKind,
+    target: String,
+    artifact: String,
+    top_up: bool,
+    manifest: String,
+    metadata: String,
 }
 
 fn ref_poll_config() -> (usize, std::time::Duration) {
@@ -484,12 +486,6 @@ fn record_test_managed_git(command: &str, elapsed: Duration) -> Result<()> {
         elapsed.as_micros()
     )
     .context("record managed top-up Git timing")
-}
-
-pub(crate) fn head_blobs_chunk_refs(
-    clonepack: &ClonepackManifest,
-) -> Vec<crate::clonepack::ChunkRef> {
-    clonepack.head_blobs_chunks.clone()
 }
 
 /// `(max_attempts, base_backoff_ms)` for artifact downloads, from the
@@ -685,6 +681,7 @@ async fn fetch_artifact_bytes(
     signed: bool,
 ) -> Result<bytes::Bytes> {
     with_fetch_retry(hash, "fetch", || async {
+        record_test_download_request(hash, 0, signed, url);
         let resp = client.get(url).send().await.map_err(|e| {
             // Transport errors (connect/reset/timeout) are transient.
             FetchFailure::Retry(anyhow::anyhow!("artifact fetch transport error: {e}"))
@@ -711,59 +708,271 @@ async fn fetch_artifact_bytes(
     .await
 }
 
-/// Download an artifact straight to a temporary file in `dir`, hashing as the
-/// body streams. Used for large packs whose bytes must never be held in memory;
-/// the caller renames the verified file into place, so a failed attempt leaves
-/// nothing behind when the handle drops.
+fn validate_content_range(
+    value: Option<&reqwest::header::HeaderValue>,
+    offset: u64,
+    expected_len: u64,
+) -> Result<()> {
+    let value = value
+        .context("resumed artifact response omitted Content-Range")?
+        .to_str()
+        .context("resumed artifact response has non-text Content-Range")?;
+    let value = value
+        .strip_prefix("bytes ")
+        .context("resumed artifact response has invalid Content-Range unit")?;
+    let (bounds, total) = value
+        .split_once('/')
+        .context("resumed artifact response has malformed Content-Range")?;
+    let (start, end) = bounds
+        .split_once('-')
+        .context("resumed artifact response has malformed Content-Range bounds")?;
+    let start = start
+        .parse::<u64>()
+        .context("resumed artifact Content-Range start is not a number")?;
+    let end = end
+        .parse::<u64>()
+        .context("resumed artifact Content-Range end is not a number")?;
+    let total = total
+        .parse::<u64>()
+        .context("resumed artifact Content-Range total is not a number")?;
+    anyhow::ensure!(
+        start == offset && end == expected_len.saturating_sub(1) && total == expected_len,
+        "invalid Content-Range for resumed artifact: expected bytes {offset}-{}/{expected_len}, got {value}",
+        expected_len.saturating_sub(1)
+    );
+    Ok(())
+}
+
+fn record_test_download_request(hash: &str, offset: u64, signed: bool, url: &str) {
+    let Some(path) = std::env::var_os("RIPCLONE_TEST_DOWNLOAD_AUDIT").map(PathBuf::from) else {
+        return;
+    };
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "invalid".to_string());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "hash={hash} offset={offset} signed={signed} ripclone_authorization={}",
+            !signed
+        );
+        let _ = writeln!(file, "host={host}");
+    }
+}
+
+/// Test-fixture-only deterministic client interruption. The real response is
+/// cancelled after bytes have been persisted, then the fixture controls when
+/// the retry may proceed (for example, after a MinIO URL really expires).
+async fn wait_for_test_download_interrupt(hash: &str, saved: u64) -> Result<bool> {
+    if std::env::var_os("RIPCLONE_TESTING").is_none()
+        || std::env::var("RIPCLONE_TEST_INTERRUPT_ARTIFACT")
+            .ok()
+            .as_deref()
+            != Some(hash)
+    {
+        return Ok(false);
+    }
+    let after = std::env::var("RIPCLONE_TEST_INTERRUPT_AFTER_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1);
+    if saved < after {
+        return Ok(false);
+    }
+    let Some(dir) = std::env::var_os("RIPCLONE_TEST_INTERRUPT_DIR").map(PathBuf::from) else {
+        return Ok(false);
+    };
+    std::fs::create_dir_all(&dir).context("create download interruption fixture directory")?;
+    let entered = dir.join("entered");
+    if entered.exists() {
+        return Ok(false);
+    }
+    std::fs::write(&entered, saved.to_string())
+        .context("record interrupted download byte count")?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !dir.join("proceed").exists() {
+        if Instant::now() >= deadline {
+            anyhow::bail!("download interruption fixture exceeded 120 seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(true)
+}
+
+/// Download one large history pack into one temporary file. Connection retries
+/// append from the verified saved byte count with an open-ended Range request;
+/// a server that ignores Range restarts this artifact (and only this artifact)
+/// in the same file. The caller renames the file only after length and SHA-256
+/// verification succeed.
 async fn fetch_artifact_to_temp(
-    client: &reqwest::Client,
-    url: &str,
+    client: &Client,
+    initial_signed_url: Option<&str>,
     hash: &str,
-    expected_len: Option<u64>,
-    signed: bool,
+    expected_len: u64,
     dir: &Path,
+    refresh: &PinnedArtifactRefresh,
+    pack_index: usize,
 ) -> Result<(tempfile::NamedTempFile, u64)> {
     use futures::StreamExt;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-    with_fetch_retry(hash, "streaming fetch", || async {
-        let resp = client.get(url).send().await.map_err(|e| {
-            FetchFailure::Retry(anyhow::anyhow!("artifact fetch transport error: {e}"))
-        })?;
-        if let Some(failure) = classify_fetch_status(resp.status(), signed, hash) {
-            return Err(failure);
+    let tmp = tempfile::Builder::new()
+        .suffix(".ripclone-download")
+        .tempfile_in(dir)
+        .context("create artifact temp file")?;
+    let std_file = tmp
+        .as_file()
+        .try_clone()
+        .context("clone artifact temp file")?;
+    let mut file = tokio::fs::File::from_std(std_file);
+    let mut hasher = sha2::Sha256::new();
+    let mut saved = 0u64;
+    let mut signed_url = initial_signed_url.map(str::to_string);
+    let (max_attempts, base_backoff_ms) = fetch_retry_config();
+
+    for attempt in 1..=max_attempts {
+        if saved == expected_len {
+            let actual_hash = hex::encode(hasher.clone().finalize());
+            verify_fetched_artifact(hash, Some(expected_len), saved, &actual_hash)
+                .map_err(FetchFailure::into_error)?;
+            file.flush().await.context("flush artifact temp file")?;
+            drop(file);
+            return Ok((tmp, saved));
         }
-        let tmp = tempfile::Builder::new()
-            .suffix(".ripclone-download")
-            .tempfile_in(dir)
-            .map_err(|e| {
-                FetchFailure::Permanent(anyhow::Error::new(e).context("create artifact temp file"))
-            })?;
-        let std_file = tmp.as_file().try_clone().map_err(|e| {
-            FetchFailure::Permanent(anyhow::Error::new(e).context("clone artifact temp file"))
-        })?;
-        let mut file = tokio::fs::File::from_std(std_file);
-        let mut stream = resp.bytes_stream();
-        let mut hasher = sha2::Sha256::new();
-        let mut len = 0u64;
+        if saved > expected_len {
+            anyhow::bail!(
+                "artifact {hash} size mismatch: expected {expected_len}, got at least {saved}"
+            );
+        }
+
+        let gateway_url = format!("{}/v1/artifacts/{hash}", client.server);
+        let (http, url, signed) = client.artifact_endpoint(signed_url.as_deref(), &gateway_url);
+        record_test_download_request(hash, saved, signed, url);
+        let mut request = http.get(url);
+        if saved > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={saved}-"));
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if attempt < max_attempts {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    continue;
+                }
+                return Err(anyhow::anyhow!("artifact fetch transport error: {error}"));
+            }
+        };
+
+        if let Some(failure) = classify_fetch_status(response.status(), signed, hash) {
+            match failure {
+                FetchFailure::RefreshUrl(_) if attempt < max_attempts => {
+                    signed_url = Some(
+                        client
+                            .refresh_pinned_pack_url(refresh, pack_index)
+                            .await
+                            .with_context(|| {
+                                format!("refresh URL for interrupted artifact {hash}")
+                            })?,
+                    );
+                    continue;
+                }
+                FetchFailure::Retry(_) if attempt < max_attempts => {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    continue;
+                }
+                failure => return Err(failure.into_error()),
+            }
+        }
+
+        if saved == 0 {
+            anyhow::ensure!(
+                response.status() == reqwest::StatusCode::OK,
+                "artifact {hash} initial response had unexpected status {}",
+                response.status()
+            );
+        } else if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            validate_content_range(
+                response.headers().get(reqwest::header::CONTENT_RANGE),
+                saved,
+                expected_len,
+            )?;
+            if let Some(content_len) = response.content_length() {
+                anyhow::ensure!(
+                    content_len == expected_len - saved,
+                    "resumed artifact Content-Length mismatch: expected {}, got {content_len}",
+                    expected_len - saved
+                );
+            }
+        } else if response.status() == reqwest::StatusCode::OK {
+            // Range unsupported: restart only this artifact in its existing
+            // private temporary file.
+            file.set_len(0)
+                .await
+                .context("truncate artifact after ignored Range")?;
+            file.seek(std::io::SeekFrom::Start(0))
+                .await
+                .context("seek restarted artifact temp file")?;
+            hasher = sha2::Sha256::new();
+            saved = 0;
+        } else {
+            anyhow::bail!(
+                "artifact {hash} resume response had unexpected status {}",
+                response.status()
+            );
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut body_error = None;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                FetchFailure::Retry(anyhow::anyhow!("artifact body read error: {e}"))
-            })?;
-            hasher.update(&chunk);
-            len += chunk.len() as u64;
-            file.write_all(&chunk).await.map_err(|e| {
-                FetchFailure::Permanent(anyhow::Error::new(e).context("write artifact temp file"))
-            })?;
+            match chunk {
+                Ok(chunk) => {
+                    file.write_all(&chunk)
+                        .await
+                        .context("write artifact temp file")?;
+                    hasher.update(&chunk);
+                    saved = saved
+                        .checked_add(u64::try_from(chunk.len()).context("chunk length overflow")?)
+                        .context("artifact byte count overflow")?;
+                    if saved > expected_len {
+                        anyhow::bail!(
+                            "artifact {hash} size mismatch: expected {expected_len}, got at least {saved}"
+                        );
+                    }
+                    if wait_for_test_download_interrupt(hash, saved).await? {
+                        body_error = Some(anyhow::anyhow!(
+                            "deterministic client-side artifact interruption after {saved} bytes"
+                        ));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    body_error = Some(anyhow::anyhow!("artifact body read error: {error}"));
+                    break;
+                }
+            }
         }
-        file.flush().await.map_err(|e| {
-            FetchFailure::Permanent(anyhow::Error::new(e).context("flush artifact temp file"))
-        })?;
+        if let Some(error) = body_error {
+            if attempt < max_attempts {
+                tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                continue;
+            }
+            return Err(error);
+        }
+
+        let actual_hash = hex::encode(hasher.clone().finalize());
+        verify_fetched_artifact(hash, Some(expected_len), saved, &actual_hash)
+            .map_err(FetchFailure::into_error)?;
+        file.flush().await.context("flush artifact temp file")?;
         drop(file);
-        verify_fetched_artifact(hash, expected_len, len, &hex::encode(hasher.finalize()))?;
-        Ok((tmp, len))
-    })
-    .await
+        return Ok((tmp, saved));
+    }
+    unreachable!("positive fetch attempt count")
 }
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
@@ -873,30 +1082,9 @@ fn fsync_tree(root: &Path) -> Result<()> {
     crate::worktree_writer::fsync_paths_durable(&files, &dirs)
 }
 
-/// Mark the exact lifecycle point where a stale inner attempt has returned but
-/// cleanup still owns a live task. This is test-only and lets the subprocess
-/// proof distinguish cleanup blocking from unrelated artifact-fetch retries.
-fn mark_test_stale_attempt_cleanup(error: &anyhow::Error) {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1"))
-        || !is_stale_signed_url(error)
-    {
-        return;
-    }
-    let Some(writer_marker) = std::env::var_os("RIPCLONE_TEST_PACK_WORKER_ENTERED") else {
-        return;
-    };
-    if !std::fs::read(writer_marker).is_ok_and(|value| value == b"active") {
-        return;
-    }
-    let Some(marker) = std::env::var_os("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED") else {
-        return;
-    };
-    std::fs::write(marker, b"entered").expect("write stale-attempt cleanup test marker");
-}
-
 /// Pause one real pack-install worker after its pack and index have been
-/// written into attempt staging. This test-only barrier proves that stale-URL
-/// teardown drains already-running blocking work before starting a retry.
+/// written into attempt staging. This test-only barrier proves cancellation
+/// drains already-running blocking work before removing private staging.
 fn wait_for_test_pack_worker(pack_index: usize) -> Result<()> {
     if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return Ok(());
@@ -1124,7 +1312,7 @@ impl ManagedGitChild {
         #[cfg(unix)]
         if let Some(group) = self.process_group {
             // The child starts a fresh process group, so this also kills an
-            // HTTP remote helper or hook-like descendant before staging drops.
+            // child transport or hook-like descendant before staging drops.
             unsafe {
                 libc::kill(-group, libc::SIGKILL);
             }
@@ -1692,6 +1880,91 @@ impl Client {
         anyhow::bail!("ref lookup did not complete")
     }
 
+    /// Refresh one signed pack URL without re-running selector resolution or
+    /// restarting any other artifact. The existing pinned query is a metadata
+    /// read for `target`; it may return the same top-up base plan, but it may
+    /// never substitute a different target or artifact commit.
+    async fn refresh_pinned_pack_url(
+        &self,
+        refresh: &PinnedArtifactRefresh,
+        pack_index: usize,
+    ) -> Result<String> {
+        let encoded_branch = urlencoding::encode(&refresh.request_branch);
+        let mut url = self.repo_url(&refresh.repo_path, &format!("/refs/{encoded_branch}"));
+        url.push_str(&format!(
+            "?result={}&pinned={}",
+            refresh.result, refresh.target
+        ));
+        if refresh.top_up {
+            url.push_str("&top_up=true");
+        }
+        if let Some(rev) = refresh.rev.as_deref() {
+            url.push_str("&rev=");
+            url.push_str(&urlencoding::encode(rev));
+        }
+
+        let response = self.send(self.request(reqwest::Method::GET, &url)).await?;
+        let status = response.status();
+        let info = if refresh.top_up && status == reqwest::StatusCode::ACCEPTED {
+            let pending: ArtifactPendingResponse = response
+                .json()
+                .await
+                .context("decode pinned top-up URL refresh response")?;
+            anyhow::ensure!(
+                pending.code == "artifact_pending"
+                    && pending.status == "building"
+                    && pending.commit == refresh.target
+                    && pending.branch == refresh.checkout_branch
+                    && pending.top_up_supported == Some(true),
+                "pinned top-up URL refresh changed the operation identity"
+            );
+            pending
+                .top_up_base
+                .context("pinned top-up URL refresh omitted its base artifact")?
+        } else if status == reqwest::StatusCode::OK {
+            response
+                .json::<RefResponse>()
+                .await
+                .context("decode pinned URL refresh response")?
+        } else {
+            let authorization_failure = matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            );
+            let error = server_error("pinned artifact URL refresh failed", response).await;
+            let context = if authorization_failure {
+                format!(
+                    "refresh of pinned commit {} was not authorized",
+                    refresh.target
+                )
+            } else {
+                format!("refresh of pinned commit {} failed", refresh.target)
+            };
+            return Err(error.context(context));
+        };
+
+        validate_ref_response_identity(
+            Some(&refresh.artifact),
+            Some(&refresh.checkout_branch),
+            refresh.checkout_branch.is_empty(),
+            &info.commit,
+            &info.branch,
+            "artifact URL refresh",
+            &refresh.repo_path,
+        )?;
+        anyhow::ensure!(
+            info.result == refresh.result
+                && info.clonepack_manifest == refresh.manifest
+                && info.metadata_chunk == refresh.metadata,
+            "pinned artifact URL refresh changed the selected artifact"
+        );
+        info.pack_chunk_urls
+            .as_ref()
+            .and_then(|urls| urls.get(pack_index))
+            .and_then(|url| url.clone())
+            .with_context(|| format!("pinned artifact URL refresh omitted pack {pack_index}"))
+    }
+
     /// Fetch any content-addressed artifact (pack, idx, index, archive, manifest).
     ///
     /// Caches the bytes locally when `RIPCLONE_CACHE_DIR` is set, so repeat
@@ -1802,11 +2075,11 @@ impl Client {
         chunk: &crate::clonepack::ChunkRef,
         signed_url: Option<&str>,
         dir: &Path,
+        refresh: &PinnedArtifactRefresh,
+        pack_index: usize,
     ) -> Result<(tempfile::NamedTempFile, u64)> {
         let hash = hash_to_hex(&chunk.hash);
-        let gateway_url = format!("{}/v1/artifacts/{}", self.server, hash);
-        let (client, url, signed) = self.artifact_endpoint(signed_url, &gateway_url);
-        fetch_artifact_to_temp(client, url, &hash, Some(chunk.len), signed, dir).await
+        fetch_artifact_to_temp(self, signed_url, &hash, chunk.len, dir, refresh, pack_index).await
     }
 
     /// Fetch many chunk refs in parallel, preserving order.
@@ -2165,43 +2438,22 @@ impl Client {
         target: P,
         mode: CloneMode,
         clonepack: Option<&str>,
-        mut bench: Option<&mut Benchmark>,
+        bench: Option<&mut Benchmark>,
     ) -> Result<CloneOutcome> {
-        const STALE_URL_MAX_RETRIES: u32 = 2;
         let mut identity = InstallIdentity::default();
-        let mut stale_retries = 0u32;
-        loop {
-            let cleanup = AttemptCleanup::default();
-            let result = self
-                .install_repo_with_mode_at_attempt(
-                    repo_path,
-                    branch,
-                    rev,
-                    target.as_ref(),
-                    mode,
-                    clonepack,
-                    bench.as_deref_mut(),
-                    &mut identity,
-                    &cleanup,
-                )
-                .await;
-            match result {
-                Ok(outcome) => return Ok(outcome),
-                Err(error) if should_retry_stale(stale_retries, STALE_URL_MAX_RETRIES, &error) => {
-                    if target.as_ref().exists() {
-                        anyhow::bail!(
-                            "stale signed-URL attempt left a published target at {}",
-                            target.as_ref().display()
-                        );
-                    }
-                    stale_retries += 1;
-                    eprintln!(
-                        "ripclone: artifact URLs expired mid-clone — refreshing the pinned commit and retrying (attempt {stale_retries})…"
-                    );
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let cleanup = AttemptCleanup::default();
+        self.install_repo_with_mode_at_attempt(
+            repo_path,
+            branch,
+            rev,
+            target.as_ref(),
+            mode,
+            clonepack,
+            bench,
+            &mut identity,
+            &cleanup,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2228,9 +2480,6 @@ impl Client {
                 repo_path, branch, rev, target, mode, clonepack, bench, identity, cleanup, &staging,
             )
             .await;
-        if let Err(error) = &result {
-            mark_test_stale_attempt_cleanup(error);
-        }
         drop(close_on_drop);
         reaper.await.context("attempt cleanup task")?;
         result
@@ -2334,6 +2583,25 @@ impl Client {
         if info.clonepack_manifest.is_empty() {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
+        let artifact_refresh = PinnedArtifactRefresh {
+            repo_path: repo_path.to_string(),
+            request_branch: identity
+                .resolved_branch
+                .clone()
+                .filter(|branch| !branch.is_empty())
+                .unwrap_or_else(|| branch.to_string()),
+            checkout_branch: identity
+                .resolved_branch
+                .clone()
+                .context("ref resolution completed without a checkout branch")?,
+            rev: rev.map(str::to_string),
+            result,
+            target: pinned.clone(),
+            artifact: artifact.clone(),
+            top_up,
+            manifest: info.clonepack_manifest.clone(),
+            metadata: info.metadata_chunk.clone(),
+        };
 
         // Hand the decoded manifest to the archive downloader over a oneshot.
         // It latches the value (no lost-wakeup race) and signals manifest
@@ -2584,6 +2852,7 @@ impl Client {
                     &install_root,
                     &metadata,
                     cleanup,
+                    &artifact_refresh,
                 )
                 .await
                 .context("install editable packs")?;
@@ -2809,6 +3078,7 @@ impl Client {
         work_tree: &std::path::Path,
         metadata: &MetadataChunk,
         cleanup: &AttemptCleanup,
+        artifact_refresh: &PinnedArtifactRefresh,
     ) -> Result<u64> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -2919,6 +3189,7 @@ impl Client {
             let idx_bundle = idx_bundle.clone();
             let history_only = entry.history_only;
             let pack_dir = pack_dir.to_path_buf();
+            let artifact_refresh = artifact_refresh.clone();
             async move {
                 let pack_ref = entry
                     .pack
@@ -2928,7 +3199,13 @@ impl Client {
                 let pack_fetch_start = std::time::Instant::now();
                 let pack_body = if history_only {
                     let (file, len) = client
-                        .fetch_chunk_ref_to_temp(pack_ref, pack_url.as_deref(), &pack_dir)
+                        .fetch_chunk_ref_to_temp(
+                            pack_ref,
+                            pack_url.as_deref(),
+                            &pack_dir,
+                            &artifact_refresh,
+                            i,
+                        )
                         .await
                         .with_context(|| format!("stream history pack {}", i))?;
                     crate::perf::record_editable_pack_fetch(pack_fetch_start.elapsed(), len);
@@ -3621,173 +3898,6 @@ impl Client {
         );
         true
     }
-
-    /// Install only the `.git` objects, packs, and prebuilt index needed for
-    /// git to check out the working tree itself. Used by the git remote helper
-    /// so that `git clone`/`git fetch` can proceed normally after the helper
-    /// seeds the object database.
-    /// Install every pack referenced by `manifest.packs` into `pack_dir`. The
-    /// git remote helper acts as a first-class transport, so a `git clone
-    /// ripclone://...` must materialize the full history (not just the HEAD
-    /// closure) just like any other remote.
-    async fn install_manifest_packs(
-        &self,
-        manifest: &ClonepackManifest,
-        info: &RefResponse,
-        pack_dir: &std::path::Path,
-    ) -> Result<u64> {
-        use futures::stream::{self, StreamExt, TryStreamExt};
-
-        let packs: Vec<_> = manifest.packs.to_vec();
-        if packs.is_empty() {
-            anyhow::bail!("clonepack has no packs for git-dir install");
-        }
-
-        let bundle_ref = manifest
-            .idx_bundle
-            .as_ref()
-            .context("clonepack manifest is missing required idx bundle")?;
-        let idx_bundle = Arc::new(
-            self.fetch_chunk_ref(bundle_ref, info.idx_bundle_url.as_deref())
-                .await
-                .context("fetch idx bundle")?,
-        );
-
-        let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
-
-        let downloads = stream::iter(packs.into_iter().enumerate()).map(|(i, entry)| {
-            let client = self.clone();
-            let pack_url = pack_urls.get(i).and_then(|o| o.clone());
-            let idx_bundle = idx_bundle.clone();
-            async move {
-                let pack_ref = entry
-                    .pack
-                    .as_ref()
-                    .with_context(|| format!("pack {} missing pack ref", i))?;
-                let pack_bytes = client
-                    .fetch_chunk_ref(pack_ref, pack_url.as_deref())
-                    .await
-                    .with_context(|| format!("fetch pack {}", i))?;
-                let idx_bytes = manifest_pack_idx_bytes(&entry, i, &idx_bundle)?;
-                Ok::<(bytes::Bytes, bytes::Bytes), anyhow::Error>((pack_bytes, idx_bytes))
-            }
-        });
-
-        let results: Vec<_> = downloads.buffer_unordered(4).try_collect().await?;
-        install_manifest_pack_bytes(pack_dir, results)
-    }
-
-    pub async fn install_git_dir<P: AsRef<Path>>(
-        &self,
-        branch: &str,
-        info: &RefResponse,
-        git_dir: P,
-    ) -> Result<()> {
-        let git_dir = git_dir.as_ref().to_path_buf();
-
-        if info.clonepack_manifest.is_empty() {
-            anyhow::bail!("ref is missing clonepack manifest; run sync first");
-        }
-
-        // Validate the manifest identity before creating or modifying the git
-        // directory. Remote-helper failures must not leave a partial seed that
-        // claims the pinned commit while containing another commit's objects.
-        let dl_start = Instant::now();
-        let (clonepack, metadata) = self.fetch_clonepack(info).await?;
-
-        std::fs::create_dir_all(&git_dir)?;
-        std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
-        std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
-        std::fs::create_dir_all(git_dir.join("info"))?;
-
-        let branch_name = if branch == "HEAD" {
-            &info.branch
-        } else {
-            branch
-        };
-        if branch_name.is_empty() {
-            std::fs::write(git_dir.join("HEAD"), format!("{}\n", info.commit))?;
-        } else {
-            crate::validation::validate_checkout_name(branch_name)
-                .context("server returned invalid checkout branch")?;
-            std::fs::write(
-                git_dir.join("HEAD"),
-                format!("ref: refs/heads/{}\n", branch_name),
-            )?;
-            let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
-            if let Some(parent) = branch_ref.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(branch_ref, format!("{}\n", info.commit))?;
-        }
-        std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
-        if info.result == ExactResultKind::Head {
-            std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
-        }
-
-        let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-
-        info!(
-            "downloaded metadata chunk ({} bytes) in {:?}",
-            metadata.skeleton_pack.len()
-                + metadata.skeleton_idx.len()
-                + metadata.prebuilt_index.len(),
-            dl_start.elapsed()
-        );
-
-        let skeleton_hash = cas_hash(&metadata.skeleton_pack);
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.pack", skeleton_hash)),
-            &metadata.skeleton_pack,
-        )?;
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.idx", skeleton_hash)),
-            &metadata.skeleton_idx,
-        )?;
-
-        let head_blobs_refs = head_blobs_chunk_refs(&clonepack);
-        let total = if !head_blobs_refs.is_empty() {
-            let idx_ref = clonepack
-                .head_blobs_idx
-                .as_ref()
-                .context("clonepack missing head-blobs idx")?;
-            let (chunks, idx_data) = tokio::join!(
-                self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
-                self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
-            );
-            let chunks = chunks?;
-            let idx_data = idx_data?;
-            let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
-            let head_blobs_hash = cas_hash(&pack_data);
-            std::fs::write(
-                pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
-                &pack_data,
-            )?;
-            std::fs::write(
-                pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
-                &idx_data,
-            )?;
-            info!("wrote head-closure pack ({} bytes)", pack_data.len());
-            (pack_data.len() + idx_data.len()) as u64
-        } else if clonepack.packs.iter().any(|p| !p.history_only) {
-            self.install_manifest_packs(&clonepack, info, &pack_dir)
-                .await
-                .context("install HEAD-closure packs")?
-        } else {
-            anyhow::bail!("clonepack missing head-blobs pack");
-        };
-
-        std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
-
-        info!(
-            "installed .git for {} refs/heads/{} ({} bytes)",
-            &info.commit[..7],
-            branch_name,
-            total
-        );
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -4106,26 +4216,8 @@ mod tests {
         assert!(!is_stale_signed_url(&err));
     }
 
-    #[test]
-    fn retry_decision_retries_stale_until_the_cap_then_stops() {
-        let stale = anyhow::Error::new(StaleSignedUrl).context("fetch chunk");
-        // The clone driver takes up to 2 retries (attempts 0 and 1), then stops.
-        assert!(should_retry_stale(0, 2, &stale), "first failure retries");
-        assert!(should_retry_stale(1, 2, &stale), "second failure retries");
-        assert!(
-            !should_retry_stale(2, 2, &stale),
-            "stops once the retry cap is reached"
-        );
-    }
-
-    #[test]
-    fn retry_decision_never_retries_a_non_stale_error() {
-        let other = anyhow::anyhow!("repo not found");
-        assert!(!should_retry_stale(0, 2, &other));
-    }
-
     #[tokio::test]
-    async fn cancelled_join_keeps_blocking_sibling_armed_until_retry_cleanup() {
+    async fn cancelled_join_keeps_blocking_sibling_armed_until_operation_cleanup() {
         let cleanup = AttemptCleanup::default();
         let fixture = tempfile::tempdir().unwrap();
         let target = fixture.path().join("target");
@@ -4147,25 +4239,24 @@ mod tests {
             }),
             cleanup.clone(),
         );
-        let stale = AbortOnDrop::new(
+        let failed = AbortOnDrop::new(
             tokio::spawn(async move {
                 started_rx.await.unwrap();
-                Err::<(), anyhow::Error>(anyhow::Error::new(StaleSignedUrl))
+                Err::<(), anyhow::Error>(anyhow::anyhow!("download failed"))
             }),
             cleanup.clone(),
         );
 
-        let stale_join = async {
-            stale.join().await.context("join stale task")??;
+        let failed_join = async {
+            failed.join().await.context("join failed task")??;
             Ok::<(), anyhow::Error>(())
         };
         let sibling_join = async {
             sibling.join().await.context("join blocking sibling")??;
             Ok::<(), anyhow::Error>(())
         };
-        let error = tokio::try_join!(stale_join, sibling_join)
-            .expect_err("stale task cancels the sibling join future");
-        assert!(is_stale_signed_url(&error));
+        tokio::try_join!(failed_join, sibling_join)
+            .expect_err("failed task cancels the sibling join future");
 
         let cleanup_wait = cleanup.clone();
         let next_attempt_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4181,7 +4272,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain_then_retry)
                 .await
                 .is_err(),
-            "retry cleanup must wait for the cancelled join's blocking sibling"
+            "operation cleanup must wait for the cancelled join's blocking sibling"
         );
         assert!(!next_attempt_started.load(std::sync::atomic::Ordering::SeqCst));
         assert!(staging.exists());
@@ -4189,7 +4280,7 @@ mod tests {
         release_tx.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), drain_then_retry)
             .await
-            .expect("blocking sibling joined before retry");
+            .expect("blocking sibling joined before cleanup");
         assert!(next_attempt_started.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!staging.exists());
         assert!(!target.exists());

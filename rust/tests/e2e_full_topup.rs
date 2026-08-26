@@ -2,11 +2,8 @@
 
 mod common;
 
-use axum::Router;
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{Request, Response, StatusCode};
-use axum::routing::any;
+use axum::http::StatusCode;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::*;
 use prost::Message;
 use ripclone::cas::Cas;
@@ -54,6 +51,39 @@ impl Drop for ScopedEnvVar {
             None => unsafe { std::env::remove_var(self.key) },
         }
     }
+}
+
+async fn mint_session_token(server: &Server) -> String {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build no-redirect login client");
+    let response = client
+        .post(format!("{}/v1/auth/login", server.url))
+        .form(&[
+            ("secret", TOKEN),
+            ("callback", "http://127.0.0.1:0/"),
+            ("state", "resume"),
+        ])
+        .send()
+        .await
+        .expect("mint session token");
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|location| location.split_once("token=").map(|(_, token)| token))
+        .and_then(|token| token.split('&').next())
+        .map(str::to_string)
+        .expect("session token in login redirect")
+}
+
+fn session_token_exp(token: &str) -> u64 {
+    let payload = token.split('.').nth(1).expect("JWT payload");
+    let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url payload");
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("JWT claims");
+    claims["exp"].as_u64().expect("JWT exp claim")
 }
 
 async fn start_failing_upstream_decoy() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -193,278 +223,6 @@ async fn wait_for_files_job_settled(server: &Server, repo: &str, commit: &str) {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("MinIO Files job did not settle for {repo}@{commit}: {last}");
-}
-
-struct MinioAuditProxy {
-    url: String,
-    signed_requests: Arc<std::sync::atomic::AtomicUsize>,
-    ripclone_auth_requests: Arc<std::sync::atomic::AtomicUsize>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-struct CloneIdProxy {
-    url: String,
-    authenticated_pinned_requests: Arc<std::sync::atomic::AtomicUsize>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for CloneIdProxy {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-#[derive(Clone)]
-struct CloneIdProxyState {
-    upstream: String,
-    pending_sequence: Arc<std::sync::atomic::AtomicUsize>,
-    authenticated_pinned_requests: Arc<std::sync::atomic::AtomicUsize>,
-    pinned_pause: Option<Arc<PinnedRequestPause>>,
-}
-
-struct PinnedRequestPause {
-    at: usize,
-    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    proceed: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-}
-
-async fn clone_id_proxy(
-    State(state): State<CloneIdProxyState>,
-    request: Request<Body>,
-) -> Response<Body> {
-    let path_query = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or(request.uri().path());
-    let has_ripclone_auth = request
-        .headers()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("Ripclone "));
-    if has_ripclone_auth && path_query.contains("pinned=") {
-        let pinned_request = state
-            .authenticated_pinned_requests
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        if let Some(pause) = &state.pinned_pause
-            && pinned_request == pause.at
-        {
-            if let Some(entered) = pause
-                .entered
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-            {
-                let _ = entered.send(());
-            }
-            if let Some(proceed) = pause.proceed.lock().await.take() {
-                tokio::time::timeout(Duration::from_secs(10), proceed)
-                    .await
-                    .expect("pinned refresh proxy barrier released within 10 seconds")
-                    .expect("pinned refresh proxy barrier sender remained alive");
-            }
-        }
-    }
-    let mut outgoing = reqwest::Client::new().request(
-        request.method().clone(),
-        format!("{}{}", state.upstream, path_query),
-    );
-    for (name, value) in request.headers() {
-        if name != axum::http::header::HOST && name != axum::http::header::CONTENT_LENGTH {
-            outgoing = outgoing.header(name, value);
-        }
-    }
-    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
-        .await
-        .expect("read clone-ID proxy request");
-    let upstream = outgoing
-        .body(body)
-        .send()
-        .await
-        .expect("forward clone-ID proxy request");
-    let status = upstream.status();
-    let headers = upstream.headers().clone();
-    let bytes = upstream
-        .bytes()
-        .await
-        .expect("read clone-ID proxy response");
-    let mut output = Response::builder().status(status);
-    for (name, value) in &headers {
-        if name != axum::http::header::CONTENT_LENGTH
-            && name != axum::http::header::TRANSFER_ENCODING
-            && name != axum::http::header::CONNECTION
-        {
-            output = output.header(name, value);
-        }
-    }
-    if status == StatusCode::ACCEPTED {
-        let sequence = state
-            .pending_sequence
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        output = output.header("x-ripclone-clone-id", format!("pending-clone-{sequence}"));
-    }
-    output.body(Body::from(bytes)).expect("clone-ID response")
-}
-
-async fn start_clone_id_proxy_inner(
-    upstream: &str,
-    pinned_pause: Option<Arc<PinnedRequestPause>>,
-) -> CloneIdProxy {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind clone-ID proxy");
-    let url = format!(
-        "http://{}",
-        listener.local_addr().expect("clone-ID proxy address")
-    );
-    let authenticated_pinned_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let state = CloneIdProxyState {
-        upstream: upstream.trim_end_matches('/').to_string(),
-        pending_sequence: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        authenticated_pinned_requests: Arc::clone(&authenticated_pinned_requests),
-        pinned_pause,
-    };
-    let task = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new()
-                .fallback(any(clone_id_proxy))
-                .with_state(state),
-        )
-        .await
-        .expect("serve clone-ID proxy");
-    });
-    CloneIdProxy {
-        url,
-        authenticated_pinned_requests,
-        task,
-    }
-}
-
-async fn start_clone_id_proxy_with_pinned_pause(
-    upstream: &str,
-    pause_at: usize,
-) -> (
-    CloneIdProxy,
-    tokio::sync::oneshot::Receiver<()>,
-    tokio::sync::oneshot::Sender<()>,
-) {
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
-    let pause = Arc::new(PinnedRequestPause {
-        at: pause_at,
-        entered: std::sync::Mutex::new(Some(entered_tx)),
-        proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
-    });
-    (
-        start_clone_id_proxy_inner(upstream, Some(pause)).await,
-        entered_rx,
-        proceed_tx,
-    )
-}
-
-impl Drop for MinioAuditProxy {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn read_http_head(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
-    let mut request = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 2048];
-    loop {
-        let count = stream.read(&mut chunk).await.ok()?;
-        if count == 0 {
-            return None;
-        }
-        request.extend_from_slice(&chunk[..count]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            return Some(request);
-        }
-        if request.len() > 64 * 1024 {
-            return None;
-        }
-    }
-}
-
-fn rewrite_proxy_head(request: &mut Vec<u8>, backend_host: &str) {
-    let Ok(text) = std::str::from_utf8(request) else {
-        return;
-    };
-    let Some(end) = text.find("\r\n\r\n") else {
-        return;
-    };
-    let body = &text[end + 4..];
-    let mut headers = Vec::new();
-    for line in text[..end].lines() {
-        if line.to_ascii_lowercase().starts_with("host:") {
-            headers.push(format!("Host: {backend_host}"));
-        } else if !line.to_ascii_lowercase().starts_with("connection:") {
-            headers.push(line.to_string());
-        }
-    }
-    *request = format!(
-        "{}\r\nConnection: close\r\n\r\n{body}",
-        headers.join("\r\n")
-    )
-    .into_bytes();
-}
-
-async fn start_minio_audit_proxy(endpoint: &str) -> MinioAuditProxy {
-    let endpoint = url::Url::parse(endpoint).expect("valid MinIO endpoint");
-    let backend_host = format!(
-        "{}:{}",
-        endpoint.host_str().expect("MinIO host"),
-        endpoint.port_or_known_default().expect("MinIO port")
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind MinIO audit proxy");
-    let url = format!(
-        "http://{}",
-        listener.local_addr().expect("MinIO audit address")
-    );
-    let signed_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let ripclone_auth_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let signed_for_task = Arc::clone(&signed_requests);
-    let auth_for_task = Arc::clone(&ripclone_auth_requests);
-    let task = tokio::spawn(async move {
-        loop {
-            let Ok((mut client, _)) = listener.accept().await else {
-                break;
-            };
-            let backend_host = backend_host.clone();
-            let signed = Arc::clone(&signed_for_task);
-            let auth = Arc::clone(&auth_for_task);
-            tokio::spawn(async move {
-                let Some(mut request) = read_http_head(&mut client).await else {
-                    return;
-                };
-                let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
-                if text.contains("x-amz-signature=") {
-                    signed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                if text.contains("authorization: ripclone ") {
-                    auth.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                rewrite_proxy_head(&mut request, &backend_host);
-                let Ok(mut backend) = tokio::net::TcpStream::connect(&backend_host).await else {
-                    return;
-                };
-                if backend.write_all(&request).await.is_ok() {
-                    let _ = tokio::io::copy(&mut backend, &mut client).await;
-                }
-            });
-        }
-    });
-    MinioAuditProxy {
-        url,
-        signed_requests,
-        ripclone_auth_requests,
-        task,
-    }
 }
 
 fn hanging_origin() -> (
@@ -1913,10 +1671,7 @@ async fn cancellation_and_timeout_reap_git_helpers_before_staging_cleanup() {
     })
     .await
     .unwrap();
-    assert!(
-        cancellation_closed,
-        "remote helper connection remained alive"
-    );
+    assert!(cancellation_closed, "upstream connection remained alive");
     for _ in 0..100 {
         if std::fs::read_dir(output.path()).unwrap().next().is_none() {
             break;
@@ -1961,7 +1716,7 @@ async fn cancellation_and_timeout_reap_git_helpers_before_staging_cleanup() {
         timeout_closed
             .recv_timeout(Duration::from_secs(5))
             .expect("hanging origin observed timeout"),
-        "timed-out remote helper connection remained alive"
+        "timed-out upstream connection remained alive"
     );
     assert!(!timeout_target.exists());
     assert!(
@@ -2257,7 +2012,7 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires digest-pinned MinIO runner"]
-async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
+async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() {
     let _guard = env_lock().lock().await;
     assert_eq!(
         std::env::var("RIPCLONE_REQUIRE_MINIO").as_deref(),
@@ -2265,200 +2020,301 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
         "run through scripts/e2e_full_topup_minio.sh"
     );
     init(false);
-    let controls = tempfile::tempdir().unwrap();
-    let direct_minio = std::env::var("RIPCLONE_S3_ENDPOINT").expect("MinIO endpoint");
-    let audit = start_minio_audit_proxy(&direct_minio).await;
-    // The server keeps using the direct S3 endpoint. Only client-facing signed
-    // URLs are rewritten through this audit hop, which records the artifact
-    // request headers before forwarding them byte-for-byte to MinIO.
-    let _signed_url_proxy = ScopedEnvVar::set("RIPCLONE_TEST_SIGNED_URL_PROXY", &audit.url);
+    let controls = tempfile::tempdir().expect("MinIO resume controls");
+    let interrupt = controls.path().join("interrupt");
+    let audit = controls.path().join("download-audit.log");
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let _private_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", "1");
+    let _public_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
+    let _backoff = ScopedEnvVar::set("RIPCLONE_FETCH_BACKOFF_MS", "0");
+    let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
+    let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server().await;
-    let (clone_proxy, refresh_entered, refresh_proceed) =
-        start_clone_id_proxy_with_pinned_pause(&server.url, 2).await;
-    let origin = make_origin("acme", "full-topup-minio");
-    let a = origin.commit(&[("value.txt", "A\n")], "A");
+
+    let origin = make_origin("acme", "resume-minio");
+    let noise = |seed: u64| {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+        let mut state = seed | 1;
+        let mut bytes = Vec::with_capacity(512 * 1024);
+        while bytes.len() < 512 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.push(ALPHABET[(state & 0x3f) as usize]);
+        }
+        String::from_utf8(bytes).expect("noise is ascii")
+    };
+    let a_text = noise(211);
+    origin.commit(&[("large.txt", a_text.as_str())], "A");
+    let b_text = noise(223);
+    let b = origin.commit(&[("large.txt", b_text.as_str())], "B");
     origin.publish();
     server
         .client()
-        .add_repo("acme/full-topup-minio")
+        .add_repo("acme/resume-minio")
         .await
-        .expect("register and publish MinIO A");
-    let ready_a = server
+        .expect("register and publish MinIO B");
+    let ready_b = server
         .client()
         .resolve_exact_result(
-            "acme/full-topup-minio",
+            "acme/resume-minio",
             "main",
             ripclone::ExactResultKind::Full,
             None,
         )
         .await
-        .expect("wait for MinIO Full(A)");
-    assert_eq!(ready_a.commit, a);
-    let client_cache_dir = controls.path().join("client-cache");
-    let priming_client = ripclone::client::Client::new_with_token_and_cache(
-        server.url.clone(),
-        Some(token_hash()),
-        Some(&client_cache_dir),
-    );
-    for hash in [&ready_a.clonepack_manifest, &ready_a.metadata_chunk] {
-        priming_client
-            .fetch_artifact(hash)
-            .await
-            .expect("prime base setup artifact from MinIO");
-    }
-    audit
-        .signed_requests
-        .store(0, std::sync::atomic::Ordering::SeqCst);
-
-    let head_barrier = controls.path().join("after-head");
-    let staging_barrier = controls.path().join("staging-barrier");
-    let _head_barrier = ScopedEnvVar::set("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR", &head_barrier);
-    let _signed_url_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
-    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
-    let _staging_barrier =
-        ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR", &staging_barrier);
-    let b = origin.commit(&[("value.txt", "B\n")], "B");
-    origin.publish();
-    let sync_client = server.client();
-    let mut sync_b =
-        tokio::spawn(async move { sync_client.sync_repo("acme/full-topup-minio", None).await });
-    for _ in 0..800 {
-        if head_barrier.join("entered").exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(head_barrier.join("entered").exists());
-
-    let plan = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/repos/github/acme/full-topup-minio/refs/main?result=full&pinned={b}&top_up=true",
-            server.url
-        ))
-        .header("Authorization", format!("Ripclone {}", token_hash()))
-        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
-        .send()
+        .expect("wait for MinIO Full(B)");
+    assert_eq!(ready_b.commit, b);
+    let (manifest, _) = server
+        .client()
+        .fetch_clonepack(&ready_b)
         .await
-        .expect("request MinIO top-up plan");
-    assert_eq!(plan.status(), reqwest::StatusCode::ACCEPTED);
-    let plan: serde_json::Value = plan.json().await.expect("decode MinIO top-up plan");
-    assert_eq!(plan["commit"], b);
-    assert_eq!(plan["top_up_base"]["commit"], a);
-    let signed_manifest = plan["top_up_base"]["clonepack_manifest_url"]
-        .as_str()
-        .expect("signed base manifest URL");
-    assert!(signed_manifest.starts_with(&audit.url));
-    assert!(signed_manifest.contains("X-Amz-Signature="));
+        .expect("fetch B manifest from MinIO");
+    let history = manifest
+        .packs
+        .iter()
+        .find(|pack| pack.history_only)
+        .and_then(|pack| pack.pack.as_ref())
+        .expect("B publishes a history-only pack");
+    assert!(history.len > 64 * 1024, "fixture history pack is large");
+    let history_hash = ripclone::clonepack::hash_to_hex(&history.hash);
+    let _interrupt_hash = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_ARTIFACT", &history_hash);
+    let _interrupt_after = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_AFTER_BYTES", "65536");
+    let _interrupt_dir = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_DIR", &interrupt);
+    let _audit = ScopedEnvVar::set("RIPCLONE_TEST_DOWNLOAD_AUDIT", &audit);
 
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
     let target_for_install = target.clone();
-    let clone_server = clone_proxy.url.clone();
-    let mut install = tokio::spawn(async move {
-        ripclone::client::Client::new_with_token_and_cache(
-            clone_server,
-            Some(token_hash()),
-            Some(&client_cache_dir),
-        )
-        .install_repo_with_mode_at(
-            "acme/full-topup-minio",
-            "HEAD",
-            None,
-            &target_for_install,
-            CloneMode::Editable,
-            Some("full"),
-            None,
-        )
-        .await
+    let clone_client = server.client();
+    let install = tokio::spawn(async move {
+        clone_client
+            .install_repo_with_mode_at(
+                "acme/resume-minio",
+                "HEAD",
+                None,
+                &target_for_install,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
     });
-    for _ in 0..400 {
-        if staging_barrier.join("entered").exists() {
+    for _ in 0..800 {
+        if interrupt.join("entered").exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let stale_staging = std::path::PathBuf::from(
-        std::fs::read_to_string(staging_barrier.join("entered"))
-            .expect("first top-up staging barrier entered")
-            .trim(),
-    );
-    assert!(
-        stale_staging.exists(),
-        "the stale attempt must own a real staging directory"
-    );
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    std::fs::write(staging_barrier.join("proceed"), b"expire\n").unwrap();
-    tokio::time::timeout(Duration::from_secs(20), refresh_entered)
+    let saved = std::fs::read_to_string(interrupt.join("entered"))
+        .expect("client interruption reached")
+        .parse::<u64>()
+        .expect("saved byte count");
+    assert!(saved >= 65_536 && saved < history.len);
+
+    // Advance the real branch and build C while the B clone is paused. The URL
+    // refresh that follows must remain an exact-B metadata read.
+    let c_text = noise(227);
+    let c = origin.commit(&[("large.txt", c_text.as_str())], "C");
+    origin.publish();
+    let ready_c = server
+        .client()
+        .sync_repo("acme/resume-minio", None)
         .await
-        .expect("stale base URL reached pinned refresh")
-        .expect("pinned refresh barrier remained alive");
-    assert!(
-        !stale_staging.exists(),
-        "pinned refresh began before the stale attempt staging was drained"
+        .expect("build branch advance C");
+    assert_eq!(ready_c.commit, c);
+    wait_for_files_job_settled(&server, "acme/resume-minio", &c).await;
+    let counters_before_refresh = (
+        probe.tip_probes.load(Ordering::SeqCst),
+        probe.exact_fetches.load(Ordering::SeqCst),
+        probe.builder_entries.load(Ordering::SeqCst),
+        probe.head_builds.load(Ordering::SeqCst),
+        probe.full_builds.load(Ordering::SeqCst),
+        probe.files_builds.load(Ordering::SeqCst),
+        probe.queue_inserts.load(Ordering::SeqCst),
     );
-    refresh_proceed
-        .send(())
-        .expect("release refreshed pinned-B plan");
-    let outcome = tokio::time::timeout(Duration::from_secs(30), &mut install)
+    let trace_before_refresh = probe
+        .http_trace
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .len();
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    std::fs::write(interrupt.join("proceed"), b"retry expired URL\n").unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), install)
         .await
-        .expect("refreshed top-up completed")
-        .expect("top-up install task joined");
-    let outcome = outcome.expect("fresh pinned-B plan succeeds after stale base URL");
+        .expect("resumed MinIO clone completed")
+        .expect("MinIO clone task joined")
+        .expect("fresh exact-B URL resumed the failed artifact");
     assert_eq!(outcome.commit, b);
-    assert!(outcome.cold, "the first 202 must survive the stale retry");
-    assert_eq!(
-        outcome.clone_id.as_deref(),
-        Some("pending-clone-1"),
-        "later top-up and stale-refresh responses must not replace the first clone ID"
-    );
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
-    assert!(
-        !stale_staging.exists(),
-        "stale attempt staging reappeared after publication"
-    );
-    assert!(!sync_b.is_finished(), "Full(B) must still be blocked");
-    assert!(
-        audit
-            .signed_requests
-            .load(std::sync::atomic::Ordering::SeqCst)
-            >= 2,
-        "the artifact host must see the expired request and refreshed base-A download"
-    );
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
     assert_eq!(
-        audit
-            .ripclone_auth_requests
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "the Ripclone session credential must never reach MinIO"
-    );
-    assert!(
-        clone_proxy
-            .authenticated_pinned_requests
-            .load(std::sync::atomic::Ordering::SeqCst)
-            >= 2,
-        "both the initial plan and stale refresh must authenticate and stay pinned"
-    );
-    println!(
-        "MINIO_TOP_UP_EVIDENCE target={b} base={a} stale_staging_drained_before_refresh=true \
-signed_requests={} authenticated_pinned_requests={} ripclone_auth_requests={}",
-        audit
-            .signed_requests
-            .load(std::sync::atomic::Ordering::SeqCst),
-        clone_proxy
-            .authenticated_pinned_requests
-            .load(std::sync::atomic::Ordering::SeqCst),
-        audit
-            .ripclone_auth_requests
-            .load(std::sync::atomic::Ordering::SeqCst),
+        counters_before_refresh,
+        (
+            probe.tip_probes.load(Ordering::SeqCst),
+            probe.exact_fetches.load(Ordering::SeqCst),
+            probe.builder_entries.load(Ordering::SeqCst),
+            probe.head_builds.load(Ordering::SeqCst),
+            probe.full_builds.load(Ordering::SeqCst),
+            probe.files_builds.load(Ordering::SeqCst),
+            probe.queue_inserts.load(Ordering::SeqCst),
+        ),
+        "URL refresh must create no source fetch, build, or job"
     );
 
-    std::fs::write(head_barrier.join("proceed"), b"release\n").unwrap();
-    tokio::time::timeout(Duration::from_secs(30), &mut sync_b)
+    let trace = probe
+        .http_trace
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let refresh_trace = &trace[trace_before_refresh..];
+    let pinned_b: Vec<_> = refresh_trace
+        .iter()
+        .filter(|event| event.contains(&format!("pinned={b}")))
+        .collect();
+    assert_eq!(
+        pinned_b.len(),
+        1,
+        "one exact-B URL refresh: {refresh_trace:?}"
+    );
+
+    let audit_text = std::fs::read_to_string(&audit).expect("read client download audit");
+    let all_requests: Vec<&str> = audit_text
+        .lines()
+        .filter(|line| line.starts_with("hash="))
+        .collect();
+    let requests: Vec<&str> = all_requests
+        .iter()
+        .copied()
+        .filter(|line| line.contains(&format!("hash={history_hash}")))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        3,
+        "initial, expired, refreshed: {requests:?}"
+    );
+    assert!(requests[0].contains("offset=0"));
+    assert!(requests[1].contains(&format!("offset={saved}")));
+    assert!(requests[2].contains(&format!("offset={saved}")));
+    let mut per_artifact = std::collections::HashMap::<&str, usize>::new();
+    for request in &all_requests {
+        let hash = request
+            .split_whitespace()
+            .next()
+            .and_then(|field| field.strip_prefix("hash="))
+            .expect("audit request hash");
+        *per_artifact.entry(hash).or_default() += 1;
+        assert!(
+            request.contains("signed=true ripclone_authorization=false"),
+            "MinIO request must use the credential-free HTTP client: {request}"
+        );
+    }
+    assert!(
+        per_artifact
+            .iter()
+            .filter(|entry| *entry.0 != history_hash.as_str())
+            .all(|(_, count)| *count == 1),
+        "completed artifacts must not be requested again: {per_artifact:?}"
+    );
+    println!(
+        "MINIO_RESUME_EVIDENCE target={b} branch_now={c} saved={saved} \
+requests=3 exact_b_refreshes=1 no_build_or_fetch_on_refresh=true no_repeated_completed_bytes=true \
+signed_requests_without_ripclone_auth={}",
+        all_requests
+            .iter()
+            .all(|request| request.contains("signed=true ripclone_authorization=false")),
+    );
+
+    // Negative row: the signed transfer starts while access is valid, but the
+    // session expires before URL refresh. The refresh must be refused and the
+    // private staging tree must disappear without publishing a target.
+    let c_manifest = server
+        .client()
+        .resolve_exact_result(
+            "acme/resume-minio",
+            "main",
+            ripclone::ExactResultKind::Full,
+            Some(&c),
+        )
         .await
-        .expect("MinIO Full(B) finished after release")
-        .expect("join MinIO B sync")
-        .expect("sync MinIO B");
-    // `sync_repo` completes once Full is ready. Keep the local source and the
-    // server alive until Files and the exact job are fully settled.
-    wait_for_files_job_settled(&server, "acme/full-topup-minio", &b).await;
+        .expect("resolve exact C for revocation fixture");
+    let (c_manifest, _) = server
+        .client()
+        .fetch_clonepack(&c_manifest)
+        .await
+        .expect("fetch C manifest");
+    let c_history = c_manifest
+        .packs
+        .iter()
+        .find(|pack| pack.history_only)
+        .and_then(|pack| pack.pack.as_ref())
+        .expect("C publishes a history pack");
+    let c_history_hash = ripclone::clonepack::hash_to_hex(&c_history.hash);
+    let revoked_interrupt = controls.path().join("revoked-interrupt");
+    let revoked_audit = controls.path().join("revoked-audit.log");
+    let _revoked_hash = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_ARTIFACT", &c_history_hash);
+    let _revoked_dir = ScopedEnvVar::set("RIPCLONE_TEST_INTERRUPT_DIR", &revoked_interrupt);
+    let _revoked_audit = ScopedEnvVar::set("RIPCLONE_TEST_DOWNLOAD_AUDIT", &revoked_audit);
+    let _jwt_ttl = ScopedEnvVar::set("RIPCLONE_JWT_TTL_SECS", "2");
+    let session = mint_session_token(&server).await;
+    let session_expires = session_token_exp(&session);
+    let revoked_output = tempfile::tempdir().expect("revoked clone output");
+    let revoked_target = revoked_output.path().join("clone");
+    let revoked_target_task = revoked_target.clone();
+    let revoked_client = ripclone::client::Client::new_with_bearer(server.url.clone(), session)
+        .with_provider("github");
+    let revoked_commit = c.clone();
+    let revoked_clone = tokio::spawn(async move {
+        revoked_client
+            .install_repo_with_mode_at(
+                "acme/resume-minio",
+                "main",
+                Some(&revoked_commit),
+                revoked_target_task,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    for _ in 0..800 {
+        if revoked_interrupt.join("entered").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        revoked_interrupt.join("entered").exists(),
+        "revoked clone reached its deterministic interruption"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_secs();
+    if session_expires >= now {
+        tokio::time::sleep(Duration::from_secs(session_expires - now + 1)).await;
+    }
+    std::fs::write(revoked_interrupt.join("proceed"), b"expire access\n").unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(30), revoked_clone)
+        .await
+        .expect("revoked clone stopped")
+        .expect("revoked clone task joined")
+        .expect_err("expired access must refuse exact-C URL refresh");
+    assert!(
+        format!("{error:#}").contains(&format!("refresh of pinned commit {c} was not authorized")),
+        "unexpected revocation error: {error:#}"
+    );
+    assert!(
+        !revoked_target.exists(),
+        "revoked clone publishes no target"
+    );
+    assert!(
+        std::fs::read_dir(revoked_output.path())
+            .expect("read revoked clone parent")
+            .next()
+            .is_none(),
+        "revoked clone removes private staging"
+    );
+    println!("MINIO_REVOCATION_EVIDENCE commit={c} no_target=true cleanup=true");
 }

@@ -846,6 +846,10 @@ impl StorageBackend for RemoteLocalStorage {
         self.inner.get_range(hash, start, len)
     }
 
+    fn open_file(&self, hash: &str) -> anyhow::Result<Option<std::fs::File>> {
+        self.inner.open_file(hash)
+    }
+
     fn put(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
         self.inner.put(hash, data)
     }
@@ -1098,6 +1102,10 @@ impl StorageBackend for FailingPutStorage {
 
     fn get_range(&self, hash: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
         self.inner.get_range(hash, start, len)
+    }
+
+    fn open_file(&self, hash: &str) -> anyhow::Result<Option<std::fs::File>> {
+        self.inner.open_file(hash)
     }
 
     fn put(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
