@@ -65,7 +65,7 @@ A real high-bandwidth `torvalds/linux` run on EC2 hits **~10×** at 5 Gbps for t
 
 ## Install
 
-Pick whichever fits. All install the `ripclone` CLI (and `ripclone-server`, `ripclone-worker`, `git-remote-ripclone`).
+Pick whichever fits. All install the `ripclone` CLI (and `ripclone-server` and `ripclone-worker`).
 
 ```sh
 # 1. Shell installer (prebuilt binaries)
@@ -97,7 +97,7 @@ Remove whichever way you installed:
 ```sh
 # Shell installer / prebuilt binaries — delete the installed binaries
 rm -f "$(command -v ripclone)" "$(command -v ripclone-server)" \
-      "$(command -v ripclone-worker)" "$(command -v git-remote-ripclone)"
+      "$(command -v ripclone-worker)"
 
 # Cargo
 cargo uninstall ripclone
@@ -277,16 +277,6 @@ your git host with `--verify-upstream`. In `auto` mode (the default) this runs
 whenever an upstream credential is available or the repo is public; for
 credential-less private/agent flows it warns and skips, leaving the ripclone
 server in the trust base. `files`-mode clones are not verifiable this way.
-
-### Plain `git clone` through the helper
-
-The `git-remote-ripclone` binary lets stock `git` clone and fetch through a ripclone server with no wrapper — handy for CI steps and tools that shell out to `git`:
-
-```sh
-git clone ripclone://github/oven-sh/bun.git bun
-```
-
-It supports `--depth 1` (shallow) or a full clone; push goes to your git host via `pushInsteadOf`. See [`docs/REMOTE_HELPER.md`](docs/REMOTE_HELPER.md) for URL syntax, server resolution, and the push workaround.
 
 ## Providers
 

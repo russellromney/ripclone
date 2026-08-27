@@ -16,11 +16,11 @@ use crate::common;
 
 use common::*;
 use ripclone::mode::CloneMode;
-use ripclone::server::{ArtifactBarrier, BarrierTarget};
+use ripclone::server::{ArtifactBarrier, ArtifactRangeBehavior, BarrierTarget};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -30,23 +30,43 @@ use tokio::sync::oneshot;
 /// bounds is how long a genuine failure takes to report.
 const OVERLAP_DEADLINE: Duration = Duration::from_secs(60);
 
+type ArtifactRequestLog = Arc<StdMutex<Vec<(String, Option<String>)>>>;
+
 /// An [`ArtifactBarrier`] whose target hash is chosen after the repo is built.
 struct HashBarrier {
     slot: Arc<StdMutex<Option<String>>>,
     entered: oneshot::Receiver<()>,
     proceed: oneshot::Sender<()>,
+    range_requests: Arc<StdMutex<Vec<String>>>,
+    artifact_requests: ArtifactRequestLog,
+    max_chunk_sent: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn hash_barrier(after_bytes: usize) -> (ArtifactBarrier, HashBarrier) {
+    hash_barrier_with_behavior(after_bytes, false, ArtifactRangeBehavior::Normal)
+}
+
+fn hash_barrier_with_behavior(
+    after_bytes: usize,
+    close_on_proceed: bool,
+    range_behavior: ArtifactRangeBehavior,
+) -> (ArtifactBarrier, HashBarrier) {
     let (entered_tx, entered_rx) = oneshot::channel();
     let (proceed_tx, proceed_rx) = oneshot::channel();
     let slot = Arc::new(StdMutex::new(None));
+    let range_requests = Arc::new(StdMutex::new(Vec::new()));
+    let artifact_requests = Arc::new(StdMutex::new(Vec::new()));
+    let max_chunk_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let barrier = ArtifactBarrier {
         after_bytes,
         target: BarrierTarget::Hash(Arc::clone(&slot)),
         entered: Arc::new(StdMutex::new(Some(entered_tx))),
         proceed: Arc::new(StdMutex::new(Some(proceed_rx))),
-        close_on_proceed: false,
+        close_on_proceed,
+        range_behavior,
+        range_requests: Arc::clone(&range_requests),
+        artifact_requests: Arc::clone(&artifact_requests),
+        max_chunk_sent: Arc::clone(&max_chunk_sent),
         consumed: Arc::new(AtomicBool::new(false)),
     };
     (
@@ -55,6 +75,9 @@ fn hash_barrier(after_bytes: usize) -> (ArtifactBarrier, HashBarrier) {
             slot,
             entered: entered_rx,
             proceed: proceed_tx,
+            range_requests,
+            artifact_requests,
+            max_chunk_sent,
         },
     )
 }
@@ -63,6 +86,35 @@ impl HashBarrier {
     fn arm(&self, hash: &str) {
         *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash.to_string());
     }
+
+    fn disarm(&self) {
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn clear_artifact_requests(&self) {
+        self.artifact_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    fn artifact_request_counts(&self) -> std::collections::HashMap<String, usize> {
+        artifact_request_counts(&self.artifact_requests)
+    }
+}
+
+fn artifact_request_counts(
+    requests: &StdMutex<Vec<(String, Option<String>)>>,
+) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for (hash, _) in requests
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+    {
+        *counts.entry(hash.clone()).or_default() += 1;
+    }
+    counts
 }
 
 /// Deterministic, poorly-compressible bytes. The archive chunk size is a fixed
@@ -124,6 +176,17 @@ where
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     (false, last)
+}
+
+async fn wait_for_empty_clone_parent(parent: &Path) -> bool {
+    let end = Instant::now() + OVERLAP_DEADLINE;
+    while Instant::now() < end {
+        if std::fs::read_dir(parent).is_ok_and(|mut entries| entries.next().is_none()) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
 }
 
 fn pack_dir_entries(staging: &Path, suffix: &str) -> Vec<String> {
@@ -416,6 +479,388 @@ async fn editable_history_pack_streams_to_one_temp_file_then_is_renamed() {
     assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "3");
 }
 
+/// Cancelling while the streamed history pack owns its private download file
+/// must abort the downloader tasks and remove the complete staging tree. The
+/// released server response must not cause a retry or resurrect output.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancellation_removes_an_active_history_download_and_staging() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, false, ArtifactRangeBehavior::Normal);
+    let server = start_server_with_barrier(barrier).await;
+    let (history_hash, _) =
+        prepare_resumable_history_fixture(&server, "cancel-active-download", &control).await;
+    control.clear_artifact_requests();
+
+    let output = tempfile::tempdir().expect("clone output");
+    let target = output.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/cancel-active-download",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+
+    control
+        .entered
+        .await
+        .expect("history response reached cancellation boundary");
+    let (active, staging) = wait_for_staging(output.path(), |staging| {
+        pack_dir_entries(staging, ".ripclone-download").len() == 1
+    })
+    .await;
+    assert!(
+        active,
+        "cancellation fixture must observe an active .ripclone-download file: {staging:?}"
+    );
+
+    let artifact_requests = Arc::clone(&control.artifact_requests);
+    clone.abort();
+    assert!(clone.await.is_err(), "clone task must report cancellation");
+    let _ = control.proceed.send(());
+    assert!(
+        wait_for_empty_clone_parent(output.path()).await,
+        "cancellation must remove the target and private staging tree"
+    );
+    assert!(!target.exists());
+    let counts = artifact_request_counts(&artifact_requests);
+    assert_eq!(
+        counts.get(&history_hash),
+        Some(&1),
+        "an aborted downloader must not retry in background: {counts:?}"
+    );
+}
+
+/// Corruption in the bytes of a genuinely streamed history response must be
+/// detected by the final SHA-256 check before rename. It is deterministic and
+/// therefore must not retry, publish a target, or retain its temp file.
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupted_streamed_history_pack_fails_before_installation() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, false, ArtifactRangeBehavior::CorruptBody);
+    let server = start_server_with_barrier(barrier).await;
+    let (history_hash, _) =
+        prepare_resumable_history_fixture(&server, "corrupt-stream", &control).await;
+    control.clear_artifact_requests();
+
+    let output = tempfile::tempdir().expect("clone output");
+    let target = output.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/corrupt-stream",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+
+    control
+        .entered
+        .await
+        .expect("corrupt history response reached its barrier");
+    let artifact_requests = Arc::clone(&control.artifact_requests);
+    control.proceed.send(()).expect("finish corrupt response");
+    let error = clone
+        .await
+        .expect("corrupt clone task joined")
+        .expect_err("corrupt streamed history pack must fail");
+    assert!(
+        format!("{error:#}").contains("artifact hash mismatch"),
+        "unexpected corrupt stream error: {error:#}"
+    );
+    assert!(
+        wait_for_empty_clone_parent(output.path()).await,
+        "corrupt stream must remove private staging"
+    );
+    assert!(!target.exists());
+    let counts = artifact_request_counts(&artifact_requests);
+    assert_eq!(
+        counts.get(&history_hash),
+        Some(&1),
+        "a hash mismatch is permanent and must not retry: {counts:?}"
+    );
+}
+
+async fn prepare_resumable_history_fixture(
+    server: &Server,
+    repo: &str,
+    control: &HashBarrier,
+) -> (String, u64) {
+    let origin = make_origin("acme", repo);
+    let c1 = noisy(101, 384 * 1024);
+    let c2 = noisy(103, 384 * 1024);
+    let c3 = noisy(107, 384 * 1024);
+    origin.commit(&[("large.txt", c1.as_str())], "c1");
+    origin.commit(&[("large.txt", c2.as_str())], "c2");
+    origin.commit(&[("large.txt", c3.as_str())], "c3");
+    origin.publish();
+
+    let info = sync_until_full_ready(server, "acme", repo).await;
+    let (manifest, _) = server
+        .client()
+        .fetch_clonepack(&info)
+        .await
+        .expect("fetch resumable fixture manifest");
+    let history = manifest
+        .packs
+        .iter()
+        .find(|pack| pack.history_only)
+        .and_then(|pack| pack.pack.as_ref())
+        .expect("fixture publishes a history-only pack");
+    let hash = ripclone::clonepack::hash_to_hex(&history.hash);
+    assert!(
+        history.len > 64 * 1024,
+        "history pack must exceed the interruption boundary: {}",
+        history.len
+    );
+    control.arm(&hash);
+    (hash, history.len)
+}
+
+/// The uninterrupted history path retains the pre-resume fast path: every
+/// artifact is requested exactly once, including the large history pack.
+#[tokio::test(flavor = "multi_thread")]
+async fn normal_history_download_uses_one_request_per_artifact() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::Normal);
+    let server = start_server_with_barrier(barrier).await;
+    let (history_hash, _) =
+        prepare_resumable_history_fixture(&server, "resume-normal-path", &control).await;
+    control.disarm();
+    control.clear_artifact_requests();
+
+    let out = tempfile::tempdir().expect("clone output");
+    let target = out.path().join("clone");
+    server
+        .client()
+        .install_repo_with_mode_at(
+            "acme/resume-normal-path",
+            "HEAD",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("normal full clone");
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
+
+    let counts = control.artifact_request_counts();
+    assert_eq!(counts.get(&history_hash), Some(&1));
+    assert!(
+        counts.values().all(|count| *count == 1),
+        "normal path must request every artifact once: {counts:?}"
+    );
+    assert!(
+        control
+            .artifact_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .all(|(_, range)| range.is_none()),
+        "normal path must send no Range request"
+    );
+}
+
+/// A real local-storage response closes after persisted bytes. The next request
+/// must start at that exact count and the final verified pack must install with
+/// a complete, fsck-clean checkout.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_history_pack_interruption_resumes_from_the_saved_byte_count() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::Normal);
+    let server = start_server_with_barrier(barrier).await;
+    let (history_hash, _len) =
+        prepare_resumable_history_fixture(&server, "resume-local", &control).await;
+    control.clear_artifact_requests();
+
+    let out = tempfile::tempdir().expect("clone output");
+    let target = out.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/resume-local",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    let artifact_requests = Arc::clone(&control.artifact_requests);
+    control
+        .entered
+        .await
+        .expect("history response reached interruption boundary");
+    control.proceed.send(()).expect("close initial response");
+    let outcome = clone
+        .await
+        .expect("clone task joined")
+        .expect("resumed local clone succeeds");
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), outcome.commit);
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
+    assert_eq!(
+        *control
+            .range_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        vec!["bytes=65536-"],
+        "the retry must start at the exact persisted byte count"
+    );
+    assert!(
+        control.max_chunk_sent.load(Ordering::SeqCst) <= 64 * 1024,
+        "local server chunks must stay bounded independently of artifact size"
+    );
+    let counts = artifact_request_counts(&artifact_requests);
+    assert_eq!(counts.get(&history_hash), Some(&2));
+    assert!(
+        counts
+            .iter()
+            .filter(|(hash, _)| *hash != &history_hash)
+            .all(|(_, count)| *count == 1),
+        "resuming the history pack must not repeat completed artifacts: {counts:?}"
+    );
+}
+
+/// A server that ignores Range must make the client truncate and restart only
+/// the interrupted history pack. The operation remains in its original staging
+/// tree and still publishes a correct checkout.
+#[tokio::test(flavor = "multi_thread")]
+async fn range_unsupported_restarts_only_the_failed_history_pack() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::Ignore);
+    let server = start_server_with_barrier(barrier).await;
+    let (history_hash, _) =
+        prepare_resumable_history_fixture(&server, "resume-ignore-range", &control).await;
+    control.clear_artifact_requests();
+
+    let out = tempfile::tempdir().expect("clone output");
+    let target = out.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/resume-ignore-range",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    let artifact_requests = Arc::clone(&control.artifact_requests);
+    control.entered.await.expect("initial response interrupted");
+    control.proceed.send(()).expect("close initial response");
+    clone
+        .await
+        .expect("clone task joined")
+        .expect("ignored Range falls back to one-artifact restart");
+    assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "3");
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
+    assert_eq!(
+        control
+            .range_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_slice(),
+        ["bytes=65536-"]
+    );
+    let counts = artifact_request_counts(&artifact_requests);
+    assert_eq!(counts.get(&history_hash), Some(&2));
+    assert!(
+        counts
+            .iter()
+            .filter(|(hash, _)| *hash != &history_hash)
+            .all(|(_, count)| *count == 1),
+        "ignored Range may restart only the failed history pack: {counts:?}"
+    );
+}
+
+/// A 206 response is accepted only when its Content-Range begins at the exact
+/// saved byte count and names the manifest length. Invalid range metadata is a
+/// permanent integrity failure and private staging is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_content_range_fails_without_publishing_or_looping() {
+    init(false);
+    let (barrier, control) =
+        hash_barrier_with_behavior(64 * 1024, true, ArtifactRangeBehavior::InvalidContentRange);
+    let server = start_server_with_barrier(barrier).await;
+    prepare_resumable_history_fixture(&server, "resume-bad-range", &control).await;
+
+    let out = tempfile::tempdir().expect("clone output");
+    let target = out.path().join("clone");
+    let clone_target = target.clone();
+    let client = server.client();
+    let clone = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/resume-bad-range",
+                "HEAD",
+                None,
+                clone_target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    control.entered.await.expect("initial response interrupted");
+    control.proceed.send(()).expect("close initial response");
+    let error = clone
+        .await
+        .expect("clone task joined")
+        .expect_err("invalid Content-Range must fail");
+    assert!(
+        format!("{error:#}").contains("invalid Content-Range"),
+        "unexpected error: {error:#}"
+    );
+    assert!(!target.exists(), "failed clone must publish no target");
+    assert!(
+        std::fs::read_dir(out.path())
+            .expect("read clone parent")
+            .next()
+            .is_none(),
+        "failed clone must remove private staging"
+    );
+    assert_eq!(
+        control
+            .range_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len(),
+        1,
+        "invalid range metadata is permanent, not an endless retry"
+    );
+}
+
 /// A transient 503 on artifact GETs must be retried on the same URL and the
 /// editable clone must still produce a correct repo. (The files-mode sibling
 /// lives in `e2e_roundtrip.rs`.)
@@ -591,10 +1036,6 @@ async fn wrong_archive_chunk_length_fails_without_a_url_refresh() {
         rendered.contains("size mismatch"),
         "expected a length failure, got: {rendered}"
     );
-    assert!(
-        !ripclone::client::is_stale_signed_url(&error),
-        "a wrong length must not enter the signed-URL refresh loop: {rendered}"
-    );
     assert!(!target.exists(), "a failed clone must publish no target");
     let leftovers: Vec<String> = std::fs::read_dir(out.path())
         .expect("read clone parent")
@@ -651,10 +1092,6 @@ async fn missing_archive_chunk_fails_without_a_url_refresh() {
     assert!(
         rendered.contains("404"),
         "a missing artifact must surface its 404: {rendered}"
-    );
-    assert!(
-        !ripclone::client::is_stale_signed_url(&error),
-        "a missing artifact must not enter the signed-URL refresh loop: {rendered}"
     );
     assert!(!target.exists(), "a failed clone must publish no target");
 }
@@ -807,11 +1244,6 @@ async fn the_authenticated_gateway_receives_the_client_credential() {
         assert!(
             rendered.contains("401") || rendered.contains("403"),
             "a {label} must be refused by the artifact route, got: {rendered}"
-        );
-        assert!(
-            !ripclone::client::is_stale_signed_url(&error),
-            "the gateway has no signed URL to refresh, so a refused credential is \
-             permanent: {rendered}"
         );
     }
 }

@@ -25,11 +25,11 @@ PROFILE="${MUSL_PROFILE:-ci}"
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repo_root/rust"
 
-BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone)
+BINS=(ripclone ripclone-server ripclone-worker)
 
 # One zigbuild of the lib *test* binary first — it pulls the whole graph with
 # cfg(test) and is what we need for the musl-only unit tests. Then build the
-# four release bins against the same target/profile so object reuse is maximal
+# three release bins against the same target/profile so object reuse is maximal
 # (two cargo invocations still share target/$TARGET/$PROFILE).
 echo "==> building the library test binary for $TARGET (profile: $PROFILE)"
 test_bin="$(cargo-zigbuild test --no-run --profile "$PROFILE" --locked \
@@ -96,8 +96,6 @@ docker run --rm --platform "$PLATFORM" \
     /b/ripclone --version
     /b/ripclone-server --version
     /b/ripclone-worker --help >/dev/null && echo "ripclone-worker: ok"
-    /b/git-remote-ripclone 2>&1 | head -1 >/dev/null && echo "git-remote-ripclone: ok"
-
     # ...and one of them must do real work: repeatedly boot the server (tokio,
     # rustls, sqlite, the local storage backend) and answer live requests. The
     # repetition catches connection-teardown faults that a single lucky boot can

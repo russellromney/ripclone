@@ -59,7 +59,22 @@ pub struct ArtifactBarrier {
     pub entered: Arc<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     pub proceed: Arc<StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     pub close_on_proceed: bool,
+    pub range_behavior: ArtifactRangeBehavior,
+    pub range_requests: Arc<StdMutex<Vec<String>>>,
+    /// Every artifact request observed while the fixture is installed. The
+    /// optional string is the request's Range header.
+    pub artifact_requests: Arc<StdMutex<Vec<(String, Option<String>)>>>,
+    pub max_chunk_sent: Arc<AtomicUsize>,
     pub consumed: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub enum ArtifactRangeBehavior {
+    #[default]
+    Normal,
+    Ignore,
+    InvalidContentRange,
+    CorruptBody,
 }
 
 /// Which artifact the barrier holds.
@@ -232,6 +247,7 @@ pub struct AdmissionTestProbe {
     pub embedded_notification_wakes: AtomicUsize,
     pub embedded_fallback_polls: AtomicUsize,
     pub claim_losses: AtomicUsize,
+    repo_reads_denied: AtomicBool,
     pub fetch_targets: StdMutex<Vec<String>>,
     pub builder_targets: StdMutex<Vec<String>>,
     pub failure_targets: StdMutex<Vec<(String, String)>>,
@@ -280,6 +296,7 @@ impl Default for AdmissionTestProbe {
             embedded_notification_wakes: AtomicUsize::new(0),
             embedded_fallback_polls: AtomicUsize::new(0),
             claim_losses: AtomicUsize::new(0),
+            repo_reads_denied: AtomicBool::new(false),
             fetch_targets: StdMutex::new(Vec::new()),
             builder_targets: StdMutex::new(Vec::new()),
             failure_targets: StdMutex::new(Vec::new()),
@@ -297,6 +314,17 @@ impl Default for AdmissionTestProbe {
 }
 
 impl AdmissionTestProbe {
+    /// Make subsequent repository authorization checks fail. This models an
+    /// active access revocation after a clone has already received a signed
+    /// artifact URL.
+    pub fn deny_repo_reads(&self) {
+        self.repo_reads_denied.store(true, Ordering::SeqCst);
+    }
+
+    pub fn allow_repo_reads(&self) {
+        self.repo_reads_denied.store(false, Ordering::SeqCst);
+    }
+
     pub fn fail_full_for(&self, commit: &str) {
         self.full_failure_targets
             .lock()
@@ -3745,6 +3773,9 @@ async fn authorize_repo_read(
     credential: Option<&secrecy::SecretString>,
     headers: &HeaderMap,
 ) -> Result<bool, Response> {
+    if admission_test_probe().is_some_and(|probe| probe.repo_reads_denied.load(Ordering::SeqCst)) {
+        return Err(forbidden_repo_response());
+    }
     if !state.require_repo_auth {
         return Ok(visibility_is_private(headers));
     }
@@ -5099,45 +5130,143 @@ async fn get_artifact(
         .into_response()
 }
 
-/// Return a response body that streams `data` but pauses after `barrier.after_bytes`
-/// bytes, signals the test, waits for the test to release it, and then either
-/// sends the rest of the bytes or errors out so the client sees a retryable
-/// transport failure.
-fn barrier_body(data: Vec<u8>, barrier: ArtifactBarrier) -> Body {
+const ARTIFACT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+enum ArtifactBodySource {
+    File(tokio::fs::File),
+    Ranges {
+        storage: crate::storage::StorageRef,
+        hash: String,
+        offset: u64,
+    },
+}
+
+/// Stream an artifact through a two-chunk bounded channel. Local storage uses
+/// one open file; uncommon non-file backends without signed URLs use fixed-size
+/// range reads. Neither path allocates according to the artifact's total size.
+fn artifact_body(
+    mut source: ArtifactBodySource,
+    len: u64,
+    barrier: Option<ArtifactBarrier>,
+) -> Body {
     let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
     tokio::spawn(async move {
-        let after = barrier.after_bytes.min(data.len());
-        let _ = tx.send(Ok(Bytes::from(data[..after].to_vec()))).await;
-        let entered = barrier
-            .entered
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(entered) = entered {
-            let _ = entered.send(());
-        }
-        let proceed = barrier
-            .proceed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let should_continue = if let Some(proceed) = proceed {
-            proceed.await.is_ok() && !barrier.close_on_proceed
-        } else {
-            false
-        };
-        if should_continue && after < data.len() {
-            let _ = tx.send(Ok(Bytes::from(data[after..].to_vec()))).await;
-        } else {
-            // Error out so reqwest surfaces a body-read failure rather than a
-            // clean short body. That makes the client's retry path run again with
-            // the now-expired credential.
-            let _ = tx
-                .send(Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "injected test barrier close",
-                )))
-                .await;
+        use tokio::io::AsyncReadExt;
+
+        let mut sent = 0u64;
+        let corrupt_body = barrier.as_ref().is_some_and(|barrier| {
+            matches!(barrier.range_behavior, ArtifactRangeBehavior::CorruptBody)
+        });
+        let mut corrupted = false;
+        let barrier_after = barrier.as_ref().map(|barrier| {
+            u64::try_from(barrier.after_bytes)
+                .unwrap_or(u64::MAX)
+                .min(len)
+        });
+        let mut barrier = barrier;
+        while sent < len {
+            if barrier_after == Some(sent) {
+                let barrier = barrier.take().expect("barrier exists at its boundary");
+                let entered = barrier
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                }
+                let proceed = barrier
+                    .proceed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                let should_continue = if let Some(proceed) = proceed {
+                    proceed.await.is_ok() && !barrier.close_on_proceed
+                } else {
+                    false
+                };
+                if !should_continue {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "injected test barrier close",
+                        )))
+                        .await;
+                    return;
+                }
+            }
+
+            let until_barrier = barrier_after
+                .filter(|after| *after > sent)
+                .map_or(u64::MAX, |after| after - sent);
+            let wanted = (len - sent)
+                .min(until_barrier)
+                .min(ARTIFACT_STREAM_CHUNK_BYTES as u64) as usize;
+            let read = match &mut source {
+                ArtifactBodySource::File(file) => {
+                    let mut buffer = vec![0u8; wanted];
+                    match file.read(&mut buffer).await {
+                        Ok(0) => Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "artifact file ended before its recorded length",
+                        )),
+                        Ok(read) => {
+                            buffer.truncate(read);
+                            Ok(buffer)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                ArtifactBodySource::Ranges {
+                    storage,
+                    hash,
+                    offset,
+                } => {
+                    let storage = Arc::clone(storage);
+                    let hash = hash.clone();
+                    let start = *offset;
+                    match tokio::task::spawn_blocking(move || {
+                        storage.get_range(&hash, start, wanted as u64)
+                    })
+                    .await
+                    {
+                        Ok(Ok(bytes)) if !bytes.is_empty() => {
+                            *offset += bytes.len() as u64;
+                            Ok(bytes)
+                        }
+                        Ok(Ok(_)) => Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "artifact range ended before its recorded length",
+                        )),
+                        Ok(Err(error)) => Err(std::io::Error::other(error)),
+                        Err(error) => Err(std::io::Error::other(error)),
+                    }
+                }
+            };
+            match read {
+                Ok(mut bytes) => {
+                    if let Some(barrier) = barrier.as_ref() {
+                        barrier
+                            .max_chunk_sent
+                            .fetch_max(bytes.len(), Ordering::SeqCst);
+                    }
+                    if corrupt_body
+                        && !corrupted
+                        && let Some(byte) = bytes.first_mut()
+                    {
+                        *byte ^= 0x01;
+                        corrupted = true;
+                    }
+                    sent += bytes.len() as u64;
+                    if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            }
         }
     });
     Body::from_stream(rx)
@@ -5148,6 +5277,19 @@ async fn serve_artifact(
     state: ServerState,
     headers: Option<axum::http::HeaderMap>,
 ) -> impl IntoResponse {
+    if let Some(barrier) = state.artifact_barrier.as_ref() {
+        let range = headers.as_ref().and_then(|headers| {
+            headers
+                .get(axum::http::header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
+        barrier
+            .artifact_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((hash.clone(), range));
+    }
     // If the backend can hand out a signed URL, redirect the client there.
     // The client can then use its own Range requests against the CDN/object store.
     // Use the same visibility-aware TTL as the ref path (a private repo gets a
@@ -5184,74 +5326,106 @@ async fn serve_artifact(
     };
 
     // Parse Range header if present.
-    let range = headers.as_ref().and_then(|h| {
-        h.get(axum::http::header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| parse_byte_range(v, total_size))
+    let requested_range = headers.as_ref().and_then(|h| {
+        let value = h
+            .get(axum::http::header::RANGE)
+            .and_then(|v| v.to_str().ok())?;
+        if let Some(barrier) = state
+            .artifact_barrier
+            .as_ref()
+            .filter(|barrier| barrier.target.matches(&hash))
+        {
+            barrier
+                .range_requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(value.to_string());
+        }
+        parse_byte_range(value, total_size)
     });
+    let range_behavior = state
+        .artifact_barrier
+        .as_ref()
+        .filter(|barrier| barrier.consumed.load(Ordering::SeqCst) && barrier.target.matches(&hash))
+        .map_or(ArtifactRangeBehavior::Normal, |barrier| {
+            barrier.range_behavior
+        });
+    let range = if matches!(range_behavior, ArtifactRangeBehavior::Ignore) {
+        None
+    } else {
+        requested_range
+    };
 
-    match range {
-        Some((start, end)) => {
-            let len = end - start + 1;
-            let hash_clone = hash.clone();
-            match tokio::task::spawn_blocking(move || {
-                state.storage.get_range(&hash_clone, start, len)
-            })
-            .await
-            {
-                Ok(Ok(data)) => {
-                    state.metrics.record_artifact_request(data.len() as u64);
-                    let content_range = format!("bytes {}-{}/{}", start, end, total_size);
-                    (
-                        StatusCode::PARTIAL_CONTENT,
-                        [
-                            ("content-range", content_range.as_str()),
-                            ("content-length", &data.len().to_string()),
-                        ],
-                        data,
-                    )
-                        .into_response()
-                }
-                _ => {
-                    state.metrics.record_error();
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(ErrorResponse {
-                            error: format!("artifact not found: {}", hash),
-                        }),
-                    )
-                        .into_response()
-                }
+    if total_size == 0 {
+        state.metrics.record_artifact_request(0);
+        return (StatusCode::OK, [("content-length", "0")], Body::empty()).into_response();
+    }
+
+    let (start, end, status) = range
+        .map(|(start, end)| (start, end, StatusCode::PARTIAL_CONTENT))
+        .unwrap_or((0, total_size.saturating_sub(1), StatusCode::OK));
+    let len = end - start + 1;
+    let source = match tokio::task::spawn_blocking({
+        let storage = Arc::clone(&state.storage);
+        let hash = hash.clone();
+        move || -> anyhow::Result<ArtifactBodySource> {
+            if let Some(mut file) = storage.open_file(&hash)? {
+                use std::io::{Seek, SeekFrom};
+                file.seek(SeekFrom::Start(start))?;
+                Ok(ArtifactBodySource::File(tokio::fs::File::from_std(file)))
+            } else {
+                Ok(ArtifactBodySource::Ranges {
+                    storage,
+                    hash,
+                    offset: start,
+                })
             }
         }
-        None => {
-            let hash_clone = hash.clone();
-            match tokio::task::spawn_blocking(move || state.storage.get(&hash_clone)).await {
-                Ok(Ok(data)) => {
-                    state.metrics.record_artifact_request(data.len() as u64);
-                    if let Some(barrier) = state.artifact_barrier.clone() {
-                        if !barrier.consumed.load(Ordering::SeqCst)
-                            && data.len() > barrier.after_bytes
-                            && barrier.target.matches(&hash)
-                        {
-                            barrier.consumed.store(true, Ordering::SeqCst);
-                            return (StatusCode::OK, barrier_body(data, barrier)).into_response();
-                        }
-                    }
-                    (StatusCode::OK, data).into_response()
-                }
-                _ => {
-                    state.metrics.record_error();
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(ErrorResponse {
-                            error: format!("artifact not found: {}", hash),
-                        }),
-                    )
-                        .into_response()
-                }
-            }
+    })
+    .await
+    {
+        Ok(Ok(source)) => source,
+        _ => {
+            state.metrics.record_error();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("artifact not found: {}", hash),
+                }),
+            )
+                .into_response();
         }
+    };
+    state.metrics.record_artifact_request(len);
+    let barrier = state.artifact_barrier.clone().and_then(|barrier| {
+        let matches = status == StatusCode::OK
+            && !barrier.consumed.load(Ordering::SeqCst)
+            && len > barrier.after_bytes as u64
+            && barrier.target.matches(&hash);
+        matches.then(|| {
+            barrier.consumed.store(true, Ordering::SeqCst);
+            barrier
+        })
+    });
+    let body = artifact_body(source, len, barrier);
+    if status == StatusCode::PARTIAL_CONTENT {
+        let content_range = if matches!(range_behavior, ArtifactRangeBehavior::InvalidContentRange)
+        {
+            format!("bytes 0-{end}/{total_size}")
+        } else {
+            format!("bytes {start}-{end}/{total_size}")
+        };
+        (
+            status,
+            [
+                ("content-range", content_range),
+                ("content-length", len.to_string()),
+            ],
+            body,
+        )
+            .into_response()
+    } else {
+        (status, [("content-length", len.to_string())], body).into_response()
     }
 }
 

@@ -86,7 +86,7 @@ fn public_links_to_internal_docs_disclose_historical_status() {
 ///
 /// A line counts only when `ripclone` is the *command* being run — the first
 /// word, after stripping a shell prompt, `sudo`, and `KEY=value` env prefixes.
-/// That skips `ripclone-server`, `ripclone://` URLs, and prose or YAML that
+/// That skips `ripclone-server` and prose or YAML that
 /// merely contains the word (e.g. `name: ripclone cache`).
 fn documented_verbs(markdown: &str) -> BTreeSet<String> {
     let mut verbs = BTreeSet::new();

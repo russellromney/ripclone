@@ -21,6 +21,12 @@ pub trait StorageBackend: Send + Sync {
     /// Fetch a byte range from the object by hash.
     fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>>;
 
+    /// Open a local artifact for bounded server-side streaming. Remote stores
+    /// normally return signed URLs and leave this as `None`.
+    fn open_file(&self, _hash: &str) -> Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+
     /// Store the full object by hash.
     fn put(&self, hash: &str, data: &[u8]) -> Result<()>;
 
@@ -122,6 +128,13 @@ impl StorageBackend for LocalStorage {
 
     fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
         self.cas.get_range(hash, start, len)
+    }
+
+    fn open_file(&self, hash: &str) -> Result<Option<std::fs::File>> {
+        let path = self.cas.path(hash);
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("open CAS object {hash} at {}", path.display()))?;
+        Ok(Some(file))
     }
 
     fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
