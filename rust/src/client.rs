@@ -339,6 +339,19 @@ struct PinnedArtifactRefresh {
     artifact: String,
     manifest: String,
     metadata: String,
+    urls: tokio::sync::watch::Sender<ArtifactUrlSnapshot>,
+    refresh_gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+struct ArtifactUrlSnapshot {
+    generation: u64,
+    response: Arc<RefResponse>,
+}
+
+struct ArtifactDownloadUrl {
+    generation: u64,
+    signed_url: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -381,6 +394,16 @@ impl ArtifactUrlKind {
             Self::PackChunk(index) => format!("pack {index}"),
             Self::Midx => "multi-pack-index".to_string(),
             Self::IdxBundle => "idx bundle".to_string(),
+        }
+    }
+}
+
+impl PinnedArtifactRefresh {
+    fn current_url(&self, kind: ArtifactUrlKind) -> ArtifactDownloadUrl {
+        let snapshot = self.urls.borrow();
+        ArtifactDownloadUrl {
+            generation: snapshot.generation,
+            signed_url: kind.select(&snapshot.response),
         }
     }
 }
@@ -886,7 +909,6 @@ async fn wait_for_test_before_buffered_artifact(hash: &str) -> Result<()> {
 /// verification succeed.
 async fn fetch_artifact_to_temp(
     client: &Client,
-    initial_signed_url: Option<&str>,
     hash: &str,
     expected_len: u64,
     dir: &Path,
@@ -907,7 +929,8 @@ async fn fetch_artifact_to_temp(
     let mut file = tokio::fs::File::from_std(std_file);
     let mut hasher = sha2::Sha256::new();
     let mut saved = 0u64;
-    let mut signed_url = initial_signed_url.map(str::to_string);
+    let kind = ArtifactUrlKind::PackChunk(pack_index);
+    let mut artifact_url = refresh.current_url(kind);
     let (max_attempts, base_backoff_ms) = fetch_retry_config();
 
     for attempt in 1..=max_attempts {
@@ -926,7 +949,8 @@ async fn fetch_artifact_to_temp(
         }
 
         let gateway_url = format!("{}/v1/artifacts/{hash}", client.server);
-        let (http, url, signed) = client.artifact_endpoint(signed_url.as_deref(), &gateway_url);
+        let (http, url, signed) =
+            client.artifact_endpoint(artifact_url.signed_url.as_deref(), &gateway_url);
         record_test_download_request(hash, saved, signed, url);
         let mut request = http.get(url);
         if saved > 0 {
@@ -946,17 +970,10 @@ async fn fetch_artifact_to_temp(
         if let Some(failure) = classify_fetch_status(response.status(), signed, hash) {
             match failure {
                 FetchFailure::RefreshUrl(_) if attempt < max_attempts => {
-                    signed_url = Some(
-                        client
-                            .refresh_pinned_artifact_url(
-                                refresh,
-                                ArtifactUrlKind::PackChunk(pack_index),
-                            )
-                            .await
-                            .with_context(|| {
-                                format!("refresh URL for interrupted artifact {hash}")
-                            })?,
-                    );
+                    artifact_url = client
+                        .refresh_pinned_artifact_url(refresh, kind, artifact_url.generation)
+                        .await
+                        .with_context(|| format!("refresh URL for interrupted artifact {hash}"))?;
                     continue;
                 }
                 FetchFailure::Retry(_) if attempt < max_attempts => {
@@ -1966,7 +1983,27 @@ impl Client {
         &self,
         refresh: &PinnedArtifactRefresh,
         kind: ArtifactUrlKind,
-    ) -> Result<String> {
+        observed_generation: u64,
+    ) -> Result<ArtifactDownloadUrl> {
+        // One operation owns one complete URL-set snapshot. Serialize only
+        // refresh I/O; after acquiring the permit, recheck the generation so
+        // concurrent artifacts reuse the leader's complete response instead
+        // of each asking the server to sign the full artifact list again.
+        let _permit = refresh
+            .refresh_gate
+            .acquire()
+            .await
+            .expect("operation-local URL refresh semaphore is never closed");
+        let latest = refresh.current_url(kind);
+        if latest.generation > observed_generation {
+            anyhow::ensure!(
+                latest.signed_url.is_some(),
+                "pinned artifact URL refresh omitted {}",
+                kind.label()
+            );
+            return Ok(latest);
+        }
+
         let encoded_branch = urlencoding::encode(&refresh.request_branch);
         let mut url = self.repo_url(&refresh.repo_path, &format!("/refs/{encoded_branch}"));
         url.push_str(&format!(
@@ -2017,8 +2054,21 @@ impl Client {
                 && info.metadata_chunk == refresh.metadata,
             "pinned artifact URL refresh changed the selected artifact"
         );
-        kind.select(&info)
-            .with_context(|| format!("pinned artifact URL refresh omitted {}", kind.label()))
+        let signed_url = kind
+            .select(&info)
+            .with_context(|| format!("pinned artifact URL refresh omitted {}", kind.label()))?;
+        let generation = latest
+            .generation
+            .checked_add(1)
+            .context("artifact URL refresh generation overflow")?;
+        refresh.urls.send_replace(ArtifactUrlSnapshot {
+            generation,
+            response: Arc::new(info),
+        });
+        Ok(ArtifactDownloadUrl {
+            generation,
+            signed_url: Some(signed_url),
+        })
     }
 
     /// Fetch any content-addressed artifact (pack, idx, index, archive, manifest).
@@ -2097,7 +2147,6 @@ impl Client {
     async fn fetch_verified_artifact_for_install(
         &self,
         hash: &str,
-        signed_url: Option<&str>,
         expected_len: Option<u64>,
         refresh: &PinnedArtifactRefresh,
         kind: ArtifactUrlKind,
@@ -2111,10 +2160,11 @@ impl Client {
             return Ok(data.into());
         }
 
-        let mut signed_url = signed_url.map(str::to_string);
+        let mut artifact_url = refresh.current_url(kind);
         let (max_attempts, base_backoff_ms) = fetch_retry_config();
         for attempt in 1..=max_attempts {
-            let (http, url, signed) = self.artifact_endpoint(signed_url.as_deref(), &gateway_url);
+            let (http, url, signed) =
+                self.artifact_endpoint(artifact_url.signed_url.as_deref(), &gateway_url);
             match fetch_artifact_bytes_once(http, url, hash, expected_len, signed).await {
                 Ok(data) => {
                     if let Some(cache) = &self.cache
@@ -2125,16 +2175,15 @@ impl Client {
                     return Ok(data);
                 }
                 Err(FetchFailure::RefreshUrl(_)) if attempt < max_attempts => {
-                    signed_url = Some(
-                        self.refresh_pinned_artifact_url(refresh, kind)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "refresh URL for buffered artifact {hash} ({})",
-                                    kind.label()
-                                )
-                            })?,
-                    );
+                    artifact_url = self
+                        .refresh_pinned_artifact_url(refresh, kind, artifact_url.generation)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "refresh URL for buffered artifact {hash} ({})",
+                                kind.label()
+                            )
+                        })?;
                 }
                 Err(FetchFailure::Retry(_)) if attempt < max_attempts => {
                     tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
@@ -2183,13 +2232,12 @@ impl Client {
     async fn fetch_chunk_ref_to_temp(
         &self,
         chunk: &crate::clonepack::ChunkRef,
-        signed_url: Option<&str>,
         dir: &Path,
         refresh: &PinnedArtifactRefresh,
         pack_index: usize,
     ) -> Result<(tempfile::NamedTempFile, u64)> {
         let hash = hash_to_hex(&chunk.hash);
-        fetch_artifact_to_temp(self, signed_url, &hash, chunk.len, dir, refresh, pack_index).await
+        fetch_artifact_to_temp(self, &hash, chunk.len, dir, refresh, pack_index).await
     }
 
     /// Fetch many chunk refs in parallel, preserving order.
@@ -2693,6 +2741,10 @@ impl Client {
         if info.clonepack_manifest.is_empty() {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
+        let (artifact_urls, _) = tokio::sync::watch::channel(ArtifactUrlSnapshot {
+            generation: 0,
+            response: Arc::new(info.clone()),
+        });
         let artifact_refresh = PinnedArtifactRefresh {
             repo_path: repo_path.to_string(),
             request_branch: identity
@@ -2710,6 +2762,8 @@ impl Client {
             artifact: artifact.clone(),
             manifest: info.clonepack_manifest.clone(),
             metadata: info.metadata_chunk.clone(),
+            urls: artifact_urls,
+            refresh_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         // Hand the decoded manifest to the archive downloader over a oneshot.
@@ -2722,7 +2776,6 @@ impl Client {
         let manifest_task = AbortOnDrop::new(
             self.clone().spawn_fetch_manifest(
                 info.clonepack_manifest.clone(),
-                info.clonepack_manifest_url.clone(),
                 artifact.clone(),
                 artifact_refresh.clone(),
                 manifest_tx,
@@ -2731,13 +2784,9 @@ impl Client {
         );
 
         let metadata_hash = info.metadata_chunk.clone();
-        let metadata_url = info.metadata_chunk_url.clone();
         let metadata_task = AbortOnDrop::new(
-            self.clone().spawn_fetch_metadata(
-                metadata_hash,
-                metadata_url,
-                artifact_refresh.clone(),
-            ),
+            self.clone()
+                .spawn_fetch_metadata(metadata_hash, artifact_refresh.clone()),
             cleanup.clone(),
         );
 
@@ -2775,12 +2824,10 @@ impl Client {
             None
         };
 
-        let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
             Some(AbortOnDrop::new(
                 self.clone().spawn_chunk_downloads(
-                    archive_urls,
                     artifact_refresh.clone(),
                     manifest_rx,
                     archive_async_tx,
@@ -2964,7 +3011,6 @@ impl Client {
             prebuilt_blob_pack_bytes = self
                 .install_editable_packs(
                     &manifest,
-                    &info,
                     &pack_dir,
                     &install_root,
                     &metadata,
@@ -3183,14 +3229,16 @@ impl Client {
             .await;
     }
 
-    /// Editable single-download path: download the small depth packs in parallel
-    /// and, as each lands, install it into `pack_dir` and extract the blobs it
-    /// contains into `work_tree` — so download and extraction overlap. Uses the
+    /// Editable single-download path: download depth packs in parallel and, as
+    /// each lands, install it into `pack_dir` and extract its blobs into
+    /// `work_tree` so download and extraction overlap. History packs use the
+    /// file-backed resumable path. Current-tree packs remain buffered because
+    /// extraction consumes their bytes directly; one oversized Git object can
+    /// therefore still make client memory scale with that HEAD pack. Uses the
     /// manifest file table to map blobs to paths. Returns total bytes downloaded.
     async fn install_editable_packs(
         &self,
         manifest: &ClonepackManifest,
-        info: &RefResponse,
         pack_dir: &std::path::Path,
         work_tree: &std::path::Path,
         metadata: &MetadataChunk,
@@ -3212,7 +3260,6 @@ impl Client {
         let idx_bundle_task = {
             let client = self.clone();
             let bundle_ref = bundle_ref.clone();
-            let idx_bundle_url = info.idx_bundle_url.clone();
             let artifact_refresh = artifact_refresh.clone();
             AbortOnDrop::new(
                 tokio::spawn(async move {
@@ -3220,7 +3267,6 @@ impl Client {
                     client
                         .fetch_verified_artifact_for_install(
                             &hash,
-                            idx_bundle_url.as_deref(),
                             Some(bundle_ref.len),
                             &artifact_refresh,
                             ArtifactUrlKind::IdxBundle,
@@ -3234,7 +3280,6 @@ impl Client {
         let midx_task = manifest.midx.as_ref().map(|midx_ref| {
             let client = self.clone();
             let midx_ref = midx_ref.clone();
-            let midx_url = info.midx_url.clone();
             let artifact_refresh = artifact_refresh.clone();
             AbortOnDrop::new(
                 tokio::spawn(async move {
@@ -3242,7 +3287,6 @@ impl Client {
                     client
                         .fetch_verified_artifact_for_install(
                             &hash,
-                            midx_url.as_deref(),
                             Some(midx_ref.len),
                             &artifact_refresh,
                             ArtifactUrlKind::Midx,
@@ -3284,10 +3328,6 @@ impl Client {
         let download_conc = tuning.editable_download_concurrency;
         let parse_conc = tuning.pack_parse_threads;
 
-        // Signed URLs (one per pack, matching manifest.packs order). Empty
-        // entries fall back to the gateway by hash; with an object-store backend
-        // these point straight at the bucket so bytes bypass the server.
-        let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
         // Fetch the required bundle once and slice every verified pack idx from it.
         let idx_bundle = Arc::new(
             idx_bundle_task
@@ -3318,7 +3358,6 @@ impl Client {
         // Stage 1: download packs (network concurrency `download_conc`).
         let downloads = stream::iter(jobs).map(|(i, entry)| {
             let client = self.clone();
-            let pack_url = pack_urls.get(i).and_then(|o| o.clone());
             let idx_bundle = idx_bundle.clone();
             let history_only = entry.history_only;
             let pack_dir = pack_dir.to_path_buf();
@@ -3332,13 +3371,7 @@ impl Client {
                 let pack_fetch_start = std::time::Instant::now();
                 let pack_body = if history_only {
                     let (file, len) = client
-                        .fetch_chunk_ref_to_temp(
-                            pack_ref,
-                            pack_url.as_deref(),
-                            &pack_dir,
-                            &artifact_refresh,
-                            i,
-                        )
+                        .fetch_chunk_ref_to_temp(pack_ref, &pack_dir, &artifact_refresh, i)
                         .await
                         .with_context(|| format!("stream history pack {}", i))?;
                     crate::perf::record_editable_pack_fetch(pack_fetch_start.elapsed(), len);
@@ -3348,7 +3381,6 @@ impl Client {
                     let bytes = client
                         .fetch_verified_artifact_for_install(
                             &hash,
-                            pack_url.as_deref(),
                             Some(pack_ref.len),
                             &artifact_refresh,
                             ArtifactUrlKind::PackChunk(i),
@@ -3562,7 +3594,6 @@ impl Client {
     fn spawn_fetch_manifest(
         self,
         hash: String,
-        signed_url: Option<String>,
         pinned: String,
         refresh: PinnedArtifactRefresh,
         manifest_tx: tokio::sync::oneshot::Sender<Arc<ClonepackManifest>>,
@@ -3571,7 +3602,6 @@ impl Client {
             let data = self
                 .fetch_verified_artifact_for_install(
                     &hash,
-                    signed_url.as_deref(),
                     None,
                     &refresh,
                     ArtifactUrlKind::Manifest,
@@ -3593,14 +3623,12 @@ impl Client {
     fn spawn_fetch_metadata(
         self,
         hash: String,
-        signed_url: Option<String>,
         refresh: PinnedArtifactRefresh,
     ) -> tokio::task::JoinHandle<Result<MetadataChunk>> {
         tokio::spawn(async move {
             let data = self
                 .fetch_verified_artifact_for_install(
                     &hash,
-                    signed_url.as_deref(),
                     None,
                     &refresh,
                     ArtifactUrlKind::Metadata,
@@ -3614,15 +3642,12 @@ impl Client {
 
     fn spawn_chunk_downloads(
         self,
-        signed_urls: Option<Vec<Option<String>>>,
         refresh: PinnedArtifactRefresh,
         manifest_rx: tokio::sync::oneshot::Receiver<Arc<ClonepackManifest>>,
         tx: tokio::sync::mpsc::Sender<(usize, Result<bytes::Bytes>)>,
     ) -> tokio::task::JoinHandle<Result<u64>> {
         tokio::spawn(async move {
             use futures::stream::{self, StreamExt, TryStreamExt};
-
-            let signed_urls: Vec<Option<String>> = signed_urls.unwrap_or_default();
 
             // Wait for the manifest so the downloader follows its chunk table,
             // not a possibly-stale signed-URL list. A receive error means the
@@ -3637,19 +3662,15 @@ impl Client {
             // downstream bridge/extractor falls behind, futures await `send()`
             // without blocking Tokio worker threads.
             let conc = ClientTuning::load().archive_fetch_concurrency;
-            let jobs: Vec<(usize, ChunkRef, Option<String>)> = manifest
+            let jobs: Vec<(usize, ChunkRef)> = manifest
                 .archive_chunks
                 .iter()
                 .cloned()
                 .enumerate()
-                .map(|(index, chunk_ref)| {
-                    let signed_url = signed_urls.get(index).cloned().flatten();
-                    (index, chunk_ref, signed_url)
-                })
                 .collect();
 
             stream::iter(jobs)
-                .map(|(index, chunk_ref, signed_url)| {
+                .map(|(index, chunk_ref)| {
                     let client = self.clone();
                     let refresh = refresh.clone();
                     let tx = tx.clone();
@@ -3659,7 +3680,6 @@ impl Client {
                         let bytes = client
                             .fetch_verified_artifact_for_install(
                                 &hash,
-                                signed_url.as_deref(),
                                 Some(chunk_ref.len),
                                 &refresh,
                                 ArtifactUrlKind::ArchiveChunk(index),

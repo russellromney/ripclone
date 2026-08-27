@@ -52,5 +52,8 @@ from the HEAD-closure pack while history-only packs remain on disk for Git.
 - Local cache cleanup removes an object only after confirming its remote copy.
 - A corrupt local CAS object must not be silently replaced after its bytes have
   entered an output artifact.
-- Metadata and manifests are small enough to use buffered APIs; large packs,
-  archive bundles, and frame objects should use file or streaming APIs.
+- Metadata, manifests, and bounded-size archive bundles use buffered APIs.
+  Large history packs use the file-backed streaming/resume path. Current-tree
+  HEAD packs remain buffered for direct extraction; because one oversized Git
+  object can make a HEAD pack arbitrarily large, that is a known client-memory
+  limitation rather than part of the large-history-pack guarantee.

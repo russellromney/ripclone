@@ -22,6 +22,7 @@ context; it is not current operational guidance.
 - **Dead client entry points removed**: `install_ref`, `install_repo`, `install_repo_with_mode`, `install_prebuilt_blob_pack`, `install_chunked_pack`, `manifest::verify_archive`, and the unused cache switch on the artifact fetch. `install_repo_with_mode_at` is the retained install entry point and tests now drive it.
 - **Byte and streamed-file artifact downloads share one set of rules** (`rust/src/client.rs`): the same HTTP request, status classification, retry budget, length + SHA-256 verification, and credential rule serve both outputs. Only where the bytes land differs — small artifacts stay a refcounted buffer, large history packs stream to one temporary file that is verified and renamed into `.git/objects/pack/`.
 - **Signed-URL failures are classified instead of lumped together**: transport errors, 408, 429, and 5xx retry the same URL with the existing bounded backoff; 401 or 403 from a signed object URL asks the clone loop to refresh URLs for the same pinned commit; 404, a wrong length, and a wrong hash fail immediately instead of entering the refresh loop. A signed object URL never receives the ripclone credential.
+- **URL refresh is operation-local and shared across artifacts**: a clone retains the newest complete signed-URL response. Queued artifacts select from that response when they start, and concurrent rejections singleflight one exact-commit refresh instead of regenerating and discarding the full URL set once per artifact.
 
 ## One current wire implementation
 

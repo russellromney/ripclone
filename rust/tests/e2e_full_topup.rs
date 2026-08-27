@@ -1998,11 +1998,11 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
     let server = start_server().await;
 
     let origin = make_origin("acme", "resume-minio");
-    let noise = |seed: u64| {
+    let noise = |seed: u64, len: usize| {
         const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
         let mut state = seed | 1;
-        let mut bytes = Vec::with_capacity(512 * 1024);
-        while bytes.len() < 512 * 1024 {
+        let mut bytes = Vec::with_capacity(len);
+        while bytes.len() < len {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
@@ -2010,9 +2010,9 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
         }
         String::from_utf8(bytes).expect("noise is ascii")
     };
-    let a_text = noise(211);
+    let a_text = noise(211, 512 * 1024);
     origin.commit(&[("large.txt", a_text.as_str())], "A");
-    let b_text = noise(223);
+    let b_text = noise(223, 512 * 1024);
     let b = origin.commit(&[("large.txt", b_text.as_str())], "B");
     origin.publish();
     server
@@ -2080,8 +2080,18 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
 
     // Advance the real branch and build C while the B clone is paused. The URL
     // refresh that follows must remain an exact-B metadata read.
-    let c_text = noise(227);
-    let c = origin.commit(&[("large.txt", c_text.as_str())], "C");
+    let c_text = noise(227, 512 * 1024);
+    // More than CDC_MAX guarantees multiple archive frames; high-entropy
+    // printable bytes keep the compressed download above the 4 MiB bundle
+    // target so the Files clone has genuinely queued MinIO chunks.
+    let c_archive_text = noise(229, 17 * 1024 * 1024);
+    let c = origin.commit(
+        &[
+            ("large.txt", c_text.as_str()),
+            ("archive-large.txt", c_archive_text.as_str()),
+        ],
+        "C",
+    );
     origin.publish();
     let ready_c = server
         .client()
@@ -2210,6 +2220,15 @@ signed_requests_without_ripclone_auth={}",
         .fetch_clonepack(&ready_c_files)
         .await
         .expect("fetch Files(C) manifest");
+    assert!(
+        c_files_manifest.archive_chunks.len() > 1,
+        "Files(C) must publish multiple queued archive chunks"
+    );
+    let archive_hashes: Vec<String> = c_files_manifest
+        .archive_chunks
+        .iter()
+        .map(|chunk| ripclone::clonepack::hash_to_hex(&chunk.hash))
+        .collect();
     let archive_hash = ripclone::clonepack::hash_to_hex(
         &c_files_manifest
             .archive_chunks
@@ -2223,6 +2242,7 @@ signed_requests_without_ripclone_auth={}",
         let _pause_hash = ScopedEnvVar::set("RIPCLONE_TEST_PAUSE_BUFFERED_ARTIFACT", &archive_hash);
         let _pause_dir = ScopedEnvVar::set("RIPCLONE_TEST_PAUSE_BUFFERED_DIR", &pause);
         let _buffered_audit = ScopedEnvVar::set("RIPCLONE_TEST_DOWNLOAD_AUDIT", &buffered_audit);
+        let _serial_downloads = ScopedEnvVar::set("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
         let files_output = tempfile::tempdir().expect("buffered Files output");
         let files_target = files_output.path().join("clone");
         let files_target_task = files_target.clone();
@@ -2265,6 +2285,12 @@ signed_requests_without_ripclone_auth={}",
             std::fs::read_to_string(files_target.join("large.txt")).unwrap(),
             c_text
         );
+        assert_eq!(
+            std::fs::metadata(files_target.join("archive-large.txt"))
+                .expect("materialize large archive fixture")
+                .len(),
+            c_archive_text.len() as u64
+        );
         let trace = probe
             .http_trace
             .lock()
@@ -2290,6 +2316,18 @@ signed_requests_without_ripclone_auth={}",
             "expired and refreshed archive: {requests:?}"
         );
         assert!(requests.iter().all(|request| request.contains("offset=0")));
+        for hash in archive_hashes.iter().skip(1) {
+            let queued_requests: Vec<_> = audit_text
+                .lines()
+                .filter(|line| line.contains(&format!("hash={hash}")))
+                .collect();
+            assert_eq!(
+                queued_requests.len(),
+                1,
+                "queued chunk must use the retained refreshed URL set: {queued_requests:?}"
+            );
+            assert!(queued_requests[0].contains("offset=0"));
+        }
     }
 
     let ready_c_head = server
@@ -2388,7 +2426,9 @@ signed_requests_without_ripclone_auth={}",
     }
     println!(
         "MINIO_BUFFERED_REFRESH_EVIDENCE files_restart_offset=0 head_restart_offset=0 \
-exact_c_refreshes=2 no_whole_clone_restart=true"
+files_chunks={} files_ref_refreshes=1 queued_chunks_reused=true \
+exact_c_refreshes=2 no_whole_clone_restart=true",
+        archive_hashes.len()
     );
 
     // Negative row: the signed transfer starts while repository access is
@@ -2508,11 +2548,11 @@ exact_c_refreshes=2 no_whole_clone_restart=true"
     // ready B must neither replace it nor make the clone fail.
     let topup_server = start_server().await;
     let topup_origin = make_origin("acme", "topup-refresh-minio");
-    let topup_a1 = noise(307);
+    let topup_a1 = noise(307, 512 * 1024);
     topup_origin.commit(&[("large.txt", topup_a1.as_str())], "A1");
-    let topup_a2 = noise(311);
+    let topup_a2 = noise(311, 512 * 1024);
     topup_origin.commit(&[("large.txt", topup_a2.as_str())], "A2");
-    let topup_a3 = noise(313);
+    let topup_a3 = noise(313, 512 * 1024);
     let topup_a = topup_origin.commit(&[("large.txt", topup_a3.as_str())], "A3");
     topup_origin.publish();
     topup_server
@@ -2544,7 +2584,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true"
     assert!(topup_a_history.len > 64 * 1024);
     let topup_a_history_hash = ripclone::clonepack::hash_to_hex(&topup_a_history.hash);
 
-    let topup_b_text = noise(317);
+    let topup_b_text = noise(317, 512 * 1024);
     let topup_b = topup_origin.commit(&[("large.txt", topup_b_text.as_str())], "B");
     topup_origin.publish();
     let topup_head_barrier = controls.path().join("topup-head-barrier");
