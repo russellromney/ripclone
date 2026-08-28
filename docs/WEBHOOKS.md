@@ -165,6 +165,7 @@ Authenticated with the server token (the same `RIPCLONE_SERVER_TOKEN` that gates
 `/build`):
 
 - `POST   /v1/repos/{provider}/{owner}/{repo}/add` — add the repo and admit its first exact build
+- `GET    /v1/repos` — list the server's added repository identities
 - `DELETE /v1/repos/{provider}/{owner}/{repo}/add` — remove it
 
 `add` is idempotent and admits an initial exact build. Its HTTP response and CLI
@@ -178,17 +179,24 @@ The CLI wraps the API against the configured server:
 
 ```
 ripclone add owner/repo          # make it cloneable and eligible for exact pushes
+ripclone list                    # print stable names accepted by the CLI
+ripclone rm owner/repo           # remove only the registration
 ```
 
-Provider-prefixed forms — `gitlab:group/proj`, `gitea:owner/repo` — use the same
-natural-key convention as the allowlist. Removal is server-token-gated via the
-`DELETE …/add` endpoint.
+CLI provider-qualified names use a colon: `gitlab:group/sub/proj` or
+`gitea:owner/repo`. The webhook allowlist uses `RepoId::natural_key`, whose
+non-GitHub provider prefix uses a slash instead:
+`gitlab/group/sub/proj` or `gitea/owner/repo`. These are intentionally separate
+formats. Every line printed by `list` can be passed to `rm`, even if that
+provider is not configured in the local CLI. Both operations are authenticated
+server-level controls; they do not probe the upstream provider.
 
 ### Storage
 
 The added-repo set is a table in the server-owned SQLite/Turso control database,
-alongside exact results and durable jobs. Artifact bytes remain in the selected
-local or S3-compatible storage backend.
+alongside exact results and durable jobs. Removing a registration does not
+delete exact results or local/S3-compatible artifact bytes, and does not cancel
+admitted or running jobs.
 
 ### How it combines with the allowlist
 

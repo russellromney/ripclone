@@ -1228,6 +1228,7 @@ pub struct RegionStorageEntry {
 
 pub fn build_app(state: ServerState) -> Router {
     let protected = Router::new()
+        .route("/v1/repos", get(list_added_repos))
         // Single catch-all route for all provider-qualified repo endpoints.
         .route("/v1/repos/{*path}", get(dispatch_repos_get))
         .route("/v1/repos/{*path}", post(dispatch_repos_post))
@@ -2849,6 +2850,28 @@ async fn dispatch_repos_delete(
         .into_response()
 }
 
+async fn list_added_repos(State(state): State<ServerState>) -> Response {
+    match state.ref_store.list_added_repos().await {
+        Ok(repos) => Json(
+            repos
+                .into_iter()
+                .map(|added| added.repo_id)
+                .collect::<Vec<RepoId>>(),
+        )
+        .into_response(),
+        Err(e) => {
+            state.metrics.record_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("list added repos failed: {e}"),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn dispatch_git_get(
     Path(path): Path<String>,
     Query(query): Query<GitServiceQuery>,
@@ -4357,6 +4380,20 @@ async fn add_repo_inner(
 }
 
 async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Response {
+    match state.ref_store.load_added_repo(&repo_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return repo_not_added_response(),
+        Err(e) => {
+            state.metrics.record_error();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("added repo lookup failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    }
     if let Err(e) = state.ref_store.remove_added_repo(&repo_id).await {
         state.metrics.record_error();
         return (
@@ -8048,6 +8085,7 @@ mod tests {
         path: PathBuf,
         inner: tokio::sync::OnceCell<Arc<crate::meta::SqlRefStore>>,
         fail_next_result_read: AtomicBool,
+        fail_next_added_repo_read: AtomicBool,
     }
 
     impl TestSqlRefStore {
@@ -8056,11 +8094,16 @@ mod tests {
                 path,
                 inner: tokio::sync::OnceCell::new(),
                 fail_next_result_read: AtomicBool::new(false),
+                fail_next_added_repo_read: AtomicBool::new(false),
             }
         }
 
         fn fail_next_result_read(&self) {
             self.fail_next_result_read.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_added_repo_read(&self) {
+            self.fail_next_added_repo_read.store(true, Ordering::SeqCst);
         }
 
         async fn store(&self) -> anyhow::Result<&Arc<crate::meta::SqlRefStore>> {
@@ -8128,6 +8171,9 @@ mod tests {
             self.store().await?.add_repo(repo).await
         }
         async fn load_added_repo(&self, repo_id: &RepoId) -> anyhow::Result<Option<AddedRepo>> {
+            if self.fail_next_added_repo_read.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected added-repository read failure");
+            }
             self.store().await?.load_added_repo(repo_id).await
         }
         async fn remove_added_repo(&self, repo_id: &RepoId) -> anyhow::Result<()> {
@@ -8280,6 +8326,127 @@ mod tests {
 
     fn auth_header() -> String {
         format!("Ripclone {}", hex::encode(Sha256::digest("secret")))
+    }
+
+    #[tokio::test]
+    async fn repository_list_is_authenticated_and_returns_repo_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let github = RepoId::github("zeta/repo");
+        let gitlab = RepoId {
+            provider: crate::provider::ProviderInstanceId::new("gitlab"),
+            path: "group/sub/repo".to_string(),
+        };
+        mark_added(&state, github.clone()).await;
+        mark_added(&state, gitlab.clone()).await;
+        let store = Arc::clone(&state.ref_store);
+        let app = build_app(state);
+
+        let response = app
+            .clone()
+            .oneshot(test_request("GET", "/v1/repos"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let repos: Vec<RepoId> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(repos.len(), 2);
+        assert!(repos.contains(&github));
+        assert!(repos.contains(&gitlab));
+
+        for auth in [None, Some("Ripclone wrong")] {
+            let rejected = app
+                .clone()
+                .oneshot(request_with_auth("GET", "/v1/repos", auth))
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let rejected_remove = app
+            .oneshot(request_with_auth(
+                "DELETE",
+                "/v1/repos/github/zeta/repo/add",
+                Some("Ripclone wrong"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected_remove.status(), StatusCode::UNAUTHORIZED);
+        assert!(store.load_added_repo(&github).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn repository_remove_rejects_missing_and_lookup_failure_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TestSqlRefStore::new(
+            tmp.path().join("remove-lookup-failure-refs.db"),
+        ));
+        let state = test_state_with_ref_store(&tmp, store.clone());
+        let repo_id = RepoId::github("acme/kept");
+        mark_added(&state, repo_id.clone()).await;
+        let app = build_app(state);
+
+        let missing = app
+            .clone()
+            .oneshot(test_request("DELETE", "/v1/repos/github/acme/missing/add"))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing_body = axum::body::to_bytes(missing.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let missing_body: serde_json::Value = serde_json::from_slice(&missing_body).unwrap();
+        assert_eq!(missing_body["code"], "repo_not_added");
+
+        store.fail_next_added_repo_read();
+        let failed = app
+            .oneshot(test_request("DELETE", "/v1/repos/github/acme/kept/add"))
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            store.load_added_repo(&repo_id).await.unwrap().is_some(),
+            "lookup failure must leave the registration intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_remove_leaves_admitted_job_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let repo_id = RepoId::github("acme/pending");
+        mark_added(&state, repo_id.clone()).await;
+        let enqueued = state
+            .build_queue
+            .enqueue(BuildJob {
+                repo_id: repo_id.clone(),
+                admitted_commit: "a".repeat(40),
+                repo_config: crate::repo_config::RepoConfig::default(),
+                credential: None,
+                size_bytes: None,
+            })
+            .await
+            .unwrap();
+        let job_id = enqueued.job_id.expect("durable admitted job id");
+        assert!(
+            matches!(
+                state.build_queue.job_status(job_id).await.unwrap(),
+                JobState::Pending
+            ),
+            "job must be pending before removal"
+        );
+
+        let response = remove_added_repo_inner(repo_id, state.clone()).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            matches!(
+                state.build_queue.job_status(job_id).await.unwrap(),
+                JobState::Pending
+            ),
+            "removal must not cancel an admitted job"
+        );
     }
 
     #[test]

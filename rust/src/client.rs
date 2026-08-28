@@ -1636,6 +1636,30 @@ impl Client {
 }
 
 impl Client {
+    /// Return the server's complete added-repository set.
+    pub async fn list_repos(&self) -> Result<Vec<RepoId>> {
+        let url = format!("{}/v1/repos", self.server);
+        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
+        if !resp.status().is_success() {
+            return Err(server_error("list failed", resp).await);
+        }
+        resp.json()
+            .await
+            .context("invalid repository list response")
+    }
+
+    /// Remove one repository registration without contacting its upstream.
+    pub async fn remove_repo(&self, repo_path: &str) -> Result<()> {
+        let url = self.repo_url(repo_path, "/add");
+        let resp = self
+            .send(self.request(reqwest::Method::DELETE, &url))
+            .await?;
+        if !resp.status().is_success() {
+            return Err(server_error("rm failed", resp).await);
+        }
+        Ok(())
+    }
+
     pub async fn resolve_ref(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
         self.resolve_exact_result(repo_path, branch, ExactResultKind::Full, None)
             .await

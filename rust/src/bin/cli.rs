@@ -96,6 +96,10 @@ enum Commands {
         #[arg(long)]
         wait: bool,
     },
+    /// List repositories added to the configured server.
+    List,
+    /// Remove a repository from the configured server's added set.
+    Rm { repo: String },
     /// Admit the exact branch tip for a background sync; returns fast unless --at is used.
     Sync {
         repo: String,
@@ -304,6 +308,23 @@ fn parse_repo_arg(repo: &str) -> (Option<String>, String) {
         return (Some(prefix.to_string()), path.to_string());
     }
     (None, repo.to_string())
+}
+
+/// Resolve a repository for a server-level control operation.
+///
+/// An explicit `provider:path` does not require that provider to be configured
+/// in this CLI: listing and removal do not contact the upstream provider. Bare
+/// paths retain the normal selected-provider validation.
+fn resolve_control_repo(
+    repo: &str,
+    default_provider: &str,
+    registry: &ProviderRegistry,
+) -> Result<(String, String)> {
+    let (provider_override, path) = parse_repo_arg(repo);
+    match provider_override {
+        Some(provider) => Ok((provider, path)),
+        None => resolve_repo(&path, default_provider, registry),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1038,6 +1059,32 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::List => {
+            let mut names = client
+                .list_repos()
+                .await?
+                .into_iter()
+                .map(|repo_id| repo_id.cli_name(&default_provider))
+                .collect::<Vec<_>>();
+            names.sort();
+            for name in names {
+                println!("{name}");
+            }
+        }
+        Commands::Rm { repo } => {
+            let (provider, repo_path) =
+                resolve_control_repo(&repo, &default_provider, &provider_registry)?;
+            let repo_id = RepoId {
+                provider: ripclone::provider::ProviderInstanceId::new(&provider),
+                path: repo_path.clone(),
+            };
+            let cli_name = repo_id.cli_name(&default_provider);
+            client
+                .with_provider(provider)
+                .remove_repo(&repo_path)
+                .await?;
+            println!("removed {cli_name}");
+        }
         Commands::Sync {
             repo,
             depth,
@@ -1666,6 +1713,15 @@ mod tests {
         assert_eq!(
             parse_repo_arg("gitlab:oven-sh/bun"),
             (Some("gitlab".to_string()), "oven-sh/bun".to_string())
+        );
+    }
+
+    #[test]
+    fn control_repo_accepts_explicit_unconfigured_provider() {
+        let registry = ProviderRegistry::new();
+        assert_eq!(
+            resolve_control_repo("gitlab:group/sub/repo", "github", &registry).unwrap(),
+            ("gitlab".to_string(), "group/sub/repo".to_string())
         );
     }
 

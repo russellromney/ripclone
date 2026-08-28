@@ -443,6 +443,19 @@ impl RepoId {
         }
     }
 
+    /// Repository name accepted by the CLI for the selected default provider.
+    ///
+    /// This is deliberately distinct from [`natural_key`](Self::natural_key):
+    /// CLI provider qualification uses `provider:path`, while webhook
+    /// allowlists use the slash-prefixed `provider/path` natural key.
+    pub fn cli_name(&self, default_provider: &str) -> String {
+        if self.provider.as_str() == default_provider {
+            self.path.clone()
+        } else {
+            format!("{}:{}", self.provider.as_str(), self.path)
+        }
+    }
+
     /// Directory name for the local bare mirror.
     ///
     /// All providers use `{provider}_{escaped_path}.git`.
@@ -617,6 +630,20 @@ mod tests {
         };
         assert_eq!(gl.natural_key(), "gitlab/group/sub/proj");
         assert_eq!(gl.storage_key(), "gitlab/group%2Fsub%2Fproj");
+    }
+
+    #[test]
+    fn cli_name_uses_colon_only_outside_selected_default_provider() {
+        let github = RepoId::github("acme/widget");
+        let gitlab = RepoId {
+            provider: ProviderInstanceId::new("gitlab"),
+            path: "group/sub/proj".to_string(),
+        };
+
+        assert_eq!(github.cli_name("github"), "acme/widget");
+        assert_eq!(gitlab.cli_name("github"), "gitlab:group/sub/proj");
+        assert_eq!(gitlab.cli_name("gitlab"), "group/sub/proj");
+        assert_eq!(gitlab.natural_key(), "gitlab/group/sub/proj");
     }
 
     #[test]
