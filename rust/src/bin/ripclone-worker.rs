@@ -138,6 +138,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    ripclone::git::require_system_git()?;
     ripclone::control::validate_worker_environment()?;
     // Validate the complete token-only API configuration before creating local
     // paths or initializing artifact storage. Standalone workers have no

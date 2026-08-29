@@ -1119,6 +1119,10 @@ async fn main() -> Result<()> {
             no_metrics,
             verify_upstream,
         } => {
+            let mode = resolve_mode(mode, config.clone.mode.as_deref())?;
+            if mode.needs_prebuilt_blob_pack() {
+                ripclone::git::require_system_git()?;
+            }
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let local_provider = provider_instance(&provider, &provider_registry)
                 .with_context(|| format!("provider '{provider}' is not configured locally"))?;
@@ -1160,7 +1164,6 @@ async fn main() -> Result<()> {
                      not --depth {depth}"
                 );
             }
-            let mode = resolve_mode(mode, config.clone.mode.as_deref())?;
             // Bridge the --temp flag to the env var the overlay check reads. Set
             // here, before any clone work reads it.
             if temp {

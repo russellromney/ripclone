@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    ripclone::git::require_system_git()?;
     let cas_dir = args.cas_dir.unwrap_or_else(default_cas_dir);
     let repo_root = args.repo_root.unwrap_or_else(default_repo_root);
     match args.control_db {
