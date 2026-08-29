@@ -223,11 +223,11 @@ impl ApiJobQueue {
     /// POST `body` to `path` and deserialize the JSON response. Maps transport /
     /// status failures to a retryable / unauthorized / permanent
     /// [`ApiReportError`] so nothing is silently dropped.
-    async fn post<B: Serialize, R: for<'de> Deserialize<'de>>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<R> {
+    async fn post<B, R>(&self, path: &str, body: &B) -> Result<R>
+    where
+        B: Serialize + Sync,
+        R: for<'de> Deserialize<'de> + Send,
+    {
         let url = format!("{}{}", self.base_url, path);
         let resp = self
             .client

@@ -83,7 +83,10 @@ pub fn take_perf_counters() -> PerfCounters {
 }
 
 fn add_ns(counter: &AtomicU64, duration: Duration) {
-    counter.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    counter.fetch_add(
+        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 pub fn record_archive_send_wait(duration: Duration) {

@@ -74,7 +74,7 @@ impl SqlRefStore {
                 return Ok(true);
             }
             tokio::time::sleep(std::time::Duration::from_millis(
-                (attempt.min(10) + 1) as u64,
+                u64::try_from(attempt.min(10) + 1).unwrap_or(1),
             ))
             .await;
         }
@@ -126,7 +126,7 @@ impl RefStore for SqlRefStore {
                 return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(
-                (attempt.min(10) + 1) as u64,
+                u64::try_from(attempt.min(10) + 1).unwrap_or(1),
             ))
             .await;
         }

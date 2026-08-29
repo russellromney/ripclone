@@ -69,7 +69,10 @@ impl Benchmark {
 
     fn mark_phase(&mut self, setter: impl FnOnce(&mut BenchmarkReport, u64)) -> Instant {
         let elapsed = self.last.elapsed();
-        setter(&mut self.report, elapsed.as_millis() as u64);
+        setter(
+            &mut self.report,
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        );
         let now = Instant::now();
         self.last = now;
         now
@@ -93,7 +96,8 @@ impl Benchmark {
 
     pub fn mark_archive_download(&mut self, bytes: u64) {
         let start = self.archive_download_start.unwrap_or(self.last);
-        self.report.archive_download_ms = start.elapsed().as_millis() as u64;
+        self.report.archive_download_ms =
+            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.report.archive_bytes = bytes;
         self.last = Instant::now();
     }
@@ -103,12 +107,12 @@ impl Benchmark {
     }
 
     pub fn add_bytes(&mut self, metadata: u64, archive: u64) {
-        self.report.metadata_bytes += metadata;
-        self.report.archive_bytes += archive;
+        self.report.metadata_bytes = self.report.metadata_bytes.saturating_add(metadata);
+        self.report.archive_bytes = self.report.archive_bytes.saturating_add(archive);
     }
 
     pub fn finish(&mut self) -> BenchmarkReport {
-        self.report.total_ms = self.start.elapsed().as_millis() as u64;
+        self.report.total_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.report.clone()
     }
 }

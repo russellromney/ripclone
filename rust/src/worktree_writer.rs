@@ -60,17 +60,26 @@ pub fn take_write_timing() -> WriteTiming {
 }
 
 fn record_prep(d: Duration) {
-    PREP_NS.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    PREP_NS.fetch_add(
+        u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 fn record_io(d: Duration, files: u64, bytes: u64) {
-    IO_NS.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    IO_NS.fetch_add(
+        u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     IO_FILES.fetch_add(files, Ordering::Relaxed);
     IO_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
 fn record_mtime(d: Duration) {
-    MTIME_NS.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    MTIME_NS.fetch_add(
+        u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1734,6 +1743,9 @@ mod linux_uring {
             slot_base: usize,
         ) -> std::result::Result<PendingDirectWindow, DirectWriteError> {
             let mut statx_buffers: Vec<crate::statx_compat::statx> = (0..in_flight.len())
+                // SAFETY: `statx` is a C-layout output struct made entirely of
+                // integer fields and integer arrays, for which all-zero is a
+                // valid bit pattern. The kernel initializes requested fields.
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect();
             let mut entries = Vec::with_capacity(in_flight.len() * 4);
@@ -2301,6 +2313,9 @@ mod linux_uring {
     fn close_open_fds_sync(writes: &mut [InFlightWrite]) {
         for write in writes {
             if let Some(fd) = write.fd.take() {
+                // SAFETY: taking `fd` removes the only owned copy from `write`,
+                // so this live descriptor is closed exactly once and never used
+                // through that slot again.
                 unsafe {
                     libc::close(fd);
                 }

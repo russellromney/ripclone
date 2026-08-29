@@ -50,13 +50,14 @@ pub fn staging_dir() -> PathBuf {
 pub fn available_space(path: &Path) -> Option<u64> {
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut buf: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::uninit();
-    unsafe {
-        if libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
-            return None;
-        }
-        let buf = buf.assume_init();
-        Some(buf.f_bavail as u64 * buf.f_bsize as u64)
+    // SAFETY: `c_path` is NUL-terminated and lives for the call, while `buf`
+    // points to writable, correctly aligned storage for one `statvfs` value.
+    if unsafe { libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return None;
     }
+    // SAFETY: a successful `statvfs` call initialized the entire output value.
+    let buf = unsafe { buf.assume_init() };
+    Some(buf.f_bavail as u64 * buf.f_bsize as u64)
 }
 
 /// Directories needed for one overlay mount.

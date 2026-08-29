@@ -46,8 +46,10 @@ impl Metrics {
 
     pub fn record_sync(&self, duration: std::time::Duration) {
         self.syncs.fetch_add(1, Ordering::Relaxed);
-        self.sync_duration_ms_total
-            .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+        self.sync_duration_ms_total.fetch_add(
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn record_sync_phases(&self, phases: SyncPhaseMetrics) {
@@ -105,8 +107,10 @@ impl Metrics {
 
     pub fn record_build_completed(&self, duration: std::time::Duration) {
         self.builds_completed.fetch_add(1, Ordering::Relaxed);
-        self.build_duration_ms_total
-            .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+        self.build_duration_ms_total.fetch_add(
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         Self::dec_saturating(&self.build_queue_depth);
     }
 

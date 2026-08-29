@@ -882,6 +882,8 @@ impl ControlPathLock {
             .mode(0o600)
             .open(&lock_path)
             .with_context(|| format!("open control ownership lock {}", lock_path.display()))?;
+        // SAFETY: `file` owns a live descriptor for the duration of the call;
+        // `flock` neither retains the descriptor nor dereferences Rust memory.
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
             let error = std::io::Error::last_os_error();

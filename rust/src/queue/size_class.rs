@@ -80,13 +80,13 @@ pub fn validate_size_classes(classes: &[SizeClass]) -> Result<()> {
 /// - If somehow past every threshold → last class.
 pub fn classify_rank(size_bytes: Option<u64>, classes: &[SizeClass]) -> i64 {
     debug_assert!(!classes.is_empty());
-    let last = (classes.len() - 1) as i64;
+    let last = i64::try_from(classes.len() - 1).unwrap_or(i64::MAX);
     let Some(n) = size_bytes else {
         return last;
     };
     for (i, c) in classes.iter().enumerate() {
         if n <= c.max_bytes {
-            return i as i64;
+            return i64::try_from(i).unwrap_or(i64::MAX);
         }
     }
     last
@@ -94,8 +94,9 @@ pub fn classify_rank(size_bytes: Option<u64>, classes: &[SizeClass]) -> i64 {
 
 /// Class name for a rank, or the last class if out of range.
 pub fn class_name(rank: i64, classes: &[SizeClass]) -> &str {
-    classes
-        .get(rank as usize)
+    usize::try_from(rank)
+        .ok()
+        .and_then(|rank| classes.get(rank))
         .or_else(|| classes.last())
         .map(|c| c.name.as_str())
         .unwrap_or("unknown")
@@ -104,14 +105,14 @@ pub fn class_name(rank: i64, classes: &[SizeClass]) -> &str {
 /// Resolve `--max-size-class NAME` to an inclusive rank ceiling.
 /// Unknown names fail loudly so a typo never silently claims everything.
 pub fn rank_ceiling(name: &str, classes: &[SizeClass]) -> Result<i64> {
-    classes
+    let rank = classes
         .iter()
         .position(|c| c.name == name)
-        .map(|i| i as i64)
         .with_context(|| {
             let known: Vec<_> = classes.iter().map(|c| c.name.as_str()).collect();
             format!("unknown size class {name:?}; configured classes: {known:?}")
-        })
+        })?;
+    i64::try_from(rank).context("size class rank exceeds database range")
 }
 
 /// Best-effort prior clonepack byte total from lengths already stored on a
@@ -222,6 +223,7 @@ mod tests {
         assert_eq!(classify_rank(Some((1 << 30) + 1), &c), 1);
         assert_eq!(class_name(0, &c), "small");
         assert_eq!(class_name(1, &c), "large");
+        assert_eq!(class_name(-1, &c), "large");
     }
 
     #[test]

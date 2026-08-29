@@ -833,7 +833,7 @@ fn fail_first_fetches_from_env() -> usize {
 /// The map is bounded and pruned periodically to avoid unbounded memory growth.
 #[derive(Clone)]
 pub struct RateLimiter {
-    buckets: Arc<StdMutex<HashMap<String, (Instant, u32)>>>,
+    buckets: Arc<StdMutex<HashMap<String, (Instant, f64)>>>,
     max_burst: u32,
     restore_rate_per_sec: f64,
     max_entries: usize,
@@ -841,6 +841,11 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(max_burst: u32, restore_rate_per_sec: f64) -> Self {
+        let restore_rate_per_sec = if restore_rate_per_sec.is_finite() {
+            restore_rate_per_sec.max(0.0)
+        } else {
+            0.0
+        };
         Self {
             buckets: Arc::new(StdMutex::new(HashMap::new())),
             max_burst,
@@ -870,16 +875,19 @@ impl RateLimiter {
 
         let entry = buckets
             .entry(key.to_string())
-            .or_insert_with(|| (now, self.max_burst));
+            .or_insert_with(|| (now, f64::from(self.max_burst)));
         let elapsed = now.duration_since(entry.0).as_secs_f64();
         entry.1 =
-            ((entry.1 as f64 + elapsed * self.restore_rate_per_sec) as u32).min(self.max_burst);
+            (entry.1 + elapsed * self.restore_rate_per_sec).clamp(0.0, f64::from(self.max_burst));
         entry.0 = now;
-        if entry.1 == 0 {
-            return false;
-        }
-        entry.1 -= 1;
-        true
+        let allowed = if entry.1 < 1.0 {
+            false
+        } else {
+            entry.1 -= 1.0;
+            true
+        };
+        drop(buckets);
+        allowed
     }
 }
 
@@ -5236,9 +5244,12 @@ fn artifact_body(
             let until_barrier = barrier_after
                 .filter(|after| *after > sent)
                 .map_or(u64::MAX, |after| after - sent);
-            let wanted = (len - sent)
-                .min(until_barrier)
-                .min(ARTIFACT_STREAM_CHUNK_BYTES as u64) as usize;
+            let wanted = usize::try_from(
+                (len - sent)
+                    .min(until_barrier)
+                    .min(u64::try_from(ARTIFACT_STREAM_CHUNK_BYTES).unwrap_or(u64::MAX)),
+            )
+            .unwrap_or(ARTIFACT_STREAM_CHUNK_BYTES);
             let read = match &mut source {
                 ArtifactBodySource::File(file) => {
                     let mut buffer = vec![0u8; wanted];
@@ -7509,7 +7520,8 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                     .heartbeat_timeout_secs()
                                     .min(worker_queue.stale_claim_secs().max(1))
                                     / 3)
-                                .max(1) as u64,
+                                .max(1)
+                                .unsigned_abs(),
                             );
                             let mut heartbeat = tokio::time::interval(heartbeat_interval);
                             heartbeat
@@ -8856,6 +8868,27 @@ mod tests {
             _c: Option<&secrecy::SecretString>,
         ) -> AccessDecision {
             self.0
+        }
+    }
+
+    #[test]
+    fn rate_limiter_sanitizes_invalid_restore_rates() {
+        for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let limiter = RateLimiter::new(1, rate);
+            assert!(limiter.check("client"));
+            assert!(!limiter.check("client"));
+        }
+    }
+
+    #[test]
+    fn rate_limiter_retains_fractional_refill_credit() {
+        let limiter = RateLimiter::new(1, 10.0);
+        assert!(limiter.check("client"));
+
+        for expected in [false, true] {
+            limiter.buckets.lock().unwrap().get_mut("client").unwrap().0 =
+                Instant::now() - Duration::from_millis(50);
+            assert_eq!(limiter.check("client"), expected);
         }
     }
 

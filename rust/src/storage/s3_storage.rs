@@ -360,11 +360,10 @@ impl S3Storage {
         let key = self.key(hash)?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key_owned = key.clone();
         let output = self.block_on(move || async move {
             client
                 .objects()
-                .head(&bucket, &key_owned)
+                .head(&bucket, &key)
                 .send()
                 .await
                 .context("S3 head_object")
@@ -381,11 +380,10 @@ impl StorageBackend for S3Storage {
         let key = self.key(hash)?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key_owned = key.clone();
         let (content_length, data) = self.block_on(move || async move {
             let output = client
                 .objects()
-                .get(&bucket, &key_owned)
+                .get(&bucket, &key)
                 .send()
                 .await
                 .context("S3 get_object")?;
@@ -417,14 +415,15 @@ impl StorageBackend for S3Storage {
             return Ok(Vec::new());
         }
         let key = self.key(hash)?;
-        let end_inclusive = start + len.saturating_sub(1);
+        let end_inclusive = start
+            .checked_add(len - 1)
+            .context("S3 range end overflow")?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key_owned = key.clone();
         let (content_length, data) = self.block_on(move || async move {
             let output = client
                 .objects()
-                .get(&bucket, &key_owned)
+                .get(&bucket, &key)
                 .range_bytes(start, end_inclusive)
                 .context("set S3 range")?
                 .send()

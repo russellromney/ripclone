@@ -360,6 +360,7 @@ impl RefStore for ApiRefStore {
                     ..Default::default()
                 });
             result.head = Some(head);
+            drop(map);
         }
         Ok(response.updated)
     }
@@ -390,6 +391,7 @@ impl RefStore for ApiRefStore {
                     ..Default::default()
                 });
             result.full = Some(full);
+            drop(map);
         }
         Ok(response.updated)
     }
@@ -420,6 +422,7 @@ impl RefStore for ApiRefStore {
                     ..Default::default()
                 });
             result.files = Some(files);
+            drop(map);
         }
         Ok(response.updated)
     }

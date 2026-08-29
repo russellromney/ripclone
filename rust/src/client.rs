@@ -337,8 +337,8 @@ struct PinnedArtifactRefresh {
     result: ExactResultKind,
     target: String,
     artifact: String,
-    manifest: String,
-    metadata: String,
+    clonepack_manifest: String,
+    metadata_chunk: String,
     urls: tokio::sync::watch::Sender<ArtifactUrlSnapshot>,
     refresh_gate: Arc<tokio::sync::Semaphore>,
 }
@@ -589,7 +589,7 @@ fn pseudo_rand_u64() -> u64 {
         if x == 0 {
             x = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
+                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
                 .unwrap_or(0x9E37_79B9_7F4A_7C15)
                 | 1;
         }
@@ -1396,7 +1396,7 @@ struct ManagedGitChild {
 impl ManagedGitChild {
     fn new(child: tokio::process::Child, cleanup: AttemptCleanup) -> Self {
         Self {
-            process_group: child.id().map(|pid| pid as i32),
+            process_group: child.id().and_then(|pid| i32::try_from(pid).ok()),
             child: Some(child),
             cleanup,
         }
@@ -1407,6 +1407,9 @@ impl ManagedGitChild {
         if let Some(group) = self.process_group {
             // The child starts a fresh process group, so this also kills an
             // child transport or hook-like descendant before staging drops.
+            // SAFETY: `group` is the positive pid of a child placed in its own
+            // process group below; negating it targets that group. `kill` does
+            // not dereference any Rust memory.
             unsafe {
                 libc::kill(-group, libc::SIGKILL);
             }
@@ -2072,10 +2075,11 @@ impl Client {
             "artifact URL refresh",
             &refresh.repo_path,
         )?;
+        let artifact_unchanged = info.result == refresh.result
+            && info.clonepack_manifest == refresh.clonepack_manifest
+            && info.metadata_chunk == refresh.metadata_chunk;
         anyhow::ensure!(
-            info.result == refresh.result
-                && info.clonepack_manifest == refresh.manifest
-                && info.metadata_chunk == refresh.metadata,
+            artifact_unchanged,
             "pinned artifact URL refresh changed the selected artifact"
         );
         let signed_url = kind
@@ -2784,8 +2788,8 @@ impl Client {
             result,
             target: pinned.clone(),
             artifact: artifact.clone(),
-            manifest: info.clonepack_manifest.clone(),
-            metadata: info.metadata_chunk.clone(),
+            clonepack_manifest: info.clonepack_manifest.clone(),
+            metadata_chunk: info.metadata_chunk.clone(),
             urls: artifact_urls,
             refresh_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         };
@@ -3960,6 +3964,9 @@ impl Client {
         }
         command.arg("-C").arg(repo).args(&args);
         #[cfg(unix)]
+        // SAFETY: `pre_exec` runs after fork and before exec. The closure only
+        // calls async-signal-safe `setpgid` and constructs an OS error from
+        // thread-local errno on failure; it captures no borrowed state.
         unsafe {
             use std::os::unix::process::CommandExt;
             command.as_std_mut().pre_exec(|| {

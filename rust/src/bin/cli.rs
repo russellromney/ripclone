@@ -1204,7 +1204,7 @@ async fn main() -> Result<()> {
                     },
                 )
                 .await?;
-            let total_ms = clone_started.elapsed().as_millis() as u64;
+            let total_ms = u64::try_from(clone_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             println!("installed {} into {}", repo_path, target.display());
             if let Err(error) =
                 verify_upstream_snapshot(&target, &outcome.commit, upstream_snapshot.as_deref())
