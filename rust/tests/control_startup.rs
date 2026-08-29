@@ -30,6 +30,7 @@ fn server_command(root: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-server"));
     command
         .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("RIPCLONE_SERVER_TOKEN", "startup-proof")
         .arg("--cas-dir")
         .arg(root.join("cas"))
@@ -45,6 +46,60 @@ fn server_command(root: &Path) -> tokio::process::Command {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
+}
+
+#[tokio::test]
+async fn missing_system_git_stops_server_and_worker_before_side_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let empty_path = root.path().join("empty-path");
+    std::fs::create_dir(&empty_path).unwrap();
+
+    let mut server = server_command(root.path());
+    server.env("PATH", &empty_path);
+    let output = run_bounded(server).await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("system Git is required"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_runtime_side_effects(root.path());
+
+    let worker_cas = root.path().join("worker-cas");
+    let worker_repos = root.path().join("worker-repos");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind untouched worker API probe");
+    let api_url = format!("http://{}", listener.local_addr().unwrap());
+    let mut worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-worker"));
+    worker
+        .env_clear()
+        .env("PATH", &empty_path)
+        .env("RIPCLONE_QUEUE_API_URL", &api_url)
+        .env("RIPCLONE_METADATA_REPORT_URL", &api_url)
+        .env("RIPCLONE_METADATA_JOB_TOKEN", "missing-git-proof")
+        .arg("--cas-dir")
+        .arg(&worker_cas)
+        .arg("--repo-root")
+        .arg(&worker_repos)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = run_bounded(worker).await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("system Git is required"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!worker_cas.exists());
+    assert!(!worker_repos.exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), listener.accept())
+            .await
+            .is_err(),
+        "worker contacted its API before the Git preflight"
+    );
 }
 
 async fn run_bounded(mut command: tokio::process::Command) -> std::process::Output {
@@ -273,6 +328,7 @@ async fn worker_rejects_server_control_credentials_before_scratch_creation() {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-worker"));
         command
             .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env(key, &decoy)
             .arg("--cas-dir")
             .arg(&cas)
@@ -306,6 +362,7 @@ async fn second_server_is_rejected_before_its_listener_or_work_paths() {
     let mut first = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-server"));
     first
         .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("RIPCLONE_SERVER_TOKEN", "owner-proof")
         .arg("--cas-dir")
         .arg(root.path().join("first-cas"))
@@ -338,6 +395,7 @@ async fn second_server_is_rejected_before_its_listener_or_work_paths() {
     let mut second = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-server"));
     second
         .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("RIPCLONE_SERVER_TOKEN", "owner-proof")
         .arg("--cas-dir")
         .arg(&second_cas)

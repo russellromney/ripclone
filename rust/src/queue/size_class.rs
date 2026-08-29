@@ -169,13 +169,13 @@ pub fn resolve_job_size_bytes(
 /// Load size classes: config list if non-empty, else launch defaults.
 /// Also accepts `RIPCLONE_SIZE_CLASSES` JSON for env-only deploys.
 pub fn load_size_classes(from_config: &[SizeClass]) -> Result<Vec<SizeClass>> {
-    if let Ok(raw) = std::env::var("RIPCLONE_SIZE_CLASSES") {
-        if !raw.trim().is_empty() {
-            let classes: Vec<SizeClass> = serde_json::from_str(&raw)
-                .with_context(|| format!("parse RIPCLONE_SIZE_CLASSES JSON: {raw}"))?;
-            validate_size_classes(&classes)?;
-            return Ok(classes);
-        }
+    if let Ok(raw) = std::env::var("RIPCLONE_SIZE_CLASSES")
+        && !raw.trim().is_empty()
+    {
+        let classes: Vec<SizeClass> = serde_json::from_str(&raw)
+            .with_context(|| format!("parse RIPCLONE_SIZE_CLASSES JSON: {raw}"))?;
+        validate_size_classes(&classes)?;
+        return Ok(classes);
     }
     if from_config.is_empty() {
         let classes = default_size_classes();

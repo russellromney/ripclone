@@ -15,9 +15,10 @@ export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-ci-e2e-token}"
 
 lint() {
   bash "$ROOT/scripts/audit_control_support.sh"
+  bash "$ROOT/scripts/audit_release_surface.sh"
   ( cd "$ROOT/rust"
     cargo fmt --all --check
-    cargo clippy --all-targets --locked -- -D warnings )
+    cargo clippy --all-targets --features dev-tools --locked -- -D warnings )
 }
 
 # Unit + integration tests. cargo test runs the test binaries sequentially,
@@ -56,8 +57,9 @@ e2e() {
     export RIPCLONE_BIN_DIR="${RIPCLONE_BIN_DIR:-$CI_ARTIFACTS}"
   elif [ -z "${RIPCLONE_BIN_DIR:-}" ]; then
     local profile="${CARGO_PROFILE:-ci}"
+    local target_root="${CARGO_TARGET_DIR:-$ROOT/rust/target}"
     ( cd "$ROOT/rust" && cargo build --profile "$profile" --locked --bins )
-    export RIPCLONE_BIN_DIR="$ROOT/rust/target/$profile"
+    export RIPCLONE_BIN_DIR="$target_root/$profile"
   fi
   bash "$ROOT/scripts/e2e_local.sh"
   bash "$ROOT/scripts/e2e_smart_http.sh"
@@ -93,7 +95,7 @@ gitea() {
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
 # raw HTTP, so a change to the server's contract (like the B5 added-repos gate)
 # does not recompile them — it silently breaks the harness against the next
-# deploy. This runs the real benchmark/fly_shaped_benchmark.sh end-to-end against
+# deploy. This runs the real benchmark/shaped_benchmark.sh end-to-end against
 # a local server and fails if the harness cannot add/warm/benchmark a fixture
 # repo. Fast tier: file:// origin, unshaped, one run.
 benchmark() {
@@ -102,9 +104,10 @@ benchmark() {
     export CLI_BIN="${CLI_BIN:-$CI_ARTIFACTS/ripclone}"
   elif [ -z "${SERVER_BIN:-}" ] || [ -z "${CLI_BIN:-}" ]; then
     local profile="${CARGO_PROFILE:-ci}"
+    local target_root="${CARGO_TARGET_DIR:-$ROOT/rust/target}"
     ( cd "$ROOT/rust" && cargo build --profile "$profile" --locked --bin ripclone --bin ripclone-server )
-    export SERVER_BIN="${SERVER_BIN:-$ROOT/rust/target/$profile/ripclone-server}"
-    export CLI_BIN="${CLI_BIN:-$ROOT/rust/target/$profile/ripclone}"
+    export SERVER_BIN="${SERVER_BIN:-$target_root/$profile/ripclone-server}"
+    export CLI_BIN="${CLI_BIN:-$target_root/$profile/ripclone}"
   fi
   bash "$ROOT/scripts/benchmark_smoke.sh"
 }
@@ -120,12 +123,11 @@ case "$STAGE" in
   test) run_tests ;;
   e2e) e2e ;;
   flake) flake ;;
-  databases) databases ;;
   ci-build) ci_build ;;
   gitea) gitea ;;
   benchmark) benchmark ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|ci-build|gitea|benchmark|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|ci-build|gitea|benchmark|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"

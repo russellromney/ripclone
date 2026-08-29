@@ -26,6 +26,12 @@ case "$arch" in
 esac
 asset="ripclone-${os_name}-${arch_name}.tar.gz"
 
+if ! git --version >/dev/null 2>&1; then
+  echo "ripclone: warning: system Git is not available on PATH." >&2
+  echo "ripclone: install Git before running the server, worker, or editable clone paths." >&2
+  echo "ripclone: Files-only client clones can run without Git." >&2
+fi
+
 if [ "$VERSION" = "latest" ]; then
   base="https://github.com/$REPO/releases/latest/download"
 else
@@ -58,9 +64,11 @@ mkdir -p "$BIN_DIR"
 src="$(find "$tmp" -type f -name ripclone -perm -u+x | head -n1)"
 src_dir="$(dirname "$src")"
 for b in ripclone ripclone-server ripclone-worker; do
-  if [ -f "$src_dir/$b" ]; then
-    install -m 0755 "$src_dir/$b" "$BIN_DIR/$b"
+  if [ ! -f "$src_dir/$b" ]; then
+    echo "ripclone: release archive is missing $b" >&2
+    exit 1
   fi
+  install -m 0755 "$src_dir/$b" "$BIN_DIR/$b"
 done
 
 echo "ripclone: installed to $BIN_DIR"
@@ -71,9 +79,9 @@ esac
 
 # Smoke test: on Linux the binaries are statically linked against musl (fully
 # self-contained — no libc or C-library runtime dependency at all), so they run
-# on any Linux including Alpine and old glibc distros; on macOS the git + TLS
-# stacks are pure Rust and the C deps (zstd, zlib-ng) are vendored. So the binary
-# should just run. If this fails it is a real problem — surface it instead of
+# on any Linux including Alpine and old glibc distros; macOS assets use only
+# system libraries and vendored native dependencies. So the binary should just
+# run. If this fails it is a real problem — surface it instead of
 # hiding it (no `|| true`).
 if ! "$BIN_DIR/ripclone" --version; then
   echo "ripclone: the installed binary failed to run." >&2
