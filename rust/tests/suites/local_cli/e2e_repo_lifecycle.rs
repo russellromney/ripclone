@@ -43,7 +43,7 @@ fn diagnostics(output: &Output) -> String {
 }
 
 #[tokio::test]
-async fn real_cli_lists_stably_and_round_trips_provider_qualified_remove() {
+async fn real_cli_lists_stably_and_round_trips_unconfigured_provider_names() {
     setup(false);
     let providers = serde_json::json!({
         "providers": [{
@@ -98,10 +98,34 @@ async fn real_cli_lists_stably_and_round_trips_provider_qualified_remove() {
         "{}",
         diagnostics(&selected_default)
     );
+    let selected_default_stdout = stdout(&selected_default);
     assert_eq!(
-        stdout(&selected_default),
+        selected_default_stdout,
         "github:alpha/repo\ngithub:zeta/repo\ngroup/sub/repo\n"
     );
+
+    let bare_name = selected_default_stdout
+        .lines()
+        .find(|name| *name == "group/sub/repo")
+        .expect("selected default provider should render as a bare name");
+    let removed_bare = run_cli(
+        &server,
+        home.path(),
+        &["--provider", "gitlab", "rm", bare_name],
+    )
+    .await;
+    assert!(
+        removed_bare.status.success(),
+        "{}",
+        diagnostics(&removed_bare)
+    );
+    assert_eq!(stdout(&removed_bare), "removed group/sub/repo\n");
+
+    // Re-register the row so the provider-qualified form printed by the
+    // default listing is independently round-tripped too.
+    register_added_without_build_for_provider(&server, "gitlab", "group/sub/repo")
+        .await
+        .unwrap();
 
     let removed = run_cli(&server, home.path(), &["rm", "gitlab:group/sub/repo"]).await;
     assert!(removed.status.success(), "{}", diagnostics(&removed));

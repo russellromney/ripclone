@@ -312,19 +312,13 @@ fn parse_repo_arg(repo: &str) -> (Option<String>, String) {
 
 /// Resolve a repository for a server-level control operation.
 ///
-/// An explicit `provider:path` does not require that provider to be configured
-/// in this CLI: listing and removal do not contact the upstream provider. Bare
-/// paths retain the normal selected-provider validation.
-fn resolve_control_repo(
-    repo: &str,
-    default_provider: &str,
-    registry: &ProviderRegistry,
-) -> Result<(String, String)> {
+/// Neither an explicit `provider:path` nor the selected default provider needs
+/// to be configured in this CLI: listing and removal do not contact the
+/// upstream provider. The server validates the provider and repository path.
+fn resolve_control_repo(repo: &str, default_provider: &str) -> (String, String) {
     let (provider_override, path) = parse_repo_arg(repo);
-    match provider_override {
-        Some(provider) => Ok((provider, path)),
-        None => resolve_repo(&path, default_provider, registry),
-    }
+    let provider = provider_override.unwrap_or_else(|| default_provider.to_string());
+    (provider, path)
 }
 
 #[derive(serde::Deserialize)]
@@ -1072,8 +1066,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Rm { repo } => {
-            let (provider, repo_path) =
-                resolve_control_repo(&repo, &default_provider, &provider_registry)?;
+            let (provider, repo_path) = resolve_control_repo(&repo, &default_provider);
             let repo_id = RepoId {
                 provider: ripclone::provider::ProviderInstanceId::new(&provider),
                 path: repo_path.clone(),
@@ -1717,10 +1710,13 @@ mod tests {
     }
 
     #[test]
-    fn control_repo_accepts_explicit_unconfigured_provider() {
-        let registry = ProviderRegistry::new();
+    fn control_repo_accepts_unconfigured_explicit_and_default_providers() {
         assert_eq!(
-            resolve_control_repo("gitlab:group/sub/repo", "github", &registry).unwrap(),
+            resolve_control_repo("gitlab:group/sub/repo", "github"),
+            ("gitlab".to_string(), "group/sub/repo".to_string())
+        );
+        assert_eq!(
+            resolve_control_repo("group/sub/repo", "gitlab"),
             ("gitlab".to_string(), "group/sub/repo".to_string())
         );
     }
