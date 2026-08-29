@@ -2,6 +2,34 @@ use crate::common;
 
 use common::*;
 
+fn snapshot_files(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        if !current.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else if path.is_file() {
+                files.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 #[tokio::test]
 async fn add_registers_builds_and_makes_repo_cloneable() {
     setup(false);
@@ -58,6 +86,84 @@ async fn add_registers_builds_and_makes_repo_cloneable() {
     .await
     .expect("clone after add");
     assert_eq!(read(&clone, "a.txt"), "1\n");
+
+    let repo_id = ripclone::provider::RepoId::github(&repo_path);
+    let store = server_ref_store(&server).await;
+    let result_before = serde_json::to_value(
+        store
+            .load_result(&repo_id, &added.commit)
+            .await
+            .expect("load exact result before removal")
+            .expect("exact result exists before removal"),
+    )
+    .unwrap();
+    let artifacts_before = snapshot_files(&server.cas_dir);
+    assert!(!artifacts_before.is_empty());
+
+    server
+        .client()
+        .remove_repo(&repo_path)
+        .await
+        .expect("remove repository registration");
+    assert!(store.load_added_repo(&repo_id).await.unwrap().is_none());
+    let result_after = serde_json::to_value(
+        store
+            .load_result(&repo_id, &added.commit)
+            .await
+            .expect("load exact result after removal")
+            .expect("exact result exists after removal"),
+    )
+    .unwrap();
+    assert_eq!(
+        result_after, result_before,
+        "removal must preserve exact results"
+    );
+    assert_eq!(
+        snapshot_files(&server.cas_dir),
+        artifacts_before,
+        "removal must preserve local artifact bytes"
+    );
+
+    let clone_error = server
+        .client()
+        .resolve_ref(&repo_path, "HEAD")
+        .await
+        .expect_err("removed repository must not remain cloneable");
+    assert!(clone_error.to_string().contains("ripclone add"));
+}
+
+#[tokio::test]
+async fn remove_isolated_to_one_registration_and_missing_remove_changes_nothing() {
+    setup(false);
+    let server = start_server().await;
+    register_added_without_build(&server, "acme/a")
+        .await
+        .unwrap();
+    register_added_without_build(&server, "acme/b")
+        .await
+        .unwrap();
+
+    server.client().remove_repo("acme/a").await.unwrap();
+    let listed = server.client().list_repos().await.unwrap();
+    assert_eq!(listed, vec![ripclone::provider::RepoId::github("acme/b")]);
+
+    let before_missing = server_ref_store(&server)
+        .await
+        .list_added_repos()
+        .await
+        .unwrap();
+    let error = server
+        .client()
+        .remove_repo("acme/a")
+        .await
+        .expect_err("second removal must report not added");
+    assert!(error.to_string().contains("repo not added"));
+    let after_missing = server_ref_store(&server)
+        .await
+        .list_added_repos()
+        .await
+        .unwrap();
+    assert_eq!(before_missing, after_missing);
 }
 
 #[tokio::test]

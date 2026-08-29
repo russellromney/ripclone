@@ -1228,6 +1228,7 @@ pub struct RegionStorageEntry {
 
 pub fn build_app(state: ServerState) -> Router {
     let protected = Router::new()
+        .route("/v1/repos", get(list_added_repos))
         // Single catch-all route for all provider-qualified repo endpoints.
         .route("/v1/repos/{*path}", get(dispatch_repos_get))
         .route("/v1/repos/{*path}", post(dispatch_repos_post))
@@ -2849,6 +2850,28 @@ async fn dispatch_repos_delete(
         .into_response()
 }
 
+async fn list_added_repos(State(state): State<ServerState>) -> Response {
+    match state.ref_store.list_added_repos().await {
+        Ok(repos) => Json(
+            repos
+                .into_iter()
+                .map(|added| added.repo_id)
+                .collect::<Vec<RepoId>>(),
+        )
+        .into_response(),
+        Err(e) => {
+            state.metrics.record_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("list added repos failed: {e}"),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn dispatch_git_get(
     Path(path): Path<String>,
     Query(query): Query<GitServiceQuery>,
@@ -4357,6 +4380,20 @@ async fn add_repo_inner(
 }
 
 async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Response {
+    match state.ref_store.load_added_repo(&repo_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return repo_not_added_response(),
+        Err(e) => {
+            state.metrics.record_error();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("added repo lookup failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    }
     if let Err(e) = state.ref_store.remove_added_repo(&repo_id).await {
         state.metrics.record_error();
         return (
@@ -8048,6 +8085,7 @@ mod tests {
         path: PathBuf,
         inner: tokio::sync::OnceCell<Arc<crate::meta::SqlRefStore>>,
         fail_next_result_read: AtomicBool,
+        fail_next_added_repo_read: AtomicBool,
     }
 
     impl TestSqlRefStore {
@@ -8056,11 +8094,16 @@ mod tests {
                 path,
                 inner: tokio::sync::OnceCell::new(),
                 fail_next_result_read: AtomicBool::new(false),
+                fail_next_added_repo_read: AtomicBool::new(false),
             }
         }
 
         fn fail_next_result_read(&self) {
             self.fail_next_result_read.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_added_repo_read(&self) {
+            self.fail_next_added_repo_read.store(true, Ordering::SeqCst);
         }
 
         async fn store(&self) -> anyhow::Result<&Arc<crate::meta::SqlRefStore>> {
@@ -8128,6 +8171,9 @@ mod tests {
             self.store().await?.add_repo(repo).await
         }
         async fn load_added_repo(&self, repo_id: &RepoId) -> anyhow::Result<Option<AddedRepo>> {
+            if self.fail_next_added_repo_read.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected added-repository read failure");
+            }
             self.store().await?.load_added_repo(repo_id).await
         }
         async fn remove_added_repo(&self, repo_id: &RepoId) -> anyhow::Result<()> {
@@ -8280,6 +8326,207 @@ mod tests {
 
     fn auth_header() -> String {
         format!("Ripclone {}", hex::encode(Sha256::digest("secret")))
+    }
+
+    #[tokio::test]
+    async fn repository_list_is_authenticated_and_returns_repo_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let github = RepoId::github("zeta/repo");
+        let gitlab = RepoId {
+            provider: crate::provider::ProviderInstanceId::new("gitlab"),
+            path: "group/sub/repo".to_string(),
+        };
+        mark_added(&state, github.clone()).await;
+        mark_added(&state, gitlab.clone()).await;
+        let store = Arc::clone(&state.ref_store);
+        let app = build_app(state);
+
+        let response = app
+            .clone()
+            .oneshot(test_request("GET", "/v1/repos"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let repos: Vec<RepoId> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(repos.len(), 2);
+        assert!(repos.contains(&github));
+        assert!(repos.contains(&gitlab));
+
+        for auth in [None, Some("Ripclone wrong")] {
+            let rejected = app
+                .clone()
+                .oneshot(request_with_auth("GET", "/v1/repos", auth))
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        for auth in [None, Some("Ripclone wrong")] {
+            let rejected_remove = app
+                .clone()
+                .oneshot(request_with_auth(
+                    "DELETE",
+                    "/v1/repos/github/zeta/repo/add",
+                    auth,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rejected_remove.status(), StatusCode::UNAUTHORIZED);
+            assert!(
+                store.load_added_repo(&github).await.unwrap().is_some(),
+                "rejected removal must preserve the registration"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_remove_rejects_missing_invalid_and_lookup_failure_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TestSqlRefStore::new(
+            tmp.path().join("remove-lookup-failure-refs.db"),
+        ));
+        let state = test_state_with_ref_store(&tmp, store.clone());
+        let repo_id = RepoId::github("acme/kept");
+        mark_added(&state, repo_id.clone()).await;
+        let app = build_app(state);
+
+        let missing = app
+            .clone()
+            .oneshot(test_request("DELETE", "/v1/repos/github/acme/missing/add"))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing_body = axum::body::to_bytes(missing.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let missing_body: serde_json::Value = serde_json::from_slice(&missing_body).unwrap();
+        assert_eq!(missing_body["code"], "repo_not_added");
+        assert!(store.load_added_repo(&repo_id).await.unwrap().is_some());
+
+        let invalid = app
+            .clone()
+            .oneshot(test_request(
+                "DELETE",
+                "/v1/repos/github/acme/bad%7Frepo/add",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            store.load_added_repo(&repo_id).await.unwrap().is_some(),
+            "invalid removal must leave other registrations intact"
+        );
+
+        store.fail_next_added_repo_read();
+        let failed = app
+            .oneshot(test_request("DELETE", "/v1/repos/github/acme/kept/add"))
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            store.load_added_repo(&repo_id).await.unwrap().is_some(),
+            "lookup failure must leave the registration intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_remove_leaves_pending_and_claimed_jobs_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let queue_db = crate::queue::LibsqlDb::connect(
+            &tmp.path().join("remove-running-jobs.db").to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        let queue = Arc::new(
+            crate::queue::SqlJobQueue::new(Box::new(queue_db))
+                .await
+                .unwrap(),
+        );
+        state.build_queue = queue.clone();
+        let repo_id = RepoId::github("acme/pending");
+        mark_added(&state, repo_id.clone()).await;
+        let first = state
+            .build_queue
+            .enqueue(BuildJob {
+                repo_id: repo_id.clone(),
+                admitted_commit: "a".repeat(40),
+                repo_config: crate::repo_config::RepoConfig::default(),
+                credential: None,
+                size_bytes: None,
+            })
+            .await
+            .unwrap();
+        let second = state
+            .build_queue
+            .enqueue(BuildJob {
+                repo_id: repo_id.clone(),
+                admitted_commit: "b".repeat(40),
+                repo_config: crate::repo_config::RepoConfig::default(),
+                credential: None,
+                size_bytes: None,
+            })
+            .await
+            .unwrap();
+        let first_id = first.job_id.expect("first durable admitted job id");
+        let second_id = second.job_id.expect("second durable admitted job id");
+        let claimed = crate::queue::WorkerQueue::claim(queue.as_ref(), "worker-1")
+            .await
+            .unwrap()
+            .expect("first job is claimable");
+        assert_eq!(claimed.id, first_id);
+        assert!(
+            matches!(
+                state.build_queue.job_status(first_id).await.unwrap(),
+                JobState::Pending
+            ),
+            "a claimed job reports as active before removal"
+        );
+        assert!(
+            matches!(
+                state.build_queue.job_status(second_id).await.unwrap(),
+                JobState::Pending
+            ),
+            "the second job must be queued before removal"
+        );
+
+        let response = remove_added_repo_inner(repo_id, state.clone()).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            matches!(
+                state.build_queue.job_status(first_id).await.unwrap(),
+                JobState::Pending
+            ),
+            "removal must not cancel a claimed job"
+        );
+        assert!(
+            matches!(
+                state.build_queue.job_status(second_id).await.unwrap(),
+                JobState::Pending
+            ),
+            "removal must not cancel a queued job"
+        );
+        assert!(
+            crate::queue::WorkerQueue::ack(queue.as_ref(), first_id, "worker-1", Ok(()))
+                .await
+                .unwrap(),
+            "the worker must retain ownership of its claim after removal"
+        );
+        let claimed_after_remove = crate::queue::WorkerQueue::claim(queue.as_ref(), "worker-2")
+            .await
+            .unwrap()
+            .expect("the queued job remains claimable after removal");
+        assert_eq!(claimed_after_remove.id, second_id);
+        assert!(
+            crate::queue::WorkerQueue::ack(queue.as_ref(), second_id, "worker-2", Ok(()))
+                .await
+                .unwrap(),
+            "the queued job must remain settleable after removal"
+        );
     }
 
     #[test]

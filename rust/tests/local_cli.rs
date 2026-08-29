@@ -18,6 +18,8 @@ mod e2e_config_clone_mode;
 mod e2e_config_provider_add_then_clone;
 #[path = "suites/local_cli/e2e_download_rules.rs"]
 mod e2e_download_rules;
+#[path = "suites/local_cli/e2e_repo_lifecycle.rs"]
+mod e2e_repo_lifecycle;
 #[path = "suites/local_cli/e2e_roundtrip.rs"]
 mod e2e_roundtrip;
 #[path = "suites/local_cli/e2e_verify_upstream.rs"]

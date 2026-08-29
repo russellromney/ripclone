@@ -155,6 +155,13 @@ Clone it:
 cargo run --release --bin ripclone -- clone oven-sh/bun bun
 ```
 
+Inspect or remove server registrations explicitly:
+
+```bash
+cargo run --release --bin ripclone -- list
+cargo run --release --bin ripclone -- rm oven-sh/bun
+```
+
 (`add` is the first-run verb — a repo must be added before it can be cloned or
 re-synced. Later re-builds use `ripclone sync <repo>`, which push webhooks and
 CI hooks call automatically. If you prefer to pass the server per command
@@ -258,7 +265,17 @@ ripclone sync owner/repo --at HEAD~5           # build at a past rev
 # Register and admit a repo; add is fast unless --wait is requested
 ripclone add owner/repo
 ripclone add owner/repo --wait                 # wait for exact Full readiness
+
+# List server registrations, then remove one registration
+ripclone list
+ripclone rm owner/repo
 ```
+
+`list` prints one stable, reusable CLI repository name per line. Repositories
+on the selected default provider use a bare path; other providers use the CLI's
+colon form, such as `gitlab:group/sub/repo`. `rm` removes only the server
+registration. Existing exact results and artifact bytes remain published, and
+already admitted or running jobs continue.
 
 For a private repo, pass an upstream credential with `--token`. The client sends it as `X-Upstream-Token` and the server translates it to the host's auth form (GitHub, GitLab, Gitea, …):
 

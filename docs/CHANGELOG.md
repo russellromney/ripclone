@@ -4,6 +4,21 @@ This file tracks what has already landed in ripclone. The old planning snapshot
 in [`internal/ROADMAP.md`](internal/ROADMAP.md) is retained for historical
 context; it is not current operational guidance.
 
+## Explicit repository lifecycle
+
+- **The CLI now completes the explicit lifecycle with `add`, `list`, and
+  `rm`.** `list` prints the server's added repositories in stable sorted order;
+  the selected default provider is bare and other providers use reusable
+  `provider:path` names. `rm` accepts those names without requiring a local
+  provider configuration or upstream credential.
+- **One authenticated `GET /v1/repos` endpoint returns the existing `RepoId`
+  values.** Removal uses the existing `DELETE .../add` route and returns the
+  existing `repo_not_added` error when the registration is absent.
+- **Removal changes only registration state.** Exact results, durable local or
+  S3-compatible artifact bytes, and admitted or running jobs remain unchanged.
+  CLI `provider:path` names remain distinct from webhook-allowlist
+  `RepoId::natural_key` values, which use `provider/path`.
+
 ## Published artifacts remain durable
 
 - **Published exact Head, Full, and Files results no longer expire.** Their
