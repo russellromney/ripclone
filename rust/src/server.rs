@@ -8365,20 +8365,26 @@ mod tests {
             assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
         }
 
-        let rejected_remove = app
-            .oneshot(request_with_auth(
-                "DELETE",
-                "/v1/repos/github/zeta/repo/add",
-                Some("Ripclone wrong"),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(rejected_remove.status(), StatusCode::UNAUTHORIZED);
-        assert!(store.load_added_repo(&github).await.unwrap().is_some());
+        for auth in [None, Some("Ripclone wrong")] {
+            let rejected_remove = app
+                .clone()
+                .oneshot(request_with_auth(
+                    "DELETE",
+                    "/v1/repos/github/zeta/repo/add",
+                    auth,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rejected_remove.status(), StatusCode::UNAUTHORIZED);
+            assert!(
+                store.load_added_repo(&github).await.unwrap().is_some(),
+                "rejected removal must preserve the registration"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn repository_remove_rejects_missing_and_lookup_failure_without_mutation() {
+    async fn repository_remove_rejects_missing_invalid_and_lookup_failure_without_mutation() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(TestSqlRefStore::new(
             tmp.path().join("remove-lookup-failure-refs.db"),
@@ -8399,6 +8405,21 @@ mod tests {
             .unwrap();
         let missing_body: serde_json::Value = serde_json::from_slice(&missing_body).unwrap();
         assert_eq!(missing_body["code"], "repo_not_added");
+        assert!(store.load_added_repo(&repo_id).await.unwrap().is_some());
+
+        let invalid = app
+            .clone()
+            .oneshot(test_request(
+                "DELETE",
+                "/v1/repos/github/acme/bad%7Frepo/add",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            store.load_added_repo(&repo_id).await.unwrap().is_some(),
+            "invalid removal must leave other registrations intact"
+        );
 
         store.fail_next_added_repo_read();
         let failed = app
@@ -8413,12 +8434,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_remove_leaves_admitted_job_pending() {
+    async fn repository_remove_leaves_pending_and_claimed_jobs_active() {
         let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
+        let mut state = test_state(&tmp);
+        let queue_db = crate::queue::LibsqlDb::connect(
+            &tmp.path().join("remove-running-jobs.db").to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        let queue = Arc::new(
+            crate::queue::SqlJobQueue::new(Box::new(queue_db))
+                .await
+                .unwrap(),
+        );
+        state.build_queue = queue.clone();
         let repo_id = RepoId::github("acme/pending");
         mark_added(&state, repo_id.clone()).await;
-        let enqueued = state
+        let first = state
             .build_queue
             .enqueue(BuildJob {
                 repo_id: repo_id.clone(),
@@ -8429,23 +8461,71 @@ mod tests {
             })
             .await
             .unwrap();
-        let job_id = enqueued.job_id.expect("durable admitted job id");
+        let second = state
+            .build_queue
+            .enqueue(BuildJob {
+                repo_id: repo_id.clone(),
+                admitted_commit: "b".repeat(40),
+                repo_config: crate::repo_config::RepoConfig::default(),
+                credential: None,
+                size_bytes: None,
+            })
+            .await
+            .unwrap();
+        let first_id = first.job_id.expect("first durable admitted job id");
+        let second_id = second.job_id.expect("second durable admitted job id");
+        let claimed = crate::queue::WorkerQueue::claim(queue.as_ref(), "worker-1")
+            .await
+            .unwrap()
+            .expect("first job is claimable");
+        assert_eq!(claimed.id, first_id);
         assert!(
             matches!(
-                state.build_queue.job_status(job_id).await.unwrap(),
+                state.build_queue.job_status(first_id).await.unwrap(),
                 JobState::Pending
             ),
-            "job must be pending before removal"
+            "a claimed job reports as active before removal"
+        );
+        assert!(
+            matches!(
+                state.build_queue.job_status(second_id).await.unwrap(),
+                JobState::Pending
+            ),
+            "the second job must be queued before removal"
         );
 
         let response = remove_added_repo_inner(repo_id, state.clone()).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(
             matches!(
-                state.build_queue.job_status(job_id).await.unwrap(),
+                state.build_queue.job_status(first_id).await.unwrap(),
                 JobState::Pending
             ),
-            "removal must not cancel an admitted job"
+            "removal must not cancel a claimed job"
+        );
+        assert!(
+            matches!(
+                state.build_queue.job_status(second_id).await.unwrap(),
+                JobState::Pending
+            ),
+            "removal must not cancel a queued job"
+        );
+        assert!(
+            crate::queue::WorkerQueue::ack(queue.as_ref(), first_id, "worker-1", Ok(()))
+                .await
+                .unwrap(),
+            "the worker must retain ownership of its claim after removal"
+        );
+        let claimed_after_remove = crate::queue::WorkerQueue::claim(queue.as_ref(), "worker-2")
+            .await
+            .unwrap()
+            .expect("the queued job remains claimable after removal");
+        assert_eq!(claimed_after_remove.id, second_id);
+        assert!(
+            crate::queue::WorkerQueue::ack(queue.as_ref(), second_id, "worker-2", Ok(()))
+                .await
+                .unwrap(),
+            "the queued job must remain settleable after removal"
         );
     }
 
