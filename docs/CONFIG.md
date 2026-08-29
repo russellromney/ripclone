@@ -27,6 +27,8 @@ Internal tuning knobs use code constants at their current defaults.
 ## Operator
 
 - `RIPCLONE_CONFIG` - path to the global `config.toml`.
+- `RUST_LOG` - server/worker tracing filter, normally `info`; use `debug` for a
+  bounded diagnostic run.
 - `RIPCLONE_PROVIDERS` - JSON provider registry override.
 - `RIPCLONE_SERVER_TOKEN` / `RIPCLONE_SERVER_TOKEN_HASH` - server auth for
   clients and self-hosted servers.

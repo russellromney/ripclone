@@ -3,10 +3,10 @@ set -euo pipefail
 
 # Single-rate shaped clone benchmark for a remote ripclone server.
 #
-# Usage (run inside the Fly client machine or any Linux host with CAP_NET_ADMIN):
-#   RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+# Usage (run on a Linux client with CAP_NET_ADMIN):
+#   RIPCLONE_URL=https://your-ripclone-server.example.com \
 #   RIPCLONE_SERVER_TOKEN=... \
-#   ./benchmark/fly_shaped_benchmark.sh <owner/repo> <rate_mbps> [runs] [target_dir]
+#   ./benchmark/shaped_benchmark.sh <owner/repo> <rate_mbps> [runs] [target_dir]
 #
 # Set RIPCLONE_BENCH_PROVIDER for non-GitHub provider routes.
 # Set BENCH_MODES to a space-separated subset of full, depth1, files,
@@ -56,7 +56,8 @@ for result in $READY_RESULTS; do
   esac
 done
 
-SERVER_URL="${RIPCLONE_URL:-https://ripclone-server-dev.fly.dev}"
+: "${RIPCLONE_URL:?RIPCLONE_URL must name the server under test}"
+SERVER_URL="$RIPCLONE_URL"
 TOKEN="${RIPCLONE_SERVER_TOKEN:-}"
 RIPCLONE="${RIPCLONE:-ripclone}"
 PROVIDER="${RIPCLONE_BENCH_PROVIDER:-github}"

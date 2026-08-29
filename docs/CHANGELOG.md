@@ -4,6 +4,18 @@ This file tracks what has already landed in ripclone. The old planning snapshot
 in [`internal/ROADMAP.md`](internal/ROADMAP.md) is retained for historical
 context; it is not current operational guidance.
 
+## OSS release readiness
+
+- **The supported installed programs are explicit:** release archives, the
+  shell installer, and default Cargo installs contain `ripclone`,
+  `ripclone-server`, and `ripclone-worker`. Benchmark-only programs require the
+  `dev-tools` Cargo feature.
+- **Missing system Git fails early and clearly** for the server, standalone
+  worker, and editable clones. Files-only clones remain available without Git.
+- **Public support and release checks now match the code.** Platform, MSRV,
+  wire-version, logging, and contribution policies are documented; deployment-
+  specific fixtures and old public planning files are removed.
+
 ## Explicit repository lifecycle
 
 - **The CLI now completes the explicit lifecycle with `add`, `list`, and
@@ -79,7 +91,7 @@ context; it is not current operational guidance.
 
 - **Cold full-history builds preserve Git's existing delta graph** (`rust/src/pack.rs`, `rust/src/git.rs`): the bitmap-backed history pack is no longer split with `git pack-objects --max-pack-size`. Splitting forced Git to discard cross-pack deltas, making large repositories substantially larger and slower to build. Local storage keeps the compact pack as one file; large remote uploads are handled by the storage transport.
 - **Large S3-compatible uploads use bounded multipart streaming** (`rust/src/storage/s3_storage.rs`): files at least 100 MiB use 128 MiB parts with one backend-wide, CPU-scaled budget of at most eight uploads in flight, automatically increasing part size to remain within the 10,000-part limit. Failed uploads are aborted, and a build removes its local artifact copy only after the remote object completes.
-- **The shaped benchmark times cloning, not repository admission** (`benchmark/fly_shaped_benchmark.sh`): add/readiness happens before each sample set, every run is pinned to one resolved commit, validation happens after the timer, failures propagate, and summaries report p50 and nearest-rank p90.
+- **The shaped benchmark times cloning, not repository admission** (`benchmark/shaped_benchmark.sh`): add/readiness happens before each sample set, every run is pinned to one resolved commit, validation happens after the timer, failures propagate, and summaries report p50 and nearest-rank p90.
 
 ## Worker heartbeat / registry (superseded implementation history)
 
@@ -141,7 +153,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 
 ## Benchmark harness
 
-- **`benchmark/fly_shaped_benchmark.sh`** now prints the resolved commit in its header instead of `commit=latest`, and prefers `RIPCLONE_SERVER_TOKEN`.
+- **`benchmark/shaped_benchmark.sh`** now prints the resolved commit in its header instead of `commit=latest`, and prefers `RIPCLONE_SERVER_TOKEN`.
 - Repository admission and artifact readiness now happen explicitly outside
   clone timing. The harness can select benchmark modes or shallow-only
   readiness and verifies every editable result is clean at the one resolved

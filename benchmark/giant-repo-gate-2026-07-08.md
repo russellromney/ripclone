@@ -5,9 +5,9 @@ Validate ripclone's performance claims on **giant** repos, not just
 
 ## Setup
 
-- **Fly-to-Fly**, so no home-internet contamination: client `ripclone-client-dev` (ewr,
-  performance-8x) → server `ripclone-server-dev` (iad). The client shapes its own link with
-  nftables; clones written to `/data` (the NVMe volume), fresh client cache every run
+- **Two cloud VMs**, so no home-internet contamination: an 8-vCPU client and a
+  separate server. The client shapes its own link with nftables; clones are
+  written to an NVMe volume, with a fresh client cache every run
   (`RIPCLONE_NO_CACHE=1`).
 - Pinned fixtures (HEAD frozen so the sweep can't drift):
   `torvalds/linux` @ `0e35b9b6ec0f`, `microsoft/vscode` @ `9269826965`.
@@ -69,11 +69,11 @@ bottleneck is the reachability-**bitmap / multi-pack-index write** (the B6 "leve
   triggered on this deployment.
 - **glibc, not the shipped musl+mimalloc binary** (Docker was unavailable to cross-build
   during the run). Consistent with the existing published numbers; musl perf is a follow-up.
-- Measured on a Fly `/data` volume; a local NVMe/SSD will differ on the writer path.
+- Measured on a cloud NVMe volume; a local NVMe/SSD will differ on the writer path.
 
 ## Reproduce
 
-`benchmark/fly_shaped_benchmark.sh` (fixed to be B5 `add`-aware in #122) + the depth-1
+`benchmark/shaped_benchmark.sh` (fixed to be B5 `add`-aware in #122) + the depth-1
 sweep driver. Pre-warm each repo (`POST /sync?rev=<sha>`), wait for readiness by attempting
 the clone (field-based readiness is unreliable on the current server — see #122), then run
 the shaped sweep on the client with `SKIP_SYNC=1`.

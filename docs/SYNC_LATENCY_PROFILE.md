@@ -62,9 +62,9 @@ hybrid top-up clone idea gets promoted into launch scope.
   fixture validates the instrumentation; the tripwire decision requires the
   same measurement on a benchmark host against live GitHub origins.
 
-## 2026-07-04 Fly real-repo `--at` parent-to-target verdict
+## 2026-07-04 cloud real-repo `--at` parent-to-target verdict
 
-Measured on `ripclone-server-dev` (`performance-8x`, 16 GiB) against live
+Measured on an 8-vCPU, 16 GiB test server against live
 GitHub upstream repos. The benchmark warmed the server by syncing the parent
 commit with `?rev=<parent>`, waited for the background full-history build to
 settle, then synced the target commit with `?rev=<target>`. This exercises the
