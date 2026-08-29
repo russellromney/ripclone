@@ -63,7 +63,7 @@ docker run --rm -it ubuntu:24.04 bash -lc '
   curl -fsSL https://github.com/russellromney/ripclone/releases/download/v0.1.0-rc.1/install.sh | sh &&
   ~/.local/bin/ripclone --version &&
   ~/.local/bin/ripclone-server --version &&
-  ~/.local/bin/ripclone-worker --version'
+  ~/.local/bin/ripclone-worker --help >/dev/null'
 ```
 
 Repeat on Alpine with `apk add ca-certificates curl git`. Confirm checksum
