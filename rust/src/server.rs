@@ -891,6 +891,33 @@ impl RateLimiter {
     }
 }
 
+fn parse_rate_limit_settings(
+    burst: Option<&str>,
+    restore_rate_per_sec: Option<&str>,
+) -> Result<(u32, f64)> {
+    let burst = burst
+        .map(|value| {
+            value
+                .parse()
+                .context("RIPCLONE_RATE_LIMIT_BURST must be an unsigned integer")
+        })
+        .transpose()?
+        .unwrap_or(60);
+    let restore_rate_per_sec: f64 = restore_rate_per_sec
+        .map(|value| {
+            value
+                .parse()
+                .context("RIPCLONE_RATE_LIMIT_PER_SEC must be a number")
+        })
+        .transpose()?
+        .unwrap_or(10.0);
+    anyhow::ensure!(
+        restore_rate_per_sec.is_finite() && restore_rate_per_sec >= 0.0,
+        "RIPCLONE_RATE_LIMIT_PER_SEC must be finite and non-negative"
+    );
+    Ok((burst, restore_rate_per_sec))
+}
+
 #[derive(Deserialize)]
 pub struct SyncRequest {
     #[serde(default = "default_branch_value")]
@@ -7745,14 +7772,10 @@ async fn run_server_with_barrier_at_control(
     );
     let broker = broker_from_env(provider_registry.clone())?;
 
-    let rate_burst: u32 = env::var("RIPCLONE_RATE_LIMIT_BURST")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
-    let rate_per_sec: f64 = env::var("RIPCLONE_RATE_LIMIT_PER_SEC")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10.0);
+    let rate_burst_raw = env::var("RIPCLONE_RATE_LIMIT_BURST").ok();
+    let rate_per_sec_raw = env::var("RIPCLONE_RATE_LIMIT_PER_SEC").ok();
+    let (rate_burst, rate_per_sec) =
+        parse_rate_limit_settings(rate_burst_raw.as_deref(), rate_per_sec_raw.as_deref())?;
     let rate_limiter = RateLimiter::new(rate_burst, rate_per_sec);
     info!(
         "rate limiter enabled: burst={}, restore={}/s",
@@ -8878,6 +8901,31 @@ mod tests {
             assert!(limiter.check("client"));
             assert!(!limiter.check("client"));
         }
+    }
+
+    #[test]
+    fn rate_limit_config_rejects_invalid_values() {
+        for rate in ["NaN", "inf", "-inf", "-1"] {
+            let error = parse_rate_limit_settings(None, Some(rate)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("RIPCLONE_RATE_LIMIT_PER_SEC must be finite and non-negative"),
+                "got: {error:#}"
+            );
+        }
+
+        let error = parse_rate_limit_settings(Some("not-a-number"), None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("RIPCLONE_RATE_LIMIT_BURST must be an unsigned integer"),
+            "got: {error:#}"
+        );
+        assert_eq!(
+            parse_rate_limit_settings(Some("0"), Some("0")).unwrap(),
+            (0, 0.0)
+        );
     }
 
     #[test]

@@ -806,8 +806,12 @@ fn retry_backoff(attempts: i64) -> std::time::Duration {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(250);
+    retry_backoff_with_base(base_ms, attempts)
+}
+
+fn retry_backoff_with_base(base_ms: u64, attempts: i64) -> std::time::Duration {
     let shift = u32::try_from(attempts.saturating_sub(1).clamp(0, 5)).unwrap_or(0);
-    std::time::Duration::from_millis(base_ms * 2_u64.saturating_pow(shift))
+    std::time::Duration::from_millis(base_ms.saturating_mul(2_u64.saturating_pow(shift)))
 }
 
 #[async_trait]
@@ -2841,6 +2845,11 @@ mod tests {
         assert_eq!(
             retry_backoff(i64::MAX),
             std::time::Duration::from_millis(8_000)
+        );
+        assert_eq!(
+            retry_backoff_with_base(u64::MAX, i64::MAX),
+            std::time::Duration::from_millis(u64::MAX),
+            "a configured base at the u64 boundary must saturate"
         );
     }
 
