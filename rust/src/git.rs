@@ -3985,6 +3985,12 @@ mod tests {
             3,
             "one changed root file should introduce only commit + root tree + changed blob"
         );
+
+        let full_range = list_object_shas_in_range(repo, None, &shas[2]).unwrap();
+        assert!(full_range.contains(&shas[0]));
+        assert!(full_range.contains(&shas[1]));
+        assert!(full_range.contains(&shas[2]));
+        assert!(full_range.contains(&stable_blob));
     }
 
     /// Regression: object lookups for ≥PARALLEL_LOOKUP_THRESHOLD objects must not
