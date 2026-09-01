@@ -157,6 +157,31 @@ async fn incomplete_turso_pairs_fail_without_side_effects() {
 }
 
 #[tokio::test]
+async fn incomplete_s3_configuration_fails_without_side_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let s3_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", s3_listener.local_addr().unwrap());
+    let mut command = server_command(root.path());
+    command.env("RIPCLONE_S3_ENDPOINT", endpoint);
+    let output = run_bounded(command).await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("RIPCLONE_S3_BUCKET"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_runtime_side_effects(root.path());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), s3_listener.accept())
+            .await
+            .is_err(),
+        "S3 configuration preflight contacted the configured endpoint"
+    );
+}
+
+#[tokio::test]
 async fn explicitly_empty_control_values_fail_without_side_effects() {
     for key in [
         "RIPCLONE_CONTROL_DB_PATH",

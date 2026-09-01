@@ -55,6 +55,14 @@ pub struct S3Storage {
     multipart_upload_slots: tokio::sync::Semaphore,
 }
 
+struct S3Settings {
+    endpoint: String,
+    region: String,
+    bucket: String,
+    prefix: Option<String>,
+    auth: Auth,
+}
+
 impl S3Storage {
     pub fn new(
         endpoint: &str,
@@ -133,6 +141,26 @@ impl S3Storage {
     /// environment only — never from config. `backend = "local"` forces local
     /// storage (returns `None`) even if S3 settings are present.
     pub fn from_env_or_config(cfg: &crate::config::StorageConfig) -> Result<Option<Self>> {
+        let Some(settings) = Self::settings_from_env_or_config(cfg)? else {
+            return Ok(None);
+        };
+        Self::new(
+            &settings.endpoint,
+            &settings.region,
+            &settings.bucket,
+            settings.prefix.as_deref(),
+            settings.auth,
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn validate_env_or_config(cfg: &crate::config::StorageConfig) -> Result<()> {
+        Self::settings_from_env_or_config(cfg).map(|_| ())
+    }
+
+    fn settings_from_env_or_config(
+        cfg: &crate::config::StorageConfig,
+    ) -> Result<Option<S3Settings>> {
         if cfg.backend.as_deref() == Some("local") {
             return Ok(None);
         }
@@ -167,7 +195,13 @@ impl S3Storage {
             .context("RIPCLONE_S3_BUCKET or BUCKET_NAME (or [storage].bucket) is required when S3 is enabled")?;
         let prefix = pick("RIPCLONE_S3_PREFIX", None, cfg.prefix.as_deref());
         let auth = Auth::from_env().context("read S3 credentials from environment")?;
-        Self::new(&endpoint, &region, &bucket, prefix.as_deref(), auth).map(Some)
+        Ok(Some(S3Settings {
+            endpoint,
+            region,
+            bucket,
+            prefix,
+            auth,
+        }))
     }
 
     fn key(&self, hash: &str) -> Result<String> {

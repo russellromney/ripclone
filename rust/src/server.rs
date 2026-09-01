@@ -7803,6 +7803,8 @@ async fn run_server_with_barrier_at_control(
         rate_burst, rate_per_sec
     );
 
+    backends::Backends::validate_environment()?;
+
     let metrics = Metrics::new();
     let control_db = Arc::new(
         crate::control::ControlDb::open(
