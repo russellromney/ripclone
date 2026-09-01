@@ -96,6 +96,11 @@ docker run --rm --platform "$PLATFORM" \
     /b/ripclone --version
     /b/ripclone-server --version
     /b/ripclone-worker --help >/dev/null && echo "ripclone-worker: ok"
+    # Loading the static programs above must work on package-free Alpine. The
+    # supported server runtime separately requires system Git, so install the
+    # same explicit runtime dependency used by the release container before
+    # exercising real server work.
+    apk add --no-cache git >/dev/null
     # ...and one of them must do real work: repeatedly boot the server (tokio,
     # rustls, sqlite, the local storage backend) and answer live requests. The
     # repetition catches connection-teardown faults that a single lucky boot can
