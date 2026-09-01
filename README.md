@@ -117,19 +117,16 @@ To wipe local state as well: the CLI's saved login lives at `~/.config/ripclone/
 
 ## Quick start
 
-Build and run the server:
+Install ripclone with one of the methods above, then start the packaged server:
 
 ```bash
-cd rust
-cargo build --release
-
 # The server requires the `git` executable on PATH.
 git --version
 
 # The server requires a token; both the server and CLI read it from
 # RIPCLONE_SERVER_TOKEN. Generate one and start the server:
 export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
-./target/release/ripclone-server
+ripclone-server
 ```
 
 The server defaults to storing its local artifact CAS and bare mirrors under
@@ -156,20 +153,20 @@ accepts the exact upstream commit; artifact construction continues in the
 background:
 
 ```bash
-cargo run --release --bin ripclone -- add oven-sh/bun
+ripclone add oven-sh/bun
 ```
 
 Clone it:
 
 ```bash
-cargo run --release --bin ripclone -- clone oven-sh/bun bun
+ripclone clone oven-sh/bun bun
 ```
 
 Inspect or remove server registrations explicitly:
 
 ```bash
-cargo run --release --bin ripclone -- list
-cargo run --release --bin ripclone -- rm oven-sh/bun
+ripclone list
+ripclone rm oven-sh/bun
 ```
 
 (`add` is the first-run verb — a repo must be added before it can be cloned or
