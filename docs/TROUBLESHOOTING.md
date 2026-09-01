@@ -2,11 +2,24 @@
 
 Common failures and what they mean.
 
+## System Git is missing
+
+The server, worker, and editable clone paths use the system `git` executable.
+They check it before starting work and report:
+
+```text
+system Git is required; install `git` and ensure it is on PATH
+```
+
+Install Git with your operating system package manager. For example,
+`apk add git` on Alpine or `apt-get install git` on Ubuntu. Files-only client
+clones do not require Git.
+
 ## `error while loading shared libraries` on Linux
 
-You should never see this. The Linux prebuilt binaries are statically linked against musl — fully self-contained, with no libc or C-library runtime dependency — so they run on any Linux, Alpine (musl) and glibc distros alike, with nothing to `apt-get` or `apk add`. The git and TLS stacks are pure Rust (gix + rustls) and the remaining C libraries (zstd, zlib-ng) are vendored into the binary.
-
-If a Linux binary still fails to load a shared library, the download is corrupt or truncated — re-run the installer, or build from source with `cargo install ripclone --locked`.
+The Linux release binaries are static musl builds. If a release asset reports a
+missing shared library, verify its checksum and reinstall it. A source build is
+not the same artifact and may use libraries from the build machine.
 
 ## Clone prints "warming" / hangs, or the server returns `202`
 
@@ -45,4 +58,15 @@ ripclone version    # prints CLI + server versions with a compatibility verdict
 A client/server protocol mismatch is the usual cause of missing modes or unexpected `202`/`404` responses — deploy matching versions.
 
 Also confirm the CLI is talking to the server you think it is. Resolution order is: `--server` > `RIPCLONE_SERVER` env var > saved login config (`~/.config/ripclone/`) > the built-in default server. A stale `RIPCLONE_SERVER` in your environment or an old saved login will silently override the server you meant to use. `ripclone logout` clears the saved login.
-</content>
+
+## Logging
+
+Set `RUST_LOG` on the server or worker to choose the tracing level:
+
+```sh
+RUST_LOG=info ripclone-server
+RUST_LOG=debug ripclone-worker
+```
+
+`info` is the normal operator setting. Use `debug` for a bounded diagnostic run;
+it is much noisier.
