@@ -3968,7 +3968,14 @@ impl Client {
         let status = self
             .run_managed_git(
                 install_root,
-                ["status", "--porcelain=v1", "--untracked-files=all"],
+                [
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--",
+                    ".",
+                    ":(exclude).ripclone-install-staging",
+                ],
                 None,
                 cleanup,
             )
