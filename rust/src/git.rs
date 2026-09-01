@@ -39,7 +39,7 @@ pub fn update_index_sizes<P: AsRef<Path>>(git_dir: P, sizes: &HashMap<String, u6
                 gix::index::entry::Stage::Unconflicted,
             )
             .with_context(|| format!("path {path} not in index"))?;
-        entry.stat.size = size as u32;
+        entry.stat.size = clamp_u64_to_u32(size);
         entry.stat.ctime = gix::index::entry::stat::Time { secs: 1, nsecs: 0 };
         entry.stat.mtime = gix::index::entry::stat::Time { secs: 1, nsecs: 0 };
         entry.stat.dev = 0;
@@ -294,17 +294,17 @@ fn index_stat_from_metadata(metadata: &std::fs::Metadata) -> IndexStat {
     IndexStat {
         ctime: gix::index::entry::stat::Time {
             secs: clamp_i64_to_u32(metadata.ctime()),
-            nsecs: metadata.ctime_nsec() as u32,
+            nsecs: clamp_i64_to_u32(metadata.ctime_nsec()),
         },
         mtime: gix::index::entry::stat::Time {
             secs: clamp_i64_to_u32(metadata.mtime()),
-            nsecs: metadata.mtime_nsec() as u32,
+            nsecs: clamp_i64_to_u32(metadata.mtime_nsec()),
         },
-        dev: truncate_u64_to_u32(metadata.dev()),
-        ino: truncate_u64_to_u32(metadata.ino()),
+        dev: clamp_u64_to_u32(metadata.dev()),
+        ino: clamp_u64_to_u32(metadata.ino()),
         uid: metadata.uid(),
         gid: metadata.gid(),
-        size: truncate_u64_to_u32(metadata.len()),
+        size: clamp_u64_to_u32(metadata.len()),
     }
 }
 
@@ -317,7 +317,7 @@ fn index_stat_from_metadata(metadata: &std::fs::Metadata) -> IndexStat {
         ino: 0,
         uid: 0,
         gid: 0,
-        size: truncate_u64_to_u32(metadata.len()),
+        size: clamp_u64_to_u32(metadata.len()),
     }
 }
 
@@ -332,18 +332,18 @@ fn index_stat_from_statx(statx: &crate::statx_compat::statx) -> IndexStat {
             secs: clamp_i64_to_u32(statx.stx_mtime.tv_sec),
             nsecs: statx.stx_mtime.tv_nsec,
         },
-        dev: truncate_u64_to_u32(make_dev(statx.stx_dev_major, statx.stx_dev_minor)),
-        ino: truncate_u64_to_u32(statx.stx_ino),
+        dev: clamp_u64_to_u32(make_dev(statx.stx_dev_major, statx.stx_dev_minor)),
+        ino: clamp_u64_to_u32(statx.stx_ino),
         uid: statx.stx_uid,
         gid: statx.stx_gid,
-        size: truncate_u64_to_u32(statx.stx_size),
+        size: clamp_u64_to_u32(statx.stx_size),
     }
 }
 
 #[cfg(target_os = "linux")]
 fn make_dev(major: u32, minor: u32) -> u64 {
-    let major = major as u64;
-    let minor = minor as u64;
+    let major = u64::from(major);
+    let minor = u64::from(minor);
     ((major & 0x00000fff) << 8)
         | (minor & 0x000000ff)
         | ((minor & 0xffffff00) << 12)
@@ -351,11 +351,11 @@ fn make_dev(major: u32, minor: u32) -> u64 {
 }
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
-    value.clamp(0, u32::MAX as i64) as u32
+    u32::try_from(value).unwrap_or(if value.is_negative() { 0 } else { u32::MAX })
 }
 
-fn truncate_u64_to_u32(value: u64) -> u32 {
-    value.min(u32::MAX as u64) as u32
+fn clamp_u64_to_u32(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Materialize the entire index into the working tree using `git checkout-index`.
@@ -1551,6 +1551,9 @@ pub async fn ls_remote_tip_async_with_timeout(
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr));
     #[cfg(unix)]
+    // SAFETY: `pre_exec` runs after fork and before exec. The closure only
+    // calls async-signal-safe `setpgid` and constructs an OS error from
+    // thread-local errno on failure; it captures no borrowed state.
     unsafe {
         use std::os::unix::process::CommandExt;
         command.as_std_mut().pre_exec(|| {
@@ -1608,7 +1611,7 @@ struct ManagedLsRemoteChild {
 impl ManagedLsRemoteChild {
     fn new(child: tokio::process::Child) -> Self {
         Self {
-            process_group: child.id().map(|pid| pid as i32),
+            process_group: child.id().and_then(|pid| i32::try_from(pid).ok()),
             child: Some(child),
         }
     }
@@ -1847,7 +1850,14 @@ pub fn ls_remote_tip_with_timeout(
 fn kill_ls_remote_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let pid = child.id() as libc::pid_t;
+        let pid = libc::pid_t::try_from(child.id()).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("child process id exceeds pid_t: {error}"),
+            )
+        })?;
+        // SAFETY: `pid` identifies the child process group established at spawn;
+        // negating it targets that group. `kill` does not dereference Rust memory.
         let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
         if result != 0 {
             let error = std::io::Error::last_os_error();
@@ -1904,6 +1914,8 @@ impl MirrorLock {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open mirror lock {}", lock_path.display()))?;
+        // SAFETY: `file` owns a live descriptor for the duration of the call;
+        // `flock` neither retains the descriptor nor dereferences Rust memory.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
             return Err(anyhow::Error::new(std::io::Error::last_os_error()))
@@ -1993,7 +2005,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             mirror_dir.as_ref(),
             &url,
             &git_args,
-            auth_header.clone(),
+            auth_header,
             branch,
             rev,
             true,

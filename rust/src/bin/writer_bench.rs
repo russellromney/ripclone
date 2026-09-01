@@ -114,11 +114,19 @@ fn build_workload(cfg: &Config) -> Workload {
     let dirs = cfg.dirs.max(1);
     for i in 0..cfg.small {
         let path = format!("d{:03}/small_{:06}.txt", i % dirs, i);
-        out.push((path.into_bytes(), 0o644, filled(cfg.small_size, i as u8)));
+        out.push((
+            path.into_bytes(),
+            0o644,
+            filled(cfg.small_size, i.to_le_bytes()[0]),
+        ));
     }
     for i in 0..cfg.large {
         let path = format!("big/large_{:04}.bin", i);
-        out.push((path.into_bytes(), 0o644, filled(cfg.large_size, i as u8)));
+        out.push((
+            path.into_bytes(),
+            0o644,
+            filled(cfg.large_size, i.to_le_bytes()[0]),
+        ));
     }
     out
 }
@@ -126,7 +134,7 @@ fn build_workload(cfg: &Config) -> Workload {
 fn filled(len: usize, seed: u8) -> Vec<u8> {
     let mut v = vec![0u8; len];
     for (i, b) in v.iter_mut().enumerate() {
-        *b = seed.wrapping_add((i & 0xff) as u8);
+        *b = seed.wrapping_add(i.to_le_bytes()[0]);
     }
     v
 }

@@ -629,28 +629,38 @@ impl ArchiveBuilder {
                     .collect::<Result<Vec<_>>>()
             })?;
 
-        let mut all_chunks = Vec::with_capacity(bounds.len());
+        anyhow::ensure!(
+            bounds.len() == processed.len(),
+            "archive frame processing count mismatch: bounds={} processed={}",
+            bounds.len(),
+            processed.len()
+        );
         let mut new_chunks = Vec::new();
         let mut frames = Vec::with_capacity(bounds.len());
-        for i in 0..bounds.len() {
-            let raw_len = (bounds[i].1 - bounds[i].0) as u64;
+        for (i, ((start, end), processed_frame)) in bounds.iter().zip(&processed).enumerate() {
+            let raw_len = u64::try_from(
+                end.checked_sub(*start)
+                    .context("archive frame bounds are reversed")?,
+            )
+            .context("archive frame length exceeds u64")?;
             let FrameChunk {
                 raw_hash,
                 chunk_hash,
                 compressed_len,
                 is_new,
-            } = &processed[i];
+            } = processed_frame;
             if *is_new {
                 new_chunks.push(chunk_hash.clone());
             }
             // One chunk per frame: chunk_index == frame index, offset 0.
             manifest.frames.push(FrameInfo {
-                chunk_index: i as u32,
+                chunk_index: u32::try_from(i).context("too many archive frames")?,
                 chunk_offset: 0,
-                compressed_len: *compressed_len as u32,
-                raw_len: raw_len as u32,
+                compressed_len: u32::try_from(*compressed_len)
+                    .context("compressed archive frame exceeds manifest limit")?,
+                raw_len: u32::try_from(raw_len)
+                    .context("raw archive frame exceeds manifest limit")?,
             });
-            all_chunks.push(chunk_hash.clone());
             frames.push(crate::ArchiveFrame {
                 raw_hash: raw_hash.clone(),
                 chunk_hash: chunk_hash.clone(),
@@ -732,7 +742,8 @@ impl ArchiveBuilder {
                 current_frame_count = 0;
                 current_hasher = sha2::Sha256::new();
             }
-            let chunk_index = bundle_hashes.len() as u32;
+            let chunk_index =
+                u32::try_from(bundle_hashes.len()).context("too many archive bundles")?;
             let chunk_offset = current_len;
             let written = Self::write_frame_chunk_to_bundle(
                 cas,
@@ -947,22 +958,35 @@ impl ArchiveBuilder {
         oids.extend(new_blobs.iter().map(|(_, o, _)| o.to_string()));
         oids.extend(old_blobs.iter().map(|(_, o, _)| o.to_string()));
         let sizes = crate::git::object_sizes(&self.mirror, &oids)?;
-        let size_of =
-            |oid: &gix::hash::ObjectId| sizes.get(&oid.to_string()).copied().unwrap_or(0) as usize;
+        let size_of = |oid: &gix::hash::ObjectId| {
+            usize::try_from(sizes.get(&oid.to_string()).copied().unwrap_or(0)).ok()
+        };
 
         // Byte offset of every file in each path-ordered stream.
         let mut new_starts = Vec::with_capacity(new_blobs.len());
         let mut acc = 0usize;
         for (_, oid, _) in &new_blobs {
             new_starts.push(acc);
-            acc += size_of(oid);
+            let Some(size) = size_of(oid) else {
+                return full();
+            };
+            let Some(total) = acc.checked_add(size) else {
+                return full();
+            };
+            acc = total;
         }
         let new_total = acc;
         let mut old_starts = Vec::with_capacity(old_blobs.len());
         let mut oacc = 0usize;
         for (_, oid, _) in &old_blobs {
             old_starts.push(oacc);
-            oacc += size_of(oid);
+            let Some(size) = size_of(oid) else {
+                return full();
+            };
+            let Some(total) = oacc.checked_add(size) else {
+                return full();
+            };
+            oacc = total;
         }
         let old_total = oacc;
 
@@ -972,7 +996,11 @@ impl ArchiveBuilder {
         }
         // The prior frames must cover exactly the prior stream, or they don't match
         // prev_commit and we can't trust them.
-        let prior_raw_total: usize = prev_frames.iter().map(|f| f.raw_len as usize).sum();
+        let Some(prior_raw_total) = prev_frames.iter().try_fold(0usize, |total, frame| {
+            total.checked_add(usize::try_from(frame.raw_len).ok()?)
+        }) else {
+            return full();
+        };
         if prior_raw_total != old_total {
             return full();
         }
@@ -982,7 +1010,7 @@ impl ArchiveBuilder {
         // old byte range, the new byte range, and the constant offset shift between
         // them. A modified/added/deleted file is changed and breaks the run.
         let mut new_changed = vec![false; new_blobs.len()];
-        let mut segs: Vec<(usize, usize, i64)> = Vec::new(); // (old_start, old_end, shift)
+        let mut segs: Vec<(usize, usize, isize)> = Vec::new(); // (old_start, old_end, shift)
         let mut run: Option<(usize, usize, usize)> = None; // (old_start, new_start, len)
         let mut i = 0usize;
         let mut j = 0usize;
@@ -997,9 +1025,16 @@ impl ArchiveBuilder {
             match ord {
                 std::cmp::Ordering::Equal => {
                     if old_blobs[i].1 == new_blobs[j].1 {
-                        let sz = size_of(&old_blobs[i].1);
+                        let Some(sz) = size_of(&old_blobs[i].1) else {
+                            return full();
+                        };
                         match &mut run {
-                            Some((_, _, len)) => *len += sz,
+                            Some((_, _, len)) => {
+                                let Some(total) = len.checked_add(sz) else {
+                                    return full();
+                                };
+                                *len = total;
+                            }
                             None => run = Some((old_starts[i], new_starts[j], sz)),
                         }
                     } else {
@@ -1023,13 +1058,19 @@ impl ArchiveBuilder {
                 && let Some((o0, n0, len)) = run.take()
                 && len > 0
             {
-                segs.push((o0, o0 + len, n0 as i64 - o0 as i64));
+                let Some(segment) = shifted_segment(o0, n0, len) else {
+                    return full();
+                };
+                segs.push(segment);
             }
         }
         if let Some((o0, n0, len)) = run.take()
             && len > 0
         {
-            segs.push((o0, o0 + len, n0 as i64 - o0 as i64));
+            let Some(segment) = shifted_segment(o0, n0, len) else {
+                return full();
+            };
+            segs.push(segment);
         }
 
         // Prior frame boundaries (prior-stream bytes).
@@ -1037,7 +1078,13 @@ impl ArchiveBuilder {
         let mut s = 0usize;
         for f in prev_frames {
             prior_starts.push(s);
-            s += f.raw_len as usize;
+            let Some(total) = usize::try_from(f.raw_len)
+                .ok()
+                .and_then(|raw_len| s.checked_add(raw_len))
+            else {
+                return full();
+            };
+            s = total;
         }
         prior_starts.push(s); // == old_total
 
@@ -1056,16 +1103,32 @@ impl ArchiveBuilder {
             if let Some(&(o0, o1, shift)) = segs.get(seg_hint)
                 && o0 <= fs
                 && fe <= o1
-                && (o0 == 0 || fs >= o0 + CDC_MAX)
+                && (o0 == 0 || fs >= o0.saturating_add(CDC_MAX))
             {
-                let ns = (fs as i64 + shift) as usize;
-                reused.push((ns, ns + f.raw_len as usize, k));
+                let Some(ns) = fs.checked_add_signed(shift) else {
+                    return full();
+                };
+                let Some(ne) = usize::try_from(f.raw_len)
+                    .ok()
+                    .and_then(|raw_len| ns.checked_add(raw_len))
+                else {
+                    return full();
+                };
+                reused.push((ns, ne, k));
             }
         }
 
         // No reuse, or the bytes we'd have to re-read are too large to be worth it.
-        let reused_bytes: usize = reused.iter().map(|&(s, e, _)| e - s).sum();
-        if reused.is_empty() || new_total - reused_bytes > max_middle {
+        let Some(reused_bytes) = reused.iter().try_fold(0usize, |total, &(start, end, _)| {
+            total.checked_add(end.checked_sub(start)?)
+        }) else {
+            return full();
+        };
+        if reused.is_empty()
+            || new_total
+                .checked_sub(reused_bytes)
+                .is_none_or(|changed_bytes| changed_bytes > max_middle)
+        {
             return full();
         }
 
@@ -1088,7 +1151,9 @@ impl ArchiveBuilder {
             let mut buf = Vec::with_capacity(g1 - g0);
             for (idx, (_, oid, _)) in new_blobs.iter().enumerate() {
                 let bs = new_starts[idx];
-                let be = bs + size_of(oid);
+                let be = bs
+                    .checked_add(size_of(oid).context("blob size exceeds usize")?)
+                    .context("blob end offset overflow")?;
                 if be <= g0 || bs >= g1 {
                     continue;
                 }
@@ -1167,7 +1232,7 @@ impl ArchiveBuilder {
         let mut hint = 0usize;
         for (idx, (path, oid, mode)) in new_blobs.iter().enumerate() {
             let bstart = new_starts[idx];
-            let blen = size_of(oid);
+            let blen = size_of(oid).context("blob size exceeds usize")?;
             let blob_sha1 = if !new_changed[idx]
                 && let Some(h) = prev_sha.get(path.as_slice())
             {
@@ -1186,10 +1251,12 @@ impl ArchiveBuilder {
         }
         for (i, f) in frames.iter().enumerate() {
             manifest.frames.push(FrameInfo {
-                chunk_index: i as u32,
+                chunk_index: u32::try_from(i).context("too many archive frames")?,
                 chunk_offset: 0,
-                compressed_len: f.compressed_len as u32,
-                raw_len: f.raw_len as u32,
+                compressed_len: u32::try_from(f.compressed_len)
+                    .context("compressed archive frame exceeds manifest limit")?,
+                raw_len: u32::try_from(f.raw_len)
+                    .context("raw archive frame exceeds manifest limit")?,
             });
         }
         // Bundle per-frame chunks into larger download objects while keeping the
@@ -1208,6 +1275,20 @@ impl ArchiveBuilder {
 
 pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
     Sha1::digest(data).into()
+}
+
+fn shifted_segment(
+    old_start: usize,
+    new_start: usize,
+    len: usize,
+) -> Option<(usize, usize, isize)> {
+    let old_end = old_start.checked_add(len)?;
+    let shift = if new_start >= old_start {
+        isize::try_from(new_start - old_start).ok()?
+    } else {
+        isize::try_from(old_start - new_start).ok()?.checked_neg()?
+    };
+    Some((old_start, old_end, shift))
 }
 
 /// Run `process_batch` over one batch of frames and append the results to
@@ -1497,6 +1578,13 @@ pub fn train_dictionary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shifted_segment_checks_offsets_and_lengths() {
+        assert_eq!(shifted_segment(10, 15, 4), Some((10, 14, 5)));
+        assert_eq!(shifted_segment(15, 10, 4), Some((15, 19, -5)));
+        assert_eq!(shifted_segment(usize::MAX, usize::MAX, 1), None);
+    }
 
     /// Regression: the streaming incremental build must write every frame's
     /// compressed bytes into CAS *as it walks* (bounded memory) and still produce

@@ -118,6 +118,8 @@ impl FileLock {
             .mode(0o600)
             .open(&lock_path)
             .with_context(|| format!("open lock file {}", lock_path.display()))?;
+        // SAFETY: `file` owns a live descriptor for the duration of the call;
+        // `flock` neither retains the descriptor nor dereferences Rust memory.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
             return Err(anyhow::Error::new(std::io::Error::last_os_error()))

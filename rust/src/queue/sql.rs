@@ -54,7 +54,7 @@ const DEFAULT_MAX_BUILD_ATTEMPTS: i64 = 5;
 pub(crate) fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -370,7 +370,8 @@ pub fn validate_heartbeat_timing(interval_secs: u64, timeout_secs: i64) -> Resul
     if interval_secs < 1 {
         anyhow::bail!("RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS must be >= 1, got {interval_secs}");
     }
-    if interval_secs as i64 >= timeout_secs {
+    let timeout_secs = u64::try_from(timeout_secs).context("heartbeat timeout must be positive")?;
+    if interval_secs >= timeout_secs {
         anyhow::bail!(
             "RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS ({interval_secs}) must be < \
              RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS ({timeout_secs}) so a healthy \
@@ -540,14 +541,15 @@ impl SqlJobQueue {
     /// `last_heartbeat >= now - timeout` count; older rows are deleted then
     /// excluded.
     pub async fn live_worker_count_at(&self, now: i64) -> Result<usize> {
-        let cutoff = now - self.heartbeat_timeout_secs;
+        let cutoff = now.saturating_sub(self.heartbeat_timeout_secs);
         // Hard age-out so the table does not grow with dead workers forever.
         // Fail loudly on prune errors — a partial view under-counts the fleet.
         self.db.prune_stale_workers(cutoff).await.map_err(|e| {
             tracing::error!("prune stale workers: {e:#}");
             e
         })?;
-        Ok(self.db.count_live_workers(cutoff).await? as usize)
+        usize::try_from(self.db.count_live_workers(cutoff).await?)
+            .context("database returned a negative live-worker count")
     }
 
     /// Live workers that can claim jobs of at least `min_rank`.
@@ -561,12 +563,13 @@ impl SqlJobQueue {
 
     /// [`live_worker_count_capable`] with an explicit clock (tests).
     pub async fn live_worker_count_capable_at(&self, min_rank: i64, now: i64) -> Result<usize> {
-        let cutoff = now - self.heartbeat_timeout_secs;
+        let cutoff = now.saturating_sub(self.heartbeat_timeout_secs);
         self.db.prune_stale_workers(cutoff).await.map_err(|e| {
             tracing::error!("prune stale workers: {e:#}");
             e
         })?;
-        Ok(self.db.count_live_workers_capable(cutoff, min_rank).await? as usize)
+        usize::try_from(self.db.count_live_workers_capable(cutoff, min_rank).await?)
+            .context("database returned a negative capable-worker count")
     }
 
     /// Pending (`queued`) job counts by size-class rank.
@@ -574,7 +577,8 @@ impl SqlJobQueue {
     /// Returns `(rank, count)` for ranks with depth > 0, ordered by rank.
     /// Ranks from the DB are clamped into the configured class range.
     pub async fn pending_by_class(&self) -> Result<Vec<(i64, usize)>> {
-        let last = (self.size_classes.len().saturating_sub(1)) as i64;
+        let last = i64::try_from(self.size_classes.len().saturating_sub(1))
+            .context("too many configured size classes")?;
         let rows = self.db.count_queued_by_size_class().await?;
         let mut out = Vec::with_capacity(rows.len());
         for (rank, count) in rows {
@@ -582,7 +586,10 @@ impl SqlJobQueue {
                 continue;
             }
             let rank = rank.clamp(0, last);
-            out.push((rank, count as usize));
+            out.push((
+                rank,
+                usize::try_from(count).context("queued job count exceeds usize")?,
+            ));
         }
         // Merge rows that collapsed onto the same clamped rank.
         out.sort_by_key(|(r, _)| *r);
@@ -799,8 +806,12 @@ fn retry_backoff(attempts: i64) -> std::time::Duration {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(250);
-    let shift = attempts.saturating_sub(1).min(5) as u32;
-    std::time::Duration::from_millis(base_ms * 2_u64.saturating_pow(shift))
+    retry_backoff_with_base(base_ms, attempts)
+}
+
+fn retry_backoff_with_base(base_ms: u64, attempts: i64) -> std::time::Duration {
+    let shift = u32::try_from(attempts.saturating_sub(1).clamp(0, 5)).unwrap_or(0);
+    std::time::Duration::from_millis(base_ms.saturating_mul(2_u64.saturating_pow(shift)))
 }
 
 #[async_trait]
@@ -883,7 +894,8 @@ impl JobQueue for SqlJobQueue {
         self.db
             .count_queued()
             .await
-            .map(|n| n as usize)
+            .ok()
+            .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0)
     }
 }
@@ -2817,6 +2829,28 @@ mod tests {
         assert!(err.to_string().contains("must be <"), "got: {err}");
         let err = validate_heartbeat_timing(90, 60).unwrap_err();
         assert!(err.to_string().contains("must be <"), "got: {err}");
+        let err = validate_heartbeat_timing(u64::MAX, 60).unwrap_err();
+        assert!(err.to_string().contains("must be <"), "got: {err}");
+    }
+
+    #[test]
+    fn retry_backoff_clamps_invalid_attempt_counts() {
+        assert_eq!(
+            retry_backoff(i64::MIN),
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(retry_backoff(0), std::time::Duration::from_millis(250));
+        assert_eq!(retry_backoff(1), std::time::Duration::from_millis(250));
+        assert_eq!(retry_backoff(6), std::time::Duration::from_millis(8_000));
+        assert_eq!(
+            retry_backoff(i64::MAX),
+            std::time::Duration::from_millis(8_000)
+        );
+        assert_eq!(
+            retry_backoff_with_base(u64::MAX, i64::MAX),
+            std::time::Duration::from_millis(u64::MAX),
+            "a configured base at the u64 boundary must saturate"
+        );
     }
 
     #[test]

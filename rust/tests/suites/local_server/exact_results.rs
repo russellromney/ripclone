@@ -3,6 +3,7 @@
 use crate::common::*;
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
+use ripclone::queue::{JobQueue, JobState};
 use ripclone::server::{AdmissionTestBarrier, AdmissionTestProbe};
 use ripclone::{ExactResultKind, RefInfo};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,6 +51,32 @@ async fn wait_count(counter: &AtomicUsize, count: usize) {
     })
     .await
     .expect("result counter reached expected value");
+}
+
+async fn wait_for_failed_job(server: &Server, repo: &str, commit: &str) {
+    let queue = ripclone::queue::SqlJobQueue::new(Box::new(
+        ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
+            .await
+            .expect("connect exact job queue"),
+    ))
+    .await
+    .expect("initialize exact job queue");
+    let key = format!("{}\x1f{commit}", RepoId::github(repo).storage_key());
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match queue
+                .job_state_for_key(&key)
+                .await
+                .expect("read exact job state")
+            {
+                JobState::Failed(_) => return,
+                JobState::Pending | JobState::Unknown => tokio::task::yield_now().await,
+                JobState::Done => panic!("injected build failure was recorded as successful"),
+            }
+        }
+    })
+    .await
+    .expect("exact job reached durable Failed state");
 }
 
 async fn exact_result(server: &Server, repo: &str, commit: &str) -> RefInfo {
@@ -329,6 +356,7 @@ async fn full_failure_keeps_head_and_files_and_pinned_checks_never_enqueue() {
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_failure(1))
         .await
         .expect("Full failure settles");
+    wait_for_failed_job(&server, "acme/full-failure", &commit).await;
     let failed = exact_result(&server, "acme/full-failure", &commit).await;
     assert!(failed.head.is_some() && failed.files.is_some());
     assert!(failed.full.is_none());
@@ -382,6 +410,7 @@ async fn files_failure_keeps_head_and_full_and_retry_builds_only_files() {
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_failure(1))
         .await
         .expect("Files failure settles");
+    wait_for_failed_job(&server, "acme/files-failure", &commit).await;
     let failed = exact_result(&server, "acme/files-failure", &commit).await;
     assert!(failed.head.is_some() && failed.full.is_some());
     assert!(failed.files.is_none());

@@ -137,6 +137,7 @@ impl OidcVerifier {
             jwks,
             fetched_at: Instant::now(),
         });
+        drop(cache);
         Ok(jwk)
     }
 
