@@ -106,6 +106,36 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
     assert_eq!(read(&c3d1, "a.txt"), "3\n");
 }
 
+#[tokio::test]
+async fn invalid_at_revision_returns_actionable_public_error() {
+    setup(true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "invalid-at-rev");
+    origin.commit(&[("a.txt", "tip\n")], "tip");
+    origin.publish();
+    register_added_without_build(&server, "acme/invalid-at-rev")
+        .await
+        .expect("register invalid-revision fixture");
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/invalid-at-rev/refs/HEAD?result=full&rev=deadbeef",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .send()
+        .await
+        .expect("invalid revision response");
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = response.json().await.expect("error response body");
+    assert_eq!(
+        body["error"],
+        "cannot resolve requested revision `deadbeef`; check the revision and upstream access"
+    );
+}
+
 /// The first resolution of a symbolic historical selector is the operation's
 /// immutable target. Advancing the mirror while its Full artifact is held must
 /// not make a later retry resolve the selector again.
