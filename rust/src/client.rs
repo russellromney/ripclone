@@ -1080,24 +1080,140 @@ fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
         + metadata.files.len() * 64) as u64
 }
 
-/// Create a temp install directory next to `target`. Returns the `TempDir`
-/// handle (not a bare path): the caller must keep it alive so that on *any*
-/// failure before the final rename, the partial install is removed on drop. On
-/// success the dir is renamed onto `target`, after which the handle's drop is a
-/// harmless no-op (the path no longer exists).
-fn temp_install_dir(target: &Path) -> Result<tempfile::TempDir> {
+const INSTALL_STAGING_MARKER: &str = ".ripclone-install-staging";
+
+#[cfg(unix)]
+fn lock_staging_marker(marker: &std::fs::File, nonblocking: bool) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut operation = libc::LOCK_EX;
+    if nonblocking {
+        operation |= libc::LOCK_NB;
+    }
+    // SAFETY: `marker` owns this valid descriptor for the whole call. `flock`
+    // changes only the advisory lock associated with that open file.
+    if unsafe { libc::flock(marker.as_raw_fd(), operation) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("lock clone staging marker")
+    }
+}
+
+struct StagedTempDir {
+    dir: tempfile::TempDir,
+    #[cfg(unix)]
+    _marker_lock: std::fs::File,
+}
+
+impl StagedTempDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_stale_install_dirs(target: &Path, parent: &Path) {
+    use std::io::Read;
+
+    let target_name = target
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("ripclone"))
+        .to_string_lossy();
+    let prefix = format!("{target_name}.ripclone-");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_suffix(".tmp") else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(mut marker) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.join(INSTALL_STAGING_MARKER))
+        else {
+            continue;
+        };
+        // A live clone holds this lock even across PID namespaces. Failure to
+        // acquire it is therefore a preserve decision, including unexpected
+        // filesystem/locking errors.
+        if lock_staging_marker(&marker, true).is_err() {
+            continue;
+        }
+        let mut contents = String::new();
+        if marker.read_to_string(&mut contents).is_err() || contents != "ripclone\n" {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            warn!(
+                "cannot remove stale clone staging directory {}: {error}",
+                path.display()
+            );
+        } else {
+            info!("removed stale clone staging directory {}", path.display());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_stale_install_dirs(_target: &Path, _parent: &Path) {}
+
+/// Create a temp install directory next to `target`. Returns its owning handle
+/// (not a bare path): the caller must keep it alive so that on *any* failure
+/// before the final rename, the partial install is removed on drop and other
+/// processes can see that its marker remains locked. On success the dir is
+/// renamed onto `target`, after which the handle's drop is a harmless no-op
+/// (the path no longer exists).
+fn temp_install_dir(target: &Path) -> Result<StagedTempDir> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
-    tempfile::Builder::new()
-        .prefix(&format!(
-            "{}.",
-            target
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("ripclone"))
-                .to_string_lossy()
-        ))
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    cleanup_stale_install_dirs(target, parent);
+    let target_name = target
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("ripclone"))
+        .to_string_lossy();
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!("{target_name}.ripclone-"))
         .suffix(".tmp")
-        .tempdir_in(parent.unwrap_or_else(|| Path::new(".")))
-        .context("create temp install directory")
+        .tempdir_in(parent)
+        .context("create temp install directory")?;
+    let marker_path = tmp.path().join(INSTALL_STAGING_MARKER);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+
+        let mut marker_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+            .context("create clone staging marker")?;
+        lock_staging_marker(&marker_lock, false)?;
+        marker_lock
+            .write_all(b"ripclone\n")
+            .context("mark temp install directory")?;
+        Ok(StagedTempDir {
+            dir: tmp,
+            _marker_lock: marker_lock,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(marker_path, b"ripclone\n").context("mark temp install directory")?;
+        Ok(StagedTempDir { dir: tmp })
+    }
 }
 
 /// True when `RIPCLONE_FSYNC` asks for a durability barrier before the clone
@@ -1295,7 +1411,7 @@ struct AttemptCleanup(Arc<AttemptCleanupInner>);
 #[derive(Default)]
 struct AttemptStaging {
     overlay_dirs: Option<overlay::OverlayDirs>,
-    temp_install: Option<tempfile::TempDir>,
+    temp_install: Option<StagedTempDir>,
 }
 
 type SharedAttemptStaging = Arc<Mutex<Option<AttemptStaging>>>;
@@ -3122,6 +3238,8 @@ impl Client {
         } else {
             // Optional durability barrier: flush the staged tree, publish it,
             // then flush the parent directory so the rename itself is durable.
+            std::fs::remove_file(install_root.join(INSTALL_STAGING_MARKER))
+                .context("remove clone staging marker before publish")?;
             if fsync_requested() {
                 fsync_tree(&install_root).context("fsync staged clone before publish")?;
             }
@@ -4218,6 +4336,31 @@ mod tests {
         fsync_tree(root).expect("fsync whole tree");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn next_clone_removes_only_marked_unlocked_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("linux");
+
+        let stale = dir.path().join("linux.ripclone-old.tmp");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join(INSTALL_STAGING_MARKER), b"ripclone\n").unwrap();
+        std::fs::write(stale.join("partial"), b"partial clone").unwrap();
+
+        let live = temp_install_dir(&target).unwrap();
+        let live_path = live.path().to_path_buf();
+
+        let unmarked = dir.path().join("linux.ripclone-unmarked.tmp");
+        std::fs::create_dir(&unmarked).unwrap();
+        std::fs::write(unmarked.join("user-data"), b"preserve").unwrap();
+
+        let created = temp_install_dir(&target).unwrap();
+        assert!(!stale.exists());
+        assert!(live_path.exists());
+        assert!(unmarked.exists());
+        assert!(created.path().join(INSTALL_STAGING_MARKER).is_file());
+    }
+
     #[test]
     fn collect_fsync_targets_covers_files_dirs_and_index() {
         // The durability barrier must flush the working-tree files, every
@@ -4413,10 +4556,7 @@ mod tests {
         let cleanup = AttemptCleanup::default();
         let fixture = tempfile::tempdir().unwrap();
         let target = fixture.path().join("target");
-        let staging_owner = tempfile::Builder::new()
-            .prefix("clone.")
-            .tempdir_in(fixture.path())
-            .unwrap();
+        let staging_owner = temp_install_dir(&target).unwrap();
         let staging = staging_owner.path().to_path_buf();
         let staging_worker = staging.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -4483,10 +4623,7 @@ mod tests {
         let cleanup = AttemptCleanup::default();
         let fixture = tempfile::tempdir().unwrap();
         let target = fixture.path().join("target");
-        let staging_owner = tempfile::Builder::new()
-            .prefix("clone.")
-            .tempdir_in(fixture.path())
-            .unwrap();
+        let staging_owner = temp_install_dir(&target).unwrap();
         let staging_path = staging_owner.path().to_path_buf();
         let staging = Arc::new(Mutex::new(Some(AttemptStaging {
             overlay_dirs: None,
