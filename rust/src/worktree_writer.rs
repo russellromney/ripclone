@@ -900,19 +900,16 @@ mod linux_uring {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const QUEUE_DEPTH: u32 = 4096;
-    // A direct-descriptor window temporarily owns one open file per entry.
-    // Keep the window well below the common Linux soft RLIMIT_NOFILE of 1024;
-    // several pack-parser threads can each have windows in flight at once.
-    const MAX_BATCH_FILES: usize = 64;
-    /// Largest per-ring overlap depth a writer can request. Each in-flight
-    /// window owns its own fixed-file slot range, so the registered slot
-    /// table holds this many `MAX_BATCH_FILES`-sized ranges.
-    const MAX_INFLIGHT_WINDOWS: usize = 2;
-    const REGISTERED_FILE_SLOTS: usize = MAX_BATCH_FILES * MAX_INFLIGHT_WINDOWS;
+    const RESERVED_PROCESS_FDS: usize = 256;
+    const SAFE_BATCH_FILES: usize = 64;
+    const SAFE_INFLIGHT_WINDOWS: usize = 2;
+    const PREFERRED_BATCH_FILES: usize = 256;
+    const PREFERRED_INFLIGHT_WINDOWS: usize = 4;
+    const MAX_REGISTERED_FILE_SLOTS: usize = PREFERRED_BATCH_FILES * PREFERRED_INFLIGHT_WINDOWS;
     /// Completion-queue capacity. A window submits up to four ops per file
-    /// (open/write/statx/close); with `MAX_INFLIGHT_WINDOWS` windows un-harvested
-    /// the CQ must hold all of their completions without overflowing.
-    const CQ_ENTRIES: u32 = (MAX_INFLIGHT_WINDOWS * MAX_BATCH_FILES * 4) as u32;
+    /// (open/write/statx/close); the CQ must hold the largest RLIMIT-derived
+    /// window plan without overflowing.
+    const CQ_ENTRIES: u32 = (PREFERRED_INFLIGHT_WINDOWS * PREFERRED_BATCH_FILES * 4) as u32;
     static DIRECT_DESCRIPTOR_ENABLED_LOG: Once = Once::new();
     static DIRECT_DESCRIPTOR_FALLBACK_LOG: Once = Once::new();
     static SKIP_OPEN_CQE_ENABLED_LOG: Once = Once::new();
@@ -921,6 +918,7 @@ mod linux_uring {
     static OPTIMIZED_RING_FALLBACK_LOG: Once = Once::new();
     static SQPOLL_RING_ENABLED_LOG: Once = Once::new();
     static SQPOLL_RING_FALLBACK_LOG: Once = Once::new();
+    static WRITER_FD_PLAN_LOG: Once = Once::new();
 
     /// Set once a per-thread io_uring ring fails to initialize (e.g. ENOMEM or
     /// the locked-memory rlimit under heavy parallelism). Once set, every writer
@@ -930,7 +928,28 @@ mod linux_uring {
     static IO_URING_RUNTIME_DISABLED: AtomicBool = AtomicBool::new(false);
     static IO_URING_DISABLED_LOG: Once = Once::new();
 
-    pub(super) fn fd_safe_writer_concurrency(requested: usize) -> usize {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct WriterFdPlan {
+        batch_files: usize,
+        inflight_windows: usize,
+        parser_capacity: usize,
+    }
+
+    impl WriterFdPlan {
+        #[cfg(test)]
+        fn descriptors_per_parser(self) -> usize {
+            self.batch_files * self.inflight_windows
+        }
+    }
+
+    fn available_parallelism() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1)
+    }
+
+    fn writer_fd_plan() -> WriterFdPlan {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -938,30 +957,81 @@ mod linux_uring {
         // SAFETY: `limit` is a valid writable rlimit and getrlimit initializes
         // it synchronously before returning.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-            return requested.max(1);
+            let requested = available_parallelism();
+            return WriterFdPlan {
+                batch_files: PREFERRED_BATCH_FILES,
+                inflight_windows: PREFERRED_INFLIGHT_WINDOWS,
+                parser_capacity: requested,
+            };
         }
-        fd_safe_writer_concurrency_for_limit(requested, limit.rlim_cur as usize)
+        writer_fd_plan_for_limit(limit.rlim_cur as usize, available_parallelism())
     }
 
-    fn fd_safe_writer_concurrency_for_limit(requested: usize, soft_limit: usize) -> usize {
-        // HTTP downloads, temp files, Git, and the runtime need descriptors too.
-        // Reserve 256 where possible, then divide the remainder by the maximum
-        // direct descriptors one parser thread can keep in flight.
-        const RESERVED_FDS: usize = 256;
-        let per_writer = REGISTERED_FILE_SLOTS;
-        let usable = soft_limit.saturating_sub(RESERVED_FDS);
-        requested.max(1).min((usable / per_writer).max(1))
+    pub(super) fn fd_safe_writer_concurrency(requested: usize) -> usize {
+        requested.max(1).min(writer_fd_plan().parser_capacity)
+    }
+
+    fn writer_fd_plan_for_limit(soft_limit: usize, requested: usize) -> WriterFdPlan {
+        // Direct descriptors count against RLIMIT_NOFILE. Keep one shared
+        // accounting model for per-ring shape and process-wide parser permits:
+        // reserve descriptors for HTTP, temp files, Git, and the runtime, then
+        // select the preferred 256 x 4 window only when it costs at most one
+        // parser relative to the machine's requested CPU parallelism. Lower
+        // limits retain the proven 64 x 2 shape used by the concurrent-clone
+        // row instead of letting one deep ring exhaust the whole process.
+        let requested = requested.max(1);
+        let usable = soft_limit.saturating_sub(RESERVED_PROCESS_FDS);
+        let preferred_cost = PREFERRED_BATCH_FILES * PREFERRED_INFLIGHT_WINDOWS;
+        let preferred_capacity = usable / preferred_cost;
+        let use_preferred = preferred_capacity >= requested.saturating_sub(1).max(1);
+        let (batch_files, inflight_windows) = if use_preferred {
+            (PREFERRED_BATCH_FILES, PREFERRED_INFLIGHT_WINDOWS)
+        } else {
+            (SAFE_BATCH_FILES, SAFE_INFLIGHT_WINDOWS)
+        };
+        let per_parser = batch_files * inflight_windows;
+        WriterFdPlan {
+            batch_files,
+            inflight_windows,
+            parser_capacity: (usable / per_parser).max(1),
+        }
     }
 
     #[cfg(test)]
     mod fd_budget_tests {
-        use super::fd_safe_writer_concurrency_for_limit;
+        use super::{WriterFdPlan, writer_fd_plan_for_limit};
 
         #[test]
-        fn parser_threads_leave_descriptors_for_http_git_and_runtime() {
-            assert_eq!(fd_safe_writer_concurrency_for_limit(8, 1024), 6);
-            assert_eq!(fd_safe_writer_concurrency_for_limit(64, 256), 1);
-            assert_eq!(fd_safe_writer_concurrency_for_limit(4, 65_536), 4);
+        fn writer_shape_and_parser_permits_share_one_descriptor_budget() {
+            assert_eq!(
+                writer_fd_plan_for_limit(1024, 8),
+                WriterFdPlan {
+                    batch_files: 64,
+                    inflight_windows: 2,
+                    parser_capacity: 6,
+                }
+            );
+            assert_eq!(
+                writer_fd_plan_for_limit(10_240, 8),
+                WriterFdPlan {
+                    batch_files: 256,
+                    inflight_windows: 4,
+                    parser_capacity: 9,
+                }
+            );
+            assert_eq!(
+                writer_fd_plan_for_limit(256, 8),
+                WriterFdPlan {
+                    batch_files: 64,
+                    inflight_windows: 2,
+                    parser_capacity: 1,
+                }
+            );
+            let near_full_machine = writer_fd_plan_for_limit(65_536, 64);
+            assert_eq!(near_full_machine.batch_files, 256);
+            assert_eq!(near_full_machine.inflight_windows, 4);
+            assert_eq!(near_full_machine.parser_capacity, 63);
+            assert_eq!(near_full_machine.descriptors_per_parser(), 1024);
         }
     }
 
@@ -983,7 +1053,10 @@ mod linux_uring {
         /// Overlap depth: how many windows may be in flight before we block to
         /// harvest the oldest.
         max_inflight: usize,
-        /// Next fixed-file slot range to use, in units of `MAX_BATCH_FILES`.
+        /// Files in one direct-descriptor window. Derived from the same
+        /// RLIMIT_NOFILE plan as the process-wide parser semaphore.
+        max_batch_files: usize,
+        /// Next fixed-file slot range to use, in units of `max_batch_files`.
         slot_cursor: usize,
         next_window_id: u32,
         direct_window_verified: bool,
@@ -1042,10 +1115,6 @@ mod linux_uring {
 
     thread_local! {
         static THREAD_WRITER: RefCell<Option<RawUringWriter>> = const { RefCell::new(None) };
-        // Desired per-ring overlap depth for the *next* ring created on this
-        // thread. The default overlap depth is 2.
-        // preserves the established double-buffered behavior.
-        static DESIRED_INFLIGHT: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
     }
 
     impl UringWriter {
@@ -1288,6 +1357,15 @@ mod linux_uring {
 
     impl RawUringWriter {
         fn new() -> Result<Self> {
+            let fd_plan = writer_fd_plan();
+            WRITER_FD_PLAN_LOG.call_once(|| {
+                tracing::info!(
+                    batch_files = fd_plan.batch_files,
+                    inflight_windows = fd_plan.inflight_windows,
+                    parser_capacity = fd_plan.parser_capacity,
+                    "selected RLIMIT-derived io_uring writer plan"
+                )
+            });
             let ring = Self::new_ring().context("initialize io_uring queue")?;
             let skip_open_success_cqe = ring.params().is_feature_skip_cqe_on_success();
             if skip_open_success_cqe {
@@ -1297,7 +1375,7 @@ mod linux_uring {
             }
             let descriptor_mode = match ring
                 .submitter()
-                .register_files_sparse(REGISTERED_FILE_SLOTS as u32)
+                .register_files_sparse(MAX_REGISTERED_FILE_SLOTS as u32)
             {
                 Ok(()) => {
                     DIRECT_DESCRIPTOR_ENABLED_LOG
@@ -1316,17 +1394,15 @@ mod linux_uring {
             // (open/write/statx/close). If a fallback ring built with a smaller
             // CQ than requested, this keeps us from ever overflowing it.
             let cq_window_capacity =
-                (ring.params().cq_entries() as usize / (MAX_BATCH_FILES * 4)).max(1);
-            let desired = DESIRED_INFLIGHT.with(|c| c.get());
-            let max_inflight = desired
-                .clamp(1, MAX_INFLIGHT_WINDOWS)
-                .min(cq_window_capacity);
+                (ring.params().cq_entries() as usize / (fd_plan.batch_files * 4)).max(1);
+            let max_inflight = fd_plan.inflight_windows.min(cq_window_capacity);
             Ok(Self {
                 ring,
                 descriptor_mode,
                 skip_open_success_cqe,
                 pending_windows: std::collections::VecDeque::new(),
                 max_inflight,
+                max_batch_files: fd_plan.batch_files,
                 slot_cursor: 0,
                 next_window_id: 1,
                 direct_window_verified: false,
@@ -1396,7 +1472,7 @@ mod linux_uring {
             }
             let mut stats = Vec::new();
             while !writes.is_empty() {
-                let n = writes.len().min(MAX_BATCH_FILES);
+                let n = writes.len().min(self.max_batch_files);
                 let batch: Vec<_> = writes.drain(..n).collect();
                 stats.extend(self.write_regular_window(batch, collect_stats)?);
             }
@@ -1584,7 +1660,7 @@ mod linux_uring {
             mut writes: Vec<PreparedRegularWrite>,
             collect_stats: bool,
         ) -> Result<WriteOutcome> {
-            // A single window claims one fixed-file slot range of MAX_BATCH_FILES.
+            // A single window claims one fixed-file slot range of max_batch_files.
             // Split a larger batch so a caller passing more than that can't
             // overrun its slot range (mirrors the synchronous write_regular_batch).
             let mut outcome = WriteOutcome {
@@ -1592,7 +1668,7 @@ mod linux_uring {
                 stats: Vec::new(),
             };
             while !writes.is_empty() {
-                let n = writes.len().min(MAX_BATCH_FILES);
+                let n = writes.len().min(self.max_batch_files);
                 let window: Vec<_> = writes.drain(..n).collect();
                 let part = self.write_regular_window_deferred(window, collect_stats)?;
                 outcome.written += part.written;
@@ -1663,7 +1739,7 @@ mod linux_uring {
                         } else {
                             (0, Vec::new())
                         };
-                    let slot_base = self.slot_cursor * MAX_BATCH_FILES;
+                    let slot_base = self.slot_cursor * self.max_batch_files;
                     match self.submit_direct_window(in_flight, collect_stats, true, slot_base) {
                         Ok(current) => {
                             self.slot_cursor = (self.slot_cursor + 1) % self.max_inflight;
