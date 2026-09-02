@@ -3793,7 +3793,7 @@ impl Client {
         // the entire 94k-path table at this serial tail.
         let index_metadata = Arc::clone(&metadata);
         let index_work_tree = work_tree.to_path_buf();
-        let index_task = AbortOnDrop::new(
+        AbortOnDrop::new(
             tokio::task::spawn_blocking(move || {
                 crate::git::clear_skip_worktree_index_with_stats_byte_iter(
                     &index_work_tree,
@@ -3805,61 +3805,51 @@ impl Client {
                 )
             }),
             cleanup.clone(),
-        );
+        )
+        .join()
+        .await
+        .context("spawn clear skip-worktree and refresh index stats")??;
 
         // Install the multi-pack-index so git object lookups stay O(log) across
         // the many installed packs. A cold build supplies the prebuilt MIDX;
         // an incremental shallow build may omit it when base packs are remote,
         // in which case the client builds it from the installed pack indexes.
-        // This touches a different file than the index-stat refresh, so run the
-        // two finalization operations concurrently.
-        let clear_index = async {
-            index_task
+        if let Some(midx_task) = midx_task {
+            match midx_task
                 .join()
                 .await
-                .context("spawn clear skip-worktree and refresh index stats")??;
-            Ok::<(), anyhow::Error>(())
-        };
-        let install_midx = async {
-            if let Some(midx_task) = midx_task {
-                match midx_task
-                    .join()
-                    .await
-                    .context("pre-built MIDX fetch task")
-                    .and_then(|r| r)
-                {
-                    Ok(midx_bytes) => {
-                        tokio::fs::write(pack_dir.join("multi-pack-index"), &midx_bytes)
-                            .await
-                            .context("write pre-built multi-pack-index")?;
-                    }
-                    Err(e) => {
-                        tracing::warn!("pre-built MIDX fetch failed ({e:#}); building locally");
-                        let work_tree3 = work_tree.to_path_buf();
-                        let _ = AbortOnDrop::new(
-                            tokio::task::spawn_blocking(move || {
-                                crate::git::write_multi_pack_index(&work_tree3)
-                            }),
-                            cleanup.clone(),
-                        )
-                        .join()
-                        .await;
-                    }
+                .context("pre-built MIDX fetch task")
+                .and_then(|r| r)
+            {
+                Ok(midx_bytes) => {
+                    tokio::fs::write(pack_dir.join("multi-pack-index"), &midx_bytes)
+                        .await
+                        .context("write pre-built multi-pack-index")?;
                 }
-            } else {
-                let work_tree3 = work_tree.to_path_buf();
-                let _ = AbortOnDrop::new(
-                    tokio::task::spawn_blocking(move || {
-                        crate::git::write_multi_pack_index(&work_tree3)
-                    }),
-                    cleanup.clone(),
-                )
-                .join()
-                .await;
+                Err(e) => {
+                    tracing::warn!("pre-built MIDX fetch failed ({e:#}); building locally");
+                    let work_tree3 = work_tree.to_path_buf();
+                    let _ = AbortOnDrop::new(
+                        tokio::task::spawn_blocking(move || {
+                            crate::git::write_multi_pack_index(&work_tree3)
+                        }),
+                        cleanup.clone(),
+                    )
+                    .join()
+                    .await;
+                }
             }
-            Ok::<(), anyhow::Error>(())
-        };
-        tokio::try_join!(clear_index, install_midx)?;
+        } else {
+            let work_tree3 = work_tree.to_path_buf();
+            let _ = AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    crate::git::write_multi_pack_index(&work_tree3)
+                }),
+                cleanup.clone(),
+            )
+            .join()
+            .await;
+        }
 
         Ok(total)
     }
