@@ -1953,7 +1953,7 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     .await
     .unwrap();
     let writes_before_release = probe.ref_store_writes.load(Ordering::SeqCst);
-    // Release the old attempt immediately after reclaim, before its next
+    // Release the old attempt immediately after ownership transfer, before its next
     // heartbeat can detect ownership loss. The publication itself must reject
     // the stale `(job_id, worker_id)` atomically.
     probe.after_head_entry.release();
