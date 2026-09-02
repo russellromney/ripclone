@@ -786,6 +786,8 @@ async fn fetch_artifact_bytes_once(
     expected_len: Option<u64>,
     signed: bool,
 ) -> std::result::Result<bytes::Bytes, FetchFailure> {
+    use futures::StreamExt;
+
     wait_for_test_before_buffered_artifact(hash)
         .await
         .map_err(FetchFailure::Permanent)?;
@@ -797,22 +799,27 @@ async fn fetch_artifact_bytes_once(
     if let Some(failure) = classify_fetch_status(resp.status(), signed, hash) {
         return Err(failure);
     }
-    // R1: keep the body as `Bytes` (a refcounted buffer) instead of copying
-    // it into a fresh Vec — it flows through the cache and on to the consumer
-    // without a second per-artifact copy. A retry of this buffered path starts
-    // only this artifact again from byte zero.
-    let data = resp
-        .bytes()
-        .await
-        .map_err(|e| FetchFailure::Retry(anyhow::anyhow!("artifact body read error: {e}")))?;
-    let hash_bytes = data.clone();
-    let actual_hash = tokio::task::spawn_blocking(move || crate::cas::hash(&hash_bytes))
-        .await
-        .map_err(|error| {
-            FetchFailure::Permanent(anyhow::anyhow!(
-                "artifact hash worker failed before verification: {error}"
-            ))
-        })?;
+    // Hash as chunks arrive so SHA-256 overlaps the wire instead of adding a
+    // second whole-artifact pass after the response has drained. `BytesMut`
+    // assembles the buffered artifact once and `freeze` hands the same storage
+    // to the cache/parser without another copy.
+    const MAX_INITIAL_BUFFER: usize = 64 * 1024 * 1024;
+    let initial_capacity = resp
+        .content_length()
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or_default()
+        .min(MAX_INITIAL_BUFFER);
+    let mut data = bytes::BytesMut::with_capacity(initial_capacity);
+    let mut hasher = sha2::Sha256::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| FetchFailure::Retry(anyhow::anyhow!("artifact body read error: {e}")))?;
+        hasher.update(&chunk);
+        data.extend_from_slice(&chunk);
+    }
+    let data = data.freeze();
+    let actual_hash = hex::encode(hasher.finalize());
     verify_fetched_artifact(hash, expected_len, data.len() as u64, &actual_hash)?;
     Ok(data)
 }
