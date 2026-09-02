@@ -1911,6 +1911,10 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
         .await
         .expect("open lost-claim database");
     let connection = database.connect().expect("connect to lost-claim database");
+    connection
+        .execute("PRAGMA busy_timeout = 5000", ())
+        .await
+        .expect("configure lost-claim database busy timeout");
     let key = format!(
         "{}\x1f{commit}",
         ripclone::provider::RepoId::github("acme/lost-claim").storage_key()
