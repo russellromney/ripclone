@@ -3238,37 +3238,27 @@ fn ref_response_from_manifest(
             return None;
         }
     }
-    let ttl = ref_signed_url_ttl(private);
-    let signed = |hash: &str| signed_url(storage, ttl, hash);
-    let signed_list = |hashes: &[String]| {
-        let urls = hashes.iter().map(|hash| signed(hash)).collect::<Vec<_>>();
-        (!urls.iter().all(Option::is_none)).then_some(urls)
-    };
-    let (owner, repo) = repo_id
-        .github_owner_repo()
-        .map(|(owner, repo)| (owner.to_string(), repo.to_string()))
-        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
-    Some(RefResponse {
-        owner,
-        repo,
-        provider: provider.id.as_str().to_string(),
-        host: provider.host.clone(),
-        origin_url: provider.clone_url(&repo_id.path),
-        branch,
+    let artifacts = ResponseArtifacts {
         commit: manifest.commit.clone(),
         parent_commit: manifest.parent_commit.clone(),
-        clonepack_manifest: manifest_hash.to_string(),
-        clonepack_manifest_url: signed(manifest_hash),
-        metadata_chunk_url: signed(&metadata_chunk),
+        manifest: manifest_hash.to_string(),
         metadata_chunk,
-        archive_chunk_urls: signed_list(&archive_hashes),
-        head_blobs_chunk_urls: signed_list(&head_blob_hashes),
-        head_blobs_idx_url: head_blobs_idx.as_deref().and_then(signed),
-        pack_chunk_urls: signed_list(&pack_hashes),
-        midx_url: midx.as_deref().and_then(signed),
-        idx_bundle_url: signed(&idx_bundle),
-        result: ExactResultKind::Full,
-    })
+        archive_chunks: archive_hashes,
+        head_blobs_chunks: head_blob_hashes,
+        head_blobs_idx,
+        packs: pack_hashes,
+        midx: midx.unwrap_or_default(),
+        idx_bundle,
+    };
+    Some(build_ref_response(
+        repo_id,
+        provider,
+        branch,
+        &artifacts,
+        storage,
+        ExactResultKind::Full,
+        private,
+    ))
 }
 
 async fn carried_full_top_up_response(
@@ -3677,6 +3667,75 @@ fn ref_signed_url_ttl(private: bool) -> Duration {
     }
 }
 
+/// Artifact hashes needed to build one [`RefResponse`], independent of
+/// whether they came from a loaded `RefInfo` or from decoded manifest bytes
+/// (the top-up path).
+struct ResponseArtifacts {
+    commit: String,
+    parent_commit: Option<String>,
+    manifest: String,
+    metadata_chunk: String,
+    archive_chunks: Vec<String>,
+    head_blobs_chunks: Vec<String>,
+    head_blobs_idx: Option<String>,
+    packs: Vec<String>,
+    midx: String,
+    idx_bundle: String,
+}
+
+/// Sign and order the URLs for one ref response. Shared by every builder:
+/// each caller extracts a [`ResponseArtifacts`] from its own source (a
+/// `RefInfo`, or a decoded manifest) and hands it here.
+fn build_ref_response(
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    branch: String,
+    artifacts: &ResponseArtifacts,
+    storage: &crate::storage::StorageRef,
+    result: ExactResultKind,
+    private: bool,
+) -> RefResponse {
+    let ttl = ref_signed_url_ttl(private);
+    let signed = |hash: &str| signed_url(storage, ttl, hash);
+    // `None` entries (e.g. local backend) fall back to the gateway. Ordered
+    // to match the manifest's own chunk/pack lists.
+    let signed_list = |hashes: &[String]| -> Option<Vec<Option<String>>> {
+        if hashes.is_empty() {
+            return None;
+        }
+        let urls: Vec<Option<String>> = hashes.iter().map(|hash| signed(hash)).collect();
+        (!urls.iter().all(Option::is_none)).then_some(urls)
+    };
+    let (owner, repo) = repo_id
+        .github_owner_repo()
+        .map(|(o, r)| (o.to_string(), r.to_string()))
+        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+    RefResponse {
+        owner,
+        repo,
+        provider: provider.id.as_str().to_string(),
+        host: provider.host.clone(),
+        origin_url: provider.clone_url(&repo_id.path),
+        branch,
+        commit: artifacts.commit.clone(),
+        parent_commit: artifacts.parent_commit.clone(),
+        clonepack_manifest: artifacts.manifest.clone(),
+        clonepack_manifest_url: signed(&artifacts.manifest),
+        metadata_chunk: artifacts.metadata_chunk.clone(),
+        metadata_chunk_url: signed(&artifacts.metadata_chunk),
+        archive_chunk_urls: signed_list(&artifacts.archive_chunks),
+        head_blobs_chunk_urls: signed_list(&artifacts.head_blobs_chunks),
+        head_blobs_idx_url: artifacts.head_blobs_idx.as_deref().and_then(signed),
+        pack_chunk_urls: signed_list(&artifacts.packs),
+        // Sign the pre-built MIDX for the selected variant so the client
+        // installs it directly instead of running `git multi-pack-index
+        // write`, and the idx bundle so the client fetches all idx in one GET.
+        midx_url: signed(&artifacts.midx),
+        idx_bundle_url: signed(&artifacts.idx_bundle),
+        result,
+    }
+}
+
 fn ref_response(
     repo_id: &RepoId,
     provider: &ProviderInstance,
@@ -3686,95 +3745,47 @@ fn ref_response(
     result: ExactResultKind,
     private: bool,
 ) -> RefResponse {
-    let ttl = ref_signed_url_ttl(private);
     let artifacts = exact_result_clonepack(info, result)
         .expect("requested exact result is ready before response construction");
-    let clonepack_manifest = artifacts.manifest.clone();
-    let metadata_chunk = artifacts.metadata_chunk.clone();
-
-    let clonepack_manifest_url = signed_url(storage, ttl, &clonepack_manifest);
-    let metadata_chunk_url = signed_url(storage, ttl, &metadata_chunk);
     let archive_chunks = info
         .files
         .as_ref()
         .filter(|_| result == ExactResultKind::Files)
-        .map(|files| files.archive_chunks.as_slice())
+        .map(|files| files.archive_chunks.clone())
         .unwrap_or_default();
-    let archive_chunk_urls = if archive_chunks.is_empty() {
-        None
-    } else {
-        let urls: Vec<Option<String>> = archive_chunks
-            .iter()
-            .map(|h| signed_url(storage, ttl, h))
-            .collect();
-        if urls.iter().all(|u| u.is_none()) {
-            None
-        } else {
-            Some(urls)
-        }
-    };
-
-    let head_blobs_chunk_urls = None;
-    let head_blobs_idx_url = None;
-
-    // Sign each editable pack so the client fetches it straight from
-    // object storage. `None` entries (e.g. local backend) fall back to the
-    // gateway. Ordered to match the manifest's `packs` list.
     let packs = match result {
         ExactResultKind::Head => info.head.as_ref().map(|head| head.packs.as_slice()),
         ExactResultKind::Full => info.full.as_ref().map(|full| full.packs.as_slice()),
         ExactResultKind::Files => None,
     }
-    .unwrap_or_default();
-    let pack_chunk_urls = if packs.is_empty() {
-        None
-    } else {
-        let packs: Vec<Option<String>> = packs
-            .iter()
-            .map(|p| signed_url(storage, ttl, &p.pack))
-            .collect();
-        if packs.iter().all(Option::is_none) {
-            None
-        } else {
-            Some(packs)
-        }
-    };
-
-    // Sign the pre-built MIDX for the selected variant so the client installs it
-    // directly instead of running `git multi-pack-index write`.
-    let midx_url = signed_url(storage, ttl, &artifacts.midx);
-    // Sign the idx bundle so the client fetches all idx in one GET.
-    let idx_bundle_url = signed_url(storage, ttl, &artifacts.idx_bundle);
-
-    let (owner, repo) = repo_id
-        .github_owner_repo()
-        .map(|(o, r)| (o.to_string(), r.to_string()))
-        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
-    let origin_url = provider.clone_url(&repo_id.path);
-    RefResponse {
-        owner,
-        repo,
-        provider: provider.id.as_str().to_string(),
-        host: provider.host.clone(),
-        origin_url,
-        branch,
+    .unwrap_or_default()
+    .iter()
+    .map(|p| p.pack.clone())
+    .collect();
+    let response_artifacts = ResponseArtifacts {
         commit: artifacts.commit.clone(),
         parent_commit: info
             .head
             .as_ref()
             .and_then(|head| head.parent_commit.clone()),
-        clonepack_manifest,
-        clonepack_manifest_url,
-        metadata_chunk,
-        metadata_chunk_url,
-        archive_chunk_urls,
-        head_blobs_chunk_urls,
-        head_blobs_idx_url,
-        pack_chunk_urls,
-        midx_url,
-        idx_bundle_url,
+        manifest: artifacts.manifest.clone(),
+        metadata_chunk: artifacts.metadata_chunk.clone(),
+        archive_chunks,
+        head_blobs_chunks: Vec::new(),
+        head_blobs_idx: None,
+        packs,
+        midx: artifacts.midx.clone(),
+        idx_bundle: artifacts.idx_bundle.clone(),
+    };
+    build_ref_response(
+        repo_id,
+        provider,
+        branch,
+        &response_artifacts,
+        storage,
         result,
-    }
+        private,
+    )
 }
 
 /// Ready admission response. Signing already-known object URLs does not read
@@ -4502,23 +4513,19 @@ fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
     size_kb.saturating_mul(1024)
 }
 
-/// Outcome of [`admit_commit`]: the exact result at the admitted commit was
-/// already complete, the build was enqueued (or folded into one already
-/// running), or admission failed with a caller-facing message.
+/// Outcome of [`admit_commit`]: already complete, enqueued, or an error.
 enum Admission {
     Complete(RefInfo),
     Enqueued(EnqueueOutcome),
     Error(String),
 }
 
-/// Admission core shared by every entry point that admits an exact commit for
-/// a build: ordinary `sync`, `sync --at`, the exact-ref lookup's enqueue
-/// tail, and the build trigger. Selector resolution differs per caller and
-/// stays there. Each caller also loads `loaded` itself, since it already
-/// needs that row for its own readiness check and keeps its own
-/// lookup-failure message; `admit_commit` only reuses it for the completeness
-/// and size-class checks. `credential` is called lazily so a caller that can
-/// skip the fetch on an already-complete commit does.
+/// Admission core shared by `sync`, `sync --at`, the exact-ref lookup's
+/// enqueue tail, and the build trigger. Selector resolution stays with the
+/// caller (it differs per entry point); the caller also loads `loaded`
+/// itself, since it already needs that row for its own readiness check and
+/// keeps its own lookup-failure message. `credential` is called lazily so a
+/// caller that can skip the fetch on an already-complete commit does.
 async fn admit_commit<F>(
     state: &ServerState,
     repo_id: &RepoId,
