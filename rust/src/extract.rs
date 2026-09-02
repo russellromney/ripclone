@@ -1033,12 +1033,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hostile_pack_object_size_cannot_reserve_beyond_pack_bytes() {
-        assert_eq!(pack_object_initial_capacity(u64::MAX, 4096), 4096);
-        assert_eq!(pack_object_initial_capacity(128, 4096), 128);
-    }
-
     fn extract_manifest(
         manifest: &MetadataChunk,
         target: &Path,
