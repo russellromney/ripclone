@@ -7660,32 +7660,30 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                     Err(error)
                                 }
                                 Ok((mut heartbeat, mut heartbeat_failure)) => {
-                                    let result = loop {
-                                        tokio::select! {
-                                            joined = &mut build => {
-                                                break match joined {
-                                                    Ok(result) => result,
-                                                    Err(error) => Err(BuildError::retryable(format!(
-                                                        "build task panicked: {error}"
-                                                    ))),
-                                                };
+                                    let result = tokio::select! {
+                                        joined = &mut build => {
+                                            match joined {
+                                                Ok(result) => result,
+                                                Err(error) => Err(BuildError::retryable(format!(
+                                                    "build task panicked: {error}"
+                                                ))),
                                             }
-                                            failure = &mut heartbeat_failure => {
-                                                let error = failure.unwrap_or_else(|_| {
-                                                    "dedicated heartbeat exited without reporting a result"
-                                                        .to_string()
-                                                });
-                                                error!(
-                                                    "embedded worker lost claim for job {}: {error}",
-                                                    claimed.id
-                                                );
-                                                admission_test_claim_lost();
-                                                build.abort();
-                                                let _ = build.await;
-                                                break Err(BuildError::retryable(format!(
-                                                    "durable claim lost while building: {error}"
-                                                )));
-                                            }
+                                        }
+                                        failure = &mut heartbeat_failure => {
+                                            let error = failure.unwrap_or_else(|_| {
+                                                "dedicated heartbeat exited without reporting a result"
+                                                    .to_string()
+                                            });
+                                            error!(
+                                                "embedded worker lost claim for job {}: {error}",
+                                                claimed.id
+                                            );
+                                            admission_test_claim_lost();
+                                            build.abort();
+                                            let _ = build.await;
+                                            Err(BuildError::retryable(format!(
+                                                "durable claim lost while building: {error}"
+                                            )))
                                         }
                                     };
                                     heartbeat.stop_and_join();
