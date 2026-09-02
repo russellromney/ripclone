@@ -8130,7 +8130,7 @@ mod tests {
             self.inner
                 .get_or_try_init(|| async {
                     let db = crate::meta::LibsqlMeta::connect(&self.path.to_string_lossy()).await?;
-                    Ok(Arc::new(crate::meta::SqlRefStore::new(Box::new(db)).await?))
+                    Ok(Arc::new(crate::meta::SqlRefStore::new(db).await?))
                 })
                 .await
         }
@@ -8223,9 +8223,7 @@ mod tests {
             self.inner
                 .get_or_try_init(|| async {
                     let db = crate::queue::LibsqlDb::connect(&self.path.to_string_lossy()).await?;
-                    Ok(Arc::new(
-                        crate::queue::SqlJobQueue::new(Box::new(db)).await?,
-                    ))
+                    Ok(Arc::new(crate::queue::SqlJobQueue::new(db).await?))
                 })
                 .await
         }
@@ -8481,11 +8479,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let queue = Arc::new(
-            crate::queue::SqlJobQueue::new(Box::new(queue_db))
-                .await
-                .unwrap(),
-        );
+        let queue = Arc::new(crate::queue::SqlJobQueue::new(queue_db).await.unwrap());
         state.build_queue = queue.clone();
         let repo_id = RepoId::github("acme/pending");
         mark_added(&state, repo_id.clone()).await;

@@ -1,12 +1,11 @@
-//! [`QueueDb`] over the server's Turso embedded-replica handle.
+//! Durable queue storage over the server's Turso embedded-replica handle.
 
 use super::sql::{
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL, QueueDb,
+    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
     SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use libsql::{Connection, Database};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,11 +34,8 @@ impl LibsqlDb {
             .context("configure queue busy timeout")?;
         Ok(conn)
     }
-}
 
-#[async_trait]
-impl QueueDb for LibsqlDb {
-    async fn init(&self) -> Result<()> {
+    pub(crate) async fn init(&self) -> Result<()> {
         let conn = self.conn().await?;
         // WAL keeps readers from blocking the writer on a local file (no-op on
         // remote, where the server manages concurrency).
@@ -66,7 +62,7 @@ impl QueueDb for LibsqlDb {
         Ok(())
     }
 
-    async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
+    pub(crate) async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -81,7 +77,7 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn latest_job_id(&self, key: &str) -> Result<Option<i64>> {
+    pub(crate) async fn latest_job_id(&self, key: &str) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -96,7 +92,7 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn insert_job(
+    pub(crate) async fn insert_job(
         &self,
         key: &str,
         provider: &str,
@@ -131,7 +127,7 @@ impl QueueDb for LibsqlDb {
         Ok(conn.last_insert_rowid())
     }
 
-    async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()> {
+    pub(crate) async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()> {
         let conn = self.conn().await?;
         conn.execute(
             "UPDATE jobs SET size_class = MAX(size_class, ?)
@@ -143,7 +139,7 @@ impl QueueDb for LibsqlDb {
         Ok(())
     }
 
-    async fn reclaim_stale(
+    pub(crate) async fn reclaim_stale(
         &self,
         cutoff: i64,
         max_attempts: i64,
@@ -190,7 +186,11 @@ impl QueueDb for LibsqlDb {
         Ok(())
     }
 
-    async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
+    /// Test-only: reads `size_class` directly, for white-box assertions
+    /// against internal queue state that `SqlJobQueue`'s public API doesn't
+    /// expose.
+    #[cfg(test)]
+    pub(crate) async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query("SELECT size_class FROM jobs WHERE id = ?", [id])
@@ -202,7 +202,7 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>> {
+    pub(crate) async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = match max_size_class {
             None => conn
@@ -227,7 +227,7 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
+    pub(crate) async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
         let conn = self.conn().await?;
         let n = conn
             .execute(
@@ -241,7 +241,7 @@ impl QueueDb for LibsqlDb {
         Ok(n == 1)
     }
 
-    async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
+    pub(crate) async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
         let conn = self.conn().await?;
         let n = conn
             .execute(
@@ -254,7 +254,7 @@ impl QueueDb for LibsqlDb {
         Ok(n == 1)
     }
 
-    async fn job_fields(
+    pub(crate) async fn job_fields(
         &self,
         id: i64,
     ) -> Result<Option<(String, String, String, String, Option<String>)>> {
@@ -278,7 +278,7 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn finish(
+    pub(crate) async fn finish(
         &self,
         id: i64,
         worker_id: &str,
@@ -300,7 +300,7 @@ impl QueueDb for LibsqlDb {
         Ok(n == 1)
     }
 
-    async fn claimed_attempts(&self, id: i64, worker_id: &str) -> Result<Option<i64>> {
+    pub(crate) async fn claimed_attempts(&self, id: i64, worker_id: &str) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -315,7 +315,12 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool> {
+    pub(crate) async fn requeue_claim(
+        &self,
+        id: i64,
+        worker_id: &str,
+        error: &str,
+    ) -> Result<bool> {
         let conn = self.conn().await?;
         let n = conn
             .execute(
@@ -344,7 +349,7 @@ impl QueueDb for LibsqlDb {
         Ok(n == 1)
     }
 
-    async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
+    pub(crate) async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query("SELECT status, error FROM jobs WHERE id = ?", [id])
@@ -356,7 +361,7 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn count_queued(&self) -> Result<i64> {
+    pub(crate) async fn count_queued(&self) -> Result<i64> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query("SELECT count(*) FROM jobs WHERE status = 'queued'", ())
@@ -368,7 +373,7 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>> {
+    pub(crate) async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -391,7 +396,7 @@ impl QueueDb for LibsqlDb {
         Ok(out)
     }
 
-    async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
+    pub(crate) async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
         self.conn()
             .await?
             .execute(
@@ -402,7 +407,7 @@ impl QueueDb for LibsqlDb {
             .context("prune failed jobs")
     }
 
-    async fn upsert_heartbeat(
+    pub(crate) async fn upsert_heartbeat(
         &self,
         worker_id: &str,
         max_size_class: Option<i64>,
@@ -433,7 +438,7 @@ impl QueueDb for LibsqlDb {
         Ok(())
     }
 
-    async fn delete_worker(&self, worker_id: &str) -> Result<u64> {
+    pub(crate) async fn delete_worker(&self, worker_id: &str) -> Result<u64> {
         self.conn()
             .await?
             .execute(
@@ -444,7 +449,7 @@ impl QueueDb for LibsqlDb {
             .context("delete worker heartbeat")
     }
 
-    async fn count_live_workers(&self, cutoff: i64) -> Result<i64> {
+    pub(crate) async fn count_live_workers(&self, cutoff: i64) -> Result<i64> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -459,7 +464,11 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn count_live_workers_capable(&self, cutoff: i64, min_rank: i64) -> Result<i64> {
+    pub(crate) async fn count_live_workers_capable(
+        &self,
+        cutoff: i64,
+        min_rank: i64,
+    ) -> Result<i64> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -476,7 +485,7 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64> {
+    pub(crate) async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64> {
         self.conn()
             .await?
             .execute(

@@ -2,7 +2,7 @@
 //! driver serves plain local SQLite and the Turso embedded replica. The server
 //! admits work; embedded workers claim locally and standalone workers use its API.
 //!
-//! [`QueueDb`] is a tiny per-engine adapter that returns plain Rust types (no
+//! `LibsqlDb` is a tiny per-engine adapter that returns plain Rust types (no
 //! engine types leak); [`SqlJobQueue`] holds one and contains all the queue
 //! orchestration, so the logic is written once and runs on either engine.
 //!
@@ -21,6 +21,7 @@
 //!   index covers both `queued` and `claimed` rows as a database backstop. A
 //!   later exact commit is intentionally a distinct job; a duplicate is not.
 
+use super::libsql_db::LibsqlDb;
 #[cfg(test)]
 use super::size_class::default_size_classes;
 use super::size_class::{SizeClass, classify_rank, load_size_classes, rank_ceiling};
@@ -105,155 +106,6 @@ pub(crate) fn decode_credential(enc: Option<String>) -> Option<secrecy::SecretSt
     enc.and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
         .and_then(|b| String::from_utf8(b).ok())
         .map(|s| secrecy::SecretString::new(s.into()))
-}
-
-/// Per-engine adapter. Each method runs one or two statements on a fresh
-/// connection and returns plain Rust types. `LibsqlDb` serves local SQLite and
-/// embedded-replica mode.
-#[async_trait]
-pub trait QueueDb: Send + Sync {
-    /// Create the `jobs` table and indexes. Active-key uniqueness is required on
-    /// every supported adapter; initialization fails closed if the backend
-    /// cannot enforce it.
-    async fn init(&self) -> Result<()>;
-
-    /// Id of the active (queued or claimed) job for `key`, if any.
-    async fn active_job_id(&self, key: &str) -> Result<Option<i64>>;
-
-    /// Newest retained job id for `key`, including settled jobs.
-    async fn latest_job_id(&self, key: &str) -> Result<Option<i64>>;
-
-    /// Insert a new queued job and return its id. Errors if a unique constraint
-    /// rejects a duplicate active key (the caller treats that as coalesced).
-    /// `size_class` is the 0-based rank from the ordered size-class config
-    /// (blessed backends persist it; lagging backends may ignore it).
-    async fn insert_job(
-        &self,
-        key: &str,
-        provider: &str,
-        path: &str,
-        admitted_commit: &str,
-        repo_config: &str,
-        credential: Option<&str>,
-        size_class: i64,
-        created_at: i64,
-    ) -> Result<i64>;
-
-    /// Raise a *queued* job's size_class to at least `rank` (no-op if already
-    /// higher). Used when a later enqueue coalesces onto an active job so a
-    /// bigger repo can't stay classified as small. Blessed backends only;
-    /// lagging backends no-op.
-    async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()>;
-
-    /// Resolve `claimed` jobs whose `claimed_at <= cutoff` (a crashed or
-    /// timed-out worker). A job that has already been claimed `max_attempts` or
-    /// more times is dead-lettered to terminal `failed` (with `dead_letter_error`
-    /// and `now` as its finished time) so a hard-killed build can't crash-loop;
-    /// anything under the cap is returned to `queued` for another attempt, with
-    /// `size_class` bumped one rung so a larger worker can claim it next
-    /// (right-sizing / O2). Dead-letter does not bump.
-    async fn reclaim_stale(
-        &self,
-        cutoff: i64,
-        max_attempts: i64,
-        now: i64,
-        dead_letter_error: &str,
-    ) -> Result<()>;
-
-    /// Current `size_class` for a job id (`None` if the row is missing).
-    async fn job_size_class(&self, id: i64) -> Result<Option<i64>>;
-
-    /// Id of the oldest queued job eligible for this worker. When
-    /// `max_size_class` is `Some(rank)`, only jobs with `size_class <= rank`
-    /// are considered (claim filter). `None` means no ceiling — claim anything.
-    /// Lagging backends that do not store `size_class` ignore the filter.
-    async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>>;
-
-    /// Atomically claim `id` if it is still `queued`, incrementing its
-    /// `attempts` counter. Returns true iff this call won the row.
-    async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
-
-    /// Renew a live claim only while `worker_id` still owns it. Returns true
-    /// iff the claimed row was refreshed.
-    async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
-
-    /// `(provider, path, admitted_commit, repo_config, credential)`
-    /// for a job id.
-    /// `credential` is the stored base64 blob (or `None`).
-    async fn job_fields(
-        &self,
-        id: i64,
-    ) -> Result<Option<(String, String, String, String, Option<String>)>>;
-
-    /// Settle a claimed job: `status` is `done` or `failed`, with optional
-    /// error. Conditional on the caller still owning the claim — the UPDATE
-    /// matches only `id = ? AND worker_id = ? AND status = 'claimed'`. Returns
-    /// true iff a row was settled; false means the claim was reclaimed and
-    /// re-owned (or dead-lettered) while this worker was building, so its result
-    /// must be discarded — the row belongs to whoever holds the claim now.
-    async fn finish(
-        &self,
-        id: i64,
-        worker_id: &str,
-        status: &str,
-        finished_at: i64,
-        error: Option<&str>,
-    ) -> Result<bool>;
-
-    /// Current attempt count for a claim owned by `worker_id`.
-    async fn claimed_attempts(&self, id: i64, worker_id: &str) -> Result<Option<i64>>;
-
-    /// Requeue a retryable build failure while the caller still owns the claim.
-    /// Returns false if the claim was reclaimed or otherwise settled first.
-    ///
-    /// If external corruption creates a same-key queued sibling, requeue may
-    /// violate the active-key constraint; settle the redundant claim with
-    /// [`SUPERSEDED_BY_NEWER_QUEUED`]. New exact B/C admissions use different
-    /// keys and therefore retry independently.
-    async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool>;
-
-    /// `(status, error)` for a job id.
-    async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>>;
-
-    /// Count of `queued` jobs.
-    async fn count_queued(&self) -> Result<i64>;
-
-    /// Count of `queued` jobs grouped by `size_class` rank.
-    ///
-    /// Returns `(rank, count)` pairs for ranks that have at least one pending
-    /// job, ordered by rank ascending.
-    ///
-    /// Both control drivers implement a real `GROUP BY size_class`.
-    async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>>;
-
-    /// Delete `failed` jobs finished before `cutoff` (epoch secs). Returns the
-    /// number removed. `done` jobs are intentionally kept (they are the build /
-    /// version-live-at-time-T history and stay small at real commit rates).
-    async fn prune_failed(&self, cutoff: i64) -> Result<u64>;
-
-    /// Upsert a worker heartbeat row.
-    async fn upsert_heartbeat(
-        &self,
-        worker_id: &str,
-        max_size_class: Option<i64>,
-        current_job: Option<i64>,
-        now: i64,
-    ) -> Result<()>;
-
-    /// Remove a worker registry row when an embedded slot exits an active job.
-    async fn delete_worker(&self, worker_id: &str) -> Result<u64>;
-
-    /// Count workers with `last_heartbeat >= cutoff`.
-    async fn count_live_workers(&self, cutoff: i64) -> Result<i64>;
-
-    /// Count live workers that can claim jobs of rank `min_rank` (inclusive).
-    ///
-    /// A worker counts when its heartbeat is fresh and either it has no claim
-    /// ceiling (`max_size_class IS NULL`) or `max_size_class >= min_rank`.
-    async fn count_live_workers_capable(&self, cutoff: i64, min_rank: i64) -> Result<i64>;
-
-    /// Delete workers with `last_heartbeat < cutoff` (hard age-out).
-    async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64>;
 }
 
 /// Default retention for `failed` jobs (seconds) before they are pruned. `done`
@@ -381,9 +233,9 @@ pub fn validate_heartbeat_timing(interval_secs: u64, timeout_secs: i64) -> Resul
     Ok(())
 }
 
-/// Cross-process queue over a [`QueueDb`].
+/// Cross-process queue over a `LibsqlDb`.
 pub struct SqlJobQueue {
-    db: Box<dyn QueueDb>,
+    db: LibsqlDb,
     stale_claim_secs: i64,
     failed_retention_secs: i64,
     max_build_attempts: i64,
@@ -406,15 +258,12 @@ impl SqlJobQueue {
     /// Wrap an engine adapter and run schema setup. Size classes load from
     /// config / `RIPCLONE_SIZE_CLASSES` / launch defaults. No claim ceiling
     /// (worker calls [`with_max_size_class`] to set one).
-    pub async fn new(db: Box<dyn QueueDb>) -> Result<Self> {
+    pub async fn new(db: LibsqlDb) -> Result<Self> {
         Self::new_with_classes(db, load_size_classes(&[])?).await
     }
 
     /// Like [`new`] but with an explicit size-class list (tests, custom wiring).
-    pub async fn new_with_classes(
-        db: Box<dyn QueueDb>,
-        size_classes: Vec<SizeClass>,
-    ) -> Result<Self> {
+    pub async fn new_with_classes(db: LibsqlDb, size_classes: Vec<SizeClass>) -> Result<Self> {
         super::size_class::validate_size_classes(&size_classes)?;
         db.init().await?;
         let stale_claim_secs = std::env::var("RIPCLONE_QUEUE_STALE_SECS")
@@ -761,7 +610,7 @@ impl SqlJobQueue {
     /// Conditional on `worker_id` still owning the claim; returns `Ok(true)` if
     /// it settled (or requeued), `Ok(false)` if the claim had been
     /// reclaimed/dead-lettered out from under this worker (its result is stale
-    /// and must be discarded — see [`QueueDb::finish`]).
+    /// and must be discarded — see `LibsqlDb::finish`).
     pub async fn ack(
         &self,
         id: i64,
@@ -1036,9 +885,9 @@ mod tests {
         out
     }
 
-    async fn make_db(engine: &str, path: &str) -> Box<dyn QueueDb> {
+    async fn make_db(engine: &str, path: &str) -> LibsqlDb {
         match engine {
-            "sqlite" => Box::new(LibsqlDb::connect(path).await.unwrap()),
+            "sqlite" => LibsqlDb::connect(path).await.unwrap(),
             other => panic!("unknown test engine {other}"),
         }
     }
@@ -1760,7 +1609,7 @@ mod tests {
         let db = LibsqlDb::connect(&dir.path().join("q.db").to_string_lossy())
             .await
             .unwrap();
-        let q = Arc::new(SqlJobQueue::new(Box::new(db)).await.unwrap());
+        let q = Arc::new(SqlJobQueue::new(db).await.unwrap());
 
         // 24 concurrent enqueues of one key → exactly one active job.
         let mut hs = Vec::new();
@@ -1815,7 +1664,7 @@ mod tests {
         let path = dir.path().join("restart-race.db");
         let path_text = path.to_string_lossy().to_string();
         let queue = Arc::new(
-            SqlJobQueue::new(Box::new(LibsqlDb::connect(&path_text).await.unwrap()))
+            SqlJobQueue::new(LibsqlDb::connect(&path_text).await.unwrap())
                 .await
                 .unwrap(),
         );
@@ -1834,7 +1683,7 @@ mod tests {
         for _ in 0..12 {
             let path = path_text.clone();
             tasks.push(tokio::spawn(async move {
-                SqlJobQueue::new(Box::new(LibsqlDb::connect(&path).await.unwrap()))
+                SqlJobQueue::new(LibsqlDb::connect(&path).await.unwrap())
                     .await
                     .unwrap();
             }));

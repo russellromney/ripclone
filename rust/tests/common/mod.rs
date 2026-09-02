@@ -1234,11 +1234,11 @@ pub async fn server_ref_store(server: &Server) -> Arc<dyn ripclone::ref_store::R
     use ripclone::meta::{LibsqlMeta, SqlRefStore};
 
     Arc::new(
-        SqlRefStore::new(Box::new(
+        SqlRefStore::new(
             LibsqlMeta::connect(&server.control_db.to_string_lossy())
                 .await
                 .expect("open server control refs"),
-        ))
+        )
         .await
         .expect("initialize server control refs"),
     )
