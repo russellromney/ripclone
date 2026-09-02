@@ -5868,10 +5868,11 @@ fn upload_concurrency() -> usize {
 }
 
 /// Upload `hashes` from CAS to storage with bounded concurrency.
-/// `crash_commit`, when set, drives the direct worker-crash test: after the
-/// first hash in `hashes` uploads, it fires the `during_upload` build-crash
-/// hook from inside this same concurrent upload, so there is exactly one
-/// upload path for tests and production alike.
+/// `crash_commit`, when set, drives the direct worker-crash test: when the
+/// `during_upload` barrier is armed for that commit, the first hash uploads
+/// alone, the hook fires, and only then do the remaining hashes start. That
+/// keeps exactly one upload path for tests and production while the crash
+/// still lands with precisely one artifact in storage.
 async fn upload_artifacts(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
@@ -5879,11 +5880,24 @@ async fn upload_artifacts(
     conc: usize,
     crash_commit: Option<&str>,
 ) -> Result<()> {
+    let crash_gate = crash_commit
+        .filter(|commit| test_build_crash_barrier_matches("during_upload", commit))
+        .map(|commit| {
+            let (opened, wait) = tokio::sync::watch::channel(false);
+            (commit.to_string(), Arc::new(opened), wait)
+        });
     futures::stream::iter(hashes.into_iter().enumerate().map(|(index, hash)| {
         let cas = cas.clone();
         let storage = storage.clone();
-        let crash_commit = crash_commit.map(str::to_string);
+        let mut crash_gate = crash_gate.clone();
         async move {
+            if index > 0
+                && let Some((_, _, wait)) = crash_gate.as_mut()
+            {
+                wait.wait_for(|opened| *opened)
+                    .await
+                    .context("during_upload crash gate closed before opening")?;
+            }
             let read_hash = hash.clone();
             let (path, len) = tokio::task::spawn_blocking(move || {
                 let len = cas
@@ -5901,13 +5915,14 @@ async fn upload_artifacts(
                 .with_context(|| format!("upload artifact {}", hash))?;
             crate::perf::record_storage_upload(upload_start.elapsed(), len);
             if index == 0
-                && let Some(commit) = crash_commit.as_deref()
+                && let Some((commit, opened, _)) = crash_gate.as_ref()
             {
                 test_hook(TestStage::BuildCrash {
                     stage: "during_upload",
                     commit,
                 })
                 .await?;
+                let _ = opened.send(true);
             }
             Ok(())
         }
@@ -9405,6 +9420,8 @@ mod tests {
             std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
             std::env::set_var("RIPCLONE_TESTING", "1");
         }
+        let probe = Arc::new(AdmissionTestProbe::default());
+        let _probe_guard = install_admission_test_probe(Arc::clone(&probe));
 
         for stage in [
             "before_upload",
@@ -9449,6 +9466,7 @@ mod tests {
                 std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_COMMIT", &admitted);
                 std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR", &barrier);
             }
+            let uploads_before = probe.artifact_uploads.load(Ordering::SeqCst);
             let crashed_state = state.clone();
             let crashed_job = job.clone();
             let attempt = tokio::spawn(async move {
@@ -9466,6 +9484,18 @@ mod tests {
                 attempt.await.unwrap_err().is_cancelled(),
                 "{stage}: the admitted worker task is the crashed attempt"
             );
+            let uploads_started = probe.artifact_uploads.load(Ordering::SeqCst) - uploads_before;
+            match stage {
+                "before_upload" => assert_eq!(uploads_started, 0, "{stage}: no Head upload began"),
+                "during_upload" => assert_eq!(
+                    uploads_started, 1,
+                    "{stage}: exactly one Head artifact uploaded before the crash"
+                ),
+                _ => assert!(
+                    uploads_started > 1,
+                    "{stage}: every Head artifact uploaded before the crash (saw {uploads_started})"
+                ),
+            }
 
             let interrupted = state
                 .ref_store
