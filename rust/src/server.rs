@@ -8922,6 +8922,144 @@ mod tests {
         assert!(resp.archive_chunk_urls.is_none());
     }
 
+    /// Signs every hash as `signed:<ttl-secs>:<hash>` so a response's URL
+    /// fields pin which hash was signed, in what order, and with which TTL.
+    struct SigningStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for SigningStorage {
+        fn get(&self, _hash: &str) -> Result<Vec<u8>> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn get_range(&self, _hash: &str, _start: u64, _len: u64) -> Result<Vec<u8>> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn put(&self, _hash: &str, _data: &[u8]) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn size(&self, _hash: &str) -> Result<u64> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn verify_durable_copy(&self, _hash: &str) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn signed_url(&self, hash: &str, expires_in: Duration) -> Option<String> {
+            Some(format!("signed:{}:{hash}", expires_in.as_secs()))
+        }
+    }
+
+    #[test]
+    fn ref_response_signs_every_artifact_in_manifest_order() {
+        let storage: StorageRef = Arc::new(SigningStorage);
+        let commit = "c".repeat(40);
+        let parent = "p".repeat(40);
+        let pack = |name: &str| crate::PackArtifact {
+            pack: format!("{name}-pack"),
+            idx: format!("{name}-idx"),
+        };
+        let info = RefInfo {
+            commit: commit.clone(),
+            head: Some(crate::HeadResult {
+                clonepack: ready_artifacts(&commit, "head"),
+                parent_commit: Some(parent.clone()),
+                packs: vec![pack("h1")],
+                ..Default::default()
+            }),
+            full: Some(crate::FullResult {
+                clonepack: crate::ClonepackArtifacts {
+                    midx: "full-midx".to_string(),
+                    ..ready_artifacts(&commit, "full")
+                },
+                packs: vec![pack("f1"), pack("f2"), pack("f3")],
+                ..Default::default()
+            }),
+            files: Some(crate::FilesResult {
+                clonepack: ready_artifacts(&commit, "files"),
+                archive_chunks: vec!["a1".to_string(), "a2".to_string()],
+                ..Default::default()
+            }),
+        };
+        let provider = ProviderRegistry::new().default_provider().clone();
+        let repo_id = RepoId::github("o/r");
+        let signed = |ttl: u64, hash: &str| Some(format!("signed:{ttl}:{hash}"));
+
+        let full = ref_response(
+            &repo_id,
+            &provider,
+            "main".to_string(),
+            &info,
+            &storage,
+            ExactResultKind::Full,
+            false,
+        );
+        let full_artifacts = info.full.as_ref().unwrap();
+        assert_eq!(full.commit, commit);
+        assert_eq!(full.parent_commit.as_deref(), Some(parent.as_str()));
+        assert_eq!(full.clonepack_manifest, full_artifacts.clonepack.manifest);
+        assert_eq!(
+            full.clonepack_manifest_url,
+            signed(1200, &full_artifacts.clonepack.manifest)
+        );
+        assert_eq!(
+            full.metadata_chunk_url,
+            signed(1200, &full_artifacts.clonepack.metadata_chunk)
+        );
+        assert_eq!(
+            full.pack_chunk_urls,
+            Some(vec![
+                signed(1200, "f1-pack"),
+                signed(1200, "f2-pack"),
+                signed(1200, "f3-pack"),
+            ])
+        );
+        assert_eq!(full.midx_url, signed(1200, "full-midx"));
+        assert_eq!(
+            full.idx_bundle_url,
+            signed(1200, &full_artifacts.clonepack.idx_bundle)
+        );
+        assert!(full.archive_chunk_urls.is_none());
+        assert!(full.head_blobs_chunk_urls.is_none());
+        assert!(full.head_blobs_idx_url.is_none());
+
+        let files = ref_response(
+            &repo_id,
+            &provider,
+            "main".to_string(),
+            &info,
+            &storage,
+            ExactResultKind::Files,
+            true,
+        );
+        assert_eq!(
+            files.archive_chunk_urls,
+            Some(vec![signed(300, "a1"), signed(300, "a2")])
+        );
+        assert!(files.pack_chunk_urls.is_none());
+        assert_eq!(
+            files.clonepack_manifest_url,
+            signed(300, &info.files.as_ref().unwrap().clonepack.manifest)
+        );
+        // No MIDX on the Files variant: an empty hash is never signed.
+        assert!(files.midx_url.is_none());
+        assert_eq!(files.parent_commit.as_deref(), Some(parent.as_str()));
+
+        let head = ref_response(
+            &repo_id,
+            &provider,
+            "main".to_string(),
+            &info,
+            &storage,
+            ExactResultKind::Head,
+            false,
+        );
+        assert_eq!(head.pack_chunk_urls, Some(vec![signed(1200, "h1-pack")]));
+    }
+
     #[test]
     fn signed_url_ttl_is_shorter_for_private() {
         // Defaults (no env override): public 20m, private 5m. Private must be the
