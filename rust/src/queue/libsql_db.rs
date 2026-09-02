@@ -35,6 +35,9 @@ impl LibsqlDb {
         Ok(conn)
     }
 
+    /// Create the `jobs` and `workers` tables and indexes. Active-key
+    /// uniqueness is required; initialization fails closed if the backend cannot
+    /// enforce it.
     pub(crate) async fn init(&self) -> Result<()> {
         let conn = self.conn().await?;
         // WAL keeps readers from blocking the writer on a local file (no-op on
@@ -62,6 +65,7 @@ impl LibsqlDb {
         Ok(())
     }
 
+    /// Id of the active (queued or claimed) job for `key`, if any.
     pub(crate) async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -77,6 +81,7 @@ impl LibsqlDb {
         }
     }
 
+    /// Newest retained job id for `key`, including settled jobs.
     pub(crate) async fn latest_job_id(&self, key: &str) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -92,6 +97,9 @@ impl LibsqlDb {
         }
     }
 
+    /// Insert a new queued job and return its id. Errors if a unique constraint
+    /// rejects a duplicate active key (the caller treats that as coalesced).
+    /// `size_class` is the 0-based rank from the ordered size-class config.
     pub(crate) async fn insert_job(
         &self,
         key: &str,
@@ -127,6 +135,9 @@ impl LibsqlDb {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Raise a *queued* job's size_class to at least `rank` (no-op if already
+    /// higher). Used when a later enqueue coalesces onto an active job so a
+    /// bigger repo can't stay classified as small.
     pub(crate) async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()> {
         let conn = self.conn().await?;
         conn.execute(
@@ -139,6 +150,13 @@ impl LibsqlDb {
         Ok(())
     }
 
+    /// Resolve `claimed` jobs whose `claimed_at <= cutoff` (a crashed or
+    /// timed-out worker). A job that has already been claimed `max_attempts` or
+    /// more times is dead-lettered to terminal `failed` (with `dead_letter_error`
+    /// and `now` as its finished time) so a hard-killed build can't crash-loop;
+    /// anything under the cap is returned to `queued` for another attempt, with
+    /// `size_class` bumped one rung so a larger worker can claim it next.
+    /// Dead-letter does not bump.
     pub(crate) async fn reclaim_stale(
         &self,
         cutoff: i64,
@@ -202,6 +220,9 @@ impl LibsqlDb {
         }
     }
 
+    /// Id of the oldest queued job eligible for this worker. When
+    /// `max_size_class` is `Some(rank)`, only jobs with `size_class <= rank`
+    /// are considered (claim filter). `None` means no ceiling: claim anything.
     pub(crate) async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = match max_size_class {
@@ -227,6 +248,8 @@ impl LibsqlDb {
         }
     }
 
+    /// Atomically claim `id` if it is still `queued`, incrementing its
+    /// `attempts` counter. Returns true iff this call won the row.
     pub(crate) async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
         let conn = self.conn().await?;
         let n = conn
@@ -241,6 +264,8 @@ impl LibsqlDb {
         Ok(n == 1)
     }
 
+    /// Renew a live claim only while `worker_id` still owns it. Returns true
+    /// iff the claimed row was refreshed.
     pub(crate) async fn renew_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
         let conn = self.conn().await?;
         let n = conn
@@ -254,6 +279,8 @@ impl LibsqlDb {
         Ok(n == 1)
     }
 
+    /// `(provider, path, admitted_commit, repo_config, credential)` for a job
+    /// id. `credential` is the stored base64 blob (or `None`).
     pub(crate) async fn job_fields(
         &self,
         id: i64,
@@ -278,6 +305,12 @@ impl LibsqlDb {
         }
     }
 
+    /// Settle a claimed job: `status` is `done` or `failed`, with optional
+    /// error. Conditional on the caller still owning the claim: the UPDATE
+    /// matches only `id = ? AND worker_id = ? AND status = 'claimed'`. Returns
+    /// true iff a row was settled; false means the claim was reclaimed and
+    /// re-owned (or dead-lettered) while this worker was building, so its result
+    /// must be discarded. The row belongs to whoever holds the claim now.
     pub(crate) async fn finish(
         &self,
         id: i64,
@@ -300,6 +333,7 @@ impl LibsqlDb {
         Ok(n == 1)
     }
 
+    /// Current attempt count for a claim owned by `worker_id`.
     pub(crate) async fn claimed_attempts(&self, id: i64, worker_id: &str) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -315,6 +349,13 @@ impl LibsqlDb {
         }
     }
 
+    /// Requeue a retryable build failure while the caller still owns the claim.
+    /// Returns false if the claim was reclaimed or otherwise settled first.
+    ///
+    /// If external corruption creates a same-key queued sibling, requeue may
+    /// violate the active-key constraint; settle the redundant claim with
+    /// [`SUPERSEDED_BY_NEWER_QUEUED`]. New exact B/C admissions use different
+    /// keys and therefore retry independently.
     pub(crate) async fn requeue_claim(
         &self,
         id: i64,
@@ -349,6 +390,7 @@ impl LibsqlDb {
         Ok(n == 1)
     }
 
+    /// `(status, error)` for a job id.
     pub(crate) async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -361,6 +403,7 @@ impl LibsqlDb {
         }
     }
 
+    /// Count of `queued` jobs.
     pub(crate) async fn count_queued(&self) -> Result<i64> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -373,6 +416,10 @@ impl LibsqlDb {
         }
     }
 
+    /// Count of `queued` jobs grouped by `size_class` rank.
+    ///
+    /// Returns `(rank, count)` pairs for ranks that have at least one pending
+    /// job, ordered by rank ascending.
     pub(crate) async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -396,6 +443,9 @@ impl LibsqlDb {
         Ok(out)
     }
 
+    /// Delete `failed` jobs finished before `cutoff` (epoch secs). Returns the
+    /// number removed. `done` jobs are intentionally kept (they are the build /
+    /// version-live-at-time-T history and stay small at real commit rates).
     pub(crate) async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
         self.conn()
             .await?
@@ -407,6 +457,7 @@ impl LibsqlDb {
             .context("prune failed jobs")
     }
 
+    /// Upsert a worker heartbeat row.
     pub(crate) async fn upsert_heartbeat(
         &self,
         worker_id: &str,
@@ -438,6 +489,7 @@ impl LibsqlDb {
         Ok(())
     }
 
+    /// Remove a worker registry row when an embedded slot exits an active job.
     pub(crate) async fn delete_worker(&self, worker_id: &str) -> Result<u64> {
         self.conn()
             .await?
@@ -449,6 +501,7 @@ impl LibsqlDb {
             .context("delete worker heartbeat")
     }
 
+    /// Count workers with `last_heartbeat >= cutoff`.
     pub(crate) async fn count_live_workers(&self, cutoff: i64) -> Result<i64> {
         let conn = self.conn().await?;
         let mut rows = conn
@@ -464,6 +517,10 @@ impl LibsqlDb {
         }
     }
 
+    /// Count live workers that can claim jobs of rank `min_rank` (inclusive).
+    ///
+    /// A worker counts when its heartbeat is fresh and either it has no claim
+    /// ceiling (`max_size_class IS NULL`) or `max_size_class >= min_rank`.
     pub(crate) async fn count_live_workers_capable(
         &self,
         cutoff: i64,
@@ -485,6 +542,7 @@ impl LibsqlDb {
         }
     }
 
+    /// Delete workers with `last_heartbeat < cutoff` (hard age-out).
     pub(crate) async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64> {
         self.conn()
             .await?
