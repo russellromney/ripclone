@@ -3619,6 +3619,8 @@ async fn get_ref_inner(
     }
 
     match admit_commit(&state, &repo_id, &commit, existing, move || Ok(credential)).await {
+        // Not ready for the requested kind above implies not complete for every
+        // kind, and the core only reads the `existing` row handed to it.
         Admission::Complete(_) => unreachable!("caller already filtered complete results"),
         Admission::Enqueued(_) => {
             artifact_pending_response(
@@ -3628,19 +3630,27 @@ async fn get_ref_inner(
             )
             .await
         }
-        Admission::Error(error) => {
-            state.metrics.record_error();
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ExactRevisionUnavailableResponse {
-                    error,
-                    commit,
-                    branch: checkout_name,
-                }),
-            )
-                .into_response()
-        }
+        Admission::Error(error) => exact_unavailable_response(&state, error, commit, checkout_name),
     }
+}
+
+/// Enqueue failure for an exact-revision request: the queue is unavailable.
+fn exact_unavailable_response(
+    state: &ServerState,
+    error: String,
+    commit: String,
+    branch: String,
+) -> Response {
+    state.metrics.record_error();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ExactRevisionUnavailableResponse {
+            error,
+            commit,
+            branch,
+        }),
+    )
+        .into_response()
 }
 
 const REF_SIGNED_URL_TTL_PUBLIC_SECS: u64 = 1200;
@@ -4313,23 +4323,8 @@ async fn sync_repo_at_revision(
     };
     let at_rev = selected_commit;
 
-    // A retry resolves entirely from the local mirror and exact result row. An
-    // explicit sync is a no-op only when every stored result is present.
+    // A retry resolves entirely from the local mirror and exact result row.
     let loaded = match state.ref_store.load_result(&repo_id, &at_rev).await {
-        Ok(Some(info)) if exact_result_complete(&info, &at_rev) => {
-            state.metrics.record_sync(start.elapsed());
-            let response = sync_response_without_storage_read(
-                &repo_id,
-                &provider,
-                branch.clone(),
-                &info,
-                &state.storage,
-                ExactResultKind::Full,
-                private,
-                "no-op",
-            );
-            return (StatusCode::OK, Json(response)).into_response();
-        }
         Ok(loaded) => loaded,
         Err(error) => {
             state.metrics.record_error();
@@ -4344,24 +4339,27 @@ async fn sync_repo_at_revision(
     };
 
     // Exact revisions use the same immutable `(repository, admitted commit)`
-    // lane as ordinary requests; checkout names are never queue identity.
+    // lane as ordinary requests; checkout names are never queue identity. An
+    // explicit sync is a no-op only when every stored result is present.
     match admit_commit(&state, &repo_id, &at_rev, loaded, move || Ok(credential)).await {
-        Admission::Complete(_) => unreachable!("caller already filtered complete results"),
+        Admission::Complete(info) => {
+            state.metrics.record_sync(start.elapsed());
+            let response = sync_response_without_storage_read(
+                &repo_id,
+                &provider,
+                branch,
+                &info,
+                &state.storage,
+                ExactResultKind::Full,
+                private,
+                "no-op",
+            );
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Admission::Enqueued(_) => {
             artifact_pending_response(&at_rev, &branch, state.build_queue.depth().await).await
         }
-        Admission::Error(error) => {
-            state.metrics.record_error();
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ExactRevisionUnavailableResponse {
-                    error,
-                    commit: at_rev,
-                    branch,
-                }),
-            )
-                .into_response()
-        }
+        Admission::Error(error) => exact_unavailable_response(&state, error, at_rev, branch),
     }
 }
 
