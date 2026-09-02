@@ -1892,8 +1892,8 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     probe.after_head_entry.arm();
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server_env(&[
-        ("RIPCLONE_QUEUE_STALE_SECS", "3"),
-        ("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS", "3"),
+        ("RIPCLONE_QUEUE_STALE_SECS", "300"),
+        ("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS", "300"),
     ])
     .await;
     let origin = make_origin("acme", "lost-claim");
@@ -1906,19 +1906,52 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     assert_eq!(response_commit(&admitted), commit);
     wait_entered(&probe.after_head_entry, 1).await;
 
+    let database = libsql::Builder::new_local(&server.control_db)
+        .build()
+        .await
+        .expect("open lost-claim database");
+    let connection = database.connect().expect("connect to lost-claim database");
+    let key = format!(
+        "{}\x1f{commit}",
+        ripclone::provider::RepoId::github("acme/lost-claim").storage_key()
+    );
+    let mut rows = connection
+        .query(
+            "SELECT id, worker_id FROM jobs WHERE key = ?1 AND status = 'claimed'",
+            [key.as_str()],
+        )
+        .await
+        .expect("read held durable claim");
+    let row = rows
+        .next()
+        .await
+        .expect("read held durable claim row")
+        .expect("held job has a durable claim");
+    let job_id = row.get::<i64>(0).expect("held job id");
+    let old_owner = row
+        .get::<Option<String>>(1)
+        .expect("held worker id column")
+        .expect("held job has an owner");
+    drop(rows);
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE jobs SET worker_id = ?1
+                 WHERE id = ?2 AND status = 'claimed' AND worker_id = ?3",
+                libsql::params!["replacement-owner", job_id, old_owner],
+            )
+            .await
+            .expect("transfer the held durable claim"),
+        1,
+        "test setup must transfer exactly the live claim"
+    );
     let takeover = ripclone::queue::SqlJobQueue::new(Box::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .unwrap(),
     ))
     .await
-    .unwrap()
-    .with_stale_claim_secs(0);
-    let transferred = takeover
-        .claim("replacement-owner")
-        .await
-        .unwrap()
-        .expect("replacement takes the held durable claim");
+    .unwrap();
     let writes_before_release = probe.ref_store_writes.load(Ordering::SeqCst);
     // Release the old attempt immediately after reclaim, before its next
     // heartbeat can detect ownership loss. The publication itself must reject
@@ -1940,7 +1973,7 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     assert!(
         takeover
             .ack(
-                transferred.id,
+                job_id,
                 "replacement-owner",
                 Err(ripclone::queue::BuildError::permanent(
                     "test settled replacement"
