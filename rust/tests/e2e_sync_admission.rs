@@ -1905,6 +1905,12 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     let admitted = admit_repo(&server, "acme/lost-claim").await;
     assert_eq!(response_commit(&admitted), commit);
     wait_entered(&probe.after_head_entry, 1).await;
+    // Head is published, so the server's only build slot is free and polling
+    // for its next claim. Park it before the takeover: otherwise it can
+    // re-claim the row between the takeover's stale reclaim and its claim, and
+    // the takeover finds nothing queued.
+    probe.before_claim.arm();
+    wait_entered(&probe.before_claim, 1).await;
 
     let takeover = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
