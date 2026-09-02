@@ -1912,8 +1912,7 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
         .expect("open lost-claim database");
     let connection = database.connect().expect("connect to lost-claim database");
     connection
-        .execute("PRAGMA busy_timeout = 5000", ())
-        .await
+        .busy_timeout(Duration::from_secs(5))
         .expect("configure lost-claim database busy timeout");
     let key = format!(
         "{}\x1f{commit}",
