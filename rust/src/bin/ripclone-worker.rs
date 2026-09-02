@@ -140,6 +140,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     ripclone::git::require_system_git()?;
     ripclone::control::validate_worker_environment()?;
+    // Complete storage parsing and client construction before creating cache
+    // or mirror directories, or contacting the worker APIs.
+    Backends::validate_environment()?;
     // Validate the complete token-only API configuration before creating local
     // paths or initializing artifact storage. Standalone workers have no
     // control-database mode or credential.
