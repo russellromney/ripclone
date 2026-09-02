@@ -1135,7 +1135,16 @@ fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
         + metadata.files.len() * 64) as u64
 }
 
-const INSTALL_STAGING_MARKER: &str = ".ripclone-install-staging";
+const INSTALL_STAGING_MARKER_SUFFIX: &str = ".ripclone-install-staging";
+
+fn install_staging_marker_path(staging_dir: &Path) -> PathBuf {
+    let mut marker_name = staging_dir
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("ripclone.tmp"))
+        .to_os_string();
+    marker_name.push(INSTALL_STAGING_MARKER_SUFFIX);
+    staging_dir.with_file_name(marker_name)
+}
 
 #[cfg(unix)]
 fn lock_staging_marker(marker: &std::fs::File, nonblocking: bool) -> Result<()> {
@@ -1155,14 +1164,39 @@ fn lock_staging_marker(marker: &std::fs::File, nonblocking: bool) -> Result<()> 
 }
 
 struct StagedTempDir {
-    dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
+    marker_path: PathBuf,
     #[cfg(unix)]
     _marker_lock: std::fs::File,
 }
 
 impl StagedTempDir {
     fn path(&self) -> &Path {
-        self.dir.path()
+        self.dir
+            .as_ref()
+            .expect("staged temp directory exists until drop")
+            .path()
+    }
+}
+
+impl Drop for StagedTempDir {
+    fn drop(&mut self) {
+        let staging_path = self.path().to_path_buf();
+        // TempDir performs the recursive cleanup. Preserve the sidecar marker
+        // if that cleanup fails so a later clone can still identify and remove
+        // the abandoned staging directory safely.
+        drop(self.dir.take());
+        if staging_path.exists() {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(&self.marker_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "cannot remove clone staging marker {}: {error}",
+                self.marker_path.display()
+            );
+        }
     }
 }
 
@@ -1194,10 +1228,11 @@ fn cleanup_stale_install_dirs(target: &Path, parent: &Path) {
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
+        let marker_path = install_staging_marker_path(&path);
         let Ok(mut marker) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path.join(INSTALL_STAGING_MARKER))
+            .open(&marker_path)
         else {
             continue;
         };
@@ -1217,6 +1252,14 @@ fn cleanup_stale_install_dirs(target: &Path, parent: &Path) {
                 path.display()
             );
         } else {
+            if let Err(error) = std::fs::remove_file(&marker_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    "cannot remove stale clone staging marker {}: {error}",
+                    marker_path.display()
+                );
+            }
             info!("removed stale clone staging directory {}", path.display());
         }
     }
@@ -1244,7 +1287,7 @@ fn temp_install_dir(target: &Path) -> Result<StagedTempDir> {
         .suffix(".tmp")
         .tempdir_in(parent)
         .context("create temp install directory")?;
-    let marker_path = tmp.path().join(INSTALL_STAGING_MARKER);
+    let marker_path = install_staging_marker_path(tmp.path());
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -1260,14 +1303,18 @@ fn temp_install_dir(target: &Path) -> Result<StagedTempDir> {
             .write_all(b"ripclone\n")
             .context("mark temp install directory")?;
         Ok(StagedTempDir {
-            dir: tmp,
+            dir: Some(tmp),
+            marker_path,
             _marker_lock: marker_lock,
         })
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(marker_path, b"ripclone\n").context("mark temp install directory")?;
-        Ok(StagedTempDir { dir: tmp })
+        std::fs::write(&marker_path, b"ripclone\n").context("mark temp install directory")?;
+        Ok(StagedTempDir {
+            dir: Some(tmp),
+            marker_path,
+        })
     }
 }
 
@@ -3317,8 +3364,6 @@ impl Client {
         } else {
             // Optional durability barrier: flush the staged tree, publish it,
             // then flush the parent directory so the rename itself is durable.
-            std::fs::remove_file(install_root.join(INSTALL_STAGING_MARKER))
-                .context("remove clone staging marker before publish")?;
             if fsync_requested() {
                 fsync_tree(&install_root).context("fsync staged clone before publish")?;
             }
@@ -3530,7 +3575,10 @@ impl Client {
         });
 
         enum PackBody {
-            Buffered(bytes::Bytes),
+            Buffered {
+                bytes: bytes::Bytes,
+                _memory_permit: tuning::EditablePackMemoryPermit,
+            },
             TempFile {
                 file: tempfile::NamedTempFile,
                 len: u64,
@@ -3540,7 +3588,7 @@ impl Client {
         impl PackBody {
             fn len(&self) -> u64 {
                 match self {
-                    PackBody::Buffered(bytes) => bytes.len() as u64,
+                    PackBody::Buffered { bytes, .. } => bytes.len() as u64,
                     PackBody::TempFile { len, .. } => *len,
                 }
             }
@@ -3578,6 +3626,13 @@ impl Client {
                         crate::perf::record_editable_pack_fetch(pack_fetch_start.elapsed(), len);
                         PackBody::TempFile { file, len }
                     } else {
+                        // Hold a process-wide weighted permit from before the
+                        // body starts buffering until its blocking parser exits.
+                        // Concurrent clones therefore share one byte budget;
+                        // one oversized pack runs alone instead of stacking
+                        // with other completed bodies.
+                        let memory_permit =
+                            tuning::acquire_editable_pack_memory(pack_ref.len).await;
                         let hash = hash_to_hex(&pack_ref.hash);
                         let bytes = client
                             .fetch_verified_artifact_for_install(
@@ -3592,7 +3647,10 @@ impl Client {
                             pack_fetch_start.elapsed(),
                             bytes.len() as u64,
                         );
-                        PackBody::Buffered(bytes)
+                        PackBody::Buffered {
+                            bytes,
+                            _memory_permit: memory_permit,
+                        }
                     };
                     Ok((i, history_only, entry, pack_body))
                 }
@@ -3691,7 +3749,13 @@ impl Client {
                                     );
                                 }
                                 let (name, pack_bytes) = match pack_body {
-                                    PackBody::Buffered(pack_bytes) => {
+                                    PackBody::Buffered {
+                                        bytes: pack_bytes,
+                                        _memory_permit,
+                                    } => {
+                                        // Keep the weighted memory permit alive
+                                        // for the complete write/extract path.
+                                        let _memory_permit = _memory_permit;
                                         // Git names packs by the 20-byte trailer sha; the idx
                                         // pairs to the pack by basename.
                                         let name =
@@ -4085,14 +4149,7 @@ impl Client {
         let status = self
             .run_managed_git(
                 install_root,
-                [
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                    "--",
-                    ".",
-                    ":(exclude).ripclone-install-staging",
-                ],
+                ["status", "--porcelain=v1", "--untracked-files=all"],
                 None,
                 cleanup,
             )
@@ -4468,7 +4525,7 @@ mod tests {
 
         let stale = dir.path().join("linux.ripclone-old.tmp");
         std::fs::create_dir(&stale).unwrap();
-        std::fs::write(stale.join(INSTALL_STAGING_MARKER), b"ripclone\n").unwrap();
+        std::fs::write(install_staging_marker_path(&stale), b"ripclone\n").unwrap();
         std::fs::write(stale.join("partial"), b"partial clone").unwrap();
 
         let live = temp_install_dir(&target).unwrap();
@@ -4482,7 +4539,31 @@ mod tests {
         assert!(!stale.exists());
         assert!(live_path.exists());
         assert!(unmarked.exists());
-        assert!(created.path().join(INSTALL_STAGING_MARKER).is_file());
+        assert!(install_staging_marker_path(created.path()).is_file());
+        assert!(!created.path().join(INSTALL_STAGING_MARKER_SUFFIX).exists());
+    }
+
+    #[test]
+    fn staging_marker_name_in_repository_survives_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("collision");
+        let staged = temp_install_dir(&target).unwrap();
+        let staging_path = staged.path().to_path_buf();
+        let sidecar = install_staging_marker_path(&staging_path);
+        std::fs::write(
+            staging_path.join(INSTALL_STAGING_MARKER_SUFFIX),
+            b"tracked repository content\n",
+        )
+        .unwrap();
+
+        std::fs::rename(&staging_path, &target).unwrap();
+        drop(staged);
+
+        assert_eq!(
+            std::fs::read(target.join(INSTALL_STAGING_MARKER_SUFFIX)).unwrap(),
+            b"tracked repository content\n"
+        );
+        assert!(!sidecar.exists());
     }
 
     #[test]

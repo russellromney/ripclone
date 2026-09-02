@@ -898,10 +898,9 @@ pub fn extract_blobs_from_pack_bytes(
         }
         let inflate_start = Instant::now();
         let mut dec = ZlibDecoder::new(&pack[data_start..]);
-        // Do not reserve the size advertised by an untrusted pack header: a
-        // tiny malformed pack could otherwise request a multi-gigabyte
-        // allocation before zlib has produced a single byte.
-        let mut content = Vec::new();
+        // Preserve the single-allocation fast path without trusting a hostile
+        // object's advertised size beyond the containing pack bytes.
+        let mut content = Vec::with_capacity(pack_object_initial_capacity(size, pack.len()));
         dec.read_to_end(&mut content)
             .with_context(|| format!("inflate pack object {}", i))?;
         let content_len = u64::try_from(content.len()).context("pack object length overflow")?;
@@ -966,6 +965,12 @@ pub fn extract_blobs_from_pack_bytes(
         files: written,
         stats,
     })
+}
+
+fn pack_object_initial_capacity(advertised_size: u64, pack_len: usize) -> usize {
+    usize::try_from(advertised_size)
+        .unwrap_or(usize::MAX)
+        .min(pack_len)
 }
 
 /// Parse a git pack object header: 3-bit type + little-endian base-128 size.
@@ -1307,5 +1312,11 @@ mod tests {
             err.to_string().contains("overflows u64"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn hostile_pack_object_size_cannot_reserve_beyond_pack_bytes() {
+        assert_eq!(pack_object_initial_capacity(u64::MAX, 4096), 4096);
+        assert_eq!(pack_object_initial_capacity(128, 4096), 128);
     }
 }
