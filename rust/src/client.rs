@@ -3568,8 +3568,9 @@ impl Client {
                         .pack
                         .as_ref()
                         .with_context(|| format!("pack {} missing pack ref", i))?;
+                    let history_only = entry.history_only;
                     let pack_fetch_start = std::time::Instant::now();
-                    let pack_body = if entry.history_only {
+                    let pack_body = if history_only {
                         let (file, len) = client
                             .fetch_chunk_ref_to_temp(pack_ref, &pack_dir, &artifact_refresh, i)
                             .await
@@ -3593,7 +3594,7 @@ impl Client {
                         );
                         PackBody::Buffered(bytes)
                     };
-                    Ok((i, entry.history_only, entry, pack_body))
+                    Ok((i, history_only, entry, pack_body))
                 }
             },
         );
