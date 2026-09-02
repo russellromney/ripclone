@@ -4515,7 +4515,7 @@ fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
 
 /// Outcome of [`admit_commit`]: already complete, enqueued, or an error.
 enum Admission {
-    Complete(RefInfo),
+    Complete(Box<RefInfo>),
     Enqueued(EnqueueOutcome),
     Error(String),
 }
@@ -4539,7 +4539,7 @@ where
     if let Some(info) = &loaded
         && exact_result_complete(info, commit)
     {
-        return Admission::Complete(loaded.expect("checked Some above"));
+        return Admission::Complete(Box::new(loaded.expect("checked Some above")));
     }
     let credential = match credential() {
         Ok(credential) => credential,
