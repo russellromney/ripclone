@@ -3628,33 +3628,29 @@ async fn get_ref_inner(
         return artifact_pending_response(&commit, &checkout_name, 0).await;
     }
 
-    let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&commit)).await;
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit: commit.clone(),
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential: credential.clone(),
-        size_bytes,
-    };
-    if let Err(error) = enqueue_admitted_build(&state, job).await {
-        state.metrics.record_error();
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ExactRevisionUnavailableResponse {
-                error,
-                commit,
-                branch: checkout_name,
-            }),
-        )
-            .into_response();
+    match admit_commit(&state, &repo_id, &commit, existing, move || Ok(credential)).await {
+        Admission::Complete(_) => unreachable!("caller already filtered complete results"),
+        Admission::Enqueued(_) => {
+            artifact_pending_response(
+                &commit,
+                &checkout_name,
+                state.build_queue_depth.load(Ordering::Relaxed),
+            )
+            .await
+        }
+        Admission::Error(error) => {
+            state.metrics.record_error();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ExactRevisionUnavailableResponse {
+                    error,
+                    commit,
+                    branch: checkout_name,
+                }),
+            )
+                .into_response()
+        }
     }
-
-    artifact_pending_response(
-        &commit,
-        &checkout_name,
-        state.build_queue_depth.load(Ordering::Relaxed),
-    )
-    .await
 }
 
 const REF_SIGNED_URL_TTL_PUBLIC_SECS: u64 = 1200;
@@ -4055,19 +4051,11 @@ async fn sync_repo_inner(
     if params.rev.is_some() {
         return sync_repo_at_revision(repo_id, provider, params, headers, state).await;
     }
-    let added_repo = match state.ref_store.load_added_repo(&repo_id).await {
-        Ok(Some(added)) => added,
-        Ok(None) => return repo_not_added_response(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("added repo lookup failed: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
+    match repo_is_added(&state, &repo_id).await {
+        Ok(true) => {}
+        Ok(false) => return repo_not_added_response(),
+        Err(resp) => return resp,
+    }
 
     let request_token = upstream_token_from_headers(&headers);
     let credential = match state
@@ -4144,67 +4132,53 @@ async fn sync_repo_inner(
                 .into_response();
         }
     };
-    let ready = loaded_exact
-        .as_ref()
-        .filter(|info| exact_result_complete(info, &commit));
-    if let Some(info) = ready {
-        state.metrics.record_sync(start.elapsed());
-        let resp = sync_response_without_storage_read(
-            &repo_id,
-            &provider,
-            effective_branch,
-            info,
-            &state.storage,
-            ExactResultKind::Full,
-            private,
-            "no-op",
-        );
-        return (StatusCode::OK, Json(resp)).into_response();
-    }
-
     let admitted_branch = effective_branch.clone();
-    let prior_size_bytes = loaded_exact.as_ref().and_then(|info| {
-        let bytes = crate::queue::prior_clonepack_bytes(info);
-        (bytes > 0).then_some(bytes)
-    });
-    let size_bytes =
-        crate::queue::resolve_job_size_bytes(prior_size_bytes, added_repo.repo_size_bytes);
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit: commit.clone(),
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential,
-        size_bytes,
-    };
-    let outcome = match enqueue_admitted_build(&state, job).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
+    match admit_commit(&state, &repo_id, &commit, loaded_exact, move || {
+        Ok(credential)
+    })
+    .await
+    {
+        Admission::Complete(info) => {
+            state.metrics.record_sync(start.elapsed());
+            let resp = sync_response_without_storage_read(
+                &repo_id,
+                &provider,
+                effective_branch,
+                &info,
+                &state.storage,
+                ExactResultKind::Full,
+                private,
+                "no-op",
+            );
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Admission::Enqueued(outcome) => (
+            StatusCode::ACCEPTED,
+            Json(BuildResponse {
+                status: match outcome {
+                    EnqueueOutcome::Enqueued => "queued",
+                    EnqueueOutcome::Coalesced => "coalesced",
+                    EnqueueOutcome::Full => "full",
+                }
+                .to_string(),
+                // Admission is complete once enqueue returns. This process-local
+                // counter is an informational hint and never performs a second
+                // database operation after durable acceptance.
+                queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
+                commit,
+                branch: admitted_branch,
+            }),
+        )
+            .into_response(),
+        Admission::Error(error) => {
             state.metrics.record_error();
-            return (
+            (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse { error }),
             )
-                .into_response();
+                .into_response()
         }
-    };
-    (
-        StatusCode::ACCEPTED,
-        Json(BuildResponse {
-            status: match outcome {
-                EnqueueOutcome::Enqueued => "queued",
-                EnqueueOutcome::Coalesced => "coalesced",
-                EnqueueOutcome::Full => "full",
-            }
-            .to_string(),
-            // Admission is complete once enqueue returns. This process-local
-            // counter is an informational hint and never performs a second
-            // database operation after durable acceptance.
-            queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
-            commit,
-            branch: admitted_branch,
-        }),
-    )
-        .into_response()
+    }
 }
 
 /// First-class exact-revision sync used by `sync --at REV`.
@@ -4330,51 +4304,42 @@ async fn sync_repo_at_revision(
 
     // A retry resolves entirely from the local mirror and exact result row. An
     // explicit sync is a no-op only when every stored result is present.
-    {
-        let commit = at_rev.clone();
-        match state.ref_store.load_result(&repo_id, &commit).await {
-            Ok(Some(info)) if exact_result_complete(&info, &commit) => {
-                state.metrics.record_sync(start.elapsed());
-                let response = sync_response_without_storage_read(
-                    &repo_id,
-                    &provider,
-                    branch.clone(),
-                    &info,
-                    &state.storage,
-                    ExactResultKind::Full,
-                    private,
-                    "no-op",
-                );
-                return (StatusCode::OK, Json(response)).into_response();
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {}
-            Err(error) => {
-                state.metrics.record_error();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("exact revision lookup failed: {error:#}"),
-                    }),
-                )
-                    .into_response();
-            }
+    let loaded = match state.ref_store.load_result(&repo_id, &at_rev).await {
+        Ok(Some(info)) if exact_result_complete(&info, &at_rev) => {
+            state.metrics.record_sync(start.elapsed());
+            let response = sync_response_without_storage_read(
+                &repo_id,
+                &provider,
+                branch.clone(),
+                &info,
+                &state.storage,
+                ExactResultKind::Full,
+                private,
+                "no-op",
+            );
+            return (StatusCode::OK, Json(response)).into_response();
         }
-    }
+        Ok(loaded) => loaded,
+        Err(error) => {
+            state.metrics.record_error();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("exact revision lookup failed: {error:#}"),
+                }),
+            )
+                .into_response();
+        }
+    };
 
     // Exact revisions use the same immutable `(repository, admitted commit)`
     // lane as ordinary requests; checkout names are never queue identity.
-    let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&at_rev)).await;
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit: at_rev.clone(),
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential,
-        size_bytes,
-    };
-    match enqueue_admitted_build(&state, job).await {
-        Ok(_) => artifact_pending_response(&at_rev, &branch, state.build_queue.depth().await).await,
-        Err(error) => {
+    match admit_commit(&state, &repo_id, &at_rev, loaded, move || Ok(credential)).await {
+        Admission::Complete(_) => unreachable!("caller already filtered complete results"),
+        Admission::Enqueued(_) => {
+            artifact_pending_response(&at_rev, &branch, state.build_queue.depth().await).await
+        }
+        Admission::Error(error) => {
             state.metrics.record_error();
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -4475,32 +4440,6 @@ async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Respons
     (StatusCode::NO_CONTENT, Body::empty()).into_response()
 }
 
-/// Byte size for size-class classification at enqueue. Prefers re-sync data
-/// (prior clonepack byte total already on the ref) over the tiered-add preflight
-/// repo size stored on [`AddedRepo`]. Unknown → `None` → largest class. No new
-/// API calls here — both signals are data already in hand.
-async fn enqueue_size_bytes(
-    state: &ServerState,
-    repo_id: &RepoId,
-    commit: Option<&str>,
-) -> Option<u64> {
-    let prior = match commit {
-        Some(commit) => match state.ref_store.load_result(repo_id, commit).await {
-            Ok(Some(info)) => {
-                let bytes = crate::queue::prior_clonepack_bytes(&info);
-                (bytes > 0).then_some(bytes)
-            }
-            _ => None,
-        },
-        None => None,
-    };
-    let preflight = match state.ref_store.load_added_repo(repo_id).await {
-        Ok(Some(added)) => added.repo_size_bytes,
-        _ => None,
-    };
-    crate::queue::resolve_job_size_bytes(prior, preflight)
-}
-
 /// Tiered-add preflight: best-effort GitHub `repo.size` (KB → bytes). Used to
 /// classify the first build without a prior clonepack. Failures return `None`
 /// (first build maps to largest class) — never fail the add.
@@ -4561,6 +4500,64 @@ async fn preflight_repo_size_bytes(
 /// GitHub's `repo.size` field is kilobytes; convert to bytes for classification.
 fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
     size_kb.saturating_mul(1024)
+}
+
+/// Outcome of [`admit_commit`]: the exact result at the admitted commit was
+/// already complete, the build was enqueued (or folded into one already
+/// running), or admission failed with a caller-facing message.
+enum Admission {
+    Complete(RefInfo),
+    Enqueued(EnqueueOutcome),
+    Error(String),
+}
+
+/// Admission core shared by every entry point that admits an exact commit for
+/// a build: ordinary `sync`, `sync --at`, the exact-ref lookup's enqueue
+/// tail, and the build trigger. Selector resolution differs per caller and
+/// stays there. Each caller also loads `loaded` itself, since it already
+/// needs that row for its own readiness check and keeps its own
+/// lookup-failure message; `admit_commit` only reuses it for the completeness
+/// and size-class checks. `credential` is called lazily so a caller that can
+/// skip the fetch on an already-complete commit does.
+async fn admit_commit<F>(
+    state: &ServerState,
+    repo_id: &RepoId,
+    commit: &str,
+    loaded: Option<RefInfo>,
+    credential: F,
+) -> Admission
+where
+    F: FnOnce() -> Result<Option<secrecy::SecretString>, String>,
+{
+    if let Some(info) = &loaded
+        && exact_result_complete(info, commit)
+    {
+        return Admission::Complete(loaded.expect("checked Some above"));
+    }
+    let credential = match credential() {
+        Ok(credential) => credential,
+        Err(error) => return Admission::Error(error),
+    };
+    let prior_size_bytes = loaded.as_ref().and_then(|info| {
+        let bytes = crate::queue::prior_clonepack_bytes(info);
+        (bytes > 0).then_some(bytes)
+    });
+    let preflight_size_bytes = match state.ref_store.load_added_repo(repo_id).await {
+        Ok(Some(added)) => added.repo_size_bytes,
+        _ => None,
+    };
+    let size_bytes = crate::queue::resolve_job_size_bytes(prior_size_bytes, preflight_size_bytes);
+    let job = BuildJob {
+        repo_id: repo_id.clone(),
+        admitted_commit: commit.to_string(),
+        repo_config: crate::repo_config::RepoConfig::default(),
+        credential,
+        size_bytes,
+    };
+    match enqueue_admitted_build(state, job).await {
+        Ok(outcome) => Admission::Enqueued(outcome),
+        Err(error) => Admission::Error(error),
+    }
 }
 
 /// Admit one exact ordinary-tip job. The local marker spans the whole
@@ -4699,28 +4696,22 @@ async fn trigger_build(
         .load_result(repo_id, &admitted_commit)
         .await
         .map_err(|e| format!("exact result lookup failed: {e}"))?;
-    if let Some(info) = existing
-        && exact_result_complete(&info, &admitted_commit)
+    // A signed replay/poller wakeup for a branch that already serves this
+    // exact full commit is a read-only no-op. Do not fetch credentials or
+    // touch the queue merely because the trusted trigger was repeated:
+    // `admit_commit` only calls `credential` once it knows enqueue is needed.
+    match admit_commit(state, repo_id, &admitted_commit, existing, || {
+        state
+            .broker
+            .fetch_credential(repo_id, None)
+            .map_err(|e| e.to_string())
+    })
+    .await
     {
-        // A signed replay/poller wakeup for a branch that already serves this
-        // exact full commit is a read-only no-op. Do not fetch credentials or
-        // touch the queue merely because the trusted trigger was repeated.
-        return Ok(EnqueueOutcome::Coalesced);
+        Admission::Complete(_) => Ok(EnqueueOutcome::Coalesced),
+        Admission::Enqueued(outcome) => Ok(outcome),
+        Admission::Error(error) => Err(error),
     }
-    let credential = state
-        .broker
-        .fetch_credential(repo_id, None)
-        .map_err(|e| e.to_string())?;
-    let size_bytes = enqueue_size_bytes(state, repo_id, Some(&admitted_commit)).await;
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit,
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential,
-        size_bytes,
-    };
-
-    enqueue_admitted_build(state, job).await
 }
 
 /// Legacy branch selectors are parsed only so they can fail closed without
