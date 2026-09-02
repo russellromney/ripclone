@@ -744,7 +744,6 @@ async fn start_server_split_storage_inner(
         build_queue,
         control_db: Some(control_db),
         worker_queue: Some(durable_queue.clone()),
-        build_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         oidc_verifier: None,
         webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
         sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

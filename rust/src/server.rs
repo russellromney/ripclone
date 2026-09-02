@@ -825,7 +825,6 @@ pub struct ServerState {
     /// worker never touches the database. `None` only in a worker's non-serving
     /// `ServerState`.
     pub worker_queue: Option<Arc<crate::queue::SqlJobQueue>>,
-    pub build_queue_depth: Arc<AtomicUsize>,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     /// Webhook receiver config: per-provider HMAC secret + optional repo
     /// allowlist. A provider with no configured secret returns 503. Reads
@@ -887,7 +886,6 @@ impl ServerState {
             control_db: None,
             // A worker never serves the farm-out endpoints itself.
             worker_queue: None,
-            build_queue_depth: Arc::new(AtomicUsize::new(0)),
             oidc_verifier: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
@@ -3609,7 +3607,7 @@ async fn get_ref_inner(
             return artifact_pending_response_with_top_up(
                 &commit,
                 &checkout_name,
-                state.build_queue_depth.load(Ordering::Relaxed),
+                state.build_queue.depth().await,
                 Some(true),
                 base,
             )
@@ -3626,7 +3624,7 @@ async fn get_ref_inner(
             artifact_pending_response(
                 &commit,
                 &checkout_name,
-                state.build_queue_depth.load(Ordering::Relaxed),
+                state.build_queue.depth().await,
             )
             .await
         }
@@ -4182,10 +4180,10 @@ async fn sync_repo_inner(
                     EnqueueOutcome::Full => "full",
                 }
                 .to_string(),
-                // Admission is complete once enqueue returns. This process-local
-                // counter is an informational hint and never performs a second
-                // database operation after durable acceptance.
-                queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
+                // Admission is complete once enqueue returns; this is a read of
+                // the real queue depth for the client's information, one extra
+                // DB read after durable acceptance.
+                queue_depth: state.build_queue.depth().await,
                 commit,
                 branch: admitted_branch,
             }),
@@ -4979,7 +4977,7 @@ async fn build_handler(
                     EnqueueOutcome::Full => "full",
                 }
                 .to_string(),
-                queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
+                queue_depth: state.build_queue.depth().await,
                 commit: tip.commit,
                 branch: admitted_branch,
             }),
@@ -7909,7 +7907,6 @@ async fn run_server_with_barrier_at_control(
         build_queue,
         control_db: Some(control_db),
         worker_queue: Some(worker_queue.clone()),
-        build_queue_depth: Arc::new(AtomicUsize::new(0)),
         oidc_verifier,
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -8416,7 +8413,6 @@ mod tests {
             build_queue,
             control_db: None,
             worker_queue: None,
-            build_queue_depth: Arc::new(AtomicUsize::new(0)),
             oidc_verifier: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
@@ -9336,11 +9332,11 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn ordinary_http_returns_after_enqueue_without_querying_queue_depth() {
-        struct DepthMustNotRunQueue;
+    async fn ordinary_http_response_reports_real_queue_depth() {
+        struct FixedDepthQueue;
 
         #[async_trait::async_trait]
-        impl crate::queue::JobQueue for DepthMustNotRunQueue {
+        impl crate::queue::JobQueue for FixedDepthQueue {
             async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
                 Ok(crate::queue::Enqueued {
                     outcome: EnqueueOutcome::Enqueued,
@@ -9349,7 +9345,7 @@ mod tests {
             }
 
             async fn depth(&self) -> usize {
-                std::future::pending().await
+                3
             }
         }
 
@@ -9364,7 +9360,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        state.build_queue = Arc::new(DepthMustNotRunQueue);
+        state.build_queue = Arc::new(FixedDepthQueue);
         let repo_id = RepoId::github("acme/accepted");
         mark_added(&state, repo_id).await;
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
@@ -9376,7 +9372,7 @@ mod tests {
             )),
         )
         .await
-        .expect("accepted response must not wait for queue depth")
+        .expect("accepted response must complete")
         .unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
@@ -9386,6 +9382,7 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["commit"], commit);
+        assert_eq!(body["queue_depth"], 3);
     }
 
     #[tokio::test]
