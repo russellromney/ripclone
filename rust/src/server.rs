@@ -9252,22 +9252,6 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ordinary_http_response_reports_real_queue_depth() {
-        struct FixedDepthQueue;
-
-        #[async_trait::async_trait]
-        impl crate::queue::JobQueue for FixedDepthQueue {
-            async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
-                Ok(crate::queue::Enqueued {
-                    outcome: EnqueueOutcome::Enqueued,
-                    job_id: Some(1),
-                })
-            }
-
-            async fn depth(&self) -> usize {
-                3
-            }
-        }
-
         let _env = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -9278,14 +9262,33 @@ mod tests {
         let commit = crate::test_fixture::commit(&origin, &[("README.md", b"accepted")]);
 
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        state.build_queue = Arc::new(FixedDepthQueue);
+        let state = test_state_with_control(&tmp).await;
         let repo_id = RepoId::github("acme/accepted");
-        mark_added(&state, repo_id).await;
+        mark_added(&state, repo_id.clone()).await;
+
+        // Pre-admit two unrelated jobs so the queue already holds 2 entries;
+        // the accepted request below admits a 3rd, so the response reports a
+        // real depth of 3.
+        let control = state.control_db.as_ref().unwrap();
+        for i in 0..2 {
+            let filler = BuildJob {
+                repo_id: RepoId::github(format!("acme/filler-{i}")),
+                admitted_commit: "f".repeat(40),
+                repo_config: Default::default(),
+                credential: None,
+                size_bytes: None,
+            };
+            let pending = pending_exact_result(&filler);
+            control
+                .admit_exact_and_job(&filler, &pending)
+                .await
+                .unwrap();
+        }
+
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
         let response = tokio::time::timeout(
             Duration::from_secs(2),
-            build_app(state).oneshot(test_request(
+            build_app(state.clone()).oneshot(test_request(
                 "POST",
                 "/v1/repos/github/acme/accepted/sync?branch=main",
             )),
@@ -10867,13 +10870,23 @@ mod tests {
         .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
+        let state = test_state_with_control(&tmp).await;
         let ref_store = state.ref_store.clone();
         let rid = RepoId::github("acme/nope");
         let commit = "b".repeat(40);
-        ref_store
-            .save_result(
-                &rid,
+        // A real claimed job, not a hardcoded job_id: the handler now always
+        // authorizes a claimed result write against ControlDb's jobs table.
+        let control = state.control_db.as_ref().unwrap();
+        let job = BuildJob {
+            repo_id: rid.clone(),
+            admitted_commit: commit.clone(),
+            repo_config: crate::repo_config::RepoConfig::default(),
+            credential: None,
+            size_bytes: None,
+        };
+        control
+            .admit_exact_and_job(
+                &job,
                 &RefInfo {
                     commit: commit.clone(),
                     ..Default::default()
@@ -10881,6 +10894,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let claimed = control
+            .queue()
+            .claim("test-worker")
+            .await
+            .unwrap()
+            .expect("job just admitted must be claimable");
+        let job_id = claimed.id;
         let storage = state.storage.clone();
         let app = build_app(state);
 
@@ -10891,7 +10911,7 @@ mod tests {
         put_report_manifest(&storage, &commit, &mut head.clonepack, &[], &[]);
         let body = serde_json::json!({
             "op": "publish_head",
-            "job_id": 1,
+            "job_id": job_id,
             "worker_id": "test-worker",
             "repo_key": repo_key,
             "commit": commit,
