@@ -1990,8 +1990,12 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
     let interrupt = controls.path().join("interrupt");
     let audit = controls.path().join("download-audit.log");
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
-    let _private_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", "1");
-    let _public_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
+    // Keep enough lifetime on the refreshed URL set for the remaining local
+    // MinIO transfers. A one-second TTL can expire twice at a wall-clock second
+    // boundary on a loaded CI runner, which proves repeated refresh rather than
+    // the intended one-refresh/reuse behavior.
+    let _private_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", "5");
+    let _public_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_SECS", "5");
     let _backoff = ScopedEnvVar::set("RIPCLONE_FETCH_BACKOFF_MS", "0");
     let probe = Arc::new(ripclone::server::AdmissionTestProbe::default());
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
@@ -2114,7 +2118,7 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .len();
-    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    tokio::time::sleep(Duration::from_millis(6_200)).await;
     std::fs::write(interrupt.join("proceed"), b"retry expired URL\n").unwrap();
 
     let outcome = tokio::time::timeout(Duration::from_secs(60), install)
@@ -2268,7 +2272,7 @@ signed_requests_without_ripclone_auth={}",
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(pause.join("entered").exists(), "archive chunk paused");
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        tokio::time::sleep(Duration::from_millis(6_200)).await;
         let trace_start = probe
             .http_trace
             .lock()
@@ -2384,7 +2388,7 @@ signed_requests_without_ripclone_auth={}",
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(pause.join("entered").exists(), "head pack paused");
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        tokio::time::sleep(Duration::from_millis(6_200)).await;
         let trace_start = probe
             .http_trace
             .lock()
@@ -2495,7 +2499,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
         .parse::<u64>()
         .expect("revoked interruption offset");
     probe.deny_repo_reads();
-    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    tokio::time::sleep(Duration::from_millis(6_200)).await;
     std::fs::write(
         revoked_interrupt.join("proceed"),
         b"retry after revocation\n",
@@ -2670,7 +2674,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .len();
-    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    tokio::time::sleep(Duration::from_millis(6_200)).await;
     std::fs::write(
         topup_interrupt.join("proceed"),
         b"refresh immutable A after Full(B) became ready\n",
