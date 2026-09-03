@@ -3238,37 +3238,27 @@ fn ref_response_from_manifest(
             return None;
         }
     }
-    let ttl = ref_signed_url_ttl(private);
-    let signed = |hash: &str| signed_url(storage, ttl, hash);
-    let signed_list = |hashes: &[String]| {
-        let urls = hashes.iter().map(|hash| signed(hash)).collect::<Vec<_>>();
-        (!urls.iter().all(Option::is_none)).then_some(urls)
-    };
-    let (owner, repo) = repo_id
-        .github_owner_repo()
-        .map(|(owner, repo)| (owner.to_string(), repo.to_string()))
-        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
-    Some(RefResponse {
-        owner,
-        repo,
-        provider: provider.id.as_str().to_string(),
-        host: provider.host.clone(),
-        origin_url: provider.clone_url(&repo_id.path),
-        branch,
+    let artifacts = ResponseArtifacts {
         commit: manifest.commit.clone(),
         parent_commit: manifest.parent_commit.clone(),
-        clonepack_manifest: manifest_hash.to_string(),
-        clonepack_manifest_url: signed(manifest_hash),
-        metadata_chunk_url: signed(&metadata_chunk),
+        manifest: manifest_hash.to_string(),
         metadata_chunk,
-        archive_chunk_urls: signed_list(&archive_hashes),
-        head_blobs_chunk_urls: signed_list(&head_blob_hashes),
-        head_blobs_idx_url: head_blobs_idx.as_deref().and_then(signed),
-        pack_chunk_urls: signed_list(&pack_hashes),
-        midx_url: midx.as_deref().and_then(signed),
-        idx_bundle_url: signed(&idx_bundle),
-        result: ExactResultKind::Full,
-    })
+        archive_chunks: archive_hashes,
+        head_blobs_chunks: head_blob_hashes,
+        head_blobs_idx,
+        packs: pack_hashes,
+        midx: midx.unwrap_or_default(),
+        idx_bundle,
+    };
+    Some(build_ref_response(
+        repo_id,
+        provider,
+        branch,
+        &artifacts,
+        storage,
+        ExactResultKind::Full,
+        private,
+    ))
 }
 
 async fn carried_full_top_up_response(
@@ -3628,33 +3618,39 @@ async fn get_ref_inner(
         return artifact_pending_response(&commit, &checkout_name, 0).await;
     }
 
-    let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&commit)).await;
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit: commit.clone(),
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential: credential.clone(),
-        size_bytes,
-    };
-    if let Err(error) = enqueue_admitted_build(&state, job).await {
-        state.metrics.record_error();
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ExactRevisionUnavailableResponse {
-                error,
-                commit,
-                branch: checkout_name,
-            }),
-        )
-            .into_response();
+    match admit_commit(&state, &repo_id, &commit, existing, move || Ok(credential)).await {
+        // Not ready for the requested kind above implies not complete for every
+        // kind, and the core only reads the `existing` row handed to it.
+        Admission::Complete(_) => unreachable!("caller already filtered complete results"),
+        Admission::Enqueued(_) => {
+            artifact_pending_response(
+                &commit,
+                &checkout_name,
+                state.build_queue_depth.load(Ordering::Relaxed),
+            )
+            .await
+        }
+        Admission::Error(error) => exact_unavailable_response(&state, error, commit, checkout_name),
     }
+}
 
-    artifact_pending_response(
-        &commit,
-        &checkout_name,
-        state.build_queue_depth.load(Ordering::Relaxed),
+/// Enqueue failure for an exact-revision request: the queue is unavailable.
+fn exact_unavailable_response(
+    state: &ServerState,
+    error: String,
+    commit: String,
+    branch: String,
+) -> Response {
+    state.metrics.record_error();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ExactRevisionUnavailableResponse {
+            error,
+            commit,
+            branch,
+        }),
     )
-    .await
+        .into_response()
 }
 
 const REF_SIGNED_URL_TTL_PUBLIC_SECS: u64 = 1200;
@@ -3681,6 +3677,75 @@ fn ref_signed_url_ttl(private: bool) -> Duration {
     }
 }
 
+/// Artifact hashes needed to build one [`RefResponse`], independent of
+/// whether they came from a loaded `RefInfo` or from decoded manifest bytes
+/// (the top-up path).
+struct ResponseArtifacts {
+    commit: String,
+    parent_commit: Option<String>,
+    manifest: String,
+    metadata_chunk: String,
+    archive_chunks: Vec<String>,
+    head_blobs_chunks: Vec<String>,
+    head_blobs_idx: Option<String>,
+    packs: Vec<String>,
+    midx: String,
+    idx_bundle: String,
+}
+
+/// Sign and order the URLs for one ref response. Shared by every builder:
+/// each caller extracts a [`ResponseArtifacts`] from its own source (a
+/// `RefInfo`, or a decoded manifest) and hands it here.
+fn build_ref_response(
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    branch: String,
+    artifacts: &ResponseArtifacts,
+    storage: &crate::storage::StorageRef,
+    result: ExactResultKind,
+    private: bool,
+) -> RefResponse {
+    let ttl = ref_signed_url_ttl(private);
+    let signed = |hash: &str| signed_url(storage, ttl, hash);
+    // `None` entries (e.g. local backend) fall back to the gateway. Ordered
+    // to match the manifest's own chunk/pack lists.
+    let signed_list = |hashes: &[String]| -> Option<Vec<Option<String>>> {
+        if hashes.is_empty() {
+            return None;
+        }
+        let urls: Vec<Option<String>> = hashes.iter().map(|hash| signed(hash)).collect();
+        (!urls.iter().all(Option::is_none)).then_some(urls)
+    };
+    let (owner, repo) = repo_id
+        .github_owner_repo()
+        .map(|(o, r)| (o.to_string(), r.to_string()))
+        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+    RefResponse {
+        owner,
+        repo,
+        provider: provider.id.as_str().to_string(),
+        host: provider.host.clone(),
+        origin_url: provider.clone_url(&repo_id.path),
+        branch,
+        commit: artifacts.commit.clone(),
+        parent_commit: artifacts.parent_commit.clone(),
+        clonepack_manifest: artifacts.manifest.clone(),
+        clonepack_manifest_url: signed(&artifacts.manifest),
+        metadata_chunk: artifacts.metadata_chunk.clone(),
+        metadata_chunk_url: signed(&artifacts.metadata_chunk),
+        archive_chunk_urls: signed_list(&artifacts.archive_chunks),
+        head_blobs_chunk_urls: signed_list(&artifacts.head_blobs_chunks),
+        head_blobs_idx_url: artifacts.head_blobs_idx.as_deref().and_then(signed),
+        pack_chunk_urls: signed_list(&artifacts.packs),
+        // Sign the pre-built MIDX for the selected variant so the client
+        // installs it directly instead of running `git multi-pack-index
+        // write`, and the idx bundle so the client fetches all idx in one GET.
+        midx_url: signed(&artifacts.midx),
+        idx_bundle_url: signed(&artifacts.idx_bundle),
+        result,
+    }
+}
+
 fn ref_response(
     repo_id: &RepoId,
     provider: &ProviderInstance,
@@ -3690,95 +3755,47 @@ fn ref_response(
     result: ExactResultKind,
     private: bool,
 ) -> RefResponse {
-    let ttl = ref_signed_url_ttl(private);
     let artifacts = exact_result_clonepack(info, result)
         .expect("requested exact result is ready before response construction");
-    let clonepack_manifest = artifacts.manifest.clone();
-    let metadata_chunk = artifacts.metadata_chunk.clone();
-
-    let clonepack_manifest_url = signed_url(storage, ttl, &clonepack_manifest);
-    let metadata_chunk_url = signed_url(storage, ttl, &metadata_chunk);
     let archive_chunks = info
         .files
         .as_ref()
         .filter(|_| result == ExactResultKind::Files)
-        .map(|files| files.archive_chunks.as_slice())
+        .map(|files| files.archive_chunks.clone())
         .unwrap_or_default();
-    let archive_chunk_urls = if archive_chunks.is_empty() {
-        None
-    } else {
-        let urls: Vec<Option<String>> = archive_chunks
-            .iter()
-            .map(|h| signed_url(storage, ttl, h))
-            .collect();
-        if urls.iter().all(|u| u.is_none()) {
-            None
-        } else {
-            Some(urls)
-        }
-    };
-
-    let head_blobs_chunk_urls = None;
-    let head_blobs_idx_url = None;
-
-    // Sign each editable pack so the client fetches it straight from
-    // object storage. `None` entries (e.g. local backend) fall back to the
-    // gateway. Ordered to match the manifest's `packs` list.
     let packs = match result {
         ExactResultKind::Head => info.head.as_ref().map(|head| head.packs.as_slice()),
         ExactResultKind::Full => info.full.as_ref().map(|full| full.packs.as_slice()),
         ExactResultKind::Files => None,
     }
-    .unwrap_or_default();
-    let pack_chunk_urls = if packs.is_empty() {
-        None
-    } else {
-        let packs: Vec<Option<String>> = packs
-            .iter()
-            .map(|p| signed_url(storage, ttl, &p.pack))
-            .collect();
-        if packs.iter().all(Option::is_none) {
-            None
-        } else {
-            Some(packs)
-        }
-    };
-
-    // Sign the pre-built MIDX for the selected variant so the client installs it
-    // directly instead of running `git multi-pack-index write`.
-    let midx_url = signed_url(storage, ttl, &artifacts.midx);
-    // Sign the idx bundle so the client fetches all idx in one GET.
-    let idx_bundle_url = signed_url(storage, ttl, &artifacts.idx_bundle);
-
-    let (owner, repo) = repo_id
-        .github_owner_repo()
-        .map(|(o, r)| (o.to_string(), r.to_string()))
-        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
-    let origin_url = provider.clone_url(&repo_id.path);
-    RefResponse {
-        owner,
-        repo,
-        provider: provider.id.as_str().to_string(),
-        host: provider.host.clone(),
-        origin_url,
-        branch,
+    .unwrap_or_default()
+    .iter()
+    .map(|p| p.pack.clone())
+    .collect();
+    let response_artifacts = ResponseArtifacts {
         commit: artifacts.commit.clone(),
         parent_commit: info
             .head
             .as_ref()
             .and_then(|head| head.parent_commit.clone()),
-        clonepack_manifest,
-        clonepack_manifest_url,
-        metadata_chunk,
-        metadata_chunk_url,
-        archive_chunk_urls,
-        head_blobs_chunk_urls,
-        head_blobs_idx_url,
-        pack_chunk_urls,
-        midx_url,
-        idx_bundle_url,
+        manifest: artifacts.manifest.clone(),
+        metadata_chunk: artifacts.metadata_chunk.clone(),
+        archive_chunks,
+        head_blobs_chunks: Vec::new(),
+        head_blobs_idx: None,
+        packs,
+        midx: artifacts.midx.clone(),
+        idx_bundle: artifacts.idx_bundle.clone(),
+    };
+    build_ref_response(
+        repo_id,
+        provider,
+        branch,
+        &response_artifacts,
+        storage,
         result,
-    }
+        private,
+    )
 }
 
 /// Ready admission response. Signing already-known object URLs does not read
@@ -4055,19 +4072,11 @@ async fn sync_repo_inner(
     if params.rev.is_some() {
         return sync_repo_at_revision(repo_id, provider, params, headers, state).await;
     }
-    let added_repo = match state.ref_store.load_added_repo(&repo_id).await {
-        Ok(Some(added)) => added,
-        Ok(None) => return repo_not_added_response(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("added repo lookup failed: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
+    match repo_is_added(&state, &repo_id).await {
+        Ok(true) => {}
+        Ok(false) => return repo_not_added_response(),
+        Err(resp) => return resp,
+    }
 
     let request_token = upstream_token_from_headers(&headers);
     let credential = match state
@@ -4144,67 +4153,53 @@ async fn sync_repo_inner(
                 .into_response();
         }
     };
-    let ready = loaded_exact
-        .as_ref()
-        .filter(|info| exact_result_complete(info, &commit));
-    if let Some(info) = ready {
-        state.metrics.record_sync(start.elapsed());
-        let resp = sync_response_without_storage_read(
-            &repo_id,
-            &provider,
-            effective_branch,
-            info,
-            &state.storage,
-            ExactResultKind::Full,
-            private,
-            "no-op",
-        );
-        return (StatusCode::OK, Json(resp)).into_response();
-    }
-
     let admitted_branch = effective_branch.clone();
-    let prior_size_bytes = loaded_exact.as_ref().and_then(|info| {
-        let bytes = crate::queue::prior_clonepack_bytes(info);
-        (bytes > 0).then_some(bytes)
-    });
-    let size_bytes =
-        crate::queue::resolve_job_size_bytes(prior_size_bytes, added_repo.repo_size_bytes);
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit: commit.clone(),
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential,
-        size_bytes,
-    };
-    let outcome = match enqueue_admitted_build(&state, job).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
+    match admit_commit(&state, &repo_id, &commit, loaded_exact, move || {
+        Ok(credential)
+    })
+    .await
+    {
+        Admission::Complete(info) => {
+            state.metrics.record_sync(start.elapsed());
+            let resp = sync_response_without_storage_read(
+                &repo_id,
+                &provider,
+                effective_branch,
+                &info,
+                &state.storage,
+                ExactResultKind::Full,
+                private,
+                "no-op",
+            );
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Admission::Enqueued(outcome) => (
+            StatusCode::ACCEPTED,
+            Json(BuildResponse {
+                status: match outcome {
+                    EnqueueOutcome::Enqueued => "queued",
+                    EnqueueOutcome::Coalesced => "coalesced",
+                    EnqueueOutcome::Full => "full",
+                }
+                .to_string(),
+                // Admission is complete once enqueue returns. This process-local
+                // counter is an informational hint and never performs a second
+                // database operation after durable acceptance.
+                queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
+                commit,
+                branch: admitted_branch,
+            }),
+        )
+            .into_response(),
+        Admission::Error(error) => {
             state.metrics.record_error();
-            return (
+            (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse { error }),
             )
-                .into_response();
+                .into_response()
         }
-    };
-    (
-        StatusCode::ACCEPTED,
-        Json(BuildResponse {
-            status: match outcome {
-                EnqueueOutcome::Enqueued => "queued",
-                EnqueueOutcome::Coalesced => "coalesced",
-                EnqueueOutcome::Full => "full",
-            }
-            .to_string(),
-            // Admission is complete once enqueue returns. This process-local
-            // counter is an informational hint and never performs a second
-            // database operation after durable acceptance.
-            queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
-            commit,
-            branch: admitted_branch,
-        }),
-    )
-        .into_response()
+    }
 }
 
 /// First-class exact-revision sync used by `sync --at REV`.
@@ -4328,64 +4323,43 @@ async fn sync_repo_at_revision(
     };
     let at_rev = selected_commit;
 
-    // A retry resolves entirely from the local mirror and exact result row. An
-    // explicit sync is a no-op only when every stored result is present.
-    {
-        let commit = at_rev.clone();
-        match state.ref_store.load_result(&repo_id, &commit).await {
-            Ok(Some(info)) if exact_result_complete(&info, &commit) => {
-                state.metrics.record_sync(start.elapsed());
-                let response = sync_response_without_storage_read(
-                    &repo_id,
-                    &provider,
-                    branch.clone(),
-                    &info,
-                    &state.storage,
-                    ExactResultKind::Full,
-                    private,
-                    "no-op",
-                );
-                return (StatusCode::OK, Json(response)).into_response();
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {}
-            Err(error) => {
-                state.metrics.record_error();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("exact revision lookup failed: {error:#}"),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // Exact revisions use the same immutable `(repository, admitted commit)`
-    // lane as ordinary requests; checkout names are never queue identity.
-    let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&at_rev)).await;
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit: at_rev.clone(),
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential,
-        size_bytes,
-    };
-    match enqueue_admitted_build(&state, job).await {
-        Ok(_) => artifact_pending_response(&at_rev, &branch, state.build_queue.depth().await).await,
+    // A retry resolves entirely from the local mirror and exact result row.
+    let loaded = match state.ref_store.load_result(&repo_id, &at_rev).await {
+        Ok(loaded) => loaded,
         Err(error) => {
             state.metrics.record_error();
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ExactRevisionUnavailableResponse {
-                    error,
-                    commit: at_rev,
-                    branch,
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("exact revision lookup failed: {error:#}"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
+    };
+
+    // Exact revisions use the same immutable `(repository, admitted commit)`
+    // lane as ordinary requests; checkout names are never queue identity. An
+    // explicit sync is a no-op only when every stored result is present.
+    match admit_commit(&state, &repo_id, &at_rev, loaded, move || Ok(credential)).await {
+        Admission::Complete(info) => {
+            state.metrics.record_sync(start.elapsed());
+            let response = sync_response_without_storage_read(
+                &repo_id,
+                &provider,
+                branch,
+                &info,
+                &state.storage,
+                ExactResultKind::Full,
+                private,
+                "no-op",
+            );
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Admission::Enqueued(_) => {
+            artifact_pending_response(&at_rev, &branch, state.build_queue.depth().await).await
+        }
+        Admission::Error(error) => exact_unavailable_response(&state, error, at_rev, branch),
     }
 }
 
@@ -4475,32 +4449,6 @@ async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Respons
     (StatusCode::NO_CONTENT, Body::empty()).into_response()
 }
 
-/// Byte size for size-class classification at enqueue. Prefers re-sync data
-/// (prior clonepack byte total already on the ref) over the tiered-add preflight
-/// repo size stored on [`AddedRepo`]. Unknown → `None` → largest class. No new
-/// API calls here — both signals are data already in hand.
-async fn enqueue_size_bytes(
-    state: &ServerState,
-    repo_id: &RepoId,
-    commit: Option<&str>,
-) -> Option<u64> {
-    let prior = match commit {
-        Some(commit) => match state.ref_store.load_result(repo_id, commit).await {
-            Ok(Some(info)) => {
-                let bytes = crate::queue::prior_clonepack_bytes(&info);
-                (bytes > 0).then_some(bytes)
-            }
-            _ => None,
-        },
-        None => None,
-    };
-    let preflight = match state.ref_store.load_added_repo(repo_id).await {
-        Ok(Some(added)) => added.repo_size_bytes,
-        _ => None,
-    };
-    crate::queue::resolve_job_size_bytes(prior, preflight)
-}
-
 /// Tiered-add preflight: best-effort GitHub `repo.size` (KB → bytes). Used to
 /// classify the first build without a prior clonepack. Failures return `None`
 /// (first build maps to largest class) — never fail the add.
@@ -4561,6 +4509,60 @@ async fn preflight_repo_size_bytes(
 /// GitHub's `repo.size` field is kilobytes; convert to bytes for classification.
 fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
     size_kb.saturating_mul(1024)
+}
+
+/// Outcome of [`admit_commit`]: already complete, enqueued, or an error.
+enum Admission {
+    Complete(Box<RefInfo>),
+    Enqueued(EnqueueOutcome),
+    Error(String),
+}
+
+/// Admission core shared by `sync`, `sync --at`, the exact-ref lookup's
+/// enqueue tail, and the build trigger. Selector resolution stays with the
+/// caller (it differs per entry point); the caller also loads `loaded`
+/// itself, since it already needs that row for its own readiness check and
+/// keeps its own lookup-failure message. `credential` is called lazily so a
+/// caller that can skip the fetch on an already-complete commit does.
+async fn admit_commit<F>(
+    state: &ServerState,
+    repo_id: &RepoId,
+    commit: &str,
+    loaded: Option<RefInfo>,
+    credential: F,
+) -> Admission
+where
+    F: FnOnce() -> Result<Option<secrecy::SecretString>, String>,
+{
+    if let Some(info) = &loaded
+        && exact_result_complete(info, commit)
+    {
+        return Admission::Complete(Box::new(loaded.expect("checked Some above")));
+    }
+    let credential = match credential() {
+        Ok(credential) => credential,
+        Err(error) => return Admission::Error(error),
+    };
+    let prior_size_bytes = loaded.as_ref().and_then(|info| {
+        let bytes = crate::queue::prior_clonepack_bytes(info);
+        (bytes > 0).then_some(bytes)
+    });
+    let preflight_size_bytes = match state.ref_store.load_added_repo(repo_id).await {
+        Ok(Some(added)) => added.repo_size_bytes,
+        _ => None,
+    };
+    let size_bytes = crate::queue::resolve_job_size_bytes(prior_size_bytes, preflight_size_bytes);
+    let job = BuildJob {
+        repo_id: repo_id.clone(),
+        admitted_commit: commit.to_string(),
+        repo_config: crate::repo_config::RepoConfig::default(),
+        credential,
+        size_bytes,
+    };
+    match enqueue_admitted_build(state, job).await {
+        Ok(outcome) => Admission::Enqueued(outcome),
+        Err(error) => Admission::Error(error),
+    }
 }
 
 /// Admit one exact ordinary-tip job. The local marker spans the whole
@@ -4699,28 +4701,22 @@ async fn trigger_build(
         .load_result(repo_id, &admitted_commit)
         .await
         .map_err(|e| format!("exact result lookup failed: {e}"))?;
-    if let Some(info) = existing
-        && exact_result_complete(&info, &admitted_commit)
+    // A signed replay/poller wakeup for a branch that already serves this
+    // exact full commit is a read-only no-op. Do not fetch credentials or
+    // touch the queue merely because the trusted trigger was repeated:
+    // `admit_commit` only calls `credential` once it knows enqueue is needed.
+    match admit_commit(state, repo_id, &admitted_commit, existing, || {
+        state
+            .broker
+            .fetch_credential(repo_id, None)
+            .map_err(|e| e.to_string())
+    })
+    .await
     {
-        // A signed replay/poller wakeup for a branch that already serves this
-        // exact full commit is a read-only no-op. Do not fetch credentials or
-        // touch the queue merely because the trusted trigger was repeated.
-        return Ok(EnqueueOutcome::Coalesced);
+        Admission::Complete(_) => Ok(EnqueueOutcome::Coalesced),
+        Admission::Enqueued(outcome) => Ok(outcome),
+        Admission::Error(error) => Err(error),
     }
-    let credential = state
-        .broker
-        .fetch_credential(repo_id, None)
-        .map_err(|e| e.to_string())?;
-    let size_bytes = enqueue_size_bytes(state, repo_id, Some(&admitted_commit)).await;
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        admitted_commit,
-        repo_config: crate::repo_config::RepoConfig::default(),
-        credential,
-        size_bytes,
-    };
-
-    enqueue_admitted_build(state, job).await
 }
 
 /// Legacy branch selectors are parsed only so they can fail closed without
@@ -8924,6 +8920,144 @@ mod tests {
         assert!(resp.clonepack_manifest_url.is_none());
         assert!(resp.metadata_chunk_url.is_none());
         assert!(resp.archive_chunk_urls.is_none());
+    }
+
+    /// Signs every hash as `signed:<ttl-secs>:<hash>` so a response's URL
+    /// fields pin which hash was signed, in what order, and with which TTL.
+    struct SigningStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for SigningStorage {
+        fn get(&self, _hash: &str) -> Result<Vec<u8>> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn get_range(&self, _hash: &str, _start: u64, _len: u64) -> Result<Vec<u8>> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn put(&self, _hash: &str, _data: &[u8]) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn size(&self, _hash: &str) -> Result<u64> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn verify_durable_copy(&self, _hash: &str) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn signed_url(&self, hash: &str, expires_in: Duration) -> Option<String> {
+            Some(format!("signed:{}:{hash}", expires_in.as_secs()))
+        }
+    }
+
+    #[test]
+    fn ref_response_signs_every_artifact_in_manifest_order() {
+        let storage: StorageRef = Arc::new(SigningStorage);
+        let commit = "c".repeat(40);
+        let parent = "p".repeat(40);
+        let pack = |name: &str| crate::PackArtifact {
+            pack: format!("{name}-pack"),
+            idx: format!("{name}-idx"),
+        };
+        let info = RefInfo {
+            commit: commit.clone(),
+            head: Some(crate::HeadResult {
+                clonepack: ready_artifacts(&commit, "head"),
+                parent_commit: Some(parent.clone()),
+                packs: vec![pack("h1")],
+                ..Default::default()
+            }),
+            full: Some(crate::FullResult {
+                clonepack: crate::ClonepackArtifacts {
+                    midx: "full-midx".to_string(),
+                    ..ready_artifacts(&commit, "full")
+                },
+                packs: vec![pack("f1"), pack("f2"), pack("f3")],
+                ..Default::default()
+            }),
+            files: Some(crate::FilesResult {
+                clonepack: ready_artifacts(&commit, "files"),
+                archive_chunks: vec!["a1".to_string(), "a2".to_string()],
+                ..Default::default()
+            }),
+        };
+        let provider = ProviderRegistry::new().default_provider().clone();
+        let repo_id = RepoId::github("o/r");
+        let signed = |ttl: u64, hash: &str| Some(format!("signed:{ttl}:{hash}"));
+
+        let full = ref_response(
+            &repo_id,
+            &provider,
+            "main".to_string(),
+            &info,
+            &storage,
+            ExactResultKind::Full,
+            false,
+        );
+        let full_artifacts = info.full.as_ref().unwrap();
+        assert_eq!(full.commit, commit);
+        assert_eq!(full.parent_commit.as_deref(), Some(parent.as_str()));
+        assert_eq!(full.clonepack_manifest, full_artifacts.clonepack.manifest);
+        assert_eq!(
+            full.clonepack_manifest_url,
+            signed(1200, &full_artifacts.clonepack.manifest)
+        );
+        assert_eq!(
+            full.metadata_chunk_url,
+            signed(1200, &full_artifacts.clonepack.metadata_chunk)
+        );
+        assert_eq!(
+            full.pack_chunk_urls,
+            Some(vec![
+                signed(1200, "f1-pack"),
+                signed(1200, "f2-pack"),
+                signed(1200, "f3-pack"),
+            ])
+        );
+        assert_eq!(full.midx_url, signed(1200, "full-midx"));
+        assert_eq!(
+            full.idx_bundle_url,
+            signed(1200, &full_artifacts.clonepack.idx_bundle)
+        );
+        assert!(full.archive_chunk_urls.is_none());
+        assert!(full.head_blobs_chunk_urls.is_none());
+        assert!(full.head_blobs_idx_url.is_none());
+
+        let files = ref_response(
+            &repo_id,
+            &provider,
+            "main".to_string(),
+            &info,
+            &storage,
+            ExactResultKind::Files,
+            true,
+        );
+        assert_eq!(
+            files.archive_chunk_urls,
+            Some(vec![signed(300, "a1"), signed(300, "a2")])
+        );
+        assert!(files.pack_chunk_urls.is_none());
+        assert_eq!(
+            files.clonepack_manifest_url,
+            signed(300, &info.files.as_ref().unwrap().clonepack.manifest)
+        );
+        // No MIDX on the Files variant: an empty hash is never signed.
+        assert!(files.midx_url.is_none());
+        assert_eq!(files.parent_commit.as_deref(), Some(parent.as_str()));
+
+        let head = ref_response(
+            &repo_id,
+            &provider,
+            "main".to_string(),
+            &info,
+            &storage,
+            ExactResultKind::Head,
+            false,
+        );
+        assert_eq!(head.pack_chunk_urls, Some(vec![signed(1200, "h1-pack")]));
     }
 
     #[test]
