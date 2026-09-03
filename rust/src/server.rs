@@ -825,7 +825,6 @@ pub struct ServerState {
     /// worker never touches the database. `None` only in a worker's non-serving
     /// `ServerState`.
     pub worker_queue: Option<Arc<crate::queue::SqlJobQueue>>,
-    pub build_queue_depth: Arc<AtomicUsize>,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     /// Webhook receiver config: per-provider HMAC secret + optional repo
     /// allowlist. A provider with no configured secret returns 503. Reads
@@ -887,7 +886,6 @@ impl ServerState {
             control_db: None,
             // A worker never serves the farm-out endpoints itself.
             worker_queue: None,
-            build_queue_depth: Arc::new(AtomicUsize::new(0)),
             oidc_verifier: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
@@ -2451,14 +2449,6 @@ async fn ref_report_handler(
                         .publish_head_for_claim(job_id, &worker_id, &repo_id, &commit, *head)
                         .await
                 }
-                #[cfg(test)]
-                None => {
-                    state
-                        .ref_store
-                        .publish_claimed_head(&repo_id, &commit, *head, job_id, &worker_id)
-                        .await
-                }
-                #[cfg(not(test))]
                 None => Err(anyhow::anyhow!("control database unavailable")),
             }
             .map(|updated| RefReportResponse { updated })
@@ -2491,14 +2481,6 @@ async fn ref_report_handler(
                         .publish_full_for_claim(job_id, &worker_id, &repo_id, &commit, *full)
                         .await
                 }
-                #[cfg(test)]
-                None => {
-                    state
-                        .ref_store
-                        .publish_claimed_full(&repo_id, &commit, *full, job_id, &worker_id)
-                        .await
-                }
-                #[cfg(not(test))]
                 None => Err(anyhow::anyhow!("control database unavailable")),
             }
             .map(|updated| RefReportResponse { updated })
@@ -2531,14 +2513,6 @@ async fn ref_report_handler(
                         .publish_files_for_claim(job_id, &worker_id, &repo_id, &commit, *files)
                         .await
                 }
-                #[cfg(test)]
-                None => {
-                    state
-                        .ref_store
-                        .publish_claimed_files(&repo_id, &commit, *files, job_id, &worker_id)
-                        .await
-                }
-                #[cfg(not(test))]
                 None => Err(anyhow::anyhow!("control database unavailable")),
             }
             .map(|updated| RefReportResponse { updated })
@@ -3609,7 +3583,7 @@ async fn get_ref_inner(
             return artifact_pending_response_with_top_up(
                 &commit,
                 &checkout_name,
-                state.build_queue_depth.load(Ordering::Relaxed),
+                state.build_queue.depth().await,
                 Some(true),
                 base,
             )
@@ -3623,12 +3597,8 @@ async fn get_ref_inner(
         // kind, and the core only reads the `existing` row handed to it.
         Admission::Complete(_) => unreachable!("caller already filtered complete results"),
         Admission::Enqueued(_) => {
-            artifact_pending_response(
-                &commit,
-                &checkout_name,
-                state.build_queue_depth.load(Ordering::Relaxed),
-            )
-            .await
+            artifact_pending_response(&commit, &checkout_name, state.build_queue.depth().await)
+                .await
         }
         Admission::Error(error) => exact_unavailable_response(&state, error, commit, checkout_name),
     }
@@ -4182,10 +4152,10 @@ async fn sync_repo_inner(
                     EnqueueOutcome::Full => "full",
                 }
                 .to_string(),
-                // Admission is complete once enqueue returns. This process-local
-                // counter is an informational hint and never performs a second
-                // database operation after durable acceptance.
-                queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
+                // Admission is complete once enqueue returns; this is a read of
+                // the real queue depth for the client's information, one extra
+                // DB read after durable acceptance.
+                queue_depth: state.build_queue.depth().await,
                 commit,
                 branch: admitted_branch,
             }),
@@ -4574,98 +4544,41 @@ async fn enqueue_admitted_build(
 ) -> Result<EnqueueOutcome, String> {
     crate::validation::validate_object_id(&job.admitted_commit)
         .map_err(|e| format!("invalid admitted commit: {e}"))?;
-    job.repo_config = match &state.control_db {
-        Some(control) => control
-            .repository_config(&job.repo_id)
-            .await
-            .map_err(|error| format!("repository config read failed: {error:#}"))?
-            .unwrap_or_default(),
-        #[cfg(test)]
-        None => job.repo_config,
-        #[cfg(not(test))]
-        None => return Err("server control database is unavailable".to_string()),
+    let Some(control) = &state.control_db else {
+        return Err("server control database is unavailable".to_string());
     };
+    job.repo_config = control
+        .repository_config(&job.repo_id)
+        .await
+        .map_err(|error| format!("repository config read failed: {error:#}"))?
+        .unwrap_or_default();
     job.repo_config
         .validate()
         .map_err(|error| format!("repository config validation failed: {error:#}"))?;
-    if let Some(control) = &state.control_db {
-        let admission = ExactAdmissionPlan {
-            pending: pending_exact_result(&job),
-        };
-        state.metrics.record_build_queued();
-        let _ = test_hook(TestStage::BeforeAdmissionTx(&job.admitted_commit)).await;
-        return match control.admit_exact_and_job(&job, &admission.pending).await {
-            Ok(enqueued) => {
-                if enqueued.outcome == EnqueueOutcome::Enqueued {
-                    state.metrics.record_build_accepted();
-                } else {
-                    state.metrics.rollback_build_queued();
-                }
-                let _ = test_hook(TestStage::Enqueue(enqueued.outcome)).await;
-                Ok(enqueued.outcome)
-            }
-            Err(error) => {
-                state.metrics.rollback_build_queued();
-                Err(format!("durable admission failed: {error:#}"))
-            }
-        };
-    }
-    let Some(admission) = prepare_exact_admission(state, &job).await? else {
-        state.metrics.record_build_accepted();
-        let _ = test_hook(TestStage::Enqueue(EnqueueOutcome::Coalesced)).await;
-        return Ok(EnqueueOutcome::Coalesced);
+    let admission = ExactAdmissionPlan {
+        pending: pending_exact_result(&job),
     };
-    state
-        .ref_store
-        .save_result(&job.repo_id, &admission.pending)
-        .await
-        .map_err(|error| format!("exact admission persistence failed: {error}"))?;
     state.metrics.record_build_queued();
-    match state.build_queue.enqueue(job).await {
-        Ok(enq) if enq.outcome == EnqueueOutcome::Enqueued => {
-            state.metrics.record_build_accepted();
-            let _ = test_hook(TestStage::Enqueue(enq.outcome)).await;
-            Ok(enq.outcome)
+    let _ = test_hook(TestStage::BeforeAdmissionTx(&job.admitted_commit)).await;
+    match control.admit_exact_and_job(&job, &admission.pending).await {
+        Ok(enqueued) => {
+            if enqueued.outcome == EnqueueOutcome::Enqueued {
+                state.metrics.record_build_accepted();
+            } else {
+                state.metrics.rollback_build_queued();
+            }
+            let _ = test_hook(TestStage::Enqueue(enqueued.outcome)).await;
+            Ok(enqueued.outcome)
         }
-        Ok(enq) if enq.outcome == EnqueueOutcome::Coalesced => {
+        Err(error) => {
             state.metrics.rollback_build_queued();
-            let _ = test_hook(TestStage::Enqueue(enq.outcome)).await;
-            Ok(enq.outcome)
-        }
-        Ok(_) => {
-            state.metrics.rollback_build_queued();
-            let _ = test_hook(TestStage::Enqueue(EnqueueOutcome::Full)).await;
-            Err("build queue full".to_string())
-        }
-        Err(e) => {
-            state.metrics.rollback_build_queued();
-            Err(format!("build queue unavailable: {e}"))
+            Err(format!("durable admission failed: {error:#}"))
         }
     }
 }
 
 struct ExactAdmissionPlan {
     pending: RefInfo,
-}
-
-async fn prepare_exact_admission(
-    state: &ServerState,
-    job: &BuildJob,
-) -> Result<Option<ExactAdmissionPlan>, String> {
-    let commit = job.admitted_commit.as_str();
-    let existing = state
-        .ref_store
-        .load_result(&job.repo_id, commit)
-        .await
-        .map_err(|e| format!("exact admission lookup failed: {e}"))?;
-    if existing
-        .as_ref()
-        .is_some_and(|result| exact_result_complete(result, commit))
-    {
-        return Ok(None);
-    }
-    let pending = existing.unwrap_or_else(|| pending_exact_result(job));
-    Ok(Some(ExactAdmissionPlan { pending }))
 }
 
 fn pending_exact_result(job: &BuildJob) -> RefInfo {
@@ -4979,7 +4892,7 @@ async fn build_handler(
                     EnqueueOutcome::Full => "full",
                 }
                 .to_string(),
-                queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
+                queue_depth: state.build_queue.depth().await,
                 commit: tip.commit,
                 branch: admitted_branch,
             }),
@@ -7909,7 +7822,6 @@ async fn run_server_with_barrier_at_control(
         build_queue,
         control_db: Some(control_db),
         worker_queue: Some(worker_queue.clone()),
-        build_queue_depth: Arc::new(AtomicUsize::new(0)),
         oidc_verifier,
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -8218,7 +8130,7 @@ mod tests {
             self.inner
                 .get_or_try_init(|| async {
                     let db = crate::meta::LibsqlMeta::connect(&self.path.to_string_lossy()).await?;
-                    Ok(Arc::new(crate::meta::SqlRefStore::new(Box::new(db)).await?))
+                    Ok(Arc::new(crate::meta::SqlRefStore::new(db).await?))
                 })
                 .await
         }
@@ -8311,9 +8223,7 @@ mod tests {
             self.inner
                 .get_or_try_init(|| async {
                     let db = crate::queue::LibsqlDb::connect(&self.path.to_string_lossy()).await?;
-                    Ok(Arc::new(
-                        crate::queue::SqlJobQueue::new(Box::new(db)).await?,
-                    ))
+                    Ok(Arc::new(crate::queue::SqlJobQueue::new(db).await?))
                 })
                 .await
         }
@@ -8416,7 +8326,6 @@ mod tests {
             build_queue,
             control_db: None,
             worker_queue: None,
-            build_queue_depth: Arc::new(AtomicUsize::new(0)),
             oidc_verifier: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
@@ -8430,6 +8339,26 @@ mod tests {
             access_verifier: Arc::new(HttpAccessVerifier::new()),
             require_repo_auth: false,
         }
+    }
+
+    /// A `ServerState` backed by a real, freshly opened `ControlDb`, for tests
+    /// that exercise the durable-admission path (`enqueue_admitted_build`,
+    /// `ref_report_handler`) rather than the in-process test fakes.
+    async fn test_state_with_control(tmp: &tempfile::TempDir) -> ServerState {
+        let control = Arc::new(
+            crate::control::ControlDb::open(
+                &tmp.path().join("control.db"),
+                None,
+                crate::queue::default_size_classes(),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut state = test_state_with_ref_store(tmp, control.ref_store());
+        state.build_queue = control.queue() as JobQueueRef;
+        state.worker_queue = Some(control.queue());
+        state.control_db = Some(control);
+        state
     }
 
     fn auth_header() -> String {
@@ -8550,11 +8479,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let queue = Arc::new(
-            crate::queue::SqlJobQueue::new(Box::new(queue_db))
-                .await
-                .unwrap(),
-        );
+        let queue = Arc::new(crate::queue::SqlJobQueue::new(queue_db).await.unwrap());
         state.build_queue = queue.clone();
         let repo_id = RepoId::github("acme/pending");
         mark_added(&state, repo_id.clone()).await;
@@ -9324,35 +9249,9 @@ mod tests {
         }
     }
 
-    /// Return an observation receiver while the authoritative queue remains
-    /// SQLite-backed.
-    fn test_state_with_queue(
-        tmp: &tempfile::TempDir,
-    ) -> (ServerState, tokio::sync::mpsc::UnboundedReceiver<BuildJob>) {
-        let mut state = test_state(tmp);
-        let rx = install_observed_queue(&mut state);
-        (state, rx)
-    }
-
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn ordinary_http_returns_after_enqueue_without_querying_queue_depth() {
-        struct DepthMustNotRunQueue;
-
-        #[async_trait::async_trait]
-        impl crate::queue::JobQueue for DepthMustNotRunQueue {
-            async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
-                Ok(crate::queue::Enqueued {
-                    outcome: EnqueueOutcome::Enqueued,
-                    job_id: Some(1),
-                })
-            }
-
-            async fn depth(&self) -> usize {
-                std::future::pending().await
-            }
-        }
-
+    async fn ordinary_http_response_reports_real_queue_depth() {
         let _env = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -9363,20 +9262,39 @@ mod tests {
         let commit = crate::test_fixture::commit(&origin, &[("README.md", b"accepted")]);
 
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        state.build_queue = Arc::new(DepthMustNotRunQueue);
+        let state = test_state_with_control(&tmp).await;
         let repo_id = RepoId::github("acme/accepted");
-        mark_added(&state, repo_id).await;
+        mark_added(&state, repo_id.clone()).await;
+
+        // Pre-admit two unrelated jobs so the queue already holds 2 entries;
+        // the accepted request below admits a 3rd, so the response reports a
+        // real depth of 3.
+        let control = state.control_db.as_ref().unwrap();
+        for i in 0..2 {
+            let filler = BuildJob {
+                repo_id: RepoId::github(format!("acme/filler-{i}")),
+                admitted_commit: "f".repeat(40),
+                repo_config: Default::default(),
+                credential: None,
+                size_bytes: None,
+            };
+            let pending = pending_exact_result(&filler);
+            control
+                .admit_exact_and_job(&filler, &pending)
+                .await
+                .unwrap();
+        }
+
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
         let response = tokio::time::timeout(
             Duration::from_secs(2),
-            build_app(state).oneshot(test_request(
+            build_app(state.clone()).oneshot(test_request(
                 "POST",
                 "/v1/repos/github/acme/accepted/sync?branch=main",
             )),
         )
         .await
-        .expect("accepted response must not wait for queue depth")
+        .expect("accepted response must complete")
         .unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
@@ -9386,6 +9304,7 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["commit"], commit);
+        assert_eq!(body["queue_depth"], 3);
     }
 
     #[tokio::test]
@@ -9403,7 +9322,7 @@ mod tests {
         let head = crate::test_fixture::commit(&origin, &[("f.txt", b"HEAD\n")]);
 
         let tmp = tempfile::tempdir().unwrap();
-        let (mut state, mut rx) = test_state_with_queue(&tmp);
+        let mut state = test_state_with_control(&tmp).await;
         mark_added(&state, RepoId::github("acme/widget")).await;
         const AUDIENCE: &str = "ripclone-test-audience";
         const KID: &str = "ripclone-test-kid";
@@ -9479,11 +9398,16 @@ mod tests {
         );
         assert_eq!(probe.tip_probes.load(Ordering::SeqCst), 1);
         assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
-        let job = rx.try_recv().expect("OIDC wakeup enqueued exact HEAD job");
+        let job = claim_admitted_job(&state)
+            .await
+            .expect("OIDC wakeup enqueued exact HEAD job");
         assert_eq!(job.repo_id, RepoId::github("acme/widget"));
         assert_eq!(job.admitted_commit, head);
         assert_ne!(job.admitted_commit, decoy);
-        assert!(rx.try_recv().is_err(), "one HEAD probe admitted one job");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "one HEAD probe admitted one job"
+        );
     }
 
     #[tokio::test]
@@ -9583,11 +9507,7 @@ mod tests {
                 credential: None,
                 size_bytes: None,
             };
-            let pending = prepare_exact_admission(&state, &job)
-                .await
-                .unwrap()
-                .expect("new exact result admission")
-                .pending;
+            let pending = pending_exact_result(&job);
             state
                 .ref_store
                 .save_result(&repo_id, &pending)
@@ -9749,15 +9669,12 @@ mod tests {
         .into_bytes()
     }
 
-    /// A test state with a configured `github` webhook secret and a durable-job
-    /// observer so a test can assert what `trigger_build` admitted.
-    fn webhook_state(
-        tmp: &tempfile::TempDir,
-    ) -> (ServerState, tokio::sync::mpsc::UnboundedReceiver<BuildJob>) {
-        let mut state = test_state(tmp);
-        let rx = install_observed_queue(&mut state);
+    /// A test state, backed by a real `ControlDb`, with a configured `github`
+    /// webhook secret. Use `claim_admitted_job` to see what a trigger admitted.
+    async fn webhook_state(tmp: &tempfile::TempDir) -> ServerState {
+        let mut state = test_state_with_control(tmp).await;
         state.webhook_config = Arc::new(WebhookConfig::with_secret("github", WEBHOOK_SECRET));
-        (state, rx)
+        state
     }
 
     async fn mark_added(state: &ServerState, repo_id: RepoId) {
@@ -9775,6 +9692,32 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// Claims the one job a real `ControlDb` admitted and reconstructs the
+    /// `BuildJob` it holds. `None` when the queue is empty. Draining by claim
+    /// (rather than watching `JobQueue::enqueue`) is required because durable
+    /// admission writes the queue directly inside `ControlDb`'s own
+    /// transaction, never through the `JobQueue` trait.
+    async fn claim_admitted_job(state: &ServerState) -> Option<BuildJob> {
+        let claimed = state
+            .control_db
+            .as_ref()
+            .expect("control db")
+            .queue()
+            .claim("test-worker")
+            .await
+            .unwrap()?;
+        Some(BuildJob {
+            repo_id: RepoId {
+                provider: crate::provider::ProviderInstanceId::new(claimed.provider),
+                path: claimed.path,
+            },
+            admitted_commit: claimed.admitted_commit,
+            repo_config: claimed.repo_config,
+            credential: None,
+            size_bytes: None,
+        })
     }
 
     #[tokio::test]
@@ -9801,9 +9744,9 @@ mod tests {
     #[tokio::test]
     async fn webhook_push_enqueues_build() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
+        let state = webhook_state(&tmp).await;
         mark_added(&state, RepoId::github("acme/widget")).await;
-        let app = build_app(state);
+        let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
             "widget",
@@ -9818,17 +9761,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let job = rx.try_recv().expect("a build job was enqueued");
+        let job = claim_admitted_job(&state)
+            .await
+            .expect("a build job was enqueued");
         assert_eq!(job.repo_id, RepoId::github("acme/widget"));
         assert_eq!(job.admitted_commit, "1".repeat(40));
-        assert!(rx.try_recv().is_err(), "exactly one job enqueued");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "exactly one job enqueued"
+        );
     }
 
     #[tokio::test]
     async fn webhook_invalid_signature_returns_401() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
-        let app = build_app(state);
+        let state = webhook_state(&tmp).await;
+        let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
             "widget",
@@ -9843,13 +9791,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(rx.try_recv().is_err(), "a bad signature must not enqueue");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "a bad signature must not enqueue"
+        );
     }
 
     #[tokio::test]
     async fn webhook_missing_signature_returns_401() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, _rx) = webhook_state(&tmp);
+        let state = webhook_state(&tmp).await;
         let app = build_app(state);
         let body = gh_push_body(
             "acme",
@@ -9869,8 +9820,8 @@ mod tests {
     #[tokio::test]
     async fn webhook_tampered_body_returns_401() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
-        let app = build_app(state);
+        let state = webhook_state(&tmp).await;
+        let app = build_app(state.clone());
         // Sign body A with the correct secret, deliver body B. Proves the handler
         // verifies over the raw received bytes, not a re-serialized parse.
         let body_a = gh_push_body(
@@ -9896,14 +9847,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(rx.try_recv().is_err(), "a tampered body must not enqueue");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "a tampered body must not enqueue"
+        );
     }
 
     #[tokio::test]
     async fn webhook_ping_is_acknowledged_without_build() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
-        let app = build_app(state);
+        let state = webhook_state(&tmp).await;
+        let app = build_app(state.clone());
         let body = br#"{"zen":"keep it simple"}"#.to_vec();
         let sig = gh_sign(WEBHOOK_SECRET, &body);
         let resp = app
@@ -9911,14 +9865,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_err(), "ping must not enqueue");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "ping must not enqueue"
+        );
     }
 
     #[tokio::test]
     async fn webhook_non_default_branch_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
-        let app = build_app(state);
+        let state = webhook_state(&tmp).await;
+        let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
             "widget",
@@ -9933,19 +9890,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_err(), "non-default push must not enqueue");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "non-default push must not enqueue"
+        );
     }
 
     #[tokio::test]
     async fn webhook_allowlist_blocks_unlisted_repo() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        let mut rx = install_observed_queue(&mut state);
+        let mut state = test_state_with_control(&tmp).await;
         state.webhook_config = Arc::new(
             WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                 .with_allowlist(["acme/allowed".to_string()]),
         );
-        let app = build_app(state);
+        let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
             "widget",
@@ -9960,20 +9919,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_err(), "unlisted repo must not enqueue");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "unlisted repo must not enqueue"
+        );
     }
 
     #[tokio::test]
     async fn webhook_allowlist_allows_listed_repo() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        let mut rx = install_observed_queue(&mut state);
+        let mut state = test_state_with_control(&tmp).await;
         state.webhook_config = Arc::new(
             WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                 .with_allowlist(["acme/widget".to_string()]),
         );
         mark_added(&state, RepoId::github("acme/widget")).await;
-        let app = build_app(state);
+        let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
             "widget",
@@ -9989,7 +9950,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            rx.try_recv().expect("listed repo enqueues").repo_id,
+            claim_admitted_job(&state)
+                .await
+                .expect("listed repo enqueues")
+                .repo_id,
             RepoId::github("acme/widget")
         );
     }
@@ -10001,14 +9965,13 @@ mod tests {
         // `gitlab/...` form isn't a silent footgun.
         for entry in ["acme/widget", "github/acme/widget"] {
             let tmp = tempfile::tempdir().unwrap();
-            let mut state = test_state(&tmp);
-            let mut rx = install_observed_queue(&mut state);
+            let mut state = test_state_with_control(&tmp).await;
             state.webhook_config = Arc::new(
                 WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                     .with_allowlist([entry.to_string()]),
             );
             mark_added(&state, RepoId::github("acme/widget")).await;
-            let app = build_app(state);
+            let app = build_app(state.clone());
             let body = gh_push_body(
                 "acme",
                 "widget",
@@ -10023,15 +9986,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "allowlist entry {entry}");
-            assert!(rx.try_recv().is_ok(), "entry {entry} must admit the repo");
+            assert!(
+                claim_admitted_job(&state).await.is_some(),
+                "entry {entry} must admit the repo"
+            );
         }
     }
 
     #[tokio::test]
     async fn webhook_tag_push_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
-        let app = build_app(state);
+        let state = webhook_state(&tmp).await;
+        let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
             "widget",
@@ -10046,14 +10012,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_err(), "a tag push must not enqueue");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "a tag push must not enqueue"
+        );
     }
 
     #[tokio::test]
     async fn webhook_hostile_branch_name_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
-        let app = build_app(state);
+        let state = webhook_state(&tmp).await;
+        let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
             "widget",
@@ -10068,13 +10037,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_err(), "an invalid branch must not enqueue");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "an invalid branch must not enqueue"
+        );
     }
 
     #[tokio::test]
     async fn webhook_branch_delete_preserves_exact_result() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
+        let state = webhook_state(&tmp).await;
         let repo = RepoId::github("acme/widget");
         let commit = "d".repeat(40);
         let info = RefInfo {
@@ -10083,7 +10055,7 @@ mod tests {
         };
         state.ref_store.save_result(&repo, &info).await.unwrap();
         let ref_store = state.ref_store.clone();
-        let app = build_app(state);
+        let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
             "widget",
@@ -10106,13 +10078,16 @@ mod tests {
                 .is_some(),
             "branch deletion must not delete an exact commit result"
         );
-        assert!(rx.try_recv().is_err(), "a delete must not enqueue a build");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "a delete must not enqueue a build"
+        );
     }
 
     #[tokio::test]
     async fn webhook_unknown_provider_returns_404() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, _rx) = webhook_state(&tmp);
+        let state = webhook_state(&tmp).await;
         let app = build_app(state);
         let body = br#"{}"#.to_vec();
         let sig = gh_sign(WEBHOOK_SECRET, &body);
@@ -10124,15 +10099,14 @@ mod tests {
     }
 
     /// Build state with a single non-default provider instance configured plus
-    /// its webhook secret and a durable-job observer.
-    fn provider_webhook_state(
+    /// its webhook secret, backed by a real `ControlDb`.
+    async fn provider_webhook_state(
         tmp: &tempfile::TempDir,
         id: &str,
         kind: &str,
         host: &str,
-    ) -> (ServerState, tokio::sync::mpsc::UnboundedReceiver<BuildJob>) {
-        let mut state = test_state(tmp);
-        let rx = install_observed_queue(&mut state);
+    ) -> ServerState {
+        let mut state = test_state_with_control(tmp).await;
         let mut registry = ProviderRegistry::new();
         registry
             .merge_one(crate::provider::ProviderConfig {
@@ -10145,13 +10119,13 @@ mod tests {
             .unwrap();
         state.provider_registry = registry;
         state.webhook_config = Arc::new(WebhookConfig::with_secret(id, WEBHOOK_SECRET));
-        (state, rx)
+        state
     }
 
     #[tokio::test]
     async fn webhook_provider_without_adapter_returns_501() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, _rx) = provider_webhook_state(&tmp, "generic", "generic", "git.example.com");
+        let state = provider_webhook_state(&tmp, "generic", "generic", "git.example.com").await;
         let app = build_app(state);
         let resp = app
             .oneshot(webhook_request(
@@ -10168,7 +10142,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_gitlab_push_enqueues() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
+        let state = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com").await;
         mark_added(
             &state,
             RepoId {
@@ -10177,7 +10151,7 @@ mod tests {
             },
         )
         .await;
-        let app = build_app(state);
+        let app = build_app(state.clone());
         let body = br#"{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"group/sub/proj","default_branch":"main","visibility_level":0}}"#.to_vec();
         // GitLab authenticates with the shared token in X-Gitlab-Token.
         let req = axum::http::Request::builder()
@@ -10190,7 +10164,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let job = rx.try_recv().expect("gitlab default-branch push enqueues");
+        let job = claim_admitted_job(&state)
+            .await
+            .expect("gitlab default-branch push enqueues");
         assert_eq!(job.repo_id.path, "group/sub/proj");
         assert_eq!(job.admitted_commit, "1".repeat(40));
     }
@@ -10198,8 +10174,8 @@ mod tests {
     #[tokio::test]
     async fn webhook_gitlab_bad_token_returns_401() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
-        let app = build_app(state);
+        let state = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com").await;
+        let app = build_app(state.clone());
         let body = br#"{"ref":"refs/heads/main","after":"abc","project":{"path_with_namespace":"g/p","default_branch":"main"}}"#.to_vec();
         let req = axum::http::Request::builder()
             .method("POST")
@@ -10211,13 +10187,16 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(rx.try_recv().is_err(), "a bad token must not enqueue");
+        assert!(
+            claim_admitted_job(&state).await.is_none(),
+            "a bad token must not enqueue"
+        );
     }
 
     #[tokio::test]
     async fn webhook_gitea_push_enqueues() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com");
+        let state = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com").await;
         mark_added(
             &state,
             RepoId {
@@ -10226,7 +10205,7 @@ mod tests {
             },
         )
         .await;
-        let app = build_app(state);
+        let app = build_app(state.clone());
         let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main","private":true}}"#.to_vec();
         // Gitea signs the raw body with HMAC-SHA256, bare hex in X-Gitea-Signature.
         let sig = {
@@ -10246,7 +10225,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let job = rx.try_recv().expect("gitea default-branch push enqueues");
+        let job = claim_admitted_job(&state)
+            .await
+            .expect("gitea default-branch push enqueues");
         assert_eq!(job.repo_id.path, "acme/widget");
         assert_eq!(job.admitted_commit, "1".repeat(40));
     }
@@ -10254,8 +10235,8 @@ mod tests {
     #[tokio::test]
     async fn webhook_gitea_bad_signature_returns_401() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com");
-        let app = build_app(state);
+        let state = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com").await;
+        let app = build_app(state.clone());
         let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main"}}"#.to_vec();
         // Sign with the WRONG secret.
         let sig = {
@@ -10276,7 +10257,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(
-            rx.try_recv().is_err(),
+            claim_admitted_job(&state).await.is_none(),
             "a bad gitea signature must not enqueue"
         );
     }
@@ -10284,7 +10265,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_gitlab_allowlist_matches_natural_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let (mut state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
+        let mut state = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com").await;
         // The allowlist is written in the operator-facing natural form
         // (provider-prefixed, unescaped) — not the escaped storage key.
         state.webhook_config = Arc::new(
@@ -10299,7 +10280,7 @@ mod tests {
             },
         )
         .await;
-        let app = build_app(state);
+        let app = build_app(state.clone());
         let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"group/sub/proj","default_branch":"main"}}"#.to_vec();
         let req = axum::http::Request::builder()
             .method("POST")
@@ -10312,7 +10293,8 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            rx.try_recv()
+            claim_admitted_job(&state)
+                .await
                 .expect("allowlisted gitlab repo enqueues")
                 .repo_id
                 .path,
@@ -10323,8 +10305,8 @@ mod tests {
     #[tokio::test]
     async fn webhook_missing_default_identity_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut rx) = webhook_state(&tmp);
-        let app = build_app(state);
+        let state = webhook_state(&tmp).await;
+        let app = build_app(state.clone());
         let body =
             gh_push_body_no_default("acme", "widget", "refs/heads/whatever", &"1".repeat(40));
         let sig = gh_sign(WEBHOOK_SECRET, &body);
@@ -10334,7 +10316,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            rx.try_recv().is_err(),
+            claim_admitted_job(&state).await.is_none(),
             "missing default-branch identity is ignored"
         );
     }
@@ -10351,7 +10333,7 @@ mod tests {
         let repo = crate::test_fixture::init_bare(&origin);
         let tip = crate::test_fixture::commit(&repo, &[("f.txt", b"v1")]);
         let tmp = tempfile::tempdir().unwrap();
-        let (state, mut observed) = test_state_with_queue(&tmp);
+        let state = test_state_with_control(&tmp).await;
         mark_added(&state, RepoId::github("acme/widget")).await;
         let probe = Arc::new(AdmissionTestProbe::default());
         let _probe_guard = install_admission_test_probe(Arc::clone(&probe));
@@ -10360,11 +10342,13 @@ mod tests {
             std::env::set_var("RIPCLONE_TESTING", "1");
         }
         assert_eq!(poll_once(&state).await, 1);
-        let first = observed.try_recv().expect("HEAD poll admitted exact work");
+        let first = claim_admitted_job(&state)
+            .await
+            .expect("HEAD poll admitted exact work");
         assert_eq!(first.admitted_commit, tip);
         assert_eq!(poll_once(&state).await, 0);
         assert!(
-            observed.try_recv().is_err(),
+            claim_admitted_job(&state).await.is_none(),
             "second poll must not add a job"
         );
         unsafe {
@@ -10373,7 +10357,6 @@ mod tests {
         }
         assert_eq!(probe.tip_probes.load(Ordering::SeqCst), 2);
     }
-
     #[tokio::test]
     async fn version_endpoint_reports_build_and_protocol() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10642,13 +10625,23 @@ mod tests {
             crate::job_token::mint_job_token(&secret, std::time::Duration::from_secs(300)).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
+        let state = test_state_with_control(&tmp).await;
         let ref_store = state.ref_store.clone();
         let rid = RepoId::github("acme/widget");
         let commit = "a".repeat(40);
-        ref_store
-            .save_result(
-                &rid,
+        // A real claimed job, not a hardcoded job_id: the handler now always
+        // authorizes a claimed result write against ControlDb's jobs table.
+        let control = state.control_db.as_ref().unwrap();
+        let job = BuildJob {
+            repo_id: rid.clone(),
+            admitted_commit: commit.clone(),
+            repo_config: crate::repo_config::RepoConfig::default(),
+            credential: None,
+            size_bytes: None,
+        };
+        control
+            .admit_exact_and_job(
+                &job,
                 &RefInfo {
                     commit: commit.clone(),
                     head: Some(crate::HeadResult::default()),
@@ -10658,6 +10651,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let claimed = control
+            .queue()
+            .claim("test-worker")
+            .await
+            .unwrap()
+            .expect("job just admitted must be claimable");
+        let job_id = claimed.id;
         let storage = state.storage.clone();
         let app = build_app(state);
         let wrong_commit = "b".repeat(40);
@@ -10770,21 +10770,21 @@ mod tests {
         );
 
         let invalid_reports = [
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_head}),
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":crate::HeadResult::default()}),
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":missing_head}),
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":corrupt_manifest_head}),
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_manifest_head}),
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":inconsistent_head}),
-            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_full}),
-            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":crate::FullResult::default()}),
-            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":missing_full}),
-            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_metadata_full}),
-            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":inconsistent_full}),
-            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":wrong_files}),
-            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":crate::FilesResult::default()}),
-            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":missing_files}),
-            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":inconsistent_files}),
+            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_head}),
+            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":crate::HeadResult::default()}),
+            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":missing_head}),
+            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":corrupt_manifest_head}),
+            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_manifest_head}),
+            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":inconsistent_head}),
+            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_full}),
+            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":crate::FullResult::default()}),
+            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":missing_full}),
+            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_metadata_full}),
+            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":inconsistent_full}),
+            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":wrong_files}),
+            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":crate::FilesResult::default()}),
+            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":missing_files}),
+            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":inconsistent_files}),
         ];
         for body in &invalid_reports {
             let response = app
@@ -10825,9 +10825,9 @@ mod tests {
         put_report_manifest(&storage, &commit, &mut valid_files.clonepack, &[], &[]);
         let valid_files_manifest = valid_files.clonepack.manifest.clone();
         let valid_reports = [
-            serde_json::json!({"op":"publish_head","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":valid_head}),
-            serde_json::json!({"op":"publish_full","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":valid_full}),
-            serde_json::json!({"op":"publish_files","job_id":1,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":valid_files}),
+            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":valid_head}),
+            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":valid_full}),
+            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":valid_files}),
         ];
         for body in &valid_reports {
             let response = app
@@ -10870,13 +10870,23 @@ mod tests {
         .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
+        let state = test_state_with_control(&tmp).await;
         let ref_store = state.ref_store.clone();
         let rid = RepoId::github("acme/nope");
         let commit = "b".repeat(40);
-        ref_store
-            .save_result(
-                &rid,
+        // A real claimed job, not a hardcoded job_id: the handler now always
+        // authorizes a claimed result write against ControlDb's jobs table.
+        let control = state.control_db.as_ref().unwrap();
+        let job = BuildJob {
+            repo_id: rid.clone(),
+            admitted_commit: commit.clone(),
+            repo_config: crate::repo_config::RepoConfig::default(),
+            credential: None,
+            size_bytes: None,
+        };
+        control
+            .admit_exact_and_job(
+                &job,
                 &RefInfo {
                     commit: commit.clone(),
                     ..Default::default()
@@ -10884,6 +10894,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let claimed = control
+            .queue()
+            .claim("test-worker")
+            .await
+            .unwrap()
+            .expect("job just admitted must be claimable");
+        let job_id = claimed.id;
         let storage = state.storage.clone();
         let app = build_app(state);
 
@@ -10894,7 +10911,7 @@ mod tests {
         put_report_manifest(&storage, &commit, &mut head.clonepack, &[], &[]);
         let body = serde_json::json!({
             "op": "publish_head",
-            "job_id": 1,
+            "job_id": job_id,
             "worker_id": "test-worker",
             "repo_key": repo_key,
             "commit": commit,

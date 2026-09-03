@@ -58,11 +58,11 @@ async fn wait_entered(barrier: &ripclone::server::AdmissionTestBarrier, count: u
 }
 
 async fn wait_until_exact_job_failed(server: &Server, repo: &str, commit: &str) -> String {
-    let queue = ripclone::queue::SqlJobQueue::new(Box::new(
+    let queue = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .expect("connect exact job observer"),
-    ))
+    )
     .await
     .expect("open exact job observer");
     let key = format!(
@@ -86,11 +86,11 @@ async fn wait_until_exact_job_failed(server: &Server, repo: &str, commit: &str) 
 }
 
 async fn wait_until_exact_job_done(server: &Server, repo: &str, commit: &str) {
-    let queue = ripclone::queue::SqlJobQueue::new(Box::new(
+    let queue = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .expect("connect exact job observer"),
-    ))
+    )
     .await
     .expect("open exact job observer");
     let key = format!(
@@ -1905,12 +1905,18 @@ async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
     let admitted = admit_repo(&server, "acme/lost-claim").await;
     assert_eq!(response_commit(&admitted), commit);
     wait_entered(&probe.after_head_entry, 1).await;
+    // Head is published, so the server's only build slot is free and polling
+    // for its next claim. Park it before the takeover: otherwise it can
+    // re-claim the row between the takeover's stale reclaim and its claim, and
+    // the takeover finds nothing queued.
+    probe.before_claim.arm();
+    wait_entered(&probe.before_claim, 1).await;
 
-    let takeover = ripclone::queue::SqlJobQueue::new(Box::new(
+    let takeover = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .unwrap(),
-    ))
+    )
     .await
     .unwrap()
     .with_stale_claim_secs(0);
@@ -1989,11 +1995,11 @@ async fn dead_lettered_stale_claim_is_readmitted_by_a_subsequent_exact_clone() {
     assert_eq!(first.status(), reqwest::StatusCode::ACCEPTED);
     assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
 
-    let takeover = ripclone::queue::SqlJobQueue::new(Box::new(
+    let takeover = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .unwrap(),
-    ))
+    )
     .await
     .unwrap()
     .with_stale_claim_secs(0);
@@ -2144,11 +2150,11 @@ async fn stopped_job_after_full_preserves_full_and_builds_only_files() {
     // The original worker is paused immediately after writing Full(B). Reclaim
     // it once, then let the stale-claim cap dead-letter it. This is the exact
     // process-death boundary that used to strand Files permanently.
-    let takeover = ripclone::queue::SqlJobQueue::new(Box::new(
+    let takeover = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .expect("connect takeover queue"),
-    ))
+    )
     .await
     .expect("open takeover queue")
     .with_stale_claim_secs(0);

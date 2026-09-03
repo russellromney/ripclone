@@ -17,11 +17,11 @@ async fn start_full_and_wait_for_failed_job(server: &Server, repo: &str, commit:
         .expect("start initial Full request");
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
 
-    let queue = ripclone::queue::SqlJobQueue::new(Box::new(
+    let queue = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .expect("connect failure observer"),
-    ))
+    )
     .await
     .expect("open failure observer");
     let repo_id = ripclone::provider::RepoId::github(repo);

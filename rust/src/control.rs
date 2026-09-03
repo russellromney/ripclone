@@ -249,12 +249,10 @@ impl ControlDb {
                 .context("configure local control database")?;
         }
         validate_or_initialize_schema(&database, path).await?;
-        let refs = Arc::new(
-            SqlRefStore::new(Box::new(LibsqlMeta::from_database(database.clone()))).await?,
-        );
+        let refs = Arc::new(SqlRefStore::new(LibsqlMeta::from_database(database.clone())).await?);
         let queue = Arc::new(
             SqlJobQueue::new_with_classes(
-                Box::new(LibsqlDb::from_database(database.clone())),
+                LibsqlDb::from_database(database.clone()),
                 size_classes.clone(),
             )
             .await?,

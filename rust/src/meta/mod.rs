@@ -15,32 +15,12 @@ pub struct ResultRow {
     pub data: String,
 }
 
-#[async_trait]
-pub trait MetaDb: Send + Sync {
-    async fn init(&self) -> Result<()>;
-    async fn get_result(&self, repo_key: &str, commit: &str) -> Result<Option<ResultRow>>;
-    async fn insert_result(&self, repo_key: &str, commit: &str, data: &str) -> Result<bool>;
-    async fn compare_and_swap_result(
-        &self,
-        repo_key: &str,
-        commit: &str,
-        expected_data: &str,
-        new_data: &str,
-    ) -> Result<bool>;
-    async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>>;
-    async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()>;
-    async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>>;
-    async fn remove_added_repo(&self, repo_key: &str) -> Result<()>;
-    async fn list_added_repos(&self) -> Result<Vec<String>>;
-    async fn health(&self) -> Result<()>;
-}
-
 pub struct SqlRefStore {
-    db: Box<dyn MetaDb>,
+    db: LibsqlMeta,
 }
 
 impl SqlRefStore {
-    pub async fn new(db: Box<dyn MetaDb>) -> Result<Self> {
+    pub async fn new(db: LibsqlMeta) -> Result<Self> {
         db.init().await?;
         Ok(Self { db })
     }
@@ -245,7 +225,7 @@ mod tests {
         let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
             .await
             .unwrap();
-        let store = SqlRefStore::new(Box::new(meta)).await.unwrap();
+        let store = SqlRefStore::new(meta).await.unwrap();
         let repo = RepoId::github("acme/widget");
         let commit = "a".repeat(40);
         store
@@ -292,7 +272,7 @@ mod tests {
         let meta = LibsqlMeta::connect(tmp.path().join("control.db").to_str().unwrap())
             .await
             .unwrap();
-        let store = std::sync::Arc::new(SqlRefStore::new(Box::new(meta)).await.unwrap());
+        let store = std::sync::Arc::new(SqlRefStore::new(meta).await.unwrap());
         let repo = RepoId::github("acme/concurrent");
         let commit = "b".repeat(40);
         store
