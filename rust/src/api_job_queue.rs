@@ -220,19 +220,18 @@ impl ApiJobQueue {
         self
     }
 
-    /// A renewal-only copy of this queue with its own HTTP client that never
-    /// reuses a pooled connection.
+    /// A renewal-only copy of this queue with its own HTTP client.
     ///
-    /// Claim renewal runs on a dedicated thread with its own runtime. A
-    /// connection pooled by the build runtime is driven by that runtime, so a
-    /// build that saturates it also stalls the renewal request and the claim
-    /// goes stale while the build is healthy. A fresh connection per renewal
-    /// keeps the whole request on the renewal thread's runtime.
+    /// Claim renewal runs on a dedicated thread with its own runtime. hyper
+    /// drives a connection from the runtime that opened it, so a connection
+    /// pooled by the build runtime stalls when a build saturates that runtime
+    /// and the claim goes stale while the build is healthy. A client used only
+    /// from the renewal thread opens every connection on the renewal runtime,
+    /// so its pool is safe to reuse.
     pub fn for_claim_renewal(&self) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(0)
             .build()
             .context("build HTTP client for dedicated claim renewal")?;
         Ok(Self {
