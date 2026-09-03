@@ -7471,13 +7471,14 @@ fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
     SEM.get_or_init(|| tokio::sync::Semaphore::new(4))
 }
 
-struct DedicatedClaimHeartbeat {
+/// Handle to a claim-renewal thread. Dropping it stops and joins the thread.
+pub struct DedicatedClaimHeartbeat {
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DedicatedClaimHeartbeat {
-    fn stop_and_join(&mut self) {
+    pub fn stop_and_join(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -7530,6 +7531,33 @@ where
         },
         failure_rx,
     ))
+}
+
+/// Renew an active durable claim from a dedicated OS thread with its own
+/// current-thread runtime.
+///
+/// Both worker shapes use this. Renewal must not share the runtime that runs
+/// the build: a build that saturates every runtime worker thread would starve
+/// a runtime-scheduled renewal and let the claim go stale while the build is
+/// still healthy. The returned receiver resolves with the first renewal error,
+/// so the caller can abort the build instead of publishing under a lost claim.
+pub fn spawn_dedicated_claim_heartbeat_thread<F, Fut>(
+    thread_name: String,
+    interval: Duration,
+    mut renew: F,
+) -> Result<(
+    DedicatedClaimHeartbeat,
+    tokio::sync::oneshot::Receiver<String>,
+)>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build dedicated claim heartbeat runtime")?;
+    spawn_dedicated_claim_heartbeat(thread_name, interval, move || runtime.block_on(renew()))
 }
 
 /// Run embedded workers against the same durable jobs table used by admission.
@@ -7632,27 +7660,19 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                 .max(1)
                                 .unsigned_abs(),
                             );
-                            let heartbeat_runtime = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .context("build dedicated claim heartbeat runtime")
-                                .map_err(|error| BuildError::retryable(format!("{error:#}")));
-                            let heartbeat = heartbeat_runtime.and_then(|runtime| {
-                                let heartbeat_queue = worker_queue.clone();
-                                let heartbeat_owner = owner.clone();
-                                let heartbeat_job = claimed.id;
-                                spawn_dedicated_claim_heartbeat(
-                                    format!("ripclone-claim-{heartbeat_job}"),
-                                    heartbeat_interval,
-                                    move || {
-                                        runtime.block_on(
-                                            heartbeat_queue
-                                                .heartbeat(&heartbeat_owner, Some(heartbeat_job)),
-                                        )
-                                    },
-                                )
-                                .map_err(|error| BuildError::retryable(format!("{error:#}")))
-                            });
+                            let heartbeat_queue = worker_queue.clone();
+                            let heartbeat_owner = owner.clone();
+                            let heartbeat_job = claimed.id;
+                            let heartbeat = spawn_dedicated_claim_heartbeat_thread(
+                                format!("ripclone-claim-{heartbeat_job}"),
+                                heartbeat_interval,
+                                move || {
+                                    let queue = heartbeat_queue.clone();
+                                    let owner = heartbeat_owner.clone();
+                                    async move { queue.heartbeat(&owner, Some(heartbeat_job)).await }
+                                },
+                            )
+                            .map_err(|error| BuildError::retryable(format!("{error:#}")));
                             match heartbeat {
                                 Err(error) => {
                                     build.abort();

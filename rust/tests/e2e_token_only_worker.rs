@@ -760,3 +760,262 @@ async fn turso_primary_loss_rejects_ref_and_job_writes() {
         "failed remote job write became visible in the local replica"
     );
 }
+
+/// A standalone worker keeps its durable claim while the build saturates every
+/// Tokio worker thread in the worker process.
+///
+/// The stale bound (2s) is far shorter than the saturation window (6s), so a
+/// renewal scheduled on the build runtime cannot run and the server reclaims a
+/// healthy claim. Renewal from a dedicated thread survives it: one claim, one
+/// build, no reclaim, and both waiters get the same commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_worker_claim_survives_a_saturated_build_runtime() {
+    init(false);
+    let origin = make_origin("acme", "saturated-runtime");
+    let commit = origin.commit(
+        &[("value.txt", "built under a saturated runtime\n")],
+        "saturated runtime",
+    );
+    origin.publish();
+    let dir = tempfile::tempdir().unwrap();
+    let cas_dir = dir.path().join("cas");
+    let repo_root = dir.path().join("repos");
+    let control_path = dir.path().join("control.db");
+
+    // A two-second stale bound with a six-second saturation window: renewal has
+    // to happen off the build runtime or the claim is reclaimed mid-build.
+    const STALE_SECS: u64 = 2;
+    const SATURATE_MS: u64 = 6_000;
+    let control = {
+        let _stale = ScopedEnvVar::set("RIPCLONE_QUEUE_STALE_SECS", STALE_SECS.to_string());
+        Arc::new(
+            ripclone::control::ControlDb::open(
+                &control_path,
+                None,
+                ripclone::queue::default_size_classes(),
+            )
+            .await
+            .unwrap(),
+        )
+    };
+    assert_eq!(
+        control.queue().stale_claim_secs(),
+        STALE_SECS as i64,
+        "test needs the short stale bound it configured"
+    );
+    control
+        .ref_store()
+        .add_repo(&AddedRepo {
+            repo_id: RepoId::github("acme/saturated-runtime"),
+            added_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            history_enabled: true,
+            source: AddedRepoSource::Api,
+            repo_size_bytes: None,
+        })
+        .await
+        .unwrap();
+    let metrics = ripclone::metrics::Metrics::new();
+    let backends = ripclone::backends::Backends::from_env_with_ref_store(
+        &cas_dir,
+        &repo_root,
+        &metrics,
+        control.ref_store(),
+    )
+    .await
+    .unwrap();
+    let queue = control.queue();
+    let provider_registry = ripclone::provider::ProviderRegistry::new();
+    let state = ServerState {
+        cas: backends.cas,
+        storage: backends.storage,
+        repo_root: repo_root.clone(),
+        ref_store: backends.ref_store,
+        provider_registry: provider_registry.clone(),
+        broker: Arc::new(ripclone::auth::broker::StaticBroker::new(provider_registry)),
+        token_hash: Some(token_hash()),
+        jwt: None,
+        metrics,
+        rate_limiter: RateLimiter::new(1_000_000, 1_000_000.0),
+        build_queue: queue.clone(),
+        control_db: Some(control.clone()),
+        worker_queue: Some(queue.clone()),
+        build_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        oidc_verifier: None,
+        webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
+        sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        artifact_fetch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fail_first_fetches: 0,
+        artifact_barrier: None,
+        readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+        access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
+        require_repo_auth: false,
+    };
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            build_app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let server_url = format!("http://127.0.0.1:{port}");
+    let ready = format!("{server_url}/readyz");
+    for attempt in 0..200 {
+        if reqwest::get(&ready)
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            break;
+        }
+        assert!(attempt < 199, "saturated-runtime test server never readied");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let secret = report_token_secret_from_env().unwrap();
+    let token = mint_job_token(&secret, Duration::from_secs(300)).unwrap();
+    let saturation = dir.path().join("runtime-saturation");
+    let mut command = Command::new(cargo_bin("ripclone-worker"));
+    command
+        // Local artifact storage is intentionally shared with the server for
+        // this composition, exactly as the token-only flow above.
+        .arg("--cas-dir")
+        .arg(&cas_dir)
+        .arg("--repo-root")
+        .arg(dir.path().join("worker-repos"))
+        .arg("--idle-poll-ms")
+        .arg("20")
+        .arg("--max-jobs")
+        .arg("1")
+        .env("RIPCLONE_QUEUE_API_URL", &server_url)
+        .env(
+            "RIPCLONE_CONFIG",
+            dir.path().join("worker-config-missing.toml"),
+        )
+        .env(
+            "RIPCLONE_METADATA_REPORT_URL",
+            format!("{server_url}/v1/refs"),
+        )
+        .env("RIPCLONE_METADATA_JOB_TOKEN", token)
+        .env("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS", "3")
+        .env("RIPCLONE_TESTING", "1")
+        .env("RIPCLONE_TEST_SATURATE_RUNTIME_MS", SATURATE_MS.to_string())
+        .env("RIPCLONE_TEST_SATURATE_RUNTIME_DIR", &saturation)
+        .env_remove("RIPCLONE_WORKER_HEARTBEAT")
+        .env_remove("RIPCLONE_CONTROL_DB_PATH")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let mut child = command.spawn().unwrap();
+
+    let first_client =
+        ripclone::client::Client::new_with_token(server_url.clone(), Some(token_hash()));
+    let first_waiter = tokio::spawn(async move {
+        first_client
+            .sync_repo("acme/saturated-runtime", None)
+            .await
+            .expect("first waiter completed")
+    });
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !saturation.join("entered").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker claimed the job and saturated its build runtime");
+
+    // Hold the reclaim window open past the stale bound while the runtime is
+    // pinned. A reclaim here means renewal died with the build runtime.
+    let mut second_waiter = None;
+    let saturation_started = Instant::now();
+    while saturation_started.elapsed() < Duration::from_millis(SATURATE_MS - 1_000) {
+        let reclaimed = queue.claim("reclaim-decoy").await.unwrap();
+        assert!(
+            reclaimed.is_none(),
+            "claim of a healthy build went stale while its runtime was saturated: \
+             reclaimed job {:?} after {:?} of saturation",
+            reclaimed.map(|claimed| claimed.id),
+            saturation_started.elapsed()
+        );
+        // The second waiter starts only after the stale bound has already
+        // elapsed, so it can only join the surviving claim's build.
+        if second_waiter.is_none()
+            && saturation_started.elapsed() >= Duration::from_secs(STALE_SECS + 1)
+        {
+            let second_client =
+                ripclone::client::Client::new_with_token(server_url.clone(), Some(token_hash()));
+            second_waiter = Some(tokio::spawn(async move {
+                second_client
+                    .sync_repo("acme/saturated-runtime", None)
+                    .await
+                    .expect("second waiter completed")
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let second_waiter = second_waiter.expect("second waiter started inside the saturation window");
+
+    let first = tokio::time::timeout(Duration::from_secs(120), first_waiter)
+        .await
+        .expect("first waiter finished")
+        .expect("first waiter task joined");
+    let second = tokio::time::timeout(Duration::from_secs(120), second_waiter)
+        .await
+        .expect("second waiter finished")
+        .expect("second waiter task joined");
+    assert_eq!(first.commit, commit);
+    assert_eq!(second.commit, commit);
+
+    let job_key = format!(
+        "{}\x1f{commit}",
+        RepoId::github("acme/saturated-runtime").storage_key()
+    );
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if matches!(
+                queue.job_state_for_key(&job_key).await.unwrap(),
+                JobState::Done
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the single saturated-runtime job settled");
+    assert_eq!(
+        job_count(&control_path, "acme/saturated-runtime").await,
+        1,
+        "two waiters on a surviving claim must share one durable job"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "worker exited {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not finish its single job"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let published = control
+        .ref_store()
+        .load_result(&RepoId::github("acme/saturated-runtime"), &commit)
+        .await
+        .unwrap()
+        .expect("the surviving claim published its exact result");
+    assert!(
+        published.head.is_some() && published.full.is_some() && published.files.is_some(),
+        "one build published every output"
+    );
+}
