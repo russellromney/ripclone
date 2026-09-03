@@ -11,9 +11,10 @@
 //!   rejection exits cleanly; the server later reclaims the stale durable claim.
 //! - storage env (`RIPCLONE_S3_*` or local) and provider config
 //!   (`RIPCLONE_PROVIDERS` or `config.toml`).
-//! - `RIPCLONE_QUEUE_STALE_SECS` (default 1800) bounds how long a crashed
-//!   worker's claimed job is held before another worker reclaims it — set it
-//!   above your longest build.
+//! - `RIPCLONE_QUEUE_STALE_SECS` (default 1800) bounds how long a dead worker's
+//!   claimed job lingers before another worker reclaims it. It does not have to
+//!   exceed the longest build: a live worker renews its claim from a dedicated
+//!   thread that runs independently of the build.
 //! - `RIPCLONE_QUEUE_FAILED_RETENTION_SECS` (default 7d): the worker periodically
 //!   prunes `failed` jobs older than this. `done` jobs are kept as build history.
 //! - `RIPCLONE_MAX_SIZE_CLASS` / `--max-size-class`: largest configured size

@@ -35,10 +35,11 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Default age (seconds) after which a `claimed` job is treated as abandoned (a
-/// crashed worker) and returned to the queue. Override with
-/// `RIPCLONE_QUEUE_STALE_SECS` — set it above your longest build so a slow build
-/// is never reclaimed and double-run.
+/// Default age (seconds) since the last renewal after which a `claimed` job is
+/// treated as abandoned (a dead worker) and returned to the queue. Override with
+/// `RIPCLONE_QUEUE_STALE_SECS`. This bounds only how long a dead worker's claim
+/// lingers; it is not a build-duration budget, because a live worker renews its
+/// claim from a dedicated thread that runs independently of the build.
 const DEFAULT_STALE_CLAIM_SECS: i64 = 1800;
 
 /// Bound on claim retries under contention before giving up for this poll (the
