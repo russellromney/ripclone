@@ -11,9 +11,10 @@
 //!   rejection exits cleanly; the server later reclaims the stale durable claim.
 //! - storage env (`RIPCLONE_S3_*` or local) and provider config
 //!   (`RIPCLONE_PROVIDERS` or `config.toml`).
-//! - `RIPCLONE_QUEUE_STALE_SECS` (default 1800) bounds how long a crashed
-//!   worker's claimed job is held before another worker reclaims it — set it
-//!   above your longest build.
+//! - `RIPCLONE_QUEUE_STALE_SECS` (default 1800) bounds how long a dead worker's
+//!   claimed job lingers before another worker reclaims it. It does not have to
+//!   exceed the longest build: a live worker renews its claim from a dedicated
+//!   thread that runs independently of the build.
 //! - `RIPCLONE_QUEUE_FAILED_RETENTION_SECS` (default 7d): the worker periodically
 //!   prunes `failed` jobs older than this. `done` jobs are kept as build history.
 //! - `RIPCLONE_MAX_SIZE_CLASS` / `--max-size-class`: largest configured size
@@ -55,13 +56,13 @@ use ripclone::api_ref_store::ApiReportError;
 use ripclone::backends::Backends;
 use ripclone::metrics::Metrics;
 use ripclone::queue::{
-    BuildError, BuildJob, JobQueueRef, WorkerQueueRef, make_worker_id, validate_heartbeat_timing,
-    worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
+    BuildError, BuildJob, JobQueueRef, WorkerQueue, WorkerQueueRef, make_worker_id,
+    validate_heartbeat_timing, worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
 };
-use ripclone::server::{ServerState, process_build_job};
+use ripclone::server::{ServerState, process_build_job, spawn_dedicated_claim_heartbeat_thread};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -93,6 +94,37 @@ fn spawn_idle_heartbeat_loop(
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+/// Test-only: hold every Tokio worker thread with blocking work for a fixed
+/// duration. Models a CPU-bound build that never yields, which is the condition
+/// a runtime-scheduled claim renewal cannot survive. Off unless
+/// `RIPCLONE_TESTING=1` and `RIPCLONE_TEST_SATURATE_RUNTIME_MS` are both set.
+fn saturate_runtime_for_test() {
+    if std::env::var("RIPCLONE_TESTING").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(hold_ms) = std::env::var("RIPCLONE_TEST_SATURATE_RUNTIME_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let hold = Duration::from_millis(hold_ms);
+    // Two blocking tasks per runtime worker thread, so every thread is busy
+    // even if the scheduler hands two to the same worker.
+    let tasks = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        * 2;
+    if let Some(dir) = std::env::var_os("RIPCLONE_TEST_SATURATE_RUNTIME_DIR").map(PathBuf::from) {
+        std::fs::create_dir_all(&dir).expect("create runtime saturation marker directory");
+        std::fs::write(dir.join("entered"), format!("{tasks}\n"))
+            .expect("signal runtime saturation");
+    }
+    for _ in 0..tasks {
+        tokio::spawn(async move { std::thread::sleep(hold) });
+    }
 }
 
 #[derive(Parser)]
@@ -140,15 +172,18 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     ripclone::git::require_system_git()?;
     ripclone::control::validate_worker_environment()?;
+    // Complete storage parsing and client construction before creating cache
+    // or mirror directories, or contacting the worker APIs.
+    Backends::validate_environment()?;
     // Validate the complete token-only API configuration before creating local
     // paths or initializing artifact storage. Standalone workers have no
     // control-database mode or credential.
-    let queue = Arc::new(
+    let api_queue = Arc::new(
         ApiJobQueue::from_env()?
             .with_max_size_class(args.max_size_class.as_deref().map(str::to_owned)),
     );
     let ref_store = Arc::new(ApiRefStore::from_env()?);
-    let queue = queue as WorkerQueueRef;
+    let queue = api_queue.clone() as WorkerQueueRef;
     let build_queue = queue.clone() as JobQueueRef;
 
     if !queue.supports_worker_registry() {
@@ -278,33 +313,76 @@ async fn main() -> Result<()> {
                 let mut build = tokio::spawn(async move {
                     process_build_job(&st, &job, job_id, &build_worker_id).await
                 });
-                let mut heartbeat = tokio::time::interval(heartbeat_interval);
-                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let (result, ownership_error) = loop {
-                    tokio::select! {
-                        joined = &mut build => {
-                            let result = match joined {
-                                Ok(result) => result,
-                                Err(error) => Err(BuildError::retryable(format!(
-                                    "build task panicked: {error}"
-                                ))),
-                            };
-                            break (result, None);
-                        }
-                        _ = heartbeat.tick() => {
-                            if let Err(error) = queue.heartbeat(&worker_id, Some(job_id)).await {
-                                error!("active claim heartbeat failed for job {job_id}: {error:#}");
-                                build.abort();
-                                let _ = build.await;
-                                let result = Err(BuildError::retryable(format!(
-                                    "durable claim lost while building: {error:#}"
-                                )));
-                                break (result, Some(error));
-                            }
-                        }
+                saturate_runtime_for_test();
+                // Renew the claim from a dedicated thread with its own
+                // runtime. A build that saturates this runtime must not be able
+                // to starve renewal and lose a claim it still owns.
+                let heartbeat_auth_expired = Arc::new(AtomicBool::new(false));
+                let renewal_queue = match api_queue.for_claim_renewal() {
+                    Ok(renewal_queue) => Arc::new(renewal_queue),
+                    Err(error) => {
+                        error!("failed to build claim renewal client for job {job_id}: {error:#}");
+                        build.abort();
+                        let _ = build.await;
+                        bail!("claim renewal client unavailable: {error:#}");
                     }
                 };
-                if ownership_error.as_ref().is_some_and(is_queue_auth_expired) {
+                let renewal_worker_id = worker_id.clone();
+                let renewal_auth_expired = heartbeat_auth_expired.clone();
+                let heartbeat = spawn_dedicated_claim_heartbeat_thread(
+                    format!("ripclone-claim-{job_id}"),
+                    heartbeat_interval,
+                    move || {
+                        let queue = renewal_queue.clone();
+                        let worker_id = renewal_worker_id.clone();
+                        let auth_expired = renewal_auth_expired.clone();
+                        async move {
+                            let renewed = queue.heartbeat(&worker_id, Some(job_id)).await;
+                            if let Err(error) = &renewed
+                                && is_queue_auth_expired(error)
+                            {
+                                auth_expired.store(true, Ordering::Relaxed);
+                            }
+                            renewed
+                        }
+                    },
+                );
+                let result = match heartbeat {
+                    Err(error) => {
+                        error!("failed to start claim heartbeat for job {job_id}: {error:#}");
+                        build.abort();
+                        let _ = build.await;
+                        Err(BuildError::retryable(format!(
+                            "claim heartbeat unavailable: {error:#}"
+                        )))
+                    }
+                    Ok((mut heartbeat, mut heartbeat_failure)) => {
+                        let result = tokio::select! {
+                            joined = &mut build => {
+                                match joined {
+                                    Ok(result) => result,
+                                    Err(error) => Err(BuildError::retryable(format!(
+                                        "build task panicked: {error}"
+                                    ))),
+                                }
+                            }
+                            failure = &mut heartbeat_failure => {
+                                let error = failure.unwrap_or_else(|_| {
+                                    "claim heartbeat exited without reporting a result".to_string()
+                                });
+                                error!("active claim heartbeat failed for job {job_id}: {error}");
+                                build.abort();
+                                let _ = build.await;
+                                Err(BuildError::retryable(format!(
+                                    "durable claim lost while building: {error}"
+                                )))
+                            }
+                        };
+                        heartbeat.stop_and_join();
+                        result
+                    }
+                };
+                if heartbeat_auth_expired.load(Ordering::Relaxed) {
                     current_job.store(-1, Ordering::Relaxed);
                     info!(
                         "queue token expired (401) during active build; exiting cleanly for respawn"

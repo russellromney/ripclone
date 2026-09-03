@@ -7471,6 +7471,95 @@ fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
     SEM.get_or_init(|| tokio::sync::Semaphore::new(4))
 }
 
+/// Handle to a claim-renewal thread. Dropping it stops and joins the thread.
+pub struct DedicatedClaimHeartbeat {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DedicatedClaimHeartbeat {
+    pub fn stop_and_join(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            error!("dedicated claim heartbeat thread panicked");
+        }
+    }
+}
+
+impl Drop for DedicatedClaimHeartbeat {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+fn spawn_dedicated_claim_heartbeat<F>(
+    thread_name: String,
+    interval: Duration,
+    mut heartbeat: F,
+) -> Result<(
+    DedicatedClaimHeartbeat,
+    tokio::sync::oneshot::Receiver<String>,
+)>
+where
+    F: FnMut() -> Result<()> + Send + 'static,
+{
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let (failure_tx, failure_rx) = tokio::sync::oneshot::channel();
+    let thread = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            loop {
+                if let Err(error) = heartbeat() {
+                    let _ = failure_tx.send(format!("{error:#}"));
+                    return;
+                }
+                match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        })
+        .context("spawn dedicated claim heartbeat thread")?;
+    Ok((
+        DedicatedClaimHeartbeat {
+            stop: Some(stop_tx),
+            thread: Some(thread),
+        },
+        failure_rx,
+    ))
+}
+
+/// Renew an active durable claim from a dedicated OS thread with its own
+/// current-thread runtime.
+///
+/// Both worker shapes use this. Renewal must not share the runtime that runs
+/// the build: a build that saturates every runtime worker thread would starve
+/// a runtime-scheduled renewal and let the claim go stale while the build is
+/// still healthy. The returned receiver resolves with the first renewal error,
+/// so the caller can abort the build instead of publishing under a lost claim.
+pub fn spawn_dedicated_claim_heartbeat_thread<F, Fut>(
+    thread_name: String,
+    interval: Duration,
+    mut renew: F,
+) -> Result<(
+    DedicatedClaimHeartbeat,
+    tokio::sync::oneshot::Receiver<String>,
+)>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build dedicated claim heartbeat runtime")?;
+    spawn_dedicated_claim_heartbeat(thread_name, interval, move || runtime.block_on(renew()))
+}
+
 /// Run embedded workers against the same durable jobs table used by admission.
 /// A slot starts one Head at a time. After Head publishes, the claimed job keeps
 /// running and heartbeating in its own task while the slot starts another Head.
@@ -7571,36 +7660,54 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                 .max(1)
                                 .unsigned_abs(),
                             );
-                            let mut heartbeat = tokio::time::interval(heartbeat_interval);
-                            heartbeat
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                            loop {
-                                tokio::select! {
-                                    joined = &mut build => {
-                                        break match joined {
-                                            Ok(result) => result,
-                                            Err(error) => Err(BuildError::retryable(format!(
-                                                "build task panicked: {error}"
-                                            ))),
-                                        };
-                                    }
-                                    _ = heartbeat.tick() => {
-                                        if let Err(error) = worker_queue
-                                            .heartbeat(&owner, Some(claimed.id))
-                                            .await
-                                        {
+                            let heartbeat_queue = worker_queue.clone();
+                            let heartbeat_owner = owner.clone();
+                            let heartbeat_job = claimed.id;
+                            let heartbeat = spawn_dedicated_claim_heartbeat_thread(
+                                format!("ripclone-claim-{heartbeat_job}"),
+                                heartbeat_interval,
+                                move || {
+                                    let queue = heartbeat_queue.clone();
+                                    let owner = heartbeat_owner.clone();
+                                    async move { queue.heartbeat(&owner, Some(heartbeat_job)).await }
+                                },
+                            )
+                            .map_err(|error| BuildError::retryable(format!("{error:#}")));
+                            match heartbeat {
+                                Err(error) => {
+                                    build.abort();
+                                    let _ = build.await;
+                                    Err(error)
+                                }
+                                Ok((mut heartbeat, mut heartbeat_failure)) => {
+                                    let result = tokio::select! {
+                                        joined = &mut build => {
+                                            match joined {
+                                                Ok(result) => result,
+                                                Err(error) => Err(BuildError::retryable(format!(
+                                                    "build task panicked: {error}"
+                                                ))),
+                                            }
+                                        }
+                                        failure = &mut heartbeat_failure => {
+                                            let error = failure.unwrap_or_else(|_| {
+                                                "dedicated heartbeat exited without reporting a result"
+                                                    .to_string()
+                                            });
                                             error!(
-                                                "embedded worker lost claim for job {}: {error:#}",
+                                                "embedded worker lost claim for job {}: {error}",
                                                 claimed.id
                                             );
                                             admission_test_claim_lost();
                                             build.abort();
                                             let _ = build.await;
-                                            break Err(BuildError::retryable(format!(
-                                                "durable claim lost while building: {error:#}"
-                                            )));
+                                            Err(BuildError::retryable(format!(
+                                                "durable claim lost while building: {error}"
+                                            )))
                                         }
-                                    }
+                                    };
+                                    heartbeat.stop_and_join();
+                                    result
                                 }
                             }
                         }
@@ -7958,6 +8065,38 @@ pub async fn run_server_with_barrier(
 mod tests {
     use super::*;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn dedicated_claim_heartbeat_progresses_while_tokio_caller_is_blocked() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let heartbeat_ticks = Arc::clone(&ticks);
+        let (mut heartbeat, mut failure) = spawn_dedicated_claim_heartbeat(
+            "ripclone-heartbeat-test".to_string(),
+            Duration::from_millis(10),
+            move || {
+                heartbeat_ticks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect("spawn heartbeat test thread");
+
+        // Model a build that blocks its Tokio worker. A timer future on that
+        // runtime could not run here; the dedicated renewal thread must.
+        std::thread::sleep(Duration::from_millis(55));
+        heartbeat.stop_and_join();
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 3,
+            "claim renewal stopped with the caller runtime"
+        );
+        assert!(
+            matches!(
+                failure.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "successful heartbeat unexpectedly reported failure"
+        );
+    }
 
     fn ready_artifacts(commit: &str, label: &str) -> crate::ClonepackArtifacts {
         let hash = |suffix: &str| crate::cas::hash(format!("{label}-{suffix}").as_bytes());

@@ -220,6 +220,30 @@ impl ApiJobQueue {
         self
     }
 
+    /// A renewal-only copy of this queue with its own HTTP client.
+    ///
+    /// Claim renewal runs on a dedicated thread with its own runtime. hyper
+    /// drives a connection from the runtime that opened it, so a connection
+    /// pooled by the build runtime stalls when a build saturates that runtime
+    /// and the claim goes stale while the build is healthy. A client used only
+    /// from the renewal thread opens every connection on the renewal runtime,
+    /// so its pool is safe to reuse.
+    pub fn for_claim_renewal(&self) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .context("build HTTP client for dedicated claim renewal")?;
+        Ok(Self {
+            base_url: self.base_url.clone(),
+            job_token: self.job_token.clone(),
+            client,
+            heartbeat_timeout_secs: self.heartbeat_timeout_secs,
+            max_size_class: self.max_size_class.clone(),
+            last_status: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// POST `body` to `path` and deserialize the JSON response. Maps transport /
     /// status failures to a retryable / unauthorized / permanent
     /// [`ApiReportError`] so nothing is silently dropped.

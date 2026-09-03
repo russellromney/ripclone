@@ -719,6 +719,51 @@ where
     }
 }
 
+fn spawn_downloads_to_bounded_channel<J, O, F, Fut>(
+    jobs: Vec<J>,
+    concurrency: usize,
+    channel_depth: usize,
+    download: F,
+) -> (
+    tokio::task::JoinHandle<Result<Duration>>,
+    tokio::sync::mpsc::Receiver<Result<O>>,
+)
+where
+    J: Send + 'static,
+    O: Send + 'static,
+    F: Fn(J) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O>> + Send + 'static,
+{
+    use futures::stream::{self, StreamExt, TryStreamExt};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(channel_depth.max(1));
+    let download = Arc::new(download);
+    let task = tokio::spawn(async move {
+        let started = Instant::now();
+        stream::iter(jobs)
+            .map(|job| {
+                let tx = tx.clone();
+                let download = Arc::clone(&download);
+                async move {
+                    let result = download(job).await;
+                    let failed = result.is_err();
+                    tx.send(result)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("download stage receiver dropped"))?;
+                    if failed {
+                        anyhow::bail!("download stage worker failed");
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+            })
+            .buffer_unordered(concurrency.max(1))
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(started.elapsed())
+    });
+    (task, rx)
+}
+
 /// Download an artifact into memory. Used for artifacts small enough to hold
 /// whole: manifests, metadata, pack indexes, archive chunks, and HEAD packs.
 async fn fetch_artifact_bytes(
@@ -741,6 +786,8 @@ async fn fetch_artifact_bytes_once(
     expected_len: Option<u64>,
     signed: bool,
 ) -> std::result::Result<bytes::Bytes, FetchFailure> {
+    use futures::StreamExt;
+
     wait_for_test_before_buffered_artifact(hash)
         .await
         .map_err(FetchFailure::Permanent)?;
@@ -752,20 +799,28 @@ async fn fetch_artifact_bytes_once(
     if let Some(failure) = classify_fetch_status(resp.status(), signed, hash) {
         return Err(failure);
     }
-    // R1: keep the body as `Bytes` (a refcounted buffer) instead of copying
-    // it into a fresh Vec — it flows through the cache and on to the consumer
-    // without a second per-artifact copy. A retry of this buffered path starts
-    // only this artifact again from byte zero.
-    let data = resp
-        .bytes()
-        .await
-        .map_err(|e| FetchFailure::Retry(anyhow::anyhow!("artifact body read error: {e}")))?;
-    verify_fetched_artifact(
-        hash,
-        expected_len,
-        data.len() as u64,
-        &crate::cas::hash(&data),
-    )?;
+    // Hash as chunks arrive so SHA-256 overlaps the wire instead of adding a
+    // second whole-artifact pass after the response has drained. `BytesMut`
+    // assembles the buffered artifact once and `freeze` hands the same storage
+    // to the cache/parser without another copy.
+    const MAX_INITIAL_BUFFER: usize = 64 * 1024 * 1024;
+    let initial_capacity = resp
+        .content_length()
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or_default()
+        .min(MAX_INITIAL_BUFFER);
+    let mut data = bytes::BytesMut::with_capacity(initial_capacity);
+    let mut hasher = sha2::Sha256::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| FetchFailure::Retry(anyhow::anyhow!("artifact body read error: {e}")))?;
+        hasher.update(&chunk);
+        data.extend_from_slice(&chunk);
+    }
+    let data = data.freeze();
+    let actual_hash = hex::encode(hasher.finalize());
+    verify_fetched_artifact(hash, expected_len, data.len() as u64, &actual_hash)?;
     Ok(data)
 }
 
@@ -1080,7 +1135,16 @@ fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
         + metadata.files.len() * 64) as u64
 }
 
-const INSTALL_STAGING_MARKER: &str = ".ripclone-install-staging";
+const INSTALL_STAGING_MARKER_SUFFIX: &str = ".ripclone-install-staging";
+
+fn install_staging_marker_path(staging_dir: &Path) -> PathBuf {
+    let mut marker_name = staging_dir
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("ripclone.tmp"))
+        .to_os_string();
+    marker_name.push(INSTALL_STAGING_MARKER_SUFFIX);
+    staging_dir.with_file_name(marker_name)
+}
 
 #[cfg(unix)]
 fn lock_staging_marker(marker: &std::fs::File, nonblocking: bool) -> Result<()> {
@@ -1100,14 +1164,39 @@ fn lock_staging_marker(marker: &std::fs::File, nonblocking: bool) -> Result<()> 
 }
 
 struct StagedTempDir {
-    dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
+    marker_path: PathBuf,
     #[cfg(unix)]
     _marker_lock: std::fs::File,
 }
 
 impl StagedTempDir {
     fn path(&self) -> &Path {
-        self.dir.path()
+        self.dir
+            .as_ref()
+            .expect("staged temp directory exists until drop")
+            .path()
+    }
+}
+
+impl Drop for StagedTempDir {
+    fn drop(&mut self) {
+        let staging_path = self.path().to_path_buf();
+        // TempDir performs the recursive cleanup. Preserve the sidecar marker
+        // if that cleanup fails so a later clone can still identify and remove
+        // the abandoned staging directory safely.
+        drop(self.dir.take());
+        if staging_path.exists() {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(&self.marker_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "cannot remove clone staging marker {}: {error}",
+                self.marker_path.display()
+            );
+        }
     }
 }
 
@@ -1139,10 +1228,11 @@ fn cleanup_stale_install_dirs(target: &Path, parent: &Path) {
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
+        let marker_path = install_staging_marker_path(&path);
         let Ok(mut marker) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path.join(INSTALL_STAGING_MARKER))
+            .open(&marker_path)
         else {
             continue;
         };
@@ -1162,6 +1252,14 @@ fn cleanup_stale_install_dirs(target: &Path, parent: &Path) {
                 path.display()
             );
         } else {
+            if let Err(error) = std::fs::remove_file(&marker_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    "cannot remove stale clone staging marker {}: {error}",
+                    marker_path.display()
+                );
+            }
             info!("removed stale clone staging directory {}", path.display());
         }
     }
@@ -1189,7 +1287,7 @@ fn temp_install_dir(target: &Path) -> Result<StagedTempDir> {
         .suffix(".tmp")
         .tempdir_in(parent)
         .context("create temp install directory")?;
-    let marker_path = tmp.path().join(INSTALL_STAGING_MARKER);
+    let marker_path = install_staging_marker_path(tmp.path());
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -1205,14 +1303,18 @@ fn temp_install_dir(target: &Path) -> Result<StagedTempDir> {
             .write_all(b"ripclone\n")
             .context("mark temp install directory")?;
         Ok(StagedTempDir {
-            dir: tmp,
+            dir: Some(tmp),
+            marker_path,
             _marker_lock: marker_lock,
         })
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(marker_path, b"ripclone\n").context("mark temp install directory")?;
-        Ok(StagedTempDir { dir: tmp })
+        std::fs::write(&marker_path, b"ripclone\n").context("mark temp install directory")?;
+        Ok(StagedTempDir {
+            dir: Some(tmp),
+            marker_path,
+        })
     }
 }
 
@@ -3086,6 +3188,36 @@ impl Client {
 
         // 6. Write the small .git artifacts from the metadata chunk.
         let pack_dir = git_dir.join("objects").join("pack");
+        let mut editable_front_matter_tx = None;
+        let editable_packs = if mode.needs_pack_worktree() {
+            let (front_matter_tx, front_matter_rx) = tokio::sync::oneshot::channel();
+            editable_front_matter_tx = Some(front_matter_tx);
+            let client = self.clone();
+            let manifest = Arc::clone(&manifest);
+            let metadata = Arc::clone(&metadata);
+            let pack_dir = pack_dir.clone();
+            let work_tree = install_root.clone();
+            let task_cleanup = cleanup.clone();
+            let artifact_refresh = artifact_refresh.clone();
+            Some(AbortOnDrop::new(
+                tokio::spawn(async move {
+                    client
+                        .install_editable_packs(
+                            manifest,
+                            pack_dir,
+                            work_tree,
+                            metadata,
+                            task_cleanup,
+                            artifact_refresh,
+                            front_matter_rx,
+                        )
+                        .await
+                }),
+                cleanup.clone(),
+            ))
+        } else {
+            None
+        };
         if !files_only {
             std::fs::create_dir_all(&pack_dir)?;
             let skeleton_hash = cas_hash(&metadata.skeleton_pack);
@@ -3106,6 +3238,9 @@ impl Client {
             );
         } else {
             info!("files mode: skipped .git skeleton pack, idx, and index install");
+        }
+        if let Some(front_matter_tx) = editable_front_matter_tx.take() {
+            let _ = front_matter_tx.send(());
         }
         bench.mark_metadata();
 
@@ -3151,18 +3286,9 @@ impl Client {
         // parallel and, as each lands, install it and extract its blobs into the
         // working tree. Download and extraction overlap.
         let mut prebuilt_blob_pack_bytes = 0u64;
-        if mode.needs_pack_worktree() {
-            prebuilt_blob_pack_bytes = self
-                .install_editable_packs(
-                    &manifest,
-                    &pack_dir,
-                    &install_root,
-                    &metadata,
-                    cleanup,
-                    &artifact_refresh,
-                )
-                .await
-                .context("install editable packs")?;
+        if let Some(handle) = editable_packs {
+            prebuilt_blob_pack_bytes =
+                handle.join().await.context("editable pack coordinator")??;
             bench.mark_write();
             info!(
                 "installed + extracted {} editable packs ({} bytes)",
@@ -3238,8 +3364,6 @@ impl Client {
         } else {
             // Optional durability barrier: flush the staged tree, publish it,
             // then flush the parent directory so the rename itself is durable.
-            std::fs::remove_file(install_root.join(INSTALL_STAGING_MARKER))
-                .context("remove clone staging marker before publish")?;
             if fsync_requested() {
                 fsync_tree(&install_root).context("fsync staged clone before publish")?;
             }
@@ -3384,20 +3508,26 @@ impl Client {
     /// manifest file table to map blobs to paths. Returns total bytes downloaded.
     async fn install_editable_packs(
         &self,
-        manifest: &ClonepackManifest,
-        pack_dir: &std::path::Path,
-        work_tree: &std::path::Path,
-        metadata: &MetadataChunk,
-        cleanup: &AttemptCleanup,
-        artifact_refresh: &PinnedArtifactRefresh,
+        manifest: Arc<ClonepackManifest>,
+        pack_dir: PathBuf,
+        work_tree: PathBuf,
+        metadata: Arc<MetadataChunk>,
+        cleanup: AttemptCleanup,
+        artifact_refresh: PinnedArtifactRefresh,
+        front_matter_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<u64> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         if manifest.packs.is_empty() {
             anyhow::bail!("clonepack has no packs for editable install");
         }
-        std::fs::create_dir_all(pack_dir)
+        std::fs::create_dir_all(&pack_dir)
             .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
+
+        let tuning = ClientTuning::load();
+        let download_conc = tuning.editable_download_concurrency;
+        let parse_conc = tuning.pack_parse_threads;
+        let pipeline_started = Instant::now();
 
         let bundle_ref = manifest
             .idx_bundle
@@ -3444,48 +3574,11 @@ impl Client {
             )
         });
 
-        // Validate every blob sha1 length up front so `build_blob_path_map`
-        // indexes every file and the files-written guard below is exact (a
-        // non-20-byte sha1 would otherwise be silently skipped and trip a
-        // misleading count mismatch).
-        for f in &metadata.files {
-            if f.blob_sha1.len() != 20 {
-                anyhow::bail!(
-                    "manifest blob_sha1 for {} is {} bytes, expected 20",
-                    String::from_utf8_lossy(&f.path),
-                    f.blob_sha1.len()
-                );
-            }
-        }
-
-        // Build the blob→paths map and pre-create directories single-threaded
-        // before the parallel writers run.
-        let blob_map = Arc::new(crate::extract::build_blob_path_map(&metadata.files));
-        crate::extract::prepare_worktree_dirs(work_tree, &metadata.files)
-            .context("prepare worktree dirs")?;
-        let worktree_writer = Arc::new(crate::worktree_writer::WorktreeWriter::new()?);
-
-        // Download and pack parsing are decoupled stages with independent
-        // concurrency. Keep zlib inflate + SHA-1 parse workers capped at core
-        // count even when the writer backend can profit from deeper io_uring
-        // submission; otherwise `2 * cores` write defaults turn into `2 * cores`
-        // CPU parse tasks.
-        let tuning = ClientTuning::load();
-        let download_conc = tuning.editable_download_concurrency;
-        let parse_conc = tuning.pack_parse_threads;
-
-        // Fetch the required bundle once and slice every verified pack idx from it.
-        let idx_bundle = Arc::new(
-            idx_bundle_task
-                .join()
-                .await
-                .context("idx bundle fetch task")??,
-        );
-
-        let jobs: Vec<(usize, PackEntry)> = manifest.packs.iter().cloned().enumerate().collect();
-
         enum PackBody {
-            Buffered(bytes::Bytes),
+            Buffered {
+                bytes: bytes::Bytes,
+                _memory_permit: tuning::EditablePackMemoryPermit,
+            },
             TempFile {
                 file: tempfile::NamedTempFile,
                 len: u64,
@@ -3495,72 +3588,140 @@ impl Client {
         impl PackBody {
             fn len(&self) -> u64 {
                 match self {
-                    PackBody::Buffered(bytes) => bytes.len() as u64,
+                    PackBody::Buffered { bytes, .. } => bytes.len() as u64,
                     PackBody::TempFile { len, .. } => *len,
                 }
             }
         }
 
-        // Stage 1: download packs (network concurrency `download_conc`).
-        let downloads = stream::iter(jobs).map(|(i, entry)| {
-            let client = self.clone();
-            let idx_bundle = idx_bundle.clone();
-            let history_only = entry.history_only;
-            let pack_dir = pack_dir.to_path_buf();
-            let artifact_refresh = artifact_refresh.clone();
-            async move {
-                let pack_ref = entry
-                    .pack
-                    .as_ref()
-                    .with_context(|| format!("pack {} missing pack ref", i))?;
-                let idx_bytes = manifest_pack_idx_bytes(&entry, i, &idx_bundle)?;
-                let pack_fetch_start = std::time::Instant::now();
-                let pack_body = if history_only {
-                    let (file, len) = client
-                        .fetch_chunk_ref_to_temp(pack_ref, &pack_dir, &artifact_refresh, i)
-                        .await
-                        .with_context(|| format!("stream history pack {}", i))?;
-                    crate::perf::record_editable_pack_fetch(pack_fetch_start.elapsed(), len);
-                    PackBody::TempFile { file, len }
-                } else {
-                    let hash = hash_to_hex(&pack_ref.hash);
-                    let bytes = client
-                        .fetch_verified_artifact_for_install(
-                            &hash,
-                            Some(pack_ref.len),
-                            &artifact_refresh,
-                            ArtifactUrlKind::PackChunk(i),
-                        )
-                        .await
-                        .with_context(|| format!("fetch head pack {}", i))?;
-                    crate::perf::record_editable_pack_fetch(
-                        pack_fetch_start.elapsed(),
-                        bytes.len() as u64,
-                    );
-                    PackBody::Buffered(bytes)
-                };
-                Ok::<(usize, bool, PackBody, bytes::Bytes), anyhow::Error>((
-                    i,
-                    history_only,
-                    pack_body,
-                    idx_bytes,
-                ))
-            }
+        let mut jobs: Vec<(usize, PackEntry)> =
+            manifest.packs.iter().cloned().enumerate().collect();
+        jobs.sort_by_key(|(_, entry)| {
+            std::cmp::Reverse(entry.pack.as_ref().map_or(0, |pack| pack.len))
+        });
+        let download_channel_depth = jobs.len().min(download_conc).max(1);
+        let download_client = self.clone();
+        let download_pack_dir = pack_dir.clone();
+        let download_refresh = artifact_refresh.clone();
+        let (download_handle, download_rx) = spawn_downloads_to_bounded_channel(
+            jobs,
+            download_conc,
+            download_channel_depth,
+            move |(i, entry)| {
+                let client = download_client.clone();
+                let pack_dir = download_pack_dir.clone();
+                let artifact_refresh = download_refresh.clone();
+                async move {
+                    let pack_ref = entry
+                        .pack
+                        .as_ref()
+                        .with_context(|| format!("pack {} missing pack ref", i))?;
+                    let history_only = entry.history_only;
+                    let pack_fetch_start = std::time::Instant::now();
+                    let pack_body = if history_only {
+                        let (file, len) = client
+                            .fetch_chunk_ref_to_temp(pack_ref, &pack_dir, &artifact_refresh, i)
+                            .await
+                            .with_context(|| format!("stream history pack {}", i))?;
+                        crate::perf::record_editable_pack_fetch(pack_fetch_start.elapsed(), len);
+                        PackBody::TempFile { file, len }
+                    } else {
+                        // Hold a process-wide weighted permit from before the
+                        // body starts buffering until its blocking parser exits.
+                        // Concurrent clones therefore share one byte budget;
+                        // one oversized pack runs alone instead of stacking
+                        // with other completed bodies.
+                        let memory_permit =
+                            tuning::acquire_editable_pack_memory(pack_ref.len).await;
+                        let hash = hash_to_hex(&pack_ref.hash);
+                        let bytes = client
+                            .fetch_verified_artifact_for_install(
+                                &hash,
+                                Some(pack_ref.len),
+                                &artifact_refresh,
+                                ArtifactUrlKind::PackChunk(i),
+                            )
+                            .await
+                            .with_context(|| format!("fetch head pack {}", i))?;
+                        crate::perf::record_editable_pack_fetch(
+                            pack_fetch_start.elapsed(),
+                            bytes.len() as u64,
+                        );
+                        PackBody::Buffered {
+                            bytes,
+                            _memory_permit: memory_permit,
+                        }
+                    };
+                    Ok((i, history_only, entry, pack_body))
+                }
+            },
+        );
+        let download_task = AbortOnDrop::new(download_handle, cleanup.clone());
+
+        let prep_metadata = Arc::clone(&metadata);
+        let prep_work_tree = work_tree.clone();
+        let prep_task = AbortOnDrop::new(
+            tokio::task::spawn_blocking(move || {
+                // Validate every blob sha1 length before building the complete
+                // blob map so the files-written guard below remains exact.
+                for file in &prep_metadata.files {
+                    if file.blob_sha1.len() != 20 {
+                        anyhow::bail!(
+                            "manifest blob_sha1 for {} is {} bytes, expected 20",
+                            String::from_utf8_lossy(&file.path),
+                            file.blob_sha1.len()
+                        );
+                    }
+                }
+                let blob_map = Arc::new(crate::extract::build_blob_path_map(&prep_metadata.files));
+                crate::extract::prepare_worktree_dirs(&prep_work_tree, &prep_metadata.files)
+                    .context("prepare worktree dirs")?;
+                let writer = Arc::new(crate::worktree_writer::WorktreeWriter::new()?);
+                Ok::<_, anyhow::Error>((blob_map, writer))
+            }),
+            cleanup.clone(),
+        );
+
+        let idx_bundle = async {
+            idx_bundle_task
+                .join()
+                .await
+                .context("idx bundle fetch task")?
+        };
+        let prep = async {
+            prep_task
+                .join()
+                .await
+                .context("worktree directory preparation task")?
+        };
+        let (idx_bundle, (blob_map, worktree_writer)) = tokio::try_join!(idx_bundle, prep)?;
+        let idx_bundle = Arc::new(idx_bundle);
+
+        // Pack bodies, the idx bundle, worktree directory creation, and the
+        // small skeleton writes all start independently. Installation waits at
+        // this one-way boundary so the pack database cannot race its skeleton.
+        front_matter_rx
+            .await
+            .context("editable front matter did not finish")?;
+
+        let downloads = stream::unfold(download_rx, |mut rx| async move {
+            rx.recv().await.map(|result| (result, rx))
         });
 
         // Stage 2: install each pack; hand-parse for the worktree only when it's
         // a HEAD-closure (undeltified) pack. History-only packs are deltified —
         // installed for the object DB, read by git, never hand-parsed.
         let total = downloads
-            .buffer_unordered(download_conc)
             .map(|res| {
                 let pack_dir = pack_dir.to_path_buf();
                 let work_tree = work_tree.to_path_buf();
+                let idx_bundle = Arc::clone(&idx_bundle);
                 let blob_map = Arc::clone(&blob_map);
                 let worktree_writer = Arc::clone(&worktree_writer);
                 let cleanup = cleanup.clone();
                 async move {
-                    let (i, history_only, pack_body, idx_bytes) = res?;
+                    let (i, history_only, entry, pack_body) = res?;
+                    let idx_bytes = manifest_pack_idx_bytes(&entry, i, &idx_bundle)?;
                     let idx_len = u64::try_from(idx_bytes.len())
                         .context("pack idx length does not fit in u64")?;
                     let bytes = pack_body
@@ -3588,7 +3749,13 @@ impl Client {
                                     );
                                 }
                                 let (name, pack_bytes) = match pack_body {
-                                    PackBody::Buffered(pack_bytes) => {
+                                    PackBody::Buffered {
+                                        bytes: pack_bytes,
+                                        _memory_permit,
+                                    } => {
+                                        // Keep the weighted memory permit alive
+                                        // for the complete write/extract path.
+                                        let _memory_permit = _memory_permit;
                                         // Git names packs by the 20-byte trailer sha; the idx
                                         // pairs to the pack by basename.
                                         let name =
@@ -3665,6 +3832,15 @@ impl Client {
                 },
             )
             .await?;
+        let download_elapsed = download_task
+            .join()
+            .await
+            .context("editable pack download coordinator")??;
+        info!(
+            download_wall_ms = download_elapsed.as_millis(),
+            pipeline_wall_ms = pipeline_started.elapsed().as_millis(),
+            "editable pack downloads overlapped independent install work"
+        );
         let (total, files_written, stat_cache) = total;
 
         // Guard against silent under-extraction (e.g. a sha/format mismatch):
@@ -3678,13 +3854,18 @@ impl Client {
         }
 
         // Files are materialized; clear skip-worktree for every tracked path.
-        let path_bytes: Vec<Vec<u8>> = metadata.files.iter().map(|e| e.path.clone()).collect();
-        let work_tree2 = work_tree.to_path_buf();
+        // Move a shared metadata handle into the worker instead of duplicating
+        // the entire 94k-path table at this serial tail.
+        let index_metadata = Arc::clone(&metadata);
+        let index_work_tree = work_tree.to_path_buf();
         AbortOnDrop::new(
             tokio::task::spawn_blocking(move || {
                 crate::git::clear_skip_worktree_index_with_stats_byte_iter(
-                    &work_tree2,
-                    path_bytes.iter().map(Vec::as_slice),
+                    &index_work_tree,
+                    index_metadata
+                        .files
+                        .iter()
+                        .map(|entry| entry.path.as_slice()),
                     &stat_cache,
                 )
             }),
@@ -3968,14 +4149,7 @@ impl Client {
         let status = self
             .run_managed_git(
                 install_root,
-                [
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                    "--",
-                    ".",
-                    ":(exclude).ripclone-install-staging",
-                ],
+                ["status", "--porcelain=v1", "--untracked-files=all"],
                 None,
                 cleanup,
             )
@@ -4351,7 +4525,7 @@ mod tests {
 
         let stale = dir.path().join("linux.ripclone-old.tmp");
         std::fs::create_dir(&stale).unwrap();
-        std::fs::write(stale.join(INSTALL_STAGING_MARKER), b"ripclone\n").unwrap();
+        std::fs::write(install_staging_marker_path(&stale), b"ripclone\n").unwrap();
         std::fs::write(stale.join("partial"), b"partial clone").unwrap();
 
         let live = temp_install_dir(&target).unwrap();
@@ -4365,7 +4539,31 @@ mod tests {
         assert!(!stale.exists());
         assert!(live_path.exists());
         assert!(unmarked.exists());
-        assert!(created.path().join(INSTALL_STAGING_MARKER).is_file());
+        assert!(install_staging_marker_path(created.path()).is_file());
+        assert!(!created.path().join(INSTALL_STAGING_MARKER_SUFFIX).exists());
+    }
+
+    #[test]
+    fn staging_marker_name_in_repository_survives_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("collision");
+        let staged = temp_install_dir(&target).unwrap();
+        let staging_path = staged.path().to_path_buf();
+        let sidecar = install_staging_marker_path(&staging_path);
+        std::fs::write(
+            staging_path.join(INSTALL_STAGING_MARKER_SUFFIX),
+            b"tracked repository content\n",
+        )
+        .unwrap();
+
+        std::fs::rename(&staging_path, &target).unwrap();
+        drop(staged);
+
+        assert_eq!(
+            std::fs::read(target.join(INSTALL_STAGING_MARKER_SUFFIX)).unwrap(),
+            b"tracked repository content\n"
+        );
+        assert!(!sidecar.exists());
     }
 
     #[test]
@@ -4556,6 +4754,45 @@ mod tests {
             .expect_err("a wrong content address is rejected");
         assert!(matches!(wrong, FetchFailure::Permanent(_)));
         assert!(format!("{:#}", wrong.into_error()).contains("hash mismatch"));
+    }
+
+    #[tokio::test]
+    async fn spawned_download_stage_progresses_while_consumer_is_stalled() {
+        let entered = Arc::new(tokio::sync::Barrier::new(3));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let download_entered = Arc::clone(&entered);
+        let download_completed = Arc::clone(&completed);
+        let (task, mut rx) =
+            spawn_downloads_to_bounded_channel(vec![0usize, 1usize], 2, 2, move |job| {
+                let entered = Arc::clone(&download_entered);
+                let completed = Arc::clone(&download_completed);
+                async move {
+                    entered.wait().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(job)
+                }
+            });
+
+        // Both downloads have started. Do not receive anything yet: this
+        // models every parser slot being occupied by blocking extraction.
+        entered.wait().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while completed.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawned downloads progress without consumer polling");
+
+        task.await
+            .expect("download coordinator task")
+            .expect("download coordinator result");
+        let mut values = vec![
+            rx.recv().await.expect("first queued result").unwrap(),
+            rx.recv().await.expect("second queued result").unwrap(),
+        ];
+        values.sort_unstable();
+        assert_eq!(values, vec![0, 1]);
     }
 
     #[tokio::test]
