@@ -1881,7 +1881,7 @@ async fn default_branch_rename_reuses_commit_and_returns_each_operations_name() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reclaimed_worker_cannot_publish_before_heartbeat_detects_loss() {
+async fn transferred_claim_ownership_rejects_the_old_attempts_publication() {
     let _guard = env_lock().lock().await;
     setup(false);
     unsafe {
