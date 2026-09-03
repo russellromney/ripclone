@@ -469,239 +469,339 @@ fn admission_test_probe() -> Option<Arc<AdmissionTestProbe>> {
         .clone()
 }
 
-pub async fn admission_test_before_claim() {
-    if let Some(probe) = admission_test_probe() {
-        probe.before_claim.wait().await;
-    }
+/// A single interception point in production control flow where a test may
+/// want to observe or pause execution. One variant per point; adding a new
+/// hook means adding a variant here, not a new function.
+pub enum TestStage<'a> {
+    BeforeClaim,
+    AfterClaim,
+    BeforeAdmissionTx(&'a str),
+    InsideAdmissionTx(&'a str),
+    TipProbe,
+    RefStoreWrite,
+    ArtifactUpload,
+    FetchEntry(Option<&'a str>),
+    BuilderEntry(&'a str),
+    HeadBuild,
+    /// Merges the in-process `after_head_entry` probe wait with the
+    /// cross-process, file-signaled after-Head barrier (used when the test
+    /// drives a separately spawned server binary).
+    AfterHeadBarrier(&'a str),
+    HeadPublished,
+    FullBuild(&'a str),
+    FilesBuild(&'a str),
+    BitmapWrite,
+    BeforeFullPublish,
+    AfterFullPublish,
+    FullPublished(&'a str),
+    BeforeFilesPublish,
+    AfterFilesPublish,
+    FilesPublished,
+    EmbeddedIdleWait,
+    EmbeddedWake {
+        fallback: bool,
+    },
+    ClaimLost,
+    BuildFailure {
+        commit: Option<&'a str>,
+        message: &'a str,
+    },
+    Http(String),
+    Enqueue(EnqueueOutcome),
+    PendingResponse,
+    RepoReadsDenied,
+    /// Cross-process, file-signaled barrier used only by the direct
+    /// worker-crash tests, keyed by an upload-pipeline stage name
+    /// (`before_upload`, `during_upload`, `after_upload`,
+    /// `before_ready_publication`).
+    BuildCrash {
+        stage: &'static str,
+        commit: &'a str,
+    },
 }
 
-pub async fn admission_test_after_claim() {
-    if let Some(probe) = admission_test_probe() {
-        probe.after_claim.wait().await;
-    }
-}
-
-async fn admission_test_before_admission_tx(commit: &str) {
-    if let Some(probe) = admission_test_probe() {
-        let held = probe
-            .admission_tx_target
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_deref()
-            == Some(commit);
-        if held {
-            probe.before_admission_tx.wait().await;
+/// The one call form production code uses to reach every test hook:
+/// `test_hook(TestStage::Whatever).await?`. A no-op unless `RIPCLONE_TESTING`
+/// is set and the relevant fixture (probe or barrier directory) is installed.
+/// The bool result is meaningful only for stages that report one
+/// (`FullBuild`, `FilesBuild`, `RepoReadsDenied`); everywhere else it is
+/// `false` and ignored.
+pub async fn test_hook(stage: TestStage<'_>) -> Result<bool> {
+    match stage {
+        TestStage::BeforeClaim => {
+            if let Some(probe) = admission_test_probe() {
+                probe.before_claim.wait().await;
+            }
+        }
+        TestStage::AfterClaim => {
+            if let Some(probe) = admission_test_probe() {
+                probe.after_claim.wait().await;
+            }
+        }
+        TestStage::BeforeAdmissionTx(commit) => {
+            if let Some(probe) = admission_test_probe() {
+                let held = probe
+                    .admission_tx_target
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_deref()
+                    == Some(commit);
+                if held {
+                    probe.before_admission_tx.wait().await;
+                }
+            }
+        }
+        TestStage::InsideAdmissionTx(commit) => {
+            if let Some(probe) = admission_test_probe() {
+                let held = probe
+                    .inside_admission_tx_target
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_deref()
+                    == Some(commit);
+                if held {
+                    probe.inside_admission_tx.wait().await;
+                }
+            }
+        }
+        TestStage::TipProbe => {
+            if let Some(probe) = admission_test_probe() {
+                probe.tip_probes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        TestStage::RefStoreWrite => {
+            if let Some(probe) = admission_test_probe() {
+                probe.ref_store_writes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        TestStage::ArtifactUpload => {
+            if let Some(probe) = admission_test_probe() {
+                probe.artifact_uploads.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        TestStage::FetchEntry(target) => {
+            if let Some(probe) = admission_test_probe() {
+                probe.exact_fetches.fetch_add(1, Ordering::SeqCst);
+                if let Some(target) = target {
+                    probe
+                        .fetch_targets
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(target.to_string());
+                }
+                probe.fetch_entry.wait().await;
+            }
+        }
+        TestStage::BuilderEntry(commit) => {
+            if let Some(probe) = admission_test_probe() {
+                probe.builder_entries.fetch_add(1, Ordering::SeqCst);
+                probe
+                    .builder_targets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(commit.to_string());
+                probe.builder_entry.wait().await;
+            }
+        }
+        TestStage::HeadBuild => {
+            if let Some(probe) = admission_test_probe() {
+                probe.head_builds.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        TestStage::HeadPublished => {
+            if let Some(probe) = admission_test_probe() {
+                probe.head_publishes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        TestStage::AfterHeadBarrier(commit) => {
+            if !explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref()) {
+                return Ok(false);
+            }
+            if let Some(probe) = admission_test_probe() {
+                probe.after_head_entry.wait().await;
+            }
+            let Some(dir) =
+                std::env::var_os("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR").map(PathBuf::from)
+            else {
+                return Ok(false);
+            };
+            if let Some(target) = std::env::var_os("RIPCLONE_TEST_AFTER_HEAD_BARRIER_COMMIT")
+                && target.to_str() != Some(commit)
+            {
+                return Ok(false);
+            }
+            std::fs::create_dir_all(&dir).context("create test after-Head barrier directory")?;
+            std::fs::write(dir.join("entered"), format!("{commit}\n"))
+                .context("signal test after-Head barrier")?;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !dir.join("proceed").exists() {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("test after-Head barrier was not released within 60 seconds");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        TestStage::FullBuild(commit) => {
+            if let Some(probe) = admission_test_probe() {
+                probe.full_builds.fetch_add(1, Ordering::SeqCst);
+                return Ok(probe
+                    .full_failure_targets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains(commit));
+            }
+        }
+        TestStage::FilesBuild(commit) => {
+            if let Some(probe) = admission_test_probe() {
+                probe.files_builds.fetch_add(1, Ordering::SeqCst);
+                return Ok(probe
+                    .files_failure_targets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains(commit));
+            }
+        }
+        TestStage::BitmapWrite => {
+            if let Some(probe) = admission_test_probe() {
+                probe.bitmap_writes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        TestStage::BeforeFullPublish => {
+            if let Some(probe) = admission_test_probe() {
+                probe.before_full_publish.wait().await;
+            }
+        }
+        TestStage::AfterFullPublish => {
+            if let Some(probe) = admission_test_probe() {
+                probe.after_full_publish.wait().await;
+            }
+        }
+        TestStage::FullPublished(commit) => {
+            if let Some(probe) = admission_test_probe() {
+                probe.full_publishes.fetch_add(1, Ordering::SeqCst);
+                probe.full_notify.notify_waiters();
+                tracing::debug!("admission test observed full publication for {commit}");
+            }
+        }
+        TestStage::BeforeFilesPublish => {
+            if let Some(probe) = admission_test_probe() {
+                probe.before_files_publish.wait().await;
+            }
+        }
+        TestStage::AfterFilesPublish => {
+            if let Some(probe) = admission_test_probe() {
+                probe.after_files_publish.wait().await;
+            }
+        }
+        TestStage::FilesPublished => {
+            if let Some(probe) = admission_test_probe() {
+                probe.files_publishes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        TestStage::EmbeddedIdleWait => {
+            if let Some(probe) = admission_test_probe() {
+                probe.embedded_idle_wait.wait().await;
+            }
+        }
+        TestStage::EmbeddedWake { fallback } => {
+            if let Some(probe) = admission_test_probe() {
+                if fallback {
+                    probe.embedded_fallback_polls.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    probe
+                        .embedded_notification_wakes
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        TestStage::ClaimLost => {
+            if let Some(probe) = admission_test_probe() {
+                probe.claim_losses.fetch_add(1, Ordering::SeqCst);
+                probe.claim_loss_notify.notify_waiters();
+            }
+        }
+        TestStage::BuildFailure { commit, message } => {
+            if let Some(probe) = admission_test_probe() {
+                probe
+                    .failure_targets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((commit.unwrap_or_default().to_string(), message.to_string()));
+                probe.failure_notify.notify_waiters();
+            }
+        }
+        TestStage::Http(event) => {
+            if let Some(probe) = admission_test_probe() {
+                probe
+                    .http_trace
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(event);
+                probe.http_notify.notify_waiters();
+            }
+        }
+        TestStage::Enqueue(outcome) => {
+            if let Some(probe) = admission_test_probe() {
+                probe.enqueue_attempts.fetch_add(1, Ordering::SeqCst);
+                match outcome {
+                    EnqueueOutcome::Enqueued => {
+                        probe.queue_inserts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    EnqueueOutcome::Coalesced => {
+                        probe.coalesces.fetch_add(1, Ordering::SeqCst);
+                    }
+                    EnqueueOutcome::Full => {}
+                }
+            }
+        }
+        TestStage::PendingResponse => {
+            if let Some(probe) = admission_test_probe() {
+                probe.pending_responses.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        TestStage::RepoReadsDenied => {
+            return Ok(admission_test_probe()
+                .is_some_and(|probe| probe.repo_reads_denied.load(Ordering::SeqCst)));
+        }
+        TestStage::BuildCrash { stage, commit } => {
+            if !test_build_crash_barrier_matches(stage, commit) {
+                return Ok(false);
+            }
+            let Some(dir) =
+                std::env::var_os("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR").map(PathBuf::from)
+            else {
+                return Ok(false);
+            };
+            std::fs::create_dir_all(&dir).context("create test build-crash barrier directory")?;
+            let entered = dir.join("entered");
+            if entered.exists() {
+                return Ok(false);
+            }
+            std::fs::write(&entered, format!("{stage} {commit}\n"))
+                .context("signal test build-crash barrier")?;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !dir.join("proceed").exists() {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("test build-crash barrier was not released within 60 seconds");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
         }
     }
+    Ok(false)
 }
 
-pub(crate) async fn admission_test_inside_admission_tx(commit: &str) {
-    if let Some(probe) = admission_test_probe() {
-        let held = probe
-            .inside_admission_tx_target
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_deref()
-            == Some(commit);
-        if held {
-            probe.inside_admission_tx.wait().await;
-        }
-    }
+fn explicit_test_mode(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
 }
 
-fn admission_test_tip_probe() {
-    if let Some(probe) = admission_test_probe() {
-        probe.tip_probes.fetch_add(1, Ordering::SeqCst);
-    }
+fn test_build_crash_barrier_matches(stage: &str, commit: &str) -> bool {
+    explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref())
+        && std::env::var("RIPCLONE_TEST_BUILD_CRASH_STAGE").as_deref() == Ok(stage)
+        && std::env::var("RIPCLONE_TEST_BUILD_CRASH_COMMIT")
+            .ok()
+            .is_none_or(|target| target == commit)
 }
-
-fn admission_test_ref_store_write() {
-    if let Some(probe) = admission_test_probe() {
-        probe.ref_store_writes.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-fn admission_test_artifact_upload() {
-    if let Some(probe) = admission_test_probe() {
-        probe.artifact_uploads.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-async fn admission_test_fetch_entry(target: Option<&str>) {
-    if let Some(probe) = admission_test_probe() {
-        probe.exact_fetches.fetch_add(1, Ordering::SeqCst);
-        if let Some(target) = target {
-            probe
-                .fetch_targets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(target.to_string());
-        }
-        probe.fetch_entry.wait().await;
-    }
-}
-
-async fn admission_test_builder_entry(commit: &str) {
-    if let Some(probe) = admission_test_probe() {
-        probe.builder_entries.fetch_add(1, Ordering::SeqCst);
-        probe
-            .builder_targets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(commit.to_string());
-        probe.builder_entry.wait().await;
-    }
-}
-
-fn admission_test_head_build() {
-    if let Some(probe) = admission_test_probe() {
-        probe.head_builds.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-async fn admission_test_after_head_entry() {
-    if let Some(probe) = admission_test_probe() {
-        probe.after_head_entry.wait().await;
-    }
-}
-
-fn admission_test_full_build(commit: &str) -> bool {
-    if let Some(probe) = admission_test_probe() {
-        probe.full_builds.fetch_add(1, Ordering::SeqCst);
-        return probe
-            .full_failure_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains(commit);
-    }
-    false
-}
-
-fn admission_test_files_build(commit: &str) -> bool {
-    if let Some(probe) = admission_test_probe() {
-        probe.files_builds.fetch_add(1, Ordering::SeqCst);
-        return probe
-            .files_failure_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains(commit);
-    }
-    false
-}
-
-fn admission_test_bitmap_write() {
-    if let Some(probe) = admission_test_probe() {
-        probe.bitmap_writes.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-async fn admission_test_before_full_publish() {
-    if let Some(probe) = admission_test_probe() {
-        probe.before_full_publish.wait().await;
-    }
-}
-
-async fn admission_test_before_files_publish() {
-    if let Some(probe) = admission_test_probe() {
-        probe.before_files_publish.wait().await;
-    }
-}
-
-async fn admission_test_after_full_publish() {
-    if let Some(probe) = admission_test_probe() {
-        probe.after_full_publish.wait().await;
-    }
-}
-
-async fn admission_test_after_files_publish() {
-    if let Some(probe) = admission_test_probe() {
-        probe.after_files_publish.wait().await;
-    }
-}
-
-async fn admission_test_embedded_idle_wait() {
-    if let Some(probe) = admission_test_probe() {
-        probe.embedded_idle_wait.wait().await;
-    }
-}
-
-fn admission_test_embedded_wake(fallback: bool) {
-    if let Some(probe) = admission_test_probe() {
-        if fallback {
-            probe.embedded_fallback_polls.fetch_add(1, Ordering::SeqCst);
-        } else {
-            probe
-                .embedded_notification_wakes
-                .fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
-
-fn admission_test_claim_lost() {
-    if let Some(probe) = admission_test_probe() {
-        probe.claim_losses.fetch_add(1, Ordering::SeqCst);
-        probe.claim_loss_notify.notify_waiters();
-    }
-}
-
-fn admission_test_full_published(commit: &str) {
-    if let Some(probe) = admission_test_probe() {
-        probe.full_publishes.fetch_add(1, Ordering::SeqCst);
-        probe.full_notify.notify_waiters();
-        tracing::debug!("admission test observed full publication for {commit}");
-    }
-}
-
-fn admission_test_head_published() {
-    if let Some(probe) = admission_test_probe() {
-        probe.head_publishes.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-fn admission_test_files_published() {
-    if let Some(probe) = admission_test_probe() {
-        probe.files_publishes.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-fn admission_test_build_failure(commit: Option<&str>, message: &str) {
-    if let Some(probe) = admission_test_probe() {
-        probe
-            .failure_targets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((commit.unwrap_or_default().to_string(), message.to_string()));
-        probe.failure_notify.notify_waiters();
-    }
-}
-
-fn admission_test_http(event: String) {
-    if let Some(probe) = admission_test_probe() {
-        probe
-            .http_trace
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(event);
-        probe.http_notify.notify_waiters();
-    }
-}
-
-fn admission_test_enqueue(outcome: EnqueueOutcome) {
-    let Some(probe) = admission_test_probe() else {
-        return;
-    };
-    probe.enqueue_attempts.fetch_add(1, Ordering::SeqCst);
-    match outcome {
-        EnqueueOutcome::Enqueued => {
-            probe.queue_inserts.fetch_add(1, Ordering::SeqCst);
-        }
-        EnqueueOutcome::Coalesced => {
-            probe.coalesces.fetch_add(1, Ordering::SeqCst);
-        }
-        EnqueueOutcome::Full => {}
-    }
-}
-
 #[derive(Clone)]
 pub struct ServerState {
     pub cas: Cas,
@@ -2344,7 +2444,7 @@ async fn ref_report_handler(
                 )
                     .into_response();
             }
-            admission_test_ref_store_write();
+            let _ = test_hook(TestStage::RefStoreWrite).await;
             match state.control_db.as_ref() {
                 Some(control) => {
                     control
@@ -2802,7 +2902,7 @@ async fn dispatch_repos_post(
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
     if let Some(repo_path) = path.strip_suffix("/add") {
-        admission_test_http(format!("POST /v1/repos/{repo_path}/add"));
+        let _ = test_hook(TestStage::Http(format!("POST /v1/repos/{repo_path}/add"))).await;
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -2827,7 +2927,7 @@ async fn dispatch_repos_post(
     }
 
     if let Some(repo_path) = path.strip_suffix("/sync") {
-        admission_test_http(format!("POST /v1/repos/{repo_path}/sync"));
+        let _ = test_hook(TestStage::Http(format!("POST /v1/repos/{repo_path}/sync"))).await;
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -3048,20 +3148,18 @@ fn exact_parent_head_ready(info: &RefInfo, commit: &str) -> bool {
     crate::exact_output_ready(info, ExactResultKind::Head, commit)
 }
 
-fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
-    artifact_pending_response_with_top_up(commit, branch, queue_depth, None, None)
+async fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
+    artifact_pending_response_with_top_up(commit, branch, queue_depth, None, None).await
 }
 
-fn artifact_pending_response_with_top_up(
+async fn artifact_pending_response_with_top_up(
     commit: &str,
     branch: &str,
     queue_depth: usize,
     top_up_supported: Option<bool>,
     top_up_base: Option<RefResponse>,
 ) -> Response {
-    if let Some(probe) = admission_test_probe() {
-        probe.pending_responses.fetch_add(1, Ordering::SeqCst);
-    }
+    let _ = test_hook(TestStage::PendingResponse).await;
     let mut response = (
         StatusCode::ACCEPTED,
         Json(ArtifactPendingResponse {
@@ -3294,11 +3392,12 @@ async fn get_ref_inner(
 
     state.metrics.record_ref_lookup();
     let (commit, checkout_name, already_pinned) = if let Some(pinned) = params.pinned.as_deref() {
-        admission_test_http(format!(
+        let _ = test_hook(TestStage::Http(format!(
             "GET /v1/repos/{}/refs/{requested_checkout}?pinned={pinned}&result={}",
             repo_id.storage_key(),
             params.result
-        ));
+        )))
+        .await;
         let checkout_name = if requested_checkout == "HEAD"
             && params.rev.as_deref() == Some(pinned)
             && validation::validate_object_id(pinned).is_ok()
@@ -3372,7 +3471,7 @@ async fn get_ref_inner(
             (commit, checkout_name, false)
         }
     } else {
-        admission_test_tip_probe();
+        let _ = test_hook(TestStage::TipProbe).await;
         let tip = {
             let _permit = fetch_semaphore()
                 .acquire()
@@ -3523,9 +3622,10 @@ async fn get_ref_inner(
                 state.build_queue_depth.load(Ordering::Relaxed),
                 Some(true),
                 base,
-            );
+            )
+            .await;
         }
-        return artifact_pending_response(&commit, &checkout_name, 0);
+        return artifact_pending_response(&commit, &checkout_name, 0).await;
     }
 
     let size_bytes = enqueue_size_bytes(&state, &repo_id, Some(&commit)).await;
@@ -3554,6 +3654,7 @@ async fn get_ref_inner(
         &checkout_name,
         state.build_queue_depth.load(Ordering::Relaxed),
     )
+    .await
 }
 
 const REF_SIGNED_URL_TTL_PUBLIC_SECS: u64 = 1200;
@@ -3578,74 +3679,6 @@ fn ref_signed_url_ttl(private: bool) -> Duration {
             REF_SIGNED_URL_TTL_PUBLIC_SECS,
         ))
     }
-}
-
-fn explicit_test_mode(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
-
-async fn wait_test_after_head_barrier(commit: &str) -> Result<()> {
-    if !explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref()) {
-        return Ok(());
-    }
-    admission_test_after_head_entry().await;
-    let Some(dir) = std::env::var_os("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR").map(PathBuf::from)
-    else {
-        return Ok(());
-    };
-    if let Some(target) = std::env::var_os("RIPCLONE_TEST_AFTER_HEAD_BARRIER_COMMIT")
-        && target.to_str() != Some(commit)
-    {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&dir).context("create test after-Head barrier directory")?;
-    std::fs::write(dir.join("entered"), format!("{commit}\n"))
-        .context("signal test after-Head barrier")?;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !dir.join("proceed").exists() {
-        if Instant::now() >= deadline {
-            anyhow::bail!("test after-Head barrier was not released within 60 seconds");
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    Ok(())
-}
-
-fn test_build_crash_barrier_matches(stage: &str, commit: &str) -> bool {
-    explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref())
-        && std::env::var("RIPCLONE_TEST_BUILD_CRASH_STAGE").as_deref() == Ok(stage)
-        && std::env::var("RIPCLONE_TEST_BUILD_CRASH_COMMIT")
-            .ok()
-            .is_none_or(|target| target == commit)
-}
-
-/// Deterministic cancellation point used only by direct worker-crash tests.
-/// The first attempt signals `entered` and waits. A retried exact build sees
-/// that signal and continues, so the test can abort the original task and prove
-/// recovery without a timer race or a production behavior change.
-async fn wait_test_build_crash_barrier(stage: &str, commit: &str) -> Result<()> {
-    if !test_build_crash_barrier_matches(stage, commit) {
-        return Ok(());
-    }
-    let Some(dir) = std::env::var_os("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR").map(PathBuf::from)
-    else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(&dir).context("create test build-crash barrier directory")?;
-    let entered = dir.join("entered");
-    if entered.exists() {
-        return Ok(());
-    }
-    std::fs::write(&entered, format!("{stage} {commit}\n"))
-        .context("signal test build-crash barrier")?;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !dir.join("proceed").exists() {
-        if Instant::now() >= deadline {
-            anyhow::bail!("test build-crash barrier was not released within 60 seconds");
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    Ok(())
 }
 
 fn ref_response(
@@ -3831,7 +3864,7 @@ async fn authorize_repo_read(
     credential: Option<&secrecy::SecretString>,
     headers: &HeaderMap,
 ) -> Result<bool, Response> {
-    if admission_test_probe().is_some_and(|probe| probe.repo_reads_denied.load(Ordering::SeqCst)) {
+    if test_hook(TestStage::RepoReadsDenied).await.unwrap_or(false) {
         return Err(forbidden_repo_response());
     }
     if !state.require_repo_auth {
@@ -4053,7 +4086,7 @@ async fn sync_repo_inner(
 
     let start = Instant::now();
     let requested_branch = params.branch;
-    admission_test_tip_probe();
+    let _ = test_hook(TestStage::TipProbe).await;
     let tip = {
         let _permit = fetch_semaphore()
             .acquire()
@@ -4340,7 +4373,7 @@ async fn sync_repo_at_revision(
         size_bytes,
     };
     match enqueue_admitted_build(&state, job).await {
-        Ok(_) => artifact_pending_response(&at_rev, &branch, state.build_queue.depth().await),
+        Ok(_) => artifact_pending_response(&at_rev, &branch, state.build_queue.depth().await).await,
         Err(error) => {
             state.metrics.record_error();
             (
@@ -4558,7 +4591,7 @@ async fn enqueue_admitted_build(
             pending: pending_exact_result(&job),
         };
         state.metrics.record_build_queued();
-        admission_test_before_admission_tx(&job.admitted_commit).await;
+        let _ = test_hook(TestStage::BeforeAdmissionTx(&job.admitted_commit)).await;
         return match control.admit_exact_and_job(&job, &admission.pending).await {
             Ok(enqueued) => {
                 if enqueued.outcome == EnqueueOutcome::Enqueued {
@@ -4566,7 +4599,7 @@ async fn enqueue_admitted_build(
                 } else {
                     state.metrics.rollback_build_queued();
                 }
-                admission_test_enqueue(enqueued.outcome);
+                let _ = test_hook(TestStage::Enqueue(enqueued.outcome)).await;
                 Ok(enqueued.outcome)
             }
             Err(error) => {
@@ -4577,7 +4610,7 @@ async fn enqueue_admitted_build(
     }
     let Some(admission) = prepare_exact_admission(state, &job).await? else {
         state.metrics.record_build_accepted();
-        admission_test_enqueue(EnqueueOutcome::Coalesced);
+        let _ = test_hook(TestStage::Enqueue(EnqueueOutcome::Coalesced)).await;
         return Ok(EnqueueOutcome::Coalesced);
     };
     state
@@ -4589,17 +4622,17 @@ async fn enqueue_admitted_build(
     match state.build_queue.enqueue(job).await {
         Ok(enq) if enq.outcome == EnqueueOutcome::Enqueued => {
             state.metrics.record_build_accepted();
-            admission_test_enqueue(enq.outcome);
+            let _ = test_hook(TestStage::Enqueue(enq.outcome)).await;
             Ok(enq.outcome)
         }
         Ok(enq) if enq.outcome == EnqueueOutcome::Coalesced => {
             state.metrics.rollback_build_queued();
-            admission_test_enqueue(enq.outcome);
+            let _ = test_hook(TestStage::Enqueue(enq.outcome)).await;
             Ok(enq.outcome)
         }
         Ok(_) => {
             state.metrics.rollback_build_queued();
-            admission_test_enqueue(EnqueueOutcome::Full);
+            let _ = test_hook(TestStage::Enqueue(EnqueueOutcome::Full)).await;
             Err("build queue full".to_string())
         }
         Err(e) => {
@@ -4906,7 +4939,7 @@ async fn build_handler(
         Ok(c) => c,
         Err(e) => return credential_error_response(e),
     };
-    admission_test_tip_probe();
+    let _ = test_hook(TestStage::TipProbe).await;
     let tip = {
         let _permit = fetch_semaphore()
             .acquire()
@@ -5835,16 +5868,36 @@ fn upload_concurrency() -> usize {
 }
 
 /// Upload `hashes` from CAS to storage with bounded concurrency.
+/// `crash_commit`, when set, drives the direct worker-crash test: when the
+/// `during_upload` barrier is armed for that commit, the first hash uploads
+/// alone, the hook fires, and only then do the remaining hashes start. That
+/// keeps exactly one upload path for tests and production while the crash
+/// still lands with precisely one artifact in storage.
 async fn upload_artifacts(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
     hashes: Vec<String>,
     conc: usize,
+    crash_commit: Option<&str>,
 ) -> Result<()> {
-    futures::stream::iter(hashes.into_iter().map(|hash| {
+    let crash_gate = crash_commit
+        .filter(|commit| test_build_crash_barrier_matches("during_upload", commit))
+        .map(|commit| {
+            let (opened, wait) = tokio::sync::watch::channel(false);
+            (commit.to_string(), Arc::new(opened), wait)
+        });
+    futures::stream::iter(hashes.into_iter().enumerate().map(|(index, hash)| {
         let cas = cas.clone();
         let storage = storage.clone();
+        let mut crash_gate = crash_gate.clone();
         async move {
+            if index > 0
+                && let Some((_, _, wait)) = crash_gate.as_mut()
+            {
+                wait.wait_for(|opened| *opened)
+                    .await
+                    .context("during_upload crash gate closed before opening")?;
+            }
             let read_hash = hash.clone();
             let (path, len) = tokio::task::spawn_blocking(move || {
                 let len = cas
@@ -5855,12 +5908,22 @@ async fn upload_artifacts(
             .await
             .context("verify artifact task")??;
             let upload_start = std::time::Instant::now();
-            admission_test_artifact_upload();
+            let _ = test_hook(TestStage::ArtifactUpload).await;
             storage
                 .put_file_async(&hash, &path)
                 .await
                 .with_context(|| format!("upload artifact {}", hash))?;
             crate::perf::record_storage_upload(upload_start.elapsed(), len);
+            if index == 0
+                && let Some((commit, opened, _)) = crash_gate.as_ref()
+            {
+                test_hook(TestStage::BuildCrash {
+                    stage: "during_upload",
+                    commit,
+                })
+                .await?;
+                let _ = opened.send(true);
+            }
             Ok(())
         }
     }))
@@ -5969,7 +6032,7 @@ async fn do_sync(
     let repo_id_sync = repo_id.clone();
     let admitted_commit_sync = admitted_commit.to_string();
     let credential_sync = credential.cloned();
-    admission_test_fetch_entry(Some(admitted_commit)).await;
+    let _ = test_hook(TestStage::FetchEntry(Some(admitted_commit))).await;
     // Cap concurrent upstream fetches across the process (bandwidth + upstream
     // abuse limits). Held only across the fetch, not the build.
     let fetch_permit = fetch_semaphore()
@@ -6117,8 +6180,8 @@ async fn build_and_publish_results(
     mut phases: SyncPhases,
     mut foreground_release: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<SyncBuildResult> {
-    admission_test_head_build();
-    admission_test_builder_entry(commit).await;
+    let _ = test_hook(TestStage::HeadBuild).await;
+    let _ = test_hook(TestStage::BuilderEntry(commit)).await;
     let upload_conc = upload_concurrency();
 
     // Load the previous synced ref once: used both for the files-table by-diff
@@ -6375,31 +6438,34 @@ async fn build_and_publish_results(
     let head_idx_keep: std::collections::HashSet<String> =
         head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
     let upload_start = Instant::now();
-    wait_test_build_crash_barrier("before_upload", commit).await?;
-    if test_build_crash_barrier_matches("during_upload", commit) {
-        let first = head_uploads
-            .first()
-            .cloned()
-            .context("Head upload set is empty")?;
-        upload_artifacts(cas, storage, vec![first], upload_conc).await?;
-        wait_test_build_crash_barrier("during_upload", commit).await?;
-        upload_artifacts(
-            cas,
-            storage,
-            head_uploads.iter().skip(1).cloned().collect(),
-            upload_conc,
-        )
-        .await?;
-    } else {
-        upload_artifacts(cas, storage, head_uploads.clone(), upload_conc).await?;
-    }
-    wait_test_build_crash_barrier("after_upload", commit).await?;
+    test_hook(TestStage::BuildCrash {
+        stage: "before_upload",
+        commit,
+    })
+    .await?;
+    upload_artifacts(
+        cas,
+        storage,
+        head_uploads.clone(),
+        upload_conc,
+        Some(commit),
+    )
+    .await?;
+    test_hook(TestStage::BuildCrash {
+        stage: "after_upload",
+        commit,
+    })
+    .await?;
     settle_storage(cas, storage, head_uploads, head_idx_keep).await;
     phases.upload_head_ms = Some(duration_ms(upload_start.elapsed()));
 
     let publish_start = Instant::now();
-    wait_test_build_crash_barrier("before_ready_publication", commit).await?;
-    admission_test_ref_store_write();
+    test_hook(TestStage::BuildCrash {
+        stage: "before_ready_publication",
+        commit,
+    })
+    .await?;
+    let _ = test_hook(TestStage::RefStoreWrite).await;
     let head_result = info
         .head
         .clone()
@@ -6415,7 +6481,7 @@ async fn build_and_publish_results(
         "job no longer owns Head publication for {}@{commit}",
         repo_id.storage_key()
     );
-    admission_test_head_published();
+    let _ = test_hook(TestStage::HeadPublished).await;
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
     info!(
         "published Head for {} in {:?}",
@@ -6427,7 +6493,7 @@ async fn build_and_publish_results(
     if let Some(release) = foreground_release.take() {
         let _ = release.send(());
     }
-    wait_test_after_head_barrier(commit).await?;
+    test_hook(TestStage::AfterHeadBarrier(commit)).await?;
 
     // Every durable claim owns Head, Files, and Full. A process death before
     // this completes leaves the SQL claim stale for the next worker to reclaim.
@@ -6762,14 +6828,14 @@ async fn build_full_result(
     storage: &crate::storage::StorageRef,
     allow_head_compaction: bool,
 ) -> Result<()> {
-    if admission_test_full_build(commit) {
+    if test_hook(TestStage::FullBuild(commit)).await? {
         anyhow::bail!("forced Full failure for {commit}");
     }
 
     // Full history walks are substantially faster on large repositories when
     // Git can use a reachability bitmap. This is best-effort and happens only
     // when Full itself is missing.
-    admission_test_bitmap_write();
+    let _ = test_hook(TestStage::BitmapWrite).await;
     let bitmap_mirror = mirror_dir.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bitmap_mirror)).await;
 
@@ -6870,7 +6936,14 @@ async fn build_full_result(
             .iter()
             .map(|(_, _, idx, _)| idx.clone())
             .collect();
-        upload_artifacts(cas, storage, compact_uploads.clone(), upload_concurrency()).await?;
+        upload_artifacts(
+            cas,
+            storage,
+            compact_uploads.clone(),
+            upload_concurrency(),
+            None,
+        )
+        .await?;
         let compact_head = crate::HeadResult {
             clonepack: crate::ClonepackArtifacts {
                 manifest: compact_manifest_hash,
@@ -6887,7 +6960,7 @@ async fn build_full_result(
             base_commit: commit.to_string(),
             base_packs: compact_packs.iter().map(tuple_to_sized).collect(),
         };
-        admission_test_ref_store_write();
+        let _ = test_hook(TestStage::RefStoreWrite).await;
         anyhow::ensure!(
             ref_store
                 .publish_head(repo_id, commit, compact_head.clone())
@@ -6934,7 +7007,7 @@ async fn build_full_result(
         .iter()
         .map(|(_, _, idx, _)| idx.clone())
         .collect();
-    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
+    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency(), None).await?;
 
     let mut all_packs = head_packs;
     all_packs.extend(history_packs);
@@ -6952,16 +7025,16 @@ async fn build_full_result(
         packs: pack_artifacts_of(&all_packs),
         history_levels: levels,
     };
-    admission_test_before_full_publish().await;
-    admission_test_ref_store_write();
+    let _ = test_hook(TestStage::BeforeFullPublish).await;
+    let _ = test_hook(TestStage::RefStoreWrite).await;
     anyhow::ensure!(
         ref_store.publish_full(repo_id, commit, full).await?,
         "job no longer owns Full publication for {}@{commit}",
         repo_id.storage_key()
     );
     settle_storage(cas, storage, uploads, keep_idx).await;
-    admission_test_full_published(commit);
-    admission_test_after_full_publish().await;
+    let _ = test_hook(TestStage::FullPublished(commit)).await;
+    let _ = test_hook(TestStage::AfterFullPublish).await;
     info!(
         "published Full result for {}@{}",
         repo_id.storage_key(),
@@ -6983,7 +7056,7 @@ async fn build_files_result(
     storage: &crate::storage::StorageRef,
     compression_level: i32,
 ) -> Result<()> {
-    if admission_test_files_build(commit) {
+    if test_hook(TestStage::FilesBuild(commit)).await? {
         anyhow::bail!("forced Files failure for {commit}");
     }
 
@@ -7077,7 +7150,7 @@ async fn build_files_result(
         &archive_chunk_hashes,
         &archive_output.new_reuse_frame_hashes,
     );
-    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
+    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency(), None).await?;
 
     let files = crate::FilesResult {
         clonepack: crate::ClonepackArtifacts {
@@ -7093,16 +7166,16 @@ async fn build_files_result(
         archive_chunks: archive_chunk_hashes,
         archive_frames: archive_output.archive_frames,
     };
-    admission_test_before_files_publish().await;
-    admission_test_ref_store_write();
+    let _ = test_hook(TestStage::BeforeFilesPublish).await;
+    let _ = test_hook(TestStage::RefStoreWrite).await;
     anyhow::ensure!(
         ref_store.publish_files(repo_id, commit, files).await?,
         "job no longer owns Files publication for {}@{commit}",
         repo_id.storage_key()
     );
     settle_storage(cas, storage, uploads, std::collections::HashSet::new()).await;
-    admission_test_files_published();
-    admission_test_after_files_publish().await;
+    let _ = test_hook(TestStage::FilesPublished).await;
+    let _ = test_hook(TestStage::AfterFilesPublish).await;
     info!(
         "published Files result for {}@{}",
         repo_id.storage_key(),
@@ -7356,7 +7429,11 @@ async fn process_build_job_with_foreground_release(
             // embedded worker acknowledges the job immediately after this
             // function returns; tests that require the durable Failed state
             // must observe the queue as well.
-            admission_test_build_failure(Some(&job.admitted_commit), classified.message());
+            let _ = test_hook(TestStage::BuildFailure {
+                commit: Some(&job.admitted_commit),
+                message: classified.message(),
+            })
+            .await;
             Err(classified)
         }
     }
@@ -7474,17 +7551,17 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                     // permit wins the select below instead of being lost.
                     let notified = admission_notify.notified();
                     tokio::pin!(notified);
-                    admission_test_before_claim().await;
+                    let _ = test_hook(TestStage::BeforeClaim).await;
                     match queue.claim(&worker_id).await {
                         Ok(Some(claimed)) => break claimed,
                         Ok(None) => {
-                            admission_test_embedded_idle_wait().await;
+                            let _ = test_hook(TestStage::EmbeddedIdleWait).await;
                             tokio::select! {
                                 () = &mut notified => {
-                                    admission_test_embedded_wake(false);
+                                    let _ = test_hook(TestStage::EmbeddedWake { fallback: false }).await;
                                 }
                                 () = tokio::time::sleep(Duration::from_millis(250)) => {
-                                    admission_test_embedded_wake(true);
+                                    let _ = test_hook(TestStage::EmbeddedWake { fallback: true }).await;
                                 }
                             }
                         }
@@ -7494,7 +7571,7 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                         }
                     }
                 };
-                admission_test_after_claim().await;
+                let _ = test_hook(TestStage::AfterClaim).await;
                 let (foreground_release, foreground_released) = tokio::sync::oneshot::channel();
                 let worker_state = state.clone();
                 let worker_queue = queue.clone();
@@ -7572,7 +7649,7 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                                 "embedded worker lost claim for job {}: {error:#}",
                                                 claimed.id
                                             );
-                                            admission_test_claim_lost();
+                                            let _ = test_hook(TestStage::ClaimLost).await;
                                             build.abort();
                                             let _ = build.await;
                                             break Err(BuildError::retryable(format!(
@@ -7657,7 +7734,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
                 .acquire()
                 .await
                 .expect("fetch semaphore never closed");
-            admission_test_tip_probe();
+            let _ = test_hook(TestStage::TipProbe).await;
             git::ls_remote_tip_async(&provider, &repo_id, "HEAD", credential.as_ref()).await
         };
         let Ok(Some(tip)) = tip else {
@@ -8009,7 +8086,7 @@ mod tests {
     }
     #[tokio::test]
     async fn pending_body_includes_the_selected_branch() {
-        let response = artifact_pending_response(&"a".repeat(40), "rélease/東京", 3);
+        let response = artifact_pending_response(&"a".repeat(40), "rélease/東京", 3).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
             response
@@ -9343,6 +9420,8 @@ mod tests {
             std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
             std::env::set_var("RIPCLONE_TESTING", "1");
         }
+        let probe = Arc::new(AdmissionTestProbe::default());
+        let _probe_guard = install_admission_test_probe(Arc::clone(&probe));
 
         for stage in [
             "before_upload",
@@ -9387,6 +9466,7 @@ mod tests {
                 std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_COMMIT", &admitted);
                 std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR", &barrier);
             }
+            let uploads_before = probe.artifact_uploads.load(Ordering::SeqCst);
             let crashed_state = state.clone();
             let crashed_job = job.clone();
             let attempt = tokio::spawn(async move {
@@ -9404,6 +9484,18 @@ mod tests {
                 attempt.await.unwrap_err().is_cancelled(),
                 "{stage}: the admitted worker task is the crashed attempt"
             );
+            let uploads_started = probe.artifact_uploads.load(Ordering::SeqCst) - uploads_before;
+            match stage {
+                "before_upload" => assert_eq!(uploads_started, 0, "{stage}: no Head upload began"),
+                "during_upload" => assert_eq!(
+                    uploads_started, 1,
+                    "{stage}: exactly one Head artifact uploaded before the crash"
+                ),
+                _ => assert!(
+                    uploads_started > 1,
+                    "{stage}: every Head artifact uploaded before the crash (saw {uploads_started})"
+                ),
+            }
 
             let interrupted = state
                 .ref_store

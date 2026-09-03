@@ -575,7 +575,10 @@ impl ControlDb {
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .context("begin durable admission")?;
-        crate::server::admission_test_inside_admission_tx(&job.admitted_commit).await;
+        let _ = crate::server::test_hook(crate::server::TestStage::InsideAdmissionTx(
+            &job.admitted_commit,
+        ))
+        .await;
         let repo_key = job.repo_id.storage_key();
         let mut existing_rows = tx
             .query(
