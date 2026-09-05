@@ -224,45 +224,21 @@ pub fn list_object_shas_in_range<P: AsRef<Path>>(
     from: Option<&str>,
     to: &str,
 ) -> Result<Vec<String>> {
-    if let Some(from) = from {
-        return list_object_shas_in_range_git(repo_path, from, to);
-    }
-
-    let repo = open_repo(repo_path)?;
-    let to_id = repo
-        .rev_parse_single(to)
-        .with_context(|| format!("resolving to '{}'", to))?;
-    let infos: Vec<_> = repo
-        .rev_walk([to_id])
-        .all()?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut oids = HashSet::with_capacity(infos.len() * 4);
-    for info in &infos {
-        oids.insert(info.id);
-    }
-    for info in &infos {
-        let commit_obj = repo
-            .find_commit(info.id)
-            .with_context(|| format!("find commit {}", info.id))?;
-        collect_tree_objects(&repo, commit_obj.tree_id()?.detach(), &mut oids)
-            .with_context(|| format!("collecting tree closure for {}", info.id))?;
-    }
-
-    let mut out: Vec<String> = oids.into_iter().map(|oid| oid.to_string()).collect();
-    out.sort();
-    Ok(out)
+    list_object_shas_in_range_git(repo_path, from, to)
 }
 
 fn list_object_shas_in_range_git<P: AsRef<Path>>(
     repo_path: P,
-    from: &str,
+    from: Option<&str>,
     to: &str,
 ) -> Result<Vec<String>> {
     crate::validation::validate_git_rev(to).with_context(|| format!("invalid commit: {to}"))?;
-    crate::validation::validate_git_rev(from).with_context(|| format!("invalid commit: {from}"))?;
-    let exclude = format!("^{from}");
-    let out = Command::new("git")
+    if let Some(from) = from {
+        crate::validation::validate_git_rev(from)
+            .with_context(|| format!("invalid commit: {from}"))?;
+    }
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_path.as_ref())
         .args([
@@ -271,8 +247,11 @@ fn list_object_shas_in_range_git<P: AsRef<Path>>(
             "--no-object-names",
             "--end-of-options",
         ])
-        .arg(to)
-        .arg(exclude)
+        .arg(to);
+    if let Some(from) = from {
+        command.arg(format!("^{from}"));
+    }
+    let out = command
         .output()
         .context("run git rev-list --objects range")?;
     if !out.status.success() {

@@ -52,4 +52,3 @@ See the [two materialize surfaces](../README.md#which-one-do-i-use) for how `clo
 The server owns one SQLite control database, optionally as a Turso embedded
 replica. Artifact storage remains local or S3-compatible. See
 [`BACKENDS.md`](BACKENDS.md) and [`CONFIG.md`](CONFIG.md).
-</content>

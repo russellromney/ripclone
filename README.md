@@ -50,7 +50,7 @@ See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
 
 ## Performance
 
-ripclone pre-builds git artifacts so clones are faster than `git clone`. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows. At 1 Gbps, on a Fly.io `performance-8x` client against `ripclone-server-dev` (median of 3 runs, cold client cache):
+ripclone pre-builds git artifacts so clones are faster than `git clone`. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows. At 1 Gbps, on a separate 8-vCPU cloud client and server (median of 3 runs, cold client cache):
 
 | Repo (1 Gbps) | ripclone full | ripclone depth=1 | ripclone files | `git clone` full | `git clone --depth 1` |
 |---|---|---|---|---|---|
@@ -78,7 +78,14 @@ cargo install ripclone --locked
 pip install ripclone
 ```
 
-The prebuilt binaries need no extra runtime packages: git and TLS are pure Rust (`gix` + `rustls`), and the remaining C libraries (`zstd`, `zlib-ng`) are statically linked. The Linux binaries (x86_64 and arm64) are fully static musl builds with no libc dependency at all, so the one-liner works on any Linux including Alpine and old-glibc containers; the macOS binaries link only the system libraries every Mac ships. `cargo install` builds from source instead.
+The prebuilt binaries have no shared-library dependency. The Linux assets are
+fully static musl builds; the macOS assets use system libraries. **System Git is
+still required** by the server, workers, and editable clone paths. Install Git
+with your OS package manager before using those paths. Files-only clients can
+clone without Git. `cargo install` builds from source and also needs the build
+tools listed in [Build options](docs/BUILD_OPTIONS.md).
+
+See [Support](docs/SUPPORT.md) for the platform, MSRV, and compatibility policy.
 
 Check your version and whether the configured server is compatible:
 
@@ -110,16 +117,16 @@ To wipe local state as well: the CLI's saved login lives at `~/.config/ripclone/
 
 ## Quick start
 
-Build and run the server:
+Install ripclone with one of the methods above, then start the packaged server:
 
 ```bash
-cd rust
-cargo build --release
+# The server requires the `git` executable on PATH.
+git --version
 
 # The server requires a token; both the server and CLI read it from
 # RIPCLONE_SERVER_TOKEN. Generate one and start the server:
 export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
-./target/release/ripclone-server
+ripclone-server
 ```
 
 The server defaults to storing its local artifact CAS and bare mirrors under
@@ -146,20 +153,20 @@ accepts the exact upstream commit; artifact construction continues in the
 background:
 
 ```bash
-cargo run --release --bin ripclone -- add oven-sh/bun
+ripclone add oven-sh/bun
 ```
 
 Clone it:
 
 ```bash
-cargo run --release --bin ripclone -- clone oven-sh/bun bun
+ripclone clone oven-sh/bun bun
 ```
 
 Inspect or remove server registrations explicitly:
 
 ```bash
-cargo run --release --bin ripclone -- list
-cargo run --release --bin ripclone -- rm oven-sh/bun
+ripclone list
+ripclone rm oven-sh/bun
 ```
 
 (`add` is the first-run verb — a repo must be added before it can be cloned or
@@ -350,6 +357,14 @@ The payload contains:
 - `client` — `{ os, arch, ripcloneVersion }`.
 
 Self-hosted servers accept and drop this POST at `POST /v1/clones/{cloneId}/metrics` so the CLI never spams its own server with 404s.
+
+## Self-hosting and the public service
+
+The open-source server is complete on its own: it owns repository registration,
+builds, clone policy, control state, and artifact storage. The CLI's public
+default service is optional convenience; `--server` or `RIPCLONE_SERVER` selects
+any self-hosted server. The OSS backend contains no account, payment, tenant, or
+hosted deployment policy.
 
 ## License
 

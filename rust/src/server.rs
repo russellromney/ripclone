@@ -3393,10 +3393,17 @@ async fn get_ref_inner(
             )
             .await
             {
+                warn!(
+                    revision = %rev,
+                    error = %error,
+                    "failed to resolve requested revision"
+                );
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(ErrorResponse {
-                        error: format!("cannot resolve exact revision {rev}: {error:#}"),
+                        error: format!(
+                            "cannot resolve requested revision `{rev}`; check the revision and upstream access"
+                        ),
                     }),
                 )
                     .into_response();
@@ -3423,10 +3430,17 @@ async fn get_ref_inner(
             let commit = match git::resolve_commit(&mirror_dir, rev) {
                 Ok(commit) => commit,
                 Err(error) => {
+                    warn!(
+                        revision = %rev,
+                        error = %error,
+                        "failed to resolve requested revision"
+                    );
                     return (
                         StatusCode::UNPROCESSABLE_ENTITY,
                         Json(ErrorResponse {
-                            error: format!("cannot resolve exact revision {rev}: {error:#}"),
+                            error: format!(
+                                "cannot resolve requested revision `{rev}`; check the revision and upstream access"
+                            ),
                         }),
                     )
                         .into_response();
@@ -4266,10 +4280,17 @@ async fn sync_repo_at_revision(
             }
             Ok(Err(error)) => {
                 state.metrics.record_error();
+                warn!(
+                    revision = %at_rev,
+                    error = %error,
+                    "failed to resolve requested revision"
+                );
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(ErrorResponse {
-                        error: format!("cannot resolve exact revision {at_rev}: {error:#}"),
+                        error: format!(
+                            "cannot resolve requested revision `{at_rev}`; check the revision and upstream access"
+                        ),
                     }),
                 )
                     .into_response();
@@ -7767,6 +7788,8 @@ async fn run_server_with_barrier_at_control(
         "rate limiter enabled: burst={}, restore={}/s",
         rate_burst, rate_per_sec
     );
+
+    backends::Backends::validate_environment()?;
 
     let metrics = Metrics::new();
     let control_db = Arc::new(

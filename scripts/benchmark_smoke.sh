@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Smoke test for benchmark/fly_shaped_benchmark.sh.
+# Smoke test for benchmark/shaped_benchmark.sh.
 #
 # The benchmark harness talks to the server over raw HTTP, so it does not
 # recompile when the server's contract changes — it just silently stops working
@@ -18,7 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-BENCH="$ROOT_DIR/benchmark/fly_shaped_benchmark.sh"
+BENCH="$ROOT_DIR/benchmark/shaped_benchmark.sh"
 
 # Debug binaries are enough: this asserts on the request/response contract, not
 # on clone throughput.

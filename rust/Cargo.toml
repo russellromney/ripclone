@@ -2,7 +2,7 @@
 name = "ripclone"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "CAS-based git clone helper: fast clones served by a content-addressed backend"
 repository = "https://github.com/russellromney/ripclone"
@@ -21,10 +21,12 @@ path = "src/bin/server.rs"
 [[bin]]
 name = "ripclone-proxy"
 path = "src/bin/ripclone-proxy.rs"
+required-features = ["dev-tools"]
 
 [[bin]]
 name = "writer_bench"
 path = "src/bin/writer_bench.rs"
+required-features = ["dev-tools"]
 
 [[bin]]
 name = "ripclone-worker"
@@ -32,6 +34,7 @@ path = "src/bin/ripclone-worker.rs"
 
 [features]
 default = ["zlib-ng"]
+dev-tools = []
 # Use zlib-ng for faster pack compression/decompression. Disable this feature
 # (e.g. `cargo build --no-default-features`) on platforms where cmake is not
 # available.

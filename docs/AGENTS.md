@@ -85,21 +85,24 @@ ripclone, puts the token in the environment, and clones headless — no login, n
 prompt, no TTY required.
 
 ```bash
-# 1. Install (pinned release recommended for reproducible fleets)
+# 1. Editable agent clones require system Git. Minimal Alpine images need:
+apk add --no-cache git ca-certificates curl
+
+# 2. Install (pinned release recommended for reproducible fleets)
 curl -fsSL https://github.com/russellromney/ripclone/releases/latest/download/install.sh | sh
 
-# 2. Point at your server + drop in the token (paste from your VM's secret store)
+# 3. Point at your server + drop in the token (paste from your VM's secret store)
 export RIPCLONE_SERVER=https://ripclone.com          # or your self-hosted URL
 export RIPCLONE_SERVER_TOKEN=rc_xxx                  # agent token, from a secret
 export RIPCLONE_AGENT=1                               # fleet-sane defaults
 
-# 3a. Editable agent (runs git): depth-1 clone, headless
+# 4a. Editable agent (runs git): depth-1 clone, headless
 ripclone clone owner/repo
 
-# 3b. Pure worktree agent (no git): files-only, fastest
+# 4b. Pure worktree agent (no git): files-only, fastest
 ripclone clone owner/repo --mode files
 
-# 3c. Ephemeral VM you'll tear down: in-memory tmpfs clone (Linux)
+# 4c. Ephemeral VM you'll tear down: in-memory tmpfs clone (Linux)
 ripclone clone owner/repo --temp
 ```
 

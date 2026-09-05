@@ -39,8 +39,7 @@ jobs:
           filters: |
             docker:
               - 'rust/**'
-              - 'tests/fly/Dockerfile*'
-              - 'scripts/fly_client_test.sh'
+              - 'tests/docker/**'
               - 'scripts/e2e_full_topup_minio.sh'
               - 'scripts/e2e_full_topup_gitea.sh'
               - '.github/workflows/ci.yml'
@@ -310,8 +309,7 @@ jobs:
         run: chmod +x ci-bins/*
       - name: Assemble runtime images from the compiled binaries
         run: |
-          docker build -f tests/fly/Dockerfile.ci -t ripclone-server:ci .
-          docker build -f tests/fly/Dockerfile.client.ci -t ripclone-client:ci .
+          docker build -f tests/docker/server.Dockerfile -t ripclone-server:ci .
       - name: Smoke-test the binaries run in the image
         run: |
           docker run --rm ripclone-server:ci ripclone-server --help
