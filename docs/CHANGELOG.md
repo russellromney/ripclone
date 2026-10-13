@@ -1,8 +1,7 @@
 # Changelog
 
-This file tracks what has already landed in ripclone. The old planning snapshot
-in [`internal/ROADMAP.md`](internal/ROADMAP.md) is retained for historical
-context; it is not current operational guidance.
+This file tracks what has already landed in ripclone. Current work is planned in
+[`internal/rebuild/PLAN.md`](internal/rebuild/PLAN.md).
 
 ## Explicit repository lifecycle
 
