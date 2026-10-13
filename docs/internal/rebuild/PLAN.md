@@ -212,22 +212,15 @@ the archive, so superseded docs are deleted, not moved.
 
 | Doc | Action |
 |---|---|
-| `docs/superpowers/` | Deleted (PR #182). |
-| `docs/ROADMAP.md`, `docs/internal/ROADMAP.md` | Deleted (PR #182); this plan replaces them. |
-| `docs/internal/GITHUB_INTEGRATION.md` | Delete after moving the `GITHUB_APP_*` env vars (documented only here) into `CONFIG.md` and `AUTH.md`. |
-| `docs/internal/ADVERSARIAL_REVIEW_2026-06-25.md`, `ARCHIVE_AB_RESULTS.md`, `WRITER_SCHEDULER_EXPERIMENT.md`, `rust/WRITER_PERF_ANALYSIS.md`, `benchmark/giant-repo-gate-2026-07-08.md` | Deleted (PR #182). Point-in-time results; `BENCHMARKS.md` keeps the current numbers. |
-| `docs/internal/RELEASE_DRYRUN.md` | Keep until the OSS release, then fold into `CONTRIBUTING.md` or delete. |
-| `docs/SCALING_WORKERS.md` | Delete with the remote worker. |
-| `docs/SYNC.md`, `docs/FRESHNESS.md`, `docs/SYNC_LATENCY_PROFILE.md` | Merge into one `docs/FRESHNESS.md`: how a push becomes clonable, top-up, and the latency numbers. |
-| `docs/BUILD_OPTIONS.md` | Fold into `CONTRIBUTING.md` (it is about compiling). |
-| `docs/AGENTS.md` | Keep as the fleet quickstart; drop `--temp`. |
-| `docs/BENCHMARKS.md` + `benchmark/README.md` | One doc: results in `BENCHMARKS.md`, how to run in `benchmark/README.md`. |
-| `docs/DESIGN.md` | Rewrite as the target model from this plan. It becomes the source of truth for behavior. |
-| `README.md`, `CONFIG.md`, `AUTH.md`, `BACKENDS.md`, `WEBHOOKS.md`, `PROVIDERS.md`, `ARTIFACT_LIFECYCLE.md`, `TROUBLESHOOTING.md` | Keep; rewrite to match the code at step 5. `BACKENDS.md` loses Turso; `AUTH.md` loses the login session and per-request tokens. |
+| `docs/superpowers/`, both roadmaps, dated reports (`ADVERSARIAL_REVIEW`, `ARCHIVE_AB_RESULTS`, `WRITER_SCHEDULER_EXPERIMENT`, `WRITER_PERF_ANALYSIS`, `giant-repo-gate`) | Deleted (PR #182). |
+| `AGENTS.md`, `AUTH.md`, `SYNC.md`, `FRESHNESS.md`, `SYNC_LATENCY_PROFILE.md`, `SCALING_WORKERS.md`, `BUILD_OPTIONS.md`, `TROUBLESHOOTING.md`, `CHANGELOG.md`, `internal/GITHUB_INTEGRATION.md`, `internal/RELEASE_DRYRUN.md` | Deleted (PR #182). They described cut features, the admission machinery being replaced, nonexistent install paths, or pre-release history. Agent guidance and build requirements moved to the README and `CONTRIBUTING.md`; GitHub App settings moved to `CONFIG.md`. |
+| `README.md`, `CONFIG.md`, `BACKENDS.md`, `PROVIDERS.md`, `WEBHOOKS.md` | Rewritten in PR #182 to the surface that stays. They omit features being cut. |
+| `DESIGN.md` | Kept. Becomes the target model as the control plane lands (step 3), including top-up. |
+| `ARTIFACT_LIFECYCLE.md`, `BENCHMARKS.md`, `benchmark/README.md`, `SECURITY.md`, `tests/fly/README.md`, `rust/README.md` | Kept. Benchmarks rerun at step 6. |
 | `docs/internal/rebuild/map-*.md` | Delete when the rebuild finishes; they cite line numbers that will go stale. |
 
-The rest lands with
-the code step that changes the behavior, or at step 5.
+A user doc for freshness (how a push becomes clonable, top-up, timings) is
+written at step 4, when top-up lands.
 
 ## Order of work
 

@@ -4259,8 +4259,8 @@ mod tests {
     #[test]
     fn post_rename_fsync_dir_resolves_relative_target_to_cwd() {
         // The post-rename durability fsync makes the atomic rename itself
-        // durable (BUILD_OPTIONS: "the target's parent directory after the
-        // atomic rename"). A bare relative target — the common case, the
+        // durable (`RIPCLONE_FSYNC` flushes the target's parent directory
+        // after the atomic rename). A bare relative target — the common case, the
         // README quickstart uses `bun` — has an empty parent. The
         // resolver must fall back to the containing directory (cwd `.`) so the
         // fsync runs, not be dropped/skipped (D6).

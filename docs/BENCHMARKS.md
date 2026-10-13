@@ -1,8 +1,6 @@
 # Benchmarks
 
-This is the authoritative benchmark reference. The [README](../README.md#performance) carries a single summary table and links here for the full sweep.
-
-Reproduce with [`benchmark/run_shaped_sweep.sh`](../benchmark/run_shaped_sweep.sh) on a client machine pointed at a ripclone server.
+Full results behind the summary table in the [README](../README.md#performance).
 
 For representative comparisons, prefer a real Fly volume mounted at `/data`. That path
 matches the production write path closely enough to expose filesystem, fsync,
@@ -85,21 +83,26 @@ The Linux run is the important stress case for files mode: 94,655 files and a 1.
 
 ## Running the sweep yourself
 
-```bash
-# Full Fly sweep, 3 runs per cell.
-RIPCLONE_SERVER=https://ripclone-server-dev.fly.dev \
-RIPCLONE_SERVER_TOKEN=... \
-./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "250 500 1000" 3
+See [`benchmark/README.md`](../benchmark/README.md).
 
-# Faster 3-rate sweep for pandas, pinned to the v2.2.2 commit.
-# GIT_REF tells the native-git baseline which tag to clone.
-BENCH_REF=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 GIT_REF=v2.2.2 \
-RIPCLONE_SERVER=https://ripclone-server-dev.fly.dev \
-RIPCLONE_SERVER_TOKEN=... \
-./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "250 500 1000" 1
-```
+## Build time
 
-For fast-moving branches, pass a commit SHA (or a tag plus `GIT_REF`) to `BENCH_REF`. If you pass a branch name, the harness resolves it once and pins that commit for the rest of the sweep so `HEAD` movement can't invalidate later rates.
+How long the server takes to build a commit's artifacts after a push, on the same hardware as the clone numbers. git has no equivalent; it builds nothing ahead of time.
+
+| repo | Head ready | Full and Files background work |
+|---|---|---|
+| `facebook/react` | 5.4 s | +32 s |
+| `oven-sh/bun` | ~8 s | +13 s |
+| `torvalds/linux` | ~40 s | very large |
+
+Head is what a `--depth 1` clone waits for. Full and Files run concurrently in
+the background and gate only their matching clone modes. React's measurement
+is a cold first build; Bun's is much shorter because the incremental re-sync
+reuses unchanged history levels and archive frames. Linux's Head build is
+dominated by its ~95k-file tree, and its full history is large enough that we
+don't pre-build it on the dev box.
+
+> In production the server syncs on push, so this happens once per commit, ahead of any clone — by the time a CI runner or agent asks for the repo, the artifacts are already built.
 
 ## Why ripclone is faster
 

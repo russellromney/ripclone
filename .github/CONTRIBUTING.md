@@ -4,6 +4,11 @@ ripclone is open to contributions. The project is dual-licensed under MIT and Ap
 
 ## Getting started
 
+Requirements: the Rust toolchain pinned in `rust-toolchain.toml`,
+`protoc`, `cmake` (for `zlib-ng`), and `git`. On Linux, `rust/.cargo/config.toml`
+links with `mold`; `scripts/install-build-deps.sh` installs it. Without cmake,
+build with `--no-default-features` to use stock zlib.
+
 ```bash
 cd rust
 cargo build --release
@@ -26,10 +31,6 @@ cargo test
    single stage with `scripts/ci.sh lint|test|e2e|flake`.
 3. Add tests for new behavior.
 4. Keep commits focused and the diff minimal.
-
-> Tests run in **parallel** (as in CI), so they must not depend on global
-> process state (e.g. shared env vars) leaking between tests. `scripts/ci.sh flake`
-> re-runs the suite to surface such races.
 
 ## Questions
 

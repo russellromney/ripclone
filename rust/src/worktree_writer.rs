@@ -839,8 +839,8 @@ fn write_regular_posix(target: &Path, mode: u32, content: &[u8]) -> Result<std::
 /// On Linux this batches `IORING_OP_FSYNC` through a dedicated ring, so a large
 /// tree is flushed with one submit per queue-depth chunk instead of one blocking
 /// `fsync` syscall per file. On other platforms, or if io_uring is unavailable
-/// at runtime, it falls back to a sequential `fsync`. Off by default — see D6 in
-/// `docs/BUILD_OPTIONS.md`; enabling it trades clone latency for durability.
+/// at runtime, it falls back to a sequential `fsync`. Off by default (see
+/// `RIPCLONE_FSYNC` in `docs/CONFIG.md`); enabling it trades clone latency for durability.
 pub fn fsync_paths_durable(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
     if files.is_empty() && dirs.is_empty() {
         return Ok(());

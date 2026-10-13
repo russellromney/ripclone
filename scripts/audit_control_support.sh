@@ -13,7 +13,7 @@ while IFS= read -r line; do
   [ -n "$line" ] || continue
   path="${line%%:*}"
   case "$path" in
-    rust/src/control.rs|rust/src/server.rs|rust/tests/control_startup.rs|rust/tests/e2e_token_only_worker.rs|rust/tests/suites/local_default/e2e_repo_config.rs|docs/BACKENDS.md|docs/CONFIG.md|docs/CHANGELOG.md|docs/internal/*)
+    rust/src/control.rs|rust/src/server.rs|rust/tests/control_startup.rs|rust/tests/e2e_token_only_worker.rs|rust/tests/suites/local_default/e2e_repo_config.rs|docs/BACKENDS.md|docs/CONFIG.md|docs/internal/*)
       allowed=$((allowed + 1))
       ;;
     *)
