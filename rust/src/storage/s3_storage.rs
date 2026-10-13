@@ -55,6 +55,14 @@ pub struct S3Storage {
     multipart_upload_slots: tokio::sync::Semaphore,
 }
 
+struct S3Settings {
+    endpoint: String,
+    region: String,
+    bucket: String,
+    prefix: Option<String>,
+    auth: Auth,
+}
+
 impl S3Storage {
     pub fn new(
         endpoint: &str,
@@ -133,9 +141,30 @@ impl S3Storage {
     /// environment only — never from config. `backend = "local"` forces local
     /// storage (returns `None`) even if S3 settings are present.
     pub fn from_env_or_config(cfg: &crate::config::StorageConfig) -> Result<Option<Self>> {
-        if cfg.backend.as_deref() == Some("local") {
+        let Some(settings) = Self::settings_from_env_or_config(cfg)? else {
             return Ok(None);
-        }
+        };
+        Self::new(
+            &settings.endpoint,
+            &settings.region,
+            &settings.bucket,
+            settings.prefix.as_deref(),
+            settings.auth,
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn validate_env_or_config(cfg: &crate::config::StorageConfig) -> Result<()> {
+        // Construct the client as part of preflight. This performs no request,
+        // but it does validate the endpoint and all client-builder settings so
+        // daemons cannot mutate SQLite or local directories before discovering
+        // an invalid S3 configuration.
+        Self::from_env_or_config(cfg).map(|_| ())
+    }
+
+    fn settings_from_env_or_config(
+        cfg: &crate::config::StorageConfig,
+    ) -> Result<Option<S3Settings>> {
         let pick =
             |env_key: &str, alt_env: Option<&str>, cfg_val: Option<&str>| -> Option<String> {
                 std::env::var(env_key)
@@ -149,12 +178,26 @@ impl S3Storage {
                     .or_else(|| cfg_val.map(str::to_string).filter(|e| !e.is_empty()))
             };
 
+        let backend = cfg.backend.as_deref().map(str::trim);
+        match backend {
+            Some("local") => return Ok(None),
+            Some("s3") | None => {}
+            Some(other) => {
+                anyhow::bail!("unknown storage backend {other:?}; expected \"local\" or \"s3\"")
+            }
+        }
+
         let endpoint = match pick(
             "RIPCLONE_S3_ENDPOINT",
             Some("AWS_ENDPOINT_URL_S3"),
             cfg.endpoint.as_deref(),
         ) {
             Some(e) => e,
+            None if backend == Some("s3") => {
+                anyhow::bail!(
+                    "RIPCLONE_S3_ENDPOINT or AWS_ENDPOINT_URL_S3 (or [storage].endpoint) is required when backend = \"s3\""
+                )
+            }
             None => return Ok(None),
         };
         let region = pick(
@@ -167,7 +210,13 @@ impl S3Storage {
             .context("RIPCLONE_S3_BUCKET or BUCKET_NAME (or [storage].bucket) is required when S3 is enabled")?;
         let prefix = pick("RIPCLONE_S3_PREFIX", None, cfg.prefix.as_deref());
         let auth = Auth::from_env().context("read S3 credentials from environment")?;
-        Self::new(&endpoint, &region, &bucket, prefix.as_deref(), auth).map(Some)
+        Ok(Some(S3Settings {
+            endpoint,
+            region,
+            bucket,
+            prefix,
+            auth,
+        }))
     }
 
     fn key(&self, hash: &str) -> Result<String> {

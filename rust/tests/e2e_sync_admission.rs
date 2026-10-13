@@ -38,10 +38,10 @@ fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             };
             if file_type.is_dir() {
                 visit(root, &path, out);
-            } else if file_type.is_file() {
-                if let Ok(bytes) = std::fs::read(&path) {
-                    out.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
-                }
+            } else if file_type.is_file()
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                out.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
             }
         }
     }

@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 DATA = {
     "oven-sh/bun": {
-        # 2026-06-30, ripclone-server-dev / ripclone-client-dev (performance-8x),
+        # 2026-06-30, separate cloud server/client VMs (8-vCPU client),
         # pinned to b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037, 3 runs per cell.
         "Mbps": [250, 500, 1000, 2000, 5000, 10000],
         "ripclone full": [13.296, 7.122, 4.769, 2.292, 2.045, 2.131],

@@ -2,14 +2,16 @@
 
 Full results behind the summary table in the [README](../README.md#performance).
 
-For representative comparisons, prefer a real Fly volume mounted at `/data`. That path
-matches the production write path closely enough to expose filesystem, fsync,
-and worktree materialization bottlenecks that local tmpdirs or memory-backed
-volumes can hide.
+For representative comparisons, use a real SSD/NVMe filesystem. Memory-backed
+temporary directories can hide filesystem, fsync, and worktree materialization
+bottlenecks.
 
 ## How to read these numbers
 
-ripclone pre-builds git artifacts so clones are faster than `git clone` across the Fly bandwidths we tested, from 250 Mbps up to about 1 Gbps. We also have a real high-bandwidth EC2 run for `torvalds/linux` at 1/2/5 Gbps. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
+ripclone pre-builds git artifacts so clones are faster than `git clone` across
+the 250 Mbps to 1 Gbps shaped links we tested. We also have a high-bandwidth
+Linux run for `torvalds/linux` at 1/2/5 Gbps. On fast links the wins are largest;
+as bandwidth drops the download itself dominates and the gap narrows.
 
 Every speedup below compares like with like: a full clone against `git clone`, and depth-1 and `files` against `git clone --depth 1` (the closest git equivalent — both fetch only the tip). Comparing `files` against a full `git clone` would inflate the number several-fold, so we don't.
 
@@ -25,9 +27,16 @@ The full-clone win is smaller on pandas than on bun because pandas's full pack i
 
 ## Shaped bandwidth sweep
 
-We run `ripclone` against native `git clone` on a Fly.io `performance-8x` client in `ewr` talking to `ripclone-server-dev` in `iad`, with the client↔server link shaped to the listed bandwidth. Each cell is the median of 3 runs with a cold client cache (`RIPCLONE_NO_CACHE=1`). `oven-sh/bun` is pinned to commit `b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037`; `pandas-dev/pandas` is pinned to tag `v2.2.2` (`d9cdd2ee5a58015ef6f4d15c7226110c9aab8140`).
+We ran `ripclone` against native `git clone` on separate 8-vCPU cloud client
+and server VMs, with the client↔server link shaped to the listed bandwidth.
+Each cell is the median of 3 runs with a cold client cache
+(`RIPCLONE_NO_CACHE=1`). `oven-sh/bun` is pinned to commit
+`b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037`; `pandas-dev/pandas` is pinned to
+tag `v2.2.2` (`d9cdd2ee5a58015ef6f4d15c7226110c9aab8140`).
 
-The sweep covers **250/500 Mbps and 1 Gbps**. The old 50 Mbps and 100 Mbps rows and warm-cache baselines have been dropped because they are not representative for real clones. The Fly client path is roughly 1 Gbps in practice; higher shaped caps are useful internal trend checks but are not representative benchmark claims — for real higher-bandwidth numbers, see the EC2 Linux rows below.
+The sweep covers **250/500 Mbps and 1 Gbps**. The old 50 Mbps and 100 Mbps rows
+and warm-cache baselines have been dropped because they are not representative
+for real clones. For higher-bandwidth numbers, see the Linux rows below.
 
 **`oven-sh/bun`**
 
@@ -49,7 +58,8 @@ Key takeaways:
 
 - **ripclone wins at every measured bandwidth** for full-history and files-mode clones, with the biggest margins at 1 Gbps (up to **11.7×** for `oven-sh/bun` full clone).
 - **The gap narrows as bandwidth drops.** At 250 Mbps the full-clone win is still **3.3×** for bun and **2.2×** for pandas, while depth-1 remains faster than `git clone --depth 1`.
-- **Above 1 Gbps, use a real high-bandwidth client.** The Linux EC2 run below is the current high-bandwidth proof at 1/2/5 Gbps; Fly-shaped 2/5/10 Gbps rows should not be presented as real link measurements.
+- **Above 1 Gbps, use a real high-bandwidth client.** The Linux run below is the
+  current high-bandwidth proof at 1/2/5 Gbps.
 
 The ratio graph shows **ripclone time / git time**; anything below the dashed `1.0` line means ripclone was faster.
 
@@ -57,7 +67,9 @@ The ratio graph shows **ripclone time / git time**; anything below the dashed `1
 
 ## High-bandwidth Linux on EC2
 
-The Fly `performance-8x` VM can't realistically shape a 5 Gbps link, so `torvalds/linux` was measured from an AWS `c6i.8xlarge` (32 vCPU, up to 25 Gbps) in `us-east-1` talking to the same `ripclone-server-dev`. The client↔server link was shaped with `nftables`; ripclone modes got 3 runs, git baselines got 1 run.
+`torvalds/linux` was measured from a 32-vCPU high-bandwidth Linux client talking
+to the same test server. The client↔server link was shaped with `nftables`;
+ripclone modes got 3 runs and Git baselines got 1 run.
 
 Pinned to `torvalds/linux` @ `ab9de95c9cf952332ab79453b4b5d1bfca8e514f`:
 
@@ -71,7 +83,10 @@ That's **~10× faster than `git clone`** for the full history at 5 Gbps, and **~
 
 ## Files-only archive benchmark
 
-GitHub's source archive endpoint (`codeload.github.com/.../tar.gz/...`) is the closest built-in comparison for `ripclone --mode=files`: both produce a worktree without git history. We measured both from the Fly client, writing extracted files to the mounted `/data` volume.
+GitHub's source archive endpoint (`codeload.github.com/.../tar.gz/...`) is the
+closest built-in comparison for `ripclone --mode=files`: both produce a
+worktree without Git history. Both wrote extracted files to the same NVMe
+volume.
 
 | Repo | ripclone files | GitHub tar.gz | Result |
 |------|----------------|---------------|--------|
@@ -112,6 +127,6 @@ don't pre-build it on the dev box.
 
 - **Sync pays the cost.** The fast clone is amortized against a full build per sync (bun: ~1m40 first full build; incremental re-syncs are cheaper). First sync of a big repo is still the price.
 - **Edge cache.** These runs had objects warm in the in-region object-storage edge. A first clone from a cold region pays an edge-cache miss. This is inherent to using object storage as the CDN.
-- **Same-datacenter network.** Fly→object-storage is a fat pipe. A laptop on home wifi is bounded by its own download speed, but still skips git's server-side pack compute.
-</content>
-</invoke>
+- **Same-datacenter network.** The test client and object storage had a fast
+  path. A laptop on home Wi-Fi is bounded by its own download speed, but still
+  skips Git's server-side pack computation.

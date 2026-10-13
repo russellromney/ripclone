@@ -10,6 +10,23 @@ use std::time::Duration;
 
 const SKIP_WORKTREE_FLAG: gix::index::entry::Flags = gix::index::entry::Flags::SKIP_WORKTREE;
 
+/// Fail before starting work that requires the system Git executable.
+pub fn require_system_git() -> Result<()> {
+    let status = Command::new("git")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("system Git is required; install `git` and ensure it is on PATH")?;
+    if !status.success() {
+        bail!(
+            "system Git is required; `git --version` exited with {status}; install Git and ensure it is on PATH"
+        );
+    }
+    Ok(())
+}
+
 fn open_index_file(path: &Path) -> Result<gix::index::File> {
     gix::index::File::at(
         path,
@@ -3968,6 +3985,12 @@ mod tests {
             3,
             "one changed root file should introduce only commit + root tree + changed blob"
         );
+
+        let full_range = list_object_shas_in_range(repo, None, &shas[2]).unwrap();
+        assert!(full_range.contains(&shas[0]));
+        assert!(full_range.contains(&shas[1]));
+        assert!(full_range.contains(&shas[2]));
+        assert!(full_range.contains(&stable_blob));
     }
 
     /// Regression: object lookups for ≥PARALLEL_LOOKUP_THRESHOLD objects must not

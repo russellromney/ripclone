@@ -51,7 +51,7 @@ See **[Design](docs/DESIGN.md)** for how the artifacts are built.
 
 ## Performance
 
-At 1 Gbps, Fly.io `performance-8x` client, median of 3 runs, cold client cache:
+At 1 Gbps, separate 8-vCPU cloud client and server, median of 3 runs, cold client cache:
 
 | Repo | ripclone full | ripclone depth=1 | ripclone files | `git clone` | `git clone --depth 1` |
 |---|---|---|---|---|---|
@@ -65,8 +65,11 @@ history at 5 Gbps and about 6× for depth 1. Details and caveats:
 
 ## Build
 
-Requirements: a Rust toolchain (pinned in `rust-toolchain.toml`), `protoc`,
-`cmake` (for `zlib-ng`), and `git` on the `PATH` of both client and server.
+Requirements: Rust 1.96 or newer (CI uses the version pinned in
+`rust-toolchain.toml`), `protoc`, and `cmake` (for `zlib-ng`). At run time the
+server and editable clones need `git` on the `PATH`; files-only clones do not.
+Linux and macOS are supported; Windows is not. Use client and server builds
+with the same wire version; a mismatch fails clearly.
 
 ```bash
 cd rust

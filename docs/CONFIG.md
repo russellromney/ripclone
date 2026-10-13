@@ -33,6 +33,7 @@ Flags: `--cas-dir`, `--repo-root`, `--control-db`, `--host` (default
 | Variable | Meaning |
 |---|---|
 | `RIPCLONE_SERVER_TOKEN` / `RIPCLONE_SERVER_TOKEN_HASH` | The token clients must present. |
+| `RUST_LOG` | Tracing filter, normally `info`. |
 | `RIPCLONE_CONTROL_DB_PATH` | SQLite control database path. Config: `[control] path`. |
 | `RIPCLONE_PROVIDERS` | JSON provider registry. See [Providers](PROVIDERS.md). |
 | `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`, `RIPCLONE_S3_PREFIX` | S3-compatible artifact storage. Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. See [Server state and storage](BACKENDS.md). |

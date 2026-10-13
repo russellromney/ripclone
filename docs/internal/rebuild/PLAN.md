@@ -216,7 +216,7 @@ the archive, so superseded docs are deleted, not moved.
 | `AGENTS.md`, `AUTH.md`, `SYNC.md`, `FRESHNESS.md`, `SYNC_LATENCY_PROFILE.md`, `SCALING_WORKERS.md`, `BUILD_OPTIONS.md`, `TROUBLESHOOTING.md`, `CHANGELOG.md`, `internal/GITHUB_INTEGRATION.md`, `internal/RELEASE_DRYRUN.md` | Deleted (PR #182). They described cut features, the admission machinery being replaced, nonexistent install paths, or pre-release history. Agent guidance and build requirements moved to the README and `CONTRIBUTING.md`; GitHub App settings moved to `CONFIG.md`. |
 | `README.md`, `CONFIG.md`, `BACKENDS.md`, `PROVIDERS.md`, `WEBHOOKS.md` | Rewritten in PR #182 to the surface that stays. They omit features being cut. |
 | `DESIGN.md` | Kept. Becomes the target model as the control plane lands (step 3), including top-up. |
-| `ARTIFACT_LIFECYCLE.md`, `BENCHMARKS.md`, `benchmark/README.md`, `SECURITY.md`, `tests/fly/README.md`, `rust/README.md` | Kept. Benchmarks rerun at step 6. |
+| `ARTIFACT_LIFECYCLE.md`, `BENCHMARKS.md`, `benchmark/README.md`, `SECURITY.md`, `rust/README.md` | Kept. Benchmarks rerun at step 6. `docs/SUPPORT.md` (added by #171) folded into the README build section. |
 | `docs/internal/rebuild/map-*.md` | Delete when the rebuild finishes; they cite line numbers that will go stale. |
 
 A user doc for freshness (how a push becomes clonable, top-up, timings) is

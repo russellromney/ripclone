@@ -154,10 +154,10 @@ impl Cas {
         let hash = hex::encode(hasher.finalize());
         let path = self.object_path(&hash)?;
         let tmp_path = tmp.into_temp_path();
-        if path.exists() {
-            if let Ok(existing_len) = self.verify_object(&hash) {
-                return Ok((hash, existing_len));
-            }
+        if path.exists()
+            && let Ok(existing_len) = self.verify_object(&hash)
+        {
+            return Ok((hash, existing_len));
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -172,10 +172,10 @@ impl Cas {
             .with_context(|| format!("stat CAS source file {}", source.display()))?;
         let len = meta.len();
         let path = self.object_path(hash)?;
-        if path.exists() {
-            if let Ok(existing_len) = self.verify_object(hash) {
-                return Ok(existing_len);
-            }
+        if path.exists()
+            && let Ok(existing_len) = self.verify_object(hash)
+        {
+            return Ok(existing_len);
         }
         std::fs::create_dir_all(&self.root)?;
         let mut input = std::fs::File::open(source)

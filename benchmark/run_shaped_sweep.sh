@@ -4,19 +4,19 @@ set -euo pipefail
 # ripclone vs native git clone sweep.
 #
 # By default the network link is shaped to the requested bandwidth using
-# nftables (run on a Linux host with CAP_NET_ADMIN such as the Fly client).
+# nftables (run on a Linux host with CAP_NET_ADMIN).
 # Set SHAPED=0 to run without traffic shaping for warm-cache comparisons.
 #
-# Usage (typically run on the Fly ripclone-client-dev machine):
-#   RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+# Usage:
+#   RIPCLONE_URL=https://your-ripclone-server.example.com \
 #   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh [repos] [rates] [runs]
 #
-#   RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+#   RIPCLONE_URL=https://your-ripclone-server.example.com \
 #   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "250 500 1000 2000 5000 10000" 3
 #
-#   BENCH_REF=v2.2.2 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+#   BENCH_REF=v2.2.2 RIPCLONE_URL=https://your-ripclone-server.example.com \
 #   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "250 500 1000" 1
 #
@@ -38,7 +38,7 @@ RATES="${2:-"250 500 1000 2000 5000 10000"}"
 RUNS="${3:-3}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BENCH="$SCRIPT_DIR/fly_shaped_benchmark.sh"
+BENCH="$SCRIPT_DIR/shaped_benchmark.sh"
 
 LOG="/data/shaped_sweep.log"
 mkdir -p "$(dirname "$LOG")"
