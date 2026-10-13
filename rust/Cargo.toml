@@ -44,7 +44,7 @@ zlib-ng = ["flate2/zlib-ng"]
 anyhow = "1"
 axum = "0.8"
 bytes = "1"
-base64 = "0.22"
+base64 = "0.23"
 byteorder = "1.5"
 chrono = "0.4"
 crossbeam-channel = "0.5"
@@ -64,7 +64,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
 sha2 = "0.11"
-fastcdc = "4"
+fastcdc = "5"
 tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
@@ -74,12 +74,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 urlencoding = "2"
 walkdir = "2"
-zstd = { version = "0.13", features = ["zdict_builder"] }
+zstd = { version = "0.14", features = ["zdict_builder"] }
 secrecy = "0.10.3"
 async-trait = "0.1.89"
 # `rust_crypto` selects the pure-Rust crypto provider so RS256 sign/verify work
 # (the GitHub App broker signs JWTs; OIDC verifies them).
-jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 subtle = "2"
 # One official driver serves plain local SQLite and Turso embedded replicas.
 # libsql 0.9.30 double-closes native connections during teardown. Pin the
