@@ -232,7 +232,6 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         build_queue: queue.clone(),
         control_db: Some(control.clone()),
         worker_queue: Some(queue.clone()),
-        build_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         oidc_verifier: None,
         webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
         sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

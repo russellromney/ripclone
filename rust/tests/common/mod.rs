@@ -744,7 +744,6 @@ async fn start_server_split_storage_inner(
         build_queue,
         control_db: Some(control_db),
         worker_queue: Some(durable_queue.clone()),
-        build_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         oidc_verifier: None,
         webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
         sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -763,7 +762,7 @@ async fn start_server_split_storage_inner(
         tokio::spawn(async move {
             let worker_id = format!("split-storage-{}-{slot}", std::process::id());
             loop {
-                ripclone::server::admission_test_before_claim().await;
+                let _ = ripclone::server::test_hook(ripclone::server::TestStage::BeforeClaim).await;
                 let claimed = match worker_queue.claim(&worker_id).await {
                     Ok(Some(claimed)) => claimed,
                     Ok(None) => {
@@ -781,7 +780,7 @@ async fn start_server_split_storage_inner(
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 let state = worker_state.clone();
-                ripclone::server::admission_test_after_claim().await;
+                let _ = ripclone::server::test_hook(ripclone::server::TestStage::AfterClaim).await;
                 let job = ripclone::queue::BuildJob {
                     repo_id: claimed.repo_id(),
                     admitted_commit: claimed.admitted_commit,
@@ -1235,11 +1234,11 @@ pub async fn server_ref_store(server: &Server) -> Arc<dyn ripclone::ref_store::R
     use ripclone::meta::{LibsqlMeta, SqlRefStore};
 
     Arc::new(
-        SqlRefStore::new(Box::new(
+        SqlRefStore::new(
             LibsqlMeta::connect(&server.control_db.to_string_lossy())
                 .await
                 .expect("open server control refs"),
-        ))
+        )
         .await
         .expect("initialize server control refs"),
     )

@@ -54,11 +54,11 @@ async fn wait_count(counter: &AtomicUsize, count: usize) {
 }
 
 async fn wait_for_failed_job(server: &Server, repo: &str, commit: &str) {
-    let queue = ripclone::queue::SqlJobQueue::new(Box::new(
+    let queue = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .expect("connect exact job queue"),
-    ))
+    )
     .await
     .expect("initialize exact job queue");
     let key = format!("{}\x1f{commit}", RepoId::github(repo).storage_key());
@@ -150,11 +150,11 @@ async fn stop_current_job(server: &Server, repo: &str, commit: &str) {
     );
     drop(rows);
 
-    let queue = ripclone::queue::SqlJobQueue::new(Box::new(
+    let queue = ripclone::queue::SqlJobQueue::new(
         ripclone::queue::LibsqlDb::connect(&server.control_db.to_string_lossy())
             .await
             .expect("connect exact job queue"),
-    ))
+    )
     .await
     .expect("open exact job queue");
     assert!(

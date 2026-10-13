@@ -1,8 +1,7 @@
 //! Exact-result metadata over the server's Turso embedded-replica handle.
 
-use super::{MetaDb, ResultRow};
+use super::ResultRow;
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use libsql::{Connection, Database};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,11 +29,8 @@ impl LibsqlMeta {
             .context("configure metadata busy timeout")?;
         Ok(conn)
     }
-}
 
-#[async_trait]
-impl MetaDb for LibsqlMeta {
-    async fn init(&self) -> Result<()> {
+    pub(crate) async fn init(&self) -> Result<()> {
         self.conn()
             .await?
             .execute(
@@ -62,7 +58,11 @@ impl MetaDb for LibsqlMeta {
         Ok(())
     }
 
-    async fn get_result(&self, repo_key: &str, commit: &str) -> Result<Option<ResultRow>> {
+    pub(crate) async fn get_result(
+        &self,
+        repo_key: &str,
+        commit: &str,
+    ) -> Result<Option<ResultRow>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -79,7 +79,12 @@ impl MetaDb for LibsqlMeta {
         }
     }
 
-    async fn insert_result(&self, repo_key: &str, commit: &str, data: &str) -> Result<bool> {
+    pub(crate) async fn insert_result(
+        &self,
+        repo_key: &str,
+        commit: &str,
+        data: &str,
+    ) -> Result<bool> {
         let changed = self
             .conn()
             .await?
@@ -92,7 +97,7 @@ impl MetaDb for LibsqlMeta {
         Ok(changed == 1)
     }
 
-    async fn compare_and_swap_result(
+    pub(crate) async fn compare_and_swap_result(
         &self,
         repo_key: &str,
         commit: &str,
@@ -111,7 +116,7 @@ impl MetaDb for LibsqlMeta {
         Ok(changed == 1)
     }
 
-    async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>> {
+    pub(crate) async fn list_commits(&self, repo_key: &str) -> Result<Vec<String>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -127,7 +132,7 @@ impl MetaDb for LibsqlMeta {
         Ok(out)
     }
 
-    async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {
+    pub(crate) async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {
         self.conn()
             .await?
             .execute(
@@ -140,7 +145,7 @@ impl MetaDb for LibsqlMeta {
         Ok(())
     }
 
-    async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
+    pub(crate) async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
@@ -155,7 +160,7 @@ impl MetaDb for LibsqlMeta {
         }
     }
 
-    async fn remove_added_repo(&self, repo_key: &str) -> Result<()> {
+    pub(crate) async fn remove_added_repo(&self, repo_key: &str) -> Result<()> {
         self.conn()
             .await?
             .execute(
@@ -167,7 +172,7 @@ impl MetaDb for LibsqlMeta {
         Ok(())
     }
 
-    async fn list_added_repos(&self) -> Result<Vec<String>> {
+    pub(crate) async fn list_added_repos(&self) -> Result<Vec<String>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query("SELECT data FROM added_repos ORDER BY repo_key", ())
@@ -180,7 +185,7 @@ impl MetaDb for LibsqlMeta {
         Ok(out)
     }
 
-    async fn health(&self) -> Result<()> {
+    pub(crate) async fn health(&self) -> Result<()> {
         self.conn()
             .await?
             .query("SELECT 1", ())
