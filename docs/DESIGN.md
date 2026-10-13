@@ -51,33 +51,4 @@ The archive is split by content, not by fixed size: cut points land on the data 
 
 This makes re-syncs cheap. When a new commit lands, frames that didn't change hash to the same name and are reused as-is — no recompressing, no re-uploading. Only the frames that actually changed get rebuilt, and the builder reads just those changed regions, so the work matches the size of the diff, not the whole repo. The same is true of everything else a sync builds: only the commits and objects new since the last sync get packed, and re-syncing a commit that's already built does no work at all. A re-sync costs about what the diff costs.
 
-## Performance
-
-The headline clone numbers are in the [README](../README.md#performance), with the full sweep in [`BENCHMARKS.md`](BENCHMARKS.md). For `--depth 1` ripclone is roughly **3–6× faster** than native `git clone`; for a full clone it is up to **~10–12× faster** (repo-dependent — bigger on `oven-sh/bun` than on `pandas-dev/pandas`), because git makes the host compute and stream the whole history pack on demand while ripclone just downloads pre-built, content-addressed packs in parallel. `files` mode (working tree only, from the zstd archive) is the fastest of all.
-
-Measured on separate 8-vCPU cloud client and server VMs with S3-compatible
-artifact storage; warm server cache, client artifact cache disabled, written to
-an NVMe volume. Git clones are from GitHub over the same link. Median of 3 runs.
-
-> `torvalds/linux` Full history is a heavy one-time build. The release gate runs
-> that cold path separately under concurrent Head, Files, and admission load;
-> ordinary agent clones should normally use `--depth 1`.
-
-### Sync performance
-
-How long a sync takes to build the artifacts (server-side, the same hardware as the clone numbers). There's no git equivalent — git builds nothing ahead of time.
-
-| repo | Head ready | Full and Files background work |
-|---|---|---|
-| `facebook/react` | 5.4 s | +32 s |
-| `oven-sh/bun` | ~8 s | +13 s |
-| `torvalds/linux` | ~40 s | very large |
-
-Head is what a `--depth 1` clone waits for. Full and Files run concurrently in
-the background and gate only their matching clone modes. React's measurement
-is a cold first build; Bun's is much shorter because the incremental re-sync
-reuses unchanged history levels and archive frames. Linux's Head build is
-dominated by its ~95k-file tree, and its full history is large enough that we
-don't pre-build it on the dev box.
-
-> In production the server syncs on push, so this happens once per commit, ahead of any clone — by the time a CI runner or agent asks for the repo, the artifacts are already built.
+Clone and build timings are in [Benchmarks](BENCHMARKS.md).

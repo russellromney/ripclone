@@ -4,367 +4,177 @@
 
 # ripclone
 
-ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup; small repos are also a bit faster.
+ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup;
+small repos are also a bit faster.
 
-ripclone pre-builds git artifacts for every pushed commit so that agents, CI systems, and humans can clone a repo and start working in seconds instead of waiting for a full `git clone`. It is **read-only** and **clone-only**: it does not proxy commits or pushes. You use normal git with your own credentials for writes.
+ripclone pre-builds git artifacts for every pushed commit so that agents, CI
+systems, and humans can clone a repo and start working in seconds instead of
+waiting for a full `git clone`. It is **read-only** and **clone-only**: it does
+not proxy pushes. You use normal git with your own credentials for writes.
 
-It works as two operations: you **sync** a repo so the server pre-builds its artifacts (automatic on every push), then you **clone** it — the client downloads those artifacts and writes the working tree in seconds.
+It is self-hostable and host-agnostic: point it at GitHub, GitLab, Gitea, or any
+git host, public or private.
 
-It is self-hostable and host-agnostic — point it at GitHub, GitLab, Gitea, or any git host — and works for private or public repos.
+ripclone started from a question asked by
+[Jarred Sumner](https://x.com/jarredsumner/status/2066420871753838913):
 
-ripclone started from a simple question asked by [Jarred Sumner](https://x.com/jarredsumner/status/2066420871753838913): 
+> *"It's hard to imagine why cloning a git repo should be much slower than
+> downloading an equivalent-sized file. Where are the experiments with custom
+> git clients that clone faster?"*
 
-> *"It's hard to imagine why cloning a git repo should be much slower than downloading an equivalent-sized file. Where are the experiments with custom git clients that clone faster?"* 
-
-ripclone is one answer. The goal: get a `git clone` as close as possible to downloading a file from object storage. A few design principles get there:
+ripclone is one answer. The goal: get a `git clone` as close as possible to
+downloading a file from object storage.
 
 | Principle | In practice |
 |---|---|
-| **Move slow work off the clone** | Negotiation, indexing, and the tree walk run once on the server at sync — never on the clone. The client just downloads finished pieces and writes them. |
-| **Parallelize the downloads** | Packs and the archive are content-addressed chunks, so a clone is many parallel range-GETs, not one serial stream. |
-| **Keep every resource busy** | Every stage runs across all cores *and* overlaps in time — the next starts the moment the last produces output. Network, CPU, and disk never idle (io_uring on Linux). |
-| **Process as little as possible** | A re-sync rebuilds only what the diff touched; a clone fetches only the artifacts its mode needs — files mode skips the object database entirely. |
+| **Move slow work off the clone** | Negotiation, indexing, and the tree walk run once on the server after a push, never on the clone. The client downloads finished pieces and writes them. |
+| **Parallelize the downloads** | Packs and the archive are content-addressed chunks, so a clone is many parallel GETs, not one serial stream. |
+| **Keep every resource busy** | Download, decode, and write overlap, so network, CPU, and disk stay busy. |
+| **Process as little as possible** | A new commit rebuilds only what the diff touched; a clone fetches only the artifacts its mode needs. |
 
-## Clone
+> **Status:** pre-release. There are no published binaries or packages yet;
+> build from source. The control plane is being simplified; see
+> [`docs/internal/rebuild/PLAN.md`](docs/internal/rebuild/PLAN.md).
 
-On every push, ripclone prebuilds a **clonepack** for `HEAD` — a set of files in object storage laid out so a clone has almost nothing left to do but download and write. Pick how much you pull with `--mode`:
+## Clone modes
 
-`--mode=editable` (the default) installs a full editable git repo by default, matching `git clone` history semantics while downloading prebuilt packs in parallel. Use `--depth 1` when you want the smaller HEAD-only clonepack for CI or agent work.
+| Command | You get | Use it when |
+|---|---|---|
+| `ripclone clone owner/repo` | A full editable git repo with complete history | You want a drop-in `git clone`. |
+| `ripclone clone owner/repo --depth 1` | An editable git repo with only `HEAD` | CI and agents that run git but don't walk history. |
+| `ripclone clone owner/repo --mode files` | The working tree only, no `.git` | You only need the files. Fastest. |
 
-`--mode=files` writes the working tree straight from a zstd archive — the fastest path when you only need the files (agents, CI). No git object database, so `git diff`/`show` don't work.
+**Git LFS:** ripclone stores LFS pointer files, never the blobs. Run
+`git lfs pull` after cloning.
 
-### Which one do I use?
-
-ripclone has two ways to materialize a tree.
-
-| Surface | What it produces | Source | Use this when… |
-|---|---|---|---|
-| `clone --mode editable` | A full git repo: `.git` (objects + packs) **and** a working tree | Prebuilt clonepack from the **server** | You want a normal repo to commit, branch, `git diff`, and push — the drop-in `git clone`. |
-| `clone --mode files` | **Just the source files** — no `.git`, no history | Prebuilt archive from the **server** | You only need the file contents (agents, CI, build inputs) and never run git in the tree. Fastest path. |
-
-Rule of thumb: `--mode editable` when you will run git in the tree, `--mode files` when you will not. For a second checkout of a repo you already have, use `git worktree add` directly.
-
-**Git LFS:** LFS objects come from your git host, not ripclone — run `git lfs pull` after cloning to fetch them. ripclone stores the LFS pointer files (it never stores the blobs); resolving them is a pass-through to your host by design.
-
-See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
+See **[Design](docs/DESIGN.md)** for how the artifacts are built.
 
 ## Performance
 
-ripclone pre-builds git artifacts so clones are faster than `git clone`. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows. At 1 Gbps, on a separate 8-vCPU cloud client and server (median of 3 runs, cold client cache):
+At 1 Gbps, separate 8-vCPU cloud client and server, median of 3 runs, cold client cache:
 
-| Repo (1 Gbps) | ripclone full | ripclone depth=1 | ripclone files | `git clone` full | `git clone --depth 1` |
+| Repo | ripclone full | ripclone depth=1 | ripclone files | `git clone` | `git clone --depth 1` |
 |---|---|---|---|---|---|
 | `oven-sh/bun` | 3.4 s · **11.7×** | 1.0 s · **3.3×** | 0.63 s · **5.4×** | 40.3 s | 3.37 s |
 | `pandas-dev/pandas` | 3.0 s · **7.6×** | 0.32 s · **6.0×** | 0.26 s · **7.4×** | 22.8 s | 1.90 s |
 
-*Mode labels:* `ripclone full` / `ripclone depth=1` are the `editable` mode with `--depth 0` / `--depth 1`; `ripclone files` is `files` mode (HEAD worktree only).
+Full clones are compared with `git clone`; depth-1 and files with
+`git clone --depth 1`. `torvalds/linux` on EC2 reaches about 10× for full
+history at 5 Gbps and about 6× for depth 1. Details and caveats:
+**[Benchmarks](docs/BENCHMARKS.md)**.
 
-*Baselines:* each speedup compares like with like. `ripclone full` is measured against `git clone` full; `ripclone depth=1` and `ripclone files` are measured against `git clone --depth 1`, the closest git equivalent (both fetch only the tip).
+## Build
 
-A real high-bandwidth `torvalds/linux` run on EC2 hits **~10×** at 5 Gbps for the full history and **~6×** for depth-1. Full sweep (250/500 Mbps + 1 Gbps, the EC2 high-bandwidth rows, the files-vs-tar.gz comparison, and honest caveats) is in **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)**.
+Requirements: Rust 1.96 or newer (CI uses the version pinned in
+`rust-toolchain.toml`), `protoc`, and `cmake` (for `zlib-ng`). At run time the
+server and editable clones need `git` on the `PATH`; files-only clones do not.
+Linux and macOS are supported; Windows is not. Use client and server builds
+with the same wire version; a mismatch fails clearly.
 
-## Install
-
-Pick whichever fits. All install the `ripclone` CLI (and `ripclone-server` and `ripclone-worker`).
-
-```sh
-# 1. Shell installer (prebuilt binaries)
-curl -fsSL https://github.com/russellromney/ripclone/releases/latest/download/install.sh | sh
-
-# 2. Cargo (builds from source; also `cargo add ripclone` to embed the client lib)
-cargo install ripclone --locked
-
-# 3. pip (prebuilt wheel)
-pip install ripclone
+```bash
+cd rust
+cargo build --release
+# binaries: target/release/ripclone, target/release/ripclone-server
 ```
-
-The prebuilt binaries have no shared-library dependency. The Linux assets are
-fully static musl builds; the macOS assets use system libraries. **System Git is
-still required** by the server, workers, and editable clone paths. Install Git
-with your OS package manager before using those paths. Files-only clients can
-clone without Git. `cargo install` builds from source and also needs the build
-tools listed in [Build options](docs/BUILD_OPTIONS.md).
-
-See [Support](docs/SUPPORT.md) for the platform, MSRV, and compatibility policy.
-
-Check your version and whether the configured server is compatible:
-
-```sh
-ripclone --version
-ripclone version            # CLI + server versions, with a compatibility verdict
-ripclone update             # check for a newer release
-```
-
-Hitting a snag? See **[Troubleshooting](docs/TROUBLESHOOTING.md)** (missing shared libraries, `202` warming, `401` vs `403`, config drift).
-
-### Uninstall
-
-Remove whichever way you installed:
-
-```sh
-# Shell installer / prebuilt binaries — delete the installed binaries
-rm -f "$(command -v ripclone)" "$(command -v ripclone-server)" \
-      "$(command -v ripclone-worker)"
-
-# Cargo
-cargo uninstall ripclone
-
-# pip
-pip uninstall ripclone
-```
-
-To wipe local state as well: the CLI's saved login lives at `~/.config/ripclone/` and a server's cache and bare mirrors default to `~/.local/share/ripclone/` (`cache` and `repos`). Removing ripclone touches nothing on your git host.
 
 ## Quick start
 
-Install ripclone with one of the methods above, then start the packaged server:
+Start a server. Server and CLI authenticate with the same token:
 
 ```bash
-# The server requires the `git` executable on PATH.
-git --version
-
-# The server requires a token; both the server and CLI read it from
-# RIPCLONE_SERVER_TOKEN. Generate one and start the server:
 export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
-ripclone-server
+./target/release/ripclone-server
 ```
 
-The server defaults to storing its local artifact CAS and bare mirrors under
-`~/.local/share/ripclone/` (`cache`, `repos`, and `control.db`). With the default
-local artifact backend, `cache` is the durable artifact store and must be
-preserved. Use `--cas-dir`, `--repo-root`, and `--control-db` to override.
-`--host` (default `0.0.0.0`) and `--port` (default `8000`) set the listen address.
-Object storage (S3/R2/Tigris/MinIO) and most other tuning are set with
-environment variables — see [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md) and
-[`docs/BACKENDS.md`](docs/BACKENDS.md).
+The server keeps its artifacts, mirrors, and `control.db` under
+`~/.local/share/ripclone/` by default (`--cas-dir`, `--repo-root`,
+`--control-db` override them; `--host` and `--port` set the listen address,
+default `0.0.0.0:8000`). With local storage, `cache` is the durable artifact
+store. For object storage see [Server state and storage](docs/BACKENDS.md).
 
-Point the CLI at your server. `--server` is a **global** flag, so it goes
-*before* the subcommand — but the cleanest way is the `RIPCLONE_SERVER` env var,
-which the rest of this quick start uses:
+Add a repo, then clone it:
 
 ```bash
-# Both the CLI and server authenticate with the same RIPCLONE_SERVER_TOKEN.
 export RIPCLONE_SERVER=http://localhost:8000
-```
-
-Make a repo available and admit its first immutable build with `add`. This
-registers the repo and returns as soon as the ready check or existing queue
-accepts the exact upstream commit; artifact construction continues in the
-background:
-
-```bash
-ripclone add oven-sh/bun
-```
-
-Clone it:
-
-```bash
+ripclone add oven-sh/bun          # registers the repo and starts its first build
 ripclone clone oven-sh/bun bun
 ```
 
-Inspect or remove server registrations explicitly:
+`add` returns once the build is accepted; `--wait` waits for it to finish.
+`ripclone list` and `ripclone rm owner/repo` manage registrations. Removing a
+registration keeps the published artifacts.
+
+## Keeping repos fresh
+
+The server builds each new commit on the default branch. Three triggers, from
+fastest to slowest:
+
+- **Push webhook** at `/webhooks/{github|gitlab|gitea}`. See
+  [Webhooks](docs/WEBHOOKS.md).
+- **GitHub Actions**: call `POST /v1/repos/github/{owner}/{repo}/sync` on push.
+  A ready-to-copy workflow is in
+  [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).
+- **Polling**: the server `ls-remote`s added repos every 5 minutes
+  (`RIPCLONE_POLL_INTERVAL_SECS`; `0` turns it off).
+
+`ripclone sync owner/repo` triggers a build by hand.
+
+## CLI
 
 ```bash
-ripclone list
-ripclone rm oven-sh/bun
-```
-
-(`add` is the first-run verb — a repo must be added before it can be cloned or
-re-synced. Later re-builds use `ripclone sync <repo>`, which push webhooks and
-CI hooks call automatically. If you prefer to pass the server per command
-instead of the env var, put the global flag first:
-`ripclone --server http://localhost:8000 add oven-sh/bun`.)
-
-## GitHub Actions trigger
-
-Add a workflow to a repo so ripclone builds artifacts on every push. Set `RIPCLONE_SERVER` as a repository variable and `RIPCLONE_SERVER_TOKEN` as a repository secret. (A ready-to-copy version lives in [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).)
-
-```yaml
-name: ripclone cache
-on: push
-jobs:
-  notify:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger ripclone sync
-        run: |
-          # The API expects the SHA-256 hash of the server token, not the token
-          # itself (the CLI hashes it for you; a raw curl must do it here).
-          token_hash=$(printf %s "$RIPCLONE_SERVER_TOKEN" | sha256sum | cut -d' ' -f1)
-          curl -fsSL -X POST \
-            -H "Authorization: Ripclone $token_hash" \
-            "${{ vars.RIPCLONE_SERVER }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
-        env:
-          RIPCLONE_SERVER_TOKEN: ${{ secrets.RIPCLONE_SERVER_TOKEN }}
-```
-
-The `github` in the path is the provider instance (see [`docs/PROVIDERS.md`](docs/PROVIDERS.md)). For private repos the server needs read access to the upstream — configure a token for the provider, or pass one per request in the `X-Upstream-Token` header.
-
-ripclone validates the hashed `RIPCLONE_SERVER_TOKEN`, resolves one exact `HEAD`
-commit, and returns `202` with that commit once the queue accepts it. The
-response is not a claim that artifact construction has finished. (If your
-secret store already holds the hash, set it as `RIPCLONE_SERVER_TOKEN_HASH` and
-send it directly.)
-
-### Native push webhook (no per-repo workflow)
-
-Instead of (or alongside) the Actions workflow, point a provider webhook at the server so it builds on every push with nothing added to the consumer repo. Set a per-provider secret, then add a repository/org webhook:
-
-- **Payload URL:** `https://ripclone.example.com/webhooks/github`
-- **Content type:** `application/json`
-- **Secret:** the value of `RIPCLONE_WEBHOOK_SECRET_GITHUB`
-- **Events:** the `push` event.
-
-The server verifies the provider HMAC (`X-Hub-Signature-256`) over the raw body — constant-time, before any parse — validates the full `after` object ID, and admits that exact commit through the same queue `/sync` uses. The webhook does not perform another tip probe and returns before artifact construction completes. Fail-closed: a provider with no configured secret returns `503`; a bad signature `401`. Delete, tag, and ping events are acknowledged without changing durable exact results.
-
-Only a signed push that identifies the repository's **default branch** admits work. Non-default pushes are acknowledged without a build. `RIPCLONE_WEBHOOK_ALLOWLIST` can restrict which added repositories respond to pushes (comma-separated; GitHub repos are `owner/repo`, other providers are prefixed: `gitlab/group/sub/proj`). The receiver is provider-agnostic — **GitHub, GitLab, and Gitea/Forgejo** are supported (point the provider at `/webhooks/{provider}`, e.g. `/webhooks/gitlab`). GitLab must use the **secret-token** webhook setting (the value of `X-Gitlab-Token`), not the newer signing-token scheme. See [`docs/WEBHOOKS.md`](docs/WEBHOOKS.md).
-
-### Polling fallback
-
-For repos without a webhook, or to catch a missed delivery, the server periodically `ls-remote`s known repos and admits any exact tip that moved. This is on by default every 5 minutes; `RIPCLONE_POLL_INTERVAL_SECS` tunes it and `0` turns it off. `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` bounds each probe (30 seconds by default). This is a backstop; webhooks/Actions are the prompt path.
-
-## CLI usage
-
-Point the CLI at your server with `--server`, the `RIPCLONE_SERVER` env var, or a saved `ripclone login`. (Resolution order: `--server` > `RIPCLONE_SERVER` > saved login config > the built-in default server.)
-
-```bash
-# Authorize this machine against the configured server (saves a token), or sign out
-ripclone login
-ripclone logout
-
-# Show CLI + server versions and compatibility, and check for a newer release
-ripclone version
-ripclone update
-
-# Clone a repo (public or private) — github is the default provider
-ripclone clone owner/repo
-ripclone clone owner/repo ./my-dir --branch feat/x
-
-# Another host: prefix the repo, or pass --provider (see Providers below)
-ripclone clone gitlab:mygroup/project
-ripclone --provider my-gitea clone owner/repo
-
-# Working tree only (no git object database), fastest for files-only jobs
-ripclone clone owner/repo --mode files
-
-# Speed knob: HEAD-only shallow history for CI/agents
-ripclone clone owner/repo --depth 1
-
-# Clone the artifacts built for a specific rev (pairs with `sync --at`)
-ripclone clone owner/repo --at HEAD~5
-
-# Ephemeral, in-memory (tmpfs) clone for throwaway agent/CI machines (Linux)
-ripclone clone owner/repo --temp
-
-# Agent-fleet mode: fleet-sane defaults (depth-1 history, never prompts).
-# See docs/AGENTS.md for the fleet quickstart.
-RIPCLONE_AGENT=1 ripclone clone owner/repo
-
-# Print a per-phase benchmark report after the clone
-ripclone clone owner/repo --bench
-
-# Admit/refresh the exact branch tip on the server; ordinary sync returns fast
-ripclone sync owner/repo
-ripclone sync owner/repo --depth 1             # shallow mirror
-ripclone sync owner/repo --wait                # wait for exact Full readiness
-ripclone sync owner/repo --at HEAD~5           # build at a past rev
-
-# Register and admit a repo; add is fast unless --wait is requested
-ripclone add owner/repo
-ripclone add owner/repo --wait                 # wait for exact Full readiness
-
-# List server registrations, then remove one registration
+ripclone clone owner/repo [dir] [--branch B] [--depth 1] [--mode files]
+ripclone clone owner/repo --at <full-sha>   # a specific commit
+ripclone clone gitlab:group/project         # another provider
+ripclone clone owner/repo --bench           # print a per-phase timing report
+ripclone sync owner/repo [--wait]
+ripclone add owner/repo [--wait]
 ripclone list
 ripclone rm owner/repo
+ripclone version                            # CLI and server versions, with a compatibility check
 ```
 
-`list` prints one stable, reusable CLI repository name per line. Repositories
-on the selected default provider use a bare path; other providers use the CLI's
-colon form, such as `gitlab:group/sub/repo`. `rm` removes only the server
-registration. Existing exact results and artifact bytes remain published, and
-already admitted or running jobs continue.
+The server URL comes from `--server` (a global flag, before the subcommand) or
+`RIPCLONE_SERVER`.
 
-For a private repo, pass an upstream credential with `--token`. The client sends it as `X-Upstream-Token` and the server translates it to the host's auth form (GitHub, GitLab, Gitea, …):
+**Agents and CI.** `RIPCLONE_AGENT=1` makes depth 1 the default and disables
+interactive prompts. Explicit `--depth` still wins. Use `--mode files` when the
+agent never runs git. Errors are JSON `{ "error", "code" }`: treat `429` and
+`502`/`503` as retryable, `401`/`403`/`404` as needing action.
 
-```bash
-ripclone --token ghp_xxx clone my-org/private-repo
-```
+**Private repos.** The server needs read access to the upstream: a token on the
+provider instance ([Providers](docs/PROVIDERS.md)) or a GitHub App
+([Configuration](docs/CONFIG.md)).
 
-Pushes go to your git host directly, not through ripclone.
-
-Running an **agent fleet or CI** at scale? Set `RIPCLONE_AGENT=1` for fleet-sane
-defaults (depth-1 history, no prompts, headless token-in-env) and see the fleet
-quickstart in **[Agents & CI](docs/AGENTS.md)**.
-
-For editable clones you can have the client cross-check the installed tip against
-your git host with `--verify-upstream`. In `auto` mode (the default) this runs
-whenever an upstream credential is available or the repo is public; for
-credential-less private/agent flows it warns and skips, leaving the ripclone
-server in the trust base. `files`-mode clones are not verifiable this way.
-
-## Providers
-
-ripclone is host-agnostic: point it at GitHub (built in), GitLab, Gitea/Forgejo/Codeberg, or a self-hosted host by registering provider instances with `RIPCLONE_PROVIDERS` or `config.toml`. See [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
+**Checking the server.** `--verify-upstream` (`auto` by default) cross-checks an
+editable clone's commit against the git host when it can.
 
 ## Architecture
 
 ```
-┌──────────────────┐
-│  push / CI hook  │  POST /sync
-└────────┬─────────┘
-         ▼
-┌──────────────────┐     transaction     ┌────────────────────────┐
-│ ripclone-server  │ ──────────────────▶ │ server control SQLite  │
-│ resolve · serve  │                     │ refs · jobs · workers  │
-└────────┬─────────┘                     └───────────┬────────────┘
-         │ serves                         claim/API │
-         ▼                                          ▼
-      clients                              ┌──────────────────┐
-                                           │ embedded/API     │
-                                           │ workers          │
-                                           └────────┬─────────┘
-                                                    ▼
-                                           local/S3 artifacts
+push / webhook / poll ──▶ ripclone-server ──▶ control.db (SQLite)
+                              │  mirror upstream, build artifacts
+                              ▼
+                          artifact store (local disk or S3-compatible)
+                              ▲
+             ripclone CLI ────┘  download in parallel, verify hashes, write tree
 ```
 
-ripclone splits into a **server** — it resolves refs, serves artifacts, and atomically admits exact work — and workers that fetch the upstream and build clonepacks. Embedded workers claim the server's durable jobs table. Standalone `ripclone-worker` processes are authenticated API-only and receive no database credential (see [Running workers at scale](docs/SCALING_WORKERS.md)).
+The server resolves each request to one exact commit, builds that commit's
+artifacts once, and serves them. Artifacts are content-addressed and never
+change after publication. With S3-compatible storage, clients download
+directly through signed URLs. Your git host stays the source of truth for
+repos, permissions, and writes.
 
-- **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Published exact results and their durable artifacts do not expire. With object storage, the local CAS and Git mirror are disposable build caches; local-storage deployments keep the artifact bytes on disk.
-- **Control database.** One server-owned SQLite database stores refs, added repositories, jobs, claims, attempts, and heartbeats. Plain local SQLite is the default; a Turso embedded replica is the replicated mode. Exact-result creation and job admission are one transaction.
-
-**Your git host stays the source of truth** for repos, refs, permissions, and writes. Clients download artifacts (signed URL or server proxy), decompress, and write files straight to disk. Public endpoints are rate-limited.
-
-Ops endpoints: `GET /healthz` (alive?), `GET /readyz` (ready? — `503` if storage or the ref store is down), and `GET /metrics` (Prometheus format). There's also a plain-git fallback (`/v1/git/github/{owner}/{repo}/...`) so a normal `git clone` still works if the fast path is down.
-
-## Build options
-
-Compile flags (e.g. building without `zlib-ng`), client tuning knobs (`RIPCLONE_FETCH_*`, `RIPCLONE_IO_URING`, `RIPCLONE_MODE`, cache and `RIPCLONE_FSYNC` durability), and the server-side backend environment variables all live in [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md). Backend details are in [`docs/BACKENDS.md`](docs/BACKENDS.md).
+Ops endpoints: `GET /healthz`, `GET /readyz` (503 if storage or the control
+database is down), and `GET /metrics` (Prometheus).
 
 ## Telemetry
 
-After a successful clone, the CLI sends a single fire-and-forget metrics POST to the configured server. It is advertising-grade telemetry, never authoritative, and never on the clone's critical path: a failure to send cannot change the clone's exit status. The report is skipped entirely when the server does not mint a clone id, when `--no-metrics` is passed, or when `RIPCLONE_NO_METRICS` is set to any non-empty value.
-
-The payload contains:
-
-- `cloneId` — the server-minted clone id from the ref-resolve response.
-- `repo` — `{ provider, owner, name }` of the cloned repo.
-- `commit` — the resolved commit SHA.
-- `mode` — `depth1`, `full`, or `files`.
-- `cold` — whether the clone waited for a fresh build.
-- `totalMs` — end-to-end clone wall time in milliseconds.
-- `bytes` — total bytes downloaded.
-- `downloadMs` — currently omitted because pure download time is not isolated.
-- `client` — `{ os, arch, ripcloneVersion }`.
-
-Self-hosted servers accept and drop this POST at `POST /v1/clones/{cloneId}/metrics` so the CLI never spams its own server with 404s.
-
-## Self-hosting and the public service
-
-The open-source server is complete on its own: it owns repository registration,
-builds, clone policy, control state, and artifact storage. The CLI's public
-default service is optional convenience; `--server` or `RIPCLONE_SERVER` selects
-any self-hosted server. The OSS backend contains no account, payment, tenant, or
-hosted deployment policy.
+After a successful clone the CLI sends one fire-and-forget metrics POST to the
+configured server: clone id, repo, commit, mode, whether it waited for a build,
+wall time, bytes, and client OS/arch/version. It never affects the clone's
+result. `--no-metrics` or `RIPCLONE_NO_METRICS=1` turns it off. Self-hosted
+servers accept and drop it.
 
 ## License
 
