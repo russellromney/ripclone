@@ -1,7 +1,7 @@
 # Archive-chunk extraction A/B results
 
 Date: 2026-06-19
-Server: `ripclone.fly.dev` (Fly `shared-cpu-2x`, 1 GB, iad, local storage)
+Server: a separate 2-vCPU, 1 GB cloud VM with local storage
 Client versions: current `main` with protobuf clonepack + chunked archive support
 
 ## Test setup

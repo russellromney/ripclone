@@ -66,6 +66,7 @@ async fn spawn_persistent_server_env(
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-server"));
     command
         .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .env("RIPCLONE_CONFIG", root.join("missing-config.toml"))
         .env(

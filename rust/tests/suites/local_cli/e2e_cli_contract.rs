@@ -126,6 +126,78 @@ async fn pending_metadata_server(commit: &str) -> String {
     url
 }
 
+#[tokio::test]
+async fn missing_system_git_fails_editable_before_network_but_not_files_preflight() {
+    setup(false);
+    let home = tempfile::tempdir().expect("CLI home");
+    let work = tempfile::tempdir().expect("CLI work");
+    let empty_path = tempfile::tempdir().expect("empty PATH");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind untouched server probe");
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let editable_target = work.path().join("editable-target");
+    let (editable, _) = run_cli(
+        &server,
+        work.path(),
+        home.path(),
+        &[
+            "clone",
+            "acme/missing-git",
+            editable_target.to_str().unwrap(),
+            "--verify-upstream",
+            "never",
+        ],
+        &[("PATH", empty_path.path().to_str().unwrap())],
+    )
+    .await;
+    assert!(!editable.status.success());
+    assert!(
+        output_text(&editable).contains("system Git is required"),
+        "{}",
+        output_text(&editable)
+    );
+    assert!(!editable_target.exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), listener.accept())
+            .await
+            .is_err(),
+        "editable clone contacted the server before the Git preflight"
+    );
+
+    let pending = pending_metadata_server("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
+    let files_target = work.path().join("files-target");
+    let (files, _) = run_cli(
+        &pending,
+        work.path(),
+        home.path(),
+        &[
+            "clone",
+            "acme/files-without-git",
+            files_target.to_str().unwrap(),
+            "--mode",
+            "files",
+            "--verify-upstream",
+            "never",
+        ],
+        &[("PATH", empty_path.path().to_str().unwrap())],
+    )
+    .await;
+    assert!(!files.status.success());
+    assert!(
+        !output_text(&files).contains("system Git is required"),
+        "Files clone was incorrectly blocked by Git preflight: {}",
+        output_text(&files)
+    );
+    assert!(
+        output_text(&files).contains("still pending"),
+        "Files clone did not reach the server: {}",
+        output_text(&files)
+    );
+    assert!(!files_target.exists());
+}
+
 #[derive(Clone, Copy)]
 enum IdentityResponseStatus {
     Pending,

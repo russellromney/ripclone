@@ -20,6 +20,7 @@ $SUDO apt-get install -y --no-install-recommends \
   libfuse-dev \
   libgit2-dev \
   git \
+  ripgrep \
   curl \
   mold
 

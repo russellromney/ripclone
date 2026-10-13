@@ -1,9 +1,10 @@
 name: release
 
 # Cut a release by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
-# The git and TLS stacks are pure Rust (gix + rustls), and the remaining C
-# libraries (zstd, zlib-ng, mimalloc) are vendored and statically linked by
-# their -sys crates. The Linux binaries target {x86_64,aarch64}-unknown-linux-musl
+# TLS is pure Rust. The remaining native libraries (zstd, zlib-ng, mimalloc)
+# are vendored and statically linked by their -sys crates. Runtime operations
+# that inspect or update Git repositories still require the `git` executable.
+# The Linux binaries target {x86_64,aarch64}-unknown-linux-musl
 # and are FULLY static — no libc dependency at all — so one binary per arch runs
 # on any Linux, Alpine (musl) and glibc distros alike; the primary target is agents/CI,
 # often in Alpine containers (increasingly on arm64). cargo-zigbuild cross-builds
@@ -18,14 +19,28 @@ name: release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: write # create the GitHub Release and upload assets
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require the tag to match the crate version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n1)"
+          test -n "$version"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "error: tag $GITHUB_REF_NAME does not match rust/Cargo.toml version $version" >&2
+            exit 1
+          fi
+
   # Prebuilt binaries + checksums, one per native platform.
   binaries:
+    needs: version
     name: binaries (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -34,7 +49,7 @@ jobs:
           - { os: ubuntu-latest, platform: linux-x86_64, target: x86_64-unknown-linux-musl }
           - { os: ubuntu-latest, platform: linux-arm64, target: aarch64-unknown-linux-musl }
           - { os: macos-14, platform: macos-arm64, target: "" }
-          - { os: macos-13, platform: macos-x86_64, target: "" }
+          - { os: macos-15-intel, platform: macos-x86_64, target: "" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -90,6 +105,7 @@ jobs:
   # Upload the installer alongside the binaries so the curl|sh one-liner and
   # `ripclone update` can fetch `.../releases/latest/download/install.sh`.
   installer:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -100,6 +116,7 @@ jobs:
 
   # crates.io: `cargo install ripclone` / `cargo add ripclone`.
   crates-io:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -118,6 +135,7 @@ jobs:
   # Linux wheels build in a manylinux container, so the C build deps are
   # installed there via before-script-linux.
   pypi:
+    needs: version
     name: pypi (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -125,7 +143,7 @@ jobs:
         include:
           - { os: ubuntu-latest, platform: linux-x86_64, args: "--manylinux 2_28" }
           - { os: macos-14, platform: macos-arm64, args: "" }
-          - { os: macos-13, platform: macos-x86_64, args: "" }
+          - { os: macos-15-intel, platform: macos-x86_64, args: "" }
     runs-on: ${{ matrix.os }}
     permissions:
       id-token: write # PyPI Trusted Publishing (OIDC)

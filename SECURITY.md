@@ -56,4 +56,5 @@ The payload contains:
 
 Self-hosted servers accept and drop this POST at
 `POST /v1/clones/{cloneId}/metrics` so a self-hosted CLI never spams its own
-server with 404s. The cloud route is the analytics sink.
+server with 404s. A server that mints clone ids may implement its own metrics
+sink without changing clone success.

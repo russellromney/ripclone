@@ -4,11 +4,11 @@ set -euo pipefail
 # Reproduce the realistic two-host clone matrix recorded for the cold-history
 # pack work. Despite the name, this is cloud-neutral: run it on a dedicated
 # Linux client with CAP_NET_ADMIN, pointed at a separate ripclone server.
-# Admission and readiness are performed by fly_shaped_benchmark.sh before every
+# Admission and readiness are performed by shaped_benchmark.sh before every
 # sample set and are excluded from clone timing.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BENCH="$SCRIPT_DIR/fly_shaped_benchmark.sh"
+BENCH="$SCRIPT_DIR/shaped_benchmark.sh"
 TARGET="${TARGET:-/data}"
 LOG="${MATRIX_LOG:-$TARGET/reproducible_ec2_matrix.log}"
 
