@@ -29,7 +29,7 @@ pub struct Backends {
 }
 
 impl Backends {
-    pub(crate) fn validate_environment() -> Result<()> {
+    pub fn validate_environment() -> Result<()> {
         S3Storage::validate_env_or_config(&config().storage)
             .context("validate S3 storage configuration")
     }

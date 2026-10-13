@@ -48,6 +48,24 @@ fn server_command(root: &Path) -> tokio::process::Command {
     command
 }
 
+fn worker_command(root: &Path, api_url: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-worker"));
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("RIPCLONE_QUEUE_API_URL", api_url)
+        .env("RIPCLONE_METADATA_REPORT_URL", api_url)
+        .env("RIPCLONE_METADATA_JOB_TOKEN", "storage-preflight-proof")
+        .arg("--cas-dir")
+        .arg(root.join("worker-cas"))
+        .arg("--repo-root")
+        .arg(root.join("worker-repos"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
 #[tokio::test]
 async fn missing_system_git_stops_server_and_worker_before_side_effects() {
     let root = tempfile::tempdir().unwrap();
@@ -179,6 +197,48 @@ async fn incomplete_s3_configuration_fails_without_side_effects() {
             .is_err(),
         "S3 configuration preflight contacted the configured endpoint"
     );
+}
+
+#[tokio::test]
+async fn explicit_or_unknown_storage_backend_never_falls_back_to_local() {
+    for contents in [
+        "[storage]\nbackend = 's3'\n",
+        "[storage]\nbackend = 'unknown'\n",
+        "[storage]\nbackend = 's3'\nendpoint = 'not a valid endpoint'\nbucket = 'proof'\n",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        std::fs::write(&config, contents).unwrap();
+
+        let mut server = server_command(root.path());
+        server.env("RIPCLONE_CONFIG", &config);
+        let output = run_bounded(server).await;
+        assert!(
+            !output.status.success(),
+            "invalid storage started server: {contents}"
+        );
+        assert_no_runtime_side_effects(root.path());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind untouched worker API probe");
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let mut worker = worker_command(root.path(), &api_url);
+        worker.env("RIPCLONE_CONFIG", &config);
+        let output = run_bounded(worker).await;
+        assert!(
+            !output.status.success(),
+            "invalid storage started worker: {contents}"
+        );
+        assert!(!root.path().join("worker-cas").exists());
+        assert!(!root.path().join("worker-repos").exists());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err(),
+            "worker contacted its API before storage preflight"
+        );
+    }
 }
 
 #[tokio::test]
