@@ -233,7 +233,7 @@ the code step that changes the behavior, or at step 5.
 
 Each step is a separate PR with green CI. No step mixes a cut with a redo.
 
-1. **Contract tests first.** Write the ~50 contract tests against the CLI and
+1. **Contract tests first** ([CONTRACT_TESTS.md](CONTRACT_TESTS.md)). Write the ~50 contract tests against the CLI and
    HTTP behavior that must survive, with external fault injection. They should
    pass on today's main where the contract is unchanged. Include top-up: a full
    clone right after a push must not wait for any server build step.
