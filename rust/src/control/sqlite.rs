@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqliteRow};
 use sqlx::{Connection, Row};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +31,28 @@ pub struct SqliteControlStore {
     pool: SqlitePool,
     max_attempts: i64,
     clock: Arc<dyn Clock>,
+    /// The database path and the file it named at open. The pool keeps the
+    /// opened file even after the path is deleted or replaced, so `health`
+    /// compares the two.
+    path: PathBuf,
+    file: FileId,
     _ownership: ControlPathLock,
+}
+
+/// A file's device and inode.
+type FileId = (u64, u64);
+
+#[cfg(unix)]
+fn file_id(path: &Path) -> std::io::Result<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+// `ControlPathLock::acquire` refuses to open a store off Unix.
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> std::io::Result<FileId> {
+    std::fs::metadata(path).map(|_| (0, 0))
 }
 
 impl SqliteControlStore {
@@ -71,10 +92,14 @@ impl SqliteControlStore {
         let pool = SqlitePool::connect_with(options)
             .await
             .with_context(|| format!("open control database {}", path.display()))?;
+        let file =
+            file_id(path).with_context(|| format!("stat control database {}", path.display()))?;
         Ok(Self {
             pool,
             max_attempts,
             clock,
+            path: path.to_path_buf(),
+            file,
             _ownership: ownership,
         })
     }
@@ -639,6 +664,23 @@ impl ControlStore for SqliteControlStore {
     }
 
     async fn health(&self) -> Result<()> {
+        match file_id(&self.path) {
+            Ok(file) => ensure!(
+                file == self.file,
+                "control database {} was replaced after the server opened it",
+                self.path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!(
+                    "control database {} was deleted after the server opened it",
+                    self.path.display()
+                )
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stat control database {}", self.path.display()));
+            }
+        }
         sqlx::query("SELECT 1")
             .execute(&self.pool)
             .await
@@ -680,6 +722,26 @@ mod tests {
 
     async fn open(path: &Path) -> Result<SqliteControlStore> {
         SqliteControlStore::open(path, 3, Arc::new(crate::control::SystemClock)).await
+    }
+
+    #[tokio::test]
+    async fn health_fails_when_the_database_file_is_deleted_or_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let store = open(&path).await.unwrap();
+        store.health().await.unwrap();
+
+        let moved = dir.path().join("moved.db");
+        std::fs::rename(&path, &moved).unwrap();
+        let error = store.health().await.unwrap_err().to_string();
+        assert!(error.contains("was deleted"), "{error}");
+
+        std::fs::write(&path, b"").unwrap();
+        let error = store.health().await.unwrap_err().to_string();
+        assert!(error.contains("was replaced"), "{error}");
+
+        std::fs::rename(&moved, &path).unwrap();
+        store.health().await.unwrap();
     }
 
     #[tokio::test]

@@ -133,7 +133,7 @@ Ripclone token reaches the origin.
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | now |
 | G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | now |
 
-### H. Storage and server state (7)
+### H. Storage and server state (8)
 
 | # | Test | Lands |
 |---|---|---|
@@ -144,6 +144,7 @@ Ripclone token reaches the origin.
 | H5 | Local disk with retention every second and a 1-day limit: the server reports retention off; month-old artifacts stay and clone. | now |
 | H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | now (S3 row) |
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | now |
+| H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | follow-ups |
 
 ### I. Auth, integrations, CLI (11)
 
@@ -161,7 +162,7 @@ Ripclone token reaches the origin.
 | I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | now |
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | now |
 
-Total: 63 tests. Several are table-driven.
+Total: 64 tests. Several are table-driven.
 
 ## What this deletes
 

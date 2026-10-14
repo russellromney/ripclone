@@ -184,3 +184,28 @@ fn h7_repo_config_survives_restart() {
     assert_eq!(status, 200, "{read}");
     assert_eq!(read, stored);
 }
+
+/// H8: `/readyz` fails once the control database file is deleted or replaced
+/// under a running server, and the log says which.
+#[test]
+fn h8_readyz_fails_when_the_control_db_file_goes() {
+    for (case, change) in [
+        (
+            "deleted",
+            (|db| std::fs::remove_file(db).unwrap()) as fn(&std::path::Path),
+        ),
+        ("replaced", |db| {
+            let fresh = db.with_extension("new");
+            std::fs::write(&fresh, b"").unwrap();
+            std::fs::rename(&fresh, db).unwrap();
+        }),
+    ] {
+        let world = World::new();
+        let server = world.server(&[]);
+        change(&world.path("server").join("control.db"));
+        let readyz = server.get("/readyz");
+        assert_eq!(readyz.status, 503, "{case}: {}", readyz.body);
+        let line = format!("was {case} after the server opened it");
+        assert!(server.log().contains(&line), "{case}:\n{}", server.log());
+    }
+}
