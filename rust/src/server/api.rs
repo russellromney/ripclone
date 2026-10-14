@@ -1,7 +1,7 @@
 //! The `/v1/repos` and `/v1/admin/config` routes: add and remove
 //! repositories, admit builds, read commits and repository status.
 
-use super::{ErrorResponse, ServerState, env_u64, fetch_semaphore};
+use super::{ErrorResponse, ServerState, fetch_semaphore};
 use crate::clonepack::{
     ClonepackManifest, collect_manifest_hashes, hash_to_hex, manifest_chunk_refs,
 };
@@ -593,7 +593,14 @@ fn ready_body(
 ) -> serde_json::Value {
     serde_json::json!(ReadyBody {
         state: "ready",
-        result: ref_response(repo_id, provider, row, &state.storage, kind),
+        result: ref_response(
+            repo_id,
+            provider,
+            row,
+            &state.storage,
+            state.signed_url_ttl,
+            kind
+        ),
     })
 }
 
@@ -698,13 +705,15 @@ async fn top_up_plan(
     })))
 }
 
-const REF_SIGNED_URL_TTL_SECS: u64 = 1200;
+pub(super) const DEFAULT_SIGNED_URL_TTL: Duration = Duration::from_secs(1200);
 
-pub(super) fn ref_signed_url_ttl() -> Duration {
-    Duration::from_secs(env_u64(
+/// `RIPCLONE_SIGNED_URL_TTL_SECS`, read once at startup.
+pub(super) fn signed_url_ttl_from_env() -> Result<Duration> {
+    crate::env::number(
         "RIPCLONE_SIGNED_URL_TTL_SECS",
-        REF_SIGNED_URL_TTL_SECS,
-    ))
+        DEFAULT_SIGNED_URL_TTL.as_secs(),
+    )
+    .map(Duration::from_secs)
 }
 
 /// The ready `kind` output of `row`, with a signed URL for every artifact the
@@ -715,6 +724,7 @@ fn ref_response(
     provider: &ProviderInstance,
     row: &BuildRow,
     storage: &crate::storage::StorageRef,
+    ttl: Duration,
     kind: ExactResultKind,
 ) -> RefResponse {
     let info = row_info(row);
@@ -735,7 +745,6 @@ fn ref_response(
     .iter()
     .map(|p| p.pack.clone())
     .collect();
-    let ttl = ref_signed_url_ttl();
     let signed = |hash: &str| signed_url(storage, ttl, hash);
     // Ordered to match the manifest's own chunk and pack lists.
     let signed_list = |hashes: &[String]| -> Option<Vec<Option<String>>> {
@@ -1562,6 +1571,7 @@ mod tests {
             &provider,
             &row_of(info, None),
             &storage,
+            DEFAULT_SIGNED_URL_TTL,
             ExactResultKind::Full,
         );
         assert_eq!(resp.commit, "exact-commit");
@@ -1639,7 +1649,14 @@ mod tests {
         // `parent_commit` comes from the row, not from the Head result.
         let row = row_of(info.clone(), Some(parent.clone()));
 
-        let full = ref_response(&repo_id, &provider, &row, &storage, ExactResultKind::Full);
+        let full = ref_response(
+            &repo_id,
+            &provider,
+            &row,
+            &storage,
+            DEFAULT_SIGNED_URL_TTL,
+            ExactResultKind::Full,
+        );
         let full_artifacts = info.full.as_ref().unwrap();
         assert_eq!(full.commit, commit);
         assert_eq!(full.parent_commit.as_deref(), Some(parent.as_str()));
@@ -1667,7 +1684,14 @@ mod tests {
         );
         assert!(full.archive_chunk_urls.is_none());
 
-        let files = ref_response(&repo_id, &provider, &row, &storage, ExactResultKind::Files);
+        let files = ref_response(
+            &repo_id,
+            &provider,
+            &row,
+            &storage,
+            DEFAULT_SIGNED_URL_TTL,
+            ExactResultKind::Files,
+        );
         assert_eq!(
             files.archive_chunk_urls,
             Some(vec![signed(1200, "a1"), signed(1200, "a2")])
@@ -1681,7 +1705,14 @@ mod tests {
         assert!(files.midx_url.is_none());
         assert_eq!(files.parent_commit.as_deref(), Some(parent.as_str()));
 
-        let head = ref_response(&repo_id, &provider, &row, &storage, ExactResultKind::Head);
+        let head = ref_response(
+            &repo_id,
+            &provider,
+            &row,
+            &storage,
+            DEFAULT_SIGNED_URL_TTL,
+            ExactResultKind::Head,
+        );
         assert_eq!(head.pack_chunk_urls, Some(vec![signed(1200, "h1-pack")]));
     }
 

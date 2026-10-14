@@ -80,6 +80,9 @@ pub struct ServerState {
     /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
     /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
     pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
+    /// Lifetime of the signed artifact URLs the server hands out
+    /// (`RIPCLONE_SIGNED_URL_TTL_SECS`).
+    pub signed_url_ttl: Duration,
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -226,13 +229,6 @@ async fn metrics_handler(State(state): State<ServerState>) -> impl IntoResponse 
     )
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
 /// Process-global cap on concurrent upstream fetches/clones. Separate from the
 /// build slots: a fetch is network/upstream bound, a build is CPU bound, so
 /// they throttle independently.
@@ -276,6 +272,16 @@ async fn serve(
 
     backends::Backends::validate_environment()?;
     let worker_settings = worker::WorkerSettings::from_env()?;
+    let retention = crate::retention::RetentionSettings::from_env()?;
+    // Polling fallback: catches pushes that arrived without a webhook/Actions
+    // trigger so build-before-clone still holds. Defaults to 5 minutes so
+    // webhook-less self-hosts still self-heal missed or stuck builds.
+    let poll_interval =
+        Duration::from_secs(crate::env::number("RIPCLONE_POLL_INTERVAL_SECS", 300)?);
+    let signed_url_ttl = api::signed_url_ttl_from_env()?;
+    // Read where they are used; checked here so a bad value stops startup.
+    crate::git::ls_remote_timeout()?;
+    builder::check_environment()?;
 
     let metrics = Metrics::new();
     let control: Arc<dyn ControlStore> = Arc::new(
@@ -296,8 +302,8 @@ async fn serve(
     );
     std::fs::create_dir_all(cas_dir)?;
     std::fs::create_dir_all(repo_root)?;
-    let b = backends::Backends::from_env(cas_dir, &metrics)?;
-    b.cache_retention.clone().spawn_from_env();
+    let b = backends::Backends::from_env(cas_dir, &metrics, &retention)?;
+    b.cache_retention.clone().spawn(retention.interval);
 
     // Webhook receiver config: per-provider secret + optional allowlist (built
     // before the registry is moved into the state). A push to a configured
@@ -319,20 +325,11 @@ async fn serve(
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+        signed_url_ttl,
     };
 
     worker::spawn_workers(&state, &worker_settings);
 
-    // Polling fallback: catches pushes that arrived without a webhook/Actions
-    // trigger so build-before-clone still holds. Defaults to 5 minutes so
-    // webhook-less self-hosts still self-heal missed or stuck builds.
-    const DEFAULT_POLL_INTERVAL_SECS: u64 = 300;
-    let poll_interval = Duration::from_secs(
-        env::var("RIPCLONE_POLL_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_POLL_INTERVAL_SECS),
-    );
     spawn_poll_loop(state.clone(), poll_interval);
 
     let app = build_app(state);
@@ -419,6 +416,7 @@ mod tests {
             webhook_config: Arc::new(WebhookConfig::default()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+            signed_url_ttl: api::DEFAULT_SIGNED_URL_TTL,
         }
     }
 

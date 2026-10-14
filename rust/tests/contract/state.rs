@@ -48,8 +48,10 @@ fn state_entries(world: &World) -> Vec<String> {
     names
 }
 
-/// H4: each invalid storage or control setting stops the server before it
-/// creates anything: no control database, cache, or mirror directory.
+/// H4: each invalid storage, control, or numeric setting stops the server
+/// before it creates anything: no control database, cache, or mirror
+/// directory. A number that does not parse is an error naming the variable,
+/// never a silent default.
 #[test]
 fn h4_invalid_config_fails_before_side_effects() {
     type Env<'a> = &'a [(&'a str, &'a str)];
@@ -103,6 +105,102 @@ fn h4_invalid_config_fails_before_side_effects() {
             "",
             &[("RIPCLONE_HEAD_SLOTS", "0")],
             "RIPCLONE_HEAD_SLOTS",
+        ),
+        (
+            "bad build retry base",
+            "",
+            &[("RIPCLONE_BUILD_RETRY_BASE_MS", "2s")],
+            "RIPCLONE_BUILD_RETRY_BASE_MS must be a non-negative integer",
+        ),
+        (
+            "bad poll interval",
+            "",
+            &[("RIPCLONE_POLL_INTERVAL_SECS", "5m")],
+            "RIPCLONE_POLL_INTERVAL_SECS must be a non-negative integer",
+        ),
+        (
+            "bad retention interval",
+            "",
+            &[("RIPCLONE_RETENTION_INTERVAL_SECS", "soon")],
+            "RIPCLONE_RETENTION_INTERVAL_SECS must be a non-negative integer",
+        ),
+        (
+            "bad retention age",
+            "",
+            &[("RIPCLONE_RETENTION_MAX_AGE_DAYS", "week")],
+            "RIPCLONE_RETENTION_MAX_AGE_DAYS must be a non-negative integer",
+        ),
+        (
+            "bad retention size",
+            "",
+            &[("RIPCLONE_RETENTION_MAX_GB", "1.5")],
+            "RIPCLONE_RETENTION_MAX_GB must be a non-negative integer",
+        ),
+        (
+            "retention size overflows",
+            "",
+            &[("RIPCLONE_RETENTION_MAX_GB", "18446744073709551615")],
+            "RIPCLONE_RETENTION_MAX_GB is too large",
+        ),
+        (
+            "bad signed URL TTL",
+            "",
+            &[("RIPCLONE_SIGNED_URL_TTL_SECS", "-1")],
+            "RIPCLONE_SIGNED_URL_TTL_SECS must be a non-negative integer",
+        ),
+        (
+            "bad ls-remote timeout",
+            "",
+            &[("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", "30s")],
+            "RIPCLONE_LS_REMOTE_TIMEOUT_SECS must be a non-negative integer",
+        ),
+        (
+            "bad LSM levels",
+            "",
+            &[("RIPCLONE_LSM_MAX_LEVELS", "")],
+            "RIPCLONE_LSM_MAX_LEVELS must be a non-negative integer",
+        ),
+        (
+            "bad head rebase size",
+            "",
+            &[("RIPCLONE_HEAD_REBASE_BYTES", "128M")],
+            "RIPCLONE_HEAD_REBASE_BYTES must be a non-negative integer",
+        ),
+        (
+            "bad S3 timeout",
+            "",
+            &[
+                ("RIPCLONE_S3_ENDPOINT", "http://127.0.0.1:9"),
+                ("RIPCLONE_S3_BUCKET", "b"),
+                ("AWS_ACCESS_KEY_ID", "test"),
+                ("AWS_SECRET_ACCESS_KEY", "test"),
+                ("RIPCLONE_S3_REQUEST_TIMEOUT_SECS", "ten"),
+            ],
+            "RIPCLONE_S3_REQUEST_TIMEOUT_SECS must be a non-negative integer",
+        ),
+        (
+            "bad S3 attempts",
+            "",
+            &[
+                ("RIPCLONE_S3_ENDPOINT", "http://127.0.0.1:9"),
+                ("RIPCLONE_S3_BUCKET", "b"),
+                ("AWS_ACCESS_KEY_ID", "test"),
+                ("AWS_SECRET_ACCESS_KEY", "test"),
+                ("RIPCLONE_S3_MAX_ATTEMPTS", "4294967296"),
+            ],
+            "RIPCLONE_S3_MAX_ATTEMPTS must be a non-negative integer",
+        ),
+        (
+            "bad S3 retry delay",
+            "",
+            &[
+                ("RIPCLONE_S3_ENDPOINT", "http://127.0.0.1:9"),
+                ("RIPCLONE_S3_BUCKET", "b"),
+                ("AWS_ACCESS_KEY_ID", "test"),
+                ("AWS_SECRET_ACCESS_KEY", "test"),
+                ("RIPCLONE_S3_MAX_RETRY_DELAY_MS", "2e3"),
+            ],
+            "RIPCLONE_S3_MAX_RETRY_DELAY_MS must be a non-negative integer",
         ),
     ];
     let world = World::new();

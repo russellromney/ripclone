@@ -77,6 +77,8 @@ pub mod clonepack;
 pub mod config;
 pub mod control;
 #[doc(hidden)]
+pub mod env;
+#[doc(hidden)]
 pub mod extract;
 #[doc(hidden)]
 pub mod fsutil;

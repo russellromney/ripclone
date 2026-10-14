@@ -1101,15 +1101,10 @@ pub fn origin_base() -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
-/// `RIPCLONE_LS_REMOTE_TIMEOUT_SECS`, default 30 s; zero or unparsable means
-/// the default.
-fn ls_remote_timeout() -> Duration {
-    std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(30))
+/// `RIPCLONE_LS_REMOTE_TIMEOUT_SECS`, default 30 s; zero means the default.
+pub fn ls_remote_timeout() -> Result<Duration> {
+    let secs = crate::env::number("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", 30)?;
+    Ok(Duration::from_secs(if secs == 0 { 30 } else { secs }))
 }
 
 fn upstream_auth_header(
@@ -1292,7 +1287,7 @@ pub async fn ls_remote_tip_async(
         ref_name,
         credential,
         origin_base().as_deref(),
-        ls_remote_timeout(),
+        ls_remote_timeout()?,
     )
     .await
 }

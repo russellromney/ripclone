@@ -7,7 +7,7 @@
 use crate::cas::Cas;
 use crate::config::Config;
 use crate::metrics::Metrics;
-use crate::retention::LocalCacheRetention;
+use crate::retention::{LocalCacheRetention, RetentionSettings};
 use crate::storage::{S3Storage, StorageRef, local};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -31,7 +31,11 @@ impl Backends {
             .context("validate S3 storage configuration")
     }
 
-    pub fn from_env(cas_dir: &Path, metrics: &Arc<Metrics>) -> Result<Self> {
+    pub fn from_env(
+        cas_dir: &Path,
+        metrics: &Arc<Metrics>,
+        retention: &RetentionSettings,
+    ) -> Result<Self> {
         let cas = Cas::new(cas_dir)?;
         let s3_storage =
             S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
@@ -46,7 +50,7 @@ impl Backends {
             local(cas_dir)?
         };
         let cache_retention =
-            LocalCacheRetention::from_env(cas.clone(), metrics.clone(), storage.clone());
+            LocalCacheRetention::new(cas.clone(), metrics.clone(), storage.clone(), retention);
         Ok(Self {
             cas,
             storage,

@@ -140,7 +140,7 @@ Ripclone token reaches the origin.
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | now |
 | H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | now |
 | H3 | A second server on the same control database is rejected before it binds. | now |
-| H4 | Table: invalid storage, control, rate-limit and worker config (file or env, malformed file, removed `[queue]` section) is rejected before anything is created in the state dir. | now |
+| H4 | Table: invalid storage, control, rate-limit and worker config (file or env, malformed file, removed `[queue]` section) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention age and size, signed-URL TTL, ls-remote timeout, LSM levels, Head rebase size, S3 timeout, attempts and retry delay), with an error naming it. | now |
 | H5 | Local disk with retention every second and a 1-day limit: the server reports retention off; month-old artifacts stay and clone. | now |
 | H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | now (S3 row) |
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | now |
@@ -303,14 +303,18 @@ SIGKILLed server, through `PR_SET_PDEATHSIG` in `git::command()`), H8
 (`/readyz` fails once the control database file is deleted or replaced) and
 I12 (removed environment variables warn once in the server and the CLI).
 A clone now accepts an existing empty target directory, as `git clone` does,
-and a failed clone leaves that directory in place and empty (D6, I7).
+and a failed clone leaves that directory in place and empty (D6, I7). Every
+numeric server variable now goes through one parser, and a value that does
+not parse stops startup; before, poll and retention intervals, retention
+limits, the signed-URL TTL, the ls-remote timeout, the LSM level cap, the
+Head rebase size and the S3 client numbers fell back to their defaults, and a
+bad retention limit turned that limit off (H4).
 
 ## Open points
 
 - Every row has a contract test.
 - Found while writing these rows, not fixed here: the server's git children
-  write `hint:` lines and bare SHAs into the server log; an unparsable
-  `RIPCLONE_RETENTION_INTERVAL_SECS` or `RIPCLONE_POLL_INTERVAL_SECS` falls back
-  to the default instead of failing at startup; `RepoConfig.clonepack_depths`
+  write `hint:` lines and bare SHAs into the server log;
+  `RepoConfig.clonepack_depths`
   and `archive_chunk_size` are validated and stored but the builder reads
   neither (it reads only `compression_level`).

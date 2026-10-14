@@ -49,12 +49,7 @@ impl WorkerSettings {
 
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let number = |key: &str, default: u64| -> Result<u64> {
-            match get(key) {
-                None => Ok(default),
-                Some(value) => value.trim().parse().with_context(|| {
-                    format!("{key} must be a non-negative integer, got {value:?}")
-                }),
-            }
+            crate::env::parse_number(key, get(key).as_deref(), default)
         };
         let head_slots = number("RIPCLONE_HEAD_SLOTS", 2)?;
         anyhow::ensure!(head_slots >= 1, "RIPCLONE_HEAD_SLOTS must be at least 1");
