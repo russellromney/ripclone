@@ -61,10 +61,11 @@ A clone POSTs once, then polls the GET for the commit it was given, so a
 branch moving mid-clone cannot change what it installs. It uses the same GET
 to refresh expired URLs. While Full is pending, the GET offers a ready Full of
 an earlier commit (the ref's latest, or the parent) as `top_up`; a full clone
-installs that and fetches the rest from the git host, so it never waits on the
-server. Errors are `{error, code}`: `repo_not_added`, `repo_not_found`,
-`ref_not_found`, `build_not_found`, `upstream_unavailable` and
-`control_unavailable` among them.
+installs that and fetches the rest with the user's own git from the URL its
+own provider config gives, so it never waits on the server (`--wait` opts
+out; see [Freshness](FRESHNESS.md)). Errors are `{error, code}`:
+`repo_not_added`, `repo_not_found`, `ref_not_found`, `build_not_found`,
+`upstream_unavailable` and `control_unavailable` among them.
 
 ### Content-defined chunking and cheap re-syncs
 
