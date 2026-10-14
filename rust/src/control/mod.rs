@@ -18,12 +18,15 @@ pub mod sqlite;
 
 pub use sqlite::SqliteControlStore;
 
-/// Which claimers a build row is offered to. Head builds are latency-critical;
-/// Files and Full run in the background once Head is ready.
+/// Which claimers a build row is offered to. A row moves through the pools
+/// in order: Head while Head is pending, then Files once Head is ready, then
+/// Full once Files is ready or failed. Files is fast, so a new push's Files
+/// never waits behind another commit's Full, and one row has one lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pool {
     Head,
-    Background,
+    Files,
+    Full,
 }
 
 /// One output kind's state.
@@ -59,7 +62,7 @@ pub struct BuildRow {
     pub head: Out<HeadResult>,
     pub files: Out<FilesResult>,
     pub full: Out<FullResult>,
-    /// Claims in the current phase (Head, then Background).
+    /// Claims in the current phase (Head, Files, then Full).
     pub attempts: i64,
     /// Lease expiry, epoch seconds. The row is building while this is in the
     /// future.
@@ -134,15 +137,20 @@ pub trait ControlStore: Send + Sync {
     /// Return failed outputs to pending with attempts and backoff cleared.
     /// Ready and pending outputs are untouched. `None` if the row is unknown.
     async fn retry(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>>;
-    /// Lease the oldest claimable row of `pool`. First fails the pending
-    /// outputs of rows whose lease expired after the last allowed attempt.
+    /// Lease the oldest claimable row of `pool`. First gives up on rows whose
+    /// lease expired after the last allowed attempt: the current phase's
+    /// output fails (a pending Head takes Files and Full with it), and a
+    /// failed Files hands the row to the Full phase.
     async fn claim(&self, owner: &str, pool: Pool, lease: Duration) -> Result<Option<Claim>>;
     /// Extend the lease. False when the claim no longer owns the row.
     async fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool>;
+    /// Write a ready output. Publishing Head or Files ends that phase and
+    /// clears attempts for the next one.
     async fn publish(&self, claim: &Claim, output: Output) -> Result<Published>;
     /// Record a failed build of `kind`. With `retry_after` and attempts left
     /// the output stays pending and the row is not claimable until the delay
-    /// passes; otherwise it fails. A failed Head fails Files and Full too.
+    /// passes; otherwise it fails. A failed Head fails Files and Full too; a
+    /// failed Files starts the Full phase.
     async fn fail(
         &self,
         claim: &Claim,
@@ -263,6 +271,7 @@ const REMOVED_ENVIRONMENT: &[(&str, Removal)] = &[
     ("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", Removal::Warn),
     ("RIPCLONE_STAGING_DIR", Removal::Warn),
     ("RIPCLONE_TEMP", Removal::Warn),
+    ("RIPCLONE_BACKGROUND_SLOTS", Removal::Warn),
 ];
 
 fn removal(name: &str) -> Option<Removal> {
@@ -402,6 +411,8 @@ mod removed_environment_tests {
             ("RIPCLONE_TEST_REF_POLL_MS", Some(Removal::Warn)),
             ("RIPCLONE_WORKER_HEARTBEAT", Some(Removal::Warn)),
             ("RIPCLONE_LSM", Some(Removal::Warn)),
+            ("RIPCLONE_BACKGROUND_SLOTS", Some(Removal::Warn)),
+            ("RIPCLONE_FILES_SLOTS", None),
             ("RIPCLONE_LSM_MAX_LEVELS", None),
             ("RIPCLONE_TRUST_FORWARDED_FOR", None),
             ("RIPCLONE_CONTROL_DB_PATH", None),

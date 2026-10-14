@@ -19,8 +19,8 @@ CREATE TABLE repo_config (
 
 -- One row per (repo, commit). Each output kind is pending | ready | failed;
 -- "building" means lease_until is in the future. A ready output is never
--- rewritten. attempts counts claims in the current phase (Head, then
--- Background); publishing Head resets it.
+-- rewritten. attempts counts claims in the current phase (Head, Files, then
+-- Full); publishing Head and settling Files reset it.
 CREATE TABLE builds (
   repo         TEXT NOT NULL,          -- RepoId::storage_key()
   commit_id    TEXT NOT NULL,

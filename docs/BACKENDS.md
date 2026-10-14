@@ -30,13 +30,15 @@ For S3-compatible storage (AWS S3, Cloudflare R2, Tigris, MinIO):
 export RIPCLONE_S3_ENDPOINT=https://s3.example.com
 export RIPCLONE_S3_REGION=us-east-1
 export RIPCLONE_S3_BUCKET=ripclone
-export RIPCLONE_S3_PREFIX=production
+export RIPCLONE_S3_PREFIX=production/
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 ```
 
 The file equivalent is `[storage]` with `backend`, `endpoint`, `region`,
-`bucket`, and `prefix`; credentials stay in the environment. With S3, clients
+`bucket`, and `prefix`; credentials stay in the environment. An object's key
+is the prefix followed directly by its content hash, with no separator added,
+so end the prefix with `/` to keep artifacts in a folder. With S3, clients
 download through signed URLs, and the local cache and git mirrors are
 disposable. S3 holds artifacts only, never control state.
 

@@ -83,9 +83,10 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | `RIPCLONE_RATE_LIMIT_BURST`, `RIPCLONE_RATE_LIMIT_PER_SEC` | Per-IP rate limit: burst size and refill per second, defaults 60 and 10. See [API](API.md#authentication). |
 | `RIPCLONE_TRUST_FORWARDED_FOR` | `1` or `true`: rate-limit by the last `X-Forwarded-For` address. Only behind one trusted proxy. |
 | `RIPCLONE_HEAD_SLOTS` | Builds that run Head at once, default 2. At least 1. |
-| `RIPCLONE_BACKGROUND_SLOTS` | Builds that run Full and Files at once, default 1. `0` pauses Full and Files; Head still builds. |
+| `RIPCLONE_FILES_SLOTS` | Builds that run Files at once, default 1. `0` pauses Files; Head and Full still build. |
+| `RIPCLONE_FULL_SLOTS` | Builds that run Full at once, default 1. `0` pauses Full; Head and Files still build. A long Full never holds back another commit's Files. |
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
-| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Full and Files) before the output fails, default 5. At least 1. |
+| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Files, then Full) before the output fails, default 5. At least 1. |
 | `RIPCLONE_LSM_MAX_LEVELS` | Most history levels a Full keeps before merging the smallest neighbors, default 16. |
 | `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head packs past their base reach this size, its Full build compacts them into a new base for later Heads. Default 128 MiB. |
 | `RIPCLONE_ORIGIN_BASE` | Fetch repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. For mirrors and tests. |

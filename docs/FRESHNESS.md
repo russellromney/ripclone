@@ -9,8 +9,10 @@ finished building the commit it asked for.
    `POST .../builds`, or its poll (every 5 minutes by default). See
    [Keeping repos fresh](../README.md#keeping-repos-fresh).
 2. It builds the commit's three results. **Head** (the depth-1 pack and index)
-   publishes first. **Full** (all history) and **Files** (the working-tree
-   archive) build next, in the background, and each publishes when it is done.
+   publishes first. **Files** (the working-tree archive) and then **Full**
+   (all history) build next, in the background, and each publishes when it is
+   done. Each has its own build slots, so a long Full does not delay the next
+   push's Files.
    Typical times are in [Benchmarks](BENCHMARKS.md#build-time).
 3. A published result never changes.
 

@@ -315,8 +315,9 @@ impl ControlStore for SqliteControlStore {
         let now = self.clock.now();
         let predicate = match pool {
             Pool::Head => "head_state = 'pending'",
-            Pool::Background => {
-                "head_state = 'ready' AND (files_state = 'pending' OR full_state = 'pending')"
+            Pool::Files => "head_state = 'ready' AND files_state = 'pending'",
+            Pool::Full => {
+                "head_state = 'ready' AND full_state = 'pending' AND files_state <> 'pending'"
             }
         };
         let mut tx = self
@@ -324,9 +325,11 @@ impl ControlStore for SqliteControlStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .context("begin claim")?;
-        // Give up on rows whose last allowed attempt ended without a result:
-        // every pending output fails (a pending Head takes Files and Full with
-        // it) and the lease is cleared so a late publish cannot land.
+        // Give up on rows whose last allowed attempt ended without a result.
+        // The current phase's output fails: a pending Head takes Files and
+        // Full with it; a pending Files fails alone and the Full phase starts
+        // with fresh attempts. The lease is cleared so a late publish cannot
+        // land. (SET expressions read the row as it was before the update.)
         sqlx::query(
             "UPDATE builds SET
                head_state = CASE WHEN head_state = 'pending' THEN 'failed' ELSE head_state END,
@@ -337,11 +340,17 @@ impl ControlStore for SqliteControlStore {
                  WHEN files_state <> 'pending' THEN files_error
                  WHEN head_state = 'pending' THEN 'head failed: ' || $1 || COALESCE(': ' || head_error, '')
                  ELSE $1 || COALESCE(': ' || files_error, '') END,
-               full_state = CASE WHEN full_state = 'pending' THEN 'failed' ELSE full_state END,
+               full_state = CASE
+                 WHEN full_state <> 'pending' THEN full_state
+                 WHEN head_state = 'ready' AND files_state = 'pending' THEN full_state
+                 ELSE 'failed' END,
                full_error = CASE
                  WHEN full_state <> 'pending' THEN full_error
                  WHEN head_state = 'pending' THEN 'head failed: ' || $1 || COALESCE(': ' || head_error, '')
+                 WHEN files_state = 'pending' THEN full_error
                  ELSE $1 || COALESCE(': ' || full_error, '') END,
+               attempts = CASE WHEN head_state = 'ready' AND files_state = 'pending'
+                 THEN 0 ELSE attempts END,
                lease_owner = NULL,
                lease_until = NULL
              WHERE attempts >= $2
@@ -428,14 +437,16 @@ impl ControlStore for SqliteControlStore {
         );
         let data = data.with_context(|| format!("encode {kind} output"))?;
         let prefix = column_prefix(kind);
-        let head_only = if kind == ExactResultKind::Head {
-            ", parent = $5, attempts = 0"
-        } else {
-            ""
+        // Head and Files end their phase; the next phase starts its own
+        // attempts.
+        let next_phase = match kind {
+            ExactResultKind::Head => ", parent = $5, attempts = 0",
+            ExactResultKind::Files => ", attempts = 0",
+            ExactResultKind::Full => "",
         };
         let sql = format!(
             "UPDATE builds SET {prefix}_state = 'ready', {prefix}_output = $1,
-               {prefix}_error = NULL{head_only}
+               {prefix}_error = NULL{next_phase}
              WHERE repo = $2 AND commit_id = $3 AND lease_owner = $4
                AND {prefix}_state <> 'ready'
              RETURNING head_state, files_state, full_state"
@@ -475,9 +486,10 @@ impl ControlStore for SqliteControlStore {
         // `$4` is the retry time, NULL for a permanent failure. The output
         // fails when there is no retry or no attempt left.
         let gives_up = "($4 IS NULL OR attempts >= $5)";
-        // A Head that fails takes the pending Files and Full with it.
-        let cascade = if kind == ExactResultKind::Head {
-            format!(
+        // A Head that fails takes the pending Files and Full with it. A Files
+        // that fails ends its phase: Full starts with fresh attempts.
+        let cascade = match kind {
+            ExactResultKind::Head => format!(
                 ", files_state = CASE WHEN {gives_up} AND files_state = 'pending'
                      THEN 'failed' ELSE files_state END,
                    files_error = CASE WHEN {gives_up} AND files_state = 'pending'
@@ -486,9 +498,11 @@ impl ControlStore for SqliteControlStore {
                      THEN 'failed' ELSE full_state END,
                    full_error = CASE WHEN {gives_up} AND full_state = 'pending'
                      THEN $7 ELSE full_error END"
-            )
-        } else {
-            String::new()
+            ),
+            ExactResultKind::Files => {
+                format!(", attempts = CASE WHEN {gives_up} THEN 0 ELSE attempts END")
+            }
+            ExactResultKind::Full => String::new(),
         };
         let sql = format!(
             "UPDATE builds SET

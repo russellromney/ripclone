@@ -110,7 +110,7 @@ fn d4_wait_reports_pending_without_installing() {
     origin.publish();
     let mut server = world.server(&[]);
     world.cli(&server, &["add", "acme/d4", "--wait"]).ok();
-    server.restart_with(&[("RIPCLONE_BACKGROUND_SLOTS", "0")]);
+    server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
     let b = origin.commit(&[("f.txt", "b\n")], "B");
     origin.publish();
 

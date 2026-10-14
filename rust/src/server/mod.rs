@@ -68,8 +68,10 @@ pub struct ServerState {
     pub rate_limiter: RateLimiter,
     /// Wakes a Head slot after an admission that left Head pending.
     pub head_wake: Arc<tokio::sync::Notify>,
-    /// Wakes a Background slot after Head publishes.
-    pub background_wake: Arc<tokio::sync::Notify>,
+    /// Wakes a Files slot after a Head build releases its row.
+    pub files_wake: Arc<tokio::sync::Notify>,
+    /// Wakes a Full slot after a Files build releases its row.
+    pub full_wake: Arc<tokio::sync::Notify>,
     /// Webhook receiver config: per-provider HMAC secret + optional repo
     /// allowlist. A provider with no configured secret returns 503. Reads
     /// `RIPCLONE_WEBHOOK_SECRET_<provider>`.
@@ -83,6 +85,17 @@ pub struct ServerState {
     /// Lifetime of the signed artifact URLs the server hands out
     /// (`RIPCLONE_SIGNED_URL_TTL_SECS`).
     pub signed_url_ttl: Duration,
+}
+
+impl ServerState {
+    /// The wake-up for `pool`'s idle slots.
+    pub fn wake(&self, pool: crate::control::Pool) -> &Arc<tokio::sync::Notify> {
+        match pool {
+            crate::control::Pool::Head => &self.head_wake,
+            crate::control::Pool::Files => &self.files_wake,
+            crate::control::Pool::Full => &self.full_wake,
+        }
+    }
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -344,7 +357,8 @@ async fn serve(
         repo_root: repo_root.to_path_buf(),
         control,
         head_wake: Arc::new(tokio::sync::Notify::new()),
-        background_wake: Arc::new(tokio::sync::Notify::new()),
+        files_wake: Arc::new(tokio::sync::Notify::new()),
+        full_wake: Arc::new(tokio::sync::Notify::new()),
         provider_registry,
         broker,
         token_hash: Some(token_hash),
@@ -434,7 +448,8 @@ mod tests {
             repo_root,
             control,
             head_wake: Arc::new(tokio::sync::Notify::new()),
-            background_wake: Arc::new(tokio::sync::Notify::new()),
+            files_wake: Arc::new(tokio::sync::Notify::new()),
+            full_wake: Arc::new(tokio::sync::Notify::new()),
             provider_registry,
             broker,
             token_hash: Some(hex::encode(Sha256::digest("secret"))),

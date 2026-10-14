@@ -428,6 +428,12 @@ impl FaultProxy {
         self.add_rule(Some(Method::PUT), prefix, fault, 0, usize::MAX);
     }
 
+    /// Hold the responses to the next `times` `PUT`s whose path starts with
+    /// `prefix`, until [`FaultProxy::release`]. Later writes pass.
+    pub fn hold_puts(&self, prefix: &str, times: usize) {
+        self.add_rule(Some(Method::PUT), prefix, Fault::Hold, 0, times);
+    }
+
     /// Apply `fault` to the next `times` responses of at least `min_len`
     /// bytes to requests whose path starts with `prefix`.
     pub fn fault_large(&self, prefix: &str, fault: Fault, min_len: usize, times: usize) {

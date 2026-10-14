@@ -35,9 +35,10 @@ ripclone builds the content three ways so each clone takes only what it needs:
 ### Separate exact results
 
 Each exact commit stores three independent results: **Head**, **Full**, and
-**Files**. A build publishes Head first. It then builds Full history and the
-Files archive, publishing each as soon as it is complete. A published result
-never changes, and a later build never rebuilds one.
+**Files**. A build publishes Head first, then the Files archive, then Full
+history, each as soon as it is complete. Head, Files and Full each have their
+own build slots, so a long Full never holds back the next commit's Head or
+Files. A published result never changes, and a later build never rebuilds one.
 
 A depth-1 editable clone needs Head, a full editable clone needs Full, and
 files mode needs Files. Each result is `pending`, `ready`, or `failed`.
