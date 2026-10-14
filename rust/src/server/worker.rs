@@ -7,9 +7,23 @@
 //! renews it every 20 s; a lost lease aborts the build. Failures record a
 //! retry time instead of sleeping, so no slot waits while holding a lease.
 
-use super::*;
-use crate::control::{Claim, Output, Pool, Published};
+use super::api::row_info;
+use super::builder::{
+    SyncPhases, build_files_result, build_full_result, build_head_result, report_sync_bench,
+    report_sync_phases, sweep_stale_tempdirs,
+};
+use super::{ServerState, duration_ms, fetch_semaphore};
+use crate::control::{BuildRow, Claim, Out, Output, Pool, Published};
+use crate::provider::RepoId;
+use crate::{ExactResultKind, git, validation};
+use anyhow::{Context, Result};
+use axum::http::StatusCode;
+use std::collections::HashMap;
+use std::env;
 use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+use tracing::{error, info, warn};
 
 const LEASE: Duration = Duration::from_secs(60);
 const RENEW_EVERY: Duration = Duration::from_secs(20);

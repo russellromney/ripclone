@@ -1,3 +1,20 @@
+//! Build the Head, Full and Files results of a commit from the bare mirror
+//! and upload their artifacts.
+
+use super::{duration_ms, env_u64};
+use crate::archive::ArchiveBuilder;
+use crate::cas::Cas;
+use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
+use crate::metrics::SyncPhaseMetrics;
+use crate::pack::PackBuilder;
+use crate::provider::RepoId;
+use anyhow::{Context, Result};
+use futures::{StreamExt, TryStreamExt};
+use prost::Message;
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncPhases {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,7 +55,7 @@ impl From<&SyncPhases> for SyncPhaseMetrics {
 
 /// Remove `.tmp*` entries under `dir` whose mtime is older than `max_age`.
 /// Best-effort cleanup of build temp dirs leaked by a killed sync.
-fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
+pub(super) fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -269,7 +286,7 @@ fn assemble_midx(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn make_manifest(
+pub(super) fn make_manifest(
     commit: &str,
     parent: &Option<String>,
     archive_chunks: &[ChunkRef],
@@ -425,7 +442,7 @@ struct HeadBuild {
 /// the full closure is packed and becomes the base. `parent_head`, the
 /// parent's ready Head, lets the files table hash only changed paths.
 #[allow(clippy::too_many_arguments)]
-async fn build_head_result(
+pub(super) async fn build_head_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     commit: &str,
@@ -781,7 +798,7 @@ fn measure_storage_amplification(
     })
 }
 
-fn report_sync_phases(repo_id: &RepoId, commit: &str, phases: &SyncPhases) {
+pub(super) fn report_sync_phases(repo_id: &RepoId, commit: &str, phases: &SyncPhases) {
     let report = serde_json::json!({
         "kind": "sync-phases",
         "repo": repo_id.storage_key(),
@@ -795,7 +812,7 @@ fn report_sync_phases(repo_id: &RepoId, commit: &str, phases: &SyncPhases) {
 /// client-side `--bench` report style: one structured object per completed
 /// build, emitted at INFO so it can be scraped from logs. Phase timings are in
 /// the `sync-phases` report written when Head publishes.
-fn report_sync_bench(
+pub(super) fn report_sync_bench(
     repo_id: &RepoId,
     commit: &str,
     storage: &crate::storage::StorageRef,
@@ -842,7 +859,7 @@ fn manifest_pack_tuples(manifest: &ClonepackManifest) -> Result<Vec<(String, u64
 /// compact packs and records them as `head_base`, so later Heads delta against
 /// it. The published Head result never changes.
 #[allow(clippy::too_many_arguments)]
-async fn build_full_result(
+pub(super) async fn build_full_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     repo_id: &RepoId,
@@ -988,7 +1005,7 @@ async fn build_full_result(
 
 /// Build and upload the Files result. `parent_files`, the parent's ready
 /// Files result and commit, lets the archive reuse unchanged frames.
-async fn build_files_result(
+pub(super) async fn build_files_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     commit: &str,
@@ -1073,6 +1090,10 @@ async fn build_files_result(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     #[test]
     fn archive_publish_uploads_download_bundles_and_reuse_frames() {
         let uploads = archive_publish_upload_hashes(
@@ -1111,3 +1132,4 @@ async fn build_files_result(
 
         assert!(archive_chunk_refs(&["a".repeat(64)], &metadata).is_err());
     }
+}

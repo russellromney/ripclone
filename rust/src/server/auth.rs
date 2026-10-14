@@ -1,3 +1,23 @@
+//! Request gates: the protocol guard, the bearer token, and the per-IP rate
+//! limit.
+
+use super::{ErrorResponse, ServerState};
+use anyhow::{Context, Result};
+use axum::{
+    Json,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::env;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
+
 /// Simple in-memory token-bucket rate limiter keyed by real client IP.
 /// The map is bounded and pruned periodically to avoid unbounded memory growth.
 #[derive(Clone)]
@@ -60,7 +80,7 @@ impl RateLimiter {
     }
 }
 
-fn parse_rate_limit_settings(
+pub(super) fn parse_rate_limit_settings(
     burst: Option<&str>,
     restore_rate_per_sec: Option<&str>,
 ) -> Result<(u32, f64)> {
@@ -90,7 +110,7 @@ fn parse_rate_limit_settings(
 /// Reject explicit declarations that do not match the sole current wire
 /// protocol. Ordinary HTTP integrations do not declare this private header and
 /// use the same implementation.
-async fn protocol_guard(
+pub(super) async fn protocol_guard(
     headers: HeaderMap,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
@@ -132,7 +152,7 @@ async fn protocol_guard(
     next.run(request).await
 }
 
-async fn auth_middleware(
+pub(super) async fn auth_middleware(
     State(state): State<ServerState>,
     headers: HeaderMap,
     request: axum::http::Request<axum::body::Body>,
@@ -215,7 +235,7 @@ fn normalize_ip_for_rate_limit(ip: IpAddr) -> String {
     }
 }
 
-async fn rate_limit_middleware(
+pub(super) async fn rate_limit_middleware(
     State(state): State<ServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: axum::http::Request<axum::body::Body>,
@@ -285,12 +305,20 @@ fn server_auth_token_hash(hash: Option<String>, raw: Option<String>) -> Result<S
 }
 
 /// [`server_auth_token_hash`] from the environment.
-fn read_server_auth_token() -> Result<String> {
+pub(super) fn read_server_auth_token() -> Result<String> {
     server_auth_token_hash(
         env::var("RIPCLONE_SERVER_TOKEN_HASH").ok(),
         env::var("RIPCLONE_SERVER_TOKEN").ok(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::build_app;
+    use crate::server::tests::{auth_header, request_with_auth, test_state};
+    use axum::body::Body;
+    use tower::util::ServiceExt;
 
     #[test]
     fn server_auth_token_hash_prefers_the_hash_and_requires_a_token() {
@@ -500,3 +528,4 @@ fn read_server_auth_token() -> Result<String> {
             .unwrap();
         assert_ne!(response.status(), StatusCode::UPGRADE_REQUIRED);
     }
+}

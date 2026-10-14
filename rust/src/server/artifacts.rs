@@ -1,3 +1,18 @@
+//! `GET /v1/artifacts/{hash}`: redirect to a signed URL, or stream the
+//! artifact with optional byte ranges.
+
+use super::api::ref_signed_url_ttl;
+use super::{ErrorResponse, ServerState};
+use axum::{
+    Json,
+    body::{Body, Bytes},
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use futures::SinkExt;
+use std::sync::Arc;
+
 fn validate_artifact_hash(hash: &str) -> Option<Response> {
     if let Err(e) = crate::cas::Cas::validate_artifact_id(hash) {
         return Some(
@@ -13,7 +28,7 @@ fn validate_artifact_hash(hash: &str) -> Option<Response> {
     None
 }
 
-async fn get_artifact(
+pub(super) async fn get_artifact(
     Path(hash): Path<String>,
     headers: axum::http::HeaderMap,
     State(state): State<ServerState>,

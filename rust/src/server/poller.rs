@@ -1,3 +1,11 @@
+//! Polling fallback: admit the upstream HEAD of every added repository.
+
+use super::ServerState;
+use super::api::{admit_build, resolve};
+use crate::validation::Selector;
+use std::time::Duration;
+use tracing::{info, warn};
+
 /// One polling pass: for every added repository, cheaply resolve HEAD once
 /// (`ls-remote`, under the fetch cap) and admit a build for that commit if it
 /// is new. Catches pushes that arrived without a webhook/Actions trigger,
@@ -61,7 +69,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
 }
 
 /// Spawn the polling-fallback loop. `interval == 0` disables it.
-fn spawn_poll_loop(state: ServerState, interval: Duration) {
+pub(super) fn spawn_poll_loop(state: ServerState, interval: Duration) {
     if interval.is_zero() {
         info!("poll fallback disabled (RIPCLONE_POLL_INTERVAL_SECS=0)");
         return;

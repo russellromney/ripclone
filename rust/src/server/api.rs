@@ -1,3 +1,28 @@
+//! The `/v1/repos` and `/v1/admin/config` routes: add and remove
+//! repositories, admit builds, read commits and repository status.
+
+use super::{ErrorResponse, ServerState, env_u64, fetch_semaphore};
+use crate::clonepack::{
+    ClonepackManifest, collect_manifest_hashes, hash_to_hex, manifest_chunk_refs,
+};
+use crate::control::{BuildRow, Out};
+use crate::git;
+use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
+use crate::validation::{self, Selector};
+use crate::{ExactResultKind, RefInfo};
+use anyhow::{Context, Result};
+use axum::{
+    Json,
+    body::{Body, Bytes},
+    extract::{OriginalUri, Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use prost::Message;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 /// `POST .../builds` body.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,10 +70,10 @@ fn resolve_repo_id<'a>(
 
 /// An API error: `{error, code}` with a stable code clients can match.
 #[derive(Debug)]
-struct ApiError {
+pub(super) struct ApiError {
     status: StatusCode,
     code: &'static str,
-    error: String,
+    pub(super) error: String,
 }
 
 impl ApiError {
@@ -88,7 +113,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn unknown_provider() -> ApiError {
+pub(super) fn unknown_provider() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         "unknown_provider",
@@ -104,7 +129,7 @@ fn repo_not_added() -> ApiError {
     )
 }
 
-async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, ApiError> {
+pub(super) async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, ApiError> {
     state
         .control
         .get_repo(repo_id)
@@ -211,7 +236,7 @@ fn not_found_response() -> Response {
         .into_response()
 }
 
-async fn dispatch_repos_get(
+pub(super) async fn dispatch_repos_get(
     Path(path): Path<String>,
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
@@ -261,7 +286,7 @@ async fn dispatch_repos_get(
     not_found_response()
 }
 
-async fn dispatch_repos_post(
+pub(super) async fn dispatch_repos_post(
     Path(path): Path<String>,
     State(state): State<ServerState>,
     body: Bytes,
@@ -296,7 +321,7 @@ async fn dispatch_repos_post(
     not_found_response()
 }
 
-async fn dispatch_repos_delete(
+pub(super) async fn dispatch_repos_delete(
     Path(path): Path<String>,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
@@ -316,7 +341,7 @@ async fn dispatch_repos_delete(
         .into_response()
 }
 
-async fn list_added_repos(State(state): State<ServerState>) -> Response {
+pub(super) async fn list_added_repos(State(state): State<ServerState>) -> Response {
     match state.control.list_repos().await {
         Ok(repos) => Json(
             repos
@@ -354,7 +379,7 @@ fn exact_result_ready(info: &RefInfo, result: ExactResultKind, commit: &str) -> 
 }
 
 /// The ready outputs of a build row, in the shape responses are built from.
-fn row_info(row: &BuildRow) -> RefInfo {
+pub(super) fn row_info(row: &BuildRow) -> RefInfo {
     RefInfo {
         commit: row.commit.clone(),
         head: row.head.ready().cloned(),
@@ -383,18 +408,18 @@ fn kind_state(row: &BuildRow, kind: ExactResultKind) -> Out<()> {
 
 /// What a selector resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Resolved {
-    commit: String,
+pub(super) struct Resolved {
+    pub(super) commit: String,
     /// The branch a clone checks out. `None` gives a detached checkout: a
     /// commit SHA, a tag, or an upstream without a symbolic HEAD.
     checkout_name: Option<String>,
     /// The upstream ref the commit was read from, recorded on admission.
-    ref_name: Option<String>,
+    pub(super) ref_name: Option<String>,
 }
 
 /// Turn a selector into one commit. A full SHA is trusted as given; `HEAD`
 /// and names cost one `ls-remote` under the fetch cap. Nothing is fetched.
-async fn resolve(
+pub(super) async fn resolve(
     state: &ServerState,
     repo_id: &RepoId,
     provider: &ProviderInstance,
@@ -681,7 +706,7 @@ async fn top_up_plan(
 
 const REF_SIGNED_URL_TTL_SECS: u64 = 1200;
 
-fn ref_signed_url_ttl() -> Duration {
+pub(super) fn ref_signed_url_ttl() -> Duration {
     Duration::from_secs(env_u64(
         "RIPCLONE_SIGNED_URL_TTL_SECS",
         REF_SIGNED_URL_TTL_SECS,
@@ -936,7 +961,7 @@ async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Respons
 /// whether this call created it. With `retry`, failed outputs go back to
 /// pending: an explicit request (`/sync`, `/add`, a clone lookup) asks for
 /// them again. Webhook and poller admissions leave failures alone.
-async fn admit_build(
+pub(super) async fn admit_build(
     state: &ServerState,
     repo_id: &RepoId,
     commit: &str,
@@ -972,7 +997,10 @@ async fn admit_build(
 
 /// `GET /v1/admin/config/{provider}/{path}`: the stored repository config,
 /// or 404 `config_not_found`.
-async fn admin_get_config(Path(path): Path<String>, State(state): State<ServerState>) -> Response {
+pub(super) async fn admin_get_config(
+    Path(path): Path<String>,
+    State(state): State<ServerState>,
+) -> Response {
     let repo_id = match repo_from_path(&state, &path) {
         Ok((repo_id, _)) => repo_id,
         Err(error) => return error.into_response(),
@@ -995,7 +1023,7 @@ async fn admin_get_config(Path(path): Path<String>, State(state): State<ServerSt
 /// `POST /v1/admin/config/{provider}/{path}`: store the repository config.
 /// The body is validated before the control database is written; builds read
 /// it when they start.
-async fn admin_put_config(
+pub(super) async fn admin_put_config(
     Path(path): Path<String>,
     State(state): State<ServerState>,
     Json(config): Json<crate::repo_config::RepoConfig>,
@@ -1015,6 +1043,18 @@ async fn admin_put_config(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::build_app;
+    use crate::server::builder::make_manifest;
+    use crate::server::tests::{mark_added, request_with_auth, test_request, test_state};
+    use crate::storage::StorageRef;
+    use axum::Router;
+    use axum::http::HeaderMap;
+    use std::sync::Arc;
+    use tower::util::ServiceExt;
 
     fn ready_artifacts(commit: &str, label: &str) -> crate::ClonepackArtifacts {
         let hash = |suffix: &str| crate::cas::hash(format!("{label}-{suffix}").as_bytes());
@@ -1789,3 +1829,4 @@ async fn admin_put_config(
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "unknown_provider");
     }
+}

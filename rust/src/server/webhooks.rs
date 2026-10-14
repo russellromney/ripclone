@@ -1,3 +1,21 @@
+//! `POST /webhooks/{provider}`: verify a push event and admit its commit.
+
+use super::api::{admit_build, repo_is_added, unknown_provider};
+use super::{ErrorResponse, ServerState};
+use crate::provider::{ProviderInstance, RepoId};
+use crate::validation;
+use crate::webhook::EventKind;
+use axum::{
+    Json,
+    body::Body,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
+use secrecy::ExposeSecret;
+use serde::Serialize;
+use tracing::info;
+
 /// Cap for a webhook request body. The HMAC can only be verified after the whole
 /// body is buffered, so this bounds what an unauthenticated caller can make the
 /// server hold before the signature is checked. GitHub caps webhook payloads at
@@ -21,7 +39,7 @@ fn webhook_ignored(reason: &'static str) -> Response {
 }
 
 /// `POST /webhooks/{provider}` — provider-agnostic webhook receiver.
-async fn webhook_handler(
+pub(super) async fn webhook_handler(
     Path(provider_id): Path<String>,
     headers: HeaderMap,
     State(state): State<ServerState>,
@@ -192,6 +210,19 @@ async fn webhook_dispatch_push(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::ProviderRegistry;
+    use crate::server::build_app;
+    use crate::server::tests::{mark_added, test_state};
+    use crate::webhook::WebhookConfig;
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::util::ServiceExt;
 
     fn gh_sign(secret: &str, body: &[u8]) -> String {
         use hmac::{Hmac, KeyInit, Mac};
@@ -603,3 +634,4 @@ async fn webhook_dispatch_push(
             "missing default-branch identity is ignored"
         );
     }
+}

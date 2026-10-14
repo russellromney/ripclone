@@ -1,45 +1,57 @@
-use crate::archive::ArchiveBuilder;
+//! The ripclone server: app state, router assembly and startup.
+
 use crate::auth::broker::{CredentialBroker, broker_from_env};
 use crate::backends;
 use crate::cas::Cas;
-use crate::clonepack::{
-    ChunkRef, ClonepackManifest, collect_manifest_hashes, hash_from_hex, hash_to_hex,
-    manifest_chunk_refs,
-};
-use crate::control::{BuildRow, ControlStore, Out};
-use crate::git;
-use crate::metrics::{Metrics, SyncPhaseMetrics};
-use crate::pack::PackBuilder;
-use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
+use crate::control::ControlStore;
+use crate::metrics::Metrics;
+use crate::provider::ProviderRegistry;
 use crate::storage::StorageRef;
-use crate::validation::{self, Selector};
-use crate::webhook::{EventKind, WebhookConfig};
-use crate::{ExactResultKind, RefInfo};
+use crate::webhook::WebhookConfig;
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, OriginalUri, Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    middleware::{self, Next},
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use futures::{SinkExt, StreamExt, TryStreamExt};
-use prost::Message;
-use secrecy::ExposeSecret;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::env;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
-use std::time::{Duration, Instant, SystemTime};
-use tracing::{error, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
+mod api;
+mod artifacts;
+mod auth;
+mod builder;
+mod poller;
+mod webhooks;
 mod worker;
+
+pub use api::{
+    BuildRequest, ExactStatusEntry, RefResponse, RegionStorageEntry, RepoStatusResponse,
+};
+pub use auth::RateLimiter;
+pub use builder::SyncPhases;
+pub use poller::poll_once;
+
+use api::{
+    admin_get_config, admin_put_config, dispatch_repos_delete, dispatch_repos_get,
+    dispatch_repos_post, list_added_repos,
+};
+use artifacts::get_artifact;
+use auth::{
+    auth_middleware, parse_rate_limit_settings, protocol_guard, rate_limit_middleware,
+    read_server_auth_token,
+};
+use poller::spawn_poll_loop;
+use webhooks::webhook_handler;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -365,10 +377,14 @@ pub async fn run_server_with_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::RepoId;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use sha2::{Digest, Sha256};
     use tower::util::ServiceExt;
 
     /// A `ServerState` on a real control store in `tmp`, with no workers.
-    async fn test_state(tmp: &tempfile::TempDir) -> ServerState {
+    pub(super) async fn test_state(tmp: &tempfile::TempDir) -> ServerState {
         let cas_root = tmp.path().join("cas");
         let cas = Cas::new(&cas_root).unwrap();
         let storage = crate::storage::local(&cas_root).unwrap();
@@ -406,11 +422,11 @@ mod tests {
         }
     }
 
-    fn auth_header() -> String {
+    pub(super) fn auth_header() -> String {
         format!("Ripclone {}", hex::encode(Sha256::digest("secret")))
     }
 
-    fn test_request(method: &str, uri: &str) -> axum::http::Request<Body> {
+    pub(super) fn test_request(method: &str, uri: &str) -> axum::http::Request<Body> {
         axum::http::Request::builder()
             .method(method)
             .uri(uri)
@@ -423,7 +439,11 @@ mod tests {
 
     /// Like `test_request` but with an explicit (or absent) `Authorization`
     /// header, for exercising the auth middleware's reject path.
-    fn request_with_auth(method: &str, uri: &str, auth: Option<&str>) -> axum::http::Request<Body> {
+    pub(super) fn request_with_auth(
+        method: &str,
+        uri: &str,
+        auth: Option<&str>,
+    ) -> axum::http::Request<Body> {
         let mut b = axum::http::Request::builder()
             .method(method)
             .uri(uri)
@@ -457,7 +477,7 @@ mod tests {
         }
     }
 
-    async fn mark_added(state: &ServerState, repo_id: RepoId) {
+    pub(super) async fn mark_added(state: &ServerState, repo_id: RepoId) {
         state.control.add_repo(&repo_id).await.unwrap();
     }
 
@@ -530,5 +550,4 @@ mod tests {
             "read-only CAS must report not ready"
         );
     }
-
 }
