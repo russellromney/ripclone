@@ -2915,29 +2915,13 @@ fn sized_to_tuple(p: &crate::SizedPack) -> (String, u64, String, u64) {
     (p.pack.clone(), p.pack_len, p.idx.clone(), p.idx_len)
 }
 
-/// LSM incremental-history configuration.
-struct LsmConfig {
-    /// When on, only the tail past the last sealed level is built each sync;
-    /// prior levels are reused by hash from object storage (Tigris). On by
-    /// default — disable with `RIPCLONE_LSM=0`.
-    enabled: bool,
-    /// Compact down to at most this many levels (merging the smallest adjacent
-    /// pair) so the level count stays bounded under seal-every-sync.
-    max_levels: usize,
-}
-
-fn lsm_config() -> LsmConfig {
-    let enabled = std::env::var("RIPCLONE_LSM")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
-    let max_levels = std::env::var("RIPCLONE_LSM_MAX_LEVELS")
+/// Compact history down to at most this many levels (merging the smallest
+/// adjacent pair) so the level count stays bounded under seal-every-sync.
+fn lsm_max_levels() -> usize {
+    std::env::var("RIPCLONE_LSM_MAX_LEVELS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(16usize);
-    LsmConfig {
-        enabled,
-        max_levels,
-    }
+        .unwrap_or(16usize)
 }
 
 /// Given the prior sealed levels and a freshly built tail, decide whether to
@@ -2957,7 +2941,7 @@ async fn seal_and_compact(
     sealed_tip: Option<String>,
     tail_packs: Vec<(String, u64, String, u64)>,
     history_target: u64,
-    cfg: &LsmConfig,
+    max_levels: usize,
 ) -> Result<(
     Vec<(String, u64, String, u64)>,
     Vec<(String, u64, String, u64)>,
@@ -2988,13 +2972,13 @@ async fn seal_and_compact(
     }
 
     // Compact (off-thread; it re-packs ranges) so the level count stays bounded.
-    if levels.len() > cfg.max_levels {
+    if levels.len() > max_levels {
         let before = levels.len();
         let (md, c, levels_in, max, tgt) = (
             mirror_dir.to_path_buf(),
             cas.clone(),
             levels.clone(),
-            cfg.max_levels,
+            max_levels,
             history_target,
         );
         let res = tokio::task::spawn_blocking(move || {
@@ -4087,52 +4071,32 @@ async fn build_full_result(
     let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bitmap_mirror)).await;
 
     let history_target = 512 * 1024 * 1024;
-    let lsm_cfg = lsm_config();
-    let sealed_tip = lsm_cfg
-        .enabled
-        .then(|| previous_levels.last().map(|level| level.tip_commit.clone()))
-        .flatten();
+    let sealed_tip = previous_levels.last().map(|level| level.tip_commit.clone());
     let history_mirror = mirror_dir.to_path_buf();
     let history_cas = cas.clone();
     let history_commit = commit.to_string();
     let history_sealed_tip = sealed_tip.clone();
-    let lsm_enabled = lsm_cfg.enabled;
-    let (built_history, is_tail) = tokio::task::spawn_blocking(move || {
-        let builder = PackBuilder::new(&history_mirror, &history_cas);
-        if lsm_enabled {
-            Ok::<_, anyhow::Error>((
-                builder.build_history_tail(
-                    &history_commit,
-                    history_sealed_tip.as_deref(),
-                    history_target,
-                )?,
-                true,
-            ))
-        } else {
-            Ok((
-                builder.build_history_packs(&history_commit, history_target)?,
-                false,
-            ))
-        }
+    let built_history = tokio::task::spawn_blocking(move || {
+        PackBuilder::new(&history_mirror, &history_cas).build_history_tail(
+            &history_commit,
+            history_sealed_tip.as_deref(),
+            history_target,
+        )
     })
     .await
     .context("Full history task")??;
 
-    let (history_packs, new_history, levels) = if is_tail {
-        seal_and_compact(
-            mirror_dir,
-            cas,
-            commit,
-            previous_levels,
-            sealed_tip,
-            built_history,
-            history_target,
-            &lsm_cfg,
-        )
-        .await?
-    } else {
-        (built_history.clone(), built_history, Vec::new())
-    };
+    let (history_packs, new_history, levels) = seal_and_compact(
+        mirror_dir,
+        cas,
+        commit,
+        previous_levels,
+        sealed_tip,
+        built_history,
+        history_target,
+        lsm_max_levels(),
+    )
+    .await?;
     let mut head = head.clone();
     let mut head_packs = head_packs;
     let rebase_bytes = env_u64("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024);
@@ -4308,49 +4272,21 @@ async fn build_files_result(
         None => Vec::new(),
     };
     let previous_commit = parent_result.map(|result| result.commit.clone());
-    let bounded = std::env::var("RIPCLONE_ARCHIVE_BOUNDED")
-        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-        && !previous_frames.is_empty()
-        && previous_commit.is_some();
-    let previous_frame_map: std::collections::HashMap<String, (String, u64)> = previous_frames
-        .iter()
-        .map(|frame| {
-            (
-                frame.raw_hash.clone(),
-                (frame.chunk_hash.clone(), frame.compressed_len),
-            )
-        })
-        .collect();
     let archive_mirror = mirror_dir.to_path_buf();
     let archive_cas = cas.clone();
     let archive_storage = storage.clone();
     let archive_commit = commit.to_string();
     let archive_output = tokio::task::spawn_blocking(move || {
-        let builder = ArchiveBuilder::new(&archive_mirror);
-        if bounded {
-            builder.build_into_cas_bounded(
-                &archive_commit,
-                &archive_cas,
-                Some(&archive_storage),
-                compression_level,
-                None,
-                &previous_frames,
-                &previous_files,
-                previous_commit.as_deref().unwrap_or_default(),
-                crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
-        } else {
-            builder.build_into_cas_incremental(
-                &archive_commit,
-                &archive_cas,
-                Some(&archive_storage),
-                compression_level,
-                None,
-                &previous_frame_map,
-                crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
-        }
+        ArchiveBuilder::new(&archive_mirror).build_into_cas_bounded(
+            &archive_commit,
+            &archive_cas,
+            Some(&archive_storage),
+            compression_level,
+            &previous_frames,
+            &previous_files,
+            previous_commit.as_deref().unwrap_or_default(),
+            crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+        )
     })
     .await
     .context("Files archive task")??;

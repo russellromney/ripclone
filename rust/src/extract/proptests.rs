@@ -221,18 +221,13 @@ fn extract_plan(
         manifest.write(&mut f).expect("write manifest");
     }
     let chunks = archive_chunks.to_vec();
-    let result = extract_archive_with_chunk_fetcher(
-        &manifest_path,
-        Some(&target),
-        None,
-        u64::MAX,
-        move |chunk| {
+    let result =
+        extract_archive_with_chunk_fetcher(&manifest_path, Some(&target), u64::MAX, move |chunk| {
             chunks
                 .get(chunk.chunk_index)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing chunk {}", chunk.chunk_index))
-        },
-    );
+        });
     (result, tmp, target)
 }
 

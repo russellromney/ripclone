@@ -17,7 +17,6 @@ $SUDO apt-get install -y --no-install-recommends \
   build-essential \
   pkg-config \
   libssl-dev \
-  libfuse-dev \
   libgit2-dev \
   git \
   ripgrep \

@@ -222,10 +222,7 @@ assert_count "$BASE_DIR/c-rs2" 2
 pass "re-sync served the new commit"
 
 # === LSM incremental build ====================================================
-echo "==> LSM incremental (restarting server with RIPCLONE_LSM=1)"
-# start_server reaps the running server and rebinds a fresh port.
-export RIPCLONE_LSM=1 RIPCLONE_LSM_SEAL_BYTES=1
-start_server
+echo "==> LSM incremental"
 w=$(new_origin acme lsm)
 commit "$w" a.txt "v1" c1; publish "$w" acme lsm
 sync_repo acme lsm                                  # seal level 0

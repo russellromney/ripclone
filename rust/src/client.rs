@@ -6,7 +6,6 @@ use crate::clonepack::{
 };
 use crate::extract::extract_archive_from_chunk_receiver;
 use crate::mode::CloneMode;
-use crate::overlay;
 use crate::provider::{ProviderInstance, ProviderInstanceId, ProviderKind, RepoId};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -1224,7 +1223,6 @@ struct AttemptCleanup(Arc<AttemptCleanupInner>);
 
 #[derive(Default)]
 struct AttemptStaging {
-    overlay_dirs: Option<overlay::OverlayDirs>,
     temp_install: Option<StagedTempDir>,
 }
 
@@ -2618,7 +2616,7 @@ impl Client {
     ) -> Result<CloneOutcome> {
         // Staging owns filesystem cleanup outside the inner attempt future.
         // Task guards unwind first; blocking workers are then joined; only
-        // after that is it safe to remove a temp tree or unmounted overlay.
+        // after that is it safe to remove the temp tree.
         let staging = Arc::new(Mutex::new(Some(AttemptStaging::default())));
         let reaper = spawn_attempt_reaper(cleanup.clone(), Arc::clone(&staging));
         let close_on_drop = CloseAttemptOnDrop(cleanup.clone());
@@ -2857,34 +2855,11 @@ impl Client {
             );
         }
 
-        // 5. Decide where to install (temp dir, possibly overlay).
-        let staging_dir = overlay::staging_dir();
-        let use_overlay =
-            mode.needs_worktree() && self.should_use_overlay(&metadata, &staging_dir).await;
-
-        let overlay_dirs = if use_overlay {
-            Some(
-                overlay::OverlayDirs::create(&staging_dir, &target)
-                    .context("create overlay staging dirs")?,
-            )
-        } else {
-            None
-        };
-        let overlay_lower = overlay_dirs.as_ref().map(|dirs| dirs.lower.clone());
-        {
-            let mut staging_state = staging.lock().unwrap_or_else(|e| e.into_inner());
-            staging_state
-                .as_mut()
-                .context("attempt staging state missing")?
-                .overlay_dirs = overlay_dirs;
-        }
-
-        // Hold the temp-dir handle for the whole install so any early failure
-        // removes the partial directory on drop. After a successful rename onto
-        // `target`, its drop is a no-op.
-        let install_root = if let Some(lower) = overlay_lower {
-            lower
-        } else {
+        // 5. Install into a temp dir next to the target. Hold the temp-dir
+        // handle for the whole install so any early failure removes the
+        // partial directory on drop. After a successful rename onto `target`,
+        // its drop is a no-op.
+        let install_root = {
             let tmp = temp_install_dir(&target)?;
             let path = tmp.path().to_path_buf();
             let mut staging_state = staging.lock().unwrap_or_else(|e| e.into_inner());
@@ -2966,7 +2941,7 @@ impl Client {
                 tokio::task::spawn_blocking(move || {
                     // Keep the temp manifest file alive for the duration of extraction.
                     let _guard = manifest_tmp;
-                    extract_archive_from_chunk_receiver(&manifest_path, Some(&work_tree), None, rx)
+                    extract_archive_from_chunk_receiver(&manifest_path, Some(&work_tree), rx)
                 }),
                 cleanup.clone(),
             ))
@@ -3058,38 +3033,17 @@ impl Client {
             self.write_origin_config(&origin_url, &git_dir)?;
         }
 
-        let overlay_dirs = {
-            let mut staging_state = staging.lock().unwrap_or_else(|e| e.into_inner());
-            staging_state
-                .as_mut()
-                .context("attempt staging state missing")?
-                .overlay_dirs
-                .take()
-        };
-        if let Some(dirs) = overlay_dirs {
-            overlay::mount_dirs(&dirs).context("mount overlay at target")?;
-            // Mount succeeded; keep the staging tree (it backs the mount). Any
-            // failure before this point drops `dirs` and removes the staging.
-            dirs.mark_mounted();
-            info!(
-                "mounted overlay {} -> {} (staging {})",
-                dirs.lower.display(),
-                target.display(),
-                staging_dir.display()
-            );
-        } else {
-            // Optional durability barrier: flush the staged tree, publish it,
-            // then flush the parent directory so the rename itself is durable.
-            if fsync_requested() {
-                fsync_tree(&install_root).context("fsync staged clone before publish")?;
-            }
-            std::fs::rename(&install_root, &target).with_context(|| {
-                format!("rename {} to {}", install_root.display(), target.display())
-            })?;
-            if fsync_requested() {
-                fsync_dir(post_rename_fsync_dir(&target))
-                    .context("fsync parent directory after publish")?;
-            }
+        // Optional durability barrier: flush the staged tree, publish it,
+        // then flush the parent directory so the rename itself is durable.
+        if fsync_requested() {
+            fsync_tree(&install_root).context("fsync staged clone before publish")?;
+        }
+        std::fs::rename(&install_root, &target).with_context(|| {
+            format!("rename {} to {}", install_root.display(), target.display())
+        })?;
+        if fsync_requested() {
+            fsync_dir(post_rename_fsync_dir(&target))
+                .context("fsync parent directory after publish")?;
         }
 
         let report = bench.finish();
@@ -3980,72 +3934,6 @@ impl Client {
             .context("read managed top-up Git stdout")?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
-    async fn should_use_overlay(&self, metadata: &MetadataChunk, staging_dir: &Path) -> bool {
-        if !overlay::is_available() {
-            return false;
-        }
-        let raw_bytes = match metadata.files.iter().try_fold(0u64, |total, file| {
-            total
-                .checked_add(file.checked_total_len()?)
-                .context("overlay raw file length total overflow")
-        }) {
-            Ok(total) => total,
-            Err(e) => {
-                warn!("overlay staging size calculation overflowed raw file lengths");
-                tracing::debug!(error = %e, "overlay raw size calculation failed");
-                return false;
-            }
-        };
-        // Sum the compressed length of every frame; archive chunks contain only
-        // frames, so this is the total compressed archive size.
-        let compressed_bytes = match metadata.frames.iter().try_fold(0u64, |total, frame| {
-            total.checked_add(u64::from(frame.compressed_len))
-        }) {
-            Some(total) => total,
-            None => {
-                warn!("overlay staging size calculation overflowed compressed frame lengths");
-                return false;
-            }
-        };
-
-        // No size threshold: overlay is opt-in (see overlay::is_available), so if
-        // the operator asked for it we honor it for any repo, falling back only
-        // when there isn't enough tmpfs space or the kernel disallows the mount.
-        let margin_mb: u64 = 128;
-        let required = match raw_bytes
-            .checked_add(compressed_bytes)
-            .and_then(|total| total.checked_add(margin_mb * 1024 * 1024))
-        {
-            Some(required) => required,
-            None => {
-                warn!("overlay staging size calculation overflowed total size");
-                return false;
-            }
-        };
-        let available = overlay::available_space(staging_dir).unwrap_or(0);
-        if available < required {
-            warn!(
-                "overlay staging wants {} MB but only {} MB available in {}; falling back to direct extraction",
-                required / 1024 / 1024,
-                available / 1024 / 1024,
-                staging_dir.display()
-            );
-            return false;
-        }
-
-        if !overlay::test_mount(staging_dir) {
-            warn!("overlay test mount failed; falling back to direct extraction");
-            return false;
-        }
-
-        info!(
-            "using overlay staging (raw {} MB, compressed {} MB, available {} MB)",
-            raw_bytes / 1024 / 1024,
-            compressed_bytes / 1024 / 1024,
-            available / 1024 / 1024
-        );
-        true
-    }
 }
 
 #[cfg(test)]
@@ -4466,7 +4354,6 @@ mod tests {
         let staging_owner = temp_install_dir(&target).unwrap();
         let staging_path = staging_owner.path().to_path_buf();
         let staging = Arc::new(Mutex::new(Some(AttemptStaging {
-            overlay_dirs: None,
             temp_install: Some(staging_owner),
         })));
         let mut reaper = spawn_attempt_reaper(cleanup.clone(), Arc::clone(&staging));

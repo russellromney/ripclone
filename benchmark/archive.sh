@@ -45,13 +45,7 @@ BASE_DIR="$(mktemp -d /tmp/ripclone-install-bench.XXXXXX)"
 CAS_DIR="$BASE_DIR/cache"
 REPO_ROOT="$BASE_DIR/repos"
 
-cleanup_overlay() {
-  umount -l "$BASE_DIR"/bun-install 2>/dev/null || true
-  rm -rf /dev/shm/ripclone-overlay-* 2>/dev/null || true
-}
-
 cleanup() {
-  cleanup_overlay
   if [ -n "${SERVER_PID:-}" ]; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true

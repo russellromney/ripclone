@@ -30,20 +30,14 @@ const CDC_MAX: usize = 16 * 1024 * 1024;
 /// frames per batch to keep every core busy.
 const STREAM_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
-/// Compress one CDC frame with zstd (optionally with a trained dictionary).
-/// Empty frames stay empty. Frames are independent, so this is the unit of both
-/// parallel compression and content-addressed reuse.
-fn compress_frame(raw: &[u8], level: i32, dictionary: Option<&[u8]>) -> Result<Vec<u8>> {
+/// Compress one CDC frame with zstd. Empty frames stay empty. Frames are
+/// independent, so this is the unit of both parallel compression and
+/// content-addressed reuse.
+fn compress_frame(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     if raw.is_empty() {
         return Ok(Vec::new());
     }
-    match dictionary {
-        Some(dict) => zstd::bulk::Compressor::with_dictionary(level, dict)
-            .context("create zstd compressor with dictionary")?
-            .compress(raw)
-            .context("zstd compress frame with dictionary"),
-        None => zstd::encode_all(raw, level).context("zstd compress frame"),
-    }
+    zstd::encode_all(raw, level).context("zstd compress frame")
 }
 
 /// Cut `stream` into content-defined frames; returns each frame's `(start, end)`
@@ -164,9 +158,8 @@ impl ArchiveBuilder {
         archive_path: &Path,
         manifest_path: &Path,
         level: i32,
-        dictionary: Option<&[u8]>,
     ) -> Result<ArchiveStats> {
-        let (manifest, chunks, stats) = self.build_chunks(commit, level, dictionary, u64::MAX)?;
+        let (manifest, chunks, stats) = self.build_chunks(commit, level, u64::MAX)?;
         if chunks.len() > 1 {
             anyhow::bail!(
                 "expected at most one archive chunk for file output, got {}",
@@ -193,7 +186,6 @@ impl ArchiveBuilder {
         &self,
         commit: &str,
         level: i32,
-        dictionary: Option<&[u8]>,
         target_chunk_size: u64,
     ) -> Result<(MetadataChunk, Vec<Vec<u8>>, ArchiveStats)> {
         let target_chunk_size = target_chunk_size.max(1);
@@ -222,7 +214,7 @@ impl ArchiveBuilder {
                 use rayon::prelude::*;
                 batch
                     .par_iter()
-                    .map(|&(_, raw)| compress_frame(raw, level, dictionary))
+                    .map(|&(_, raw)| compress_frame(raw, level))
                     .collect::<Result<Vec<_>>>()
             })?;
 
@@ -409,11 +401,10 @@ impl ArchiveBuilder {
         archive_path: &Path,
         manifest_path: &Path,
         level: i32,
-        dictionary: Option<&[u8]>,
     ) -> Result<ArchiveStats> {
         let mirror = repo_root.join(format!("{}_{}.git", owner, repo_name));
         let builder = ArchiveBuilder::new(&mirror);
-        builder.build(commit, archive_path, manifest_path, level, dictionary)
+        builder.build(commit, archive_path, manifest_path, level)
     }
 
     /// Build only the metadata *files table* (path, mode, blob sha1) — no zstd
@@ -543,10 +534,9 @@ impl ArchiveBuilder {
         commit: &str,
         cas: &Cas,
         level: i32,
-        dictionary: Option<&[u8]>,
     ) -> Result<(Vec<String>, MetadataChunk)> {
         let (metadata, chunks, _stats) =
-            self.build_chunks(commit, level, dictionary, DEFAULT_ARCHIVE_CHUNK_SIZE)?;
+            self.build_chunks(commit, level, DEFAULT_ARCHIVE_CHUNK_SIZE)?;
         let mut archive_chunk_hashes = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             archive_chunk_hashes.push(cas.put(&chunk)?);
@@ -570,7 +560,6 @@ impl ArchiveBuilder {
         cas: &Cas,
         storage: Option<&crate::storage::StorageRef>,
         level: i32,
-        dictionary: Option<&[u8]>,
         prev: &std::collections::HashMap<String, (String, u64)>,
         bundle_size: u64,
     ) -> Result<ArchiveBuildOutput> {
@@ -614,7 +603,7 @@ impl ArchiveBuilder {
                                 is_new: false,
                             }),
                             None => {
-                                let comp = compress_frame(raw, level, dictionary)?;
+                                let comp = compress_frame(raw, level)?;
                                 let compressed_len = comp.len() as u64;
                                 let chunk_hash = cas.put(&comp)?;
                                 Ok(FrameChunk {
@@ -898,7 +887,6 @@ impl ArchiveBuilder {
         cas: &Cas,
         storage: Option<&crate::storage::StorageRef>,
         level: i32,
-        dictionary: Option<&[u8]>,
         prev_frames: &[crate::ArchiveFrame],
         prev_files: &[FileEntry],
         prev_commit: &str,
@@ -908,17 +896,8 @@ impl ArchiveBuilder {
             .iter()
             .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
             .collect();
-        let full = || {
-            self.build_into_cas_incremental(
-                commit,
-                cas,
-                storage,
-                level,
-                dictionary,
-                &prev_map,
-                bundle_size,
-            )
-        };
+        let full =
+            || self.build_into_cas_incremental(commit, cas, storage, level, &prev_map, bundle_size);
 
         // Largest changed middle we'll read into memory; above this the full build
         // is both simpler and not much slower.
@@ -1170,7 +1149,7 @@ impl ArchiveBuilder {
                 let (chunk_hash, compressed_len) = match prev_map.get(&raw_hash) {
                     Some((ch, cl)) => (ch.clone(), *cl),
                     None => {
-                        let comp = compress_frame(raw, level, dictionary)?;
+                        let comp = compress_frame(raw, level)?;
                         let ch = cas.put(&comp)?;
                         news.push(ch.clone());
                         (ch, comp.len() as u64)
@@ -1479,102 +1458,6 @@ fn hash_blobs_parallel(
     })
 }
 
-/// Maximum size of a single file sample used for dictionary training.
-/// Large binary blobs don't help the dictionary much and slow training down.
-const MAX_SAMPLE_FILE_BYTES: usize = 200 * 1024;
-
-/// Train a zstd dictionary from the working-tree files at `commit` in `mirror`.
-///
-/// `max_size` is the maximum size of the generated dictionary. `sample_bytes`
-/// is an approximate cap on how much file data to feed into the trainer.
-/// Training is expensive, so this is intended to run once per repo per day, not
-/// per clone.
-pub fn train_dictionary(
-    mirror: &std::path::Path,
-    commit: &str,
-    max_size: usize,
-    sample_bytes: usize,
-) -> anyhow::Result<Vec<u8>> {
-    if !mirror.exists() {
-        anyhow::bail!("mirror not found: {}", mirror.display());
-    }
-
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {}", commit))?;
-    let mut child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(mirror.as_os_str())
-        .args(["archive", "--format=tar", "--end-of-options", commit])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawn git archive for dictionary training")?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing archive stdout"))?;
-    let mut tar = tar::Archive::new(stdout);
-
-    let mut samples: Vec<Vec<u8>> = Vec::new();
-    let mut total = 0usize;
-    let mut finished_early = false;
-
-    for entry in tar.entries().context("read archive entries")? {
-        let mut entry = entry.context("tar entry")?;
-        let entry_type = entry.header().entry_type();
-        if !matches!(
-            entry_type,
-            tar::EntryType::Regular | tar::EntryType::Symlink
-        ) {
-            continue;
-        }
-
-        let content = if entry_type == tar::EntryType::Symlink {
-            let target = entry
-                .link_name()
-                .with_context(|| "read symlink target")?
-                .ok_or_else(|| anyhow::anyhow!("missing symlink target"))?;
-            let target = target.to_str().with_context(|| "non-utf8 symlink target")?;
-            target.as_bytes().to_vec()
-        } else {
-            let mut content = Vec::new();
-            entry.read_to_end(&mut content).context("read tar entry")?;
-            content
-        };
-
-        // Skip large individual files; the dictionary is most useful for the
-        // long tail of small source/text files.
-        if content.len() > MAX_SAMPLE_FILE_BYTES {
-            continue;
-        }
-
-        if total + content.len() > sample_bytes && !samples.is_empty() {
-            finished_early = true;
-            break;
-        }
-        total += content.len();
-        samples.push(content);
-    }
-
-    // If we stopped reading before git archive finished, kill it so we don't
-    // hang waiting for its stdout pipe to drain.
-    if finished_early {
-        let _ = child.kill();
-    }
-    let status = child.wait().context("git archive wait")?;
-    if !finished_early && !status.success() {
-        anyhow::bail!("git archive failed during dictionary training");
-    }
-
-    if samples.is_empty() {
-        anyhow::bail!("no samples found for dictionary training");
-    }
-
-    let dict = zstd::dict::from_samples(&samples, max_size).context("train zstd dictionary")?;
-    Ok(dict)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,11 +1477,7 @@ mod tests {
     /// pins the observable contract of streaming-to-CAS: each returned frame's
     /// chunk is already durable in CAS, and decompressing the frames in order
     /// reproduces the exact path-ordered worktree bytes.
-    ///
-    /// Ignored by default (multi-frame CDC over ~12 MiB). Run with
-    /// `cargo test --release -- --ignored`.
     #[test]
-    #[ignore = "slow: CDC heavy, run in release"]
     fn incremental_build_streams_frames_to_cas() {
         use std::collections::HashMap;
         // High-entropy xorshift so CDC finds real content-defined cut points
@@ -1629,15 +1508,7 @@ mod tests {
         let builder = ArchiveBuilder::new(tmp.path());
         let empty: HashMap<String, (String, u64)> = HashMap::new();
         let out = builder
-            .build_into_cas_incremental(
-                &commit,
-                &cas,
-                None,
-                6,
-                None,
-                &empty,
-                DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
+            .build_into_cas_incremental(&commit, &cas, None, 6, &empty, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
 
         assert!(
@@ -1686,11 +1557,7 @@ mod tests {
     /// Incremental archive: identical commit reuses every frame; a small edit at
     /// the end of the stream reuses all earlier (unchanged) frames and rebuilds
     /// only the affected one. Verifies the CDC reuse mechanic.
-    ///
-    /// Ignored by default because it CDC-processes ~20 MiB of incompressible
-    /// data in debug mode. Run with `cargo test --release -- --ignored`.
     #[test]
-    #[ignore = "slow: CDC heavy, run in release"]
     fn incremental_archive_reuses_unchanged_frames() {
         use std::collections::HashMap;
         let pr = |len: usize, seed: u8| {
@@ -1709,15 +1576,7 @@ mod tests {
         let c1 = commit_onto_bytes(&repo, &[(b"a.bin", &big), (b"z.txt", b"hello")]);
         let empty: HashMap<String, (String, u64)> = HashMap::new();
         let out1 = builder
-            .build_into_cas_incremental(
-                &c1,
-                &cas,
-                None,
-                6,
-                None,
-                &empty,
-                DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
+            .build_into_cas_incremental(&c1, &cas, None, 6, &empty, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         assert_eq!(
             out1.new_reuse_frame_hashes.len(),
@@ -1737,7 +1596,7 @@ mod tests {
 
         // Same commit → full reuse.
         let out1b = builder
-            .build_into_cas_incremental(&c1, &cas, None, 6, None, &prev, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .build_into_cas_incremental(&c1, &cas, None, 6, &prev, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         assert_eq!(
             out1b.new_reuse_frame_hashes.len(),
@@ -1748,7 +1607,7 @@ mod tests {
         // Change only the trailing small file → only the last frame changes.
         let c2 = commit_onto_bytes(&repo, &[(b"a.bin", &big), (b"z.txt", b"changed!")]);
         let out2 = builder
-            .build_into_cas_incremental(&c2, &cas, None, 6, None, &prev, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .build_into_cas_incremental(&c2, &cas, None, 6, &prev, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         assert!(
             out2.new_reuse_frame_hashes.len() < out2.archive_frames.len(),
@@ -1784,7 +1643,7 @@ mod tests {
         );
         let empty: HashMap<String, (String, u64)> = HashMap::new();
         let first = builder
-            .build_into_cas_incremental(&commit, &cas, None, 3, None, &empty, 16)
+            .build_into_cas_incremental(&commit, &cas, None, 3, &empty, 16)
             .unwrap();
 
         for frame in &first.archive_frames {
@@ -1804,7 +1663,7 @@ mod tests {
             .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
             .collect();
         let second = builder
-            .build_into_cas_incremental(&commit, &cas, Some(&storage), 3, None, &prev, 16)
+            .build_into_cas_incremental(&commit, &cas, Some(&storage), 3, &prev, 16)
             .unwrap();
 
         assert_eq!(
@@ -1828,7 +1687,7 @@ mod tests {
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let raw = b"correct frame bytes";
-        let compressed = compress_frame(raw, 3, None).unwrap();
+        let compressed = compress_frame(raw, 3).unwrap();
         let hash = crate::cas::hash(&compressed);
         let corrupt = vec![compressed[0].wrapping_add(1); compressed.len()];
         let storage: crate::storage::StorageRef = std::sync::Arc::new(CorruptFrameStorage {
@@ -1876,7 +1735,7 @@ mod tests {
         let mut frames = Vec::new();
         let mut frame_infos = Vec::new();
         for (idx, raw) in raws.iter().enumerate() {
-            let compressed = compress_frame(raw, 3, None).unwrap();
+            let compressed = compress_frame(raw, 3).unwrap();
             let hash = cas.put(&compressed).unwrap();
             frames.push(crate::ArchiveFrame {
                 raw_hash: crate::cas::hash(raw),
@@ -2039,15 +1898,7 @@ mod tests {
         let c1 = commit_onto(&repo, &as_refs(files1));
         let empty: HashMap<String, (String, u64)> = HashMap::new();
         let c1_out = builder
-            .build_into_cas_incremental(
-                &c1,
-                &cas,
-                None,
-                3,
-                None,
-                &empty,
-                DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
+            .build_into_cas_incremental(&c1, &cas, None, 3, &empty, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         let c1_meta = c1_out.metadata;
         let c1_frames = c1_out.archive_frames;
@@ -2059,15 +1910,7 @@ mod tests {
             .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
             .collect();
         let inc = builder
-            .build_into_cas_incremental(
-                &c2,
-                &cas,
-                None,
-                3,
-                None,
-                &prev_map,
-                DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
+            .build_into_cas_incremental(&c2, &cas, None, 3, &prev_map, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         let bnd = builder
             .build_into_cas_bounded(
@@ -2075,7 +1918,6 @@ mod tests {
                 &cas,
                 None,
                 3,
-                None,
                 &c1_frames,
                 &c1_meta.files,
                 &c1,
@@ -2125,12 +1967,9 @@ mod tests {
 
     /// The bounded archive (read only the changed middle) must be byte-identical to
     /// the full incremental build across edit positions and shapes — a wrong
-    /// prefix/suffix reuse or a bad offset shift would diverge here.
-    ///
-    /// Ignored by default: it builds ~30 MiB of archives nine times. Run with
-    /// `cargo test --release -- --ignored`; the scenarios run in parallel.
+    /// prefix/suffix reuse or a bad offset shift would diverge here. The
+    /// scenarios run in parallel.
     #[test]
-    #[ignore = "slow: builds ~30 MiB of archives nine times, run in release"]
     fn bounded_archive_matches_incremental() {
         let base: Vec<(String, Vec<u8>)> = (0..10)
             .map(|s| (format!("f{s:02}.bin"), mix_blob(s)))
@@ -2304,7 +2143,7 @@ mod tests {
 
         // The full chunk builder must also stream the symlink target bytes in order.
         let (_metadata, _chunks, _stats) = builder
-            .build_chunks(&commit, 6, None, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .build_chunks(&commit, 6, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
     }
 
@@ -2346,10 +2185,7 @@ mod tests {
         assert_eq!(blobs[0].2, 0o100644);
     }
 
-    /// Ignored by default: it builds ~32 MiB of archives. Run with
-    /// `cargo test --release -- --ignored`.
     #[test]
-    #[ignore = "slow: builds ~32 MiB of archives, run in release"]
     fn archive_chunks_respect_target_size() {
         let pseudo_random = |len: usize| {
             (0..len)
@@ -2367,7 +2203,7 @@ mod tests {
         let (tmp, commit) = commit_files(&files_ref);
         let builder = ArchiveBuilder::new(tmp.path());
         let target = 8 * 1024 * 1024;
-        let (_metadata, chunks, _stats) = builder.build_chunks(&commit, 6, None, target).unwrap();
+        let (_metadata, chunks, _stats) = builder.build_chunks(&commit, 6, target).unwrap();
         for (i, chunk) in chunks.iter().enumerate() {
             assert!(
                 chunk.len() as u64 <= target,
@@ -2390,7 +2226,7 @@ mod tests {
         let manifest = builder.build_files_table(&commit).unwrap();
         assert!(manifest.files.is_empty());
         let (metadata, chunks, stats) = builder
-            .build_chunks(&commit, 1, None, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .build_chunks(&commit, 1, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         assert!(chunks.is_empty());
         assert_eq!(stats.raw_bytes, 0);
@@ -2403,7 +2239,7 @@ mod tests {
         let builder = ArchiveBuilder::new(tmp.path());
 
         let (metadata, chunks, stats) = builder
-            .build_chunks(&commit, 1, None, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .build_chunks(&commit, 1, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         assert_eq!(stats.files, 1);
         assert_eq!(stats.frames, 1);
@@ -2418,7 +2254,6 @@ mod tests {
                 &cas,
                 None,
                 1,
-                None,
                 &std::collections::HashMap::new(),
                 DEFAULT_ARCHIVE_CHUNK_SIZE,
             )
@@ -2441,10 +2276,7 @@ mod tests {
     /// Round-trip across multiple frames: content larger than FRAME_MAX is split
     /// into several frames, compressed in parallel, then must extract byte-exact.
     /// Guards the parallel-compression + chunk-assembly refactor.
-    /// Ignored by default: it builds ~21 MiB of archives. Run with
-    /// `cargo test --release -- --ignored`.
     #[test]
-    #[ignore = "slow: builds ~21 MiB of archives, run in release"]
     fn archive_roundtrip_multiframe() {
         let pr = |len: usize, seed: u8| {
             (0..len)
@@ -2466,12 +2298,12 @@ mod tests {
         let arch = out.path().join("a.zst");
         let man = out.path().join("a.manifest");
         ArchiveBuilder::new(tmp.path())
-            .build(&commit, &arch, &man, 6, None)
+            .build(&commit, &arch, &man, 6)
             .unwrap();
 
         let dest = out.path().join("extracted");
         std::fs::create_dir_all(&dest).unwrap();
-        crate::extract::extract_archive(&arch, &man, &dest, None).unwrap();
+        crate::extract::extract_archive(&arch, &man, &dest).unwrap();
 
         for (name, content) in &files {
             let got = std::fs::read(dest.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"));
@@ -2483,10 +2315,7 @@ mod tests {
     /// slice-based chunker over the same path-ordered worktree. This is what lets
     /// us drop the whole-worktree buffer without invalidating already-stored
     /// archives or per-frame reuse keys.
-    /// Ignored by default: it CDC-processes ~27 MiB of data. Run with
-    /// `cargo test --release -- --ignored`.
     #[test]
-    #[ignore = "slow: CDC-processes ~27 MiB, run in release"]
     fn stream_cdc_bounds_match_slice_cdc() {
         // High-entropy xorshift bytes so CDC finds real content-defined cut
         // points (not just max-size cuts) — that's what makes the streaming vs.
@@ -2558,7 +2387,7 @@ mod tests {
         let commit = commit_onto_bytes(&repo, &[(b"a.txt", b"hi"), (weird, b"payload")]);
 
         let (manifest, _chunks, _stats) = ArchiveBuilder::new(tmp.path())
-            .build_chunks(&commit, 6, None, u64::MAX)
+            .build_chunks(&commit, 6, u64::MAX)
             .unwrap();
 
         assert!(

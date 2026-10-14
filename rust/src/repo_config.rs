@@ -2,7 +2,7 @@
 //!
 //! A `RepoConfig` tells the server how to build a repository's clonepacks:
 //! which depth variants to produce, the zstd compression level,
-//! archive/head-blobs chunk sizes, and an optional dictionary. The server-owned
+//! and archive/head-blobs chunk sizes. The server-owned
 //! control database stores one record per repository. Admission snapshots the
 //! validated result into the durable job, so workers never read live config.
 //!
@@ -41,10 +41,6 @@ pub struct RepoConfig {
     /// zstd compression level for archive frames.
     #[serde(default)]
     pub compression_level: Option<i32>,
-    /// Identifier of a trained zstd dictionary to compress with (stored for
-    /// forward compatibility; dictionary lookup is a follow-up).
-    #[serde(default)]
-    pub dictionary_id: Option<String>,
     /// Target compressed size of each archive chunk, in bytes.
     #[serde(default)]
     pub archive_chunk_size: Option<u64>,
