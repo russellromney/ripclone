@@ -346,7 +346,7 @@ impl S3Storage {
         Fut: std::future::Future<Output = Result<T>> + Send + 'static,
         T: Send + 'static,
     {
-        // We may be called from a Tokio worker thread (e.g. do_sync), from a
+        // We may be called from a Tokio worker thread (e.g. a build), from a
         // spawn_blocking thread (e.g. artifact handlers), or from a
         // non-Tokio thread (e.g. CLI before a runtime exists). Use the right
         // blocking strategy for each, but always execute the actual S3 request

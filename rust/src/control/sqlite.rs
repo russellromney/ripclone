@@ -45,7 +45,6 @@ impl SqliteControlStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create control directory {}", parent.display()))?;
         }
-        libsql_configures_sqlite_first().await?;
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -84,18 +83,6 @@ impl SqliteControlStore {
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
-}
-
-/// Until libsql is removed, libsql and sqlx share one linked SQLite engine,
-/// and libsql asserts that it sets the engine's threading mode before anything
-/// initializes it. Opening an in-memory libsql database runs that one-time
-/// setup first, so libsql code in the same process keeps working.
-async fn libsql_configures_sqlite_first() -> Result<()> {
-    libsql::Builder::new_local(":memory:")
-        .build()
-        .await
-        .context("initialize libsql before the control store")?;
-    Ok(())
 }
 
 async fn initialize(connection: &mut SqliteConnection, path: &Path) -> Result<()> {
@@ -532,6 +519,19 @@ impl ControlStore for SqliteControlStore {
         self.select_build(repo, commit).await
     }
 
+    async fn list_builds(&self, repo: &RepoId) -> Result<Vec<BuildRow>> {
+        sqlx::query(&format!(
+            "SELECT {COLUMNS} FROM builds WHERE repo = $1 ORDER BY created_at, commit_id"
+        ))
+        .bind(repo.storage_key())
+        .fetch_all(&self.pool)
+        .await
+        .context("list builds")?
+        .iter()
+        .map(decode_build)
+        .collect()
+    }
+
     async fn latest_ready_full(
         &self,
         repo: &RepoId,
@@ -601,7 +601,7 @@ impl ControlStore for SqliteControlStore {
             .collect()
     }
 
-    async fn get_config(&self, repo: &RepoId) -> Result<RepoConfig> {
+    async fn get_config(&self, repo: &RepoId) -> Result<Option<RepoConfig>> {
         let key = repo.storage_key();
         let data: Option<String> =
             sqlx::query_scalar("SELECT data FROM repo_config WHERE repo = $1")
@@ -610,14 +610,14 @@ impl ControlStore for SqliteControlStore {
                 .await
                 .with_context(|| format!("read repository config {key}"))?;
         let Some(data) = data else {
-            return Ok(RepoConfig::default());
+            return Ok(None);
         };
         let config: RepoConfig = serde_json::from_str(&data)
             .with_context(|| format!("decode repository config {key}"))?;
         config
             .validate()
             .with_context(|| format!("validate repository config {key}"))?;
-        Ok(config)
+        Ok(Some(config))
     }
 
     async fn set_config(&self, repo: &RepoId, config: &RepoConfig) -> Result<()> {

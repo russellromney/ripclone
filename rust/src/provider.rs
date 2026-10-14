@@ -410,7 +410,7 @@ impl RepoId {
         self.provider.as_str() == DEFAULT_PROVIDER_ID
     }
 
-    /// Storage key used by `RefStore` implementations.
+    /// Storage key: how the control store and logs name the repository.
     ///
     /// All providers use `{provider}/{escaped_path}`.
     pub fn storage_key(&self) -> String {

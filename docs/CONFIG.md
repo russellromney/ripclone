@@ -48,7 +48,11 @@ Flags: `--cas-dir`, `--repo-root`, `--control-db`, `--host` (default
 | `RIPCLONE_RATE_LIMIT_PER_SEC`, `RIPCLONE_RATE_LIMIT_BURST` | Rate limit for public endpoints. |
 | `RIPCLONE_TRUST_FORWARDED_FOR` | Use `X-Forwarded-For` for rate limiting behind a trusted proxy. |
 | `RIPCLONE_LSM_MAX_LEVELS` | Maximum history levels before compaction. |
-| `RIPCLONE_HEAD_REBASE_BYTES` | Threshold for rebasing the Head delta. Expert setting. |
+| `RIPCLONE_HEAD_SLOTS` | Builds that run Head at once, default 2. At least 1. |
+| `RIPCLONE_BACKGROUND_SLOTS` | Builds that run Full and Files at once, default 1. `0` pauses Full and Files; Head still builds. |
+| `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
+| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Full and Files) before the output fails, default 5. |
+| `RIPCLONE_HEAD_REBASE_BYTES` | When a Head delta reaches this size, the Full build compacts Head packs into a new base for later Heads. Expert setting. |
 
 ### GitHub App credentials
 

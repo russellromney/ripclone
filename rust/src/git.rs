@@ -1851,6 +1851,12 @@ fn sync_bare_mirror_admitted_from(
     }
 
     let _mirror_lock = MirrorLock::acquire(mirror_dir)?;
+    // A commit already in the mirror (an earlier attempt, or the Background
+    // phase after Head) needs no upstream round trip. Auto-gc is off, so it
+    // stays.
+    if mirror_has_commit(mirror_dir, commit) {
+        return Ok(());
+    }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential, origin_base);
     let auth_header = upstream_auth_header(provider, credential);
     sync_bare_mirror_rev(
@@ -1864,6 +1870,18 @@ fn sync_bare_mirror_admitted_from(
     )?;
 
     Ok(())
+}
+
+fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
+    mirror_dir.exists()
+        && Command::new("git")
+            .arg("-C")
+            .arg(mirror_dir.as_os_str())
+            .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 fn set_bare_default_branch(mirror_dir: &Path, default_branch: &str) -> Result<()> {

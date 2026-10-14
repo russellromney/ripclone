@@ -13,7 +13,7 @@ while IFS= read -r line; do
   [ -n "$line" ] || continue
   path="${line%%:*}"
   case "$path" in
-    rust/src/control/mod.rs|rust/src/server.rs|docs/BACKENDS.md|docs/CONFIG.md|docs/internal/*)
+    rust/src/control/mod.rs|rust/src/server.rs|docs/internal/*)
       allowed=$((allowed + 1))
       ;;
     *)
@@ -42,8 +42,19 @@ if [ -n "$dependency_matches" ]; then
   exit 1
 fi
 
+# The control store links one SQLite, sqlx's. libsql bundles a second one.
+libsql_matches="$(cd "$ROOT" && git grep -niE 'libsql([^i]|$)' -- . ':!docs/internal' ':!scripts/audit_control_support.sh' || true)"
+if [ -n "$libsql_matches" ]; then
+  echo "libsql is present; the control store uses sqlx's SQLite only:" >&2
+  echo "$libsql_matches" >&2
+  exit 1
+fi
+
 for path in \
   rust/src/dispatch \
+  rust/src/meta \
+  rust/src/queue \
+  rust/src/ref_store.rs \
   rust/src/queue/postgres.rs \
   rust/src/queue/mysql.rs \
   rust/src/queue/local.rs \

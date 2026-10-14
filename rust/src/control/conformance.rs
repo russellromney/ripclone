@@ -65,10 +65,11 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
         stale_claim_cannot_overwrite_any_ready_result,
         reset_leases_frees_every_row,
         latest_ready_full_is_newest_ready_on_the_ref,
+        list_builds_returns_one_repo_oldest_first,
         concurrent_claims_never_share_a_row,
         state_survives_restart,
         repos_are_added_listed_and_removed,
-        config_defaults_without_writing,
+        config_is_absent_until_written,
     );
 }
 
@@ -876,6 +877,26 @@ async fn latest_ready_full_is_newest_ready_on_the_ref(backend: &dyn Backend) {
     );
 }
 
+async fn list_builds_returns_one_repo_oldest_first(backend: &dyn Backend) {
+    let (clock, store) = open(backend).await;
+    let other_repo = RepoId::github("acme/other");
+    assert!(store.list_builds(&repo()).await.unwrap().is_empty());
+    complete(store.as_ref(), &repo(), &sha(2), Some(MAIN)).await;
+    clock.advance(10);
+    store.admit(&repo(), &sha(1), None).await.unwrap();
+    store.admit(&other_repo, &sha(3), None).await.unwrap();
+
+    let rows = store.list_builds(&repo()).await.unwrap();
+    let commits: Vec<&str> = rows.iter().map(|row| row.commit.as_str()).collect();
+    assert_eq!(commits, [sha(2), sha(1)]);
+    assert_eq!(
+        ready_manifest(&rows[0].full),
+        Some(manifest(&sha(2), "full"))
+    );
+    assert!(is(&rows[1].head, &pending(None)));
+    assert_eq!(store.list_builds(&other_repo).await.unwrap().len(), 1);
+}
+
 async fn concurrent_claims_never_share_a_row(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     let rows = 16;
@@ -952,7 +973,10 @@ async fn state_survives_restart(backend: &dyn Backend) {
         store.get_repo(&repo()).await.unwrap().unwrap().added_at,
         START as u64
     );
-    assert_eq!(store.get_config(&repo()).await.unwrap(), config);
+    assert_eq!(
+        store.get_config(&repo()).await.unwrap(),
+        Some(config.clone())
+    );
     assert_eq!(
         store
             .latest_ready_full(&repo(), MAIN)
@@ -1017,34 +1041,34 @@ async fn repos_are_added_listed_and_removed(backend: &dyn Backend) {
     );
 }
 
-async fn config_defaults_without_writing(backend: &dyn Backend) {
+async fn config_is_absent_until_written(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     let missing = RepoId::github("acme/missing");
-    assert_eq!(
-        store.get_config(&missing).await.unwrap(),
-        RepoConfig::default()
-    );
+    assert_eq!(store.get_config(&missing).await.unwrap(), None);
     let config = RepoConfig {
         compression_level: Some(3),
         archive_chunk_size: Some(1024),
         ..Default::default()
     };
     store.set_config(&repo(), &config).await.unwrap();
-    assert_eq!(store.get_config(&repo()).await.unwrap(), config);
+    assert_eq!(
+        store.get_config(&repo()).await.unwrap(),
+        Some(config.clone())
+    );
     let invalid = RepoConfig {
         compression_level: Some(99),
         ..Default::default()
     };
     assert!(store.set_config(&repo(), &invalid).await.is_err());
-    assert_eq!(store.get_config(&repo()).await.unwrap(), config);
+    assert_eq!(
+        store.get_config(&repo()).await.unwrap(),
+        Some(config.clone())
+    );
     let updated = RepoConfig {
         compression_level: Some(19),
         ..Default::default()
     };
     store.set_config(&repo(), &updated).await.unwrap();
-    assert_eq!(store.get_config(&repo()).await.unwrap(), updated);
-    assert_eq!(
-        store.get_config(&missing).await.unwrap(),
-        RepoConfig::default()
-    );
+    assert_eq!(store.get_config(&repo()).await.unwrap(), Some(updated));
+    assert_eq!(store.get_config(&missing).await.unwrap(), None);
 }
