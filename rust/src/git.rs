@@ -337,6 +337,22 @@ fn clamp_u64_to_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// Run a git command with its output captured, so nothing it prints reaches
+/// the server log. On failure the error carries git's stderr.
+fn run_quiet(command: &mut Command, what: &str) -> Result<()> {
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("spawn git {what}"))?;
+    if !output.status.success() {
+        bail!(
+            "git {what} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Run a git command in a repo and return stdout as String.
 pub fn run_git<P: AsRef<Path>>(repo: P, args: &[&str]) -> Result<String> {
     let output = command()
@@ -490,18 +506,13 @@ pub fn list_object_shas_with_depth<P: AsRef<Path>>(
 /// Cheap: indexes the existing `.idx` files; no pack data is rewritten. Best
 /// effort — a failure only loses the lookup speedup, not correctness.
 pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = command()
-        .arg("-C")
-        .arg(repo_dir.as_ref().as_os_str())
-        .args(["multi-pack-index", "write"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawn git multi-pack-index write")?;
-    if !status.success() {
-        anyhow::bail!("git multi-pack-index write failed");
-    }
-    Ok(())
+    run_quiet(
+        command()
+            .arg("-C")
+            .arg(repo_dir.as_ref().as_os_str())
+            .args(["multi-pack-index", "write"]),
+        "multi-pack-index write",
+    )
 }
 
 /// Write a commit-graph over all reachable commits so the many `rev-list` /
@@ -513,24 +524,19 @@ pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 /// graph layer instead of rewriting the whole graph, so this stays O(new
 /// commits) rather than O(all commits) every sync.
 pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = command()
-        .arg("-C")
-        .arg(repo_dir.as_ref().as_os_str())
-        .args([
-            "commit-graph",
-            "write",
-            "--reachable",
-            "--split",
-            "--no-progress",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawn git commit-graph write")?;
-    if !status.success() {
-        anyhow::bail!("git commit-graph write failed");
-    }
-    Ok(())
+    run_quiet(
+        command()
+            .arg("-C")
+            .arg(repo_dir.as_ref().as_os_str())
+            .args([
+                "commit-graph",
+                "write",
+                "--reachable",
+                "--split",
+                "--no-progress",
+            ]),
+        "commit-graph write",
+    )
 }
 
 /// Write a multi-pack-index *with a reachability bitmap* over the mirror's packs
@@ -542,18 +548,13 @@ pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 /// costs one reachability walk, so call it once after fetch, before the heavy
 /// builds, not on the depth=1 fast path.
 pub fn write_bitmap<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = command()
-        .arg("-C")
-        .arg(repo_dir.as_ref().as_os_str())
-        .args(["multi-pack-index", "write", "--bitmap", "--no-progress"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawn git multi-pack-index write --bitmap")?;
-    if !status.success() {
-        anyhow::bail!("git multi-pack-index write --bitmap failed");
-    }
-    Ok(())
+    run_quiet(
+        command()
+            .arg("-C")
+            .arg(repo_dir.as_ref().as_os_str())
+            .args(["multi-pack-index", "write", "--bitmap", "--no-progress"]),
+        "multi-pack-index write --bitmap",
+    )
 }
 
 /// Build a multi-pack-index over the given packs (each a `(pack_bytes,
@@ -570,14 +571,12 @@ pub fn build_multi_pack_index_bytes(packs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<
     let dir = tmp.path();
     // Minimal bare object store so `git multi-pack-index write` has a repo and
     // an `objects/pack` directory laid out exactly like the client's.
-    let status = command()
-        .args(["init", "--bare", "-q"])
-        .arg(dir.as_os_str())
-        .status()
-        .context("git init --bare for midx")?;
-    if !status.success() {
-        anyhow::bail!("git init --bare for midx failed");
-    }
+    run_quiet(
+        command()
+            .args(["init", "--bare", "-q"])
+            .arg(dir.as_os_str()),
+        "init --bare for midx",
+    )?;
     let pack_dir = dir.join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)?;
     for (pack_bytes, idx_bytes) in packs {
@@ -589,17 +588,13 @@ pub fn build_multi_pack_index_bytes(packs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<
         std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), pack_bytes)?;
         std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), idx_bytes)?;
     }
-    let status = command()
-        .arg("-C")
-        .arg(dir.as_os_str())
-        .args(["multi-pack-index", "write"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawn git multi-pack-index write")?;
-    if !status.success() {
-        anyhow::bail!("git multi-pack-index write (server pregen) failed");
-    }
+    run_quiet(
+        command()
+            .arg("-C")
+            .arg(dir.as_os_str())
+            .args(["multi-pack-index", "write"]),
+        "multi-pack-index write (server pregen)",
+    )?;
     std::fs::read(pack_dir.join("multi-pack-index")).context("read generated multi-pack-index")
 }
 
@@ -752,6 +747,11 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
 
+    // Capture rather than inherit: pack-objects prints each pack's hash on
+    // stdout, which we do not need (the packs are written by base name), and
+    // its stderr is the diagnostic. Stderr goes to a file so a long
+    // diagnostic cannot block the stdin writes below.
+    let mut stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
     let mut child = command()
         .arg("-C")
         .arg(repo.as_ref())
@@ -759,26 +759,33 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
         .args(extra_args)
         .arg(prefix.as_ref())
         .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .context("clone pack-objects stderr file")?,
+        ))
         .spawn()
         .context("spawn git pack-objects")?;
 
-    {
+    let written = {
         let mut stdin = child.stdin.take().context("open git pack-objects stdin")?;
-        for sha in object_shas {
-            stdin
-                .write_all(sha.as_bytes())
-                .context("write object id to pack-objects stdin")?;
-            stdin
-                .write_all(b"\n")
-                .context("write newline to pack-objects stdin")?;
-        }
-    }
+        object_shas.iter().try_for_each(|sha| {
+            stdin.write_all(sha.as_bytes())?;
+            stdin.write_all(b"\n")
+        })
+    };
 
     let status = child.wait().context("wait for git pack-objects")?;
-
     if !status.success() {
-        bail!("pack-objects failed");
+        let mut text = String::new();
+        stderr.rewind().context("rewind pack-objects stderr")?;
+        stderr
+            .read_to_string(&mut text)
+            .context("read pack-objects stderr")?;
+        bail!("pack-objects failed: {}", text.trim());
     }
+    written.context("write object ids to pack-objects stdin")?;
 
     Ok(())
 }
@@ -959,35 +966,19 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
                 "gix index-pack failed for {}: {e:#}; falling back to git index-pack",
                 pack_path.display()
             );
-            let status = command()
-                .arg("index-pack")
-                .arg(pack_path)
-                .current_dir(directory)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .with_context(|| format!("spawn git index-pack for {}", pack_path.display()))?;
-            if !status.success() {
-                bail!(
-                    "git index-pack failed for {} (status {:?})",
-                    pack_path.display(),
-                    status.code()
-                );
-            }
-            Ok(())
+            run_quiet(
+                command()
+                    .arg("index-pack")
+                    .arg(pack_path)
+                    .current_dir(directory),
+                &format!("index-pack {}", pack_path.display()),
+            )
         }
     }
 }
 
 pub fn init<P: AsRef<Path>>(git_dir: P) -> Result<()> {
-    let status = command()
-        .args(["init", "-q", &git_dir.as_ref().to_string_lossy()])
-        .status()
-        .context("git init")?;
-    if !status.success() {
-        bail!("git init failed");
-    }
-    Ok(())
+    run_quiet(command().args(["init", "-q"]).arg(git_dir.as_ref()), "init")
 }
 
 pub fn set_head<P: AsRef<Path>>(git_dir: P, commit: &str) -> Result<()> {
@@ -1024,15 +1015,13 @@ pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
         ("gc.autoPackLimit", "0"),
         ("maintenance.auto", "false"),
     ] {
-        let status = command()
-            .arg("-C")
-            .arg(mirror_dir.as_os_str())
-            .args(["config", key, value])
-            .status()
-            .with_context(|| format!("git config {key}"))?;
-        if !status.success() {
-            bail!("failed to disable auto-gc ({key}) on mirror");
-        }
+        run_quiet(
+            command()
+                .arg("-C")
+                .arg(mirror_dir.as_os_str())
+                .args(["config", key, value]),
+            &format!("config {key} (disable auto-gc on the mirror)"),
+        )?;
     }
     Ok(())
 }
@@ -1625,39 +1614,30 @@ fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
 fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     if !mirror_dir.exists() {
         std::fs::create_dir_all(mirror_dir.parent().unwrap_or(Path::new("")))?;
-        let status = command()
-            .args(["init", "--bare"])
-            .arg(mirror_dir.as_os_str())
-            .status()
-            .context("git init bare mirror")?;
-        if !status.success() {
-            bail!("init bare mirror failed");
-        }
+        // `-q` and captured output: `init` prints its default-branch hint and
+        // an "Initialized" line, which would land in the server log.
+        run_quiet(
+            command()
+                .args(["init", "--bare", "-q"])
+                .arg(mirror_dir.as_os_str()),
+            "init --bare (mirror)",
+        )?;
         disable_auto_gc(mirror_dir)?;
-
-        let status = command()
-            .arg("-C")
-            .arg(mirror_dir.as_os_str())
-            .args(["remote", "add", "origin", url])
-            .status()
-            .context("git remote add origin")?;
-        if !status.success() {
-            bail!("remote add origin failed");
-        }
-
-        let status = command()
-            .arg("-C")
-            .arg(mirror_dir.as_os_str())
-            .args([
+        run_quiet(
+            command()
+                .arg("-C")
+                .arg(mirror_dir.as_os_str())
+                .args(["remote", "add", "origin", url]),
+            "remote add origin",
+        )?;
+        run_quiet(
+            command().arg("-C").arg(mirror_dir.as_os_str()).args([
                 "config",
                 "remote.origin.fetch",
                 "+refs/heads/*:refs/heads/*",
-            ])
-            .status()
-            .context("git config remote.origin.fetch")?;
-        if !status.success() {
-            bail!("config remote.origin.fetch failed");
-        }
+            ]),
+            "config remote.origin.fetch",
+        )?;
     } else {
         disable_auto_gc(mirror_dir)?;
     }
@@ -1720,6 +1700,36 @@ mod tests {
     use super::*;
     use rayon::scope;
     use std::io::Read;
+
+    /// Git's output is captured, not printed, and a failure still carries
+    /// git's own error text.
+    #[test]
+    fn captured_git_failures_carry_git_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = format!(
+            "{:#}",
+            write_commit_graph(dir.path().join("missing")).unwrap_err()
+        );
+        assert!(
+            err.starts_with("git commit-graph write failed: fatal: cannot change to"),
+            "{err}"
+        );
+
+        let repo = crate::test_fixture::init_bare(dir.path());
+        drop(repo);
+        let missing = "1".repeat(40);
+        let err = format!(
+            "{:#}",
+            pack_objects_to_prefix(
+                dir.path(),
+                std::slice::from_ref(&missing),
+                dir.path().join("p/pack")
+            )
+            .unwrap_err()
+        );
+        assert!(err.starts_with("pack-objects failed: fatal:"), "{err}");
+        assert!(err.contains(&missing), "{err}");
+    }
 
     #[test]
     fn upstream_failure_classification_uses_the_git_result() {

@@ -77,7 +77,7 @@ against the CLI) or the plan step that introduces the behavior.
 | C2 | Head ready, then restart with the storage proxy failing PUTs and background builds on: Full and Files fail, Head stays cloneable, status shows `failed` per output. | step 3 PR B (S3 row) |
 | C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | step 3 PR B (S3 row) |
 | C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | step 3 PR A (short lease) |
-| C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). | step 3 PR A |
+| C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). Over the three builds, every server log line is the server's own: no git output. | step 3 PR A |
 | C6 | Linux only: SIGKILL the server while the origin holds its fetch: the server's `git` children exit too. | follow-ups |
 
 ### D. Clone pins B (6)
@@ -308,13 +308,15 @@ numeric server variable now goes through one parser, and a value that does
 not parse stops startup; before, poll and retention intervals, retention
 limits, the signed-URL TTL, the ls-remote timeout, the LSM level cap, the
 Head rebase size and the S3 client numbers fell back to their defaults, and a
-bad retention limit turned that limit off (H4).
+bad retention limit turned that limit off (H4). The server's git children no
+longer write into its log: `git init` of a mirror printed its default-branch
+hint and an "Initialized" line, and `pack-objects` printed each pack's hash.
+Their output is now captured, and a failure's error carries git's stderr
+(C5).
 
 ## Open points
 
 - Every row has a contract test.
-- Found while writing these rows, not fixed here: the server's git children
-  write `hint:` lines and bare SHAs into the server log;
-  `RepoConfig.clonepack_depths`
-  and `archive_chunk_size` are validated and stored but the builder reads
-  neither (it reads only `compression_level`).
+- Found while writing these rows, not fixed here:
+  `RepoConfig.clonepack_depths` and `archive_chunk_size` are validated and
+  stored but the builder reads neither (it reads only `compression_level`).

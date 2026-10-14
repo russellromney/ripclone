@@ -271,4 +271,27 @@ fn c5_later_build_never_changes_published_results() {
         git(&target, &["fsck"]);
         assert_eq!(listing(&target), origin.tree(commit));
     }
+
+    // The server's git children print nothing into its log: every line is
+    // the server's own (`<timestamp>  <LEVEL> ...`), with no `hint:` lines
+    // from `git init` and no pack hashes from `pack-objects`.
+    let log = server.log();
+    let foreign: Vec<&str> = log.lines().filter(|line| !is_tracing_line(line)).collect();
+    assert!(
+        foreign.is_empty(),
+        "git output in the server log:\n{}",
+        foreign.join("\n")
+    );
+}
+
+/// A line the server's tracing subscriber wrote: an RFC 3339 UTC timestamp,
+/// then a level.
+fn is_tracing_line(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let stamp = words.next().unwrap_or("");
+    let level = words.next().unwrap_or("");
+    stamp.len() > 20
+        && stamp.ends_with('Z')
+        && stamp.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+        && ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"].contains(&level)
 }
