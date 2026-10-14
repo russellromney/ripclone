@@ -4878,12 +4878,11 @@ mod tests {
     /// chain that hides the real cause.
     #[tokio::test]
     async fn unreachable_server_names_the_server_and_hints() {
-        // Bind then immediately drop to claim a port nothing is listening on, so
-        // the connect is refused deterministically.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let client = Client::new(format!("http://127.0.0.1:{port}"));
+        // A bound socket that never listens: the connect is refused, and no
+        // other process can take the port while the test runs.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = Client::new(format!("http://{}", socket.local_addr().unwrap()));
         let err = client.add_repo("acme/widget").await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(

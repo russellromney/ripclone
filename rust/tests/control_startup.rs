@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+#[path = "common/server_bin.rs"]
+mod server_bin;
+
 const REMOVED: &[(&str, &str)] = &[
     ("RIPCLONE_METADATA", "postgres"),
     ("RIPCLONE_METADATA_DB_URL", "postgres://decoy/metadata"),
@@ -433,16 +436,6 @@ async fn worker_rejects_server_control_credentials_before_scratch_creation() {
 #[tokio::test]
 async fn second_server_is_rejected_before_its_listener_or_work_paths() {
     let root = tempfile::tempdir().unwrap();
-    let first_port = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let second_port = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let control = root.path().join("control.db");
     let mut first = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-server"));
     first
@@ -455,26 +448,13 @@ async fn second_server_is_rejected_before_its_listener_or_work_paths() {
         .arg(root.path().join("first-repos"))
         .arg("--control-db")
         .arg(&control)
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(first_port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut first = first.spawn().unwrap();
-    let ready = format!("http://127.0.0.1:{first_port}/readyz");
-    for attempt in 0..200 {
-        if reqwest::get(&ready)
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            break;
-        }
-        assert!(attempt < 199, "first server did not become ready");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+        .stderr(Stdio::null());
+    let (mut first, _url) = server_bin::spawn_server_binary(first).await;
 
+    // Hold the second server's port. Had it tried to bind before the
+    // ownership check, it would fail with "address in use" instead.
+    let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let second_port = held.local_addr().unwrap().port();
     let second_cas = root.path().join("second-cas");
     let second_repos = root.path().join("second-repos");
     let mut second = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-server"));
@@ -500,9 +480,7 @@ async fn second_server_is_rejected_before_its_listener_or_work_paths() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("already owned by another server"));
     assert!(!second_cas.exists());
     assert!(!second_repos.exists());
-    let listener = std::net::TcpListener::bind(("127.0.0.1", second_port))
-        .expect("second server never bound its listener");
-    drop(listener);
+    drop(held);
     first.kill().await.unwrap();
     let _ = first.wait().await;
 }

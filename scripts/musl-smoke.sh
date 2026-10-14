@@ -108,13 +108,17 @@ docker run --rm --platform "$PLATFORM" \
     for attempt in $(seq 1 8); do
       log="/tmp/srv-$attempt.log"
       /b/ripclone-server \
-        --port 8123 \
+        --host 127.0.0.1 \
+        --port 0 \
         --cas-dir "/tmp/cas-$attempt" \
         --repo-root "/tmp/repos-$attempt" \
         --control-db "/tmp/control-$attempt.db" >"$log" 2>&1 &
       srv=$!
+      # Port 0: the server logs the address it bound.
+      url=""
       for _ in $(seq 1 80); do
-        wget -qO- http://127.0.0.1:8123/healthz >/dev/null 2>&1 && break
+        [ -n "$url" ] || url="$(grep -o "listening on http://[0-9.:]*" "$log" | head -1 | sed "s/^listening on //")"
+        [ -n "$url" ] && wget -qO- "$url/healthz" >/dev/null 2>&1 && break
         if ! kill -0 "$srv" 2>/dev/null; then
           set +e
           wait "$srv"
@@ -126,8 +130,8 @@ docker run --rm --platform "$PLATFORM" \
         fi
         sleep 0.25
       done
-      health="$(wget -qO- http://127.0.0.1:8123/healthz || true)"
-      version="$(wget -qO- http://127.0.0.1:8123/v1/version || true)"
+      health="$(wget -qO- "$url/healthz" || true)"
+      version="$(wget -qO- "$url/v1/version" || true)"
       [ -n "$health" ] || { echo "server attempt $attempt never became healthy:"; cat "$log"; exit 1; }
       kill "$srv" 2>/dev/null || true
       wait "$srv" 2>/dev/null || true

@@ -376,10 +376,11 @@ What it provides:
     global `SERVER_START_LOCK`, the harness waits for `/readyz`, and then restores
     the old values. This only works because the server reads env once at
     construction. Any lazy env read in `src/` leaks across tests.
-- **Ports.** `free_port()` binds `:0`, drops the listener, and remembers the issued
-  ports in a static set. There is still a TOCTOU window against other processes.
-  The `/readyz` wait is 400 x 25ms (10s) and needs 2 consecutive successes. It
-  produced one CI failure: "default server on port 42387 did not become HTTP-ready".
+- **Ports.** `free_port()` bound `:0`, dropped the listener, and remembered the
+  issued ports in a static set, which left a window for other processes to take
+  the port. Fixed 2026-10-14: every server now binds `:0` itself and reports the
+  bound address (in-process servers get a pre-bound listener; binaries log it),
+  and "unreachable" fixtures hold a bound socket that never listens.
 - **Origins.** `make_origin` creates a bare git repo under a shared
   `origin_root()` tempdir (process-global `OnceLock`, so repo names must be unique
   per process). `make_http_origin*` spawns a **Python** `http.server` script for
