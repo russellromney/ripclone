@@ -319,6 +319,8 @@ pub enum Fault {
 }
 
 struct Rule {
+    /// Only requests with this method, or any method.
+    method: Option<Method>,
     prefix: String,
     fault: Fault,
     min_len: usize,
@@ -389,19 +391,25 @@ impl FaultProxy {
     /// Apply `fault` to the next `times` artifact responses whose body is at
     /// least `min_len` bytes.
     pub fn fault_artifacts(&self, fault: Fault, min_len: usize, times: usize) {
-        self.add_rule("/v1/artifacts/", fault, min_len, times);
+        self.add_rule(None, "/v1/artifacts/", fault, min_len, times);
     }
 
     /// Apply `fault` to the next `times` responses to any request whose path
     /// starts with `prefix`.
     pub fn fault_requests(&self, prefix: &str, fault: Fault, times: usize) {
-        self.add_rule(prefix, fault, 0, times);
+        self.add_rule(None, prefix, fault, 0, times);
+    }
+
+    /// Apply `fault` to the responses of every `PUT` whose path starts with
+    /// `prefix`, as a store that rejects writes.
+    pub fn fail_puts(&self, prefix: &str, fault: Fault) {
+        self.add_rule(Some(Method::PUT), prefix, fault, 0, usize::MAX);
     }
 
     /// Apply `fault` to the next `times` responses of at least `min_len`
     /// bytes to requests whose path starts with `prefix`.
     pub fn fault_large(&self, prefix: &str, fault: Fault, min_len: usize, times: usize) {
-        self.add_rule(prefix, fault, min_len, times);
+        self.add_rule(None, prefix, fault, min_len, times);
     }
 
     /// Forward the client's Host header instead of the upstream's, so
@@ -410,11 +418,19 @@ impl FaultProxy {
         self.state.preserve_host.store(true, Ordering::SeqCst);
     }
 
-    fn add_rule(&self, prefix: &str, fault: Fault, min_len: usize, times: usize) {
+    fn add_rule(
+        &self,
+        method: Option<Method>,
+        prefix: &str,
+        fault: Fault,
+        min_len: usize,
+        times: usize,
+    ) {
         if matches!(fault, Fault::Hold) {
             self.state.gate.open.send_replace(false);
         }
         self.state.rules.lock().unwrap().push(Rule {
+            method,
             prefix: prefix.to_string(),
             fault,
             min_len,
@@ -551,7 +567,12 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
         let mut rules = state.rules.lock().unwrap();
         rules
             .iter_mut()
-            .find(|r| r.remaining > 0 && path.starts_with(&r.prefix) && data.len() >= r.min_len)
+            .find(|r| {
+                r.remaining > 0
+                    && r.method.as_ref().is_none_or(|m| *m == parts.method)
+                    && path.starts_with(&r.prefix)
+                    && data.len() >= r.min_len
+            })
             .map(|r| {
                 r.remaining -= 1;
                 r.fault.clone()

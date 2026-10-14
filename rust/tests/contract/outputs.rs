@@ -20,6 +20,49 @@ fn wait_all_ready(server: &Server, repo: &str, commit: &str) -> serde_json::Valu
     })
 }
 
+/// The state of each output of `commit`, from the API's build summary.
+pub fn output_states(server: &Server, repo: &str, commit: &str) -> [String; 3] {
+    let (status, body) = api::read_commit(server, repo, commit, None);
+    assert_eq!(status, 200, "{body}");
+    ["head", "full", "files"].map(|kind| body[kind]["state"].as_str().unwrap_or("").to_string())
+}
+
+/// C1: with no background slots, a depth-1 clone succeeds on Head alone while
+/// Full and Files stay pending.
+#[test]
+fn c1_head_clones_while_background_outputs_pend() {
+    let world = World::new();
+    let origin = world.origin("acme", "c1");
+    let tip = origin.commit(&[("a.txt", "a\n"), ("b/c.txt", "c\n")], "B");
+    origin.publish();
+    let server = world.server(&[("RIPCLONE_BACKGROUND_SLOTS", "0")]);
+    world.cli(&server, &["add", "acme/c1"]).ok();
+
+    let target = world.target("c1");
+    world
+        .cli(
+            &server,
+            &["clone", "acme/c1", target.to_str().unwrap(), "--depth", "1"],
+        )
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(listing(&target), origin.tree(&tip));
+
+    assert_eq!(
+        output_states(&server, "acme/c1", &tip),
+        ["ready", "pending", "pending"]
+    );
+    for kind in ["full", "files"] {
+        assert_eq!(
+            server.metric(&format!(
+                "ripclone_outputs_published_total{{kind=\"{kind}\"}}"
+            )),
+            0,
+            "{kind}"
+        );
+    }
+}
+
 /// C4: SIGKILL while the origin holds the build's fetch; after a restart and
 /// release the build completes once and every output is ready.
 #[test]

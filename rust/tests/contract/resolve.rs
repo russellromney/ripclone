@@ -105,6 +105,53 @@ fn a4_clone_at_full_sha_is_detached_at_that_commit() {
     assert_eq!(listing(&target), origin.tree(&a));
 }
 
+/// A5: a rev expression is not a selector. The CLI rejects it before asking
+/// the server, and the API rejects it too; nothing builds.
+#[test]
+fn a5_rev_expression_is_rejected_without_a_build() {
+    let world = World::new();
+    let origin = world.origin("acme", "a5");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/a5", "--wait"]).ok();
+    let queued = server.metric("ripclone_builds_queued_total");
+    let proxy = FaultProxy::start(&server);
+
+    let target = world.target("a5");
+    let clone = world.cli(
+        &proxy,
+        &[
+            "clone",
+            "acme/a5",
+            target.to_str().unwrap(),
+            "--at",
+            "HEAD~1",
+        ],
+    );
+    let sync = world.cli(&proxy, &["sync", "acme/a5", "--at", "HEAD~1"]);
+    for (verb, out) in [("clone", &clone), ("sync", &sync)] {
+        let err = out.err();
+        assert!(
+            err.contains("HEAD~1") && err.contains("full commit SHA"),
+            "{verb}: {err}"
+        );
+    }
+    assert!(!target.exists(), "failed clone left {}", target.display());
+    assert!(
+        !proxy.seen().iter().any(api::is_build_post),
+        "the CLI sent a rev expression to the server"
+    );
+
+    let (status, body) = api::post_build(&server, "acme/a5", "HEAD~1", true);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_selector"))
+    );
+    assert_eq!(server.metric("ripclone_builds_queued_total"), queued);
+}
+
 /// A6: each bad request fails with its own error kind and builds nothing.
 /// The kind is the CLI exit code and the API's `code`.
 #[test]

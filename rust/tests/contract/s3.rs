@@ -1,9 +1,10 @@
-//! F7 and H2 against S3 storage: a versitygw emulator per test, started by
-//! `scripts/s3_emulator.sh`. Ignored by default because the script fetches
+//! C2, C3, F7 and H2 against S3 storage: a versitygw emulator per test,
+//! started by `scripts/s3_emulator.sh`. Ignored by default because the script fetches
 //! the emulator binary; the `s3` CI job runs them with `--ignored`.
 
 use crate::downloads::{BIG, big_history_origin};
 use crate::harness::*;
+use crate::outputs::output_states;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -109,4 +110,114 @@ fn s3_h2_artifacts_live_in_bucket_and_survive_restart() {
     assert_eq!(listing(&target), origin.tree(&tip));
     assert_eq!(server.metric("ripclone_builds_queued_total"), 0);
     assert_eq!(s3.objects(), objects);
+}
+
+/// Head(B) ready on a server with no background slots; then a restart with
+/// background builds on and the bucket refusing every PUT, until Full and
+/// Files have failed. Returns the S3 proxy so the caller keeps it alive.
+fn background_failed(world: &World, s3: &S3, name: &str) -> (Origin, Server, FaultProxy, String) {
+    let s3_proxy = FaultProxy::start(s3);
+    s3_proxy.preserve_host();
+    let origin = world.origin("acme", name);
+    let tip = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "B");
+    origin.publish();
+    let repo = format!("acme/{name}");
+    let mut env = s3.server_env(&s3_proxy.url());
+    env.push(("RIPCLONE_BACKGROUND_SLOTS".into(), "0".into()));
+    let mut server = world.server(&env_refs(&env));
+    world.cli(&server, &["add", &repo]).ok();
+    wait_for("Head ready", || {
+        (output_states(&server, &repo, &tip) == ["ready", "pending", "pending"]).then_some(())
+    });
+
+    // A 403 is permanent, so each output fails on its first attempt.
+    s3_proxy.fail_puts(&format!("/{}/", s3.bucket), Fault::Status(403));
+    server.restart_with(&[("RIPCLONE_BACKGROUND_SLOTS", "1")]);
+    wait_for("Full and Files failed", || {
+        (output_states(&server, &repo, &tip) == ["ready", "failed", "failed"]).then_some(())
+    });
+    (origin, server, s3_proxy, tip)
+}
+
+/// C2: storage rejects the background writes. Full and Files fail with the
+/// storage error, Head still clones, and a full clone fails clearly.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_c2_failed_background_outputs_leave_head_cloneable() {
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let (origin, server, s3_proxy, tip) = background_failed(&world, &s3, "c2");
+    assert!(
+        s3_proxy
+            .seen()
+            .iter()
+            .any(|s| s.method == "PUT" && s.faulted),
+        "no write reached the failing bucket"
+    );
+    let (_, summary) = api::read_commit(&server, "acme/c2", &tip, None);
+    for kind in ["full", "files"] {
+        let error = summary[kind]["error"].as_str().unwrap_or_default();
+        assert!(
+            !error.is_empty() && !error.starts_with("gave up"),
+            "{kind} should fail with the storage error: {summary}"
+        );
+    }
+
+    let shallow = world.target("c2-shallow");
+    world
+        .cli(
+            &server,
+            &[
+                "clone",
+                "acme/c2",
+                shallow.to_str().unwrap(),
+                "--depth",
+                "1",
+            ],
+        )
+        .ok();
+    assert_eq!(git(&shallow, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(listing(&shallow), origin.tree(&tip));
+
+    let full = world.target("c2-full");
+    let out = world.cli(&server, &["clone", "acme/c2", full.to_str().unwrap()]);
+    let err = out.err();
+    assert!(
+        err.contains("failed") && err.contains("ripclone sync"),
+        "{err}"
+    );
+    assert!(!full.exists(), "failed clone left {}", full.display());
+}
+
+/// C3: with the fault gone, `sync --at` retries the failed outputs. Only Full
+/// and Files rebuild; Head is not published again.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_c3_retry_rebuilds_only_failed_outputs() {
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let (origin, mut server, _s3_proxy, tip) = background_failed(&world, &s3, "c3");
+
+    let direct = s3.server_env(&s3.endpoint);
+    server.restart_with(&env_refs(&direct));
+    world.cli(&server, &["sync", "acme/c3", "--at", &tip]).ok();
+    assert_eq!(output_states(&server, "acme/c3", &tip), ["ready"; 3]);
+    let published = |kind: &str| {
+        server.metric(&format!(
+            "ripclone_outputs_published_total{{kind=\"{kind}\"}}"
+        ))
+    };
+    assert_eq!(
+        (published("head"), published("full"), published("files")),
+        (0, 1, 1)
+    );
+    assert_eq!(server.metric("ripclone_builds_queued_total"), 0);
+
+    let target = world.target("c3");
+    world
+        .cli(&server, &["clone", "acme/c3", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+    git(&target, &["fsck", "--full"]);
+    assert_eq!(listing(&target), origin.tree(&tip));
 }

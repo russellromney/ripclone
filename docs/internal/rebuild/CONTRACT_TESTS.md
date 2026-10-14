@@ -57,7 +57,7 @@ against the CLI) or the plan step that introduces the behavior.
 | A2 | Sync an unchanged branch twice: no new build (`builds_queued_total` flat), storage listing unchanged. | now |
 | A3 | Push C, sync: exactly one new build; clone gets C. | now |
 | A4 | Clone at a full SHA of an older commit: detached checkout at that SHA. | now |
-| A5 | `--at HEAD~1` (a rev expression) is rejected with a clear error and no build. | step 3 |
+| A5 | `--at HEAD~1` (a rev expression) is rejected with a clear error and no build. | step 3 PR B |
 | A6 | Table: repo not added, unknown ref, missing upstream repo. Each gives its own error code and no build. | now |
 
 ### B. Coalescing (3)
@@ -72,11 +72,11 @@ against the CLI) or the plan step that introduces the behavior.
 
 | # | Test | Lands |
 |---|---|---|
-| C1 | `background_slots = 0`: depth-1 clone of B succeeds while Full and Files stay pending (API status shows it). | step 3 |
-| C2 | Head ready, then restart with the storage proxy failing PUTs and background builds on: Full and Files fail, Head stays cloneable, status shows `failed` per output. | step 3 |
-| C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | step 3 |
-| C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | step 3 (short lease) |
-| C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). | step 3 |
+| C1 | `background_slots = 0`: depth-1 clone of B succeeds while Full and Files stay pending (API status shows it). | step 3 PR B |
+| C2 | Head ready, then restart with the storage proxy failing PUTs and background builds on: Full and Files fail, Head stays cloneable, status shows `failed` per output. | step 3 PR B (S3 row) |
+| C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | step 3 PR B (S3 row) |
+| C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | step 3 PR A (short lease) |
+| C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). | step 3 PR A |
 
 ### D. Clone pins B (5)
 
@@ -138,7 +138,7 @@ Ripclone token reaches the origin.
 | # | Test | Lands |
 |---|---|---|
 | I1 | Missing or wrong server token: 401; a valid token works. | now |
-| I2 | Private repo with a token configured at `repo add`: the server builds it; the client sends no upstream token. | step 3 |
+| I2 | Private repo with a token configured at `repo add`: the server builds it; the client sends no upstream token. | step 3 PR A |
 | I3 | Table across GitHub, GitLab, Gitea, generic: the provider's auth header reaches the origin. | now |
 | I4 | Table across GitHub, GitLab, Gitea webhooks: a signed push builds before any clone; a bad signature gets 401 and no build. | now |
 | I5 | Poller: with no webhook, a push is built within one poll interval. | now |
@@ -167,7 +167,7 @@ step 2, after the contract suite is green.
 - `test`: unit tests plus the contract suite, parallel. Target under 5 minutes
   after compile. The one S3 unit test (multipart upload) runs here against
   `scripts/s3_emulator.sh`, reusing the unit-test binary.
-- `s3`: F7 and H2 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
+- `s3`: C2, C3, F7 and H2 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
 - `gitea`: the live Gitea provider job, unchanged.
 - `lint`, `musl`, `docker`, `cargo-deny`: unchanged.
 - Nightly: stress tests, benchmarks.
@@ -238,10 +238,25 @@ the server's provider token while the CLI holds none and the origin refuses
 anonymous reads. The queue and ref-store unit tests went with their code;
 their rules are in the ControlStore conformance suite.
 
+Step 3 PR B replaced the wire. A clone POSTs `/builds` once and polls
+`GET /commits/{sha}?kind=` for that commit; the same GET refreshes URLs. The
+old `/refs/{branch}` and `/sync` routes are gone. The suite's wire details
+live in one harness module, `harness::api`. B1-B3 count `POST /builds`
+admissions instead of 202 ref lookups; D2 rewrites commit reads; F2 expects
+exactly one commit read (no refresh) and F7 at least two; C5 reads B's
+outputs through the GET; A6 takes each code from the API (a missing upstream
+is now `404 repo_not_found`, exit 5, not exit 6). New rows: A5 (`--at HEAD~1`
+fails in the CLI before any request, and the API answers `400
+invalid_selector`), C1 (`RIPCLONE_BACKGROUND_SLOTS=0`: depth-1 clone works
+while the summary shows Full and Files pending), and C2 and C3 as S3 rows:
+the fault proxy in front of the emulator answers every `PUT` with 403, so
+Full and Files fail with the storage error while Head still clones; after a
+restart on the emulator directly, `sync --at` publishes only Full and Files.
+
 ## Open points
 
-- C1, C2, D4 and E1 depend on `background_slots`, which arrives in step 3. Until
-  then, the "now" tests run against today's main.
+- D4 and E1-E4 wait on step 4 (top-up with the user's git credentials and the
+  `--wait` rule).
 - Every "now" row has a contract test except H4, which waits on #181.
 - Behavior the deleted suites checked that no row covers yet, to add with the
   matching step: the artifact-by-hash route needs the token (I1);
@@ -252,5 +267,4 @@ their rules are in the ControlStore conformance suite.
   restart; config file discovery. The ControlStore conformance suite takes the
   queue rules from `queue/sql.rs`, the stale-owner and ready-is-immutable
   rules from `control.rs`, and lease reclaim from `e2e_sync_admission`.
-- Next: the step-3 rows (A5, C1, C2, D4, E1, I2) once `background_slots` and
-  the `--at` rule land, then the deletions listed above.
+- Next: the step-4 rows (D4, E1-E4), then the deletions listed above.
