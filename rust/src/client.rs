@@ -441,17 +441,16 @@ impl PinnedArtifactRefresh {
     }
 }
 
-fn ref_poll_config() -> (usize, std::time::Duration) {
+fn ref_poll_attempts() -> usize {
     const DEFAULT_ATTEMPTS: usize = 40;
     if std::env::var_os("RIPCLONE_TESTING").is_none() {
-        return (DEFAULT_ATTEMPTS, poll_interval());
+        return DEFAULT_ATTEMPTS;
     }
-    let attempts = std::env::var("RIPCLONE_TEST_REF_MAX_ATTEMPTS")
+    std::env::var("RIPCLONE_TEST_REF_MAX_ATTEMPTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_ATTEMPTS);
-    (attempts, poll_interval())
+        .unwrap_or(DEFAULT_ATTEMPTS)
 }
 
 fn managed_git_timeout() -> Duration {
@@ -579,15 +578,16 @@ fn fetch_retry_config() -> (u32, u64) {
     (attempts, backoff_ms)
 }
 
-/// Wait between polls while a build is pending (202/503 sync responses) or a
-/// ref is resolving. `RIPCLONE_POLL_MS` overrides the 2 s default; tests set it
-/// low so a pending build is seen quickly.
-fn poll_interval() -> std::time::Duration {
-    let ms = std::env::var("RIPCLONE_POLL_MS")
+/// Wait before poll `attempt` (0-based) while a build is pending (202/503
+/// sync responses) or a ref is resolving. Starts at 100 ms and doubles up to
+/// a 2 s cap, so a short build is seen at once and a long one is not polled
+/// hard. `RIPCLONE_POLL_MS` overrides the cap.
+fn poll_delay(attempt: usize) -> std::time::Duration {
+    let cap = std::env::var("RIPCLONE_POLL_MS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(2_000u64);
-    std::time::Duration::from_millis(ms)
+    std::time::Duration::from_millis((100u64 << attempt.min(5)).min(cap))
 }
 
 /// Exponential backoff with jitter for retry `attempt` (1-based), capped at 5 s.
@@ -1943,7 +1943,7 @@ impl Client {
         first_clone_id: &mut Option<String>,
         cold: &mut bool,
     ) -> Result<InstallPlan> {
-        let (max_attempts, poll_delay) = ref_poll_config();
+        let max_attempts = ref_poll_attempts();
         let detached_checkout_allowed = branch == "HEAD"
             && rev.is_some_and(|value| crate::validation::validate_object_id(value).is_ok());
         // Track whether any attempt polled a cold build (202/503) before
@@ -2102,7 +2102,7 @@ impl Client {
                     continue;
                 }
                 if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll_delay).await;
+                    tokio::time::sleep(poll_delay(attempt)).await;
                     continue;
                 }
                 let commit = pinned
@@ -2172,7 +2172,7 @@ impl Client {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
                 if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll_delay).await;
+                    tokio::time::sleep(poll_delay(attempt)).await;
                     continue;
                 }
                 if let Some(commit) = pinned.as_deref() {
@@ -2786,7 +2786,6 @@ impl Client {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(40);
-        let poll = poll_interval();
         for attempt in 0..max_attempts {
             let mut url = self.repo_url(repo_path, "/sync");
             let mut q: Vec<String> = Vec::new();
@@ -2821,7 +2820,7 @@ impl Client {
                 selected_rev = pending.commit;
                 selected_branch = (!pending.branch.is_empty()).then_some(pending.branch);
                 if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll).await;
+                    tokio::time::sleep(poll_delay(attempt)).await;
                     continue;
                 }
                 anyhow::bail!("sync still building after {max_attempts} attempts");
@@ -2840,7 +2839,7 @@ impl Client {
                 selected_rev = unavailable.commit;
                 selected_branch = (!unavailable.branch.is_empty()).then_some(unavailable.branch);
                 if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll).await;
+                    tokio::time::sleep(poll_delay(attempt)).await;
                     continue;
                 }
                 anyhow::bail!(
