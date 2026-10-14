@@ -6,13 +6,6 @@ use axum::response::IntoResponse;
 
 const MAX_REF_LEN: usize = 256;
 
-/// Validate an `owner` or `repo` path segment. GitHub identifiers are limited
-/// to ASCII alphanumeric plus `.`, `-`, and `_`, must not be empty, and must
-/// not contain path separators.
-pub fn validate_repo_id(id: &str) -> Result<()> {
-    validate_repo_id_inner(id)
-}
-
 fn validate_repo_id_inner(id: &str) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("repo identifier must not be empty");

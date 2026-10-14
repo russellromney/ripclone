@@ -235,7 +235,10 @@ Each step is a separate PR with green CI. No step mixes a cut with a redo.
 3. **Control plane.** Introduce the `builds` row model, the split API, one
    resolve function, leases, and capped sequencing. Delete `jobs`, `workers`,
    `meta/`, `queue/` adapters, and the hook suites that pinned them. No data
-   migration (there are no users).
+   migration (there are no users). The Head republish after Full compaction
+   is replaced here by an immutable scheme: Full(A) records a compacted Head
+   base that the next Head(B) builds its delta against, because cutting the
+   republish alone lets the Head delta grow without bound.
 4. **Client.** Resolver, download layer, install plan.
 5. **Module split and docs.** Split `server.rs`; make README, `CONFIG.md`, and
    `ARTIFACT_LIFECYCLE.md` match the code.

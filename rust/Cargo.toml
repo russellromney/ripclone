@@ -18,19 +18,8 @@ path = "src/bin/cli.rs"
 name = "ripclone-server"
 path = "src/bin/server.rs"
 
-[[bin]]
-name = "ripclone-proxy"
-path = "src/bin/ripclone-proxy.rs"
-required-features = ["dev-tools"]
-
-[[bin]]
-name = "writer_bench"
-path = "src/bin/writer_bench.rs"
-required-features = ["dev-tools"]
-
 [features]
 default = ["zlib-ng"]
-dev-tools = []
 # Use zlib-ng for faster pack compression/decompression. Disable this feature
 # (e.g. `cargo build --no-default-features`) on platforms where cmake is not
 # available.

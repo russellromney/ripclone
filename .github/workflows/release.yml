@@ -71,7 +71,7 @@ jobs:
           echo "$HOME/.zigbuild/bin" >> "$GITHUB_PATH"
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf cmake pkg-config libgit2 openssl@3
+        run: brew install protobuf cmake pkg-config
       # Linux: static musl via cargo-zigbuild (zig cc supplies the musl C
       # cross-toolchain for the vendored -sys crates). macOS: native.
       - name: Build binaries (Linux musl)
@@ -151,7 +151,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf cmake pkg-config libgit2 openssl@3
+        run: brew install protobuf cmake pkg-config
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -159,8 +159,8 @@ jobs:
           args: --release --out dist --manifest-path rust/Cargo.toml ${{ matrix.args }}
           manylinux: ${{ runner.os == 'Linux' && '2_28' || 'auto' }}
           before-script-linux: |
-            dnf install -y protobuf-compiler protobuf-devel cmake openssl-devel libgit2-devel || \
-            (apt-get update && apt-get install -y protobuf-compiler cmake libssl-dev libgit2-dev pkg-config)
+            dnf install -y protobuf-compiler cmake || \
+            (apt-get update && apt-get install -y protobuf-compiler cmake pkg-config)
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.platform }}

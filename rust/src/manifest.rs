@@ -1,13 +1,9 @@
-pub use crate::clonepack::{
-    ChunkRef, ClonepackManifest, FileEntry, Fragment, FrameInfo, MetadataChunk,
-};
+pub use crate::clonepack::{FileEntry, FrameInfo, MetadataChunk};
 
 use anyhow::{Context, Result};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-
-pub type Manifest = MetadataChunk;
 
 impl MetadataChunk {
     /// Create an empty metadata chunk.

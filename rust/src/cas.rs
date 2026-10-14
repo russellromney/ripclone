@@ -352,10 +352,6 @@ impl Cas {
         Ok(len)
     }
 
-    pub fn copy_to_writer_verified<W: Write>(&self, hash: &str, writer: &mut W) -> Result<u64> {
-        self.copy_to_writer_verified_with(hash, writer, |_| {})
-    }
-
     pub fn copy_to_writer_verified_with<W, F>(
         &self,
         hash: &str,

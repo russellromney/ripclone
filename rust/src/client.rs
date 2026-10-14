@@ -535,10 +535,6 @@ enum FetchFailure {
 }
 
 impl FetchFailure {
-    fn retryable(&self) -> bool {
-        matches!(self, FetchFailure::Retry(_))
-    }
-
     /// Surface the underlying failure to the caller. The streamed downloader
     /// handles `RefreshUrl` before conversion; buffered artifacts fail without
     /// an outer clone retry.
@@ -607,50 +603,6 @@ fn verify_fetched_artifact(
         )));
     }
     Ok(())
-}
-
-/// The retry rule: run `attempt_once` until it succeeds, fails permanently, or
-/// exhausts the bounded attempt budget, sleeping the existing jittered backoff
-/// between transient failures.
-async fn with_fetch_retry<T, F, Fut>(hash: &str, label: &str, mut attempt_once: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<T, FetchFailure>>,
-{
-    let (max_attempts, base_backoff_ms) = fetch_retry_config();
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match attempt_once().await {
-            Ok(value) => return Ok(value),
-            Err(failure) => {
-                if failure.retryable() && attempt < max_attempts {
-                    let backoff = fetch_backoff(base_backoff_ms, attempt);
-                    tracing::debug!(
-                        "artifact {hash} {label} attempt {attempt}/{max_attempts} failed; retrying in {backoff:?}"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                return Err(failure.into_error());
-            }
-        }
-    }
-}
-
-/// Download an artifact into memory. Used for artifacts small enough to hold
-/// whole: manifests, metadata, pack indexes, archive chunks, and HEAD packs.
-async fn fetch_artifact_bytes(
-    client: &reqwest::Client,
-    url: &str,
-    hash: &str,
-    expected_len: Option<u64>,
-    signed: bool,
-) -> Result<bytes::Bytes> {
-    with_fetch_retry(hash, "fetch", || {
-        fetch_artifact_bytes_once(client, url, hash, expected_len, signed)
-    })
-    .await
 }
 
 async fn fetch_artifact_bytes_once(
@@ -1528,11 +1480,6 @@ impl Client {
         self
     }
 
-    pub fn with_upstream_token(mut self, token: impl Into<String>) -> Self {
-        self.upstream_token = Some(token.into());
-        self
-    }
-
     pub fn with_upstream_token_opt(mut self, token: Option<String>) -> Self {
         self.upstream_token = token;
         self
@@ -2060,24 +2007,6 @@ impl Client {
         })
     }
 
-    /// Fetch any content-addressed artifact (pack, idx, index, archive, manifest).
-    ///
-    /// Caches the bytes locally when `RIPCLONE_CACHE_DIR` is set, so repeat
-    /// clones of the same repo/commit bypass the network entirely.
-    pub async fn fetch_artifact(&self, hash: &str) -> Result<bytes::Bytes> {
-        self.fetch_artifact_with_url(hash, None).await
-    }
-
-    /// Fetch an artifact, optionally using a pre-signed URL directly. Falls back
-    /// to `/v1/artifacts/{hash}` when `signed_url` is `None`.
-    pub async fn fetch_artifact_with_url(
-        &self,
-        hash: &str,
-        signed_url: Option<&str>,
-    ) -> Result<bytes::Bytes> {
-        self.fetch_verified_artifact(hash, signed_url, None).await
-    }
-
     /// The credential rule: a presigned URL is self-authenticating, so it is
     /// fetched with the no-auth client and never carries the ripclone token to
     /// object storage. Without a signed URL the by-hash gateway fetch against
@@ -2092,42 +2021,6 @@ impl Client {
             Some(url) => (&self.raw_http, url, true),
             None => (&self.http, gateway_url, false),
         }
-    }
-
-    /// Buffered artifact download through the shared rules, with the local
-    /// complete-object cache in front of it. `expected_len` is the length the
-    /// manifest promised, when the caller knows one.
-    ///
-    /// On a failed signed URL we do NOT fall back to a by-hash gateway fetch —
-    /// the cloud no longer serves content by hash. Operation installs use the
-    /// refresh-aware sibling below; standalone callers fail in place. A
-    /// missing, short, or corrupt object always fails without restarting the
-    /// clone.
-    async fn fetch_verified_artifact(
-        &self,
-        hash: &str,
-        signed_url: Option<&str>,
-        expected_len: Option<u64>,
-    ) -> Result<bytes::Bytes> {
-        let gateway_url = format!("{}/v1/artifacts/{}", self.server, hash);
-
-        if let Some(cache) = &self.cache
-            && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
-            && let Ok(data) = cache.get(&key)
-        {
-            return Ok(data.into());
-        }
-
-        let (client, url, signed) = self.artifact_endpoint(signed_url, &gateway_url);
-        let data = fetch_artifact_bytes(client, url, hash, expected_len, signed).await?;
-
-        if let Some(cache) = &self.cache
-            && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
-        {
-            let _ = cache.put_with_hash(&key, &data);
-        }
-
-        Ok(data)
     }
 
     /// Fetch one buffered artifact for an already-pinned install. Transport
@@ -2183,41 +2076,11 @@ impl Client {
         unreachable!("positive fetch attempt count")
     }
 
-    async fn fetch_validated_manifest(
-        &self,
-        hash: &str,
-        signed_url: Option<&str>,
-        pinned: &str,
-    ) -> Result<ClonepackManifest> {
-        // The CAS is keyed by the verified content hash, so immutable bytes may
-        // be retained even when their embedded commit is wrong for this
-        // operation. Identity remains a per-use check: every cached or fetched
-        // manifest is decoded and compared with the operation pin here before
-        // any installation work starts.
-        let data = self.fetch_artifact_with_url(hash, signed_url).await?;
-        let manifest =
-            ClonepackManifest::decode(data.as_ref()).context("decode clonepack manifest")?;
-        validate_manifest_commit(&manifest, pinned)?;
-        Ok(manifest)
-    }
-
-    /// Fetch an artifact referenced by a `ChunkRef`, optionally using a signed URL.
-    pub async fn fetch_chunk_ref(
-        &self,
-        chunk: &crate::clonepack::ChunkRef,
-        signed_url: Option<&str>,
-    ) -> Result<bytes::Bytes> {
-        let hash = hash_to_hex(&chunk.hash);
-        self.fetch_verified_artifact(&hash, signed_url, Some(chunk.len))
-            .await
-    }
-
     /// Stream an artifact referenced by a `ChunkRef` to a temporary file in
-    /// `dir`, verifying it as it streams. Same rules as [`Self::fetch_chunk_ref`];
-    /// only the output differs, so a large pack never lands in memory. The
-    /// complete-object cache is deliberately not used here: caching a large
-    /// streamed pack would add the second full-file copy this path exists to
-    /// avoid.
+    /// `dir`, verifying it as it streams, so a large pack never lands in
+    /// memory. The complete-object cache is deliberately not used here: caching
+    /// a large streamed pack would add the second full-file copy this path
+    /// exists to avoid.
     async fn fetch_chunk_ref_to_temp(
         &self,
         chunk: &crate::clonepack::ChunkRef,
@@ -2227,73 +2090,6 @@ impl Client {
     ) -> Result<(tempfile::NamedTempFile, u64)> {
         let hash = hash_to_hex(&chunk.hash);
         fetch_artifact_to_temp(self, &hash, chunk.len, dir, refresh, pack_index).await
-    }
-
-    /// Fetch many chunk refs in parallel, preserving order.
-    ///
-    /// `signed_urls` is indexed by chunk position; `None` entries fall back to
-    /// the gateway. Concurrency defaults to 6 but can be overridden with
-    /// the fixed fetch concurrency.
-    pub async fn fetch_chunk_refs(
-        &self,
-        chunks: &[crate::clonepack::ChunkRef],
-        signed_urls: Option<&[Option<String>]>,
-    ) -> Result<Vec<bytes::Bytes>> {
-        use futures::TryStreamExt;
-        use futures::stream::{self, StreamExt};
-        if chunks.is_empty() {
-            return Ok(Vec::new());
-        }
-        let concurrency = ClientTuning::load().fetch_concurrency;
-        let jobs: Vec<(usize, crate::clonepack::ChunkRef, Option<String>)> = chunks
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, chunk)| {
-                let signed_url = signed_urls
-                    .and_then(|urls| urls.get(i))
-                    .and_then(|o| o.clone());
-                (i, chunk, signed_url)
-            })
-            .collect();
-        let mut results: Vec<(usize, bytes::Bytes)> = stream::iter(jobs)
-            .map(|(i, chunk, signed_url)| async move {
-                let data = self.fetch_chunk_ref(&chunk, signed_url.as_deref()).await?;
-                Ok::<_, anyhow::Error>((i, data))
-            })
-            .buffer_unordered(concurrency)
-            .try_collect()
-            .await?;
-        results.sort_by_key(|(i, _)| *i);
-        Ok(results.into_iter().map(|(_, d)| d).collect())
-    }
-
-    /// Fetch the top-level clonepack manifest and the metadata chunk it points to.
-    /// Uses signed URLs from the ref response when available.
-    pub async fn fetch_clonepack(
-        &self,
-        info: &RefResponse,
-    ) -> Result<(ClonepackManifest, Arc<MetadataChunk>)> {
-        if info.clonepack_manifest.is_empty() {
-            anyhow::bail!("ref is missing clonepack manifest; run sync first");
-        }
-        let clonepack = self
-            .fetch_validated_manifest(
-                &info.clonepack_manifest,
-                info.clonepack_manifest_url.as_deref(),
-                &info.commit,
-            )
-            .await?;
-        let metadata_ref = clonepack
-            .metadata_chunk
-            .as_ref()
-            .context("clonepack manifest missing metadata chunk")?;
-        let metadata_hash = hash_to_hex(&metadata_ref.hash);
-        let metadata_data = self
-            .fetch_artifact_with_url(&metadata_hash, info.metadata_chunk_url.as_deref())
-            .await?;
-        let metadata = MetadataChunk::decode_and_validate(metadata_data.as_ref())?;
-        Ok((clonepack, Arc::new(metadata)))
     }
 
     pub async fn sync_repo(&self, repo_path: &str, depth: Option<usize>) -> Result<RefResponse> {
@@ -2360,13 +2156,6 @@ impl Client {
         } else {
             self.sync_repo(repo_path, depth).await
         }
-    }
-
-    /// Resolve a specific branch once instead of using the repo's default, then
-    /// admit its exact commit. Checkout names are request-local: two names that
-    /// resolve to the same commit share one durable result and job.
-    pub async fn sync_branch(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
-        self.sync_inner(repo_path, Some(branch), None).await
     }
 
     async fn admit_sync_request(
@@ -2466,19 +2255,6 @@ impl Client {
             InstallPlan::Exact { response, .. } => Ok(response),
             InstallPlan::TopUp { .. } => unreachable!("sync readiness does not top up"),
         }
-    }
-
-    async fn sync_inner(
-        &self,
-        repo_path: &str,
-        branch: Option<&str>,
-        depth: Option<usize>,
-    ) -> Result<RefResponse> {
-        let admission = self.admit_sync_request(repo_path, branch, depth).await?;
-        if let Some(ready) = admission.ready {
-            return Ok(ready);
-        }
-        self.wait_for_admitted_sync(repo_path, &admission).await
     }
 
     async fn sync_at_revision(

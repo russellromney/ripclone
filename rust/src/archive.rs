@@ -522,28 +522,6 @@ impl ArchiveBuilder {
         Ok(manifest)
     }
 
-    /// Build the archive chunks and store them in `cas`.
-    ///
-    /// The returned metadata chunk contains only the frame/file tables; the
-    /// caller is expected to add the .git artifacts and store the final metadata
-    /// chunk itself.
-    ///
-    /// Returns `(archive_chunk_hashes, metadata_chunk)`.
-    pub fn build_into_cas(
-        &self,
-        commit: &str,
-        cas: &Cas,
-        level: i32,
-    ) -> Result<(Vec<String>, MetadataChunk)> {
-        let (metadata, chunks, _stats) =
-            self.build_chunks(commit, level, DEFAULT_ARCHIVE_CHUNK_SIZE)?;
-        let mut archive_chunk_hashes = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            archive_chunk_hashes.push(cas.put(&chunk)?);
-        }
-        Ok((archive_chunk_hashes, metadata))
-    }
-
     /// Build the archive with per-frame incremental reuse: one content-addressed
     /// compressed chunk per CDC frame. A frame whose raw bytes are unchanged
     /// (found in `prev` by raw-bytes hash) reuses the prior compressed chunk —

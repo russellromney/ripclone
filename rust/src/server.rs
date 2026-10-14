@@ -4491,16 +4491,6 @@ impl RefStore for ClaimScopedRefStore {
     }
 }
 
-/// Run one durable exact-commit job to completion.
-pub async fn process_build_job(
-    state: &ServerState,
-    job: &BuildJob,
-    job_id: crate::queue::JobId,
-    worker_id: &str,
-) -> Result<SyncBuildResult, BuildError> {
-    process_build_job_with_foreground_release(state, job, job_id, worker_id, None).await
-}
-
 async fn process_build_job_with_foreground_release(
     state: &ServerState,
     job: &BuildJob,
@@ -5416,7 +5406,7 @@ mod tests {
             build_queue,
             control_db: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
-            webhook_config: Arc::new(WebhookConfig::empty()),
+            webhook_config: Arc::new(WebhookConfig::default()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -5900,7 +5890,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let provider = ProviderRegistry::new().default_provider().clone();
+        let provider = ProviderRegistry::new().get("github").unwrap().clone();
         let repo_id = RepoId::github("o/r");
         let resp = ref_response(
             &repo_id,
@@ -5980,7 +5970,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let provider = ProviderRegistry::new().default_provider().clone();
+        let provider = ProviderRegistry::new().get("github").unwrap().clone();
         let repo_id = RepoId::github("o/r");
         let signed = |ttl: u64, hash: &str| Some(format!("signed:{ttl}:{hash}"));
 

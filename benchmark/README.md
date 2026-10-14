@@ -55,8 +55,7 @@ The Rust shaping proxy and writer micro-benchmark are developer tools, not
 installed release programs. Build them explicitly:
 
 ```bash
-cargo build --release --features dev-tools \
-  --bin ripclone-proxy --bin writer_bench
+cargo build --release --example ripclone-proxy --example writer_bench
 ```
 
 ## Common variables

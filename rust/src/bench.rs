@@ -28,19 +28,6 @@ impl BenchmarkReport {
     pub fn total_bytes(&self) -> u64 {
         self.metadata_bytes + self.archive_bytes
     }
-
-    pub fn throughput_mbps(&self, bytes: u64, ms: u64) -> f64 {
-        if ms == 0 || bytes == 0 {
-            0.0
-        } else {
-            // bytes * 8 / ms / 1000 -> Mbps
-            (bytes as f64 * 8.0) / (ms as f64) / 1000.0
-        }
-    }
-
-    pub fn archive_throughput_mbps(&self) -> f64 {
-        self.throughput_mbps(self.archive_bytes, self.archive_download_ms)
-    }
 }
 
 pub struct Benchmark {

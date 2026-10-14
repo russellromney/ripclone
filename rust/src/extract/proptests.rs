@@ -10,8 +10,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::clonepack::ClonepackManifest;
+use crate::clonepack::Fragment;
 use crate::extract::{ExtractStats, extract_archive_with_chunk_fetcher};
-use crate::manifest::{FileEntry, Fragment, FrameInfo, MetadataChunk};
+use crate::manifest::{FileEntry, FrameInfo, MetadataChunk};
 use proptest::prelude::*;
 use prost::Message;
 use sha1::{Digest, Sha1};

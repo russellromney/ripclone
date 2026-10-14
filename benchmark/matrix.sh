@@ -28,11 +28,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 RIPCLONE="$ROOT_DIR/rust/target/release/ripclone"
 SERVER="$ROOT_DIR/rust/target/release/ripclone-server"
-PROXY="$ROOT_DIR/rust/target/release/ripclone-proxy"
+PROXY="$ROOT_DIR/rust/target/release/examples/ripclone-proxy"
 
 for bin in "$RIPCLONE" "$SERVER" "$PROXY"; do
   if [ ! -x "$bin" ]; then
-    echo "error: missing binary $bin (run cargo build --release in rust/)"
+    echo "error: missing binary $bin (run cargo build --release --bins --example ripclone-proxy in rust/)"
     exit 1
   fi
 done

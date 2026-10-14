@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 RIPCLONE="$ROOT_DIR/rust/target/release/ripclone"
 SERVER="$ROOT_DIR/rust/target/release/ripclone-server"
-PROXY="$ROOT_DIR/rust/target/release/ripclone-proxy"
+PROXY="$ROOT_DIR/rust/target/release/examples/ripclone-proxy"
 
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
 

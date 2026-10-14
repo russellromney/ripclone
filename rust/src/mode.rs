@@ -33,20 +33,10 @@ impl CloneMode {
         matches!(self, CloneMode::Files)
     }
 
-    pub fn needs_worktree(self) -> bool {
-        matches!(self, CloneMode::Editable | CloneMode::Files)
-    }
-
     /// True for modes that materialize the working tree by reading blobs out of
     /// the installed depth pack (the single-download editable path).
     pub fn needs_pack_worktree(self) -> bool {
         matches!(self, CloneMode::Editable)
-    }
-
-    pub fn needs_checkout(self) -> bool {
-        // The working tree is always materialized directly (from the pack or the
-        // files artifact); no separate git checkout-index step is required.
-        false
     }
 }
 

@@ -16,10 +16,6 @@ use serde::{Deserialize, Serialize};
 /// Default zstd compression level used for archive frames (matches the level the
 /// build used before this config existed).
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 6;
-/// Name of the built-in depth-1 variant.
-pub const SHALLOW_VARIANT: &str = "shallow";
-/// Name of the built-in unlimited-history variant.
-pub const FULL_VARIANT: &str = "full";
 /// One named clonepack depth. `depth: None` means unlimited (full history);
 /// `depth: Some(n)` bounds it to the last `n` commits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,39 +46,6 @@ pub struct RepoConfig {
 }
 
 impl RepoConfig {
-    /// The depth variants to build: the configured set, or the built-in
-    /// `shallow` + `full` when none are configured.
-    pub fn effective_depths(&self) -> Vec<DepthSpec> {
-        if self.clonepack_depths.is_empty() {
-            vec![
-                DepthSpec {
-                    name: SHALLOW_VARIANT.to_string(),
-                    depth: Some(1),
-                },
-                DepthSpec {
-                    name: FULL_VARIANT.to_string(),
-                    depth: None,
-                },
-            ]
-        } else {
-            self.clonepack_depths.clone()
-        }
-    }
-
-    /// The single finite-depth ("shallow"-slot) variant, if configured.
-    pub fn shallow_variant(&self) -> Option<DepthSpec> {
-        self.effective_depths()
-            .into_iter()
-            .find(|d| d.depth.is_some())
-    }
-
-    /// The unlimited-depth ("full"-slot) variant, if configured.
-    pub fn full_variant(&self) -> Option<DepthSpec> {
-        self.effective_depths()
-            .into_iter()
-            .find(|d| d.depth.is_none())
-    }
-
     /// zstd level to compress archive frames with.
     pub fn compression_level(&self) -> i32 {
         self.compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL)
@@ -138,24 +101,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_reproduces_shallow_and_full() {
+    fn default_config_uses_default_compression_and_validates() {
         let cfg = RepoConfig::default();
-        let depths = cfg.effective_depths();
-        assert_eq!(depths.len(), 2);
-        assert_eq!(
-            cfg.shallow_variant().unwrap(),
-            DepthSpec {
-                name: "shallow".into(),
-                depth: Some(1)
-            }
-        );
-        assert_eq!(
-            cfg.full_variant().unwrap(),
-            DepthSpec {
-                name: "full".into(),
-                depth: None
-            }
-        );
         assert_eq!(cfg.compression_level(), DEFAULT_COMPRESSION_LEVEL);
         cfg.validate().unwrap();
     }
