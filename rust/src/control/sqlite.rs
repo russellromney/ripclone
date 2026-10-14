@@ -745,6 +745,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_config_with_a_removed_key_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("control.db")).await.unwrap();
+        let repo = RepoId::github("acme/old");
+        sqlx::query("INSERT INTO repo_config (repo, data) VALUES ($1, $2)")
+            .bind(repo.storage_key())
+            .bind(r#"{"compression_level":9,"head_blobs_chunk_size":4194304}"#)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let config = store.get_config(&repo).await.unwrap().unwrap();
+        assert_eq!(config.compression_level(), 9);
+    }
+
+    #[tokio::test]
     async fn second_owner_is_rejected_while_first_is_alive() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control.db");
