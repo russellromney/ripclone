@@ -61,8 +61,8 @@ pub struct ProviderEntry {
     pub auth_header_name: Option<String>,
 }
 
-/// Server-side artifact storage. These are read only by `ripclone-server` /
-/// `ripclone-worker`; the matching `RIPCLONE_S3_*` env vars always override them.
+/// Server-side artifact storage. These are read only by `ripclone-server`; the
+/// matching `RIPCLONE_S3_*` env vars always override them.
 /// Credentials (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) are read from the
 /// environment only — never from this file.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -77,17 +77,11 @@ pub struct StorageConfig {
     pub prefix: Option<String>,
 }
 
-/// Server-owned SQLite control database. A Turso URL and token together enable
-/// the embedded-replica mode; otherwise `path` is plain local SQLite.
+/// Server-owned SQLite control database at `path`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ControlConfig {
     pub path: Option<String>,
-    pub turso_url: Option<String>,
-    pub turso_token: Option<String>,
-    /// Ordered worker size classes. Empty uses `small | large`; the
-    /// `RIPCLONE_SIZE_CLASSES` environment override remains supported.
-    pub size_classes: Vec<crate::queue::SizeClass>,
 }
 
 /// Path to the global config file (`~/.config/ripclone/config.toml`).
@@ -246,13 +240,6 @@ fn merge(overrides: Config, base: Config) -> Config {
         },
         control: ControlConfig {
             path: overrides.control.path.or(base.control.path),
-            turso_url: overrides.control.turso_url.or(base.control.turso_url),
-            turso_token: overrides.control.turso_token.or(base.control.turso_token),
-            size_classes: if overrides.control.size_classes.is_empty() {
-                base.control.size_classes
-            } else {
-                overrides.control.size_classes
-            },
         },
         removed_metadata: overrides.removed_metadata.or(base.removed_metadata),
         removed_queue: overrides.removed_queue.or(base.removed_queue),
@@ -310,45 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn size_classes_parse_from_toml_array() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[control]
-path = "/tmp/control.db"
-
-[[control.size_classes]]
-name = "small"
-max_bytes = 1000
-machine = "s"
-
-[[control.size_classes]]
-name = "medium"
-max_bytes = 5000
-machine = "m"
-
-[[control.size_classes]]
-name = "large"
-max_bytes = 18446744073709551615
-machine = "l"
-"#,
-        )
-        .unwrap();
-        let cfg = try_load_from(&path).unwrap();
-        assert_eq!(cfg.control.size_classes.len(), 3);
-        assert_eq!(cfg.control.size_classes[0].name, "small");
-        assert_eq!(cfg.control.size_classes[0].max_bytes, 1000);
-        assert_eq!(cfg.control.size_classes[1].name, "medium");
-        assert_eq!(cfg.control.size_classes[2].name, "large");
-        assert_eq!(cfg.control.size_classes[2].max_bytes, u64::MAX);
-        crate::queue::size_class::validate_size_classes(&cfg.control.size_classes).unwrap();
-        let loaded = crate::queue::load_size_classes(&cfg.control.size_classes).unwrap();
-        assert_eq!(loaded.len(), 3);
-    }
-
-    #[test]
     fn round_trip_toml_provider_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -379,7 +327,6 @@ machine = "l"
             },
             control: ControlConfig {
                 path: Some("/var/lib/ripclone/control.db".into()),
-                ..Default::default()
             },
             removed_metadata: None,
             removed_queue: None,

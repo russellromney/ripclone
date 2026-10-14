@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXPECTED=$'ripclone\nripclone-server\nripclone-worker'
+EXPECTED=$'ripclone\nripclone-server'
 
 actual="$({
   cd "$ROOT/rust"
@@ -47,4 +47,4 @@ check_surface() {
 check_surface archive "$archive"
 check_surface installer "$installer"
 
-echo "release surface: ripclone, ripclone-server, ripclone-worker"
+echo "release surface: ripclone, ripclone-server"

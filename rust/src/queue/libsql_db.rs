@@ -1,9 +1,8 @@
-//! Durable queue storage over the server's Turso embedded-replica handle.
+//! Durable queue storage over the server's control database handle.
 
 use super::sql::{
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
-    SUPERSEDED_BY_NEWER_QUEUED, now_secs,
+    CREATE_TABLE_SQL, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use libsql::{Connection, Database};
@@ -35,13 +34,12 @@ impl LibsqlDb {
         Ok(conn)
     }
 
-    /// Create the `jobs` and `workers` tables and indexes. Active-key
+    /// Create the `jobs` table and indexes. Active-key
     /// uniqueness is required; initialization fails closed if the backend cannot
     /// enforce it.
     pub(crate) async fn init(&self) -> Result<()> {
         let conn = self.conn().await?;
-        // WAL keeps readers from blocking the writer on a local file (no-op on
-        // remote, where the server manages concurrency).
+        // WAL keeps readers from blocking the writer.
         let _ = conn.execute("PRAGMA journal_mode = WAL", ()).await;
         conn.execute(CREATE_TABLE_SQL, ())
             .await
@@ -55,13 +53,6 @@ impl LibsqlDb {
         conn.execute(CREATE_HISTORY_INDEX_SQL, ())
             .await
             .context("create history index")?;
-        // Durable worker heartbeat registry.
-        conn.execute(CREATE_WORKERS_TABLE_SQL, ())
-            .await
-            .context("create workers table")?;
-        conn.execute(CREATE_WORKERS_HEARTBEAT_INDEX_SQL, ())
-            .await
-            .context("create workers heartbeat index")?;
         Ok(())
     }
 
@@ -99,7 +90,6 @@ impl LibsqlDb {
 
     /// Insert a new queued job and return its id. Errors if a unique constraint
     /// rejects a duplicate active key (the caller treats that as coalesced).
-    /// `size_class` is the 0-based rank from the ordered size-class config.
     pub(crate) async fn insert_job(
         &self,
         key: &str,
@@ -108,7 +98,6 @@ impl LibsqlDb {
         admitted_commit: &str,
         repo_config: &str,
         credential: Option<&str>,
-        size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
         let conn = self.conn().await?;
@@ -117,8 +106,8 @@ impl LibsqlDb {
             None => libsql::Value::Null,
         };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, admitted_commit, repo_config, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+            "INSERT INTO jobs (key, provider, path, admitted_commit, repo_config, status, credential, created_at)
+             VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)",
             libsql::params![
                 key,
                 provider,
@@ -126,7 +115,6 @@ impl LibsqlDb {
                 admitted_commit,
                 repo_config,
                 cred_val,
-                size_class,
                 created_at
             ],
         )
@@ -135,28 +123,11 @@ impl LibsqlDb {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Raise a *queued* job's size_class to at least `rank` (no-op if already
-    /// higher). Used when a later enqueue coalesces onto an active job so a
-    /// bigger repo can't stay classified as small.
-    pub(crate) async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()> {
-        let conn = self.conn().await?;
-        conn.execute(
-            "UPDATE jobs SET size_class = MAX(size_class, ?)
-             WHERE id = ? AND status = 'queued'",
-            libsql::params![rank, id],
-        )
-        .await
-        .context("raise size_class")?;
-        Ok(())
-    }
-
     /// Resolve `claimed` jobs whose `claimed_at <= cutoff` (a crashed or
     /// timed-out worker). A job that has already been claimed `max_attempts` or
     /// more times is dead-lettered to terminal `failed` (with `dead_letter_error`
     /// and `now` as its finished time) so a hard-killed build can't crash-loop;
-    /// anything under the cap is returned to `queued` for another attempt, with
-    /// `size_class` bumped one rung so a larger worker can claim it next.
-    /// Dead-letter does not bump.
+    /// anything under the cap is returned to `queued` for another attempt.
     pub(crate) async fn reclaim_stale(
         &self,
         cutoff: i64,
@@ -192,10 +163,9 @@ impl LibsqlDb {
         )
         .await
         .context("supersede stale jobs with a newer queued sibling")?;
-        // Under-cap with no sibling: requeue and bump size_class.
+        // Under-cap with no sibling: requeue.
         conn.execute(
-            "UPDATE jobs SET status = 'queued', worker_id = NULL,
-                 size_class = size_class + 1
+            "UPDATE jobs SET status = 'queued', worker_id = NULL
              WHERE status = 'claimed' AND claimed_at <= ? AND attempts < ?",
             libsql::params![cutoff, max_attempts],
         )
@@ -204,44 +174,16 @@ impl LibsqlDb {
         Ok(())
     }
 
-    /// Test-only: reads `size_class` directly, for white-box assertions
-    /// against internal queue state that `SqlJobQueue`'s public API doesn't
-    /// expose.
-    #[cfg(test)]
-    pub(crate) async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
+    /// Id of the oldest queued job.
+    pub(crate) async fn next_queued_id(&self) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = conn
-            .query("SELECT size_class FROM jobs WHERE id = ?", [id])
+            .query(
+                "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
+                (),
+            )
             .await
-            .context("fetch job size_class")?;
-        match rows.next().await? {
-            Some(row) => Ok(Some(row.get::<i64>(0)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Id of the oldest queued job eligible for this worker. When
-    /// `max_size_class` is `Some(rank)`, only jobs with `size_class <= rank`
-    /// are considered (claim filter). `None` means no ceiling: claim anything.
-    pub(crate) async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>> {
-        let conn = self.conn().await?;
-        let mut rows = match max_size_class {
-            None => conn
-                .query(
-                    "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
-                    (),
-                )
-                .await
-                .context("select next queued")?,
-            Some(ceiling) => conn
-                .query(
-                    "SELECT id FROM jobs WHERE status = 'queued' AND size_class <= ?
-                     ORDER BY created_at, id LIMIT 1",
-                    libsql::params![ceiling],
-                )
-                .await
-                .context("select next queued under size-class ceiling")?,
-        };
+            .context("select next queued")?;
         match rows.next().await? {
             Some(row) => Ok(Some(row.get::<i64>(0)?)),
             None => Ok(None),
@@ -414,143 +356,5 @@ impl LibsqlDb {
             Some(row) => Ok(row.get::<i64>(0)?),
             None => Ok(0),
         }
-    }
-
-    /// Count of `queued` jobs grouped by `size_class` rank.
-    ///
-    /// Returns `(rank, count)` pairs for ranks that have at least one pending
-    /// job, ordered by rank ascending.
-    pub(crate) async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>> {
-        let conn = self.conn().await?;
-        let mut rows = conn
-            .query(
-                "SELECT size_class, count(*) FROM jobs
-                 WHERE status = 'queued'
-                 GROUP BY size_class
-                 ORDER BY size_class",
-                (),
-            )
-            .await
-            .context("count queued by size_class")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let rank = row.get::<i64>(0)?;
-            let count = row.get::<i64>(1)?;
-            if count > 0 {
-                out.push((rank, count));
-            }
-        }
-        Ok(out)
-    }
-
-    /// Delete `failed` jobs finished before `cutoff` (epoch secs). Returns the
-    /// number removed. `done` jobs are intentionally kept (they are the build /
-    /// version-live-at-time-T history and stay small at real commit rates).
-    pub(crate) async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
-        self.conn()
-            .await?
-            .execute(
-                "DELETE FROM jobs WHERE status = 'failed' AND finished_at < ?",
-                libsql::params![cutoff],
-            )
-            .await
-            .context("prune failed jobs")
-    }
-
-    /// Upsert a worker heartbeat row.
-    pub(crate) async fn upsert_heartbeat(
-        &self,
-        worker_id: &str,
-        max_size_class: Option<i64>,
-        current_job: Option<i64>,
-        now: i64,
-    ) -> Result<()> {
-        let max_sc = match max_size_class {
-            Some(n) => libsql::Value::Integer(n),
-            None => libsql::Value::Null,
-        };
-        let cur = match current_job {
-            Some(n) => libsql::Value::Integer(n),
-            None => libsql::Value::Null,
-        };
-        self.conn()
-            .await?
-            .execute(
-                "INSERT INTO workers (worker_id, max_size_class, current_job, last_heartbeat)
-                 VALUES (?, ?, ?, ?)
-                 ON CONFLICT(worker_id) DO UPDATE SET
-                     max_size_class = excluded.max_size_class,
-                     current_job = excluded.current_job,
-                     last_heartbeat = excluded.last_heartbeat",
-                libsql::params![worker_id, max_sc, cur, now],
-            )
-            .await
-            .context("upsert worker heartbeat")?;
-        Ok(())
-    }
-
-    /// Remove a worker registry row when an embedded slot exits an active job.
-    pub(crate) async fn delete_worker(&self, worker_id: &str) -> Result<u64> {
-        self.conn()
-            .await?
-            .execute(
-                "DELETE FROM workers WHERE worker_id = ?",
-                libsql::params![worker_id],
-            )
-            .await
-            .context("delete worker heartbeat")
-    }
-
-    /// Count workers with `last_heartbeat >= cutoff`.
-    pub(crate) async fn count_live_workers(&self, cutoff: i64) -> Result<i64> {
-        let conn = self.conn().await?;
-        let mut rows = conn
-            .query(
-                "SELECT count(*) FROM workers WHERE last_heartbeat >= ?",
-                [cutoff],
-            )
-            .await
-            .context("count live workers")?;
-        match rows.next().await? {
-            Some(row) => Ok(row.get::<i64>(0)?),
-            None => Ok(0),
-        }
-    }
-
-    /// Count live workers that can claim jobs of rank `min_rank` (inclusive).
-    ///
-    /// A worker counts when its heartbeat is fresh and either it has no claim
-    /// ceiling (`max_size_class IS NULL`) or `max_size_class >= min_rank`.
-    pub(crate) async fn count_live_workers_capable(
-        &self,
-        cutoff: i64,
-        min_rank: i64,
-    ) -> Result<i64> {
-        let conn = self.conn().await?;
-        let mut rows = conn
-            .query(
-                "SELECT count(*) FROM workers
-                 WHERE last_heartbeat >= ?
-                   AND (max_size_class IS NULL OR max_size_class >= ?)",
-                libsql::params![cutoff, min_rank],
-            )
-            .await
-            .context("count live workers capable of rank")?;
-        match rows.next().await? {
-            Some(row) => Ok(row.get::<i64>(0)?),
-            None => Ok(0),
-        }
-    }
-
-    /// Delete workers with `last_heartbeat < cutoff` (hard age-out).
-    pub(crate) async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64> {
-        self.conn()
-            .await?
-            .execute(
-                "DELETE FROM workers WHERE last_heartbeat < ?",
-                libsql::params![cutoff],
-            )
-            .await
-            .context("prune stale workers")
     }
 }

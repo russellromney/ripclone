@@ -77,11 +77,11 @@ jobs:
       - name: Build binaries (Linux musl)
         if: runner.os == 'Linux'
         working-directory: rust
-        run: cargo zigbuild --release --locked --target ${{ matrix.target }} --bin ripclone --bin ripclone-server --bin ripclone-worker
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }} --bin ripclone --bin ripclone-server
       - name: Build binaries (macOS)
         if: runner.os == 'macOS'
         working-directory: rust
-        run: cargo build --release --locked --bin ripclone --bin ripclone-server --bin ripclone-worker
+        run: cargo build --release --locked --bin ripclone --bin ripclone-server
       - name: Package
         run: |
           if [ -n "${{ matrix.target }}" ]; then
@@ -91,7 +91,7 @@ jobs:
           fi
           dir="ripclone-${{ matrix.platform }}"
           mkdir -p "$dir"
-          cp "$bindir/ripclone" "$bindir/ripclone-server" "$bindir/ripclone-worker" "$dir/"
+          cp "$bindir/ripclone" "$bindir/ripclone-server" "$dir/"
           cp LICENSE-MIT LICENSE-APACHE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"

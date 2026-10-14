@@ -1,8 +1,8 @@
 //! Artifact storage and build-local paths.
 //!
-//! Control state is supplied by the server-owned SQLite database, or by the
-//! authenticated ref API in a standalone worker. Artifact bytes remain local
-//! or S3-compatible and are deliberately independent of control state.
+//! Control state is supplied by the server-owned SQLite database. Artifact
+//! bytes remain local or S3-compatible and are deliberately independent of
+//! control state.
 
 use crate::cas::Cas;
 use crate::config::Config;
@@ -11,7 +11,7 @@ use crate::ref_store::RefStore;
 use crate::retention::LocalCacheRetention;
 use crate::storage::{S3Storage, StorageRef, local};
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
@@ -25,7 +25,6 @@ pub struct Backends {
     pub storage: StorageRef,
     pub ref_store: Arc<dyn RefStore>,
     pub cache_retention: LocalCacheRetention,
-    pub repo_root: PathBuf,
 }
 
 impl Backends {
@@ -36,7 +35,6 @@ impl Backends {
 
     pub async fn from_env_with_ref_store(
         cas_dir: &Path,
-        repo_root: &Path,
         metrics: &Arc<Metrics>,
         ref_store: Arc<dyn RefStore>,
     ) -> Result<Self> {
@@ -60,7 +58,6 @@ impl Backends {
             storage,
             ref_store,
             cache_retention,
-            repo_root: repo_root.to_path_buf(),
         })
     }
 }

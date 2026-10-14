@@ -59,12 +59,7 @@ pub struct ServerState {
     pub rate_limiter: RateLimiter,
     pub build_queue: JobQueueRef,
     /// Holds the server's process-ownership lock and concrete control driver.
-    /// Standalone API workers never construct this value.
     pub control_db: Option<Arc<crate::control::ControlDb>>,
-    /// Backs worker-facing `/v1/jobs/*` endpoints so a token-only standalone
-    /// worker never touches the database. `None` only in a worker's non-serving
-    /// `ServerState`.
-    pub worker_queue: Option<Arc<crate::queue::SqlJobQueue>>,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     /// Webhook receiver config: per-provider HMAC secret + optional repo
     /// allowlist. A provider with no configured secret returns 503. Reads
@@ -85,48 +80,6 @@ pub struct ServerState {
     /// self-host that fully trusts whoever holds the shared server token (the old
     /// behavior); then visibility falls back to the client-supplied header.
     pub require_repo_auth: bool,
-}
-
-impl ServerState {
-    /// Assemble state for a standalone `ripclone-worker`. It uses the real
-    /// durable backends but none of the HTTP-only features (auth, rate limiting,
-    /// OIDC) since it never serves requests — it only runs
-    /// [`process_build_job`]. It builds its own provider registry + credential
-    /// broker from the environment, exactly as the server does, so it can resolve
-    /// upstream credentials for the repos it builds.
-    pub fn for_worker(
-        b: backends::Backends,
-        queue: JobQueueRef,
-        metrics: Arc<Metrics>,
-    ) -> Result<Self> {
-        let provider_registry = ProviderRegistry::load().context("load provider registry")?;
-        let broker = broker_from_env(provider_registry.clone())?;
-        Ok(ServerState {
-            cas: b.cas,
-            storage: b.storage,
-            repo_root: b.repo_root,
-            ref_store: b.ref_store,
-            provider_registry,
-            broker,
-            token_hash: None,
-            jwt: None,
-            metrics,
-            rate_limiter: RateLimiter::new(60, 10.0),
-            build_queue: queue,
-            control_db: None,
-            // A worker never serves the farm-out endpoints itself.
-            worker_queue: None,
-            oidc_verifier: None,
-            // No webhook secret here (worker has no HTTP; tests install their own).
-            webhook_config: Arc::new(WebhookConfig::empty()),
-            sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            readyz_cache: Arc::new(std::sync::Mutex::new(None)),
-            // The worker never serves reads; a verifier is required by the type
-            // but unused, and auth enforcement is irrelevant here.
-            access_verifier: Arc::new(HttpAccessVerifier::new()),
-            require_repo_auth: false,
-        })
-    }
 }
 
 /// Whether per-repo read authz is enforced. On by default (multi-tenant safe);
@@ -611,17 +564,6 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/login", get(login_page_handler))
         .route("/v1/auth/login", post(auth_login_handler))
         .route("/v1/build", post(build_handler))
-        // Worker metadata report: authenticated by a signed, expiring HMAC
-        // bearer token (not the shared server token). Standalone workers POST
-        // ref writes here; the server holds the DB
-        // creds and performs the durable write. Lives outside `protected`.
-        .route("/v1/refs", get(ref_read_handler).post(ref_report_handler))
-        // Worker queue endpoints: a token-only worker claims, acks, and
-        // heartbeats here instead of touching the DB. Same
-        // signed-bearer gate as /v1/refs; the server holds the one queue DB.
-        .route("/v1/jobs/claim", post(job_claim_handler))
-        .route("/v1/jobs/{id}/ack", post(job_ack_handler))
-        .route("/v1/jobs/heartbeat", post(job_heartbeat_handler))
         // Provider-agnostic push-webhook receiver: authenticated by the provider
         // HMAC over the raw body (not the ripclone bearer token), so it lives
         // outside the `protected` layer.
@@ -1153,602 +1095,6 @@ async fn version_handler() -> impl IntoResponse {
 /// use for it; rejecting it would only make self-hosted clients see 404s.
 async fn clone_metrics_drop_handler() -> impl IntoResponse {
     StatusCode::ACCEPTED
-}
-
-/// Shared bearer-token gate for every farmed-out-worker endpoint (`/v1/refs`,
-/// `/v1/jobs/*`). Fails **closed**: 503 when no signing secret is configured,
-/// 401 before any state change when the token is missing / malformed / expired /
-/// signed with the wrong secret. Auth is signature + expiry only — no repo/job
-/// scope, because one token is injected into a pooled worker that may claim any
-/// repo's job. `Err(Response)` short-circuits the handler; `Ok(())` proceeds.
-// The `Err` is an axum `Response` (large by clippy's measure) but each handler
-// returns it at most once per request — not a hot path.
-#[allow(clippy::result_large_err)]
-fn authorize_worker_token(route: &str, headers: &HeaderMap) -> Result<(), Response> {
-    use crate::job_token::{report_token_secret_from_env, verify_job_token};
-
-    let Some(secret) = report_token_secret_from_env() else {
-        error!(
-            "{route}: no job-token secret configured \
-             (set RIPCLONE_JOB_TOKEN_SECRET or RIPCLONE_SERVER_TOKEN)"
-        );
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "job tokens not configured on this server".to_string(),
-            }),
-        )
-            .into_response());
-    };
-
-    let presented = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(token) = presented else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "missing Authorization: Bearer <job token>".to_string(),
-            }),
-        )
-            .into_response());
-    };
-
-    if let Err(e) = verify_job_token(&secret, token) {
-        warn!("{route}: auth rejected: {e:#}");
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "invalid or expired job token".to_string(),
-            }),
-        )
-            .into_response());
-    }
-    Ok(())
-}
-
-/// Resolve the server's concrete SQL queue for a `/v1/jobs/*` handler, or a 503
-/// response when this state's control queue is unavailable. Called only after
-/// [`authorize_worker_token`].
-#[allow(clippy::result_large_err)]
-fn worker_queue_or_503(
-    route: &str,
-    state: &ServerState,
-) -> Result<Arc<crate::queue::SqlJobQueue>, Response> {
-    match &state.worker_queue {
-        Some(q) => Ok(q.clone()),
-        None => {
-            error!("{route}: server control queue is unavailable");
-            Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "server control queue is unavailable".to_string(),
-                }),
-            )
-                .into_response())
-        }
-    }
-}
-
-/// `POST /v1/jobs/claim` — a farm-out worker claims exactly one queued job.
-///
-/// Same bearer gate as `/v1/refs`. Returns the one claimed job (or `null`),
-/// including its per-job upstream `credential` so the worker can fetch a private
-/// repo — never a list, never another job's data. Delegates to the server's SQL
-/// queue, applying the worker's `max_size_class` ceiling per claim.
-async fn job_claim_handler(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(req): Json<crate::api_job_queue::ClaimRequest>,
-) -> Response {
-    use crate::api_job_queue::{ClaimResponse, ClaimedJobWire};
-    use secrecy::ExposeSecret;
-
-    if let Err(resp) = authorize_worker_token("POST /v1/jobs/claim", &headers) {
-        return resp;
-    }
-    let queue = match worker_queue_or_503("POST /v1/jobs/claim", &state) {
-        Ok(q) => q,
-        Err(resp) => return resp,
-    };
-    if req.worker_id.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "worker_id must not be empty".to_string(),
-            }),
-        )
-            .into_response();
-    }
-    let ceiling = match queue.resolve_ceiling(req.max_size_class.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("invalid max_size_class: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-    match queue.claim_capped(&req.worker_id, ceiling).await {
-        Ok(claimed) => {
-            let job = claimed.map(|c| ClaimedJobWire {
-                id: c.id,
-                provider: c.provider,
-                path: c.path,
-                admitted_commit: c.admitted_commit,
-                repo_config: c.repo_config,
-                credential: c.credential.map(|s| s.expose_secret().to_string()),
-            });
-            (StatusCode::OK, Json(ClaimResponse { job })).into_response()
-        }
-        Err(e) => {
-            error!("POST /v1/jobs/claim failed: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("claim failed: {e:#}"),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// `POST /v1/jobs/{id}/ack` — a worker settles its claimed job. Same bearer gate
-/// as `/v1/refs`. Delegates to the SQL queue and returns the post-ack lifecycle.
-async fn job_ack_handler(
-    State(state): State<ServerState>,
-    Path(id): Path<i64>,
-    headers: HeaderMap,
-    Json(req): Json<crate::api_job_queue::AckRequest>,
-) -> Response {
-    use crate::api_job_queue::{AckResponse, job_state_tag};
-    use crate::queue::{BuildError, JobQueue, JobState};
-
-    if let Err(resp) = authorize_worker_token("POST /v1/jobs/ack", &headers) {
-        return resp;
-    }
-    let queue = match worker_queue_or_503("POST /v1/jobs/ack", &state) {
-        Ok(q) => q,
-        Err(resp) => return resp,
-    };
-    if req.worker_id.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "worker_id must not be empty".to_string(),
-            }),
-        )
-            .into_response();
-    }
-    let result: Result<(), BuildError> = if req.result.ok {
-        Ok(())
-    } else {
-        let msg = req
-            .result
-            .error
-            .unwrap_or_else(|| "build failed".to_string());
-        Err(if req.result.retryable {
-            BuildError::retryable(msg)
-        } else {
-            BuildError::permanent(msg)
-        })
-    };
-    match queue.ack(id, &req.worker_id, result).await {
-        Ok(settled) => {
-            // Active API heartbeats create a registry row even when optional
-            // idle fleet registration is disabled. Once this sequential worker
-            // settles (or discovers it no longer owns) the job, remove that row;
-            // an opt-in idle heartbeat may recreate it on its next interval.
-            if let Err(error) = queue.remove_worker(&req.worker_id).await {
-                error!("remove settled API worker {}: {error:#}", req.worker_id);
-            }
-            // Report the resulting lifecycle so the worker can detect a
-            // dead-letter without a second round-trip.
-            let (state_tag, error) =
-                match <crate::queue::SqlJobQueue as JobQueue>::job_status(queue.as_ref(), id).await
-                {
-                    Ok(JobState::Failed(err)) => ("failed", Some(err)),
-                    Ok(s) => (job_state_tag(&s), None),
-                    Err(_) => ("unknown", None),
-                };
-            (
-                StatusCode::OK,
-                Json(AckResponse {
-                    settled,
-                    state: state_tag.to_string(),
-                    error,
-                }),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            error!("POST /v1/jobs/{id}/ack failed: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("ack failed: {e:#}"),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// `POST /v1/jobs/heartbeat` — a worker refreshes its registry row so the
-/// autoscaler can count it. Worker-scoped (fires while idle, `current_job` may
-/// be `None`), so no job id in the path. Same bearer gate as `/v1/refs`.
-async fn job_heartbeat_handler(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(req): Json<crate::api_job_queue::HeartbeatRequest>,
-) -> Response {
-    if let Err(resp) = authorize_worker_token("POST /v1/jobs/heartbeat", &headers) {
-        return resp;
-    }
-    let queue = match worker_queue_or_503("POST /v1/jobs/heartbeat", &state) {
-        Ok(q) => q,
-        Err(resp) => return resp,
-    };
-    if req.worker_id.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "worker_id must not be empty".to_string(),
-            }),
-        )
-            .into_response();
-    }
-    match queue.heartbeat(&req.worker_id, req.current_job).await {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(e) => {
-            error!("POST /v1/jobs/heartbeat failed: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("heartbeat failed: {e:#}"),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct WorkerRefReadQuery {
-    repo_key: String,
-    commit: String,
-}
-
-enum ExactResultRef<'a> {
-    Head(&'a crate::HeadResult),
-    Full(&'a crate::FullResult),
-    Files(&'a crate::FilesResult),
-}
-
-impl ExactResultRef<'_> {
-    fn kind(&self) -> ExactResultKind {
-        match self {
-            Self::Head(_) => ExactResultKind::Head,
-            Self::Full(_) => ExactResultKind::Full,
-            Self::Files(_) => ExactResultKind::Files,
-        }
-    }
-
-    fn artifacts(&self) -> &crate::ClonepackArtifacts {
-        match self {
-            Self::Head(result) => &result.clonepack,
-            Self::Full(result) => &result.clonepack,
-            Self::Files(result) => &result.clonepack,
-        }
-    }
-}
-
-fn manifest_ref_hash(reference: Option<&ChunkRef>) -> String {
-    reference
-        .map(|reference| hash_to_hex(&reference.hash))
-        .unwrap_or_default()
-}
-
-fn validate_manifest_packs(
-    manifest: &ClonepackManifest,
-    reported: &[crate::PackArtifact],
-) -> Result<()> {
-    anyhow::ensure!(
-        manifest.packs.len() == reported.len(),
-        "manifest pack count does not match reported result"
-    );
-    for (index, (manifest_pack, reported_pack)) in
-        manifest.packs.iter().zip(reported.iter()).enumerate()
-    {
-        anyhow::ensure!(
-            manifest_ref_hash(manifest_pack.pack.as_ref()) == reported_pack.pack
-                && manifest_ref_hash(manifest_pack.idx.as_ref()) == reported_pack.idx,
-            "manifest pack {index} does not match reported result"
-        );
-    }
-    Ok(())
-}
-
-/// Validate one authenticated job result before its claim-protected mutation.
-/// The manifest is the only object fetched here: normal readiness remains a
-/// metadata-only check, and content-addressed child uploads remain repeatable.
-async fn validate_claimed_result_manifest(
-    storage: &StorageRef,
-    commit: &str,
-    result: ExactResultRef<'_>,
-) -> Result<()> {
-    let kind = result.kind();
-    let artifacts = result.artifacts();
-    anyhow::ensure!(
-        crate::exact_output_artifacts_ready(commit, kind, artifacts),
-        "invalid {kind} result for exact commit {commit}"
-    );
-
-    let storage = storage.clone();
-    let manifest_hash = artifacts.manifest.clone();
-    let fetch_hash = manifest_hash.clone();
-    let bytes = tokio::task::spawn_blocking(move || storage.get(&fetch_hash))
-        .await
-        .context("fetch claimed result manifest task")?
-        .context("fetch claimed result manifest")?;
-    anyhow::ensure!(
-        crate::cas::hash(&bytes) == manifest_hash,
-        "claimed result manifest digest does not match its artifact ID"
-    );
-    let manifest =
-        ClonepackManifest::decode(bytes.as_slice()).context("decode claimed result manifest")?;
-    anyhow::ensure!(
-        manifest.commit == commit,
-        "claimed result manifest commit does not match exact commit {commit}"
-    );
-    anyhow::ensure!(
-        manifest_ref_hash(manifest.metadata_chunk.as_ref()) == artifacts.metadata_chunk,
-        "claimed result manifest metadata does not match reported result"
-    );
-    anyhow::ensure!(
-        manifest_ref_hash(manifest.midx.as_ref()) == artifacts.midx,
-        "claimed result manifest MIDX does not match reported result"
-    );
-    anyhow::ensure!(
-        manifest_ref_hash(manifest.idx_bundle.as_ref()) == artifacts.idx_bundle,
-        "claimed result manifest idx bundle does not match reported result"
-    );
-
-    match result {
-        ExactResultRef::Head(result) => {
-            validate_manifest_packs(&manifest, &result.packs)?;
-            anyhow::ensure!(
-                manifest.archive_chunks.is_empty(),
-                "Head manifest contains an unreported archive list"
-            );
-        }
-        ExactResultRef::Full(result) => {
-            validate_manifest_packs(&manifest, &result.packs)?;
-            anyhow::ensure!(
-                manifest.archive_chunks.is_empty(),
-                "Full manifest contains an unreported archive list"
-            );
-        }
-        ExactResultRef::Files(result) => {
-            anyhow::ensure!(
-                manifest.packs.is_empty(),
-                "Files manifest contains an unreported pack list"
-            );
-            let manifest_archives: Vec<String> = manifest
-                .archive_chunks
-                .iter()
-                .map(|chunk| hash_to_hex(&chunk.hash))
-                .collect();
-            anyhow::ensure!(
-                manifest_archives == result.archive_chunks,
-                "Files manifest archive list does not match reported result"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// `GET /v1/refs` — a worker reads the explicit results already published for
-/// the exact commit it owns. This lets a replacement job skip ready work.
-async fn ref_read_handler(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Query(query): Query<WorkerRefReadQuery>,
-) -> Response {
-    use crate::provider::parse_storage_key;
-
-    if let Err(resp) = authorize_worker_token("GET /v1/refs", &headers) {
-        return resp;
-    }
-    let Some(repo_id) = parse_storage_key(&query.repo_key) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid repo_key: {}", query.repo_key),
-            }),
-        )
-            .into_response();
-    };
-    if let Err(error) = crate::validation::validate_object_id(&query.commit) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid exact commit: {error}"),
-            }),
-        )
-            .into_response();
-    }
-    match state.ref_store.load_result(&repo_id, &query.commit).await {
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("exact result read failed: {error:#}"),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-/// `POST /v1/refs` — farmed-out worker reports an exact result publication.
-///
-/// Auth is a signed, expiring HMAC bearer token (`Authorization: Bearer …`), not
-/// the shared server token. Every mutation additionally carries the existing
-/// job/worker claim identity; the control database validates ownership in the
-/// same transaction as the result write.
-async fn ref_report_handler(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(body): Json<crate::api_ref_store::RefReport>,
-) -> Response {
-    use crate::api_ref_store::{RefReport, RefReportResponse};
-    use crate::provider::parse_storage_key;
-
-    // Same fail-closed (503 no secret), 401-before-any-effect gate as the
-    // worker queue endpoints. Auth is signature + expiry only (no repo scope):
-    // the token is injected into a pooled worker that may claim any repo's job.
-    if let Err(resp) = authorize_worker_token("POST /v1/refs", &headers) {
-        return resp;
-    }
-
-    // The write target comes from the request body, not the token.
-    let repo_key = body.repo_key().to_string();
-    let Some(repo_id) = parse_storage_key(&repo_key) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid repo_key: {repo_key}"),
-            }),
-        )
-            .into_response();
-    };
-
-    let result: Result<RefReportResponse, anyhow::Error> = match body {
-        RefReport::PublishHead {
-            job_id,
-            worker_id,
-            commit,
-            head,
-            ..
-        } => {
-            if let Err(error) = validate_claimed_result_manifest(
-                &state.storage,
-                &commit,
-                ExactResultRef::Head(&head),
-            )
-            .await
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("invalid Head result for exact commit {commit}: {error:#}"),
-                    }),
-                )
-                    .into_response();
-            }
-            match state.control_db.as_ref() {
-                Some(control) => {
-                    control
-                        .publish_head_for_claim(job_id, &worker_id, &repo_id, &commit, *head)
-                        .await
-                }
-                None => Err(anyhow::anyhow!("control database unavailable")),
-            }
-            .map(|updated| RefReportResponse { updated })
-        }
-        RefReport::PublishFull {
-            job_id,
-            worker_id,
-            commit,
-            full,
-            ..
-        } => {
-            if let Err(error) = validate_claimed_result_manifest(
-                &state.storage,
-                &commit,
-                ExactResultRef::Full(&full),
-            )
-            .await
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("invalid Full result for exact commit {commit}: {error:#}"),
-                    }),
-                )
-                    .into_response();
-            }
-            match state.control_db.as_ref() {
-                Some(control) => {
-                    control
-                        .publish_full_for_claim(job_id, &worker_id, &repo_id, &commit, *full)
-                        .await
-                }
-                None => Err(anyhow::anyhow!("control database unavailable")),
-            }
-            .map(|updated| RefReportResponse { updated })
-        }
-        RefReport::PublishFiles {
-            job_id,
-            worker_id,
-            commit,
-            files,
-            ..
-        } => {
-            if let Err(error) = validate_claimed_result_manifest(
-                &state.storage,
-                &commit,
-                ExactResultRef::Files(&files),
-            )
-            .await
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("invalid Files result for exact commit {commit}: {error:#}"),
-                    }),
-                )
-                    .into_response();
-            }
-            match state.control_db.as_ref() {
-                Some(control) => {
-                    control
-                        .publish_files_for_claim(job_id, &worker_id, &repo_id, &commit, *files)
-                        .await
-                }
-                None => Err(anyhow::anyhow!("control database unavailable")),
-            }
-            .map(|updated| RefReportResponse { updated })
-        }
-    };
-
-    match result {
-        Ok(resp) if resp.updated => (StatusCode::OK, Json(resp)).into_response(),
-        Ok(_resp) => (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: "worker no longer owns the claimed job".to_string(),
-            }),
-        )
-            .into_response(),
-        Err(e) => {
-            error!("POST /v1/refs write failed for {repo_key}: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("ref write failed: {e:#}"),
-                }),
-            )
-                .into_response()
-        }
-    }
 }
 
 /// Readiness probe: 200 only when storage and the ref store are both reachable,
@@ -3577,9 +2923,6 @@ async fn add_repo_inner(
         return resp;
     }
 
-    // Tiered-add preflight: capture repo size now so the first build can be
-    // size-classified without a new API call at enqueue.
-    let repo_size_bytes = preflight_repo_size_bytes(&provider, &repo_id, credential.as_ref()).await;
     let added = AddedRepo {
         repo_id: repo_id.clone(),
         added_at: SystemTime::now()
@@ -3588,7 +2931,6 @@ async fn add_repo_inner(
             .as_secs(),
         history_enabled: true,
         source: params.source,
-        repo_size_bytes,
     };
     if let Err(e) = state.ref_store.add_repo(&added).await {
         state.metrics.record_error();
@@ -3642,68 +2984,6 @@ async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Respons
     (StatusCode::NO_CONTENT, Body::empty()).into_response()
 }
 
-/// Tiered-add preflight: best-effort GitHub `repo.size` (KB → bytes). Used to
-/// classify the first build without a prior clonepack. Failures return `None`
-/// (first build maps to largest class) — never fail the add.
-async fn preflight_repo_size_bytes(
-    provider: &ProviderInstance,
-    repo_id: &RepoId,
-    credential: Option<&secrecy::SecretString>,
-) -> Option<u64> {
-    use crate::provider::ProviderKind;
-    if provider.kind != ProviderKind::GitHub {
-        return None;
-    }
-    // GitHub paths are always `owner/repo` (including Enterprise / non-default
-    // instance ids). Do not use `github_owner_repo()` — that only matches the
-    // built-in `github` instance id and would skip every GHE / renamed instance.
-    let (owner, repo) = repo_id.path.split_once('/')?;
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return None;
-    }
-    // github.com → api.github.com; GitHub Enterprise → https://{host}/api/v3.
-    let host = provider
-        .host
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    let api_base = if host == "github.com" || host.is_empty() {
-        "https://api.github.com".to_string()
-    } else {
-        format!("https://{host}/api/v3")
-    };
-    let url = format!("{api_base}/repos/{owner}/{repo}");
-    let client = reqwest::ClientBuilder::new()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
-    let mut req = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "ripclone");
-    // REST API wants Bearer / token, not the git-HTTPS Basic x-access-token form.
-    if let Some(cred) = credential {
-        req = req.header("Authorization", format!("Bearer {}", cred.expose_secret()));
-    }
-    let resp = req.send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    #[derive(serde::Deserialize)]
-    struct GhRepo {
-        /// GitHub reports size in kilobytes.
-        size: u64,
-    }
-    let body: GhRepo = resp.json().await.ok()?;
-    Some(github_repo_size_kb_to_bytes(body.size))
-}
-
-/// GitHub's `repo.size` field is kilobytes; convert to bytes for classification.
-fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
-    size_kb.saturating_mul(1024)
-}
-
 /// Outcome of [`admit_commit`]: already complete, enqueued, or an error.
 enum Admission {
     Complete(Box<RefInfo>),
@@ -3736,21 +3016,11 @@ where
         Ok(credential) => credential,
         Err(error) => return Admission::Error(error),
     };
-    let prior_size_bytes = loaded.as_ref().and_then(|info| {
-        let bytes = crate::queue::prior_clonepack_bytes(info);
-        (bytes > 0).then_some(bytes)
-    });
-    let preflight_size_bytes = match state.ref_store.load_added_repo(repo_id).await {
-        Ok(Some(added)) => added.repo_size_bytes,
-        _ => None,
-    };
-    let size_bytes = crate::queue::resolve_job_size_bytes(prior_size_bytes, preflight_size_bytes);
     let job = BuildJob {
         repo_id: repo_id.clone(),
         admitted_commit: commit.to_string(),
         repo_config: crate::repo_config::RepoConfig::default(),
         credential,
-        size_bytes,
     };
     match enqueue_admitted_build(state, job).await {
         Ok(outcome) => Admission::Enqueued(outcome),
@@ -6351,16 +5621,6 @@ fn classify_build_error(error: &anyhow::Error) -> BuildError {
                 BuildError::permanent(message)
             };
         }
-        // ApiRefStore report failures (network / 5xx / 401). Must not be
-        // swallowed: a silent success would drop the build result.
-        if let Some(api_err) = cause.downcast_ref::<crate::api_ref_store::ApiReportError>() {
-            let message = format!("{error:#}");
-            return if api_err.is_retryable() {
-                BuildError::retryable(message)
-            } else {
-                BuildError::permanent(message)
-            };
-        }
         if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
             let message = format!("{error:#}");
             return if reqwest_error.is_timeout()
@@ -6431,7 +5691,7 @@ fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
 
 /// Run embedded workers against the same durable jobs table used by admission.
 /// A slot starts one Head at a time. After Head publishes, the claimed job keeps
-/// running and heartbeating in its own task while the slot starts another Head.
+/// running and renewing its claim in its own task while the slot starts another Head.
 fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJobQueue>) {
     let admission_notify = state
         .control_db
@@ -6493,7 +5753,6 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                     admitted_commit: admitted_commit.clone(),
                                     repo_config: claimed.repo_config,
                                     credential,
-                                    size_bytes: None,
                                 };
                                 let state = worker_state.clone();
                                 let release_for_build = foreground_release.take();
@@ -6514,17 +5773,8 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                     let result = match build {
                         Err(error) => Err(error),
                         Ok(mut build) => {
-                            let heartbeat_interval = Duration::from_secs(
-                                (worker_queue
-                                    .heartbeat_timeout_secs()
-                                    .min(worker_queue.stale_claim_secs().max(1))
-                                    / 3)
-                                .max(1)
-                                .unsigned_abs(),
-                            );
-                            let mut heartbeat = tokio::time::interval(heartbeat_interval);
-                            heartbeat
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            let mut renew = tokio::time::interval(worker_queue.renew_interval());
+                            renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             loop {
                                 tokio::select! {
                                     joined = &mut build => {
@@ -6535,9 +5785,9 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                             ))),
                                         };
                                     }
-                                    _ = heartbeat.tick() => {
+                                    _ = renew.tick() => {
                                         if let Err(error) = worker_queue
-                                            .heartbeat(&owner, Some(claimed.id))
+                                            .renew_claim(claimed.id, &owner)
                                             .await
                                         {
                                             error!(
@@ -6571,9 +5821,6 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                             "embedded worker failed to acknowledge job {}: {error:#}",
                             claimed.id
                         ),
-                    }
-                    if let Err(error) = worker_queue.remove_worker(&owner).await {
-                        error!("embedded worker registry cleanup failed: {error:#}");
                     }
                 });
                 // The sender fires after Head is durably published. If the
@@ -6754,28 +6001,15 @@ async fn serve(
     backends::Backends::validate_environment()?;
 
     let metrics = Metrics::new();
-    let control_db = Arc::new(
-        crate::control::ControlDb::open(
-            &control_settings.path,
-            control_settings.turso,
-            control_settings.size_classes,
-        )
-        .await?,
-    );
+    let control_db = Arc::new(crate::control::ControlDb::open(&control_settings.path).await?);
     info!(
         path = %control_db.path().display(),
-        turso_replica = control_db.is_turso_replica(),
         "server owns control database"
     );
     std::fs::create_dir_all(cas_dir)?;
     std::fs::create_dir_all(repo_root)?;
-    let b = backends::Backends::from_env_with_ref_store(
-        cas_dir,
-        repo_root,
-        &metrics,
-        control_db.ref_store(),
-    )
-    .await?;
+    let b = backends::Backends::from_env_with_ref_store(cas_dir, &metrics, control_db.ref_store())
+        .await?;
     b.cache_retention.clone().spawn_from_env();
 
     let oidc_audience = env::var("RIPCLONE_OIDC_AUDIENCE")
@@ -6806,7 +6040,6 @@ async fn serve(
         rate_limiter,
         build_queue,
         control_db: Some(control_db),
-        worker_queue: Some(worker_queue.clone()),
         oidc_verifier,
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -6895,43 +6128,6 @@ mod tests {
             commit: commit.to_string(),
             ..Default::default()
         }
-    }
-
-    fn report_chunk(hash: &str) -> ChunkRef {
-        ChunkRef {
-            hash: hash_from_hex(hash).unwrap(),
-            len: 1,
-        }
-    }
-
-    fn put_report_manifest(
-        storage: &StorageRef,
-        manifest_commit: &str,
-        artifacts: &mut crate::ClonepackArtifacts,
-        packs: &[crate::PackArtifact],
-        archives: &[String],
-    ) {
-        let manifest = ClonepackManifest {
-            commit: manifest_commit.to_string(),
-            metadata_chunk: Some(report_chunk(&artifacts.metadata_chunk)),
-            archive_chunks: archives.iter().map(|hash| report_chunk(hash)).collect(),
-            packs: packs
-                .iter()
-                .map(|pack| crate::clonepack::PackEntry {
-                    pack: Some(report_chunk(&pack.pack)),
-                    idx: Some(report_chunk(&pack.idx)),
-                    ..Default::default()
-                })
-                .collect(),
-            midx: (!artifacts.midx.is_empty()).then(|| report_chunk(&artifacts.midx)),
-            idx_bundle: (!artifacts.idx_bundle.is_empty())
-                .then(|| report_chunk(&artifacts.idx_bundle)),
-            ..Default::default()
-        }
-        .encode_to_vec();
-        let hash = crate::cas::hash(&manifest);
-        storage.put(&hash, &manifest).unwrap();
-        artifacts.manifest = hash;
     }
 
     #[test]
@@ -7042,19 +6238,6 @@ mod tests {
 
         let not_found_io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(!classify_build_error(&not_found_io).is_retryable());
-    }
-
-    #[test]
-    fn classify_api_report_error_retryable_and_permanent() {
-        let retry = anyhow::Error::new(crate::api_ref_store::ApiReportError::retryable(
-            "metadata report to http://x: network unreachable",
-        ));
-        assert!(classify_build_error(&retry).is_retryable());
-
-        let permanent = anyhow::Error::new(crate::api_ref_store::ApiReportError::permanent(
-            "metadata report unauthorized (401)",
-        ));
-        assert!(!classify_build_error(&permanent).is_retryable());
     }
 
     struct TestSqlQueue {
@@ -7287,7 +6470,6 @@ mod tests {
             rate_limiter: RateLimiter::new(100, 100.0),
             build_queue,
             control_db: None,
-            worker_queue: None,
             oidc_verifier: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
@@ -7305,17 +6487,12 @@ mod tests {
     /// `ref_report_handler`) rather than the in-process test fakes.
     async fn test_state_with_control(tmp: &tempfile::TempDir) -> ServerState {
         let control = Arc::new(
-            crate::control::ControlDb::open(
-                &tmp.path().join("control.db"),
-                None,
-                crate::queue::default_size_classes(),
-            )
-            .await
-            .unwrap(),
+            crate::control::ControlDb::open(&tmp.path().join("control.db"))
+                .await
+                .unwrap(),
         );
         let mut state = test_state_with_ref_store(tmp, control.ref_store());
         state.build_queue = control.queue() as JobQueueRef;
-        state.worker_queue = Some(control.queue());
         state.control_db = Some(control);
         state
     }
@@ -7449,7 +6626,6 @@ mod tests {
                 admitted_commit: "a".repeat(40),
                 repo_config: crate::repo_config::RepoConfig::default(),
                 credential: None,
-                size_bytes: None,
             })
             .await
             .unwrap();
@@ -7460,13 +6636,13 @@ mod tests {
                 admitted_commit: "b".repeat(40),
                 repo_config: crate::repo_config::RepoConfig::default(),
                 credential: None,
-                size_bytes: None,
             })
             .await
             .unwrap();
         let first_id = first.job_id.expect("first durable admitted job id");
         let second_id = second.job_id.expect("second durable admitted job id");
-        let claimed = crate::queue::WorkerQueue::claim(queue.as_ref(), "worker-1")
+        let claimed = queue
+            .claim("worker-1")
             .await
             .unwrap()
             .expect("first job is claimable");
@@ -7503,20 +6679,17 @@ mod tests {
             "removal must not cancel a queued job"
         );
         assert!(
-            crate::queue::WorkerQueue::ack(queue.as_ref(), first_id, "worker-1", Ok(()))
-                .await
-                .unwrap(),
+            queue.ack(first_id, "worker-1", Ok(())).await.unwrap(),
             "the worker must retain ownership of its claim after removal"
         );
-        let claimed_after_remove = crate::queue::WorkerQueue::claim(queue.as_ref(), "worker-2")
+        let claimed_after_remove = queue
+            .claim("worker-2")
             .await
             .unwrap()
             .expect("the queued job remains claimable after removal");
         assert_eq!(claimed_after_remove.id, second_id);
         assert!(
-            crate::queue::WorkerQueue::ack(queue.as_ref(), second_id, "worker-2", Ok(()))
-                .await
-                .unwrap(),
+            queue.ack(second_id, "worker-2", Ok(())).await.unwrap(),
             "the queued job must remain settleable after removal"
         );
     }
@@ -8235,7 +7408,6 @@ mod tests {
                 admitted_commit: "f".repeat(40),
                 repo_config: Default::default(),
                 credential: None,
-                size_bytes: None,
             };
             let pending = pending_exact_result(&filler);
             control
@@ -8502,7 +7674,6 @@ mod tests {
                     .as_secs(),
                 history_enabled: true,
                 source: AddedRepoSource::Api,
-                repo_size_bytes: None,
             })
             .await
             .unwrap();
@@ -8530,7 +7701,6 @@ mod tests {
             admitted_commit: claimed.admitted_commit,
             repo_config: claimed.repo_config,
             credential: None,
-            size_bytes: None,
         })
     }
 
@@ -9399,379 +8569,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    fn ref_report_request(
-        token: Option<&str>,
-        body: &serde_json::Value,
-    ) -> axum::http::Request<Body> {
-        let mut b = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/refs")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .header("Content-Type", "application/json")
-            .header("x-ripclone-protocol", crate::PROTOCOL_VERSION);
-        if let Some(t) = token {
-            b = b.header("Authorization", format!("Bearer {t}"));
-        }
-        b.body(Body::from(serde_json::to_vec(body).unwrap()))
-            .unwrap()
-    }
-
-    /// Authenticated worker output must match the exact commit and contain the
-    /// hashes its result needs. A valid retry replaces invalid stored output.
-    #[tokio::test]
-    async fn ref_report_rejects_invalid_outputs_and_accepts_valid_retries() {
-        let secret = crate::job_token::report_token_secret_from_env()
-            .or_else(|| {
-                // test_state does not set RIPCLONE_SERVER_TOKEN; plant one for the mint.
-                unsafe { std::env::set_var("RIPCLONE_SERVER_TOKEN", "secret") };
-                crate::job_token::report_token_secret_from_env()
-            })
-            .expect("job token secret");
-        let repo_key = "github/acme%2Fwidget";
-        let tok =
-            crate::job_token::mint_job_token(&secret, std::time::Duration::from_secs(300)).unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state_with_control(&tmp).await;
-        let ref_store = state.ref_store.clone();
-        let rid = RepoId::github("acme/widget");
-        let commit = "a".repeat(40);
-        // A real claimed job, not a hardcoded job_id: the handler now always
-        // authorizes a claimed result write against ControlDb's jobs table.
-        let control = state.control_db.as_ref().unwrap();
-        let job = BuildJob {
-            repo_id: rid.clone(),
-            admitted_commit: commit.clone(),
-            repo_config: crate::repo_config::RepoConfig::default(),
-            credential: None,
-            size_bytes: None,
-        };
-        control
-            .admit_exact_and_job(
-                &job,
-                &RefInfo {
-                    commit: commit.clone(),
-                    head: Some(crate::HeadResult::default()),
-                    full: Some(crate::FullResult::default()),
-                    files: Some(crate::FilesResult::default()),
-                },
-            )
-            .await
-            .unwrap();
-        let claimed = control
-            .queue()
-            .claim("test-worker")
-            .await
-            .unwrap()
-            .expect("job just admitted must be claimable");
-        let job_id = claimed.id;
-        let storage = state.storage.clone();
-        let app = build_app(state);
-        let wrong_commit = "b".repeat(40);
-
-        let wrong_head = crate::HeadResult {
-            clonepack: ready_artifacts(&wrong_commit, "wrong-head"),
-            ..Default::default()
-        };
-        let wrong_full = crate::FullResult {
-            clonepack: ready_artifacts(&wrong_commit, "wrong-full"),
-            ..Default::default()
-        };
-        let wrong_files = crate::FilesResult {
-            clonepack: ready_artifacts(&wrong_commit, "wrong-files"),
-            ..Default::default()
-        };
-
-        let missing_head = crate::HeadResult {
-            clonepack: ready_artifacts(&commit, "missing-head-manifest"),
-            ..Default::default()
-        };
-        let missing_full = crate::FullResult {
-            clonepack: ready_artifacts(&commit, "missing-full-manifest"),
-            ..Default::default()
-        };
-        let mut missing_files_artifacts = ready_artifacts(&commit, "missing-files-manifest");
-        missing_files_artifacts.idx_bundle.clear();
-        let missing_files = crate::FilesResult {
-            clonepack: missing_files_artifacts,
-            ..Default::default()
-        };
-
-        let mut wrong_manifest_head = crate::HeadResult {
-            clonepack: ready_artifacts(&commit, "wrong-manifest-commit"),
-            ..Default::default()
-        };
-        put_report_manifest(
-            &storage,
-            &wrong_commit,
-            &mut wrong_manifest_head.clonepack,
-            &[],
-            &[],
-        );
-
-        let corrupt_manifest = [0x80];
-        let corrupt_manifest_hash = crate::cas::hash(&corrupt_manifest);
-        storage
-            .put(&corrupt_manifest_hash, &corrupt_manifest)
-            .unwrap();
-        let mut corrupt_manifest_head = crate::HeadResult {
-            clonepack: ready_artifacts(&commit, "corrupt-manifest"),
-            ..Default::default()
-        };
-        corrupt_manifest_head.clonepack.manifest = corrupt_manifest_hash;
-
-        let mut wrong_metadata_full = crate::FullResult {
-            clonepack: ready_artifacts(&commit, "wrong-manifest-metadata"),
-            ..Default::default()
-        };
-        put_report_manifest(
-            &storage,
-            &commit,
-            &mut wrong_metadata_full.clonepack,
-            &[],
-            &[],
-        );
-        wrong_metadata_full.clonepack.metadata_chunk = crate::cas::hash(b"other metadata");
-
-        let reported_pack = crate::PackArtifact {
-            pack: crate::cas::hash(b"reported pack"),
-            idx: crate::cas::hash(b"reported idx"),
-        };
-        let mut inconsistent_head = crate::HeadResult {
-            clonepack: ready_artifacts(&commit, "inconsistent-head-packs"),
-            packs: vec![reported_pack.clone()],
-            ..Default::default()
-        };
-        put_report_manifest(
-            &storage,
-            &commit,
-            &mut inconsistent_head.clonepack,
-            &[],
-            &[],
-        );
-        let mut inconsistent_full = crate::FullResult {
-            clonepack: ready_artifacts(&commit, "inconsistent-full-packs"),
-            packs: vec![reported_pack],
-            ..Default::default()
-        };
-        put_report_manifest(
-            &storage,
-            &commit,
-            &mut inconsistent_full.clonepack,
-            &[],
-            &[],
-        );
-        let mut inconsistent_files_artifacts = ready_artifacts(&commit, "inconsistent-files");
-        inconsistent_files_artifacts.idx_bundle.clear();
-        let mut inconsistent_files = crate::FilesResult {
-            clonepack: inconsistent_files_artifacts,
-            archive_chunks: vec![crate::cas::hash(b"reported archive")],
-            ..Default::default()
-        };
-        put_report_manifest(
-            &storage,
-            &commit,
-            &mut inconsistent_files.clonepack,
-            &[],
-            &[],
-        );
-
-        let invalid_reports = [
-            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_head}),
-            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":crate::HeadResult::default()}),
-            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":missing_head}),
-            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":corrupt_manifest_head}),
-            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":wrong_manifest_head}),
-            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":inconsistent_head}),
-            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_full}),
-            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":crate::FullResult::default()}),
-            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":missing_full}),
-            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":wrong_metadata_full}),
-            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":inconsistent_full}),
-            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":wrong_files}),
-            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":crate::FilesResult::default()}),
-            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":missing_files}),
-            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":inconsistent_files}),
-        ];
-        for body in &invalid_reports {
-            let response = app
-                .clone()
-                .oneshot(ref_report_request(Some(&tok), body))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-
-        let unchanged = ref_store
-            .load_result(&rid, &commit)
-            .await
-            .unwrap()
-            .expect("invalid reports preserve the existing result");
-        assert!(unchanged.head.unwrap().clonepack.manifest.is_empty());
-        assert!(unchanged.full.unwrap().clonepack.manifest.is_empty());
-        assert!(unchanged.files.unwrap().clonepack.manifest.is_empty());
-
-        let mut valid_head = crate::HeadResult {
-            clonepack: ready_artifacts(&commit, "valid-head"),
-            ..Default::default()
-        };
-        put_report_manifest(&storage, &commit, &mut valid_head.clonepack, &[], &[]);
-        let valid_head_manifest = valid_head.clonepack.manifest.clone();
-        let mut valid_full = crate::FullResult {
-            clonepack: ready_artifacts(&commit, "valid-full"),
-            ..Default::default()
-        };
-        put_report_manifest(&storage, &commit, &mut valid_full.clonepack, &[], &[]);
-        let valid_full_manifest = valid_full.clonepack.manifest.clone();
-        let mut valid_files_artifacts = ready_artifacts(&commit, "valid-files");
-        valid_files_artifacts.idx_bundle.clear();
-        let mut valid_files = crate::FilesResult {
-            clonepack: valid_files_artifacts,
-            ..Default::default()
-        };
-        put_report_manifest(&storage, &commit, &mut valid_files.clonepack, &[], &[]);
-        let valid_files_manifest = valid_files.clonepack.manifest.clone();
-        let valid_reports = [
-            serde_json::json!({"op":"publish_head","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"head":valid_head}),
-            serde_json::json!({"op":"publish_full","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"full":valid_full}),
-            serde_json::json!({"op":"publish_files","job_id":job_id,"worker_id":"test-worker","repo_key":repo_key,"commit":commit,"files":valid_files}),
-        ];
-        for body in &valid_reports {
-            let response = app
-                .clone()
-                .oneshot(ref_report_request(Some(&tok), body))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-
-        let stored = ref_store
-            .load_result(&rid, &commit)
-            .await
-            .unwrap()
-            .expect("valid retries must replace invalid stored outputs");
-        assert!(crate::exact_result_complete(&stored, &commit));
-        assert_eq!(stored.head.unwrap().clonepack.manifest, valid_head_manifest);
-        assert_eq!(stored.full.unwrap().clonepack.manifest, valid_full_manifest);
-        assert_eq!(
-            stored.files.unwrap().clonepack.manifest,
-            valid_files_manifest
-        );
-    }
-
-    /// Auth gate: wrong / missing token → 401 and no write.
-    #[tokio::test]
-    async fn ref_report_bad_token_rejects_and_does_not_write() {
-        let secret = {
-            unsafe { std::env::set_var("RIPCLONE_SERVER_TOKEN", "secret") };
-            crate::job_token::report_token_secret_from_env().expect("secret")
-        };
-        let repo_key = "github/acme%2Fnope";
-        let good =
-            crate::job_token::mint_job_token(&secret, std::time::Duration::from_secs(300)).unwrap();
-        // Token signed with the wrong secret must not authorize this write.
-        let wrong_secret = crate::job_token::mint_job_token(
-            b"a-different-secret",
-            std::time::Duration::from_secs(300),
-        )
-        .unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state_with_control(&tmp).await;
-        let ref_store = state.ref_store.clone();
-        let rid = RepoId::github("acme/nope");
-        let commit = "b".repeat(40);
-        // A real claimed job, not a hardcoded job_id: the handler now always
-        // authorizes a claimed result write against ControlDb's jobs table.
-        let control = state.control_db.as_ref().unwrap();
-        let job = BuildJob {
-            repo_id: rid.clone(),
-            admitted_commit: commit.clone(),
-            repo_config: crate::repo_config::RepoConfig::default(),
-            credential: None,
-            size_bytes: None,
-        };
-        control
-            .admit_exact_and_job(
-                &job,
-                &RefInfo {
-                    commit: commit.clone(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let claimed = control
-            .queue()
-            .claim("test-worker")
-            .await
-            .unwrap()
-            .expect("job just admitted must be claimable");
-        let job_id = claimed.id;
-        let storage = state.storage.clone();
-        let app = build_app(state);
-
-        let mut head = crate::HeadResult {
-            clonepack: ready_artifacts(&commit, "authorized-head"),
-            ..Default::default()
-        };
-        put_report_manifest(&storage, &commit, &mut head.clonepack, &[], &[]);
-        let body = serde_json::json!({
-            "op": "publish_head",
-            "job_id": job_id,
-            "worker_id": "test-worker",
-            "repo_key": repo_key,
-            "commit": commit,
-            "head": head,
-        });
-
-        // Missing Authorization.
-        let resp = app
-            .clone()
-            .oneshot(ref_report_request(None, &body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        // Garbage bearer.
-        let resp = app
-            .clone()
-            .oneshot(ref_report_request(Some("not-a-real-token"), &body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        // Well-formed token signed with the wrong secret → bad signature.
-        let resp = app
-            .clone()
-            .oneshot(ref_report_request(Some(&wrong_secret), &body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        assert!(
-            ref_store
-                .load_result(&rid, &"b".repeat(40))
-                .await
-                .unwrap()
-                .is_some_and(|result| result.head.is_none()),
-            "rejected reports must not write"
-        );
-
-        // Sanity: the good token still works (proves the store itself is fine).
-        let resp = app
-            .oneshot(ref_report_request(Some(&good), &body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            ref_store
-                .load_result(&rid, &"b".repeat(40))
-                .await
-                .unwrap()
-                .is_some_and(|result| result.head.is_some())
-        );
     }
 }

@@ -12,9 +12,6 @@
 //! points used by the bundled binaries. Modules marked `doc(hidden)` are public
 //! for in-repo binaries and integration tests, not a stability promise.
 
-#[cfg(test)]
-pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 // mimalloc as the global allocator on musl targets. The Linux release binaries
 // are statically linked against musl (so one binary runs on any Linux, Alpine
 // included), but musl's default allocator is markedly slower than glibc's under
@@ -22,8 +19,8 @@ pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 // performance is the product. mimalloc closes that gap so a static musl binary
 // keeps glibc-class throughput. Scoped to musl only: glibc and macOS already
 // ship capable allocators, so those builds are left untouched. Defined here in
-// the library crate so every binary that links it (ripclone, ripclone-server,
-// ripclone-worker) picks it up. NOTE: this cfg path only
+// the library crate so every binary that links it (ripclone, ripclone-server)
+// picks it up. NOTE: this cfg path only
 // compiles on a musl build — the host `cargo check` never sees it. It is built
 // and run by the `musl` CI job (scripts/musl-smoke.sh).
 #[cfg(target_env = "musl")]
@@ -66,9 +63,6 @@ mod musl_global_allocator {
 /// `ripclone version`.
 pub const PROTOCOL_VERSION: u32 = 2;
 
-#[doc(hidden)]
-pub mod api_job_queue;
-pub mod api_ref_store;
 pub mod archive;
 #[doc(hidden)]
 pub mod auth;
@@ -90,8 +84,6 @@ pub mod fsutil;
 pub mod git;
 #[doc(hidden)]
 pub mod gix_util;
-#[doc(hidden)]
-pub mod job_token;
 pub mod manifest;
 #[doc(hidden)]
 pub mod meta;

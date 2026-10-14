@@ -1,12 +1,10 @@
 //! The server-owned SQLite control database.
 //!
 //! Refs, added repositories, repository build settings, durable jobs, attempts,
-//! claims, and worker heartbeats share one schema and one local path. Plain
-//! SQLite is the default; the only replicated mode is a Turso embedded replica
-//! at that same path.
+//! and claims share one schema and one local SQLite path.
 
 use crate::meta::{LibsqlMeta, SqlRefStore};
-use crate::queue::{BuildJob, EnqueueOutcome, Enqueued, LibsqlDb, SizeClass, SqlJobQueue};
+use crate::queue::{BuildJob, EnqueueOutcome, Enqueued, LibsqlDb, SqlJobQueue};
 use crate::ref_store::RefStore;
 use anyhow::{Context, Result, bail};
 use libsql::{Builder, Database, OpenFlags};
@@ -17,25 +15,13 @@ use std::time::Duration;
 const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
-pub struct TursoReplicaConfig {
-    pub url: String,
-    pub token: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ControlSettings {
     pub path: PathBuf,
-    pub turso: Option<TursoReplicaConfig>,
-    pub size_classes: Vec<SizeClass>,
 }
 
 impl ControlSettings {
     /// Resolve and validate every control selector before any runtime component
     /// creates a directory, opens storage, binds a listener, or starts work.
-    pub fn from_env(default_path: &Path) -> Result<Self> {
-        Self::from_sources(None, default_path)
-    }
-
     pub fn from_sources(explicit_path: Option<&Path>, default_path: &Path) -> Result<Self> {
         validate_removed_environment()?;
         let config = crate::config::load_global();
@@ -48,8 +34,6 @@ impl ControlSettings {
             bail!("RIPCLONE_CONTROL_DB_PATH must not be empty");
         }
         validate_nonempty_config("control.path", config.control.path.as_deref())?;
-        validate_nonempty_config("control.turso_url", config.control.turso_url.as_deref())?;
-        validate_nonempty_config("control.turso_token", config.control.turso_token.as_deref())?;
         let path = explicit_path
             .map(Path::to_path_buf)
             .or_else(|| environment_path.map(PathBuf::from))
@@ -58,39 +42,7 @@ impl ControlSettings {
         if path.as_os_str().to_string_lossy().trim().is_empty() {
             bail!("RIPCLONE_CONTROL_DB_PATH must not be empty");
         }
-        let url = strict_env_or(
-            "RIPCLONE_TURSO_DATABASE_URL",
-            config.control.turso_url.as_deref(),
-        )?;
-        let token = strict_env_or(
-            "RIPCLONE_TURSO_AUTH_TOKEN",
-            config.control.turso_token.as_deref(),
-        )?;
-        let turso = match (url, token) {
-            (None, None) => None,
-            (Some(url), Some(token)) => Some(TursoReplicaConfig { url, token }),
-            (Some(_), None) => {
-                bail!("RIPCLONE_TURSO_DATABASE_URL requires RIPCLONE_TURSO_AUTH_TOKEN")
-            }
-            (None, Some(_)) => {
-                bail!("RIPCLONE_TURSO_AUTH_TOKEN requires RIPCLONE_TURSO_DATABASE_URL")
-            }
-        };
-        let size_classes = crate::queue::load_size_classes(&config.control.size_classes)?;
-        Ok(Self {
-            path,
-            turso,
-            size_classes,
-        })
-    }
-}
-
-fn strict_env_or(key: &str, fallback: Option<&str>) -> Result<Option<String>> {
-    match std::env::var(key) {
-        Ok(value) if value.trim().is_empty() => bail!("{key} must not be empty"),
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(fallback.map(str::to_owned)),
-        Err(std::env::VarError::NotUnicode(_)) => bail!("{key} must be valid UTF-8"),
+        Ok(Self { path })
     }
 }
 
@@ -130,41 +82,9 @@ pub fn validate_removed_environment() -> Result<()> {
         return Ok(());
     }
     bail!(
-        "removed control configuration is set: {}; use RIPCLONE_CONTROL_DB_PATH and optional RIPCLONE_TURSO_DATABASE_URL/RIPCLONE_TURSO_AUTH_TOKEN",
+        "removed control configuration is set: {}; use RIPCLONE_CONTROL_DB_PATH",
         configured.join(", ")
     )
-}
-
-/// Standalone workers are API-only. Reject even otherwise-valid server control
-/// credentials so a deployment cannot accidentally grant database authority.
-pub fn validate_worker_environment() -> Result<()> {
-    validate_removed_environment()?;
-    let config = crate::config::load_global();
-    validate_removed_config(&config)?;
-    if config.control.path.is_some()
-        || config.control.turso_url.is_some()
-        || config.control.turso_token.is_some()
-        || !config.control.size_classes.is_empty()
-    {
-        bail!("standalone workers are API-only; [control] configuration is forbidden");
-    }
-    const SERVER_ONLY: &[&str] = &[
-        "RIPCLONE_CONTROL_DB_PATH",
-        "RIPCLONE_TURSO_DATABASE_URL",
-        "RIPCLONE_TURSO_AUTH_TOKEN",
-    ];
-    let configured: Vec<&str> = SERVER_ONLY
-        .iter()
-        .copied()
-        .filter(|key| std::env::var_os(key).is_some())
-        .collect();
-    if !configured.is_empty() {
-        bail!(
-            "standalone workers are API-only; server control configuration is forbidden: {}",
-            configured.join(", ")
-        );
-    }
-    Ok(())
 }
 
 fn validate_removed_config(config: &crate::config::Config) -> Result<()> {
@@ -185,11 +105,9 @@ fn validate_removed_config(config: &crate::config::Config) -> Result<()> {
 /// its shared connection handle.
 pub struct ControlDb {
     database: Arc<Database>,
-    turso_replica: bool,
     refs: Arc<SqlRefStore>,
     queue: Arc<SqlJobQueue>,
     path: PathBuf,
-    size_classes: Vec<SizeClass>,
     /// Process-local wake hint for embedded claimers. The jobs table remains
     /// authoritative; notifications are emitted only after admission commits.
     admission_notify: Arc<tokio::sync::Notify>,
@@ -200,11 +118,7 @@ impl ControlDb {
     /// Open the configured local path and fail closed on an incompatible
     /// pre-existing database. The ownership lock is held for this value's
     /// lifetime and is acquired before the database is opened.
-    pub async fn open(
-        path: &Path,
-        turso: Option<TursoReplicaConfig>,
-        size_classes: Vec<SizeClass>,
-    ) -> Result<Self> {
+    pub async fn open(path: &Path) -> Result<Self> {
         let ownership = ControlPathLock::acquire(path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -212,58 +126,26 @@ impl ControlDb {
         }
 
         preflight_sqlite_schema(path).await?;
-        let (database, turso_replica) = match turso {
-            None => (
-                Arc::new(
-                    Builder::new_local(path)
-                        .build()
-                        .await
-                        .with_context(|| format!("open control database {}", path.display()))?,
-                ),
-                false,
-            ),
-            Some(config) => {
-                let database = Arc::new(
-                    Builder::new_remote_replica(path, config.url, config.token)
-                        .read_your_writes(true)
-                        .sync_interval(Duration::from_secs(1))
-                        .build()
-                        .await
-                        .with_context(|| {
-                            format!("open Turso embedded replica {}", path.display())
-                        })?,
-                );
-                database
-                    .sync()
-                    .await
-                    .context("bootstrap Turso embedded replica from primary")?;
-                (database, true)
-            }
-        };
-        if !turso_replica {
-            database
-                .connect()
-                .context("connect to control database")?
-                .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+        let database = Arc::new(
+            Builder::new_local(path)
+                .build()
                 .await
-                .context("configure local control database")?;
-        }
+                .with_context(|| format!("open control database {}", path.display()))?,
+        );
+        database
+            .connect()
+            .context("connect to control database")?
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+            .await
+            .context("configure local control database")?;
         validate_or_initialize_schema(&database, path).await?;
         let refs = Arc::new(SqlRefStore::new(LibsqlMeta::from_database(database.clone())).await?);
-        let queue = Arc::new(
-            SqlJobQueue::new_with_classes(
-                LibsqlDb::from_database(database.clone()),
-                size_classes.clone(),
-            )
-            .await?,
-        );
+        let queue = Arc::new(SqlJobQueue::new(LibsqlDb::from_database(database.clone())).await?);
         Ok(Self {
             database,
-            turso_replica,
             refs,
             queue,
             path: path.to_path_buf(),
-            size_classes,
             admission_notify: Arc::new(tokio::sync::Notify::new()),
             _ownership: ownership,
         })
@@ -279,10 +161,6 @@ impl ControlDb {
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    pub fn is_turso_replica(&self) -> bool {
-        self.turso_replica
     }
 
     pub(crate) fn admission_notifier(&self) -> Arc<tokio::sync::Notify> {
@@ -615,14 +493,13 @@ impl ControlDb {
         }
         insert_exact_result(&tx, job, pending).await?;
         let key = job.key();
-        let size_class = crate::queue::classify_rank(job.size_bytes, &self.size_classes);
         let credential = crate::queue::sql::encode_credential(job.credential.as_ref());
         let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO jobs
                  (key, provider, path, status, created_at, admitted_commit,
-                  repo_config, credential, attempts, size_class)
-                 VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, 0, ?8)",
+                  repo_config, credential, attempts)
+                 VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, 0)",
                 libsql::params![
                     key.clone(),
                     job.repo_id.provider.as_str(),
@@ -630,8 +507,7 @@ impl ControlDb {
                     crate::queue::sql::now_secs(),
                     job.admitted_commit.as_str(),
                     repo_config,
-                    credential.as_deref(),
-                    size_class
+                    credential.as_deref()
                 ],
             )
             .await
@@ -653,13 +529,6 @@ impl ControlDb {
                 .context("coalesced durable job disappeared")?
                 .get::<i64>(0)?;
             drop(rows);
-            tx.execute(
-                "UPDATE jobs SET size_class = MAX(size_class, ?1)
-                 WHERE id = ?2 AND status = 'queued'",
-                libsql::params![size_class, id],
-            )
-            .await
-            .context("raise coalesced job size class")?;
             (EnqueueOutcome::Coalesced, id)
         };
         tx.commit().await.context("commit durable admission")?;
@@ -923,7 +792,6 @@ mod tests {
             admitted_commit: commit.to_string(),
             repo_config: crate::repo_config::RepoConfig::default(),
             credential: None,
-            size_bytes: None,
         }
     }
 
@@ -959,18 +827,14 @@ mod tests {
             archive_chunk_size: Some(1024),
             ..Default::default()
         };
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
+        let control = ControlDb::open(&path).await.unwrap();
         assert!(control.repository_config(&missing).await.unwrap().is_none());
         control
             .put_repository_config(&repo_id, &config)
             .await
             .unwrap();
         drop(control);
-        let reopened = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
+        let reopened = ControlDb::open(&path).await.unwrap();
         assert_eq!(
             reopened.repository_config(&repo_id).await.unwrap(),
             Some(config)
@@ -988,9 +852,7 @@ mod tests {
     async fn corrupt_or_invalid_repository_config_fails_instead_of_defaulting() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
+        let control = ControlDb::open(&path).await.unwrap();
         let repo_id = crate::provider::RepoId::github("acme/corrupt");
         let connection = control.database.connect().unwrap();
         connection
@@ -1029,9 +891,7 @@ mod tests {
     async fn admission_snapshots_repository_config() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
+        let control = ControlDb::open(&path).await.unwrap();
         let repo_id = crate::provider::RepoId::github("acme/control");
         let admitted_config = crate::repo_config::RepoConfig {
             compression_level: Some(3),
@@ -1071,11 +931,7 @@ mod tests {
     async fn same_commit_different_names_share_one_result_and_job() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
-        let control = Arc::new(
-            ControlDb::open(&path, None, crate::queue::default_size_classes())
-                .await
-                .unwrap(),
-        );
+        let control = Arc::new(ControlDb::open(&path).await.unwrap());
         let commit = "1111111111111111111111111111111111111111";
         let names = ["main", "release", "HEAD"];
         let mut admissions = Vec::new();
@@ -1123,9 +979,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
         let commit = "4444444444444444444444444444444444444444";
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
+        let control = ControlDb::open(&path).await.unwrap();
         let admitted_id = control
             .admit_exact_and_job(&job(commit, "main"), &pending(commit))
             .await
@@ -1133,9 +987,7 @@ mod tests {
             .job_id
             .unwrap();
         drop(control);
-        let reopened = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
+        let reopened = ControlDb::open(&path).await.unwrap();
         assert!(matches!(
             reopened.queue().job_status(admitted_id).await.unwrap(),
             JobState::Pending
@@ -1156,9 +1008,7 @@ mod tests {
     async fn stale_job_cannot_overwrite_any_ready_result() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
-        let control = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
+        let control = ControlDb::open(&path).await.unwrap();
         let commit = "5555555555555555555555555555555555555555";
         let repo_id = job(commit, "main").repo_id;
         let first_id = control
@@ -1300,13 +1150,8 @@ mod tests {
     async fn second_server_is_rejected_while_owner_is_alive() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.db");
-        let _owner = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .unwrap();
-        let error = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .err()
-            .unwrap();
+        let _owner = ControlDb::open(&path).await.unwrap();
+        let error = ControlDb::open(&path).await.err().unwrap();
         assert!(
             error
                 .to_string()
@@ -1327,10 +1172,7 @@ mod tests {
             .unwrap();
         drop(database);
         let before = std::fs::read(&path).unwrap();
-        let error = ControlDb::open(&path, None, crate::queue::default_size_classes())
-            .await
-            .err()
-            .unwrap();
+        let error = ControlDb::open(&path).await.err().unwrap();
         assert!(
             error
                 .to_string()

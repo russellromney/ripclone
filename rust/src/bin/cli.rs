@@ -77,18 +77,6 @@ enum Commands {
     Version,
     /// Check for a newer ripclone release and show how to update.
     Update,
-    /// Mint a durable worker bearer token for token-only farm-out workers.
-    ///
-    /// Uses the server's job-token secret (`RIPCLONE_JOB_TOKEN_SECRET`, or
-    /// `RIPCLONE_SERVER_TOKEN`) to print a signed, expiring token. Provision it
-    /// as each standalone worker's `RIPCLONE_METADATA_JOB_TOKEN`. One
-    /// token authenticates claim/ack/heartbeat and the metadata reports. Rotate
-    /// by re-minting before it expires.
-    MintWorkerToken {
-        /// Token lifetime in days (default 90). Re-mint before it expires.
-        #[arg(long, default_value = "90")]
-        ttl_days: u64,
-    },
     /// Make a repo available and admit its exact first build; returns fast.
     Add {
         repo: String,
@@ -441,25 +429,6 @@ fn release_status(current: &str, latest_tag: &str) -> ReleaseStatus {
 /// Check the latest published release on GitHub and, if newer, show how to
 /// update. Deliberately does not replace the binary itself — it prints the
 /// install command — so it works the same however ripclone was installed.
-/// Print a durable worker bearer token for token-only farm-out workers.
-///
-/// Signs it with the same secret the server verifies with
-/// (`RIPCLONE_JOB_TOKEN_SECRET`, or `RIPCLONE_SERVER_TOKEN`). Provision the
-/// output as each worker's `RIPCLONE_METADATA_JOB_TOKEN`; rotate by re-minting.
-fn run_mint_worker_token(ttl_days: u64) -> Result<()> {
-    use ripclone::job_token::{mint_job_token, report_token_secret_from_env};
-
-    let secret = report_token_secret_from_env().context(
-        "no job-token secret available: set RIPCLONE_JOB_TOKEN_SECRET or RIPCLONE_SERVER_TOKEN \
-         (the same secret the server verifies with)",
-    )?;
-    let secs = ttl_days.saturating_mul(24 * 3600).max(1);
-    let token = mint_job_token(&secret, std::time::Duration::from_secs(secs))
-        .context("mint worker token")?;
-    println!("{token}");
-    Ok(())
-}
-
 async fn run_update() -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     println!("ripclone {current}");
@@ -996,7 +965,6 @@ async fn run() -> Result<()> {
         Commands::Auth { action } => return run_auth(&server, action).await,
         Commands::Version => return run_version(&server).await,
         Commands::Update => return run_update().await,
-        Commands::MintWorkerToken { ttl_days } => return run_mint_worker_token(*ttl_days),
         _ => {}
     }
 
@@ -1048,8 +1016,7 @@ async fn run() -> Result<()> {
         | Commands::Logout
         | Commands::Auth { .. }
         | Commands::Version
-        | Commands::Update
-        | Commands::MintWorkerToken { .. } => {
+        | Commands::Update => {
             unreachable!()
         }
         Commands::Provider { action } => match action {
