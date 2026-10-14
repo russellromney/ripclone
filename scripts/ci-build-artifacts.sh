@@ -41,7 +41,7 @@ pick_lib_test_exe() {
 BINS=(ripclone ripclone-server ripclone-worker)
 
 TESTS=(
-  e2e_full_topup
+  contract
   e2e_gitea_provider
   e2e_token_only_worker
 )

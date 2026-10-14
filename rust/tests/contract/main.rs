@@ -8,8 +8,10 @@ mod net;
 
 mod coalesce;
 mod downloads;
+mod integrations;
 mod pinning;
 mod resolve;
+mod s3;
 mod shapes;
 mod state;
 mod surface;

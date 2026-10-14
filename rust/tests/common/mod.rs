@@ -48,6 +48,10 @@ fn init_env(lsm: bool) {
             // (burst 60) throttle them. Test-only — production keeps its limits.
             std::env::set_var("RIPCLONE_RATE_LIMIT_BURST", "1000000");
             std::env::set_var("RIPCLONE_RATE_LIMIT_PER_SEC", "1000000");
+            // The poll loop's first tick fires at startup and builds the tip of
+            // every added repo, racing whatever the test registers next. Tests
+            // that want polling pass an interval to `start_server_env`.
+            std::env::set_var("RIPCLONE_POLL_INTERVAL_SECS", "0");
             std::env::set_var(
                 "RIPCLONE_ORIGIN_BASE",
                 format!("file://{}", origin_root().display()),
