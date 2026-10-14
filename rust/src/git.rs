@@ -10,9 +10,47 @@ use std::time::Duration;
 
 const SKIP_WORKTREE_FLAG: gix::index::entry::Flags = gix::index::entry::Flags::SKIP_WORKTREE;
 
+/// `git` for a child of this process. Every git the server runs starts here.
+///
+/// On Linux the child gets SIGKILL when the thread that spawned it exits, so
+/// a server killed with SIGKILL leaves no git fetch or pack-objects running
+/// against its mirrors. Every caller waits for the child on the thread that
+/// spawned it (or, for `tokio::process`, spawns it from a runtime worker,
+/// which lives as long as the process). Git's own helpers (`git-remote-http`,
+/// `index-pack`) are not covered; they exit when their parent git's pipes
+/// close.
+///
+/// macOS has no parent-death signal. There a killed server's git children
+/// run until their current command ends.
+pub fn command() -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new("git");
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+        // SAFETY: `pre_exec` runs after fork and before exec. The closure only
+        // calls the async-signal-safe `prctl` and `getppid` and builds an OS
+        // error from errno; it captures only a copied pid.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The parent died before the signal was armed.
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    command
+}
+
 /// Fail before starting work that requires the system Git executable.
 pub fn require_system_git() -> Result<()> {
-    let status = Command::new("git")
+    let status = command()
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -301,7 +339,7 @@ fn clamp_u64_to_u32(value: u64) -> u32 {
 
 /// Run a git command in a repo and return stdout as String.
 pub fn run_git<P: AsRef<Path>>(repo: P, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = command()
         .arg("-C")
         .arg(repo.as_ref().as_os_str())
         .args(args)
@@ -403,7 +441,7 @@ pub fn diff_name_set<P: AsRef<Path>>(
     crate::validation::validate_git_rev(from)
         .with_context(|| format!("invalid commit: {}", from))?;
     crate::validation::validate_git_rev(to).with_context(|| format!("invalid commit: {}", to))?;
-    let output = Command::new("git")
+    let output = command()
         .arg("-C")
         .arg(repo.as_ref().as_os_str())
         .args([
@@ -452,7 +490,7 @@ pub fn list_object_shas_with_depth<P: AsRef<Path>>(
 /// Cheap: indexes the existing `.idx` files; no pack data is rewritten. Best
 /// effort — a failure only loses the lookup speedup, not correctness.
 pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = Command::new("git")
+    let status = command()
         .arg("-C")
         .arg(repo_dir.as_ref().as_os_str())
         .args(["multi-pack-index", "write"])
@@ -475,7 +513,7 @@ pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 /// graph layer instead of rewriting the whole graph, so this stays O(new
 /// commits) rather than O(all commits) every sync.
 pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = Command::new("git")
+    let status = command()
         .arg("-C")
         .arg(repo_dir.as_ref().as_os_str())
         .args([
@@ -504,7 +542,7 @@ pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 /// costs one reachability walk, so call it once after fetch, before the heavy
 /// builds, not on the depth=1 fast path.
 pub fn write_bitmap<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = Command::new("git")
+    let status = command()
         .arg("-C")
         .arg(repo_dir.as_ref().as_os_str())
         .args(["multi-pack-index", "write", "--bitmap", "--no-progress"])
@@ -532,7 +570,7 @@ pub fn build_multi_pack_index_bytes(packs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<
     let dir = tmp.path();
     // Minimal bare object store so `git multi-pack-index write` has a repo and
     // an `objects/pack` directory laid out exactly like the client's.
-    let status = Command::new("git")
+    let status = command()
         .args(["init", "--bare", "-q"])
         .arg(dir.as_os_str())
         .status()
@@ -551,7 +589,7 @@ pub fn build_multi_pack_index_bytes(packs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<
         std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), pack_bytes)?;
         std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), idx_bytes)?;
     }
-    let status = Command::new("git")
+    let status = command()
         .arg("-C")
         .arg(dir.as_os_str())
         .args(["multi-pack-index", "write"])
@@ -662,7 +700,7 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     // Capture rather than inherit: pack-objects prints each output pack's hash to
     // stdout (noise in the server log), and stderr carries the real diagnostic when
     // it fails. We write the packs by base-name, so stdout is not needed.
-    let mut child = Command::new("git")
+    let mut child = command()
         .arg("-C")
         .arg(repo.as_ref())
         .arg("pack-objects")
@@ -714,7 +752,7 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
 
-    let mut child = Command::new("git")
+    let mut child = command()
         .arg("-C")
         .arg(repo.as_ref())
         .arg("pack-objects")
@@ -921,7 +959,7 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
                 "gix index-pack failed for {}: {e:#}; falling back to git index-pack",
                 pack_path.display()
             );
-            let status = Command::new("git")
+            let status = command()
                 .arg("index-pack")
                 .arg(pack_path)
                 .current_dir(directory)
@@ -942,7 +980,7 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
 }
 
 pub fn init<P: AsRef<Path>>(git_dir: P) -> Result<()> {
-    let status = Command::new("git")
+    let status = command()
         .args(["init", "-q", &git_dir.as_ref().to_string_lossy()])
         .status()
         .context("git init")?;
@@ -986,7 +1024,7 @@ pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
         ("gc.autoPackLimit", "0"),
         ("maintenance.auto", "false"),
     ] {
-        let status = Command::new("git")
+        let status = command()
             .arg("-C")
             .arg(mirror_dir.as_os_str())
             .args(["config", key, value])
@@ -1277,7 +1315,7 @@ async fn ls_remote_tip_async_with(
     let child_stdout = stdout.try_clone().context("clone ls-remote stdout file")?;
     let mut stderr = tempfile::tempfile().context("create ls-remote stderr file")?;
     let child_stderr = stderr.try_clone().context("clone ls-remote stderr file")?;
-    let mut command = tokio::process::Command::new("git");
+    let mut command = tokio::process::Command::from(command());
     command
         .args(&git_args)
         .args(["ls-remote", "--symref", "--", &url])
@@ -1579,7 +1617,7 @@ fn sync_bare_mirror_admitted_from(
 
 fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
     mirror_dir.exists()
-        && Command::new("git")
+        && command()
             .arg("-C")
             .arg(mirror_dir.as_os_str())
             .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
@@ -1592,7 +1630,7 @@ fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
 fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     if !mirror_dir.exists() {
         std::fs::create_dir_all(mirror_dir.parent().unwrap_or(Path::new("")))?;
-        let status = Command::new("git")
+        let status = command()
             .args(["init", "--bare"])
             .arg(mirror_dir.as_os_str())
             .status()
@@ -1602,7 +1640,7 @@ fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
         }
         disable_auto_gc(mirror_dir)?;
 
-        let status = Command::new("git")
+        let status = command()
             .arg("-C")
             .arg(mirror_dir.as_os_str())
             .args(["remote", "add", "origin", url])
@@ -1612,7 +1650,7 @@ fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
             bail!("remote add origin failed");
         }
 
-        let status = Command::new("git")
+        let status = command()
             .arg("-C")
             .arg(mirror_dir.as_os_str())
             .args([
@@ -1642,7 +1680,7 @@ fn sync_bare_mirror_rev(
 
     let refspec = format!("{rev}:refs/ripclone/revs/{}", rev_internal_ref_name(rev));
 
-    let output = Command::new("git")
+    let output = command()
         .args(git_args)
         .arg("-C")
         .arg(mirror_dir.as_os_str())

@@ -14,6 +14,10 @@ Only one server process may own a control database. A second server on the
 same path exits before it binds its port or starts any work. Admitted builds
 survive a restart.
 
+On Linux the server's `git` children die with it, even after a SIGKILL. macOS
+has no parent-death signal, so a killed server's `git` children run until
+their command ends, alongside a restarted server.
+
 ## Artifact storage
 
 Local disk is the default and needs no configuration. With local disk, the

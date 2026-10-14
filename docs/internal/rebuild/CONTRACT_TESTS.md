@@ -69,7 +69,7 @@ against the CLI) or the plan step that introduces the behavior.
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | now |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | now |
 
-### C. Outputs are independent and immutable (5)
+### C. Outputs are independent and immutable (6)
 
 | # | Test | Lands |
 |---|---|---|
@@ -78,6 +78,7 @@ against the CLI) or the plan step that introduces the behavior.
 | C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | step 3 PR B (S3 row) |
 | C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | step 3 PR A (short lease) |
 | C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). | step 3 PR A |
+| C6 | Linux only: SIGKILL the server while the origin holds its fetch: the server's `git` children exit too. | follow-ups |
 
 ### D. Clone pins B (6)
 
@@ -160,7 +161,7 @@ Ripclone token reaches the origin.
 | I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | now |
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | now |
 
-Total: 62 tests. Several are table-driven.
+Total: 63 tests. Several are table-driven.
 
 ## What this deletes
 
