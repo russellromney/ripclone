@@ -19,9 +19,19 @@ pub const DEFAULT_ARCHIVE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 /// be reused without recompression. Frames stay in path order (the stream is the
 /// path-ordered concatenation of file contents), so there is no compression
 /// penalty vs fixed framing.
-const CDC_MIN: usize = 1024 * 1024;
-const CDC_AVG: usize = 4 * 1024 * 1024;
-const CDC_MAX: usize = 16 * 1024 * 1024;
+#[derive(Clone, Copy, Debug)]
+struct CdcBounds {
+    min: usize,
+    avg: usize,
+    max: usize,
+}
+
+/// The production bounds. Only tests build with others.
+const CDC: CdcBounds = CdcBounds {
+    min: 1024 * 1024,
+    avg: 4 * 1024 * 1024,
+    max: 16 * 1024 * 1024,
+};
 
 /// How many raw frame bytes to buffer before compressing a batch in parallel.
 /// The worktree is streamed through the chunker one frame at a time, so peak
@@ -50,7 +60,7 @@ fn cdc_frame_bounds(stream: &[u8]) -> Vec<(usize, usize)> {
     if stream.is_empty() {
         return vec![(0, 0)];
     }
-    fastcdc::v2020::FastCDC::new(stream, CDC_MIN, CDC_AVG, CDC_MAX)
+    fastcdc::v2020::FastCDC::new(stream, CDC.min, CDC.avg, CDC.max)
         .map(|c| (c.offset, c.offset + c.length))
         .collect()
 }
@@ -135,13 +145,22 @@ struct FrameChunk {
 
 pub struct ArchiveBuilder {
     mirror: PathBuf,
+    cdc: CdcBounds,
 }
 
 impl ArchiveBuilder {
     pub fn new<P: AsRef<Path>>(mirror: P) -> Self {
         Self {
             mirror: mirror.as_ref().to_path_buf(),
+            cdc: CDC,
         }
+    }
+
+    /// The same builder with smaller frames, so a test can span many frames
+    /// with little data.
+    #[cfg(test)]
+    fn with_cdc(self, cdc: CdcBounds) -> Self {
+        Self { cdc, ..self }
     }
 
     /// Build a working-tree archive and its manifest for `commit`.
@@ -327,7 +346,7 @@ impl ArchiveBuilder {
         let mut batch: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut batch_bytes = 0usize;
 
-        for chunk in StreamCDC::new(reader, CDC_MIN, CDC_AVG, CDC_MAX) {
+        for chunk in StreamCDC::new(reader, self.cdc.min, self.cdc.avg, self.cdc.max) {
             let chunk = chunk.map_err(|e| anyhow::anyhow!("content-defined chunking: {e}"))?;
             let start = usize::try_from(chunk.offset)
                 .context("content-defined frame offset does not fit in usize")?;
@@ -1060,7 +1079,7 @@ impl ArchiveBuilder {
             if let Some(&(o0, o1, shift)) = segs.get(seg_hint)
                 && o0 <= fs
                 && fe <= o1
-                && (o0 == 0 || fs >= o0.saturating_add(CDC_MAX))
+                && (o0 == 0 || fs >= o0.saturating_add(self.cdc.max))
             {
                 let Some(ns) = fs.checked_add_signed(shift) else {
                     return full();
@@ -1121,7 +1140,7 @@ impl ArchiveBuilder {
                 let hi = g1.min(be) - bs;
                 buf.extend_from_slice(&blob.data[lo..hi]);
             }
-            for c in fastcdc::v2020::FastCDC::new(&buf, CDC_MIN, CDC_AVG, CDC_MAX) {
+            for c in fastcdc::v2020::FastCDC::new(&buf, self.cdc.min, self.cdc.avg, self.cdc.max) {
                 let raw = &buf[c.offset..c.offset + c.length];
                 let raw_hash = crate::cas::hash(raw);
                 let (chunk_hash, compressed_len) = match prev_map.get(&raw_hash) {
@@ -1840,65 +1859,68 @@ mod tests {
         assert!(changed.contains(b"b.txt".as_slice()));
     }
 
-    /// ~3 MB of well-mixed (CDC-cuttable) bytes per file (splitmix64).
-    fn mix_blob(seed: u64) -> Vec<u8> {
-        // 3 MiB pseudo-random bytes. With production CDC settings (avg 4 MiB,
-        // max 16 MiB) ten of these gives the bounded-archive test enough data to
-        // span several frames.
-        const MIX_BLOB_SIZE: usize = 3_000_000;
-        (0..MIX_BLOB_SIZE)
-            .map(|i| {
-                let i = i as u64;
-                let mut z = (seed << 40)
-                    .wrapping_add(i)
-                    .wrapping_add(0x9E37_79B9_7F4A_7C15);
-                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                (z ^ (z >> 31)) as u8
-            })
-            .collect()
+    /// `len` well-mixed (CDC-cuttable) bytes: splitmix64, eight bytes per step.
+    fn mix_blob(seed: u64, len: usize) -> Vec<u8> {
+        let mut blob = Vec::with_capacity(len + 8);
+        let mut i = 0u64;
+        while blob.len() < len {
+            let mut z = (seed << 40)
+                .wrapping_add(i)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            blob.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+            i += 1;
+        }
+        blob.truncate(len);
+        blob
     }
 
     fn as_refs(fs: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
         fs.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect()
     }
 
-    /// Build the bounded archive at `files2` (with `files1` as the prior) and assert
-    /// it is byte-identical to the full incremental build: same per-frame chunk
-    /// hashes, frame table, and files table.
-    fn assert_bounded_matches(files1: &[(String, Vec<u8>)], files2: &[(String, Vec<u8>)]) {
+    /// The prior commit's build, shared by every scenario of
+    /// `bounded_archive_matches_incremental`.
+    struct Prior<'a> {
+        builder: &'a ArchiveBuilder,
+        cas: &'a Cas,
+        commit: &'a str,
+        out: &'a ArchiveBuildOutput,
+    }
+
+    /// Build the bounded archive at commit `c2` (with `prior` as the previous
+    /// build) and assert it is byte-identical to the full incremental build: same
+    /// per-frame chunk hashes, frame table, and files table.
+    fn assert_bounded_matches(prior: &Prior, c2: &str) {
         use std::collections::HashMap;
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = crate::test_fixture::init_bare(tmp.path());
-        let cas = Cas::new(tempfile::tempdir().unwrap().path()).unwrap();
-        let builder = ArchiveBuilder::new(tmp.path());
-
-        let c1 = commit_onto(&repo, &as_refs(files1));
-        let empty: HashMap<String, (String, u64)> = HashMap::new();
-        let c1_out = builder
-            .build_into_cas_incremental(&c1, &cas, None, 3, &empty, DEFAULT_ARCHIVE_CHUNK_SIZE)
-            .unwrap();
-        let c1_meta = c1_out.metadata;
-        let c1_frames = c1_out.archive_frames;
-        assert!(c1_frames.len() > 3, "need several frames to exercise reuse");
-
-        let c2 = commit_onto(&repo, &as_refs(files2));
-        let prev_map: HashMap<String, (String, u64)> = c1_frames
+        let prev_map: HashMap<String, (String, u64)> = prior
+            .out
+            .archive_frames
             .iter()
             .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
             .collect();
-        let inc = builder
-            .build_into_cas_incremental(&c2, &cas, None, 3, &prev_map, DEFAULT_ARCHIVE_CHUNK_SIZE)
-            .unwrap();
-        let bnd = builder
-            .build_into_cas_bounded(
-                &c2,
-                &cas,
+        let inc = prior
+            .builder
+            .build_into_cas_incremental(
+                c2,
+                prior.cas,
                 None,
                 3,
-                &c1_frames,
-                &c1_meta.files,
-                &c1,
+                &prev_map,
+                DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
+            .unwrap();
+        let bnd = prior
+            .builder
+            .build_into_cas_bounded(
+                c2,
+                prior.cas,
+                None,
+                3,
+                &prior.out.archive_frames,
+                &prior.out.metadata.files,
+                prior.commit,
                 DEFAULT_ARCHIVE_CHUNK_SIZE,
             )
             .unwrap();
@@ -1945,10 +1967,20 @@ mod tests {
 
     /// The bounded archive (read only the changed middle) must be byte-identical to
     /// the full incremental build across edit positions and shapes — a wrong
-    /// prefix/suffix reuse or a bad offset shift would diverge here. The
-    /// scenarios run in parallel.
+    /// prefix/suffix reuse or a bad offset shift would diverge here. Frames are
+    /// the production bounds scaled down 64x, so 2 MB spans about 20 of them
+    /// and a change has whole frames more than one max frame away on both
+    /// sides to reuse. The prior commit is built once; the scenarios' builds
+    /// run in parallel.
     #[test]
     fn bounded_archive_matches_incremental() {
+        const SCALE: usize = 64;
+        let cdc = CdcBounds {
+            min: CDC.min / SCALE,
+            avg: CDC.avg / SCALE,
+            max: CDC.max / SCALE,
+        };
+        let mix_blob = |seed| mix_blob(seed, 200_000);
         let base: Vec<(String, Vec<u8>)> = (0..10)
             .map(|s| (format!("f{s:02}.bin"), mix_blob(s)))
             .collect();
@@ -2015,12 +2047,38 @@ mod tests {
             }),
         ];
 
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let builder = ArchiveBuilder::new(tmp.path()).with_cdc(cdc);
+        let c1 = commit_onto(&repo, &as_refs(&base));
+        let empty = std::collections::HashMap::new();
+        let out = builder
+            .build_into_cas_incremental(&c1, &cas, None, 3, &empty, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .unwrap();
+        assert!(
+            out.archive_frames.len() > 15,
+            "need many frames to exercise reuse, got {}",
+            out.archive_frames.len()
+        );
+        let prior = Prior {
+            builder: &builder,
+            cas: &cas,
+            commit: &c1,
+            out: &out,
+        };
+        // Commits update one ref, so they are made in turn.
+        let commits: Vec<String> = scenarios
+            .iter()
+            .map(|scenario| commit_onto(&repo, &as_refs(&scenario(&base))))
+            .collect();
         std::thread::scope(|scope| {
-            let base = &base;
-            let mut handles = Vec::with_capacity(scenarios.len());
-            for scenario in scenarios {
-                handles.push(scope.spawn(move || assert_bounded_matches(base, &scenario(base))));
-            }
+            let prior = &prior;
+            let handles: Vec<_> = commits
+                .iter()
+                .map(|c2| scope.spawn(move || assert_bounded_matches(prior, c2)))
+                .collect();
             for h in handles {
                 h.join().expect("bounded scenario panicked");
             }
