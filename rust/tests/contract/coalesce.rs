@@ -42,10 +42,9 @@ fn b1_concurrent_clones_share_one_build() {
     let clones: Vec<_> = targets
         .iter()
         .map(|t| {
-            world.cli_spawn_env(
+            world.cli_spawn(
                 &proxy,
                 &["clone", "acme/b1", t.to_str().unwrap(), "--depth", "1"],
-                SLOW_POLL,
             )
         })
         .collect();
@@ -75,7 +74,7 @@ fn b2_branch_sha_and_default_share_one_build() {
     let by_sha = world.target("b2-sha");
     let by_default = world.target("b2-default");
     let clones = [
-        world.cli_spawn_env(
+        world.cli_spawn(
             &proxy,
             &[
                 "clone",
@@ -86,9 +85,8 @@ fn b2_branch_sha_and_default_share_one_build() {
                 "--branch",
                 "main",
             ],
-            SLOW_POLL,
         ),
-        world.cli_spawn_env(
+        world.cli_spawn(
             &proxy,
             &[
                 "clone",
@@ -99,9 +97,8 @@ fn b2_branch_sha_and_default_share_one_build() {
                 "--at",
                 &b,
             ],
-            SLOW_POLL,
         ),
-        world.cli_spawn_env(
+        world.cli_spawn(
             &proxy,
             &[
                 "clone",
@@ -110,7 +107,6 @@ fn b2_branch_sha_and_default_share_one_build() {
                 "--depth",
                 "1",
             ],
-            SLOW_POLL,
         ),
     ];
     proxy.wait_seen("three admissions", |seen| admissions(seen) >= 3);
@@ -149,7 +145,7 @@ fn b3_move_during_build_builds_both() {
     let proxy = FaultProxy::start(&server);
 
     let pinned_b = world.target("b3-b");
-    let clone = world.cli_spawn_env(
+    let clone = world.cli_spawn(
         &proxy,
         &[
             "clone",
@@ -158,7 +154,6 @@ fn b3_move_during_build_builds_both() {
             "--depth",
             "1",
         ],
-        SLOW_POLL,
     );
     proxy.wait_seen("the clone to pin B", |seen| admissions(seen) >= 1);
     let c = origin.commit(&[("f.txt", "c\n")], "C");

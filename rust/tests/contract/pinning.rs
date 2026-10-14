@@ -49,10 +49,9 @@ fn d2_changed_commit_in_later_poll_fails() {
     let proxy = FaultProxy::start(&server);
     proxy.rewrite(api::COMMIT_READS, &b, &a);
     let target = world.target("d2");
-    let out = world.cli_env(
+    let out = world.cli(
         &proxy,
         &["clone", "acme/d2", target.to_str().unwrap(), "--depth", "1"],
-        SLOW_POLL,
     );
     let err = out.err();
 
@@ -117,9 +116,11 @@ fn d4_wait_reports_pending_without_installing() {
 
     let proxy = FaultProxy::start(&server);
     let target = world.target("d4");
-    let out = world.cli(
+    // Polls 50 ms apart run the CLI's 40-poll budget out in about 2 s.
+    let out = world.cli_env(
         &proxy,
         &["clone", "acme/d4", target.to_str().unwrap(), "--wait"],
+        &[("RIPCLONE_POLL_MS", "50")],
     );
     let err = out.err();
 

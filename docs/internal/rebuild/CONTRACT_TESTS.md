@@ -312,7 +312,11 @@ bad retention limit turned that limit off (H4). The server's git children no
 longer write into its log: `git init` of a mirror printed its default-branch
 hint and an "Initialized" line, and `pack-objects` printed each pack's hash.
 Their output is now captured, and a failure's error carries git's stderr
-(C5).
+(C5). The harness ran the CLI with polls 50 ms apart, so `--wait` gave up
+after about 2 s; under a full parallel run the F rows' 2 MB fixture took
+2.2 s to build and four F rows failed once. The CLI now polls at most 200 ms
+apart in every test (about 8 s, inside the 10 s wait), `SLOW_POLL` is gone,
+and D4, which needs the budget to run out, sets 50 ms itself.
 
 ## Open points
 

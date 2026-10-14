@@ -21,10 +21,6 @@ pub const TOKEN: &str = "ripclone-contract-token";
 /// How long any wait in this suite may take before the test fails.
 pub const WAIT: Duration = Duration::from_secs(10);
 
-/// CLI env for clones that wait on a held build: 40 polls at 200 ms, so the
-/// CLI keeps polling for 8 s instead of giving up after 2 s.
-pub const SLOW_POLL: &[(&str, &str)] = &[("RIPCLONE_POLL_MS", "200")];
-
 /// A built binary. `RIPCLONE_BIN_DIR` points at prebuilt binaries (CI fan-out
 /// jobs); otherwise Cargo's own build of this package is used.
 pub fn bin(name: &str) -> PathBuf {
@@ -244,7 +240,10 @@ impl World {
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .env("RIPCLONE_ORIGIN_BASE", self.origin_base())
             .env("RIPCLONE_NO_METRICS", "1")
-            .env("RIPCLONE_POLL_MS", "50")
+            // The CLI gives up after 40 polls. Polls at most 200 ms apart give
+            // it about 8 s, inside WAIT, so a build slowed by a loaded
+            // machine still finishes inside the budget.
+            .env("RIPCLONE_POLL_MS", "200")
             .stdin(Stdio::null());
         for (k, v) in env {
             cmd.env(k, v);

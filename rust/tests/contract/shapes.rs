@@ -270,10 +270,7 @@ fn g6_incremental_files_rebuild_after_small_push() {
     let a = origin.commit(&[("zz.txt", "a\n")], "A");
     origin.publish();
     let server = world.server(&[]);
-    // 12 MiB takes longer to build than the default 2 s poll budget.
-    world
-        .cli_env(&server, &["add", "acme/g6", "--wait"], SLOW_POLL)
-        .ok();
+    world.cli(&server, &["add", "acme/g6", "--wait"]).ok();
     let proxy = FaultProxy::start(&server);
     let files_clone = |name: &str| {
         let target = world.target(name);
@@ -302,9 +299,7 @@ fn g6_incremental_files_rebuild_after_small_push() {
 
     let b = origin.commit(&[("zz.txt", "b\n")], "B");
     origin.publish();
-    world
-        .cli_env(&server, &["sync", "acme/g6", "--wait"], SLOW_POLL)
-        .ok();
+    world.cli(&server, &["sync", "acme/g6", "--wait"]).ok();
     let grown = stored_bytes(&world) - stored_a;
     let (target_b, fetched_b) = files_clone("g6-b");
 
@@ -403,13 +398,7 @@ fn g9_concurrent_branch_builds_do_not_mix() {
     http.hold_fetches();
     let syncs: Vec<RunningCli> = ["main", "feature"]
         .iter()
-        .map(|branch| {
-            world.cli_spawn_env(
-                &server,
-                &["sync", "acme/g9", "--at", branch, "--wait"],
-                SLOW_POLL,
-            )
-        })
+        .map(|branch| world.cli_spawn(&server, &["sync", "acme/g9", "--at", branch, "--wait"]))
         .collect();
     http.wait_held(1);
     wait_for("both branches admitted", || {
