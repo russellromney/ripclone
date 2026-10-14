@@ -25,8 +25,17 @@ done
 curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null || { echo "server did not start"; cat "$WORKDIR/server.log"; exit 1; }
 
 REPO="${REPO:-oven-sh/bun}"
-echo "==> Syncing $REPO..."
-curl -sf -X POST "http://127.0.0.1:$PORT/v1/repos/github/$REPO/sync" > "$WORKDIR/sync.json"
+API="http://127.0.0.1:$PORT/v1/repos/github/$REPO"
+echo "==> Adding $REPO..."
+commit=$(curl -sf -X POST "$API/add" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
+echo "==> Waiting for the Files output of $commit..."
+while true; do
+  curl -sf "$API/commits/$commit?kind=files" > "$WORKDIR/sync.json"
+  state=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1]))["state"])' "$WORKDIR/sync.json")
+  [ "$state" = "pending" ] || break
+  sleep 2
+done
+[ "$state" = "ready" ] || { echo "Files output $state"; cat "$WORKDIR/sync.json"; exit 1; }
 
 echo "==> CAS total"
 du -sh "$WORKDIR/cas"

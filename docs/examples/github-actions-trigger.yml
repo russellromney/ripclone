@@ -31,4 +31,6 @@ jobs:
           token_hash=$(printf %s "$RIPCLONE_SERVER_TOKEN" | sha256sum | cut -d' ' -f1)
           curl -fsSL -X POST \
             -H "Authorization: Ripclone $token_hash" \
-            "${{ vars.RIPCLONE_SERVER }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
+            -H "Content-Type: application/json" \
+            -d '{"selector": "${{ github.sha }}"}' \
+            "${{ vars.RIPCLONE_SERVER }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/builds"

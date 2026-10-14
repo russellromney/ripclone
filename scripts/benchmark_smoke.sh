@@ -84,12 +84,13 @@ run_current_server() {
     { cat "$BASE_DIR/server.log"; fail "server not ready"; }
 
   # Control: the gate must actually be live on the server under test, otherwise
-  # the assertion below proves nothing. A sync on a repo that was never added
+  # the assertion below proves nothing. A build of a repo that was never added
   # has to be rejected with repo_not_added.
   body="$(curl -s -X POST -H "Authorization: Ripclone $TOKEN_HASH" \
-    "$url/v1/repos/github/$REPO/sync?branch=main")"
+    -H 'Content-Type: application/json' -d '{"selector":"main"}' \
+    "$url/v1/repos/github/$REPO/builds")"
   case "$body" in
-    *repo_not_added*) pass "added-repos gate is live (sync without add -> repo_not_added)" ;;
+    *repo_not_added*) pass "added-repos gate is live (build without add -> repo_not_added)" ;;
     *) fail "server under test does not enforce the added-repos gate; this smoke test cannot catch the regression (got: $body)" ;;
   esac
 
@@ -102,7 +103,7 @@ run_current_server() {
     cat "$log" >&2
     # The harness swallows response bodies, so name the likely cause here.
     if ! grep -q 'repo .* is added' "$log"; then
-      echo "HINT: the harness never added $REPO. The server rejects sync/refs/clone" >&2
+      echo "HINT: the harness never added $REPO. The server rejects builds and clones" >&2
       echo "      for a repo that was never added: 404 {\"code\":\"repo_not_added\"}." >&2
     fi
     fail "benchmark harness exited non-zero against a current ripclone-server"

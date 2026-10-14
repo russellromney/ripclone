@@ -132,7 +132,10 @@ cas_path() {
   echo "$CAS_DIR/${h:0:2}/${h}"
 }
 AUTH_HASH=$(printf '%s' "${RIPCLONE_SERVER_TOKEN:-}" | shasum -a 256 | awk '{print $1}')
-ref_json=$(curl -fsS -H "Authorization: Ripclone $AUTH_HASH" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/refs/HEAD")
+# Read the default branch tip's Full output so we can report artifact sizes.
+commit=$(curl -fsS -X POST -H "Authorization: Ripclone $AUTH_HASH" -H 'Content-Type: application/json' -d '{"selector":"HEAD"}' \
+  "$SERVER_URL/v1/repos/github/$OWNER/$NAME/builds" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
+ref_json=$(curl -fsS -H "Authorization: Ripclone $AUTH_HASH" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/commits/$commit?kind=full")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 
 echo ""

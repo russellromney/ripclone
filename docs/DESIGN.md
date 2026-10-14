@@ -35,15 +35,36 @@ ripclone builds the content three ways so each clone takes only what it needs:
 ### Separate exact results
 
 Each exact commit stores three independent results: **Head**, **Full**, and
-**Files**. A sync builds and publishes Head first. It then builds missing Full
-history and Files archive work concurrently, publishing each as soon as it is
-complete. A later job checks these fields and never rebuilds a result that is
-already present.
+**Files**. A build publishes Head first. It then builds Full history and the
+Files archive, publishing each as soon as it is complete. A published result
+never changes, and a later build never rebuilds one.
 
-A depth-1 editable clone requests Head, a full editable clone requests Full,
-and files mode requests Files. A missing result returns `202` while the one job
-for that exact commit is active. Readiness comes only from the requested stored
-result; job state reports pending or failed work.
+A depth-1 editable clone needs Head, a full editable clone needs Full, and
+files mode needs Files. Each result is `pending`, `ready`, or `failed`.
+
+### API
+
+Two routes carry every build and clone:
+
+- `POST /v1/repos/{provider}/{path}/builds` with `{"selector", "retry"}`
+  resolves the selector to one commit and admits a build of it. The selector
+  is `HEAD`, a full commit SHA (trusted as given), or a branch or tag name;
+  anything else is `400 invalid_selector`. `retry: true` also rebuilds failed
+  results. The answer is `{commit, checkout_name, head, files, full}`, each
+  result as `{state, error?}`.
+- `GET /v1/repos/{provider}/{path}/commits/{sha}?kind=head|full|files` reads
+  one result: a ready body with signed URLs, a pending body, or a failed body
+  with the error. Without `kind` it returns the same summary as the POST. It
+  never builds and is never cached.
+
+A clone POSTs once, then polls the GET for the commit it was given, so a
+branch moving mid-clone cannot change what it installs. It uses the same GET
+to refresh expired URLs. While Full is pending, the GET offers a ready Full of
+an earlier commit (the ref's latest, or the parent) as `top_up`; a full clone
+installs that and fetches the rest from the git host, so it never waits on the
+server. Errors are `{error, code}`: `repo_not_added`, `repo_not_found`,
+`ref_not_found`, `build_not_found`, `upstream_unavailable` and
+`control_unavailable` among them.
 
 ### Content-defined chunking and cheap re-syncs
 

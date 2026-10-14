@@ -111,7 +111,8 @@ fastest to slowest:
 
 - **Push webhook** at `/webhooks/{github|gitlab|gitea}`. See
   [Webhooks](docs/WEBHOOKS.md).
-- **GitHub Actions**: call `POST /v1/repos/github/{owner}/{repo}/sync` on push.
+- **GitHub Actions**: call `POST /v1/repos/github/{owner}/{repo}/builds` with
+  `{"selector": "<pushed sha>"}` on push.
   A ready-to-copy workflow is in
   [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).
 - **Polling**: the server `ls-remote`s added repos every 5 minutes
@@ -123,7 +124,7 @@ fastest to slowest:
 
 ```bash
 ripclone clone owner/repo [dir] [--branch B] [--depth 1] [--mode files]
-ripclone clone owner/repo --at <full-sha>   # a specific commit
+ripclone clone owner/repo --at <ref>        # a full commit SHA, branch, or tag
 ripclone clone gitlab:group/project         # another provider
 ripclone clone owner/repo --bench           # print a per-phase timing report
 ripclone sync owner/repo [--wait]
@@ -148,7 +149,7 @@ exit code says what kind of failure it was:
 | 2 | Bad arguments | Fix the command |
 | 3 | Not authenticated (401) | Log in or set the token |
 | 4 | Forbidden (403) | Get access |
-| 5 | Not found (404): repo not added, unknown ref, missing artifact | Add the repo or fix the ref |
+| 5 | Not found (404): repo not added, upstream repo not found, unknown ref, missing artifact | Add the repo or fix the name or ref |
 | 6 | Server unreachable, rate limited, or unavailable (429, 5xx) | Retry |
 | 130 | Interrupted (Ctrl-C); staging is removed before exit | |
 

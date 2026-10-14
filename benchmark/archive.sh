@@ -84,8 +84,10 @@ printf "sync=%d ms\n" $((sync_end - sync_start))
 OWNER="$(echo "$REPO" | cut -d/ -f1)"
 NAME="$(echo "$REPO" | cut -d/ -f2)"
 
-# Resolve the ref so we can report artifact sizes.
-ref_json=$(curl -fsS "${CURL_AUTH[@]}" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/refs/HEAD")
+# Read the default branch tip's Full output so we can report artifact sizes.
+commit=$(curl -fsS -X POST "${CURL_AUTH[@]}" -H 'Content-Type: application/json' -d '{"selector":"HEAD"}' \
+  "$SERVER_URL/v1/repos/github/$OWNER/$NAME/builds" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
+ref_json=$(curl -fsS "${CURL_AUTH[@]}" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/commits/$commit?kind=full")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 
 # CAS objects are stored by hash under CAS_DIR/<first2>/<hash>.
