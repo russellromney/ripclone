@@ -67,8 +67,7 @@ history at 5 Gbps and about 6× for depth 1. Details and caveats:
 Requirements: Rust 1.96 or newer (CI uses the version pinned in
 `rust-toolchain.toml`), `protoc`, and `cmake` (for `zlib-ng`). At run time the
 server and editable clones need `git` on the `PATH`; files-only clones do not.
-Linux and macOS are supported; Windows is not. Use client and server builds
-with the same wire version; a mismatch fails clearly.
+Without it, the command stops before any work with "system Git is required".
 
 ```bash
 cd rust
@@ -211,6 +210,32 @@ one fire-and-forget POST to that server after a successful clone: clone id,
 repo, commit, mode, whether it waited for a build, wall time,
 bytes, and client OS/arch/version. It never affects the clone's result.
 `--no-metrics` or `RIPCLONE_NO_METRICS=1` turns it off.
+
+## Self-hosted and hosted
+
+Self-hosted ripclone is free and complete. Your server owns the repo list,
+builds, clone policy, and artifact storage. The hosted service at
+`https://ripclone.com` is an optional convenience. The CLI uses it only when no
+server is configured. The code in this repository has no accounts, billing, or
+tenant logic.
+
+## Support
+
+- **Platforms:** Linux (x86-64, arm64) and macOS (x86-64, arm64). Windows is
+  not supported.
+- **Rust:** 1.96 or newer.
+- **Wire protocol:** the client and server must speak the same protocol
+  version (`GET /v1/version`). A mismatch fails with HTTP 426 and a message
+  to upgrade, not with a partial clone.
+- **Stored formats:** artifacts, mirrors, and `control.db` are internal. A
+  pre-release version may need a fresh cache.
+
+## Contributing
+
+Bug fixes on the supported platforms are welcome as pull requests. New storage
+backends, databases, providers, or product features need a design issue first.
+CI runs `scripts/ci.sh`; `bash scripts/ci.sh lint` and `bash scripts/ci.sh test`
+run the same checks locally.
 
 ## License
 
