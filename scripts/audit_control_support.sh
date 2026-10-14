@@ -13,7 +13,7 @@ while IFS= read -r line; do
   [ -n "$line" ] || continue
   path="${line%%:*}"
   case "$path" in
-    rust/src/control.rs|rust/src/server.rs|docs/BACKENDS.md|docs/CONFIG.md|docs/internal/*)
+    rust/src/control/mod.rs|rust/src/server.rs|docs/BACKENDS.md|docs/CONFIG.md|docs/internal/*)
       allowed=$((allowed + 1))
       ;;
     *)
@@ -31,8 +31,10 @@ if [ "$unexpected" -ne 0 ]; then
   exit 1
 fi
 
+# sqlx is allowed for the SQLite control store; its network-database drivers
+# are not.
 dependency_matches="$(cd "$ROOT" && git grep -nE \
-  'name = "(sqlx|sqlx-postgres|sqlx-mysql|tokio-postgres|postgres|mysql_async)"|features = .*"(postgres|mysql)"' \
+  'name = "(sqlx-postgres|sqlx-mysql|tokio-postgres|postgres|mysql_async)"|features = .*"(postgres|mysql)"' \
   -- rust/Cargo.toml rust/Cargo.lock || true)"
 if [ -n "$dependency_matches" ]; then
   echo "removed network-database dependency closure is present:" >&2
