@@ -301,3 +301,31 @@ fn h8_readyz_fails_when_the_control_db_file_goes() {
         assert!(server.log().contains(&line), "{case}:\n{}", server.log());
     }
 }
+
+/// H9: build scratch lives under the cache directory and is emptied at
+/// startup, so a killed server leaks nothing into the system temp directory.
+/// The server's `TMPDIR` is read-only: a build that staged there would fail.
+#[test]
+fn h9_build_scratch_is_under_the_cache_and_cleared_at_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new();
+    let origin = world.origin("acme", "h9");
+    let tip = origin.commit(&[("a.txt", "a\n"), ("b/c.txt", "c\n")], "A");
+    origin.publish();
+    let scratch = world.path("server").join("cache").join("tmp");
+    std::fs::create_dir_all(scratch.join(".tmpkilled")).unwrap();
+    std::fs::write(scratch.join(".tmpkilled").join("pack-x.pack"), b"x").unwrap();
+    let system_tmp = world.path("system-tmp");
+    std::fs::create_dir_all(&system_tmp).unwrap();
+    std::fs::set_permissions(&system_tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let server = world.server(&[("TMPDIR", system_tmp.to_str().unwrap())]);
+    assert!(!scratch.join(".tmpkilled").exists(), "stale scratch kept");
+    world.cli(&server, &["add", "acme/h9", "--wait"]).ok();
+    let target = world.target("h9");
+    world
+        .cli(&server, &["clone", "acme/h9", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(listing(&target), origin.tree(&tip));
+    assert_eq!(std::fs::read_dir(&system_tmp).unwrap().count(), 0);
+}

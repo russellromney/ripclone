@@ -21,7 +21,9 @@ their command ends, alongside a restarted server.
 ## Artifact storage
 
 Local disk is the default and needs no configuration. With local disk, the
-`cache` directory is the durable artifact store and must be kept.
+`cache` directory is the durable artifact store and must be kept. Builds
+stage temporary files in `cache/tmp`; the server empties it at startup, so a
+crashed build leaves nothing behind.
 
 For S3-compatible storage (AWS S3, Cloudflare R2, Tigris, MinIO):
 

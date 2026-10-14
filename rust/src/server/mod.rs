@@ -237,6 +237,33 @@ fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
     SEM.get_or_init(|| tokio::sync::Semaphore::new(4))
 }
 
+/// Put every temporary file and directory this process makes under `dir`,
+/// emptied first. Builds stage packs and archives in temp directories; a
+/// killed or crashed server cannot remove them, and for a large repo each is
+/// gigabytes. Under the cache directory they are cleared on the next start
+/// instead of filling the system temp directory. Call only after this process
+/// owns the control database, so no other server is using `dir`.
+fn use_scratch_dir(dir: &std::path::Path) -> Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("clear scratch dir {}", dir.display()));
+        }
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create scratch dir {}", dir.display()))?;
+    if let Err(current) = tempfile::env::override_temp_dir(dir) {
+        anyhow::ensure!(
+            current == dir,
+            "temp dir already set to {}, not {}",
+            current.display(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 async fn serve(
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
@@ -302,6 +329,7 @@ async fn serve(
     );
     std::fs::create_dir_all(cas_dir)?;
     std::fs::create_dir_all(repo_root)?;
+    use_scratch_dir(&cas_dir.join("tmp"))?;
     let b = backends::Backends::from_env(cas_dir, &metrics, &retention)?;
     b.cache_retention.clone().spawn(retention.interval);
 
