@@ -762,13 +762,12 @@ mod linux_uring {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn set_runtime_disabled_for_test(disabled: bool) {
-        IO_URING_RUNTIME_DISABLED.store(disabled, Ordering::Relaxed);
-    }
-
     #[derive(Clone, Copy)]
-    pub(super) struct UringWriter;
+    pub(super) struct UringWriter {
+        /// Gates new ring creation. Every writer shares the process-wide
+        /// `IO_URING_RUNTIME_DISABLED`; a test passes its own flag.
+        disabled: &'static AtomicBool,
+    }
 
     struct RawUringWriter {
         ring: IoUring,
@@ -847,7 +846,14 @@ mod linux_uring {
 
     impl UringWriter {
         pub(super) fn new() -> Result<Self> {
-            RawUringWriter::new().map(|_| Self)
+            RawUringWriter::new().map(|_| Self {
+                disabled: &IO_URING_RUNTIME_DISABLED,
+            })
+        }
+
+        #[cfg(test)]
+        pub(super) fn with_disabled_flag(self, disabled: &'static AtomicBool) -> Self {
+            Self { disabled }
         }
 
         /// Ensure this thread's io_uring ring exists. Returns `Err` if io_uring is
@@ -856,7 +862,7 @@ mod linux_uring {
         /// this *before* consuming the write payload lets us fall back without
         /// having to clone it.
         fn ensure_ready(&self) -> Result<()> {
-            with_thread_writer(|_| Ok(()))
+            with_thread_writer(self.disabled, |_| Ok(()))
         }
 
         pub(super) fn write_regular(&self, target: &Path, mode: u32, content: &[u8]) -> Result<()> {
@@ -877,7 +883,7 @@ mod linux_uring {
                     .map(|_| ())
                     .with_context(|| format!("write {}", target.display()));
             }
-            with_thread_writer(|writer| {
+            with_thread_writer(self.disabled, |writer| {
                 writer
                     .write_regular_batch(
                         vec![PreparedRegularWrite {
@@ -904,7 +910,9 @@ mod linux_uring {
             if self.ensure_ready().is_err() {
                 return write_regular_batch_posix(&writes, collect_stats);
             }
-            with_thread_writer(|writer| writer.write_regular_batch(writes, collect_stats))
+            with_thread_writer(self.disabled, |writer| {
+                writer.write_regular_batch(writes, collect_stats)
+            })
         }
 
         pub(super) fn write_regular_batch_deferred(
@@ -922,7 +930,9 @@ mod linux_uring {
                 let stats = write_regular_batch_posix(&writes, collect_stats)?;
                 return Ok(WriteOutcome { written, stats });
             }
-            with_thread_writer(|writer| writer.write_regular_batch_deferred(writes, collect_stats))
+            with_thread_writer(self.disabled, |writer| {
+                writer.write_regular_batch_deferred(writes, collect_stats)
+            })
         }
 
         pub(super) fn flush_deferred_writes(&self) -> Result<WriteOutcome> {
@@ -937,7 +947,7 @@ mod linux_uring {
                     stats: Vec::new(),
                 });
             }
-            with_thread_writer(|writer| writer.flush_deferred_writes())
+            with_thread_writer(self.disabled, |writer| writer.flush_deferred_writes())
         }
 
         pub(super) fn probe(&self) -> Result<()> {
@@ -1048,14 +1058,17 @@ mod linux_uring {
         Ok(())
     }
 
-    fn with_thread_writer<T>(f: impl FnOnce(&mut RawUringWriter) -> Result<T>) -> Result<T> {
+    fn with_thread_writer<T>(
+        disabled: &AtomicBool,
+        f: impl FnOnce(&mut RawUringWriter) -> Result<T>,
+    ) -> Result<T> {
         THREAD_WRITER.with(|cell| {
             let mut writer = cell.borrow_mut();
             if writer.is_none() {
                 // Only *new* ring creation is gated by the runtime-disabled flag.
                 // A thread that already has a working ring keeps using it, so any
                 // writes it already deferred there are still flushed.
-                if IO_URING_RUNTIME_DISABLED.load(Ordering::Relaxed) {
+                if disabled.load(Ordering::Relaxed) {
                     anyhow::bail!("io_uring disabled at runtime; using POSIX writer");
                 }
                 match RawUringWriter::new() {
@@ -1065,7 +1078,7 @@ mod linux_uring {
                         // locked-memory rlimit under heavy parallelism. Disable
                         // io_uring for the rest of the run so callers fall back to
                         // the POSIX writer instead of failing the clone.
-                        IO_URING_RUNTIME_DISABLED.store(true, Ordering::Relaxed);
+                        disabled.store(true, Ordering::Relaxed);
                         IO_URING_DISABLED_LOG.call_once(|| {
                             tracing::warn!(
                                 "io_uring ring creation failed ({e:#}); disabling io_uring \
@@ -2217,17 +2230,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn io_uring_falls_back_to_posix_when_runtime_disabled() {
-        // Build a real io_uring writer; skip where io_uring is unavailable.
-        let writer = match WorktreeWriter::io_uring() {
-            Ok(w) => w,
+        // A writer whose own flag says a ring allocation has already failed,
+        // so the process-wide flag other tests use stays untouched. Skip where
+        // io_uring is unavailable.
+        static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let writer = match linux_uring::UringWriter::new() {
+            Ok(w) => WorktreeWriter {
+                backend: WriterBackend::IoUring(w.with_disabled_flag(&DISABLED)),
+            },
             Err(_) => {
                 eprintln!("skipping: io_uring unavailable on this host");
                 return;
             }
         };
-        // Simulate a per-thread ring allocation having failed and disabled
-        // io_uring for the run.
-        linux_uring::set_runtime_disabled_for_test(true);
         let dir = tempfile::TempDir::new().unwrap();
         let dir_path = dir.path().to_path_buf();
         // More than IO_URING_MIN_BATCH_FILES so the io_uring batch path is taken
@@ -2244,16 +2259,13 @@ mod tests {
             })
             .collect();
         // Run on a fresh thread that has no ring yet, so ring creation is what's
-        // attempted (and refused) — exercising the POSIX fallback rather than
-        // reusing the ring this test thread created during the probe above.
+        // attempted (and refused): the POSIX fallback, not a reused ring.
         let result = std::thread::spawn(move || {
             writer
                 .write_owned_entries_with_options(&dir_path, writes, WriteOptions::default())
                 .map(|outcome| outcome.written)
         })
         .join();
-        // Restore before asserting so a failure can't leak the flag to other tests.
-        linux_uring::set_runtime_disabled_for_test(false);
         let written = result
             .expect("writer thread panicked")
             .expect("disabled io_uring must fall back to POSIX, not fail");
