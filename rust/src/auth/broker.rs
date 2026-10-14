@@ -1,7 +1,6 @@
 //! Credential broker seam.
 //!
-//! `StaticBroker` is Tier-B passthrough: a request-scoped token from the
-//! `X-Upstream-Token` header wins, then a per-instance configured token.
+//! `StaticBroker` is Tier-B passthrough: the per-instance configured token.
 //!
 //! `GitHubAppBroker` is a Tier-A broker that mints short-lived scoped tokens: it
 //! signs an app JWT (RS256) with the app's private key and exchanges it for an
@@ -27,18 +26,10 @@ use tracing::info;
 pub trait CredentialBroker: Send + Sync {
     /// Return a token to use when syncing `repo_id`, or `None` if the repo
     /// should be mirrored anonymously.
-    ///
-    /// `request_token` is the token supplied by the caller (e.g. the
-    /// `X-Upstream-Token` header). It takes precedence over any configured
-    /// token so that per-request overrides work.
-    fn fetch_credential(
-        &self,
-        repo_id: &RepoId,
-        request_token: Option<&SecretString>,
-    ) -> Result<Option<SecretString>>;
+    fn fetch_credential(&self, repo_id: &RepoId) -> Result<Option<SecretString>>;
 }
 
-/// Tier-B passthrough broker: request token → configured instance token → none.
+/// Tier-B passthrough broker: configured instance token → none.
 #[derive(Clone)]
 pub struct StaticBroker {
     registry: ProviderRegistry,
@@ -51,14 +42,7 @@ impl StaticBroker {
 }
 
 impl CredentialBroker for StaticBroker {
-    fn fetch_credential(
-        &self,
-        repo_id: &RepoId,
-        request_token: Option<&SecretString>,
-    ) -> Result<Option<SecretString>> {
-        if let Some(token) = request_token {
-            return Ok(Some(token.clone()));
-        }
+    fn fetch_credential(&self, repo_id: &RepoId) -> Result<Option<SecretString>> {
         Ok(self.registry.token(repo_id.provider.as_str()).cloned())
     }
 }
@@ -277,15 +261,7 @@ impl GitHubAppBroker {
 }
 
 impl CredentialBroker for GitHubAppBroker {
-    fn fetch_credential(
-        &self,
-        repo_id: &RepoId,
-        request_token: Option<&SecretString>,
-    ) -> Result<Option<SecretString>> {
-        // A per-request override still wins, matching the static broker.
-        if let Some(token) = request_token {
-            return Ok(Some(token.clone()));
-        }
+    fn fetch_credential(&self, repo_id: &RepoId) -> Result<Option<SecretString>> {
         // This broker only authenticates against the github default instance;
         // other providers fall through to anonymous mirroring.
         if !repo_id.is_github_default() {
@@ -377,13 +353,8 @@ impl ProviderAwareBroker {
 }
 
 impl CredentialBroker for ProviderAwareBroker {
-    fn fetch_credential(
-        &self,
-        repo_id: &RepoId,
-        request_token: Option<&SecretString>,
-    ) -> Result<Option<SecretString>> {
-        self.broker_for(repo_id)
-            .fetch_credential(repo_id, request_token)
+    fn fetch_credential(&self, repo_id: &RepoId) -> Result<Option<SecretString>> {
+        self.broker_for(repo_id).fetch_credential(repo_id)
     }
 }
 
@@ -417,24 +388,12 @@ pub(crate) mod tests {
     use secrecy::ExposeSecret;
 
     #[test]
-    fn static_broker_prefers_request_token() {
-        let registry = ProviderRegistry::new();
-        let broker = StaticBroker::new(registry);
-        let request = SecretString::new("request".into());
-        let token = broker
-            .fetch_credential(&RepoId::github("o/r"), Some(&request))
-            .unwrap()
-            .unwrap();
-        assert_eq!(token.expose_secret(), "request");
-    }
-
-    #[test]
     fn static_broker_falls_back_to_none() {
         let registry = ProviderRegistry::new();
         let broker = StaticBroker::new(registry);
         assert!(
             broker
-                .fetch_credential(&RepoId::github("o/r"), None)
+                .fetch_credential(&RepoId::github("o/r"))
                 .unwrap()
                 .is_none()
         );
@@ -490,26 +449,14 @@ RwIDAQAB
     }
 
     #[test]
-    fn github_app_broker_prefers_request_token() {
-        let broker = test_broker();
-        let request = SecretString::new("request".into());
-        let token = broker
-            .fetch_credential(&RepoId::github("o/r"), Some(&request))
-            .unwrap()
-            .unwrap();
-        // The request token wins without any network call.
-        assert_eq!(token.expose_secret(), "request");
-    }
-
-    #[test]
     fn github_app_broker_ignores_non_github_providers() {
         let broker = test_broker();
         let repo = RepoId {
             provider: ProviderInstanceId::new("gitlab"),
             path: "group/proj".to_string(),
         };
-        // No request token + non-github provider → anonymous (no network call).
-        assert!(broker.fetch_credential(&repo, None).unwrap().is_none());
+        // Non-github provider → anonymous (no network call).
+        assert!(broker.fetch_credential(&repo).unwrap().is_none());
     }
 
     #[test]
@@ -525,7 +472,7 @@ RwIDAQAB
             },
         );
         let token = broker
-            .fetch_credential(&RepoId::github("o/r"), None)
+            .fetch_credential(&RepoId::github("o/r"))
             .unwrap()
             .expect("cached token");
         assert_eq!(token.expose_secret(), "ghs_cached");
@@ -541,9 +488,7 @@ RwIDAQAB
         })
         .expect("build test broker from test key");
 
-        let err = broker
-            .fetch_credential(&RepoId::github("o/r"), None)
-            .unwrap_err();
+        let err = broker.fetch_credential(&RepoId::github("o/r")).unwrap_err();
         assert!(format!("{err:#}").contains("GitHub App installation token"));
     }
 
@@ -635,11 +580,7 @@ RwIDAQAB
     }
 
     impl CredentialBroker for RecordingBroker {
-        fn fetch_credential(
-            &self,
-            _repo_id: &RepoId,
-            _request_token: Option<&SecretString>,
-        ) -> Result<Option<SecretString>> {
+        fn fetch_credential(&self, _repo_id: &RepoId) -> Result<Option<SecretString>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(self.token.clone()))
         }
@@ -656,7 +597,7 @@ RwIDAQAB
             path: "org/repo".to_string(),
         };
         let token = broker
-            .fetch_credential(&repo, None)
+            .fetch_credential(&repo)
             .unwrap()
             .expect("token from registered broker");
         assert_eq!(token.expose_secret(), "custom-token");
@@ -674,7 +615,7 @@ RwIDAQAB
             provider: ProviderInstanceId::new("gitlab"),
             path: "group/proj".to_string(),
         };
-        assert!(broker.fetch_credential(&repo, None).unwrap().is_none());
+        assert!(broker.fetch_credential(&repo).unwrap().is_none());
         assert_eq!(custom.call_count(), 0);
     }
 
@@ -685,7 +626,7 @@ RwIDAQAB
         let broker = ProviderAwareBroker::new(registry).register("github", gh_broker.clone());
 
         let token = broker
-            .fetch_credential(&RepoId::github("o/r"), None)
+            .fetch_credential(&RepoId::github("o/r"))
             .unwrap()
             .expect("github app token");
         assert_eq!(token.expose_secret(), "gh-app-token");
@@ -775,7 +716,7 @@ RwIDAQAB
             .expect("RIPCLONE_GITHUB_APP_* must be set for the live test");
         let broker = GitHubAppBroker::new(config).expect("broker");
         let token = broker
-            .fetch_credential(&RepoId::github("o/r"), None)
+            .fetch_credential(&RepoId::github("o/r"))
             .unwrap()
             .expect("mint a live installation token");
         assert!(

@@ -17,9 +17,9 @@ yanked = "deny"
 # None has an upstream fix we can reach today.
 ignore = [
   # rsa (Marvin Attack): timing sidechannel in RSA private-key decryption.
-  # Ripclone uses jsonwebtoken for verification and symmetric token issuance;
-  # the vulnerable private-key decryption operation is not used.
-  { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken; vulnerable private-key decryption is not used; no upstream fix" },
+  # Ripclone uses jsonwebtoken only for the GitHub App broker, which signs its
+  # app JWT locally with RS256; RSA decryption is not used.
+  { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken (GitHub App JWT signing); RSA decryption is not used; no upstream fix" },
 
   # quick-xml 0.40.1 via s3 0.1.36. No patched s3 release exists; quick-xml 0.41
   # is out but s3's version requirement does not accept it. The crate is only

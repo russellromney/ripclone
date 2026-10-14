@@ -1,5 +1,4 @@
 use crate::archive::ArchiveBuilder;
-use crate::auth::access::{AccessDecision, AccessVerifier, HttpAccessVerifier};
 use crate::auth::broker::{CredentialBroker, broker_from_env};
 use crate::backends;
 use crate::cas::Cas;
@@ -9,7 +8,6 @@ use crate::clonepack::{
 };
 use crate::git;
 use crate::metrics::{Metrics, SyncPhaseMetrics};
-use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
@@ -20,12 +18,12 @@ use crate::webhook::{EventKind, WebhookConfig};
 use crate::{ExactResultKind, RefInfo};
 use anyhow::{Context, Result};
 use axum::{
-    Form, Json, Router,
+    Json, Router,
     body::{Body, Bytes},
     extract::{ConnectInfo, DefaultBodyLimit, OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use futures::{SinkExt, StreamExt, TryStreamExt};
@@ -51,16 +49,11 @@ pub struct ServerState {
     pub provider_registry: ProviderRegistry,
     pub broker: Arc<dyn CredentialBroker>,
     pub token_hash: Option<String>,
-    /// Signing material for short-lived session tokens (`ripclone auth login`).
-    /// `None` when no signing secret is available (only the token *hash* is
-    /// configured); session-token issuance is then disabled.
-    pub jwt: Option<Arc<crate::auth::jwt::JwtKeys>>,
     pub metrics: Arc<Metrics>,
     pub rate_limiter: RateLimiter,
     pub build_queue: JobQueueRef,
     /// Holds the server's process-ownership lock and concrete control driver.
     pub control_db: Option<Arc<crate::control::ControlDb>>,
-    pub oidc_verifier: Option<Arc<OidcVerifier>>,
     /// Webhook receiver config: per-provider HMAC secret + optional repo
     /// allowlist. A provider with no configured secret returns 503. Reads
     /// `RIPCLONE_WEBHOOK_SECRET_<provider>`.
@@ -71,24 +64,6 @@ pub struct ServerState {
     /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
     /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
     pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
-    /// Per-repo read authorization (AU1): proves the caller may read a private
-    /// repo (public repos are anonymous). Used by every repo-read entry point
-    /// before serving content or signing URLs, unless `require_repo_auth` is off.
-    pub access_verifier: Arc<dyn AccessVerifier>,
-    /// When true (default), private repos are gated by `access_verifier` on every
-    /// read. Set false by `RIPCLONE_TRUST_GATEWAY=1` for a single-tenant
-    /// self-host that fully trusts whoever holds the shared server token (the old
-    /// behavior); then visibility falls back to the client-supplied header.
-    pub require_repo_auth: bool,
-}
-
-/// Whether per-repo read authz is enforced. On by default (multi-tenant safe);
-/// `RIPCLONE_TRUST_GATEWAY=1` turns it off for a single-tenant self-host that
-/// trusts the shared server token as the only authz layer.
-fn require_repo_auth_from_env() -> bool {
-    !std::env::var("RIPCLONE_TRUST_GATEWAY")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 /// Simple in-memory token-bucket rate limiter keyed by real client IP.
@@ -216,15 +191,6 @@ pub struct RefQuery {
 
 fn default_added_repo_source() -> AddedRepoSource {
     AddedRepoSource::Api
-}
-
-#[derive(Deserialize)]
-pub struct BuildRequest {
-    pub owner: String,
-    pub repo: String,
-    pub commit: String,
-    #[serde(rename = "ref")]
-    pub ref_name: String,
 }
 
 #[derive(Serialize)]
@@ -381,13 +347,6 @@ async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, Re
         })
 }
 
-fn upstream_token_from_headers(headers: &HeaderMap) -> Option<secrecy::SecretString> {
-    headers
-        .get("X-Upstream-Token")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| secrecy::SecretString::new(s.to_string().into()))
-}
-
 /// Validate an `owner` or `repo` path segment. GitHub identifiers are limited
 /// to ASCII alphanumeric plus `.`, `-`, and `_`, must not be empty, and must
 /// not contain path separators.
@@ -530,9 +489,6 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/v1/repos/{*path}", get(dispatch_repos_get))
         .route("/v1/repos/{*path}", post(dispatch_repos_post))
         .route("/v1/repos/{*path}", delete(dispatch_repos_delete))
-        // Refresh requires a still-valid session token (the auth layer verifies
-        // the Bearer); it mints a fresh one before the current expires.
-        .route("/v1/auth/refresh", post(auth_refresh_handler))
         .route("/v1/artifacts/{hash}", get(get_artifact))
         // Repository build settings. Legacy `?branch=` queries are parsed only
         // to return a clear fail-closed error.
@@ -540,9 +496,6 @@ pub fn build_app(state: ServerState) -> Router {
             "/v1/admin/config/{owner}/{repo}",
             get(admin_get_config).post(admin_put_config),
         )
-        // Single catch-all route for git smart-http endpoints.
-        .route("/v1/git/{*path}", get(dispatch_git_get))
-        .route("/v1/git/{*path}", post(dispatch_git_post))
         // Clone metrics sink. The cloud consumes these for analytics; the OSS
         // server accepts and drops them so a self-hosted CLI never spams 404s.
         .route(
@@ -559,11 +512,6 @@ pub fn build_app(state: ServerState) -> Router {
     let rate_limited = Router::new()
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
-        // Session-token login: the page and the exchange are unauthenticated (they
-        // prove the secret in the body) but rate-limited against brute force.
-        .route("/login", get(login_page_handler))
-        .route("/v1/auth/login", post(auth_login_handler))
-        .route("/v1/build", post(build_handler))
         // Provider-agnostic push-webhook receiver: authenticated by the provider
         // HMAC over the raw body (not the ripclone bearer token), so it lives
         // outside the `protected` layer.
@@ -583,10 +531,8 @@ pub fn build_app(state: ServerState) -> Router {
         .with_state(state)
 }
 
-/// Maximum request body size accepted by the server. This bounds the
-/// `git-upload-pack` body and any other large POST payload.
+/// Maximum request body size accepted by the server.
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
-const MAX_UPLOAD_PACK_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// Cap for a webhook request body. The HMAC can only be verified after the whole
 /// body is buffered, so this bounds what an unauthenticated caller can make the
 /// server hold before the signature is checked. GitHub caps webhook payloads at
@@ -594,8 +540,8 @@ const MAX_UPLOAD_PACK_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_WEBHOOK_BODY_BYTES: usize = 25 * 1024 * 1024;
 
 /// Reject explicit declarations that do not match the sole current wire
-/// protocol. Callers such as vanilla Git and ordinary HTTP integrations do not
-/// declare this private header and use the same implementation.
+/// protocol. Ordinary HTTP integrations do not declare this private header and
+/// use the same implementation.
 async fn protocol_guard(
     headers: HeaderMap,
     request: axum::http::Request<axum::body::Body>,
@@ -644,26 +590,13 @@ async fn auth_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let path = request.uri().path().to_string();
     if let Some(expected) = &state.token_hash {
         let authorized = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|v| check_auth_header(v, expected) || check_bearer_token(v, state.jwt.as_deref()))
+            .map(|v| check_auth_header(v, expected))
             .unwrap_or(false);
         if !authorized {
-            // Smart-HTTP clients (vanilla git) expect a Basic challenge so they
-            // can retry with the credentials embedded in the URL.
-            if path.starts_with("/v1/git/") {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    [("WWW-Authenticate", r#"Basic realm="ripclone""#)],
-                    Json(ErrorResponse {
-                        error: "unauthorized".to_string(),
-                    }),
-                )
-                    .into_response();
-            }
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
@@ -681,301 +614,10 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
-/// Accept a `Bearer <jwt>` session token issued by `/v1/auth/login`. Returns
-/// false when the header isn't a bearer, session tokens are disabled, or the
-/// token fails verification (bad signature, wrong issuer, expired).
-fn check_bearer_token(header: &str, jwt: Option<&crate::auth::jwt::JwtKeys>) -> bool {
-    let Some(token) = header.strip_prefix("Bearer ") else {
-        return false;
-    };
-    jwt.map(|keys| keys.verify(token).is_ok()).unwrap_or(false)
-}
-
-#[derive(Deserialize)]
-struct LoginQuery {
-    /// Loopback URL the browser is redirected to with the minted token, for
-    /// `ripclone auth login`'s auto-capture. Absent → the page shows the token
-    /// for copy-paste.
-    callback: Option<String>,
-    /// Opaque value echoed back to the callback so the CLI can match its request.
-    state: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct LoginForm {
-    secret: String,
-    callback: Option<String>,
-    state: Option<String>,
-}
-
-#[derive(Serialize)]
-struct TokenResponse {
-    token: String,
-    /// Seconds until expiry.
-    expires_in: u64,
-    /// Absolute expiry (epoch seconds).
-    expires_at: u64,
-}
-
-/// Only ever redirect the minted token to a loopback address — never an external
-/// host. This is the open-redirect / token-exfiltration guard for the callback.
-fn is_loopback_callback(raw: &str) -> bool {
-    // Reject control characters (CR/LF would split the redirect header) and
-    // fragments (a `#` would swallow the appended `?token=…` so the CLI never
-    // sees it — and isn't a valid callback anyway).
-    if raw.bytes().any(|b| b.is_ascii_control()) || raw.contains('#') {
-        return false;
-    }
-    let Some(rest) = raw.strip_prefix("http://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?']).next().unwrap_or("");
-    // No userinfo: `http://127.0.0.1:80@evil.com/` parses as loopback to a naive
-    // host:port split but a browser connects to `evil.com`. Reject any `@`.
-    if authority.contains('@') {
-        return false;
-    }
-    // Strip an optional `:port`. For a bracketed IPv6 literal the only port colon
-    // is the one after `]`, so keep the bracketed host intact.
-    let host = if authority.starts_with('[') {
-        match authority.find(']') {
-            Some(end) => &authority[..=end],
-            None => return false,
-        }
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
-    };
-    host == "127.0.0.1" || host == "localhost" || host == "[::1]"
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn login_page_html(callback: Option<&str>, state: Option<&str>, error: Option<&str>) -> String {
-    let callback_field = callback
-        .map(|c| {
-            format!(
-                r#"<input type="hidden" name="callback" value="{}">"#,
-                html_escape(c)
-            )
-        })
-        .unwrap_or_default();
-    let state_field = state
-        .map(|s| {
-            format!(
-                r#"<input type="hidden" name="state" value="{}">"#,
-                html_escape(s)
-            )
-        })
-        .unwrap_or_default();
-    let error_block = error
-        .map(|e| format!(r#"<p class="err">{}</p>"#, html_escape(e)))
-        .unwrap_or_default();
-    format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ripclone — sign in</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 15px/1.5 system-ui, sans-serif; max-width: 26rem; margin: 12vh auto; padding: 0 1.25rem; }}
-  h1 {{ font-size: 1.25rem; margin: 0 0 .25rem; }}
-  p.sub {{ color: #888; margin: 0 0 1.5rem; }}
-  label {{ display: block; font-weight: 600; margin-bottom: .4rem; }}
-  input[type=password] {{ width: 100%; padding: .6rem .7rem; font-size: 1rem; border: 1px solid #8884; border-radius: .5rem; box-sizing: border-box; }}
-  button {{ margin-top: 1rem; width: 100%; padding: .65rem; font-size: 1rem; font-weight: 600; border: 0; border-radius: .5rem; background: #2563eb; color: #fff; cursor: pointer; }}
-  button:hover {{ background: #1d4ed8; }}
-  p.err {{ color: #dc2626; font-weight: 600; }}
-</style></head>
-<body>
-  <h1>ripclone</h1>
-  <p class="sub">Sign in to mint a short-lived session token.</p>
-  {error_block}
-  <form method="post" action="/v1/auth/login">
-    <label for="secret">Server token</label>
-    <input id="secret" name="secret" type="password" autocomplete="current-password" autofocus required>
-    {callback_field}{state_field}
-    <button type="submit">Sign in</button>
-  </form>
-</body></html>"#
-    )
-}
-
-fn token_page_html(token: &str) -> String {
-    format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ripclone — session token</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 15px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 12vh auto; padding: 0 1.25rem; }}
-  h1 {{ font-size: 1.25rem; }}
-  p.sub {{ color: #888; }}
-  textarea {{ width: 100%; height: 7rem; font: 13px/1.4 ui-monospace, monospace; padding: .6rem; border: 1px solid #8884; border-radius: .5rem; box-sizing: border-box; }}
-</style></head>
-<body>
-  <h1>Signed in ✓</h1>
-  <p class="sub">Copy this token and paste it into <code>ripclone auth login</code>:</p>
-  <textarea readonly onclick="this.select()">{token}</textarea>
-</body></html>"#,
-        token = html_escape(token)
-    )
-}
-
-async fn login_page_handler(Query(q): Query<LoginQuery>) -> Html<String> {
-    Html(login_page_html(
-        q.callback.as_deref(),
-        q.state.as_deref(),
-        None,
-    ))
-}
-
-async fn auth_login_handler(
-    State(state): State<ServerState>,
-    Form(form): Form<LoginForm>,
-) -> Response {
-    let (Some(expected), Some(keys)) = (state.token_hash.as_deref(), state.jwt.as_deref()) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Html(login_page_html(
-                form.callback.as_deref(),
-                form.state.as_deref(),
-                Some("Session tokens are not enabled on this server."),
-            )),
-        )
-            .into_response();
-    };
-
-    let presented = hex::encode(Sha256::digest(form.secret.as_bytes()));
-    if !constant_time_eq_str(&presented, expected) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Html(login_page_html(
-                form.callback.as_deref(),
-                form.state.as_deref(),
-                Some("Invalid server token."),
-            )),
-        )
-            .into_response();
-    }
-
-    let (token, _exp) = match keys.issue(crate::auth::jwt::ttl(), crate::auth::jwt::session_max()) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("failed to mint session token: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "failed to mint token".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    match form.callback.as_deref() {
-        Some(cb) if is_loopback_callback(cb) => {
-            let st = form.state.as_deref().unwrap_or("");
-            let sep = if cb.contains('?') { '&' } else { '?' };
-            // Percent-encode the query values so an attacker-supplied `state`
-            // can't inject extra parameters or split the Location header.
-            (
-                [("cache-control", "no-store")],
-                Redirect::to(&format!(
-                    "{cb}{sep}token={}&state={}",
-                    urlencoding::encode(&token),
-                    urlencoding::encode(st)
-                )),
-            )
-                .into_response()
-        }
-        Some(_) => (
-            StatusCode::BAD_REQUEST,
-            Html(login_page_html(
-                None,
-                form.state.as_deref(),
-                Some("Refusing to deliver the token to a non-loopback address."),
-            )),
-        )
-            .into_response(),
-        None => (
-            [("cache-control", "no-store")],
-            Html(token_page_html(&token)),
-        )
-            .into_response(),
-    }
-}
-
-async fn auth_refresh_handler(State(state): State<ServerState>, headers: HeaderMap) -> Response {
-    let Some(keys) = state.jwt.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session tokens disabled".to_string(),
-            }),
-        )
-            .into_response();
-    };
-    let ttl = crate::auth::jwt::ttl();
-    let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    // From a session token: re-issue keeping the same absolute session deadline,
-    // so a refresh chain can't outlive the original session. Authed by the shared
-    // token instead (no Bearer): start a fresh session.
-    let minted = match bearer {
-        Some(token) => keys.refresh(token, ttl),
-        None => keys.issue(ttl, crate::auth::jwt::session_max()),
-    };
-    match minted {
-        Ok((token, expires_at)) => Json(TokenResponse {
-            token,
-            expires_in: expires_at.saturating_sub(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            ),
-            expires_at,
-        })
-        .into_response(),
-        Err(e) => (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: format!("{e}"),
-            }),
-        )
-            .into_response(),
-    }
-}
-
 fn check_auth_header(header: &str, expected: &str) -> bool {
-    if let Some(token) = header.strip_prefix("Ripclone ") {
-        return constant_time_eq_str(token, expected);
-    }
-    if let Some(credentials) = header.strip_prefix("Basic ")
-        && let Ok(decoded) =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, credentials)
-        && let Ok(decoded) = String::from_utf8(decoded)
-    {
-        // Accept "<username>:<password>"; compare the password to the
-        // expected hash so vanilla git can use
-        // http://user:<hash>@host/... URLs.
-        if let Some((_, password)) = decoded.split_once(':') {
-            return constant_time_eq_str(password, expected);
-        }
-    }
-    false
+    header
+        .strip_prefix("Ripclone ")
+        .is_some_and(|token| constant_time_eq_str(token, expected))
 }
 
 /// Trust a forwarded-for header for the rate-limit key. Off by default: the
@@ -1070,9 +712,7 @@ fn is_authenticated_artifact_get(
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            check_auth_header(value, expected) || check_bearer_token(value, state.jwt.as_deref())
-        })
+        .map(|value| check_auth_header(value, expected))
         .unwrap_or(false)
 }
 
@@ -1160,203 +800,8 @@ async fn metrics_handler(State(state): State<ServerState>) -> impl IntoResponse 
     )
 }
 
-#[derive(Deserialize)]
-struct GitServiceQuery {
-    service: String,
-}
-
-/// Smart-HTTP `info/refs` fallback. Advertises refs so a vanilla git client can
-/// talk to ripclone when the archive-first path is not available.
-async fn git_info_refs_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    query: GitServiceQuery,
-    headers: HeaderMap,
-    state: ServerState,
-) -> Response {
-    if query.service != "git-upload-pack" {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: "only git-upload-pack is supported".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    // AU1: gate the vanilla-git read surface too (it serves the private repo's
-    // refs/objects directly from the mirror).
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
-    let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(
-        &mirror_dir,
-        &provider,
-        &repo_id,
-        "HEAD",
-        None,
-        credential.as_ref(),
-    )
-    .await
-    {
-        state.metrics.record_error();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("mirror sync failed: {}", e),
-            }),
-        )
-            .into_response();
-    }
-    drop(_guard);
-
-    match advertise_refs(&mirror_dir).await {
-        Ok(body) => (
-            StatusCode::OK,
-            [(
-                "content-type",
-                "application/x-git-upload-pack-advertisement",
-            )],
-            body,
-        )
-            .into_response(),
-        Err(e) => {
-            state.metrics.record_error();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("advertise-refs failed: {}", e),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn advertise_refs(mirror_dir: &std::path::Path) -> Result<Vec<u8>> {
-    let mirror_dir = mirror_dir.to_path_buf();
-    let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("git")
-            .arg("upload-pack")
-            .arg("--advertise-refs")
-            .arg(&mirror_dir)
-            .output()
-    })
-    .await
-    .context("advertise-refs task")?;
-
-    let output = output.context("git upload-pack --advertise-refs")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git upload-pack --advertise-refs failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Smart-HTTP advertisement prefix.
-    let mut body = Vec::new();
-    body.extend_from_slice(b"001e# service=git-upload-pack\n0000");
-    body.extend_from_slice(&output.stdout);
-    Ok(body)
-}
-
-/// Smart-HTTP `git-upload-pack` RPC fallback. Pipes the client's request body
-/// through `git upload-pack --stateless-rpc` on the local bare mirror.
-async fn git_upload_pack_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    body: Body,
-    headers: HeaderMap,
-    state: ServerState,
-) -> Response {
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    // AU1: gate the vanilla-git upload-pack read surface.
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
-    let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(
-        &mirror_dir,
-        &provider,
-        &repo_id,
-        "HEAD",
-        None,
-        credential.as_ref(),
-    )
-    .await
-    {
-        state.metrics.record_error();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("mirror sync failed: {}", e),
-            }),
-        )
-            .into_response();
-    }
-    drop(_guard);
-
-    let bytes = match axum::body::to_bytes(body, MAX_UPLOAD_PACK_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(e) => {
-            state.metrics.record_error();
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("read body failed: {}", e),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    match upload_pack_rpc(&mirror_dir, bytes).await {
-        Ok(output) => (
-            StatusCode::OK,
-            [("content-type", "application/x-git-upload-pack-result")],
-            output,
-        )
-            .into_response(),
-        Err(e) => {
-            state.metrics.record_error();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("upload-pack rpc failed: {}", e),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
 async fn dispatch_repos_get(
     Path(path): Path<String>,
-    headers: HeaderMap,
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
@@ -1381,15 +826,7 @@ async fn dispatch_repos_get(
         {
             return resp;
         }
-        return get_ref_inner(
-            repo_id,
-            provider.clone(),
-            branch.to_string(),
-            params,
-            headers,
-            state,
-        )
-        .await;
+        return get_ref_inner(repo_id, provider.clone(), branch.to_string(), params, state).await;
     }
 
     if let Some(repo_path) = path.strip_suffix("/status") {
@@ -1413,7 +850,7 @@ async fn dispatch_repos_get(
                     .into_response();
             }
         };
-        return repo_status_inner(repo_id, provider.clone(), query, headers, state).await;
+        return repo_status_inner(repo_id, query, state).await;
     }
 
     (
@@ -1427,7 +864,6 @@ async fn dispatch_repos_get(
 
 async fn dispatch_repos_post(
     Path(path): Path<String>,
-    headers: HeaderMap,
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
@@ -1452,7 +888,7 @@ async fn dispatch_repos_post(
                     .into_response();
             }
         };
-        return add_repo_inner(repo_id, provider.clone(), query, headers, state).await;
+        return add_repo_inner(repo_id, provider.clone(), query, state).await;
     }
 
     if let Some(repo_path) = path.strip_suffix("/sync") {
@@ -1476,7 +912,7 @@ async fn dispatch_repos_post(
                     .into_response();
             }
         };
-        return sync_repo_inner(repo_id, provider.clone(), query, headers, state).await;
+        return sync_repo_inner(repo_id, provider.clone(), query, state).await;
     }
 
     (
@@ -1533,91 +969,6 @@ async fn list_added_repos(State(state): State<ServerState>) -> Response {
                 .into_response()
         }
     }
-}
-
-async fn dispatch_git_get(
-    Path(path): Path<String>,
-    Query(query): Query<GitServiceQuery>,
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-) -> Response {
-    if let Some(repo_path) = path.strip_suffix("/info/refs") {
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
-        };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        return git_info_refs_inner(repo_id, provider.clone(), query, headers, state).await;
-    }
-
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "not found".to_string(),
-        }),
-    )
-        .into_response()
-}
-
-async fn dispatch_git_post(
-    Path(path): Path<String>,
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-    body: Body,
-) -> Response {
-    if let Some(repo_path) = path.strip_suffix("/git-upload-pack") {
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
-        };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        return git_upload_pack_inner(repo_id, provider.clone(), body, headers, state).await;
-    }
-
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "not found".to_string(),
-        }),
-    )
-        .into_response()
-}
-
-async fn upload_pack_rpc(mirror_dir: &std::path::Path, input: Bytes) -> Result<Vec<u8>> {
-    let mirror_dir = mirror_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut child = std::process::Command::new("git")
-            .arg("upload-pack")
-            .arg("--stateless-rpc")
-            .arg(&mirror_dir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("spawn git upload-pack --stateless-rpc")?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin.write_all(&input)?;
-        }
-
-        let output = child.wait_with_output().context("wait for upload-pack")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "git upload-pack --stateless-rpc failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Ok(output.stdout)
-    })
-    .await
-    .context("upload-pack rpc task")?
 }
 
 async fn ensure_mirror(
@@ -1724,7 +1075,6 @@ fn ref_response_from_manifest(
     manifest_hash: &str,
     manifest: &ClonepackManifest,
     storage: &crate::storage::StorageRef,
-    private: bool,
 ) -> Option<RefResponse> {
     let metadata_chunk = checked_manifest_hash(manifest.metadata_chunk.as_ref()?)?;
     let archive_hashes = manifest
@@ -1784,7 +1134,6 @@ fn ref_response_from_manifest(
         &artifacts,
         storage,
         ExactResultKind::Full,
-        private,
     ))
 }
 
@@ -1796,7 +1145,6 @@ async fn carried_full_top_up_response(
     pinned: &str,
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
-    private: bool,
 ) -> Option<RefResponse> {
     // The caller supplies the same exact-row snapshot that is still building B.
     // Do not read it again here: Full(B) could publish between reads, which
@@ -1840,7 +1188,6 @@ async fn carried_full_top_up_response(
         manifest_hash,
         &manifest,
         storage,
-        private,
     )
 }
 
@@ -1849,7 +1196,6 @@ async fn get_ref_inner(
     provider: ProviderInstance,
     requested_checkout: String,
     params: RefQuery,
-    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
     if let Some(response) = validation::reject_if_invalid(|| {
@@ -1878,20 +1224,10 @@ async fn get_ref_inner(
         Err(response) => return response,
     }
 
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
+    let credential = match state.broker.fetch_credential(&repo_id) {
         Ok(credential) => credential,
         Err(error) => return credential_error_response(error),
     };
-    let private =
-        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-        {
-            Ok(private) => private,
-            Err(response) => return response,
-        };
 
     state.metrics.record_ref_lookup();
     let (commit, checkout_name, already_pinned) = if let Some(pinned) = params.pinned.as_deref() {
@@ -2062,7 +1398,6 @@ async fn get_ref_inner(
                 info,
                 &state.storage,
                 params.result,
-                private,
             )),
         )
             .into_response();
@@ -2111,7 +1446,6 @@ async fn get_ref_inner(
                         &info,
                         &state.storage,
                         params.result,
-                        private,
                     )),
                 )
                     .into_response();
@@ -2140,7 +1474,6 @@ async fn get_ref_inner(
                         &commit,
                         &state.ref_store,
                         &state.storage,
-                        private,
                     )
                     .await
                 }
@@ -2189,8 +1522,7 @@ fn exact_unavailable_response(
         .into_response()
 }
 
-const REF_SIGNED_URL_TTL_PUBLIC_SECS: u64 = 1200;
-const REF_SIGNED_URL_TTL_PRIVATE_SECS: u64 = 300;
+const REF_SIGNED_URL_TTL_SECS: u64 = 1200;
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -2199,18 +1531,11 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn ref_signed_url_ttl(private: bool) -> Duration {
-    if private {
-        Duration::from_secs(env_u64(
-            "RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS",
-            REF_SIGNED_URL_TTL_PRIVATE_SECS,
-        ))
-    } else {
-        Duration::from_secs(env_u64(
-            "RIPCLONE_SIGNED_URL_TTL_SECS",
-            REF_SIGNED_URL_TTL_PUBLIC_SECS,
-        ))
-    }
+fn ref_signed_url_ttl() -> Duration {
+    Duration::from_secs(env_u64(
+        "RIPCLONE_SIGNED_URL_TTL_SECS",
+        REF_SIGNED_URL_TTL_SECS,
+    ))
 }
 
 /// Artifact hashes needed to build one [`RefResponse`], independent of
@@ -2239,9 +1564,8 @@ fn build_ref_response(
     artifacts: &ResponseArtifacts,
     storage: &crate::storage::StorageRef,
     result: ExactResultKind,
-    private: bool,
 ) -> RefResponse {
-    let ttl = ref_signed_url_ttl(private);
+    let ttl = ref_signed_url_ttl();
     let signed = |hash: &str| signed_url(storage, ttl, hash);
     // `None` entries (e.g. local backend) fall back to the gateway. Ordered
     // to match the manifest's own chunk/pack lists.
@@ -2289,7 +1613,6 @@ fn ref_response(
     info: &RefInfo,
     storage: &crate::storage::StorageRef,
     result: ExactResultKind,
-    private: bool,
 ) -> RefResponse {
     let artifacts = exact_result_clonepack(info, result)
         .expect("requested exact result is ready before response construction");
@@ -2330,7 +1653,6 @@ fn ref_response(
         &response_artifacts,
         storage,
         result,
-        private,
     )
 }
 
@@ -2344,11 +1666,10 @@ fn sync_response_without_storage_read(
     info: &RefInfo,
     storage: &crate::storage::StorageRef,
     result: ExactResultKind,
-    private: bool,
     status: impl Into<String>,
 ) -> SyncResponse {
     SyncResponse {
-        ref_info: ref_response(repo_id, provider, branch, info, storage, result, private),
+        ref_info: ref_response(repo_id, provider, branch, info, storage, result),
         status: status.into(),
         phases: SyncPhases::default(),
         bytes: None,
@@ -2363,21 +1684,6 @@ fn signed_url(storage: &crate::storage::StorageRef, ttl: Duration, hash: &str) -
     storage.signed_url(hash, ttl)
 }
 
-/// Single-tenant trust mode only: the client tags a request with the visibility
-/// it resolved. Absent means public for direct self-host clients; malformed
-/// values fail closed to private. This is advisory and trusted ONLY when
-/// `require_repo_auth` is off; the enforced path derives visibility from the
-/// provider via [`authorize_repo_read`] instead.
-fn visibility_is_private(headers: &HeaderMap) -> bool {
-    match headers.get("x-ripclone-visibility") {
-        None => false,
-        Some(value) => value
-            .to_str()
-            .map(|v| !v.eq_ignore_ascii_case("public"))
-            .unwrap_or(true),
-    }
-}
-
 fn credential_error_response(e: anyhow::Error) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2386,49 +1692,6 @@ fn credential_error_response(e: anyhow::Error) -> Response {
         }),
     )
         .into_response()
-}
-
-/// 403 for a caller that may not read this repo.
-fn forbidden_repo_response() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(ErrorResponse {
-            error: "not authorized for this repository".to_string(),
-        }),
-    )
-        .into_response()
-}
-
-/// Per-repo read authorization gate (AU1). Every repo-read entry point calls
-/// this before serving content or signing URLs. On success it returns whether
-/// the repo is private (for signed-URL TTL); on failure it returns a 403 the
-/// caller must propagate.
-///
-/// Enforced path (`require_repo_auth`): public repos are served anonymously,
-/// private repos require the caller's own credential to prove read access
-/// against the provider (cached). This is what stops a holder of the shared
-/// server token from reading an already-cached private repo it has no access to.
-/// Trust mode (`RIPCLONE_TRUST_GATEWAY=1`): the gate is skipped and visibility
-/// comes from the client header (single-tenant self-host behavior).
-async fn authorize_repo_read(
-    state: &ServerState,
-    provider: &ProviderInstance,
-    repo_id: &RepoId,
-    credential: Option<&secrecy::SecretString>,
-    headers: &HeaderMap,
-) -> Result<bool, Response> {
-    if !state.require_repo_auth {
-        return Ok(visibility_is_private(headers));
-    }
-    match state
-        .access_verifier
-        .verify(provider, &repo_id.path, credential)
-        .await
-    {
-        AccessDecision::Public => Ok(false),
-        AccessDecision::PrivateAuthorized => Ok(true),
-        AccessDecision::Denied => Err(forbidden_repo_response()),
-    }
 }
 
 #[derive(Deserialize, Default)]
@@ -2441,25 +1704,9 @@ struct RepoStatusQuery {
 
 async fn repo_status_inner(
     repo_id: RepoId,
-    provider: ProviderInstance,
     query: RepoStatusQuery,
-    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
-    // AU1: status reveals a private repo's existence, commit, and byte sizes.
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
     match build_repo_status(&state, &repo_id, query.public, query.fork_of.as_deref()).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
@@ -2590,7 +1837,6 @@ async fn sync_repo_inner(
     repo_id: RepoId,
     provider: ProviderInstance,
     params: SyncRequest,
-    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
     if let Some(resp) = validation::reject_if_invalid(|| {
@@ -2603,7 +1849,7 @@ async fn sync_repo_inner(
         return resp;
     }
     if params.rev.is_some() {
-        return sync_repo_at_revision(repo_id, provider, params, headers, state).await;
+        return sync_repo_at_revision(repo_id, provider, params, state).await;
     }
     match repo_is_added(&state, &repo_id).await {
         Ok(true) => {}
@@ -2611,20 +1857,10 @@ async fn sync_repo_inner(
         Err(resp) => return resp,
     }
 
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
+    let credential = match state.broker.fetch_credential(&repo_id) {
         Ok(c) => c,
         Err(e) => return credential_error_response(e),
     };
-    let private =
-        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-        {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
 
     let start = Instant::now();
     let requested_branch = params.branch;
@@ -2700,7 +1936,6 @@ async fn sync_repo_inner(
                 &info,
                 &state.storage,
                 ExactResultKind::Full,
-                private,
                 "no-op",
             );
             (StatusCode::OK, Json(resp)).into_response()
@@ -2739,7 +1974,6 @@ async fn sync_repo_at_revision(
     repo_id: RepoId,
     provider: ProviderInstance,
     params: SyncRequest,
-    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
     if let Some(resp) = validation::reject_if_invalid(|| {
@@ -2772,21 +2006,10 @@ async fn sync_repo_at_revision(
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let mut branch = params.branch;
 
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
+    let credential = match state.broker.fetch_credential(&repo_id) {
         Ok(c) => c,
         Err(e) => return credential_error_response(e),
     };
-    // AU1: a sync both builds and returns the ref (with signed URLs), so gate it.
-    let private =
-        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-        {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
 
     // Resolve a symbolic historical selector exactly once. Subsequent work and
     // polls use only the selected object id. A concrete object id never needs
@@ -2890,7 +2113,6 @@ async fn sync_repo_at_revision(
                 &info,
                 &state.storage,
                 ExactResultKind::Full,
-                private,
                 "no-op",
             );
             (StatusCode::OK, Json(response)).into_response()
@@ -2906,23 +2128,8 @@ async fn add_repo_inner(
     repo_id: RepoId,
     provider: ProviderInstance,
     params: AddRequest,
-    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
-    let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    if let Err(resp) =
-        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-    {
-        return resp;
-    }
-
     let added = AddedRepo {
         repo_id: repo_id.clone(),
         added_at: SystemTime::now()
@@ -2950,7 +2157,6 @@ async fn add_repo_inner(
             branch: "HEAD".to_string(),
             rev: None,
         },
-        headers,
         state,
     )
     .await
@@ -3082,12 +2288,10 @@ fn pending_exact_result(job: &BuildJob) -> RefInfo {
 /// Fire-and-forget: enqueue a build for `(repo_id, admitted_commit)` and return
 /// immediately — the build runs ahead of any clone
 /// (build-before-clone).
-/// Used by the `/build` OIDC endpoint, the push-webhook receiver, and the poll
-/// loop. The durable active-key constraint coalesces it exactly like `/sync`.
-/// Credentials come from the server's standing
-/// provider token (the caller carries no per-request token). Returns `Ok` if the
-/// build is queued or folded into one already running; `Err(msg)` if the queue is
-/// unavailable.
+/// Used by the push-webhook receiver and the poll loop. The durable active-key
+/// constraint coalesces it exactly like `/sync`. Credentials come from the
+/// server's broker. Returns `Ok` if the build is queued or folded into one
+/// already running; `Err(msg)` if the queue is unavailable.
 async fn trigger_build(
     state: &ServerState,
     repo_id: &RepoId,
@@ -3112,7 +2316,7 @@ async fn trigger_build(
     match admit_commit(state, repo_id, &admitted_commit, existing, || {
         state
             .broker
-            .fetch_credential(repo_id, None)
+            .fetch_credential(repo_id)
             .map_err(|e| e.to_string())
     })
     .await
@@ -3237,162 +2441,6 @@ async fn admin_put_config(
                 Json(ErrorResponse {
                     error: format!("store config: {e:#}"),
                 }),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn build_handler(
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-    Json(body): Json<BuildRequest>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&body.owner, &body.repo) {
-        return resp;
-    }
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.commit))
-    {
-        return resp;
-    }
-    if let Some(resp) =
-        validation::reject_if_invalid(|| validation::validate_git_rev(&body.ref_name))
-    {
-        return resp;
-    }
-    // The build endpoint accepts GitHub's OIDC token in the standard
-    // Authorization header and the ripclone token in a dedicated header.
-    let oidc_token = match headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "missing OIDC Authorization: Bearer token".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // Verify the ripclone token if one is configured.
-    if let Some(expected) = &state.token_hash {
-        let ripclone_header = headers
-            .get("X-Ripclone-Token")
-            .and_then(|v| v.to_str().ok());
-        let authorized = ripclone_header
-            .map(|v| check_auth_header(&format!("Ripclone {v}"), expected))
-            .unwrap_or(false);
-        if !authorized {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "unauthorized".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    let verifier = match &state.oidc_verifier {
-        Some(v) => v,
-        None => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(ErrorResponse {
-                    error: "OIDC verification is not configured".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    if let Err(e) = verifier.verify(oidc_token, &body.owner, &body.repo).await {
-        state.metrics.record_error();
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: format!("OIDC verification failed: {}", e),
-            }),
-        )
-            .into_response();
-    }
-
-    let job_repo_id = RepoId::github(format!("{}/{}", body.owner, body.repo));
-
-    // `/v1/build` is an explicit HEAD wakeup. The body commit is intentionally
-    // untrusted; resolve HEAD once, then pass that exact result to admission.
-    let Some(provider) = state.provider_registry.get("github").cloned() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "github provider is not configured".to_string(),
-            }),
-        )
-            .into_response();
-    };
-    let credential = match state.broker.fetch_credential(&job_repo_id, None) {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-    let tip = {
-        let _permit = fetch_semaphore()
-            .acquire()
-            .await
-            .expect("fetch semaphore never closed");
-        git::ls_remote_tip_async(&provider, &job_repo_id, "HEAD", credential.as_ref()).await
-    };
-    let tip = match tip {
-        Ok(Some(tip)) => tip,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "upstream HEAD has no commit".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            state.metrics.record_error();
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("upstream HEAD probe failed: {e:#}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let admitted_branch = tip
-        .default_branch
-        .clone()
-        .unwrap_or_else(|| "HEAD".to_string());
-    match trigger_build(&state, &job_repo_id, tip.commit.clone()).await {
-        Ok(outcome) => (
-            StatusCode::ACCEPTED,
-            Json(BuildResponse {
-                status: match outcome {
-                    EnqueueOutcome::Enqueued => "queued",
-                    EnqueueOutcome::Coalesced => "coalesced",
-                    EnqueueOutcome::Full => "full",
-                }
-                .to_string(),
-                queue_depth: state.build_queue.depth().await,
-                commit: tip.commit,
-                branch: admitted_branch,
-            }),
-        )
-            .into_response(),
-        Err(error) => {
-            state.metrics.record_error();
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse { error }),
             )
                 .into_response()
         }
@@ -3703,10 +2751,8 @@ async fn serve_artifact(
 ) -> impl IntoResponse {
     // If the backend can hand out a signed URL, redirect the client there.
     // The client can then use its own Range requests against the CDN/object store.
-    // Use the same visibility-aware TTL as the ref path (a private repo gets a
-    // shorter-lived URL) rather than a flat window.
-    let private = headers.as_ref().map(visibility_is_private).unwrap_or(false);
-    if let Some(url) = state.storage.signed_url(&hash, ref_signed_url_ttl(private)) {
+    // Use the same TTL as the ref path.
+    if let Some(url) = state.storage.signed_url(&hash, ref_signed_url_ttl()) {
         state.metrics.record_artifact_request(0);
         return (
             StatusCode::TEMPORARY_REDIRECT,
@@ -5739,10 +4785,10 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                         Err(error) => Err(BuildError::permanent(format!(
                             "queued job has invalid admitted commit: {error}"
                         ))),
-                        Ok(()) => match worker_state
-                            .broker
-                            .fetch_credential(&repo_id, claimed.credential.as_ref())
-                        {
+                        Ok(()) => match claimed.credential.clone().map_or_else(
+                            || worker_state.broker.fetch_credential(&repo_id),
+                            |c| Ok(Some(c)),
+                        ) {
                             Err(error) => Err(BuildError::permanent(format!(
                                 "fetch credential for queued job {}: {error:#}",
                                 repo_id.storage_key()
@@ -5860,7 +4906,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
         };
         // Cheap tip probe, under the same fetch cap as a real fetch so a sweep
         // can't become uncapped upstream chatter. Best-effort.
-        let credential = match state.broker.fetch_credential(&repo_id, None) {
+        let credential = match state.broker.fetch_credential(&repo_id) {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -5966,21 +5012,6 @@ async fn serve(
     let token_hash = read_server_auth_token()?;
     info!("server auth token configured; auth middleware enabled");
 
-    // Session-token signing key. Derived from the *raw* server token (or an
-    // explicit RIPCLONE_JWT_SECRET) — never from the hash clients hold. Disabled
-    // when only the hash is configured, so we never sign with client-known material.
-    let raw_server_token = env::var("RIPCLONE_SERVER_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
-    let jwt = crate::auth::jwt::JwtKeys::from_env(raw_server_token.as_deref()).map(Arc::new);
-    if jwt.is_some() {
-        info!("session tokens enabled: `ripclone auth login` issues short-lived JWTs");
-    } else {
-        info!(
-            "session tokens disabled: set RIPCLONE_JWT_SECRET (or RIPCLONE_SERVER_TOKEN as raw, not _HASH) to enable `ripclone auth login`"
-        );
-    }
-
     let provider_registry = ProviderRegistry::load().context("load provider registry")?;
     info!(
         "provider registry loaded with {} instance(s)",
@@ -6012,14 +5043,6 @@ async fn serve(
         .await?;
     b.cache_retention.clone().spawn_from_env();
 
-    let oidc_audience = env::var("RIPCLONE_OIDC_AUDIENCE")
-        .ok()
-        .filter(|t| !t.is_empty());
-    let oidc_verifier = oidc_audience.map(OidcVerifier::new);
-    if oidc_verifier.is_some() {
-        info!("OIDC verification enabled for audience configured via RIPCLONE_OIDC_AUDIENCE");
-    }
-
     // Webhook receiver config: per-provider secret + optional allowlist (built
     // before the registry is moved into the state). A push to a configured
     // webhook triggers a build before any clone — no per-repo Actions workflow.
@@ -6035,17 +5058,13 @@ async fn serve(
         provider_registry,
         broker,
         token_hash: Some(token_hash),
-        jwt,
         metrics,
         rate_limiter,
         build_queue,
         control_db: Some(control_db),
-        oidc_verifier,
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
-        access_verifier: Arc::new(HttpAccessVerifier::new()),
-        require_repo_auth: require_repo_auth_from_env(),
     };
 
     spawn_durable_build_worker(state.clone(), worker_queue);
@@ -6064,15 +5083,6 @@ async fn serve(
 
     let app = build_app(state);
 
-    if require_repo_auth_from_env() {
-        info!(
-            "per-repo access enforcement ON: private repos require the caller's credential on every read (RIPCLONE_TRUST_GATEWAY=1 to disable for single-tenant self-host)"
-        );
-    } else {
-        warn!(
-            "per-repo access enforcement OFF (RIPCLONE_TRUST_GATEWAY): any holder of the shared server token can read any cached repo — keep this backend network-isolated and single-tenant"
-        );
-    }
     // Bind only after config and control ownership are checked, so a rejected
     // server never takes the port.
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
@@ -6465,20 +5475,14 @@ mod tests {
             provider_registry,
             broker,
             token_hash: Some(token_hash),
-            jwt: None,
             metrics,
             rate_limiter: RateLimiter::new(100, 100.0),
             build_queue,
             control_db: None,
-            oidc_verifier: None,
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
-            // Default tests to single-tenant trust (no network access checks);
-            // the authz-specific tests override these two fields with a fake.
-            access_verifier: Arc::new(HttpAccessVerifier::new()),
-            require_repo_auth: false,
         }
     }
 
@@ -6969,7 +5973,6 @@ mod tests {
             &info,
             &storage,
             ExactResultKind::Full,
-            false,
         );
         assert_eq!(resp.commit, "exact-commit");
         assert_eq!(resp.clonepack_manifest, "exact-manifest");
@@ -7052,7 +6055,6 @@ mod tests {
             &info,
             &storage,
             ExactResultKind::Full,
-            false,
         );
         let full_artifacts = info.full.as_ref().unwrap();
         assert_eq!(full.commit, commit);
@@ -7090,16 +6092,15 @@ mod tests {
             &info,
             &storage,
             ExactResultKind::Files,
-            true,
         );
         assert_eq!(
             files.archive_chunk_urls,
-            Some(vec![signed(300, "a1"), signed(300, "a2")])
+            Some(vec![signed(1200, "a1"), signed(1200, "a2")])
         );
         assert!(files.pack_chunk_urls.is_none());
         assert_eq!(
             files.clonepack_manifest_url,
-            signed(300, &info.files.as_ref().unwrap().clonepack.manifest)
+            signed(1200, &info.files.as_ref().unwrap().clonepack.manifest)
         );
         // No MIDX on the Files variant: an empty hash is never signed.
         assert!(files.midx_url.is_none());
@@ -7112,54 +6113,8 @@ mod tests {
             &info,
             &storage,
             ExactResultKind::Head,
-            false,
         );
         assert_eq!(head.pack_chunk_urls, Some(vec![signed(1200, "h1-pack")]));
-    }
-
-    #[test]
-    fn signed_url_ttl_is_shorter_for_private() {
-        // Defaults (no env override): public 20m, private 5m. Private must be the
-        // shorter window — it bounds how long a leaked/stale signed URL works
-        // after a caller loses GitHub access.
-        assert_eq!(ref_signed_url_ttl(false), Duration::from_secs(1200));
-        assert_eq!(ref_signed_url_ttl(true), Duration::from_secs(300));
-        assert!(ref_signed_url_ttl(true) < ref_signed_url_ttl(false));
-    }
-
-    #[test]
-    fn visibility_header_is_parsed_case_insensitively() {
-        use axum::http::HeaderValue;
-        let mut h = HeaderMap::new();
-        assert!(!visibility_is_private(&h)); // absent → public (self-host direct)
-        h.insert("x-ripclone-visibility", HeaderValue::from_static("private"));
-        assert!(visibility_is_private(&h));
-        h.insert("x-ripclone-visibility", HeaderValue::from_static("PRIVATE"));
-        assert!(visibility_is_private(&h));
-        h.insert("x-ripclone-visibility", HeaderValue::from_static("public"));
-        assert!(!visibility_is_private(&h));
-        h.insert("x-ripclone-visibility", HeaderValue::from_static("wat"));
-        assert!(visibility_is_private(&h));
-        h.insert(
-            "x-ripclone-visibility",
-            HeaderValue::from_bytes(&[0xff]).unwrap(),
-        );
-        assert!(visibility_is_private(&h));
-    }
-
-    /// A canned [`AccessVerifier`] for the authz wiring tests.
-    struct StubVerifier(AccessDecision);
-
-    #[async_trait::async_trait]
-    impl AccessVerifier for StubVerifier {
-        async fn verify(
-            &self,
-            _p: &ProviderInstance,
-            _path: &str,
-            _c: Option<&secrecy::SecretString>,
-        ) -> AccessDecision {
-            self.0
-        }
     }
 
     #[test]
@@ -7208,72 +6163,6 @@ mod tests {
         }
     }
 
-    /// AU1 gate decisions: trust mode falls back to the header; enforced mode
-    /// maps the verifier's decision to public/private/403.
-    #[tokio::test]
-    async fn authorize_repo_read_maps_decisions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        let provider = state.provider_registry.get("github").unwrap().clone();
-        let repo = RepoId::github("o/r");
-        let headers = HeaderMap::new();
-
-        // Trust mode: gate skipped, visibility from header (absent → public).
-        state.require_repo_auth = false;
-        assert!(
-            !authorize_repo_read(&state, &provider, &repo, None, &headers)
-                .await
-                .unwrap()
-        );
-
-        // Enforced + public → served anonymously (private = false).
-        state.require_repo_auth = true;
-        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Public));
-        assert!(
-            !authorize_repo_read(&state, &provider, &repo, None, &headers)
-                .await
-                .unwrap()
-        );
-
-        // Enforced + authorized private → private = true.
-        state.access_verifier = Arc::new(StubVerifier(AccessDecision::PrivateAuthorized));
-        assert!(
-            authorize_repo_read(&state, &provider, &repo, None, &headers)
-                .await
-                .unwrap()
-        );
-
-        // Enforced + denied → 403.
-        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Denied));
-        let resp = authorize_repo_read(&state, &provider, &repo, None, &headers)
-            .await
-            .unwrap_err();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    }
-
-    /// End-to-end: a `refs` read for a repo the caller can't access returns 403
-    /// through the real route — and never reaches the build/mirror path. (Before
-    /// AU1, a cached private repo here returned 200 to any shared-token holder.)
-    #[tokio::test]
-    async fn ref_read_is_forbidden_when_access_denied() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
-        state.require_repo_auth = true;
-        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Denied));
-        mark_added(&state, RepoId::github("o/r")).await;
-        let app = build_app(state);
-
-        let resp = app
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/o/r/refs/main?result=full",
-                Some(&auth_header()),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    }
-
     fn test_request(method: &str, uri: &str) -> axum::http::Request<Body> {
         axum::http::Request::builder()
             .method(method)
@@ -7297,38 +6186,6 @@ mod tests {
             b = b.header("Authorization", a);
         }
         b.body(Body::empty()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn session_tokens_disabled_without_signing_key() {
-        // test_state has token_hash set but jwt = None (no signing key).
-        let tmp = tempfile::tempdir().unwrap();
-        let app = build_app(test_state(&tmp));
-        // Login can't mint a token → 503, never a token.
-        let login = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/auth/login")
-                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .body(Body::from("secret=whatever"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(login.status(), StatusCode::SERVICE_UNAVAILABLE);
-        // A bearer token is never accepted when issuance is disabled.
-        let bearer = app
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/acme/secret/status",
-                Some("Bearer anything.at.all"),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(bearer.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -7436,103 +6293,6 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["commit"], commit);
         assert_eq!(body["queue_depth"], 3);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn oidc_build_wakeup_ignores_body_target_and_admits_one_probed_head() {
-        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        let origin_path = origin_base.path().join("acme").join("widget.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let head = crate::test_fixture::commit(&origin, &[("f.txt", b"HEAD\n")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state_with_control(&tmp).await;
-        mark_added(&state, RepoId::github("acme/widget")).await;
-        const AUDIENCE: &str = "ripclone-test-audience";
-        const KID: &str = "ripclone-test-kid";
-        state.oidc_verifier = Some(crate::oidc::OidcVerifier::new_for_test(
-            AUDIENCE.to_string(),
-            KID,
-            crate::auth::broker::tests::TEST_PUBLIC_KEY.as_bytes(),
-        ));
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let claims = serde_json::json!({
-            "sub": "repo:acme/widget:ref:refs/heads/main",
-            "iss": "https://token.actions.githubusercontent.com",
-            "aud": AUDIENCE,
-            "repository": "acme/widget",
-            "repository_owner": "acme",
-            "repository_id": "123",
-            "iat": now,
-            "exp": now + 300
-        });
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(KID.to_string());
-        let oidc = encode(
-            &header,
-            &claims,
-            &EncodingKey::from_rsa_pem(crate::auth::broker::tests::TEST_PRIVATE_KEY.as_bytes())
-                .unwrap(),
-        )
-        .unwrap();
-        let decoy = "ffffffffffffffffffffffffffffffffffffffff";
-        let body = serde_json::json!({
-            "owner": "acme",
-            "repo": "widget",
-            "commit": decoy,
-            "ref": "refs/heads/body-decoy"
-        });
-        unsafe {
-            std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
-        }
-        let response = build_app(state.clone())
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/build")
-                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-                    .header("Authorization", format!("Bearer {oidc}"))
-                    .header("X-Ripclone-Token", hex::encode(Sha256::digest("secret")))
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe {
-            std::env::remove_var("RIPCLONE_ORIGIN_BASE");
-        }
-
-        let response_status = response.status();
-        let response_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        assert_eq!(
-            response_status,
-            StatusCode::ACCEPTED,
-            "OIDC build response: {}",
-            String::from_utf8_lossy(&response_body)
-        );
-        let job = claim_admitted_job(&state)
-            .await
-            .expect("OIDC wakeup enqueued exact HEAD job");
-        assert_eq!(job.repo_id, RepoId::github("acme/widget"));
-        assert_eq!(job.admitted_commit, head);
-        assert_ne!(job.admitted_commit, decoy);
-        assert!(
-            claim_admitted_job(&state).await.is_none(),
-            "one HEAD probe admitted one job"
-        );
     }
 
     #[tokio::test]

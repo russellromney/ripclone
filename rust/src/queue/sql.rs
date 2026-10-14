@@ -65,9 +65,8 @@ pub struct ClaimedJob {
     pub admitted_commit: String,
     /// Validated repository build settings snapshotted at admission.
     pub repo_config: crate::repo_config::RepoConfig,
-    /// Per-job upstream credential the enqueuer passed (the cloud's per-request
-    /// `X-Upstream-Token`), so the worker can read a private repo it has no
-    /// standing credential for. `None` falls back to the server's broker.
+    /// Upstream credential the broker returned at admission. `None` falls back
+    /// to the server's broker when the job is claimed.
     /// SECURITY: stored only base64-obfuscated in the queue DB — treat that DB as
     /// sensitive and access-controlled. (Tokens are short-lived; encryption-at-
     /// rest with a worker-shared key is a noted follow-up.)

@@ -532,9 +532,6 @@ impl ServerConfig {
             .env("RIPCLONE_CONFIG", state.join("ripclone.toml"))
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .env("RIPCLONE_ORIGIN_BASE", &self.origin_base)
-            // file:// origins cannot answer the provider's access probe; the
-            // shared token is the only auth in these single-tenant tests.
-            .env("RIPCLONE_TRUST_GATEWAY", "1")
             .env("RIPCLONE_POLL_INTERVAL_SECS", "0")
             .env("RIPCLONE_RATE_LIMIT_BURST", "1000000")
             .env("RIPCLONE_RATE_LIMIT_PER_SEC", "1000000")

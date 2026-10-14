@@ -1446,7 +1446,8 @@ pub struct Client {
     /// A non-default provider id alone is insufficient: its host/template must
     /// come from the client's own registry, never from the server response.
     provider_instance: Option<ProviderInstance>,
-    /// Upstream credential token sent as `X-Upstream-Token`.
+    /// Upstream credential for the local top-up fetch. Never sent to the
+    /// ripclone server.
     upstream_token: Option<String>,
     /// When true, suppress the post-clone metrics report regardless of env.
     skip_metrics: bool,
@@ -1480,19 +1481,6 @@ impl Client {
     ) -> Self {
         let auth = token.as_ref().map(|t| format!("Ripclone {t}"));
         Self::new_with_auth(server, auth, cache_dir)
-    }
-
-    /// Create a client that authenticates with a `Bearer <jwt>` session token
-    /// (from `ripclone auth login`) instead of the shared `Ripclone <hash>`
-    /// scheme.
-    pub fn new_with_bearer(server: String, jwt: String) -> Self {
-        let cache_dir = if std::env::var_os("RIPCLONE_NO_CACHE").is_some() {
-            None
-        } else {
-            std::env::var_os("RIPCLONE_CACHE_DIR").map(PathBuf::from)
-        };
-        let auth = Some(format!("Bearer {jwt}"));
-        Self::new_with_auth(server, auth, cache_dir.as_deref())
     }
 
     fn new_with_auth(server: String, auth_value: Option<String>, cache_dir: Option<&Path>) -> Self {
@@ -1572,18 +1560,6 @@ impl Client {
         )
     }
 
-    /// Start a request against the ripclone server, attaching the upstream
-    /// credential when one was configured.
-    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
-        let mut req = self.http.request(method, url);
-        if let Some(token) = &self.upstream_token
-            && let Ok(value) = reqwest::header::HeaderValue::from_str(token)
-        {
-            req = req.header("X-Upstream-Token", value);
-        }
-        req
-    }
-
     /// Send a request, turning a transport-level failure — server unreachable,
     /// connection refused, DNS failure, timeout — into an actionable message that
     /// names the server. The most common first-run mistake is pointing at a
@@ -1608,7 +1584,9 @@ impl Client {
     /// Return the server's complete added-repository set.
     pub async fn list_repos(&self) -> Result<Vec<RepoId>> {
         let url = format!("{}/v1/repos", self.server);
-        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
+        let resp = self
+            .send(self.http.request(reqwest::Method::GET, &url))
+            .await?;
         if !resp.status().is_success() {
             return Err(server_error("list failed", resp).await);
         }
@@ -1621,7 +1599,7 @@ impl Client {
     pub async fn remove_repo(&self, repo_path: &str) -> Result<()> {
         let url = self.repo_url(repo_path, "/add");
         let resp = self
-            .send(self.request(reqwest::Method::DELETE, &url))
+            .send(self.http.request(reqwest::Method::DELETE, &url))
             .await?;
         if !resp.status().is_success() {
             return Err(server_error("rm failed", resp).await);
@@ -1723,7 +1701,9 @@ impl Client {
                 url.push('?');
                 url.push_str(&q.join("&"));
             }
-            let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
+            let resp = self
+                .send(self.http.request(reqwest::Method::GET, &url))
+                .await?;
             let status = resp.status();
             if status == reqwest::StatusCode::ACCEPTED {
                 let response_clone_id = resp
@@ -2023,7 +2003,9 @@ impl Client {
             url.push_str(&urlencoding::encode(rev));
         }
 
-        let response = self.send(self.request(reqwest::Method::GET, &url)).await?;
+        let response = self
+            .send(self.http.request(reqwest::Method::GET, &url))
+            .await?;
         let status = response.status();
         let info = if status == reqwest::StatusCode::OK {
             response
@@ -2347,7 +2329,9 @@ impl Client {
     pub async fn admit_add_repo(&self, repo_path: &str) -> Result<SyncAdmission> {
         let mut url = self.repo_url(repo_path, "/add");
         url.push_str("?source=cli");
-        let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
+        let resp = self
+            .send(self.http.request(reqwest::Method::POST, &url))
+            .await?;
         if resp.status() == reqwest::StatusCode::OK {
             let ready: RefResponse = resp.json().await?;
             return Ok(SyncAdmission {
@@ -2405,7 +2389,9 @@ impl Client {
             url.push('?');
             url.push_str(&q.join("&"));
         }
-        let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
+        let resp = self
+            .send(self.http.request(reqwest::Method::POST, &url))
+            .await?;
         if resp.status() == reqwest::StatusCode::OK {
             let ready: RefResponse = resp.json().await?;
             return Ok(SyncAdmission {
@@ -2527,7 +2513,9 @@ impl Client {
             q.push(format!("rev={}", urlencoding::encode(&selected_rev)));
             url.push('?');
             url.push_str(&q.join("&"));
-            let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
+            let resp = self
+                .send(self.http.request(reqwest::Method::POST, &url))
+                .await?;
             let status = resp.status();
             if status == reqwest::StatusCode::OK {
                 let ready: RefResponse = resp

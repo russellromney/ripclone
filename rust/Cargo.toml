@@ -53,7 +53,6 @@ hmac = "0.13"
 libc = "0.2.186"
 prost = "0.14"
 rayon = "1"
-rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
 s3 = { version = "0.1.36", default-features = false, features = ["async", "rustls", "multipart"] }
 serde = { version = "1", features = ["derive"] }
@@ -74,7 +73,7 @@ zstd = { version = "0.13", features = ["zdict_builder"] }
 secrecy = "0.10.3"
 async-trait = "0.1.89"
 # `rust_crypto` selects the pure-Rust crypto provider so RS256 sign/verify work
-# (the GitHub App broker signs JWTs; OIDC verifies them).
+# (the GitHub App broker signs its app JWT with RS256).
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
 # libsql serves the local SQLite control database.
