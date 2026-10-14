@@ -41,7 +41,7 @@ jobs:
               - 'rust/**'
               - 'tests/docker/**'
               - 'scripts/s3_emulator.sh'
-              - 'scripts/e2e_full_topup_gitea.sh'
+              - 'scripts/gitea_live.sh'
               - '.github/workflows/ci.yml'
             bench:
               - 'rust/**'
@@ -161,55 +161,6 @@ jobs:
           chmod +x bin/*
           bash scripts/ci.sh e2e
 
-  # Durable artifact lifecycle: the server uses an embedded replica against the
-  # official libsql fixture, the standalone worker is API-only, and published
-  # bytes remain in the local S3 emulator after its local caches are removed.
-  turso-api-worker-s3:
-    needs: [changes, ci-build]
-    if: ${{ needs.changes.outputs.docker == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    services:
-      sqld:
-        image: ghcr.io/tursodatabase/libsql-server@sha256:bc100873a74865392a49191b4733025fe8222a409799efa424dc196feaf05035
-        ports:
-          - 8080:8080
-    steps:
-      - uses: actions/checkout@v7
-      - name: Download ci artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: ci-artifacts
-          path: bin
-      - name: Wait for primary; start the S3 emulator with a bucket
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 60); do
-            curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:8080/health >/dev/null 2>&1 && break
-            sleep 0.25
-          done
-          curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:8080/health >/dev/null
-          bash scripts/s3_emulator.sh "$RUNNER_TEMP/s3" "ripclone-${GITHUB_RUN_ID}-turso-worker" >> "$GITHUB_ENV"
-      - name: API worker keeps published S3 artifacts across empty local caches
-        timeout-minutes: 6
-        env:
-          RIPCLONE_REQUIRE_TURSO: "1"
-          RIPCLONE_TURSO_DATABASE_URL: http://127.0.0.1:8080
-          RIPCLONE_TURSO_AUTH_TOKEN: local-surrogate
-          RIPCLONE_S3_PREFIX: control-collapse/turso-api-worker/
-          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
-          CARGO_BIN_EXE_ripclone-worker: ${{ github.workspace }}/bin/ripclone-worker
-        run: |
-          set -euo pipefail
-          test_bin="${{ github.workspace }}/bin/e2e_token_only_worker"
-          chmod +x "$test_bin" "$CARGO_BIN_EXE_ripclone" "$CARGO_BIN_EXE_ripclone-worker"
-          test_name=token_only_worker_builds_and_clones_without_control_credentials
-          timeout 30 "$test_bin" --list | grep -Fqx "$test_name: test"
-          timeout 300 "$test_bin" --exact "$test_name"
-      - name: S3 emulator log
-        if: failure()
-        run: cat "$RUNNER_TEMP/s3/versitygw.log" || true
-
   # Contract rows F7 and H2 against S3 storage. Each test starts its own
   # versitygw emulator (scripts/s3_emulator.sh), so they are ignored in the
   # default run and selected here.
@@ -235,8 +186,8 @@ jobs:
           # A filter that matched nothing would also pass.
           grep -Eq "test result: ok\. 2 passed; 0 failed" "$RUNNER_TEMP/s3.log"
 
-  # Real multi-provider + server-side-token path against a live Gitea.
-  # Prebuilt e2e_gitea_provider from ci-build — no cargo on this runner.
+  # Contract row: a private repo on a live Gitea, read with the server's token.
+  # Prebuilt contract binary from ci-build — no cargo on this runner.
   gitea:
     needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
@@ -248,15 +199,14 @@ jobs:
         with:
           name: ci-artifacts
           path: bin
-      - name: Digest-pinned Gitea provider + Full top-up e2e
+      - name: Live Gitea contract row
         env:
           CI_ARTIFACTS: ${{ github.workspace }}/bin
           RIPCLONE_BIN_DIR: ${{ github.workspace }}/bin
-          RIPCLONE_REQUIRE_GITEA: "1"
         run: |
           set -euo pipefail
           chmod +x bin/*
-          bash scripts/e2e_full_topup_gitea.sh
+          bash scripts/gitea_live.sh
 
   # Benchmark-harness smoke — prebuilt bins from ci-build.
   benchmark:

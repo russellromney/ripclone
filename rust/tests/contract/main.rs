@@ -7,7 +7,9 @@ mod harness;
 mod net;
 
 mod coalesce;
+mod docs;
 mod downloads;
+mod gitea;
 mod integrations;
 mod pinning;
 mod resolve;

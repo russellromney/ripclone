@@ -1,5 +1,4 @@
-//! Integration test for the LSM incremental history build.
-//! Included in the bounded `local_cli` integration-test crate.
+//! LSM incremental history build, end to end through the pack builder.
 //!
 //! Simulates two syncs of a growing repo: sync 1 seals all history up to commit
 //! C as level 0; sync 2 builds only the tail (C, E]. Installing level 0 + the
@@ -8,8 +7,8 @@
 //! again before E. That blob is the head-exclusion trap: it must live in the
 //! sealed level (full range, no head exclusion) or it goes missing.
 
-use ripclone::cas::Cas;
-use ripclone::pack::PackBuilder;
+use crate::cas::Cas;
+use crate::pack::PackBuilder;
 use std::path::Path;
 use std::process::Command;
 

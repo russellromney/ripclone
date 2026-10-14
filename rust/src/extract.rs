@@ -1008,6 +1008,9 @@ fn parse_pack_obj_header(buf: &[u8]) -> Result<(u8, u64, usize)> {
 }
 
 #[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::{Fragment, FrameInfo, MetadataChunk};

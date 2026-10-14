@@ -696,6 +696,11 @@ impl<'a> PackBuilder<'a> {
 }
 
 #[cfg(test)]
+mod lsm_incremental_tests;
+#[cfg(test)]
+mod multipack_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

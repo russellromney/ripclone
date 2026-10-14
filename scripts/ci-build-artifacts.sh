@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compile once (ci profile) everything the PR gate fans out to separate jobs:
-# product bins (docker/e2e/benchmark) plus the integration/lib test binaries
-# those jobs run. Stages stable names under rust/target/ci-artifacts/ for upload.
+# product bins (docker/e2e/benchmark) plus the contract test binary the s3 and
+# gitea jobs run. Stages stable names under rust/target/ci-artifacts/ for upload.
 #
 # Not the full unit/integration suite — that is the `test` job's job. Keep this
 # list to what fan-out actually executes.
@@ -28,22 +28,10 @@ pick_test_exe() {
     | tail -n1
 }
 
-pick_lib_test_exe() {
-  jq -r \
-    'select(.reason == "compiler-artifact"
-            and .profile.test == true
-            and .executable != null
-            and (.executable | length) > 0
-            and (.target.kind | index("lib"))) | .executable' \
-    | tail -n1
-}
-
 BINS=(ripclone ripclone-server ripclone-worker)
 
 TESTS=(
   contract
-  e2e_gitea_provider
-  e2e_token_only_worker
 )
 
 echo "==> building bins (profile=$PROFILE)"
@@ -59,14 +47,14 @@ for b in "${BINS[@]}"; do
   echo "    staged bin $b"
 done
 
-echo "==> building fan-out integration + lib test binaries (no-run)"
+echo "==> building fan-out test binaries (no-run)"
 test_args=()
 for t in "${TESTS[@]}"; do
   test_args+=(--test "$t")
 done
 # shellcheck disable=SC2068
 json="$(cargo test --profile "$PROFILE" --locked --no-run --message-format=json \
-  ${test_args[@]} --lib)"
+  ${test_args[@]})"
 
 for t in "${TESTS[@]}"; do
   exe="$(printf '%s\n' "$json" | pick_test_exe "$t")"
@@ -78,15 +66,6 @@ for t in "${TESTS[@]}"; do
   chmod +x "$STAGE_DIR/$t"
   echo "    staged test $t"
 done
-
-lib_exe="$(printf '%s\n' "$json" | pick_lib_test_exe)"
-if [ -z "$lib_exe" ] || [ ! -x "$lib_exe" ]; then
-  echo "error: missing lib test binary (exe=${lib_exe:-empty})" >&2
-  exit 1
-fi
-cp -f "$lib_exe" "$STAGE_DIR/ripclone-lib-tests"
-chmod +x "$STAGE_DIR/ripclone-lib-tests"
-echo "    staged test ripclone-lib-tests"
 
 echo "==> ci-build-artifacts ready in $STAGE_DIR"
 ls -la "$STAGE_DIR"

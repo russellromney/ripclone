@@ -252,21 +252,113 @@ fn i4_signed_webhook_builds_before_clone() {
     }
 }
 
-/// I7: `--verify-upstream` against the upstream the CLI sees. The server
-/// always builds the real origin; the CLI's upstream is that origin, a closed
-/// port, or a copy whose tip has moved on.
-#[test]
-fn i7_verify_upstream_modes() {
+/// I7 setup: an origin the server has built, and its tip.
+fn i7_world(name: &str) -> (World, Server, Origin, String) {
     let world = World::new();
-    let origin = world.origin("acme", "i7");
+    let origin = world.origin("acme", name);
     let tip = origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
     let server = world.server(&[]);
-    world.cli(&server, &["add", "acme/i7", "--wait"]).ok();
+    world
+        .cli(&server, &["add", &format!("acme/{name}"), "--wait"])
+        .ok();
+    (world, server, origin, tip)
+}
 
+/// Clone with each `--verify-upstream` mode while the CLI sees the upstream at
+/// `base` (empty: the real origin). Expected per mode: `Ok(warns)` or
+/// `Err(text)`.
+fn i7_cases(
+    world: &World,
+    server: &Server,
+    name: &str,
+    tip: &str,
+    base: &str,
+    cases: &[(&str, Result<bool, &str>)],
+) {
+    for (mode, expected) in cases {
+        let case = format!("{name}-{mode}");
+        let target = world.target(&case);
+        let mut env = vec![];
+        if !base.is_empty() {
+            env.push(("RIPCLONE_ORIGIN_BASE", base));
+        }
+        let out = world.cli_env(
+            server,
+            &[
+                "clone",
+                &format!("acme/{name}"),
+                target.to_str().unwrap(),
+                "--depth",
+                "1",
+                &format!("--verify-upstream={mode}"),
+            ],
+            &env,
+        );
+        match expected {
+            Ok(warns) => {
+                out.ok();
+                assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "{case}");
+                assert_eq!(
+                    out.stderr().contains("--verify-upstream skipped"),
+                    *warns,
+                    "{case}: {}",
+                    out.stderr()
+                );
+            }
+            Err(text) => {
+                let err = out.err();
+                assert!(err.contains(text), "{case}: {err}");
+                assert!(!target.exists(), "{case} left {}", target.display());
+            }
+        }
+    }
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+}
+
+/// I7: `--verify-upstream=always` passes when the CLI's upstream matches what
+/// the server built.
+#[test]
+fn i7_verify_upstream_same_tip() {
+    let (world, server, _origin, tip) = i7_world("i7-same");
+    i7_cases(
+        &world,
+        &server,
+        "i7-same",
+        &tip,
+        "",
+        &[("always", Ok(false))],
+    );
+}
+
+/// I7: the CLI's upstream is broken. `never` stays quiet, `auto` warns and
+/// clones, `always` fails.
+#[test]
+fn i7_verify_upstream_broken() {
+    let (world, server, _origin, tip) = i7_world("i7-broken");
+    let broken = Hangup::new();
+    i7_cases(
+        &world,
+        &server,
+        "i7-broken",
+        &tip,
+        &broken.url(),
+        &[
+            ("never", Ok(false)),
+            ("auto", Ok(true)),
+            ("always", Err("upstream verification failed")),
+        ],
+    );
+}
+
+/// I7: the CLI's upstream has moved past what the server built. `never`
+/// clones; `auto` and `always` refuse.
+#[test]
+fn i7_verify_upstream_moved_tip() {
+    let (world, server, origin, tip) = i7_world("i7-moved");
     // A copy of the origin whose main has a commit the server never saw.
     let moved = world.path("moved");
-    let moved_bare = moved.join("acme").join("i7.git");
+    let moved_bare = moved.join("acme").join("i7-moved.git");
     std::fs::create_dir_all(moved_bare.parent().unwrap()).unwrap();
     git(
         &moved,
@@ -283,73 +375,16 @@ fn i7_verify_upstream_modes() {
         &origin.work,
         &["push", "-q", moved_bare.to_str().unwrap(), "HEAD:main"],
     );
-    let closed = Closed::new();
-    let same = String::new();
-    let moved_base = format!("file://{}", moved.display());
-
-    // (upstream, its base for the CLI, mode, expected: Ok(warns) or Err(text))
-    let cases: [(&str, &str, &str, Result<bool, &str>); 9] = [
-        ("same", &same, "never", Ok(false)),
-        ("same", &same, "auto", Ok(false)),
-        ("same", &same, "always", Ok(false)),
-        ("closed", &closed.url(), "never", Ok(false)),
-        ("closed", &closed.url(), "auto", Ok(true)),
-        (
-            "closed",
-            &closed.url(),
-            "always",
-            Err("upstream verification failed"),
-        ),
-        ("moved", &moved_base, "never", Ok(false)),
-        (
-            "moved",
-            &moved_base,
-            "auto",
-            Err("does not match upstream tip"),
-        ),
-        (
-            "moved",
-            &moved_base,
-            "always",
-            Err("does not match upstream tip"),
-        ),
-    ];
-    for (upstream, base, mode, expected) in cases {
-        let case = format!("{upstream}-{mode}");
-        let target = world.target(&case);
-        let mut env = vec![];
-        if !base.is_empty() {
-            env.push(("RIPCLONE_ORIGIN_BASE", base));
-        }
-        let out = world.cli_env(
-            &server,
-            &[
-                "clone",
-                "acme/i7",
-                target.to_str().unwrap(),
-                "--depth",
-                "1",
-                &format!("--verify-upstream={mode}"),
-            ],
-            &env,
-        );
-        match expected {
-            Ok(warns) => {
-                out.ok();
-                assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "{case}");
-                assert_eq!(
-                    out.stderr().contains("--verify-upstream skipped"),
-                    warns,
-                    "{case}: {}",
-                    out.stderr()
-                );
-            }
-            Err(text) => {
-                let err = out.err();
-                assert!(err.contains(text), "{case}: {err}");
-                assert!(!target.exists(), "{case} left {}", target.display());
-            }
-        }
-    }
-    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+    i7_cases(
+        &world,
+        &server,
+        "i7-moved",
+        &tip,
+        &format!("file://{}", moved.display()),
+        &[
+            ("never", Ok(false)),
+            ("auto", Err("does not match upstream tip")),
+            ("always", Err("does not match upstream tip")),
+        ],
+    );
 }

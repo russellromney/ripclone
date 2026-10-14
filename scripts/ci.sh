@@ -21,37 +21,15 @@ lint() {
     cargo clippy --all-targets --features dev-tools --locked -- -D warnings )
 }
 
-# Unit + integration tests. cargo test runs the test binaries sequentially,
-# which keeps concurrent io_uring queue allocation bounded — nextest's
-# all-binaries-at-once parallelism exhausts the runner's locked-memory limit
-# while io_uring is the default writer.
+# Unit tests run one at a time: some still mutate process env, and io_uring
+# queue allocation must stay under the runner's locked-memory limit. The
+# contract suite runs in parallel: each test owns its server, port, and temp
+# dir, and races only show up under concurrent load.
 #
 # This job self-compiles (ci profile + sccache/rust-cache). Fan-out jobs
-# (gitea/e2e/…) use prebuilt binaries from ci-build instead;
-# staging the full suite there was ~30m cold before integration-test
-# consolidation and is not worth it.
+# (gitea/e2e/s3/…) use prebuilt binaries from ci-build instead.
 run_tests() {
-  # The local-server harness has both LSM-on and LSM-off fixtures. LSM mode is
-  # process-global, so execute its two groups in separate processes while
-  # retaining one compiled test binary. The broad pass still compiles every
-  # target and runs every other test.
-  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked -- \
-      --test-threads=1 --skip lsm_on_ --skip lsm_off_ )
-
-  local filter listed
-  for filter in lsm_on_ lsm_off_; do
-    listed="$(cd "$ROOT/rust" && timeout 60 cargo test --profile ci --locked \
-      --test local_server -- "$filter" --list)"
-    if ! grep -Fq "$filter" <<<"$listed"; then
-      echo "required local-server group matched zero tests: $filter" >&2
-      exit 1
-    fi
-    ( cd "$ROOT/rust" && cargo test --profile ci --locked --test local_server -- \
-        "$filter" --test-threads=1 )
-  done
-
-  # The contract suite also runs in parallel: each test owns its server, port,
-  # and temp dir, and races only show up under concurrent load.
+  ( cd "$ROOT/rust" && cargo test --profile ci --locked --lib --bins -- --test-threads=1 )
   ( cd "$ROOT/rust" && cargo test --profile ci --locked --test contract )
 }
 
@@ -74,26 +52,6 @@ e2e() {
 # the gate — one run is enough and the second run was ~half of overall wall.
 flake() {
   run_tests
-}
-
-# Real multi-provider + server-side-token path against a live Gitea (the seam a
-# production dogfood found broken but every file:// e2e missed — the #114
-# provider-token clobber). Needs a running Gitea; the CI job brings one up and
-# exports RIPCLONE_GITEA_URL / _TOKEN / _USER. The test auto-skips if they're
-# unset, so a bare `scripts/ci.sh gitea` on a laptop without Gitea is a no-op.
-gitea() {
-  export RIPCLONE_GITEA_URL="${RIPCLONE_GITEA_URL:-http://127.0.0.1:3000}"
-  export RIPCLONE_GITEA_USER="${RIPCLONE_GITEA_USER:-ci}"
-  : "${RIPCLONE_GITEA_TOKEN:?set RIPCLONE_GITEA_TOKEN to a Gitea admin access token}"
-  if [ -n "${CI_ARTIFACTS:-}" ]; then
-    local bin="$CI_ARTIFACTS/e2e_gitea_provider"
-    [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
-    echo "gitea: running prebuilt $bin"
-    ( cd "$ROOT/rust" && "$bin" --ignored --nocapture )
-  else
-    local profile="${CARGO_PROFILE:-ci}"
-    ( cd "$ROOT/rust" && cargo test --profile "$profile" --locked --test e2e_gitea_provider -- --ignored --nocapture )
-  fi
 }
 
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
@@ -128,10 +86,9 @@ case "$STAGE" in
   e2e) e2e ;;
   flake) flake ;;
   ci-build) ci_build ;;
-  gitea) gitea ;;
   benchmark) benchmark ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|ci-build|gitea|benchmark|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|ci-build|benchmark|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"
