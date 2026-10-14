@@ -69,7 +69,7 @@ against the CLI) or the plan step that introduces the behavior.
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | now |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | now |
 
-### C. Outputs are independent and immutable (5)
+### C. Outputs are independent and immutable (6)
 
 | # | Test | Lands |
 |---|---|---|
@@ -77,7 +77,8 @@ against the CLI) or the plan step that introduces the behavior.
 | C2 | Head ready, then restart with the storage proxy failing PUTs and background builds on: Full and Files fail, Head stays cloneable, status shows `failed` per output. | step 3 PR B (S3 row) |
 | C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | step 3 PR B (S3 row) |
 | C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | step 3 PR A (short lease) |
-| C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). | step 3 PR A |
+| C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). Over the three builds, every server log line is the server's own: no git output. | step 3 PR A |
+| C6 | Linux only: SIGKILL the server while the origin holds its fetch: the server's `git` children exit too. | follow-ups |
 
 ### D. Clone pins B (6)
 
@@ -88,7 +89,7 @@ against the CLI) or the plan step that introduces the behavior.
 | D3 | Pinned commit removed upstream before it is built: clone fails and does not fall back to the branch. | now |
 | D4 | `--wait` with Full(B) pending and `background_slots = 0`: the CLI waits, reports pending, and exits at its timeout without installing anything else. | step 4 |
 | D5 | 401, 403, 404, 5xx, and an unreachable server give distinct CLI errors and exit codes (3, 4, 5, 6, 6; see the README). | now |
-| D6 | Client-side failures: target exists and is not empty (exit 1, its files untouched), server unreachable (exit 6), no `git` on PATH for an editable clone (exit 1, before any request). Nothing left behind; a Files clone works without git. | now |
+| D6 | Client-side failures: target exists and is not empty (exit 1, its files untouched), server unreachable (exit 6), no `git` on PATH for an editable clone (exit 1, before any request). Nothing left behind; a Files clone works without git. An existing empty directory is a valid target, as for `git clone`: the clone lands in it and keeps its mode; an unreachable server, no git, or artifacts failing mid-clone leave it in place, empty, with its mode. | now |
 
 ### E. Top-up (4)
 
@@ -132,19 +133,20 @@ Ripclone token reaches the origin.
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | now |
 | G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | now |
 
-### H. Storage and server state (7)
+### H. Storage and server state (8)
 
 | # | Test | Lands |
 |---|---|---|
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | now |
 | H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | now |
 | H3 | A second server on the same control database is rejected before it binds. | now |
-| H4 | Table: invalid storage, control, rate-limit and worker config (file or env, malformed file, removed `[queue]` section) is rejected before anything is created in the state dir. | now |
+| H4 | Table: invalid storage, control, rate-limit and worker config (file or env, malformed file, removed `[queue]` section) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention age and size, signed-URL TTL, ls-remote timeout, LSM levels, Head rebase size, S3 timeout, attempts and retry delay), with an error naming it. | now |
 | H5 | Local disk with retention every second and a 1-day limit: the server reports retention off; month-old artifacts stay and clone. | now |
 | H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | now (S3 row) |
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | now |
+| H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | follow-ups |
 
-### I. Auth, integrations, CLI (11)
+### I. Auth, integrations, CLI (12)
 
 | # | Test | Lands |
 |---|---|---|
@@ -154,13 +156,14 @@ Ripclone token reaches the origin.
 | I4 | Table across GitHub, GitLab, Gitea webhooks: a signed push builds before any clone; a bad signature gets 401 and no build. | now |
 | I5 | Poller: with no webhook, a push is built within one poll interval. | now |
 | I6 | Every documented CLI verb exists (keep `docs_cli_surface`). | now |
-| I7 | `--verify-upstream` auto, always, never (table). | now |
+| I7 | `--verify-upstream` auto, always, never (table). A clone that fails verification is removed; a target that was an empty directory is left empty. | now |
 | I8 | Only `/healthz`, `/readyz`, `/metrics` and `/v1/version` answer without the token; unsigned webhooks fail closed (503 without a secret); every other route, `/v1/artifacts/{hash}` included, gives 401 to a missing or wrong token. | now |
 | I9 | A client declaring another protocol gets 426; the CLI names the mismatch and says to run `ripclone version`; nothing builds. | now |
 | I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | now |
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | now |
+| I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | follow-ups |
 
-Total: 62 tests. Several are table-driven.
+Total: 65 tests. Several are table-driven.
 
 ## What this deletes
 
@@ -295,11 +298,29 @@ only warned and skipped verification; it now fails before any download (I10).
 A 426 and a 502 `upstream_unavailable` now carry their own CLI hint instead of
 none and "ripclone is briefly unavailable" (I9, A7).
 
+The follow-ups PR added C6 (Linux: the server's git children die with a
+SIGKILLed server, through `PR_SET_PDEATHSIG` in `git::command()`), H8
+(`/readyz` fails once the control database file is deleted or replaced) and
+I12 (removed environment variables warn once in the server and the CLI).
+A clone now accepts an existing empty target directory, as `git clone` does,
+and a failed clone leaves that directory in place and empty (D6, I7). Every
+numeric server variable now goes through one parser, and a value that does
+not parse stops startup; before, poll and retention intervals, retention
+limits, the signed-URL TTL, the ls-remote timeout, the LSM level cap, the
+Head rebase size and the S3 client numbers fell back to their defaults, and a
+bad retention limit turned that limit off (H4). The server's git children no
+longer write into its log: `git init` of a mirror printed its default-branch
+hint and an "Initialized" line, and `pack-objects` printed each pack's hash.
+Their output is now captured, and a failure's error carries git's stderr
+(C5). The harness ran the CLI with polls 50 ms apart, so `--wait` gave up
+after about 2 s; under a full parallel run the F rows' 2 MB fixture took
+2.2 s to build and four F rows failed once. The CLI now polls at most 200 ms
+apart in every test (about 8 s, inside the 10 s wait), `SLOW_POLL` is gone,
+and D4, which needs the budget to run out, sets 50 ms itself.
+
 ## Open points
 
 - Every row has a contract test.
-- Found while writing these rows, not fixed here: the server's git children
-  write `hint:` lines and bare SHAs into the server log; an existing empty
-  target directory is rejected, where `git clone` accepts it; an unparsable
-  `RIPCLONE_RETENTION_INTERVAL_SECS` or `RIPCLONE_POLL_INTERVAL_SECS` falls back
-  to the default instead of failing at startup.
+- Found while writing these rows, not fixed here:
+  `RepoConfig.clonepack_depths` and `archive_chunk_size` are validated and
+  stored but the builder reads neither (it reads only `compression_level`).

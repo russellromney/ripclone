@@ -200,12 +200,53 @@ pub(super) fn temp_install_dir(target: &Path) -> Result<StagedTempDir> {
     }
 }
 
-/// Rename the finished staging tree onto `target`. With `RIPCLONE_FSYNC` set,
-/// flush the tree first and the parent directory after, so a crash cannot
-/// leave a torn tree that `git status` calls clean. Off by default: the
-/// rename alone is already crash-consistent.
-pub(super) fn publish(root: &Path, target: &Path) -> Result<()> {
+/// Check `target` before a clone. Like `git clone`, it may be missing or an
+/// empty directory; anything else is refused. Returns the empty directory's
+/// permissions, which the clone keeps when it is published onto it.
+pub(super) fn check_target(target: &Path) -> Result<Option<std::fs::Permissions>> {
+    let meta = match std::fs::symlink_metadata(target) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect target {}", target.display()));
+        }
+    };
+    let empty_dir = meta.is_dir()
+        && std::fs::read_dir(target)
+            .with_context(|| format!("read target directory {}", target.display()))?
+            .next()
+            .is_none();
+    anyhow::ensure!(
+        empty_dir,
+        "target directory already exists and is not empty: {}",
+        target.display()
+    );
+    // The clone is staged next to the target and renamed onto it, so the
+    // target needs a name in its parent: `.`, `..` and `/` have none.
+    anyhow::ensure!(
+        target.file_name().is_some(),
+        "cannot clone into {}: name the directory by its path from its parent",
+        target.display()
+    );
+    Ok(Some(meta.permissions()))
+}
+
+/// Rename the finished staging tree onto `target`, which is missing or an
+/// empty directory (`rename` replaces an empty directory; `keep` carries its
+/// permissions over). With `RIPCLONE_FSYNC` set, flush the tree first and the
+/// parent directory after, so a crash cannot leave a torn tree that
+/// `git status` calls clean. Off by default: the rename alone is already
+/// crash-consistent.
+pub(super) fn publish(
+    root: &Path,
+    target: &Path,
+    keep: Option<std::fs::Permissions>,
+) -> Result<()> {
     let fsync = fsync_requested();
+    if let Some(permissions) = keep {
+        std::fs::set_permissions(root, permissions)
+            .with_context(|| format!("set permissions of {}", root.display()))?;
+    }
     if fsync {
         fsync_tree(root).context("fsync staged clone before publish")?;
     }
@@ -524,7 +565,7 @@ mod tests {
         )
         .unwrap();
 
-        publish(&staging_path, &target).unwrap();
+        publish(&staging_path, &target, None).unwrap();
         drop(staged);
 
         assert_eq!(
@@ -532,6 +573,53 @@ mod tests {
             b"tracked repository content\n"
         );
         assert!(!sidecar.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_onto_an_empty_directory_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("empty");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let keep = check_target(&target).unwrap();
+        assert!(keep.is_some());
+
+        let staged = temp_install_dir(&target).unwrap();
+        std::fs::write(staged.path().join("f.txt"), b"clone\n").unwrap();
+        publish(staged.path(), &target, keep).unwrap();
+        drop(staged);
+
+        assert_eq!(std::fs::read(target.join("f.txt")).unwrap(), b"clone\n");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o750);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_target_refuses_anything_but_missing_or_empty_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(check_target(&dir.path().join("missing")).unwrap().is_none());
+
+        let full = dir.path().join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join(".hidden"), b"").unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&empty, &link).unwrap();
+        for refused in [&full, &file, &link] {
+            let err = check_target(refused).unwrap_err().to_string();
+            assert!(
+                err.contains("target directory already exists"),
+                "{}: {err}",
+                refused.display()
+            );
+        }
     }
 
     #[test]

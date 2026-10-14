@@ -10,9 +10,47 @@ use std::time::Duration;
 
 const SKIP_WORKTREE_FLAG: gix::index::entry::Flags = gix::index::entry::Flags::SKIP_WORKTREE;
 
+/// `git` for a child of this process. Every git the server runs starts here.
+///
+/// On Linux the child gets SIGKILL when the thread that spawned it exits, so
+/// a server killed with SIGKILL leaves no git fetch or pack-objects running
+/// against its mirrors. Every caller waits for the child on the thread that
+/// spawned it (or, for `tokio::process`, spawns it from a runtime worker,
+/// which lives as long as the process). Git's own helpers (`git-remote-http`,
+/// `index-pack`) are not covered; they exit when their parent git's pipes
+/// close.
+///
+/// macOS has no parent-death signal. There a killed server's git children
+/// run until their current command ends.
+pub fn command() -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new("git");
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+        // SAFETY: `pre_exec` runs after fork and before exec. The closure only
+        // calls the async-signal-safe `prctl` and `getppid` and builds an OS
+        // error from errno; it captures only a copied pid.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The parent died before the signal was armed.
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    command
+}
+
 /// Fail before starting work that requires the system Git executable.
 pub fn require_system_git() -> Result<()> {
-    let status = Command::new("git")
+    let status = command()
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -299,9 +337,25 @@ fn clamp_u64_to_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// Run a git command with its output captured, so nothing it prints reaches
+/// the server log. On failure the error carries git's stderr.
+fn run_quiet(command: &mut Command, what: &str) -> Result<()> {
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("spawn git {what}"))?;
+    if !output.status.success() {
+        bail!(
+            "git {what} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Run a git command in a repo and return stdout as String.
 pub fn run_git<P: AsRef<Path>>(repo: P, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = command()
         .arg("-C")
         .arg(repo.as_ref().as_os_str())
         .args(args)
@@ -403,7 +457,7 @@ pub fn diff_name_set<P: AsRef<Path>>(
     crate::validation::validate_git_rev(from)
         .with_context(|| format!("invalid commit: {}", from))?;
     crate::validation::validate_git_rev(to).with_context(|| format!("invalid commit: {}", to))?;
-    let output = Command::new("git")
+    let output = command()
         .arg("-C")
         .arg(repo.as_ref().as_os_str())
         .args([
@@ -452,18 +506,13 @@ pub fn list_object_shas_with_depth<P: AsRef<Path>>(
 /// Cheap: indexes the existing `.idx` files; no pack data is rewritten. Best
 /// effort — a failure only loses the lookup speedup, not correctness.
 pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir.as_ref().as_os_str())
-        .args(["multi-pack-index", "write"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawn git multi-pack-index write")?;
-    if !status.success() {
-        anyhow::bail!("git multi-pack-index write failed");
-    }
-    Ok(())
+    run_quiet(
+        command()
+            .arg("-C")
+            .arg(repo_dir.as_ref().as_os_str())
+            .args(["multi-pack-index", "write"]),
+        "multi-pack-index write",
+    )
 }
 
 /// Write a commit-graph over all reachable commits so the many `rev-list` /
@@ -475,24 +524,19 @@ pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 /// graph layer instead of rewriting the whole graph, so this stays O(new
 /// commits) rather than O(all commits) every sync.
 pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir.as_ref().as_os_str())
-        .args([
-            "commit-graph",
-            "write",
-            "--reachable",
-            "--split",
-            "--no-progress",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawn git commit-graph write")?;
-    if !status.success() {
-        anyhow::bail!("git commit-graph write failed");
-    }
-    Ok(())
+    run_quiet(
+        command()
+            .arg("-C")
+            .arg(repo_dir.as_ref().as_os_str())
+            .args([
+                "commit-graph",
+                "write",
+                "--reachable",
+                "--split",
+                "--no-progress",
+            ]),
+        "commit-graph write",
+    )
 }
 
 /// Write a multi-pack-index *with a reachability bitmap* over the mirror's packs
@@ -504,18 +548,13 @@ pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 /// costs one reachability walk, so call it once after fetch, before the heavy
 /// builds, not on the depth=1 fast path.
 pub fn write_bitmap<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir.as_ref().as_os_str())
-        .args(["multi-pack-index", "write", "--bitmap", "--no-progress"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawn git multi-pack-index write --bitmap")?;
-    if !status.success() {
-        anyhow::bail!("git multi-pack-index write --bitmap failed");
-    }
-    Ok(())
+    run_quiet(
+        command()
+            .arg("-C")
+            .arg(repo_dir.as_ref().as_os_str())
+            .args(["multi-pack-index", "write", "--bitmap", "--no-progress"]),
+        "multi-pack-index write --bitmap",
+    )
 }
 
 /// Build a multi-pack-index over the given packs (each a `(pack_bytes,
@@ -532,14 +571,12 @@ pub fn build_multi_pack_index_bytes(packs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<
     let dir = tmp.path();
     // Minimal bare object store so `git multi-pack-index write` has a repo and
     // an `objects/pack` directory laid out exactly like the client's.
-    let status = Command::new("git")
-        .args(["init", "--bare", "-q"])
-        .arg(dir.as_os_str())
-        .status()
-        .context("git init --bare for midx")?;
-    if !status.success() {
-        anyhow::bail!("git init --bare for midx failed");
-    }
+    run_quiet(
+        command()
+            .args(["init", "--bare", "-q"])
+            .arg(dir.as_os_str()),
+        "init --bare for midx",
+    )?;
     let pack_dir = dir.join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)?;
     for (pack_bytes, idx_bytes) in packs {
@@ -551,17 +588,13 @@ pub fn build_multi_pack_index_bytes(packs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<
         std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), pack_bytes)?;
         std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), idx_bytes)?;
     }
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(dir.as_os_str())
-        .args(["multi-pack-index", "write"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawn git multi-pack-index write")?;
-    if !status.success() {
-        anyhow::bail!("git multi-pack-index write (server pregen) failed");
-    }
+    run_quiet(
+        command()
+            .arg("-C")
+            .arg(dir.as_os_str())
+            .args(["multi-pack-index", "write"]),
+        "multi-pack-index write (server pregen)",
+    )?;
     std::fs::read(pack_dir.join("multi-pack-index")).context("read generated multi-pack-index")
 }
 
@@ -662,7 +695,7 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     // Capture rather than inherit: pack-objects prints each output pack's hash to
     // stdout (noise in the server log), and stderr carries the real diagnostic when
     // it fails. We write the packs by base-name, so stdout is not needed.
-    let mut child = Command::new("git")
+    let mut child = command()
         .arg("-C")
         .arg(repo.as_ref())
         .arg("pack-objects")
@@ -714,33 +747,45 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
 
-    let mut child = Command::new("git")
+    // Capture rather than inherit: pack-objects prints each pack's hash on
+    // stdout, which we do not need (the packs are written by base name), and
+    // its stderr is the diagnostic. Stderr goes to a file so a long
+    // diagnostic cannot block the stdin writes below.
+    let mut stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
+    let mut child = command()
         .arg("-C")
         .arg(repo.as_ref())
         .arg("pack-objects")
         .args(extra_args)
         .arg(prefix.as_ref())
         .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .context("clone pack-objects stderr file")?,
+        ))
         .spawn()
         .context("spawn git pack-objects")?;
 
-    {
+    let written = {
         let mut stdin = child.stdin.take().context("open git pack-objects stdin")?;
-        for sha in object_shas {
-            stdin
-                .write_all(sha.as_bytes())
-                .context("write object id to pack-objects stdin")?;
-            stdin
-                .write_all(b"\n")
-                .context("write newline to pack-objects stdin")?;
-        }
-    }
+        object_shas.iter().try_for_each(|sha| {
+            stdin.write_all(sha.as_bytes())?;
+            stdin.write_all(b"\n")
+        })
+    };
 
     let status = child.wait().context("wait for git pack-objects")?;
-
     if !status.success() {
-        bail!("pack-objects failed");
+        let mut text = String::new();
+        stderr.rewind().context("rewind pack-objects stderr")?;
+        stderr
+            .read_to_string(&mut text)
+            .context("read pack-objects stderr")?;
+        bail!("pack-objects failed: {}", text.trim());
     }
+    written.context("write object ids to pack-objects stdin")?;
 
     Ok(())
 }
@@ -921,35 +966,19 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
                 "gix index-pack failed for {}: {e:#}; falling back to git index-pack",
                 pack_path.display()
             );
-            let status = Command::new("git")
-                .arg("index-pack")
-                .arg(pack_path)
-                .current_dir(directory)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .with_context(|| format!("spawn git index-pack for {}", pack_path.display()))?;
-            if !status.success() {
-                bail!(
-                    "git index-pack failed for {} (status {:?})",
-                    pack_path.display(),
-                    status.code()
-                );
-            }
-            Ok(())
+            run_quiet(
+                command()
+                    .arg("index-pack")
+                    .arg(pack_path)
+                    .current_dir(directory),
+                &format!("index-pack {}", pack_path.display()),
+            )
         }
     }
 }
 
 pub fn init<P: AsRef<Path>>(git_dir: P) -> Result<()> {
-    let status = Command::new("git")
-        .args(["init", "-q", &git_dir.as_ref().to_string_lossy()])
-        .status()
-        .context("git init")?;
-    if !status.success() {
-        bail!("git init failed");
-    }
-    Ok(())
+    run_quiet(command().args(["init", "-q"]).arg(git_dir.as_ref()), "init")
 }
 
 pub fn set_head<P: AsRef<Path>>(git_dir: P, commit: &str) -> Result<()> {
@@ -986,15 +1015,13 @@ pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
         ("gc.autoPackLimit", "0"),
         ("maintenance.auto", "false"),
     ] {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(mirror_dir.as_os_str())
-            .args(["config", key, value])
-            .status()
-            .with_context(|| format!("git config {key}"))?;
-        if !status.success() {
-            bail!("failed to disable auto-gc ({key}) on mirror");
-        }
+        run_quiet(
+            command()
+                .arg("-C")
+                .arg(mirror_dir.as_os_str())
+                .args(["config", key, value]),
+            &format!("config {key} (disable auto-gc on the mirror)"),
+        )?;
     }
     Ok(())
 }
@@ -1063,15 +1090,10 @@ pub fn origin_base() -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
-/// `RIPCLONE_LS_REMOTE_TIMEOUT_SECS`, default 30 s; zero or unparsable means
-/// the default.
-fn ls_remote_timeout() -> Duration {
-    std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(30))
+/// `RIPCLONE_LS_REMOTE_TIMEOUT_SECS`, default 30 s; zero means the default.
+pub fn ls_remote_timeout() -> Result<Duration> {
+    let secs = crate::env::number("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", 30)?;
+    Ok(Duration::from_secs(if secs == 0 { 30 } else { secs }))
 }
 
 fn upstream_auth_header(
@@ -1254,7 +1276,7 @@ pub async fn ls_remote_tip_async(
         ref_name,
         credential,
         origin_base().as_deref(),
-        ls_remote_timeout(),
+        ls_remote_timeout()?,
     )
     .await
 }
@@ -1277,7 +1299,7 @@ async fn ls_remote_tip_async_with(
     let child_stdout = stdout.try_clone().context("clone ls-remote stdout file")?;
     let mut stderr = tempfile::tempfile().context("create ls-remote stderr file")?;
     let child_stderr = stderr.try_clone().context("clone ls-remote stderr file")?;
-    let mut command = tokio::process::Command::new("git");
+    let mut command = tokio::process::Command::from(command());
     command
         .args(&git_args)
         .args(["ls-remote", "--symref", "--", &url])
@@ -1579,7 +1601,7 @@ fn sync_bare_mirror_admitted_from(
 
 fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
     mirror_dir.exists()
-        && Command::new("git")
+        && command()
             .arg("-C")
             .arg(mirror_dir.as_os_str())
             .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
@@ -1592,39 +1614,30 @@ fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
 fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     if !mirror_dir.exists() {
         std::fs::create_dir_all(mirror_dir.parent().unwrap_or(Path::new("")))?;
-        let status = Command::new("git")
-            .args(["init", "--bare"])
-            .arg(mirror_dir.as_os_str())
-            .status()
-            .context("git init bare mirror")?;
-        if !status.success() {
-            bail!("init bare mirror failed");
-        }
+        // `-q` and captured output: `init` prints its default-branch hint and
+        // an "Initialized" line, which would land in the server log.
+        run_quiet(
+            command()
+                .args(["init", "--bare", "-q"])
+                .arg(mirror_dir.as_os_str()),
+            "init --bare (mirror)",
+        )?;
         disable_auto_gc(mirror_dir)?;
-
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(mirror_dir.as_os_str())
-            .args(["remote", "add", "origin", url])
-            .status()
-            .context("git remote add origin")?;
-        if !status.success() {
-            bail!("remote add origin failed");
-        }
-
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(mirror_dir.as_os_str())
-            .args([
+        run_quiet(
+            command()
+                .arg("-C")
+                .arg(mirror_dir.as_os_str())
+                .args(["remote", "add", "origin", url]),
+            "remote add origin",
+        )?;
+        run_quiet(
+            command().arg("-C").arg(mirror_dir.as_os_str()).args([
                 "config",
                 "remote.origin.fetch",
                 "+refs/heads/*:refs/heads/*",
-            ])
-            .status()
-            .context("git config remote.origin.fetch")?;
-        if !status.success() {
-            bail!("config remote.origin.fetch failed");
-        }
+            ]),
+            "config remote.origin.fetch",
+        )?;
     } else {
         disable_auto_gc(mirror_dir)?;
     }
@@ -1642,7 +1655,7 @@ fn sync_bare_mirror_rev(
 
     let refspec = format!("{rev}:refs/ripclone/revs/{}", rev_internal_ref_name(rev));
 
-    let output = Command::new("git")
+    let output = command()
         .args(git_args)
         .arg("-C")
         .arg(mirror_dir.as_os_str())
@@ -1687,6 +1700,36 @@ mod tests {
     use super::*;
     use rayon::scope;
     use std::io::Read;
+
+    /// Git's output is captured, not printed, and a failure still carries
+    /// git's own error text.
+    #[test]
+    fn captured_git_failures_carry_git_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = format!(
+            "{:#}",
+            write_commit_graph(dir.path().join("missing")).unwrap_err()
+        );
+        assert!(
+            err.starts_with("git commit-graph write failed: fatal: cannot change to"),
+            "{err}"
+        );
+
+        let repo = crate::test_fixture::init_bare(dir.path());
+        drop(repo);
+        let missing = "1".repeat(40);
+        let err = format!(
+            "{:#}",
+            pack_objects_to_prefix(
+                dir.path(),
+                std::slice::from_ref(&missing),
+                dir.path().join("p/pack")
+            )
+            .unwrap_err()
+        );
+        assert!(err.starts_with("pack-objects failed: fatal:"), "{err}");
+        assert!(err.contains(&missing), "{err}");
+    }
 
     #[test]
     fn upstream_failure_classification_uses_the_git_result() {
@@ -2117,18 +2160,19 @@ mod tests {
         assert!(resolve_commit(&mirror, "main").is_err());
     }
 
-    /// Is a read-only build safe while another build fetches and rewrites the
-    /// commit-graph/bitmap on the same mirror, with auto-gc off? One writer thread
-    /// does fetch + commit-graph + bitmap; several readers walk every object. With
-    /// gc off, the writer only appends packs and atomically replaces the
-    /// accelerators, so readers should never see a torn or missing object.
-    /// Run: `cargo test --lib concurrent_prep_and_reads_stay_safe -- --ignored --nocapture`.
+    /// Reads and fetches of one mirror stay correct while the multi-pack-index
+    /// bitmap is rewritten beside them, with auto-gc off. One thread runs the
+    /// locked prep (fetch, then `commit-graph write --split`) for a fixed number
+    /// of new commits. Another rewrites the bitmap in a loop, outside that
+    /// lock, as the Full build does. Readers walk every object, with and
+    /// without the bitmap. With gc off, writers only add packs and atomically
+    /// replace the accelerators, so no reader or fetch may fail.
     #[test]
-    #[ignore]
     fn concurrent_prep_and_reads_stay_safe() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::time::{Duration, Instant};
+
+        const ROUNDS: u64 = 8;
 
         let base = tempfile::tempdir().unwrap();
         let origin = base.path().join("origin.git");
@@ -2154,9 +2198,9 @@ mod tests {
             origin.to_str().unwrap(),
             pusher.to_str().unwrap(),
         ]);
-        let p = pusher.to_str().unwrap();
-        git(&["-C", p, "config", "user.email", "t@t"]);
-        git(&["-C", p, "config", "user.name", "t"]);
+        let p = pusher.to_str().unwrap().to_string();
+        git(&["-C", &p, "config", "user.email", "t@t"]);
+        git(&["-C", &p, "config", "user.name", "t"]);
 
         // The mirror under test, cloned with gc off (the production path).
         let mirror = base.path().join("mirror.git");
@@ -2170,142 +2214,135 @@ mod tests {
         ]);
         let m = mirror.to_string_lossy().to_string();
         // Keep fetched objects as packfiles (production fetches from GitHub arrive
-        // as packs), so multi-pack-index/bitmap has packs to index — a local
+        // as packs), so multi-pack-index/bitmap has packs to index; a local
         // file:// fetch would otherwise unpack to loose objects.
         git(&["-C", &m, "config", "transfer.unpackLimit", "1"]);
         git(&["-C", &m, "config", "fetch.unpackLimit", "1"]);
+        // A local clone hardlinks loose objects; a production mirror starts
+        // from a pack.
+        git(&["-C", &m, "repack", "-a", "-d", "-q"]);
 
-        let stop = Arc::new(AtomicBool::new(false));
+        /// Run git; true on success, else print why.
+        fn run(label: &str, args: &[&str]) -> bool {
+            let out = Command::new("git").args(args).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            let ok = out.status.success() && !text.contains("missing");
+            if !ok {
+                eprintln!(
+                    "{label} FAILED: git {args:?}: {:?} {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            ok
+        }
+
+        let prep_done = Arc::new(AtomicBool::new(false));
+        let prep_err = Arc::new(AtomicU64::new(0));
+        let bitmap_ok = Arc::new(AtomicU64::new(0));
         let read_ok = Arc::new(AtomicU64::new(0));
         let read_err = Arc::new(AtomicU64::new(0));
-        let prep_rounds = Arc::new(AtomicU64::new(0));
 
-        let prep_err = Arc::new(AtomicU64::new(0));
-        // Writer: advance origin, then run the exclusive-prep trio on the mirror.
-        let writer = {
-            let (m, p, stop, prep_rounds, prep_err) = (
-                m.clone(),
-                p.to_string(),
-                stop.clone(),
-                prep_rounds.clone(),
-                prep_err.clone(),
-            );
+        let bitmap = {
+            let (m, prep_done, bitmap_ok) = (m.clone(), prep_done.clone(), bitmap_ok.clone());
             std::thread::spawn(move || {
-                let run = |args: &[&str], err: &AtomicU64| {
-                    let out = Command::new("git").args(args).output().unwrap();
-                    if !out.status.success() {
-                        err.fetch_add(1, Ordering::Relaxed);
-                        eprintln!(
-                            "PREP FAIL git {:?}: {}",
-                            args,
-                            String::from_utf8_lossy(&out.stderr)
-                        );
+                while !prep_done.load(Ordering::Relaxed) {
+                    // Best-effort in production: a failed write only loses the
+                    // speedup, so failures are printed, not counted.
+                    let args = ["-C", &m, "multi-pack-index", "write", "--bitmap"];
+                    if run("bitmap", &[&args[..], &["--no-progress"]].concat()) {
+                        bitmap_ok.fetch_add(1, Ordering::Relaxed);
                     }
-                };
-                let mut i = 0u64;
-                while !stop.load(Ordering::Relaxed) {
-                    i += 1;
-                    let file = pusher_path_write(&p, i);
-                    run(&["-C", &p, "add", &file], &prep_err);
-                    run(
-                        &["-C", &p, "commit", "-q", "-m", &format!("c{i}")],
-                        &prep_err,
-                    );
-                    run(&["-C", &p, "push", "-q", "origin"], &prep_err);
-                    // Exclusive prep, serialized (as the per-repo lock would do it).
-                    run(&["-C", &m, "fetch", "-q", "origin"], &prep_err);
-                    run(
-                        &[
-                            "-C",
-                            &m,
-                            "commit-graph",
-                            "write",
-                            "--reachable",
-                            "--split",
-                            "--no-progress",
-                        ],
-                        &prep_err,
-                    );
-                    // Bitmap is best-effort in production (write_bitmap ignores
-                    // errors); still run it to stress its atomic-replace vs reads,
-                    // but don't count its content prerequisites as a prep failure.
-                    let _ = Command::new("git")
-                        .args([
-                            "-C",
-                            &m,
-                            "multi-pack-index",
-                            "write",
-                            "--bitmap",
-                            "--no-progress",
-                        ])
-                        .output();
-                    prep_rounds.fetch_add(1, Ordering::Relaxed);
                 }
             })
         };
 
-        // Readers: walk every object — would surface a torn/missing pack.
         let readers: Vec<_> = (0..4)
             .map(|_| {
-                let (m, stop, read_ok, read_err) =
-                    (m.clone(), stop.clone(), read_ok.clone(), read_err.clone());
+                let (m, prep_done, read_ok, read_err) = (
+                    m.clone(),
+                    prep_done.clone(),
+                    read_ok.clone(),
+                    read_err.clone(),
+                );
                 std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let out = Command::new("git")
-                            .args(["-C", &m, "cat-file", "--batch-check", "--batch-all-objects"])
-                            .output()
-                            .unwrap();
-                        let text = String::from_utf8_lossy(&out.stdout);
-                        if out.status.success() && !text.contains("missing") {
-                            read_ok.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            read_err.fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "READ FAILURE: status={:?} stderr={}",
-                                out.status,
-                                String::from_utf8_lossy(&out.stderr)
-                            );
+                    loop {
+                        let done = prep_done.load(Ordering::Relaxed);
+                        for args in [
+                            &["-C", &m, "cat-file", "--batch-check", "--batch-all-objects"][..],
+                            &[
+                                "-C",
+                                &m,
+                                "rev-list",
+                                "--objects",
+                                "--all",
+                                "--use-bitmap-index",
+                            ],
+                        ] {
+                            let counter = if run("read", args) {
+                                &read_ok
+                            } else {
+                                &read_err
+                            };
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if done {
+                            break;
                         }
                     }
                 })
             })
             .collect();
 
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(4) {
-            std::thread::sleep(Duration::from_millis(50));
+        // The locked prep: advance the origin, fetch, rewrite the commit-graph.
+        for i in 1..=ROUNDS {
+            let file = pusher_path_write(&p, i);
+            git(&["-C", &p, "add", &file]);
+            git(&["-C", &p, "commit", "-q", "-m", &format!("c{i}")]);
+            git(&["-C", &p, "push", "-q", "origin"]);
+            for args in [
+                &["-C", &m, "fetch", "-q", "origin"][..],
+                &[
+                    "-C",
+                    &m,
+                    "commit-graph",
+                    "write",
+                    "--reachable",
+                    "--split",
+                    "--no-progress",
+                ],
+            ] {
+                if !run("prep", args) {
+                    prep_err.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
-        stop.store(true, Ordering::Relaxed);
-        writer.join().unwrap();
-        for r in readers {
-            r.join().unwrap();
+        prep_done.store(true, Ordering::Relaxed);
+        bitmap.join().unwrap();
+        for reader in readers {
+            reader.join().unwrap();
         }
 
-        eprintln!(
-            "spike: prep_rounds={} prep_err={} read_ok={} read_err={}",
-            prep_rounds.load(Ordering::Relaxed),
+        let (prep_err, bitmap_ok, read_ok, read_err) = (
             prep_err.load(Ordering::Relaxed),
+            bitmap_ok.load(Ordering::Relaxed),
             read_ok.load(Ordering::Relaxed),
             read_err.load(Ordering::Relaxed),
         );
-        assert!(
-            prep_rounds.load(Ordering::Relaxed) > 3,
-            "writer should complete several prep rounds"
+        eprintln!(
+            "prep_err={prep_err} bitmap_ok={bitmap_ok} read_ok={read_ok} read_err={read_err}"
         );
         assert_eq!(
-            prep_err.load(Ordering::Relaxed),
-            0,
-            "an exclusive-prep op failed"
-        );
-        assert!(
-            read_ok.load(Ordering::Relaxed) > 10,
-            "readers should complete many walks"
+            prep_err, 0,
+            "a fetch or commit-graph write failed beside the bitmap"
         );
         assert_eq!(
-            read_err.load(Ordering::Relaxed),
-            0,
-            "a read failed concurrent with fetch+graph+bitmap — lock-shrink is NOT safe as-is"
+            read_err, 0,
+            "a read failed beside fetch, commit-graph and bitmap"
         );
+        assert!(bitmap_ok > 0, "no bitmap write succeeded during the run");
+        // Every object the readers saw is still there and connected at the end.
+        git(&["-C", &m, "fsck", "--connectivity-only", "--no-progress"]);
     }
 
     /// Write a unique file into the pusher worktree (for the test above).

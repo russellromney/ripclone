@@ -136,6 +136,9 @@ ripclone rm owner/repo
 ripclone version                            # CLI and server versions, with a compatibility check
 ```
 
+`dir` defaults to the repository name. As with `git clone`, it may be an
+existing empty directory; a non-empty one is refused.
+
 The server URL comes from `--server` (a global flag, before the subcommand) or
 `RIPCLONE_SERVER`.
 

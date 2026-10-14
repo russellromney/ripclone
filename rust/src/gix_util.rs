@@ -3,7 +3,6 @@ use gix::objs::tree::EntryMode;
 use gix::traverse::tree::{Visit, visit::Action};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
 /// Global ceiling on the number of worker threads spawned by any gix parallel
@@ -205,7 +204,7 @@ fn list_object_shas_in_range_git<P: AsRef<Path>>(
         crate::validation::validate_git_rev(from)
             .with_context(|| format!("invalid commit: {from}"))?;
     }
-    let mut command = Command::new("git");
+    let mut command = crate::git::command();
     command
         .arg("-C")
         .arg(repo_path.as_ref())

@@ -213,30 +213,86 @@ fn validate_nonempty_config(key: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-const REMOVED_ENVIRONMENT: &[&str] = &[
-    "RIPCLONE_METADATA",
-    "RIPCLONE_METADATA_DB_URL",
-    "RIPCLONE_METADATA_DB_TOKEN",
-    "RIPCLONE_QUEUE",
-    "RIPCLONE_QUEUE_DB_URL",
-    "RIPCLONE_QUEUE_DB_TOKEN",
-    "RIPCLONE_DISPATCH",
-    "RIPCLONE_DISPATCH_CMD",
-    "RIPCLONE_DISPATCH_CMD_ARGS",
-    "RIPCLONE_DISPATCH_INTERVAL_SECS",
-    "RIPCLONE_DISPATCH_MAX_WORKERS",
-    "RIPCLONE_DISPATCH_TOKEN",
-    "RIPCLONE_DISPATCH_URL",
-    "RIPCLONE_HEARTBEAT_URL",
-    "RIPCLONE_RECHECK_MAX",
-    "RIPCLONE_REF_CACHE_TTL_SECS",
+/// How a removed environment variable is treated when it is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// A removed control setting: the server refuses to start.
+    Refuse,
+    /// No effect: the server and the CLI warn once at startup.
+    Warn,
+}
+
+/// Environment variables removed in the rebuild (from `git log -S`). A
+/// trailing `*` matches a prefix; the first matching row wins.
+const REMOVED_ENVIRONMENT: &[(&str, Removal)] = &[
+    ("RIPCLONE_METADATA", Removal::Refuse),
+    ("RIPCLONE_METADATA_DB_URL", Removal::Refuse),
+    ("RIPCLONE_METADATA_DB_TOKEN", Removal::Refuse),
+    ("RIPCLONE_QUEUE", Removal::Refuse),
+    ("RIPCLONE_QUEUE_DB_URL", Removal::Refuse),
+    ("RIPCLONE_QUEUE_DB_TOKEN", Removal::Refuse),
+    ("RIPCLONE_DISPATCH", Removal::Refuse),
+    ("RIPCLONE_DISPATCH_CMD", Removal::Refuse),
+    ("RIPCLONE_DISPATCH_CMD_ARGS", Removal::Refuse),
+    ("RIPCLONE_DISPATCH_INTERVAL_SECS", Removal::Refuse),
+    ("RIPCLONE_DISPATCH_MAX_WORKERS", Removal::Refuse),
+    ("RIPCLONE_DISPATCH_TOKEN", Removal::Refuse),
+    ("RIPCLONE_DISPATCH_URL", Removal::Refuse),
+    ("RIPCLONE_HEARTBEAT_URL", Removal::Refuse),
+    ("RIPCLONE_RECHECK_MAX", Removal::Refuse),
+    ("RIPCLONE_REF_CACHE_TTL_SECS", Removal::Refuse),
+    ("RIPCLONE_METADATA_*", Removal::Warn),
+    ("RIPCLONE_QUEUE_*", Removal::Warn),
+    ("RIPCLONE_DISPATCH_*", Removal::Warn),
+    ("RIPCLONE_TEST_*", Removal::Warn),
+    ("RIPCLONE_TESTING", Removal::Warn),
+    ("RIPCLONE_WORKER_HEARTBEAT*", Removal::Warn),
+    ("RIPCLONE_JWT_*", Removal::Warn),
+    ("RIPCLONE_JOB_TOKEN_SECRET", Removal::Warn),
+    ("RIPCLONE_OIDC_AUDIENCE", Removal::Warn),
+    ("RIPCLONE_TRUST_GATEWAY", Removal::Warn),
+    ("RIPCLONE_TURSO_*", Removal::Warn),
+    ("RIPCLONE_LSM", Removal::Warn),
+    ("RIPCLONE_SIZE_CLASSES", Removal::Warn),
+    ("RIPCLONE_MAX_SIZE_CLASS", Removal::Warn),
+    ("RIPCLONE_MAX_JOBS", Removal::Warn),
+    ("RIPCLONE_IDLE_EXIT_SECS", Removal::Warn),
+    ("RIPCLONE_BUILD_CONCURRENCY", Removal::Warn),
+    ("RIPCLONE_ARCHIVE_BOUNDED", Removal::Warn),
+    ("RIPCLONE_NO_OVERLAY", Removal::Warn),
+    ("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", Removal::Warn),
+    ("RIPCLONE_STAGING_DIR", Removal::Warn),
+    ("RIPCLONE_TEMP", Removal::Warn),
 ];
 
-pub fn validate_removed_environment() -> Result<()> {
-    let configured: Vec<&str> = REMOVED_ENVIRONMENT
+fn removal(name: &str) -> Option<Removal> {
+    REMOVED_ENVIRONMENT
         .iter()
-        .copied()
-        .filter(|key| std::env::var_os(key).is_some())
+        .find(|(pattern, _)| match pattern.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == *pattern,
+        })
+        .map(|(_, removal)| *removal)
+}
+
+/// The removed variables set in this process's environment, sorted by name.
+pub fn removed_environment() -> Vec<(String, Removal)> {
+    let mut found: Vec<(String, Removal)> = std::env::vars_os()
+        .filter_map(|(name, _)| {
+            let name = name.into_string().ok()?;
+            let removal = removal(&name)?;
+            Some((name, removal))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+pub fn validate_removed_environment() -> Result<()> {
+    let configured: Vec<String> = removed_environment()
+        .into_iter()
+        .filter(|(_, removal)| *removal == Removal::Refuse)
+        .map(|(name, _)| name)
         .collect();
     if configured.is_empty() {
         return Ok(());
@@ -329,5 +385,29 @@ impl ControlPathLock {
             "exclusive control database ownership is unsupported on this platform: {}",
             path.display()
         )
+    }
+}
+
+#[cfg(test)]
+mod removed_environment_tests {
+    use super::*;
+
+    #[test]
+    fn removed_environment_rows_match_names_and_prefixes() {
+        for (name, want) in [
+            ("RIPCLONE_QUEUE", Some(Removal::Refuse)),
+            ("RIPCLONE_QUEUE_DB_URL", Some(Removal::Refuse)),
+            ("RIPCLONE_QUEUE_STALE_SECS", Some(Removal::Warn)),
+            ("RIPCLONE_DISPATCH_SIZE_LARGE", Some(Removal::Warn)),
+            ("RIPCLONE_TEST_REF_POLL_MS", Some(Removal::Warn)),
+            ("RIPCLONE_WORKER_HEARTBEAT", Some(Removal::Warn)),
+            ("RIPCLONE_LSM", Some(Removal::Warn)),
+            ("RIPCLONE_LSM_MAX_LEVELS", None),
+            ("RIPCLONE_TRUST_FORWARDED_FOR", None),
+            ("RIPCLONE_CONTROL_DB_PATH", None),
+            ("RIPCLONE_QUEUED", None),
+        ] {
+            assert_eq!(removal(name), want, "{name}");
+        }
     }
 }

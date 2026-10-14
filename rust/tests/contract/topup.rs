@@ -194,11 +194,7 @@ fn e4_no_base_waits_for_full() {
 
     let proxy = FaultProxy::start(&server);
     let target = world.target("e4");
-    let clone = world.cli_spawn_env(
-        &proxy,
-        &["clone", "acme/e4", target.to_str().unwrap()],
-        SLOW_POLL,
-    );
+    let clone = world.cli_spawn(&proxy, &["clone", "acme/e4", target.to_str().unwrap()]);
     proxy.wait_seen("two pending reads of B", |seen| {
         seen.iter().filter(|s| api::is_commit_read(s, &b)).count() >= 2
     });

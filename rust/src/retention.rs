@@ -20,13 +20,51 @@ pub struct LocalCacheRetention {
     durable_storage: Option<StorageRef>,
 }
 
+/// Retention settings from the environment, read once at startup.
+#[derive(Clone, Copy, Debug)]
+pub struct RetentionSettings {
+    /// Time between passes (`RIPCLONE_RETENTION_INTERVAL_SECS`); zero turns
+    /// retention off.
+    pub interval: Duration,
+    /// `RIPCLONE_RETENTION_MAX_AGE_DAYS`; `None` (set to 0) keeps any age.
+    pub max_age: Option<Duration>,
+    /// `RIPCLONE_RETENTION_MAX_GB`; `None` (set to 0) keeps any size.
+    pub max_size_bytes: Option<u64>,
+}
+
+impl RetentionSettings {
+    pub fn from_env() -> Result<Self> {
+        const DAY_SECS: u64 = 24 * 60 * 60;
+        const GB: u64 = 1024 * 1024 * 1024;
+        let interval = crate::env::number("RIPCLONE_RETENTION_INTERVAL_SECS", 300)?;
+        let days: u64 = crate::env::number("RIPCLONE_RETENTION_MAX_AGE_DAYS", 7)?;
+        let gb: u64 = crate::env::number("RIPCLONE_RETENTION_MAX_GB", 100)?;
+        let max_age = days
+            .checked_mul(DAY_SECS)
+            .context("RIPCLONE_RETENTION_MAX_AGE_DAYS is too large")?;
+        let max_size_bytes = gb
+            .checked_mul(GB)
+            .context("RIPCLONE_RETENTION_MAX_GB is too large")?;
+        Ok(Self {
+            interval: Duration::from_secs(interval),
+            max_age: (max_age > 0).then(|| Duration::from_secs(max_age)),
+            max_size_bytes: (max_size_bytes > 0).then_some(max_size_bytes),
+        })
+    }
+}
+
 impl LocalCacheRetention {
-    pub fn from_env(cas: Cas, metrics: Arc<Metrics>, storage: StorageRef) -> Self {
+    pub fn new(
+        cas: Cas,
+        metrics: Arc<Metrics>,
+        storage: StorageRef,
+        settings: &RetentionSettings,
+    ) -> Self {
         let durable_storage = storage.is_remote().then_some(storage);
         Self {
             cas,
-            max_age: durable_storage.as_ref().and_then(|_| Self::parse_age()),
-            max_size_bytes: durable_storage.as_ref().and_then(|_| Self::parse_size()),
+            max_age: durable_storage.as_ref().and(settings.max_age),
+            max_size_bytes: durable_storage.as_ref().and(settings.max_size_bytes),
             metrics,
             durable_storage,
         }
@@ -51,15 +89,6 @@ impl LocalCacheRetention {
 
     pub fn disabled(&self) -> bool {
         self.durable_storage.is_none() || (self.max_age.is_none() && self.max_size_bytes.is_none())
-    }
-
-    pub fn spawn_from_env(self) {
-        let interval = std::env::var("RIPCLONE_RETENTION_INTERVAL_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(300));
-        self.spawn(interval);
     }
 
     pub fn spawn(self, interval: Duration) {
@@ -179,28 +208,6 @@ impl LocalCacheRetention {
         self.metrics
             .record_local_cache_cleanup(total_deleted, deleted_count);
         Ok(())
-    }
-
-    fn parse_age() -> Option<Duration> {
-        match std::env::var("RIPCLONE_RETENTION_MAX_AGE_DAYS") {
-            Ok(value) if !value.is_empty() => value
-                .parse::<u64>()
-                .ok()
-                .map(|days| Duration::from_secs(days * 24 * 60 * 60))
-                .filter(|duration| !duration.is_zero()),
-            _ => Some(Duration::from_secs(7 * 24 * 60 * 60)),
-        }
-    }
-
-    fn parse_size() -> Option<u64> {
-        match std::env::var("RIPCLONE_RETENTION_MAX_GB") {
-            Ok(value) if !value.is_empty() => value
-                .parse::<u64>()
-                .ok()
-                .map(|gb| gb * 1024 * 1024 * 1024)
-                .filter(|bytes| *bytes > 0),
-            _ => Some(100 * 1024 * 1024 * 1024),
-        }
     }
 }
 

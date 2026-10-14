@@ -690,6 +690,9 @@ async fn run() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    for (name, _) in ripclone::control::removed_environment() {
+        eprintln!("ripclone: warning: {name} is set but was removed; it has no effect");
+    }
     let config = ripclone::config::load();
 
     // Server precedence: --server / RIPCLONE_SERVER (both land in args.server) >
@@ -943,6 +946,9 @@ async fn run() -> Result<()> {
                 kind,
                 wait,
             };
+            // Like `git clone`, the target may be an existing empty directory.
+            // A failed clone must leave it there.
+            let target_was_dir = target.is_dir();
             let outcome = client
                 .clone_repo(&request, &target, enable_bench.then_some(&mut benchmark))
                 .await?;
@@ -952,12 +958,14 @@ async fn run() -> Result<()> {
                 verify_upstream_snapshot(&target, &outcome.commit, upstream_snapshot.as_deref())
                     .await
             {
-                tokio::fs::remove_dir_all(&target).await.with_context(|| {
-                    format!(
-                        "remove clone target {} after upstream verification failed",
-                        target.display()
-                    )
-                })?;
+                remove_clone(&target, target_was_dir)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "remove clone target {} after upstream verification failed",
+                            target.display()
+                        )
+                    })?;
                 return Err(error);
             }
             if enable_bench {
@@ -1204,6 +1212,18 @@ async fn observe_upstream_for_verification(
     };
 
     Ok(Some(upstream_tip))
+}
+
+/// Remove a published clone. A target that was an empty directory before the
+/// clone is put back as an empty directory with the same permissions.
+async fn remove_clone(target: &std::path::Path, was_dir: bool) -> Result<()> {
+    let permissions = tokio::fs::metadata(target).await?.permissions();
+    tokio::fs::remove_dir_all(target).await?;
+    if was_dir {
+        tokio::fs::create_dir(target).await?;
+        tokio::fs::set_permissions(target, permissions).await?;
+    }
+    Ok(())
 }
 
 async fn verify_upstream_snapshot(

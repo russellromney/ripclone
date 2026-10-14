@@ -83,7 +83,7 @@ impl S3Storage {
         //
         // Override with RIPCLONE_S3_REQUEST_TIMEOUT_SECS (e.g. tighter on
         // a local S3 emulator in tests). Must stay >0.
-        let request_timeout = env_duration_secs("RIPCLONE_S3_REQUEST_TIMEOUT_SECS", 30);
+        let request_timeout = env_duration_secs("RIPCLONE_S3_REQUEST_TIMEOUT_SECS", 30)?;
 
         // Retry budget. Transient 5xx / throttling / brief blips still retry;
         // a dead endpoint must not pin a worker for minutes. Defaults:
@@ -97,8 +97,8 @@ impl S3Storage {
         // handshake fails in ~5s, not after the full request timeout. The s3
         // crate (0.1.36) does not yet expose a connect_timeout builder knob;
         // if that lands upstream we should set it explicitly here.
-        let max_attempts = env_u32("RIPCLONE_S3_MAX_ATTEMPTS", 5).max(1);
-        let max_retry_delay = env_duration_ms("RIPCLONE_S3_MAX_RETRY_DELAY_MS", 2_000);
+        let max_attempts = crate::env::number("RIPCLONE_S3_MAX_ATTEMPTS", 5u32)?.max(1);
+        let max_retry_delay = env_duration_ms("RIPCLONE_S3_MAX_RETRY_DELAY_MS", 2_000)?;
 
         let client = Client::builder(endpoint)
             .context("build S3 client")?
@@ -615,52 +615,30 @@ impl StorageBackend for S3Storage {
     }
 }
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    u32_or(std::env::var(key).ok(), default)
-}
-
-fn env_duration_secs(key: &str, default_secs: u64) -> Duration {
-    secs_or(std::env::var(key).ok(), default_secs)
-}
-
-fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
-    ms_or(std::env::var(key).ok(), default_ms)
-}
-
-/// `value` parsed, or `default` when unset or unparsable.
-fn u32_or(value: Option<String>, default: u32) -> u32 {
-    value.and_then(|s| s.parse().ok()).unwrap_or(default)
-}
-
-/// Seconds from `value` (else `default_secs`), at least 1: the S3 client
+/// Seconds from `key` (default `default_secs`), at least 1: the S3 client
 /// rejects a zero timeout as invalid config.
-fn secs_or(value: Option<String>, default_secs: u64) -> Duration {
-    let secs = value
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default_secs)
-        .max(1);
-    Duration::from_secs(secs)
+fn env_duration_secs(key: &str, default_secs: u64) -> Result<Duration> {
+    Ok(Duration::from_secs(
+        crate::env::number(key, default_secs)?.max(1),
+    ))
 }
 
-/// Milliseconds from `value` (else `default_ms`), at least 1.
-fn ms_or(value: Option<String>, default_ms: u64) -> Duration {
-    let ms = value
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default_ms)
-        .max(1);
-    Duration::from_millis(ms)
+/// Milliseconds from `key` (default `default_ms`), at least 1.
+fn env_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
+    Ok(Duration::from_millis(
+        crate::env::number(key, default_ms)?.max(1),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         MULTIPART_UPLOAD_MAX_OBJECT_BYTES, MULTIPART_UPLOAD_MAX_PART_BYTES,
-        MULTIPART_UPLOAD_PART_BYTES, S3Storage, ms_or, multipart_upload_concurrency_for_cores,
-        multipart_upload_part_bytes, secs_or, u32_or,
+        MULTIPART_UPLOAD_PART_BYTES, S3Storage, multipart_upload_concurrency_for_cores,
+        multipart_upload_part_bytes,
     };
     use crate::storage::StorageBackend;
     use std::io::Write;
-    use std::time::Duration;
 
     #[test]
     fn multipart_budget_scales_with_machine_and_stays_bounded() {
@@ -713,19 +691,5 @@ mod tests {
         let downloaded = storage.get(&hash).expect("download multipart object");
         assert_eq!(downloaded.len() as u64, len);
         assert_eq!(crate::cas::hash(&downloaded), hash);
-    }
-
-    #[test]
-    fn timeout_settings_default_and_clamp_zero() {
-        let v = |s: &str| Some(s.to_string());
-        for (value, want) in [(None, 5), (v("7"), 7), (v("not-a-number"), 5)] {
-            assert_eq!(u32_or(value, 5), want);
-        }
-        for (value, want) in [(None, 30), (v("0"), 1), (v("12"), 12), (v("-1"), 30)] {
-            assert_eq!(secs_or(value, 30), Duration::from_secs(want));
-        }
-        for (value, want) in [(None, 2_000), (v("0"), 1), (v("250"), 250)] {
-            assert_eq!(ms_or(value, 2_000), Duration::from_millis(want));
-        }
     }
 }

@@ -110,6 +110,72 @@ fn c4_build_killed_mid_fetch_completes_once_after_restart() {
     assert_eq!(listing(&target), origin.tree(&tip));
 }
 
+/// C6 (Linux): SIGKILL the server while the origin holds its fetch. The
+/// server's git children die with it instead of running on against its
+/// mirrors. macOS has no parent-death signal, so this row is Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn c6_server_git_children_die_with_the_server() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let origin = world.origin("acme", "c6");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let mut server = world.server(&[]);
+    http.hold_fetches();
+    world.cli(&server, &["add", "acme/c6"]).ok();
+    http.wait_held(1);
+
+    let children = proc_children(server.pid(), "git");
+    assert!(!children.is_empty(), "no git child while the fetch is held");
+    server.kill();
+    wait_for("the killed server's git children to exit", || {
+        children.iter().all(|p| !proc_alive(*p)).then_some(())
+    });
+}
+
+/// A process, by pid and start time so a reused pid does not count.
+#[cfg(target_os = "linux")]
+type Proc = (u32, u64);
+
+/// `(comm, state, ppid, start time)` from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn proc_stat(pid: u32) -> Option<(String, String, u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid ...`; comm may contain spaces and parens.
+    let (head, rest) = stat.rsplit_once(") ")?;
+    let comm = head.split_once(" (")?.1.to_string();
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // `rest` starts at field 3 (state); start time is field 22.
+    Some((
+        comm,
+        fields.first()?.to_string(),
+        fields.get(1)?.parse().ok()?,
+        fields.get(19)?.parse().ok()?,
+    ))
+}
+
+/// Processes whose parent is `parent` and whose command name is `name`.
+#[cfg(target_os = "linux")]
+fn proc_children(parent: u32, name: &str) -> Vec<Proc> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let (comm, _, ppid, start) = proc_stat(pid)?;
+            (ppid == parent && comm == name).then_some((pid, start))
+        })
+        .collect()
+}
+
+/// Whether the process is still running: same start time, not a zombie.
+#[cfg(target_os = "linux")]
+fn proc_alive((pid, start): Proc) -> bool {
+    proc_stat(pid)
+        .is_some_and(|(_, state, _, started)| started == start && state != "Z" && state != "X")
+}
+
 /// A ref response with every URL's query string removed: signatures and
 /// expiry change per request, the object keys must not.
 fn without_queries(value: serde_json::Value) -> serde_json::Value {
@@ -205,4 +271,27 @@ fn c5_later_build_never_changes_published_results() {
         git(&target, &["fsck"]);
         assert_eq!(listing(&target), origin.tree(commit));
     }
+
+    // The server's git children print nothing into its log: every line is
+    // the server's own (`<timestamp>  <LEVEL> ...`), with no `hint:` lines
+    // from `git init` and no pack hashes from `pack-objects`.
+    let log = server.log();
+    let foreign: Vec<&str> = log.lines().filter(|line| !is_tracing_line(line)).collect();
+    assert!(
+        foreign.is_empty(),
+        "git output in the server log:\n{}",
+        foreign.join("\n")
+    );
+}
+
+/// A line the server's tracing subscriber wrote: an RFC 3339 UTC timestamp,
+/// then a level.
+fn is_tracing_line(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let stamp = words.next().unwrap_or("");
+    let level = words.next().unwrap_or("");
+    stamp.len() > 20
+        && stamp.ends_with('Z')
+        && stamp.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+        && ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"].contains(&level)
 }

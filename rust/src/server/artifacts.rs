@@ -1,7 +1,6 @@
 //! `GET /v1/artifacts/{hash}`: redirect to a signed URL, or stream the
 //! artifact with optional byte ranges.
 
-use super::api::ref_signed_url_ttl;
 use super::{ErrorResponse, ServerState};
 use axum::{
     Json,
@@ -132,7 +131,7 @@ async fn serve_artifact(
     // If the backend can hand out a signed URL, redirect the client there.
     // The client can then use its own Range requests against the CDN/object store.
     // Use the same TTL as the ref path.
-    if let Some(url) = state.storage.signed_url(&hash, ref_signed_url_ttl()) {
+    if let Some(url) = state.storage.signed_url(&hash, state.signed_url_ttl) {
         state.metrics.record_artifact_request(0);
         return (
             StatusCode::TEMPORARY_REDIRECT,

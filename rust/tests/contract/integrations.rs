@@ -396,7 +396,8 @@ fn i7_verify_upstream_broken() {
 }
 
 /// I7: the CLI's upstream has moved past what the server built. `never`
-/// clones; `auto` and `always` refuse.
+/// clones; `auto` and `always` refuse, and remove the clone they installed.
+/// A target that was an empty directory is left as an empty directory.
 #[test]
 fn i7_verify_upstream_moved_tip() {
     let (world, server, origin, tip) = i7_world("i7-moved");
@@ -431,6 +432,28 @@ fn i7_verify_upstream_moved_tip() {
             ("always", Err("does not match upstream tip")),
         ],
     );
+
+    let empty = world.target("i7-moved-empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let base = format!("file://{}", moved.display());
+    let out = world.cli_env(
+        &server,
+        &[
+            "clone",
+            "acme/i7-moved",
+            empty.to_str().unwrap(),
+            "--depth",
+            "1",
+            "--verify-upstream=always",
+        ],
+        &[("RIPCLONE_ORIGIN_BASE", &base)],
+    );
+    let err = out.err();
+    assert!(err.contains("does not match upstream tip"), "{err}");
+    let entries = std::fs::read_dir(&empty)
+        .unwrap_or_else(|e| panic!("the empty target is gone: {e}"))
+        .count();
+    assert_eq!(entries, 0, "the failed clone left files in the target");
 }
 
 /// I10: a Files clone has no git objects to check against the upstream.

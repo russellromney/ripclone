@@ -6,7 +6,9 @@ over env, env wins over the file.
 
 This file lists the settings that are staying. Settings for features being
 removed (see [`internal/rebuild/PLAN.md`](internal/rebuild/PLAN.md)) are not
-listed.
+listed. The server and the CLI warn once at startup for each removed variable
+that is set; a removed control setting (`[queue]`, `[metadata]`, dispatch)
+stops the server instead.
 
 ## Client
 
@@ -40,11 +42,11 @@ Flags: `--cas-dir`, `--repo-root`, `--control-db`, `--host` (default
 | `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`, `RIPCLONE_S3_PREFIX` | S3-compatible artifact storage. Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. See [Server state and storage](BACKENDS.md). |
 | `RIPCLONE_S3_REQUEST_TIMEOUT_SECS`, `RIPCLONE_S3_MAX_ATTEMPTS`, `RIPCLONE_S3_MAX_RETRY_DELAY_MS` | S3 client timeouts and retries. |
 | `RIPCLONE_SIGNED_URL_TTL_SECS` | Signed artifact URL lifetime, default 1200 seconds. |
-| `RIPCLONE_RETENTION_INTERVAL_SECS`, `RIPCLONE_RETENTION_MAX_AGE_DAYS`, `RIPCLONE_RETENTION_MAX_GB` | Trim the local build cache when S3 is the durable store. Never deletes S3 objects or published results. |
+| `RIPCLONE_RETENTION_INTERVAL_SECS`, `RIPCLONE_RETENTION_MAX_AGE_DAYS`, `RIPCLONE_RETENTION_MAX_GB` | Trim the local build cache when S3 is the durable store, defaults 300 seconds, 7 days and 100 GB; `0` turns each off. Never deletes S3 objects or published results. |
 | `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>` | Webhook secret per provider instance. See [Webhooks](WEBHOOKS.md). |
 | `RIPCLONE_WEBHOOK_ALLOWLIST` | Optional comma-separated repos that webhooks may build. |
 | `RIPCLONE_POLL_INTERVAL_SECS` | Fallback polling interval, default `300`; `0` turns it off. |
-| `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` | Timeout for each upstream `ls-remote`, default 30. |
+| `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` | Timeout for each upstream `ls-remote`, default 30; `0` means the default. |
 | `RIPCLONE_RATE_LIMIT_PER_SEC`, `RIPCLONE_RATE_LIMIT_BURST` | Rate limit for public endpoints. |
 | `RIPCLONE_TRUST_FORWARDED_FOR` | Use `X-Forwarded-For` for rate limiting behind a trusted proxy. |
 | `RIPCLONE_LSM_MAX_LEVELS` | Maximum history levels before compaction. |
@@ -53,6 +55,12 @@ Flags: `--cas-dir`, `--repo-root`, `--control-db`, `--host` (default
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
 | `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Full and Files) before the output fails, default 5. |
 | `RIPCLONE_HEAD_REBASE_BYTES` | When a Head delta reaches this size, the Full build compacts Head packs into a new base for later Heads. Expert setting. |
+
+Every numeric setting above is a non-negative integer (the rate per second may
+be a decimal). A value that is set but does not parse, including an empty one,
+stops the server at startup with an error that names the variable; it never
+falls back to the default. The S3 numbers are checked when S3 storage is
+configured.
 
 ### GitHub App credentials
 

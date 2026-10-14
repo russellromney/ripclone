@@ -1,7 +1,7 @@
 //! Build the Head, Full and Files results of a commit from the bare mirror
 //! and upload their artifacts.
 
-use super::{duration_ms, env_u64};
+use super::duration_ms;
 use crate::archive::ArchiveBuilder;
 use crate::cas::Cas;
 use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
@@ -99,11 +99,20 @@ fn sized_to_tuple(p: &crate::SizedPack) -> (String, u64, String, u64) {
 
 /// Compact history down to at most this many levels (merging the smallest
 /// adjacent pair) so the level count stays bounded under seal-every-sync.
-fn lsm_max_levels() -> usize {
-    std::env::var("RIPCLONE_LSM_MAX_LEVELS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16usize)
+fn lsm_max_levels() -> Result<usize> {
+    crate::env::number("RIPCLONE_LSM_MAX_LEVELS", 16)
+}
+
+/// Head packs past the base that trigger a rebase onto a new base.
+fn head_rebase_bytes() -> Result<u64> {
+    crate::env::number("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024)
+}
+
+/// Fail on a bad value of a setting the builder reads at build time.
+pub(super) fn check_environment() -> Result<()> {
+    lsm_max_levels()?;
+    head_rebase_bytes()?;
+    Ok(())
 }
 
 /// Given the prior sealed levels and a freshly built tail, decide whether to
@@ -906,11 +915,11 @@ pub(super) async fn build_full_result(
         sealed_tip,
         built_history,
         history_target,
-        lsm_max_levels(),
+        lsm_max_levels()?,
     )
     .await?;
 
-    let rebase_bytes = env_u64("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024);
+    let rebase_bytes = head_rebase_bytes()?;
     let delta_bytes: u64 = head_packs
         .iter()
         .skip(head.base_packs.len())

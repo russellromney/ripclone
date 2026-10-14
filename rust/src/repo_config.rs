@@ -2,7 +2,7 @@
 //!
 //! A `RepoConfig` tells the server how to build a repository's clonepacks:
 //! which depth variants to produce, the zstd compression level,
-//! and archive/head-blobs chunk sizes. The server-owned
+//! and the archive chunk size. The server-owned
 //! control database stores one record per repository. Admission snapshots the
 //! validated result into the durable job, so workers never read live config.
 //!
@@ -40,9 +40,10 @@ pub struct RepoConfig {
     /// Target compressed size of each archive chunk, in bytes.
     #[serde(default)]
     pub archive_chunk_size: Option<u64>,
-    /// Target size of each head-blobs pack chunk, in bytes.
-    #[serde(default)]
-    pub head_blobs_chunk_size: Option<u64>,
+    /// Removed: nothing read it. Accepted and dropped so a stored config that
+    /// still has the key loads; never written.
+    #[serde(default, rename = "head_blobs_chunk_size", skip_serializing)]
+    pub removed_head_blobs_chunk_size: serde::de::IgnoredAny,
 }
 
 impl RepoConfig {
@@ -65,9 +66,6 @@ impl RepoConfig {
         }
         if let Some(0) = self.archive_chunk_size {
             anyhow::bail!("archive_chunk_size must be greater than zero");
-        }
-        if let Some(0) = self.head_blobs_chunk_size {
-            anyhow::bail!("head_blobs_chunk_size must be greater than zero");
         }
         let mut names = std::collections::HashSet::new();
         let mut finite = 0usize;
@@ -138,5 +136,21 @@ mod tests {
         ] {
             assert_eq!(cfg.validate().is_ok(), ok, "{case}");
         }
+    }
+
+    #[test]
+    fn removed_head_blobs_chunk_size_is_accepted_and_dropped() {
+        let stored = r#"{"compression_level":9,"head_blobs_chunk_size":4194304}"#;
+        let config: RepoConfig = serde_json::from_str(stored).unwrap();
+        assert_eq!(
+            config,
+            RepoConfig {
+                compression_level: Some(9),
+                ..Default::default()
+            }
+        );
+        let written = serde_json::to_string(&config).unwrap();
+        assert!(!written.contains("head_blobs"), "{written}");
+        assert!(serde_json::from_str::<RepoConfig>(r#"{"other":1}"#).is_err());
     }
 }

@@ -289,3 +289,29 @@ fn i11_config_file_discovery_and_precedence() {
         );
     }
 }
+
+/// I12: removed environment variables are not silently ignored. The server
+/// and the CLI each warn once per removed variable that is set, and still run.
+#[test]
+fn i12_removed_env_vars_warn_once() {
+    let world = World::new();
+    let removed = [
+        ("RIPCLONE_QUEUE_STALE_SECS", "5"),
+        ("RIPCLONE_TEST_REF_POLL_MS", "1"),
+        ("RIPCLONE_JWT_TTL_SECS", "60"),
+    ];
+    let server = world.server(&removed);
+    let cli = world.cli_env(&server, &["version"], &removed);
+    cli.ok();
+    let stderr = cli.stderr();
+    for (name, _) in removed {
+        let line = format!("{name} is set but was removed; it has no effect");
+        assert_eq!(
+            server.log().matches(&line).count(),
+            1,
+            "server:\n{}",
+            server.log()
+        );
+        assert_eq!(stderr.matches(&line).count(), 1, "cli:\n{stderr}");
+    }
+}
