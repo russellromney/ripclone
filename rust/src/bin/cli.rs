@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ripclone::ExactResultKind;
 use ripclone::archive::ArchiveBuilder;
 use ripclone::auth::token_store::{FileBackedTokenStore, TokenStore};
 use ripclone::bench::Benchmark;
-use ripclone::client::Client;
+use ripclone::client::{Client, CloneRequest};
 use ripclone::config::ProviderEntry;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
@@ -910,10 +911,12 @@ async fn run() -> Result<()> {
             }
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
-            let clonepack_kind = if mode.needs_archive() {
-                Some("full")
+            let kind = if mode == CloneMode::Files {
+                ExactResultKind::Files
+            } else if depth == 1 {
+                ExactResultKind::Head
             } else {
-                Some(ripclone::mode::clonepack_kind_for_depth(depth))
+                ExactResultKind::Full
             };
             let upstream_snapshot = observe_upstream_for_verification(
                 &provider,
@@ -928,20 +931,14 @@ async fn run() -> Result<()> {
             .await?;
             // End-to-end wall clock for the clone, for the metrics report.
             let clone_started = std::time::Instant::now();
+            let request = CloneRequest {
+                repo_path: &repo_path,
+                branch: &branch,
+                at: at.as_deref(),
+                kind,
+            };
             let outcome = client
-                .install_repo_with_mode_at(
-                    &repo_path,
-                    &branch,
-                    at.as_deref(),
-                    &target,
-                    mode,
-                    clonepack_kind,
-                    if enable_bench {
-                        Some(&mut benchmark)
-                    } else {
-                        None
-                    },
-                )
+                .clone_repo(&request, &target, enable_bench.then_some(&mut benchmark))
                 .await?;
             let total_ms = u64::try_from(clone_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             println!("installed {} into {}", repo_path, target.display());
