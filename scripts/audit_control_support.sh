@@ -13,7 +13,7 @@ while IFS= read -r line; do
   [ -n "$line" ] || continue
   path="${line%%:*}"
   case "$path" in
-    rust/src/control/mod.rs|rust/src/server.rs|docs/internal/*)
+    rust/src/control/mod.rs|docs/internal/*)
       allowed=$((allowed + 1))
       ;;
     *)

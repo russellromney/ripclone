@@ -298,10 +298,6 @@ pub struct RefResponse {
     pub metadata_chunk_url: Option<String>,
     #[serde(default)]
     pub archive_chunk_urls: Option<Vec<Option<String>>>,
-    #[serde(default)]
-    pub head_blobs_chunk_urls: Option<Vec<Option<String>>>,
-    #[serde(default)]
-    pub head_blobs_idx_url: Option<String>,
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.
     #[serde(default)]
     pub pack_chunk_urls: Option<Vec<Option<String>>>,
