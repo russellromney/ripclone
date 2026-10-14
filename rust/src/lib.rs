@@ -86,7 +86,6 @@ pub mod git;
 pub mod gix_util;
 pub mod manifest;
 #[doc(hidden)]
-pub mod meta;
 #[doc(hidden)]
 pub mod metrics;
 pub mod mode;
@@ -96,8 +95,6 @@ pub mod perf;
 pub mod provider;
 pub mod provider_config;
 #[doc(hidden)]
-pub mod queue;
-pub mod ref_store;
 pub mod repo_config;
 #[doc(hidden)]
 pub mod retention;
@@ -209,6 +206,19 @@ pub struct FullResult {
     pub packs: Vec<PackArtifact>,
     #[serde(default)]
     pub history_levels: Vec<HistoryLevel>,
+    /// Compacted Head packs for this commit, written when its Head delta grew
+    /// past `RIPCLONE_HEAD_REBASE_BYTES`. A child's Head builds its delta
+    /// against these instead of the parent Head's base.
+    #[serde(default)]
+    pub head_base: Option<HeadBase>,
+}
+
+/// A Head pack set that later Heads build deltas against. Lengths are kept so
+/// a manifest can list the packs without reading them.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct HeadBase {
+    pub commit: String,
+    pub packs: Vec<SizedPack>,
 }
 
 /// Published Files artifacts for one exact commit.
@@ -268,12 +278,6 @@ pub(crate) fn exact_output_ready(info: &RefInfo, result: ExactResultKind, commit
         ExactResultKind::Files => info.files.as_ref().map(|output| &output.clonepack),
     };
     artifacts.is_some_and(|artifacts| exact_output_artifacts_ready(commit, result, artifacts))
-}
-
-pub(crate) fn exact_result_complete(info: &RefInfo, commit: &str) -> bool {
-    exact_output_ready(info, ExactResultKind::Head, commit)
-        && exact_output_ready(info, ExactResultKind::Full, commit)
-        && exact_output_ready(info, ExactResultKind::Files, commit)
 }
 
 impl std::fmt::Display for ExactResultKind {

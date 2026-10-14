@@ -228,6 +228,16 @@ upstream-ref 404 gained `ref_not_found`). F1 sets `RIPCLONE_CACHE_DIR` and
 checks that the corrupt artifact is not cached. G4 rewinds to a commit the
 server never built. G5 checks the server logged a compaction.
 
+Step 3 PR A moved the server onto the control store and added C4, C5 and I2
+in `outputs.rs` and `integrations.rs`. C4 kills the server while the gated
+origin holds the build's fetch and checks the restarted server publishes
+each output once. C5 sets `RIPCLONE_HEAD_REBASE_BYTES=1` so Full(B) compacts
+a Head base, builds C on it, and compares B's ref responses (URL queries
+removed) and manifest bytes before and after. I2 builds a private repo with
+the server's provider token while the CLI holds none and the origin refuses
+anonymous reads. The queue and ref-store unit tests went with their code;
+their rules are in the ControlStore conformance suite.
+
 ## Open points
 
 - C1, C2, D4 and E1 depend on `background_slots`, which arrives in step 3. Until

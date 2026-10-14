@@ -2121,8 +2121,7 @@ impl Client {
     /// Register and admit an ordinary default-branch build, returning after the
     /// durable registration plus ready detection or queue acceptance.
     pub async fn admit_add_repo(&self, repo_path: &str) -> Result<SyncAdmission> {
-        let mut url = self.repo_url(repo_path, "/add");
-        url.push_str("?source=cli");
+        let url = self.repo_url(repo_path, "/add");
         let resp = self
             .send(self.http.request(reqwest::Method::POST, &url))
             .await?;

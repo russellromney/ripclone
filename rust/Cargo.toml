@@ -64,14 +64,11 @@ async-trait = "0.1.89"
 # (the GitHub App broker signs its app JWT with RS256).
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
-# libsql serves the local SQLite control database.
-# libsql 0.9.30 double-closes native connections during teardown. Pin the
-# upstream one-line fix until it is included in a crates.io release.
-libsql = { version = "0.10.0-pre.4", git = "https://github.com/tursodatabase/libsql", rev = "c942c8262dabc47e403d23e8ca22f7cc0a1007f5", default-features = false, features = ["core"] }
 gix = "0.85.0"
 gix-pack = "0.72.0"
 rpassword = "7"
 toml = "1.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

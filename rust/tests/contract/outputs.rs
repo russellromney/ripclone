@@ -1,0 +1,167 @@
+//! C. Outputs are independent and immutable.
+
+use crate::harness::*;
+
+/// The `/status` entry for `commit` once Head, Full and Files are all ready.
+fn wait_all_ready(server: &Server, repo: &str, commit: &str) -> serde_json::Value {
+    wait_for(&format!("every output of {commit} ready"), || {
+        let resp = server.get(&format!("/v1/repos/github/{repo}/status"));
+        let status: serde_json::Value = serde_json::from_str(&resp.body).ok()?;
+        status["refs"]
+            .as_array()?
+            .iter()
+            .find(|entry| {
+                entry["commit"] == commit
+                    && entry["head"] == true
+                    && entry["full"] == true
+                    && entry["files"] == true
+            })
+            .cloned()
+    })
+}
+
+/// C4: SIGKILL while the origin holds the build's fetch; after a restart and
+/// release the build completes once and every output is ready.
+#[test]
+fn c4_build_killed_mid_fetch_completes_once_after_restart() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let origin = world.origin("acme", "c4");
+    let tip = origin.commit(&[("a.txt", "a\n"), ("b/c.txt", "c\n")], "A");
+    origin.publish();
+    let mut server = world.server(&[]);
+    http.hold_fetches();
+    world.cli(&server, &["add", "acme/c4"]).ok();
+    http.wait_held(1);
+
+    server.restart();
+    // The killed server's fetch is still parked; the restarted server leases
+    // the same build again and parks its own fetch.
+    http.wait_held(2);
+    http.release_fetches();
+
+    let entry = wait_all_ready(&server, "acme/c4", &tip);
+    assert_eq!(entry["job"], "done", "{entry}");
+    wait_for("the build to complete", || {
+        (server.metric("ripclone_builds_completed_total") == 1).then_some(())
+    });
+    // The restarted server admitted nothing new and published each output
+    // once.
+    assert_eq!(server.metric("ripclone_builds_queued_total"), 0);
+    for kind in ["head", "full", "files"] {
+        assert_eq!(
+            server.metric(&format!(
+                "ripclone_outputs_published_total{{kind=\"{kind}\"}}"
+            )),
+            1,
+            "{kind}"
+        );
+    }
+    assert_eq!(server.metric("ripclone_builds_failed_total"), 0);
+
+    let target = world.target("c4");
+    world
+        .cli(&server, &["clone", "acme/c4", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(listing(&target), origin.tree(&tip));
+}
+
+/// A ref response with every URL's query string removed: signatures and
+/// expiry change per request, the object keys must not.
+fn without_queries(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) if s.contains("://") => {
+            serde_json::Value::String(s.split('?').next().unwrap_or_default().to_string())
+        }
+        serde_json::Value::Array(items) => items.into_iter().map(without_queries).collect(),
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .map(|(k, v)| (k, without_queries(v)))
+            .collect(),
+        other => other,
+    }
+}
+
+/// Every pinned ref response for `commit`, without queries, plus the bytes of
+/// each manifest.
+fn published(server: &Server, commit: &str) -> Vec<(serde_json::Value, String)> {
+    ["head", "full", "files"]
+        .iter()
+        .map(|kind| {
+            let resp = server.get(&format!(
+                "/v1/repos/github/acme/c5/refs/main?result={kind}&pinned={commit}"
+            ));
+            assert_eq!(resp.status, 200, "{kind}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            let manifest = body["clonepack_manifest"].as_str().unwrap().to_string();
+            let bytes = server.get(&format!("/v1/artifacts/{manifest}"));
+            assert_eq!(bytes.status, 200, "{kind} manifest {manifest}");
+            (without_queries(body), bytes.body)
+        })
+        .collect()
+}
+
+/// C5: after B is fully ready, building C never changes B's published
+/// results, even when B's Full compacts a new Head base that C builds on.
+#[test]
+fn c5_later_build_never_changes_published_results() {
+    let world = World::new();
+    let origin = world.origin("acme", "c5");
+    origin.commit(&[("a.txt", "a\n"), ("keep.txt", "keep\n")], "A");
+    origin.publish();
+    // Any Head delta compacts, so Full(B) records a new Head base.
+    let server = world.server(&[("RIPCLONE_HEAD_REBASE_BYTES", "1")]);
+    world.cli(&server, &["add", "acme/c5", "--wait"]).ok();
+
+    let b = origin.commit(&[("a.txt", "b\n"), ("b.txt", "b\n")], "B");
+    origin.publish();
+    world.cli(&server, &["sync", "acme/c5", "--wait"]).ok();
+    wait_all_ready(&server, "acme/c5", &b);
+    let before = published(&server, &b);
+    assert!(
+        server.log().contains("compacted Head packs"),
+        "Full(B) did not compact a Head base:\n{}",
+        server.log()
+    );
+
+    let c = origin.commit(&[("a.txt", "c\n"), ("c.txt", "c\n")], "C");
+    origin.publish();
+    world.cli(&server, &["sync", "acme/c5", "--wait"]).ok();
+    wait_all_ready(&server, "acme/c5", &c);
+
+    let base_line = format!("delta vs base {}", &b[..7]);
+    assert!(
+        server.log().contains(&base_line),
+        "Head(C) did not build on Full(B)'s base:\n{}",
+        server.log()
+    );
+
+    let after = published(&server, &b);
+    for ((kind, before), after) in ["head", "full", "files"].iter().zip(&before).zip(&after) {
+        assert_eq!(before.0, after.0, "{kind} response of B changed");
+        assert!(before.1 == after.1, "{kind} manifest bytes of B changed");
+    }
+
+    // C's Head is a delta on the base Full(B) compacted; both clone right.
+    for (commit, name) in [(&c, "c5-c"), (&b, "c5-b")] {
+        let target = world.target(name);
+        world
+            .cli(
+                &server,
+                &[
+                    "clone",
+                    "acme/c5",
+                    target.to_str().unwrap(),
+                    "--depth",
+                    "1",
+                    "--at",
+                    commit,
+                ],
+            )
+            .ok();
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]), *commit);
+        git(&target, &["fsck"]);
+        assert_eq!(listing(&target), origin.tree(commit));
+    }
+}

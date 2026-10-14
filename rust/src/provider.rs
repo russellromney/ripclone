@@ -410,11 +410,38 @@ impl RepoId {
         self.provider.as_str() == DEFAULT_PROVIDER_ID
     }
 
-    /// Storage key used by `RefStore` implementations.
+    /// Storage key: how the control store and logs name the repository.
     ///
     /// All providers use `{provider}/{escaped_path}`.
     pub fn storage_key(&self) -> String {
         format!("{}/{}", self.provider.as_str(), escape_path(&self.path))
+    }
+
+    /// Inverse of [`storage_key`](Self::storage_key). The escaped path never
+    /// contains `/`, so the last `/` separates provider from path.
+    pub fn from_storage_key(key: &str) -> Result<Self> {
+        let invalid = || anyhow::anyhow!("invalid repository storage key {key:?}");
+        let (provider, escaped) = key.rsplit_once('/').ok_or_else(invalid)?;
+        let mut path = String::with_capacity(escaped.len());
+        let mut rest = escaped;
+        while let Some(index) = rest.find('%') {
+            path.push_str(&rest[..index]);
+            path.push(match rest.get(index + 1..index + 3) {
+                Some("25") => '%',
+                Some("2F") => '/',
+                Some("5C") => '\\',
+                _ => return Err(invalid()),
+            });
+            rest = &rest[index + 3..];
+        }
+        path.push_str(rest);
+        if provider.is_empty() || path.is_empty() {
+            return Err(invalid());
+        }
+        Ok(Self {
+            provider: ProviderInstanceId::new(provider),
+            path,
+        })
     }
 
     /// Human-readable key for operator-facing config (the webhook allowlist).
@@ -602,6 +629,10 @@ mod tests {
             assert_eq!(repo.storage_key(), *storage);
             assert_eq!(repo.mirror_dir_name(), *mirror);
             assert_eq!(repo.natural_key(), *natural);
+            assert_eq!(&RepoId::from_storage_key(storage).unwrap(), repo);
+        }
+        for bad in ["noslash", "/path", "github/", "github/a%2", "github/a%41"] {
+            assert!(RepoId::from_storage_key(bad).is_err(), "{bad}");
         }
         let mut keys: Vec<String> = rows.iter().map(|r| r.0.storage_key()).collect();
         keys.sort();

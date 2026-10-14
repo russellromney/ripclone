@@ -1,11 +1,10 @@
 //! Provider-agnostic webhook receiver: a signed default-branch push → exact admission.
 //!
 //! A webhook is a thin **front door**. Everything heavy already exists — the
-//! build queue, the worker, storage, the metadata store. The receiver does
-//! three things: **verify → normalize → enqueue**. This module owns the
-//! normalize step (per-provider parsing) and the config (per-provider secret +
-//! optional allowlist); `server.rs` wires it into the router and the enqueue
-//! path.
+//! control store, the build workers, storage. The receiver does three things:
+//! **verify → normalize → admit**. This module owns the normalize step
+//! (per-provider parsing) and the config (per-provider secret + optional
+//! allowlist); `server.rs` wires it into the router and the admission path.
 //!
 //! Phase 1 ships GitHub only. GitLab and Gitea are later `WebhookProvider`
 //! impls behind the same trait — adding a provider is implementing this one

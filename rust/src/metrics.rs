@@ -32,7 +32,9 @@ pub struct Metrics {
     builds_completed: AtomicU64,
     builds_failed: AtomicU64,
     build_duration_ms_total: AtomicU64,
-    build_queue_depth: AtomicU64,
+    outputs_published_head: AtomicU64,
+    outputs_published_files: AtomicU64,
+    outputs_published_full: AtomicU64,
 }
 
 impl Metrics {
@@ -88,43 +90,32 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increment the queue-depth gauge when a job is accepted into (or about
-    /// to enter) the queue.
-    pub fn record_build_queued(&self) {
-        self.build_queue_depth.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Roll back a provisional queue-depth increment when admission does not
-    /// create a new job (coalesced, full, or failed).
-    pub fn rollback_build_queued(&self) {
-        Self::dec_saturating(&self.build_queue_depth);
-    }
-
-    /// Record that a job was actually enqueued successfully.
+    /// A new build row was admitted.
     pub fn record_build_accepted(&self) {
         self.builds_queued.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Every output of a build row is ready. `duration` runs from admission.
     pub fn record_build_completed(&self, duration: std::time::Duration) {
         self.builds_completed.fetch_add(1, Ordering::Relaxed);
         self.build_duration_ms_total.fetch_add(
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        Self::dec_saturating(&self.build_queue_depth);
     }
 
+    /// An output failed for good (permanent error or attempts exhausted).
     pub fn record_build_failed(&self) {
         self.builds_failed.fetch_add(1, Ordering::Relaxed);
-        Self::dec_saturating(&self.build_queue_depth);
     }
 
-    /// Decrement a gauge but never wrap below zero — a gauge that underflowed to
-    /// `u64::MAX` would render as a garbage Prometheus value.
-    fn dec_saturating(g: &AtomicU64) {
-        let _ = g.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(1))
-        });
+    pub fn record_output_published(&self, kind: crate::ExactResultKind) {
+        let counter = match kind {
+            crate::ExactResultKind::Head => &self.outputs_published_head,
+            crate::ExactResultKind::Files => &self.outputs_published_files,
+            crate::ExactResultKind::Full => &self.outputs_published_full,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     fn add_optional(counter: &AtomicU64, value: Option<u64>) {
@@ -134,7 +125,7 @@ impl Metrics {
     }
 
     /// Render metrics in the Prometheus text exposition format (v0.0.4).
-    /// Counters use the `_total` suffix; `build_queue_depth` is a gauge.
+    /// Every metric is a counter with the `_total` suffix.
     pub fn prometheus(&self) -> String {
         use std::fmt::Write as _;
         let s = self.snapshot();
@@ -230,7 +221,7 @@ impl Metrics {
             ),
             (
                 "ripclone_builds_queued_total",
-                "Builds enqueued",
+                "Build rows admitted",
                 s.builds_queued,
             ),
             (
@@ -257,11 +248,20 @@ impl Metrics {
 
         let _ = writeln!(
             out,
-            "# HELP ripclone_build_queue_depth {}",
-            escape_help("Builds currently queued or in flight")
+            "# HELP ripclone_outputs_published_total {}",
+            escape_help("Build outputs published, by kind")
         );
-        let _ = writeln!(out, "# TYPE ripclone_build_queue_depth gauge");
-        let _ = writeln!(out, "ripclone_build_queue_depth {}", s.build_queue_depth);
+        let _ = writeln!(out, "# TYPE ripclone_outputs_published_total counter");
+        for (kind, value) in [
+            ("head", s.outputs_published_head),
+            ("files", s.outputs_published_files),
+            ("full", s.outputs_published_full),
+        ] {
+            let _ = writeln!(
+                out,
+                "ripclone_outputs_published_total{{kind=\"{kind}\"}} {value}"
+            );
+        }
 
         out
     }
@@ -301,7 +301,9 @@ impl Metrics {
             },
             build_duration_ms_total: build_ms,
             builds_failed: self.builds_failed.load(Ordering::Relaxed),
-            build_queue_depth: self.build_queue_depth.load(Ordering::Relaxed),
+            outputs_published_head: self.outputs_published_head.load(Ordering::Relaxed),
+            outputs_published_files: self.outputs_published_files.load(Ordering::Relaxed),
+            outputs_published_full: self.outputs_published_full.load(Ordering::Relaxed),
         }
     }
 }
@@ -353,7 +355,9 @@ pub struct MetricsSnapshot {
     pub build_avg_ms: u64,
     pub build_duration_ms_total: u64,
     pub builds_failed: u64,
-    pub build_queue_depth: u64,
+    pub outputs_published_head: u64,
+    pub outputs_published_files: u64,
+    pub outputs_published_full: u64,
 }
 
 #[cfg(test)]
@@ -361,20 +365,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_queue_depth_gauge_is_balanced_and_saturating() {
+    fn published_outputs_render_one_series_per_kind() {
         let m = Metrics::new();
-        m.record_build_queued();
-        m.record_build_completed(std::time::Duration::from_millis(1));
-        assert!(
-            m.prometheus().contains("\nripclone_build_queue_depth 0\n"),
-            "balanced queue/complete should return the gauge to 0"
-        );
-        // Underflow guard: a stray decrement must clamp at 0, never wrap to
-        // u64::MAX (which would render as a garbage gauge value).
-        m.record_build_failed();
-        assert!(
-            m.prometheus().contains("\nripclone_build_queue_depth 0\n"),
-            "decrement below zero must saturate at 0"
-        );
+        m.record_output_published(crate::ExactResultKind::Head);
+        m.record_output_published(crate::ExactResultKind::Head);
+        m.record_output_published(crate::ExactResultKind::Full);
+        let text = m.prometheus();
+        for line in [
+            "\nripclone_outputs_published_total{kind=\"head\"} 2\n",
+            "\nripclone_outputs_published_total{kind=\"files\"} 0\n",
+            "\nripclone_outputs_published_total{kind=\"full\"} 1\n",
+        ] {
+            assert!(text.contains(line), "{line:?} missing from {text}");
+        }
     }
 }

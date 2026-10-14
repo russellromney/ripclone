@@ -7,7 +7,6 @@
 use crate::cas::Cas;
 use crate::config::Config;
 use crate::metrics::Metrics;
-use crate::ref_store::RefStore;
 use crate::retention::LocalCacheRetention;
 use crate::storage::{S3Storage, StorageRef, local};
 use anyhow::{Context, Result};
@@ -23,7 +22,6 @@ fn config() -> &'static Config {
 pub struct Backends {
     pub cas: Cas,
     pub storage: StorageRef,
-    pub ref_store: Arc<dyn RefStore>,
     pub cache_retention: LocalCacheRetention,
 }
 
@@ -33,11 +31,7 @@ impl Backends {
             .context("validate S3 storage configuration")
     }
 
-    pub async fn from_env_with_ref_store(
-        cas_dir: &Path,
-        metrics: &Arc<Metrics>,
-        ref_store: Arc<dyn RefStore>,
-    ) -> Result<Self> {
+    pub fn from_env(cas_dir: &Path, metrics: &Arc<Metrics>) -> Result<Self> {
         let cas = Cas::new(cas_dir)?;
         let s3_storage =
             S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
@@ -56,7 +50,6 @@ impl Backends {
         Ok(Self {
             cas,
             storage,
-            ref_store,
             cache_retention,
         })
     }

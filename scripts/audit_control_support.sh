@@ -13,7 +13,7 @@ while IFS= read -r line; do
   [ -n "$line" ] || continue
   path="${line%%:*}"
   case "$path" in
-    rust/src/control.rs|rust/src/server.rs|docs/BACKENDS.md|docs/CONFIG.md|docs/internal/*)
+    rust/src/control/mod.rs|rust/src/server.rs|docs/internal/*)
       allowed=$((allowed + 1))
       ;;
     *)
@@ -31,8 +31,10 @@ if [ "$unexpected" -ne 0 ]; then
   exit 1
 fi
 
+# sqlx is allowed for the SQLite control store; its network-database drivers
+# are not.
 dependency_matches="$(cd "$ROOT" && git grep -nE \
-  'name = "(sqlx|sqlx-postgres|sqlx-mysql|tokio-postgres|postgres|mysql_async)"|features = .*"(postgres|mysql)"' \
+  'name = "(sqlx-postgres|sqlx-mysql|tokio-postgres|postgres|mysql_async)"|features = .*"(postgres|mysql)"' \
   -- rust/Cargo.toml rust/Cargo.lock || true)"
 if [ -n "$dependency_matches" ]; then
   echo "removed network-database dependency closure is present:" >&2
@@ -40,8 +42,21 @@ if [ -n "$dependency_matches" ]; then
   exit 1
 fi
 
+# The control store links one SQLite, sqlx's. Turso's SQLite fork bundles a
+# second one, so any mention of it fails. The bracket keeps this script out of
+# its own match. sqlx's own binding crate (SQLite 3 sys) is allowed.
+second_sqlite="$(cd "$ROOT" && git grep -niE 'lib[s]ql([^i]|$)' -- . ':!docs/internal' || true)"
+if [ -n "$second_sqlite" ]; then
+  echo "Turso's SQLite fork is present; the control store uses sqlx's SQLite only:" >&2
+  echo "$second_sqlite" >&2
+  exit 1
+fi
+
 for path in \
   rust/src/dispatch \
+  rust/src/meta \
+  rust/src/queue \
+  rust/src/ref_store.rs \
   rust/src/queue/postgres.rs \
   rust/src/queue/mysql.rs \
   rust/src/queue/local.rs \
