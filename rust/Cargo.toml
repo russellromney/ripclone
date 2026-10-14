@@ -60,7 +60,6 @@ serde_json = "1"
 sha1 = "0.11"
 sha2 = "0.11"
 fastcdc = "4"
-tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -69,7 +68,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 urlencoding = "2"
 walkdir = "2"
-zstd = { version = "0.13", features = ["zdict_builder"] }
+zstd = "0.13"
 secrecy = "0.10.3"
 async-trait = "0.1.89"
 # `rust_crypto` selects the pure-Rust crypto provider so RS256 sign/verify work

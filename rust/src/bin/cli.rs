@@ -118,11 +118,6 @@ enum Commands {
         /// the branch tip. Pairs with `sync --at <rev>`.
         #[arg(long)]
         at: Option<String>,
-        /// Materialize the working tree in memory (tmpfs) for a fast, EPHEMERAL
-        /// clone. The tree does not survive a reboot — intended for throwaway
-        /// agent/CI machines. Linux only.
-        #[arg(long)]
-        temp: bool,
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
@@ -155,9 +150,6 @@ enum Commands {
         level: i32,
         #[arg(long, default_value = "/data/repos")]
         repo_root: PathBuf,
-        /// Optional zstd dictionary trained from this repo.
-        #[arg(long)]
-        dictionary: Option<PathBuf>,
     },
     /// Extract a working-tree archive + manifest into a directory.
     #[command(hide = true)]
@@ -168,26 +160,6 @@ enum Commands {
         manifest: PathBuf,
         #[arg(short, long, default_value = ".")]
         dir: PathBuf,
-        /// zstd dictionary required to decompress this archive.
-        #[arg(long)]
-        dictionary: Option<PathBuf>,
-    },
-    /// Train a zstd dictionary from a repo's HEAD blobs.
-    #[command(hide = true)]
-    TrainDictionary {
-        repo: String,
-        #[arg(short, long, default_value = "HEAD")]
-        branch: String,
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Maximum dictionary size in bytes.
-        #[arg(long, default_value = "1048576")]
-        max_size: usize,
-        /// Approximate total sample bytes to use for training.
-        #[arg(long, default_value = "52428800")]
-        sample_bytes: usize,
-        #[arg(long, default_value = "/data/repos")]
-        repo_root: PathBuf,
     },
 }
 
@@ -892,7 +864,6 @@ async fn run() -> Result<()> {
             mode,
             depth,
             at,
-            temp,
             bench,
             no_metrics,
             verify_upstream,
@@ -942,14 +913,6 @@ async fn run() -> Result<()> {
                      not --depth {depth}"
                 );
             }
-            // Bridge the --temp flag to the env var the overlay check reads. Set
-            // here, before any clone work reads it.
-            if temp {
-                // SAFETY: set once at the start of the clone command, before the
-                // install path (the only reader) runs.
-                unsafe { std::env::set_var("RIPCLONE_TEMP", "1") };
-            }
-
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
             let clonepack_kind = if mode.needs_archive() {
@@ -1016,7 +979,6 @@ async fn run() -> Result<()> {
             manifest,
             level,
             repo_root,
-            dictionary,
         } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let client = client.with_provider(&provider);
@@ -1038,25 +1000,11 @@ async fn run() -> Result<()> {
                     .await?
                     .commit
             };
-            let dict_bytes = match dictionary {
-                Some(path) => Some(
-                    std::fs::read(&path)
-                        .with_context(|| format!("read dictionary {}", path.display()))?,
-                ),
-                None => None,
-            };
             println!("building archive for {} at {}", repo_path, &commit[..7]);
             let start = std::time::Instant::now();
             let stats = tokio::task::spawn_blocking(move || {
                 ArchiveBuilder::build_repo(
-                    &repo_root,
-                    &owner,
-                    &repo_name,
-                    &commit,
-                    &archive,
-                    &manifest,
-                    level,
-                    dict_bytes.as_deref(),
+                    &repo_root, &owner, &repo_name, &commit, &archive, &manifest, level,
                 )
             })
             .await
@@ -1071,76 +1019,16 @@ async fn run() -> Result<()> {
             archive,
             manifest,
             dir,
-            dictionary,
         } => {
-            let dict_bytes = match dictionary {
-                Some(path) => Some(
-                    std::fs::read(&path)
-                        .with_context(|| format!("read dictionary {}", path.display()))?,
-                ),
-                None => None,
-            };
             let start = std::time::Instant::now();
-            let stats = tokio::task::spawn_blocking(move || {
-                extract_archive(&archive, &manifest, &dir, dict_bytes.as_deref())
-            })
-            .await
-            .context("archive extract task")??;
+            let stats =
+                tokio::task::spawn_blocking(move || extract_archive(&archive, &manifest, &dir))
+                    .await
+                    .context("archive extract task")??;
             let elapsed = start.elapsed();
             println!(
                 "extracted {} files ({} bytes) in {:?}",
                 stats.files, stats.raw_bytes, elapsed
-            );
-        }
-        Commands::TrainDictionary {
-            repo,
-            branch,
-            output,
-            max_size,
-            sample_bytes,
-            repo_root,
-        } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
-            let (owner, repo_name) = repo_path
-                .split_once('/')
-                .map(|(o, n)| (o.to_string(), n.to_string()))
-                .unwrap_or(("".to_string(), repo_path.clone()));
-            let info = client.sync_repo(&repo_path, None).await?;
-            let commit = if branch == "HEAD" {
-                info.commit
-            } else {
-                client
-                    .resolve_exact_result(
-                        &repo_path,
-                        &branch,
-                        ripclone::ExactResultKind::Full,
-                        None,
-                    )
-                    .await?
-                    .commit
-            };
-            let mirror = repo_root.join(format!("{}_{}.git", owner, repo_name));
-            println!(
-                "training {} byte dictionary for {} at {} from mirror {}",
-                max_size,
-                repo,
-                &commit[..7],
-                mirror.display()
-            );
-            let start = std::time::Instant::now();
-            let dict = tokio::task::spawn_blocking(move || {
-                ripclone::archive::train_dictionary(&mirror, &commit, max_size, sample_bytes)
-            })
-            .await
-            .context("dictionary training task")??;
-            std::fs::write(&output, &dict)
-                .with_context(|| format!("write dictionary {}", output.display()))?;
-            println!(
-                "wrote {} byte dictionary to {} in {:?}",
-                dict.len(),
-                output.display(),
-                start.elapsed()
             );
         }
     }

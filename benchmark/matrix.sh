@@ -49,17 +49,7 @@ REPO_ROOT="$BASE_DIR/repos"
 SERVER_PID=""
 PROXY_PID=""
 
-cleanup_overlay() {
-  if [ -d "$BASE_DIR" ]; then
-    for d in "$BASE_DIR"/*/; do
-      umount -l "$d" 2>/dev/null || true
-    done
-  fi
-  rm -rf /dev/shm/ripclone-overlay-* 2>/dev/null || true
-}
-
 cleanup() {
-  cleanup_overlay
   if [ -n "${PROXY_PID:-}" ]; then
     kill "$PROXY_PID" 2>/dev/null || true
     wait "$PROXY_PID" 2>/dev/null || true

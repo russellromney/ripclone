@@ -186,7 +186,6 @@ pub fn extract_archive(
     archive_path: &Path,
     manifest_path: &Path,
     target_dir: &Path,
-    dictionary: Option<&[u8]>,
 ) -> Result<ExtractStats> {
     let mut archive_file = File::open(archive_path)
         .with_context(|| format!("open archive {}", archive_path.display()))?;
@@ -201,7 +200,6 @@ pub fn extract_archive(
     extract_archive_with_chunk_fetcher(
         manifest_path,
         Some(target_dir),
-        dictionary,
         DEFAULT_LOCAL_CHUNK_SIZE,
         move |chunk: &Chunk| {
             let start = usize::try_from(chunk.byte_start)
@@ -230,7 +228,6 @@ pub fn extract_archive(
 pub fn extract_archive_with_chunk_fetcher<F>(
     manifest_path: &Path,
     target_dir: Option<&Path>,
-    dictionary: Option<&[u8]>,
     chunk_size: u64,
     fetch_chunk: F,
 ) -> Result<ExtractStats>
@@ -272,13 +269,7 @@ where
         }
     });
 
-    extract_archive_from_chunk_receiver_with_chunks(
-        manifest_path,
-        target_dir,
-        dictionary,
-        chunk_rx,
-        chunk_map,
-    )
+    extract_archive_from_chunk_receiver_with_chunks(manifest_path, target_dir, chunk_rx, chunk_map)
 }
 
 /// `WriteOptions` shared by every archive regular-file write.
@@ -319,31 +310,17 @@ fn archive_thread_counts() -> (usize, usize) {
     (fetch_threads, write_threads)
 }
 
-fn decompress_frame_recorded(
-    compressed: &[u8],
-    frame: &FrameInfo,
-    dictionary: Option<&[u8]>,
-    idx: usize,
-) -> Result<Vec<u8>> {
+fn decompress_frame_recorded(compressed: &[u8], frame: &FrameInfo, idx: usize) -> Result<Vec<u8>> {
     let start = Instant::now();
     let raw_len =
         usize::try_from(frame.raw_len).context("archive frame raw length does not fit in usize")?;
     let raw = if frame.compressed_len == 0 && frame.raw_len == 0 {
         Vec::new()
     } else {
-        match dictionary {
-            Some(dict) => {
-                let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict)
-                    .context("create zstd decompressor with dictionary")?;
-                decompressor
-                    .decompress(compressed, raw_len)
-                    .with_context(|| format!("decompress frame {} with dictionary", idx))?
-            }
-            None => zstd::bulk::Decompressor::new()
-                .context("create zstd decompressor")?
-                .decompress(compressed, raw_len)
-                .with_context(|| format!("decompress frame {}", idx))?,
-        }
+        zstd::bulk::Decompressor::new()
+            .context("create zstd decompressor")?
+            .decompress(compressed, raw_len)
+            .with_context(|| format!("decompress frame {}", idx))?
     };
     crate::perf::record_zstd_inflate(start.elapsed(), compressed.len(), raw.len());
     Ok(raw)
@@ -382,7 +359,6 @@ fn sha1_digest_fragments_recorded(fragments: &[FileSlice]) -> sha1::digest::Outp
 pub fn extract_archive_from_chunk_receiver(
     manifest_path: &Path,
     target_dir: Option<&Path>,
-    dictionary: Option<&[u8]>,
     chunk_rx: Receiver<(usize, Result<bytes::Bytes>)>,
 ) -> Result<ExtractStats> {
     let manifest = read_archive_manifest(manifest_path)?;
@@ -393,7 +369,6 @@ pub fn extract_archive_from_chunk_receiver(
     extract_archive_from_chunk_receiver_with_chunks(
         manifest_path,
         target_dir,
-        dictionary,
         chunk_rx,
         chunks_by_index,
     )
@@ -402,7 +377,6 @@ pub fn extract_archive_from_chunk_receiver(
 fn extract_archive_from_chunk_receiver_with_chunks(
     manifest_path: &Path,
     target_dir: Option<&Path>,
-    dictionary: Option<&[u8]>,
     chunk_rx: Receiver<(usize, Result<bytes::Bytes>)>,
     chunks_by_index: HashMap<usize, Chunk>,
 ) -> Result<ExtractStats> {
@@ -501,8 +475,6 @@ fn extract_archive_from_chunk_receiver_with_chunks(
         Receiver<Result<ArchiveFrameWriteResult>>,
     ) = bounded(manifest.frames.len());
 
-    let dictionary = dictionary.map(|d| Arc::new(d.to_vec()));
-
     // Fetcher threads read whole archive chunks from the channel, slice them into
     // per-frame compressed buffers, and push those to the writer pool.
     for _ in 0..fetch_threads {
@@ -563,7 +535,6 @@ fn extract_archive_from_chunk_receiver_with_chunks(
         let fragments_by_frame2 = fragments_by_frame.clone();
         let pending_files2 = pending_files.clone();
         let target_dir2 = target_dir.clone();
-        let dictionary2 = dictionary.clone();
         std::thread::spawn(move || {
             let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
             while let Ok((idx, res)) = compressed_rx.recv() {
@@ -575,12 +546,7 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                     };
                     let compressed = res?;
                     let frame = &manifest2.frames[idx];
-                    let raw = Arc::new(decompress_frame_recorded(
-                        compressed.as_ref(),
-                        frame,
-                        dictionary2.as_deref().map(|d| d.as_slice()),
-                        idx,
-                    )?);
+                    let raw = Arc::new(decompress_frame_recorded(compressed.as_ref(), frame, idx)?);
                     let raw_len = usize::try_from(frame.raw_len)
                         .context("archive frame raw length does not fit in usize")?;
                     if raw.len() != raw_len {
@@ -1046,18 +1012,12 @@ mod tests {
             let mut f = File::create(&manifest_path)?;
             manifest.write(&mut f)?;
         }
-        extract_archive_with_chunk_fetcher(
-            &manifest_path,
-            Some(target),
-            None,
-            u64::MAX,
-            move |chunk| {
-                archive_chunks
-                    .get(chunk.chunk_index)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("missing chunk {}", chunk.chunk_index))
-            },
-        )
+        extract_archive_with_chunk_fetcher(&manifest_path, Some(target), u64::MAX, move |chunk| {
+            archive_chunks
+                .get(chunk.chunk_index)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing chunk {}", chunk.chunk_index))
+        })
     }
 
     #[test]
