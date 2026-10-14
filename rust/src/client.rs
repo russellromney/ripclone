@@ -827,7 +827,7 @@ fn record_test_download_request(hash: &str, offset: u64, signed: bool, url: &str
 
 /// Test-fixture-only deterministic client interruption. The real response is
 /// cancelled after bytes have been persisted, then the fixture controls when
-/// the retry may proceed (for example, after a MinIO URL really expires).
+/// the retry may proceed (for example, after an S3 URL really expires).
 async fn wait_for_test_download_interrupt(hash: &str, saved: u64) -> Result<bool> {
     if std::env::var_os("RIPCLONE_TESTING").is_none()
         || std::env::var("RIPCLONE_TEST_INTERRUPT_ARTIFACT")
@@ -865,7 +865,7 @@ async fn wait_for_test_download_interrupt(hash: &str, saved: u64) -> Result<bool
 }
 
 /// Test-fixture-only pause before a buffered artifact's first real request.
-/// This lets the MinIO acceptance row expire the signed URL without inserting
+/// This lets the S3 emulator acceptance row expire the signed URL without inserting
 /// a proxy or changing production retry timing.
 async fn wait_for_test_before_buffered_artifact(hash: &str) -> Result<()> {
     if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1"))

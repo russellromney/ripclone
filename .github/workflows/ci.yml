@@ -40,7 +40,8 @@ jobs:
             docker:
               - 'rust/**'
               - 'tests/docker/**'
-              - 'scripts/e2e_full_topup_minio.sh'
+              - 'scripts/e2e_full_topup_s3.sh'
+              - 'scripts/s3_emulator.sh'
               - 'scripts/e2e_full_topup_gitea.sh'
               - '.github/workflows/ci.yml'
             bench:
@@ -162,8 +163,8 @@ jobs:
 
   # Durable artifact lifecycle: the server uses an embedded replica against the
   # official libsql fixture, the standalone worker is API-only, and published
-  # bytes remain in digest-pinned MinIO after its local caches are removed.
-  turso-api-worker-minio:
+  # bytes remain in the local S3 emulator after its local caches are removed.
+  turso-api-worker-s3:
     needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
@@ -173,14 +174,6 @@ jobs:
         image: ghcr.io/tursodatabase/libsql-server@sha256:bc100873a74865392a49191b4733025fe8222a409799efa424dc196feaf05035
         ports:
           - 8080:8080
-      minio:
-        image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-        command: server /data
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports:
-          - 9000:9000
     steps:
       - uses: actions/checkout@v7
       - name: Download ci artifacts
@@ -188,10 +181,7 @@ jobs:
         with:
           name: ci-artifacts
           path: bin
-      - name: Wait for primary and MinIO, then create bucket
-        env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
+      - name: Wait for primary; start the S3 emulator with a bucket
         run: |
           set -euo pipefail
           for _ in $(seq 1 60); do
@@ -199,24 +189,14 @@ jobs:
             sleep 0.25
           done
           curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:8080/health >/dev/null
-          for _ in $(seq 1 60); do
-            curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && break
-            sleep 0.25
-          done
-          curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:9000/minio/health/live >/dev/null
-          aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb "s3://ripclone-${GITHUB_RUN_ID}-turso-worker"
+          bash scripts/s3_emulator.sh "$RUNNER_TEMP/s3" "ripclone-${GITHUB_RUN_ID}-turso-worker" >> "$GITHUB_ENV"
       - name: API worker keeps published S3 artifacts across empty local caches
         timeout-minutes: 6
         env:
           RIPCLONE_REQUIRE_TURSO: "1"
           RIPCLONE_TURSO_DATABASE_URL: http://127.0.0.1:8080
           RIPCLONE_TURSO_AUTH_TOKEN: local-surrogate
-          RIPCLONE_S3_ENDPOINT: http://127.0.0.1:9000
-          RIPCLONE_S3_REGION: us-east-1
-          RIPCLONE_S3_BUCKET: ripclone-${{ github.run_id }}-turso-worker
           RIPCLONE_S3_PREFIX: control-collapse/turso-api-worker/
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
           CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
           CARGO_BIN_EXE_ripclone-worker: ${{ github.workspace }}/bin/ripclone-worker
         run: |
@@ -226,10 +206,13 @@ jobs:
           test_name=token_only_worker_builds_and_clones_without_control_credentials
           timeout 30 "$test_bin" --list | grep -Fqx "$test_name: test"
           timeout 300 "$test_bin" --exact "$test_name"
+      - name: S3 emulator log
+        if: failure()
+        run: cat "$RUNNER_TEMP/s3/versitygw.log" || true
 
   # Real signed base-A artifact download and stale pinned-B refresh against
-  # digest-pinned MinIO. Runs the one focused ignored fixture test exactly.
-  full-topup-minio:
+  # the local S3 emulator. Runs the one focused ignored fixture test exactly.
+  full-topup-s3:
     needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
@@ -241,14 +224,14 @@ jobs:
         with:
           name: ci-artifacts
           path: bin
-      - name: Digest-pinned MinIO Full top-up e2e
+      - name: S3 emulator Full top-up e2e
         env:
           CI_ARTIFACTS: ${{ github.workspace }}/bin
           RIPCLONE_BIN_DIR: ${{ github.workspace }}/bin
         run: |
           set -euo pipefail
-          chmod +x bin/* scripts/e2e_full_topup_minio.sh
-          bash scripts/e2e_full_topup_minio.sh
+          chmod +x bin/* scripts/e2e_full_topup_s3.sh
+          bash scripts/e2e_full_topup_s3.sh
 
   # Real multi-provider + server-side-token path against a live Gitea.
   # Prebuilt e2e_gitea_provider from ci-build — no cargo on this runner.

@@ -188,7 +188,7 @@ async fn wait_for_files_job_settled(server: &Server, repo: &str, commit: &str) {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    panic!("MinIO Files job did not settle for {repo}@{commit}: {last}");
+    panic!("S3 Files job did not settle for {repo}@{commit}: {last}");
 }
 
 fn hanging_origin() -> (
@@ -1977,16 +1977,16 @@ async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires digest-pinned MinIO runner"]
-async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() {
+#[ignore = "requires the S3 emulator; run scripts/e2e_full_topup_s3.sh"]
+async fn s3_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() {
     let _guard = env_lock().lock().await;
     assert_eq!(
-        std::env::var("RIPCLONE_REQUIRE_MINIO").as_deref(),
+        std::env::var("RIPCLONE_REQUIRE_S3").as_deref(),
         Ok("1"),
-        "run through scripts/e2e_full_topup_minio.sh"
+        "run through scripts/e2e_full_topup_s3.sh"
     );
     init(false);
-    let controls = tempfile::tempdir().expect("MinIO resume controls");
+    let controls = tempfile::tempdir().expect("S3 resume controls");
     let interrupt = controls.path().join("interrupt");
     let audit = controls.path().join("download-audit.log");
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
@@ -1997,7 +1997,7 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
     let _probe_guard = ripclone::server::install_admission_test_probe(Arc::clone(&probe));
     let server = start_server().await;
 
-    let origin = make_origin("acme", "resume-minio");
+    let origin = make_origin("acme", "resume-s3");
     let noise = |seed: u64, len: usize| {
         const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
         let mut state = seed | 1;
@@ -2017,25 +2017,25 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
     origin.publish();
     server
         .client()
-        .add_repo("acme/resume-minio")
+        .add_repo("acme/resume-s3")
         .await
-        .expect("register and publish MinIO B");
+        .expect("register and publish S3 B");
     let ready_b = server
         .client()
         .resolve_exact_result(
-            "acme/resume-minio",
+            "acme/resume-s3",
             "main",
             ripclone::ExactResultKind::Full,
             None,
         )
         .await
-        .expect("wait for MinIO Full(B)");
+        .expect("wait for S3 Full(B)");
     assert_eq!(ready_b.commit, b);
     let (manifest, _) = server
         .client()
         .fetch_clonepack(&ready_b)
         .await
-        .expect("fetch B manifest from MinIO");
+        .expect("fetch B manifest from S3");
     let history = manifest
         .packs
         .iter()
@@ -2056,7 +2056,7 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
     let install = tokio::spawn(async move {
         clone_client
             .install_repo_with_mode_at(
-                "acme/resume-minio",
+                "acme/resume-s3",
                 "HEAD",
                 None,
                 &target_for_install,
@@ -2083,7 +2083,7 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
     let c_text = noise(227, 512 * 1024);
     // More than CDC_MAX guarantees multiple archive frames; high-entropy
     // printable bytes keep the compressed download above the 4 MiB bundle
-    // target so the Files clone has genuinely queued MinIO chunks.
+    // target so the Files clone has genuinely queued S3 chunks.
     let c_archive_text = noise(229, 17 * 1024 * 1024);
     let c = origin.commit(
         &[
@@ -2095,11 +2095,11 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
     origin.publish();
     let ready_c = server
         .client()
-        .sync_repo("acme/resume-minio", None)
+        .sync_repo("acme/resume-s3", None)
         .await
         .expect("build branch advance C");
     assert_eq!(ready_c.commit, c);
-    wait_for_files_job_settled(&server, "acme/resume-minio", &c).await;
+    wait_for_files_job_settled(&server, "acme/resume-s3", &c).await;
     let counters_before_refresh = (
         probe.tip_probes.load(Ordering::SeqCst),
         probe.exact_fetches.load(Ordering::SeqCst),
@@ -2119,8 +2119,8 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
 
     let outcome = tokio::time::timeout(Duration::from_secs(60), install)
         .await
-        .expect("resumed MinIO clone completed")
-        .expect("MinIO clone task joined")
+        .expect("resumed S3 clone completed")
+        .expect("S3 clone task joined")
         .expect("fresh exact-B URL resumed the failed artifact");
     assert_eq!(outcome.commit, b);
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
@@ -2183,7 +2183,7 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
         *per_artifact.entry(hash).or_default() += 1;
         assert!(
             request.contains("signed=true ripclone_authorization=false"),
-            "MinIO request must use the credential-free HTTP client: {request}"
+            "S3 request must use the credential-free HTTP client: {request}"
         );
     }
     assert!(
@@ -2194,7 +2194,7 @@ async fn minio_interrupted_history_pack_expires_refreshes_exact_b_and_resumes() 
         "completed artifacts must not be requested again: {per_artifact:?}"
     );
     println!(
-        "MINIO_RESUME_EVIDENCE target={b} branch_now={c} saved={saved} \
+        "S3_RESUME_EVIDENCE target={b} branch_now={c} saved={saved} \
 requests=3 exact_b_refreshes=1 no_build_or_fetch_on_refresh=true no_repeated_completed_bytes=true \
 signed_requests_without_ripclone_auth={}",
         all_requests
@@ -2204,11 +2204,11 @@ signed_requests_without_ripclone_auth={}",
 
     // Buffered Files chunks and Head packs restart only themselves from byte
     // zero after obtaining a fresh exact-C URL. Both pauses occur before the
-    // real MinIO request, so the initial signed URL genuinely expires.
+    // real S3 request, so the initial signed URL genuinely expires.
     let ready_c_files = server
         .client()
         .resolve_exact_result(
-            "acme/resume-minio",
+            "acme/resume-s3",
             "main",
             ripclone::ExactResultKind::Files,
             Some(&c),
@@ -2251,7 +2251,7 @@ signed_requests_without_ripclone_auth={}",
         let files_clone = tokio::spawn(async move {
             files_client
                 .install_repo_with_mode_at(
-                    "acme/resume-minio",
+                    "acme/resume-s3",
                     "main",
                     Some(&files_commit),
                     files_target_task,
@@ -2333,7 +2333,7 @@ signed_requests_without_ripclone_auth={}",
     let ready_c_head = server
         .client()
         .resolve_exact_result(
-            "acme/resume-minio",
+            "acme/resume-s3",
             "main",
             ripclone::ExactResultKind::Head,
             Some(&c),
@@ -2367,7 +2367,7 @@ signed_requests_without_ripclone_auth={}",
         let head_clone = tokio::spawn(async move {
             head_client
                 .install_repo_with_mode_at(
-                    "acme/resume-minio",
+                    "acme/resume-s3",
                     "main",
                     Some(&head_commit),
                     head_target_task,
@@ -2425,7 +2425,7 @@ signed_requests_without_ripclone_auth={}",
         assert!(requests.iter().all(|request| request.contains("offset=0")));
     }
     println!(
-        "MINIO_BUFFERED_REFRESH_EVIDENCE files_restart_offset=0 head_restart_offset=0 \
+        "S3_BUFFERED_REFRESH_EVIDENCE files_restart_offset=0 head_restart_offset=0 \
 files_chunks={} files_ref_refreshes=1 queued_chunks_reused=true \
 exact_c_refreshes=2 no_whole_clone_restart=true",
         archive_hashes.len()
@@ -2438,7 +2438,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
     let c_manifest = server
         .client()
         .resolve_exact_result(
-            "acme/resume-minio",
+            "acme/resume-s3",
             "main",
             ripclone::ExactResultKind::Full,
             Some(&c),
@@ -2470,7 +2470,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
     let revoked_clone = tokio::spawn(async move {
         revoked_client
             .install_repo_with_mode_at(
-                "acme/resume-minio",
+                "acme/resume-s3",
                 "main",
                 Some(&revoked_commit),
                 revoked_target_task,
@@ -2539,7 +2539,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
     );
     probe.allow_repo_reads();
     println!(
-        "MINIO_REVOCATION_EVIDENCE commit={c} active_revocation=true no_target=true cleanup=true"
+        "S3_REVOCATION_EVIDENCE commit={c} active_revocation=true no_target=true cleanup=true"
     );
 
     // Top-up race: acquire a Full(A) plan while Full(B) is pending, interrupt
@@ -2547,7 +2547,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
     // the expired URL is refreshed. Refresh must address immutable A directly;
     // ready B must neither replace it nor make the clone fail.
     let topup_server = start_server().await;
-    let topup_origin = make_origin("acme", "topup-refresh-minio");
+    let topup_origin = make_origin("acme", "topup-refresh-s3");
     let topup_a1 = noise(307, 512 * 1024);
     topup_origin.commit(&[("large.txt", topup_a1.as_str())], "A1");
     let topup_a2 = noise(311, 512 * 1024);
@@ -2557,13 +2557,13 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
     topup_origin.publish();
     topup_server
         .client()
-        .add_repo("acme/topup-refresh-minio")
+        .add_repo("acme/topup-refresh-s3")
         .await
-        .expect("publish MinIO Full(A)");
+        .expect("publish S3 Full(A)");
     let ready_topup_a = topup_server
         .client()
         .resolve_exact_result(
-            "acme/topup-refresh-minio",
+            "acme/topup-refresh-s3",
             "main",
             ripclone::ExactResultKind::Full,
             Some(&topup_a),
@@ -2595,7 +2595,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
     let topup_b_for_sync = topup_b.clone();
     let topup_sync = tokio::spawn(async move {
         let ready = topup_sync_client
-            .sync_repo("acme/topup-refresh-minio", None)
+            .sync_repo("acme/topup-refresh-s3", None)
             .await?;
         anyhow::ensure!(ready.commit == topup_b_for_sync);
         Ok::<_, anyhow::Error>(ready)
@@ -2623,7 +2623,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
     let topup_clone = tokio::spawn(async move {
         topup_client
             .install_repo_with_mode_at(
-                "acme/topup-refresh-minio",
+                "acme/topup-refresh-s3",
                 "HEAD",
                 None,
                 topup_target_task,
@@ -2655,7 +2655,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
         .expect("Full(B) completed before refresh")
         .expect("Full(B) sync task joined")
         .expect("Full(B) sync succeeded");
-    wait_for_files_job_settled(&topup_server, "acme/topup-refresh-minio", &topup_b).await;
+    wait_for_files_job_settled(&topup_server, "acme/topup-refresh-s3", &topup_b).await;
     let topup_counters_before_refresh = (
         probe.tip_probes.load(Ordering::SeqCst),
         probe.exact_fetches.load(Ordering::SeqCst),
@@ -2737,7 +2737,7 @@ exact_c_refreshes=2 no_whole_clone_restart=true",
             && topup_history_requests[2].contains(&format!("offset={topup_saved}"))
     );
     println!(
-        "MINIO_TOPUP_REFRESH_EVIDENCE target={topup_b} artifact={topup_a} \
+        "S3_TOPUP_REFRESH_EVIDENCE target={topup_b} artifact={topup_a} \
 saved={topup_saved} full_b_ready_before_refresh=true exact_a_refreshes=1 \
 exact_b_refreshes=0 no_build_or_fetch_on_refresh=true"
     );
