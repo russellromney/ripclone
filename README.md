@@ -33,8 +33,7 @@ downloading a file from object storage.
 | **Process as little as possible** | A new commit rebuilds only what the diff touched; a clone fetches only the artifacts its mode needs. |
 
 > **Status:** pre-release. There are no published binaries or packages yet;
-> build from source. The control plane is being simplified; see
-> [`docs/internal/rebuild/PLAN.md`](docs/internal/rebuild/PLAN.md).
+> build from source.
 
 ## Clone modes
 
@@ -79,7 +78,8 @@ cargo build --release
 
 ## Quick start
 
-Start a server. Server and CLI authenticate with the same token:
+Start a server. Server and CLI authenticate with the same token, and the
+server refuses to start without one:
 
 ```bash
 export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
@@ -102,7 +102,9 @@ ripclone clone oven-sh/bun bun
 
 `add` returns once the build is accepted; `--wait` waits for it to finish.
 `ripclone list` and `ripclone rm owner/repo` manage registrations. Removing a
-registration keeps the published artifacts.
+registration keeps the published artifacts. Without `RIPCLONE_SERVER` (or
+`--server`, or `server` in the config file) the CLI talks to
+`https://ripclone.com`.
 
 ## Keeping repos fresh
 
@@ -119,33 +121,45 @@ fastest to slowest:
   (`RIPCLONE_POLL_INTERVAL_SECS`; `0` turns it off).
 
 `ripclone sync owner/repo` triggers a build by hand. What a clone does while
-a new commit is still building: **[Freshness](docs/FRESHNESS.md)**.
+a new commit is still building: **[Freshness](docs/FRESHNESS.md)**. The HTTP
+API behind all of these: **[API](docs/API.md)**.
 
 ## CLI
 
 ```bash
-ripclone clone owner/repo [dir] [--branch B] [--depth 1] [--mode files]
+ripclone clone owner/repo [dir] [--branch B] [--depth 0|1] [--mode editable|files]
 ripclone clone owner/repo --at <ref>        # a full commit SHA, branch, or tag
 ripclone clone owner/repo --wait            # wait for the exact full build, no top-up
 ripclone clone gitlab:group/project         # another provider
 ripclone clone owner/repo --bench           # print a per-phase timing report
-ripclone sync owner/repo [--wait]
+ripclone clone owner/repo --no-metrics      # never send the metrics report
+ripclone sync owner/repo                    # build the default branch tip
+ripclone sync owner/repo --at <ref> [--wait]
 ripclone add owner/repo [--wait]
 ripclone list
 ripclone rm owner/repo
+ripclone provider add|list|rm|test          # provider instances in this CLI's config
 ripclone version                            # CLI and server versions, with a compatibility check
+ripclone update                             # check GitHub for a newer release
+ripclone login | logout                     # sign in to https://ripclone.com
 ```
 
 `dir` defaults to the repository name. As with `git clone`, it may be an
-existing empty directory; a non-empty one is refused.
+existing empty directory; a non-empty one is refused. `--depth` takes `0`
+(full history, the default) or `1`. `sync` builds failed outputs of the commit
+again; with `--at` it also waits. `--wait` on `sync`, `add`, or `clone` polls
+at most 40 times, about 70 seconds; run the command again to keep waiting.
 
-The server URL comes from `--server` (a global flag, before the subcommand) or
-`RIPCLONE_SERVER`.
+Global flags go before the subcommand: `--server` (or `RIPCLONE_SERVER`),
+`--provider` (default `github`), and `--token` (an upstream token for
+`--verify-upstream`, never sent to the ripclone server). All settings:
+**[Configuration](docs/CONFIG.md)**.
 
 **Agents and CI.** `RIPCLONE_AGENT=1` makes depth 1 the default and disables
 interactive prompts. Explicit `--depth` still wins. Use `--mode files` when the
-agent never runs git. Server errors are JSON `{ "error", "code" }`. The CLI's
-exit code says what kind of failure it was:
+agent never runs git. Server errors are JSON `{ "error", "code" }`
+([API](docs/API.md#errors)). The CLI's exit code says what kind of failure it
+was:
 
 | Exit | Meaning | Action |
 |---|---|---|
@@ -160,7 +174,8 @@ exit code says what kind of failure it was:
 
 **Private repos.** The server needs read access to the upstream: a token on the
 provider instance ([Providers](docs/PROVIDERS.md)) or a GitHub App
-([Configuration](docs/CONFIG.md)).
+([Configuration](docs/CONFIG.md#github-app-credentials)). A full clone that
+tops up fetches from the upstream with your own git credentials.
 
 **Checking the server.** `--verify-upstream` (`auto` by default) cross-checks an
 editable clone's commit against the git host when it can. A Files clone has no
@@ -183,16 +198,19 @@ change after publication. With S3-compatible storage, clients download
 directly through signed URLs. Your git host stays the source of truth for
 repos, permissions, and writes.
 
-Ops endpoints: `GET /healthz`, `GET /readyz` (503 if storage or the control
-database is down), and `GET /metrics` (Prometheus).
+Ops endpoints, all without the token: `GET /healthz`, `GET /readyz` (503 if
+storage or the control database is down), `GET /v1/version`, and
+`GET /metrics` (Prometheus).
 
 ## Telemetry
 
-After a successful clone the CLI sends one fire-and-forget metrics POST to the
-configured server: clone id, repo, commit, mode, whether it waited for a build,
-wall time, bytes, and client OS/arch/version. It never affects the clone's
-result. `--no-metrics` or `RIPCLONE_NO_METRICS=1` turns it off. Self-hosted
-servers accept and drop it.
+The CLI sends a metrics report only when the server asks for one: the build
+answer carries an `x-ripclone-clone-id` header. The server in this repo never
+sends it, so a self-hosted server gets no reports. When asked, the CLI sends
+one fire-and-forget POST to that server after a successful clone: clone id,
+repo, commit, mode, whether it waited for a build, wall time,
+bytes, and client OS/arch/version. It never affects the clone's result.
+`--no-metrics` or `RIPCLONE_NO_METRICS=1` turns it off.
 
 ## License
 

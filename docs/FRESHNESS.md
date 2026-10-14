@@ -53,3 +53,7 @@ and double up to 2 s (`RIPCLONE_POLL_MS` sets the cap). After 40 polls,
 about 70 s at the default cap, it stops with an error that names the commit
 and says the result is still pending; run the same clone with `--at <commit>`
 to keep waiting for that commit.
+
+A result that failed for good fails the clone at once. The error names the
+commit and the command that builds it again: `ripclone sync <repo> --at
+<commit>`.

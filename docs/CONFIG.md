@@ -1,66 +1,105 @@
 # Configuration
 
-Settings come from flags, environment variables, and `config.toml`
-(`~/.config/ripclone/config.toml`, or the path in `RIPCLONE_CONFIG`). Flags win
-over env, env wins over the file.
+Settings come from flags, environment variables, and TOML config files. A
+flag beats the environment, and the environment beats a file.
 
-This file lists the settings that are staying. Settings for features being
-removed (see [`internal/rebuild/PLAN.md`](internal/rebuild/PLAN.md)) are not
-listed. The server and the CLI warn once at startup for each removed variable
-that is set; a removed control setting (`[queue]`, `[metadata]`, dispatch)
-stops the server instead.
+Config files: `~/.config/ripclone/config.toml` (or the path in
+`RIPCLONE_CONFIG`), and the first `ripclone.toml` found walking up from the
+current directory. Keys in `ripclone.toml` beat the same keys in
+`config.toml`. A file that does not parse stops the command.
+
+## Server token
+
+The server and the CLI share one token. The server refuses to start without
+one.
+
+| Variable | Meaning |
+|---|---|
+| `RIPCLONE_SERVER_TOKEN` | The shared token. Server and CLI hash it with SHA-256. |
+| `RIPCLONE_SERVER_TOKEN_HASH` | The token's SHA-256 in hex, used instead of the token. Wins over `RIPCLONE_SERVER_TOKEN`. |
+
+The CLI sends `Authorization: Ripclone <hash>`, and the server compares that
+value with its stored hash. So the hash is itself a bearer credential: anyone
+who has it can use the server. Keep `RIPCLONE_SERVER_TOKEN_HASH` as secret as
+the token. Hashing gives no protection if the hash leaks.
 
 ## Client
 
-| Variable | Meaning |
+| Setting | Meaning |
 |---|---|
-| `RIPCLONE_SERVER` | Server URL. Same as `--server`. |
-| `RIPCLONE_SERVER_TOKEN` | Shared server token. The client sends `Authorization: Ripclone <sha256(token)>`. |
-| `RIPCLONE_SERVER_TOKEN_HASH` | The token's SHA-256 hash, for secret stores that hold only the hash. |
-| `RIPCLONE_MODE` | Default `--mode`: `editable` or `files`. |
-| `RIPCLONE_AGENT` | Truthy: depth 1 by default and no interactive prompts. Config key `agent = true`. |
-| `RIPCLONE_VERIFY_UPSTREAM` | `auto` (default), `always`, or `never`. |
+| `--server`, `RIPCLONE_SERVER`, config `server` | Server URL. Default `https://ripclone.com`. |
+| `--provider`, config `default_provider` | Provider instance for a repo without a `provider:` prefix. Default `github`. |
+| `--token`, `RIPCLONE_UPSTREAM_TOKEN` | Upstream credential for `--verify-upstream`. Beats the provider's configured token. Never sent to the ripclone server. |
+| `RIPCLONE_MODE`, config `[clone] mode` | Default `--mode`: `editable` (default) or `files`. |
+| config `[clone] depth` | Default `--depth`: `0` (full history) or `1`. |
+| `RIPCLONE_AGENT`, config `agent` | Truthy (`1`, `true`, `yes`, `on`): depth 1 by default and no interactive prompts. An explicit or configured depth still wins. |
+| `--verify-upstream`, `RIPCLONE_VERIFY_UPSTREAM` | `auto` (default), `always`, or `never`. |
 | `RIPCLONE_CACHE_DIR` | Turn on the local artifact cache at this path. Off by default. |
-| `RIPCLONE_NO_CACHE` | Force the cache off. |
-| `RIPCLONE_NO_METRICS` | Skip the post-clone metrics POST. |
-| `RIPCLONE_POLL_MS` | Longest wait between polls while an output the CLI needs is pending, default 2000. Polling starts at 100 ms and doubles up to this cap. Tests set it low. |
-| `RIPCLONE_FETCH_MAX_ATTEMPTS`, `RIPCLONE_FETCH_BACKOFF_MS` | Download retry budget (defaults 3 and 100 ms). |
-| `RIPCLONE_FSYNC` | Flush the tree, index, and rename before reporting success. Off by default, like `git checkout`. |
-| `RIPCLONE_BENCH` | Same as `--bench`. On the server, emits structured build timing logs. |
+| `RIPCLONE_NO_CACHE` | Set: no cache, even with `RIPCLONE_CACHE_DIR`. |
+| `--no-metrics`, `RIPCLONE_NO_METRICS` | Never send the post-clone metrics report. |
+| `RIPCLONE_POLL_MS` | Longest wait between polls while an output the CLI needs is pending, default 2000. Polls start at 100 ms and double up to this cap. A command stops after 40 polls. |
+| `RIPCLONE_FETCH_MAX_ATTEMPTS`, `RIPCLONE_FETCH_BACKOFF_MS` | Attempts per artifact download and the first retry delay, defaults 3 and 100 ms. |
+| `RIPCLONE_FSYNC` | `1` or `true`: flush the tree, index, and rename before reporting success. Off by default, like `git checkout`. |
+| `RIPCLONE_IO_URING` | Linux worktree writer. Unset or `auto`: io_uring when the kernel has it, else POSIX. `1`, `true`, `on`, `yes`: io_uring or fail. `0`, `false`, `off`, `no`: POSIX. Other platforms use POSIX unless forced. |
+| `--bench`, `RIPCLONE_BENCH` | Print a per-phase timing report after a clone. |
+| `RIPCLONE_NO_BROWSER` | Set: `ripclone login` does not open a browser. |
+| `RIPCLONE_ORIGIN_BASE` | Top up and verify repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. |
+| `RIPCLONE_PROVIDERS`, config `[providers.<id>]` | Provider instances. See [Providers](PROVIDERS.md). |
+| `RUST_LOG` | Tracing filter. |
+
+Without `RIPCLONE_SERVER_TOKEN` or `RIPCLONE_SERVER_TOKEN_HASH`, the CLI uses
+the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 
 ## Server
 
-Flags: `--cas-dir`, `--repo-root`, `--control-db`, `--host` (default
-`0.0.0.0`), `--port` (default `8000`).
+| Flag | Meaning |
+|---|---|
+| `--cas-dir` | Local artifact store, default `~/.local/share/ripclone/cache`. With local storage it is the durable store. |
+| `--repo-root` | Git mirrors, default `~/.local/share/ripclone/repos`. |
+| `--control-db` | Control database. See `RIPCLONE_CONTROL_DB_PATH`. |
+| `--host`, `--port` | Listen address, default `0.0.0.0` and `8000`. Port `0` picks a free port; the log names the bound address. |
 
 | Variable | Meaning |
 |---|---|
-| `RIPCLONE_SERVER_TOKEN` / `RIPCLONE_SERVER_TOKEN_HASH` | The token clients must present. |
-| `RUST_LOG` | Tracing filter, normally `info`. |
-| `RIPCLONE_CONTROL_DB_PATH` | SQLite control database path. Config: `[control] path`. |
-| `RIPCLONE_PROVIDERS` | JSON provider registry. See [Providers](PROVIDERS.md). |
-| `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`, `RIPCLONE_S3_PREFIX` | S3-compatible artifact storage. Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. See [Server state and storage](BACKENDS.md). |
-| `RIPCLONE_S3_REQUEST_TIMEOUT_SECS`, `RIPCLONE_S3_MAX_ATTEMPTS`, `RIPCLONE_S3_MAX_RETRY_DELAY_MS` | S3 client timeouts and retries. |
-| `RIPCLONE_SIGNED_URL_TTL_SECS` | Signed artifact URL lifetime, default 1200 seconds. |
-| `RIPCLONE_RETENTION_INTERVAL_SECS`, `RIPCLONE_RETENTION_MAX_AGE_DAYS`, `RIPCLONE_RETENTION_MAX_GB` | Trim the local build cache when S3 is the durable store, defaults 300 seconds, 7 days and 100 GB; `0` turns each off. Never deletes S3 objects or published results. |
+| `RIPCLONE_SERVER_TOKEN`, `RIPCLONE_SERVER_TOKEN_HASH` | The token clients must present. See [Server token](#server-token). |
+| `RUST_LOG` | Tracing filter. Default `info`. |
+| `RIPCLONE_CONTROL_DB_PATH`, config `[control] path` | SQLite control database. Default `control.db` in the parent of `--repo-root`. |
+| `RIPCLONE_PROVIDERS`, config `[providers.<id>]` | Provider instances and their tokens. See [Providers](PROVIDERS.md). |
+| `RIPCLONE_S3_ENDPOINT` (or `AWS_ENDPOINT_URL_S3`), config `[storage] endpoint` | S3-compatible endpoint. Setting it turns S3 storage on. See [Server state and storage](BACKENDS.md). |
+| `RIPCLONE_S3_REGION` (or `AWS_REGION`), config `[storage] region` | Region, default `us-east-1`. |
+| `RIPCLONE_S3_BUCKET` (or `BUCKET_NAME`), config `[storage] bucket` | Bucket. Required with S3. |
+| `RIPCLONE_S3_PREFIX`, config `[storage] prefix` | Key prefix. |
+| config `[storage] backend` | `local` or `s3`. `local` ignores the S3 settings; `s3` requires an endpoint. Unset: S3 when an endpoint is set. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | S3 credentials. Environment only. |
+| `RIPCLONE_S3_REQUEST_TIMEOUT_SECS` | Timeout per S3 request, default 30. |
+| `RIPCLONE_S3_MAX_ATTEMPTS` | Attempts per S3 request, default 5. |
+| `RIPCLONE_S3_MAX_RETRY_DELAY_MS` | Longest wait between S3 retries, default 2000. |
+| `RIPCLONE_SIGNED_URL_TTL_SECS` | Lifetime of signed artifact URLs, default 1200. |
+| `RIPCLONE_RETENTION_INTERVAL_SECS`, `RIPCLONE_RETENTION_MAX_AGE_DAYS`, `RIPCLONE_RETENTION_MAX_GB` | Trim the local artifact cache when S3 is the durable store: how often, and the age and size limits. Defaults 300 seconds, 7 days, 100 GB; `0` turns each off. With local storage, retention is off. It never deletes S3 objects. |
 | `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>` | Webhook secret per provider instance. See [Webhooks](WEBHOOKS.md). |
-| `RIPCLONE_WEBHOOK_ALLOWLIST` | Optional comma-separated repos that webhooks may build. |
-| `RIPCLONE_POLL_INTERVAL_SECS` | Fallback polling interval, default `300`; `0` turns it off. |
+| `RIPCLONE_WEBHOOK_ALLOWLIST` | Comma-separated repos that webhooks may build. Unset: every added repo. |
+| `RIPCLONE_POLL_INTERVAL_SECS` | How often the server checks added repos for new commits, default 300; `0` turns polling off. |
 | `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` | Timeout for each upstream `ls-remote`, default 30; `0` means the default. |
-| `RIPCLONE_RATE_LIMIT_PER_SEC`, `RIPCLONE_RATE_LIMIT_BURST` | Rate limit for public endpoints. |
-| `RIPCLONE_TRUST_FORWARDED_FOR` | Use `X-Forwarded-For` for rate limiting behind a trusted proxy. |
-| `RIPCLONE_LSM_MAX_LEVELS` | Maximum history levels before compaction. |
+| `RIPCLONE_RATE_LIMIT_BURST`, `RIPCLONE_RATE_LIMIT_PER_SEC` | Per-IP rate limit: burst size and refill per second, defaults 60 and 10. See [API](API.md#authentication). |
+| `RIPCLONE_TRUST_FORWARDED_FOR` | `1` or `true`: rate-limit by the last `X-Forwarded-For` address. Only behind one trusted proxy. |
 | `RIPCLONE_HEAD_SLOTS` | Builds that run Head at once, default 2. At least 1. |
 | `RIPCLONE_BACKGROUND_SLOTS` | Builds that run Full and Files at once, default 1. `0` pauses Full and Files; Head still builds. |
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
-| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Full and Files) before the output fails, default 5. |
-| `RIPCLONE_HEAD_REBASE_BYTES` | When a Head delta reaches this size, the Full build compacts Head packs into a new base for later Heads. Expert setting. |
+| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Full and Files) before the output fails, default 5. At least 1. |
+| `RIPCLONE_LSM_MAX_LEVELS` | Most history levels a Full keeps before merging the smallest neighbors, default 16. |
+| `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head packs past their base reach this size, its Full build compacts them into a new base for later Heads. Default 128 MiB. |
+| `RIPCLONE_ORIGIN_BASE` | Fetch repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. For mirrors and tests. |
+| `RIPCLONE_BENCH` | Log a JSON timing report for each build. |
 
-Every numeric setting above is a non-negative integer (the rate per second may
-be a decimal). A value that is set but does not parse, including an empty one,
-stops the server at startup with an error that names the variable; it never
-falls back to the default. The S3 numbers are checked when S3 storage is
+Every numeric server setting is a non-negative integer, except
+`RIPCLONE_RATE_LIMIT_PER_SEC`, which may be a decimal. A value that is set but
+does not parse, including an empty one, stops the server at startup with an
+error that names the variable. The S3 numbers are checked when S3 storage is
 configured.
+
+The server reads `[storage]` and `[control]` from `config.toml`, and
+`[providers]` from both config files. Entries in `[providers]` beat
+`RIPCLONE_PROVIDERS` entries with the same id.
 
 ### GitHub App credentials
 
@@ -73,3 +112,25 @@ for GitHub repos:
 | `RIPCLONE_GITHUB_APP_INSTALLATION_ID` | Installation id. Required with the app id. |
 | `RIPCLONE_GITHUB_APP_PRIVATE_KEY` or `RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH` | The app's PEM private key, inline or as a file. |
 | `RIPCLONE_GITHUB_API_BASE` | GitHub API base URL for GitHub Enterprise, `https://` only. Default `https://api.github.com`. |
+
+## Removed settings
+
+These stop the server at startup: the `[metadata]` and `[queue]` config
+sections, and the variables `RIPCLONE_METADATA`, `RIPCLONE_METADATA_DB_URL`,
+`RIPCLONE_METADATA_DB_TOKEN`, `RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`,
+`RIPCLONE_QUEUE_DB_TOKEN`, `RIPCLONE_DISPATCH`, `RIPCLONE_DISPATCH_CMD`,
+`RIPCLONE_DISPATCH_CMD_ARGS`, `RIPCLONE_DISPATCH_INTERVAL_SECS`,
+`RIPCLONE_DISPATCH_MAX_WORKERS`, `RIPCLONE_DISPATCH_TOKEN`,
+`RIPCLONE_DISPATCH_URL`, `RIPCLONE_HEARTBEAT_URL`, `RIPCLONE_RECHECK_MAX` and
+`RIPCLONE_REF_CACHE_TTL_SECS`.
+
+These have no effect, and the server and the CLI warn once at startup for each
+one that is set: any other `RIPCLONE_METADATA_*`, `RIPCLONE_QUEUE_*`,
+`RIPCLONE_DISPATCH_*`, `RIPCLONE_TEST_*`, `RIPCLONE_JWT_*`, `RIPCLONE_TURSO_*`
+or `RIPCLONE_WORKER_HEARTBEAT*` variable, and `RIPCLONE_TESTING`,
+`RIPCLONE_JOB_TOKEN_SECRET`, `RIPCLONE_OIDC_AUDIENCE`,
+`RIPCLONE_TRUST_GATEWAY`, `RIPCLONE_LSM`, `RIPCLONE_SIZE_CLASSES`,
+`RIPCLONE_MAX_SIZE_CLASS`, `RIPCLONE_MAX_JOBS`, `RIPCLONE_IDLE_EXIT_SECS`,
+`RIPCLONE_BUILD_CONCURRENCY`, `RIPCLONE_ARCHIVE_BOUNDED`,
+`RIPCLONE_NO_OVERLAY`, `RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS`,
+`RIPCLONE_STAGING_DIR` and `RIPCLONE_TEMP`. The CLI only warns, for both lists.

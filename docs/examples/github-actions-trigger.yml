@@ -8,10 +8,14 @@
 #
 # The API authenticates with the SHA-256 hash of that token, so the step below
 # hashes it before sending. If your secret store already holds the hash, drop the
-# hashing line and send the secret directly.
+# hashing line and send the secret directly. The hash works as a password,
+# so keep it secret like the token.
 #
-# For private repos, configure the `github` provider with a token that can read
-# the consumer repo (see docs/PROVIDERS.md).
+# Add the repo once first (`ripclone add owner/repo`); a build request for a
+# repo that was not added gets 404 repo_not_added.
+#
+# For private repos, give the server read access: a GitHub App or a token on
+# the `github` provider (see docs/CONFIG.md and docs/PROVIDERS.md).
 
 name: ripclone cache
 on:
