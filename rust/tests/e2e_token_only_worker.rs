@@ -349,7 +349,7 @@ async fn token_only_worker_builds_and_clones_without_control_credentials() {
         );
         artifact_storage
             .verify_durable_copy(durable_hash)
-            .expect("API worker cleanup retained the durable MinIO object");
+            .expect("API worker cleanup retained the durable S3 object");
     }
     let client = ripclone::client::Client::new_with_token(server_url.clone(), Some(token_hash()));
     let admission = tokio::time::timeout(
