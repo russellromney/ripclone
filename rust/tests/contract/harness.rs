@@ -701,11 +701,6 @@ impl Server {
         self.spawn();
     }
 
-    /// The running server's process id.
-    pub fn pid(&self) -> u32 {
-        self.child.as_ref().expect("server is running").id()
-    }
-
     pub fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();

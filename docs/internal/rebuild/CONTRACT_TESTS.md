@@ -69,7 +69,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | #188 |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | #188 |
 
-### C. Outputs are independent and immutable (6)
+### C. Outputs are independent and immutable (5)
 
 | # | Test | Added |
 |---|---|---|
@@ -78,7 +78,13 @@ after the row (`a1_...`, `s3_c2_...`).
 | C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | #203 (S3 job) |
 | C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | #202 |
 | C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). Over the three builds, every server log line is the server's own: no git output. | #202 |
-| C6 | Linux only: SIGKILL the server while the origin holds its fetch: the server's `git` children exit too. | #209 |
+
+A SIGKILLed server's `git` children run until their command ends, on every
+OS. #209 killed them on Linux with a parent-death signal (row C6), but
+setting it needs a `pre_exec` hook, and any `pre_exec` makes std `fork()` the
+whole server for every git spawn. C6 is gone. The unit test
+`git::tests::server_git_spawns_do_not_fork` keeps server spawns on
+`posix_spawn`.
 
 ### D. Clone pins B (6)
 
@@ -164,7 +170,7 @@ Ripclone token reaches the origin.
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | #208 |
 | I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | #209 |
 
-Total: 66 tests. Several are table-driven.
+Total: 65 tests. Several are table-driven.
 
 ## What it replaced
 

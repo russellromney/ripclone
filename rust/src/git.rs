@@ -12,40 +12,18 @@ const SKIP_WORKTREE_FLAG: gix::index::entry::Flags = gix::index::entry::Flags::S
 
 /// `git` for a child of this process. Every git the server runs starts here.
 ///
-/// On Linux the child gets SIGKILL when the thread that spawned it exits, so
-/// a server killed with SIGKILL leaves no git fetch or pack-objects running
-/// against its mirrors. Every caller waits for the child on the thread that
-/// spawned it (or, for `tokio::process`, spawns it from a runtime worker,
-/// which lives as long as the process). Git's own helpers (`git-remote-http`,
-/// `index-pack`) are not covered; they exit when their parent git's pipes
-/// close.
+/// The command must stay on std's `posix_spawn` path: no `pre_exec`, `uid`,
+/// `gid`, `groups`, `setsid`, `env_clear`, or `PATH` change. Any of those
+/// makes std `fork()` the whole server, which copies its page tables on every
+/// spawn and turns a Head build's hundreds of `pack-objects` into seconds of
+/// overhead at a few GB of RSS. `process_group` and `current_dir` keep
+/// `posix_spawn` (glibc 2.29+, musl, macOS).
+/// `tests::server_git_spawns_do_not_fork` checks this.
 ///
-/// macOS has no parent-death signal. There a killed server's git children
-/// run until their current command ends.
+/// A server killed with SIGKILL leaves its git children running until their
+/// current command ends, on every OS.
 pub fn command() -> Command {
-    #[allow(unused_mut)]
-    let mut command = Command::new("git");
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
-        // SAFETY: `pre_exec` runs after fork and before exec. The closure only
-        // calls the async-signal-safe `prctl` and `getppid` and builds an OS
-        // error from errno; it captures only a copied pid.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // The parent died before the signal was armed.
-                if libc::getppid() != parent {
-                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-                }
-                Ok(())
-            });
-        }
-    }
-    command
+    Command::new("git")
 }
 
 /// Fail before starting work that requires the system Git executable.
@@ -1306,20 +1284,9 @@ async fn ls_remote_tip_async_with(
         .args(&candidates)
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr));
+    // Its own process group, so a timeout can kill git's HTTP helper too.
     #[cfg(unix)]
-    // SAFETY: `pre_exec` runs after fork and before exec. The closure only
-    // calls async-signal-safe `setpgid` and constructs an OS error from
-    // thread-local errno on failure; it captures no borrowed state.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.as_std_mut().pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
+    command.process_group(0);
     let child = command.spawn().context("spawn git ls-remote")?;
     let mut managed = ManagedLsRemoteChild::new(child);
     let status = match tokio::time::timeout(timeout, managed.child_mut().wait()).await {
@@ -1925,6 +1892,90 @@ mod tests {
         // Idempotent: a second call on an already-configured mirror is fine.
         disable_auto_gc(repo).unwrap();
         assert_eq!(read("gc.auto"), "0");
+    }
+
+    thread_local! {
+        static FORKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    extern "C" fn count_fork() {
+        FORKS.with(|forks| forks.set(forks.get() + 1));
+    }
+
+    /// `fork()` calls made by this thread. `fork()` runs `pthread_atfork`
+    /// handlers on glibc, musl and macOS; `posix_spawn` does not.
+    fn forks_on_this_thread() -> u32 {
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| {
+            // SAFETY: the handler only bumps a const-initialized thread local
+            // in the forking parent.
+            assert_eq!(
+                unsafe { libc::pthread_atfork(Some(count_fork), None, None) },
+                0
+            );
+        });
+        FORKS.with(std::cell::Cell::get)
+    }
+
+    /// Server git spawns use `posix_spawn`, never `fork()`. A `fork()` copies
+    /// the server's page tables: at 1 GB of RSS a spawn cost 23 ms instead
+    /// of 0.5 ms, and a Linux Head build spawns hundreds of `pack-objects`.
+    /// This counts forks, so it holds at any RSS and on any machine.
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_git_spawns_do_not_fork() {
+        use std::os::unix::process::CommandExt;
+        let base = tempfile::tempdir().unwrap();
+        let forks = forks_on_this_thread();
+
+        // The control: a `pre_exec` hook does fork, and the counter sees it.
+        let mut forked = Command::new("git");
+        // SAFETY: the hook does nothing.
+        unsafe { forked.pre_exec(|| Ok(())) };
+        assert!(forked.arg("--version").output().unwrap().status.success());
+        assert_eq!(
+            forks_on_this_thread(),
+            forks + 1,
+            "the fork counter is broken"
+        );
+
+        // `git::command()` with the options server callers add.
+        let output = command()
+            .arg("--version")
+            .current_dir(base.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let repo_dir = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        let repo = crate::test_fixture::init_bare(&repo_dir);
+        let tip = crate::test_fixture::commit(&repo, &[("README.md", b"one")]);
+        let packed = pack_objects_to_prefix(
+            &repo_dir,
+            std::slice::from_ref(&tip),
+            base.path().join("p/pack"),
+        );
+        assert!(packed.is_ok(), "{packed:?}");
+
+        // The API path's ls-remote, in its own process group.
+        let registry = crate::provider::ProviderRegistry::new();
+        let found = ls_remote_tip_async_with(
+            registry.get("github").unwrap(),
+            &crate::provider::RepoId::github("acme/widget"),
+            "HEAD",
+            None,
+            Some(base.path().to_str().unwrap()),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.map(|t| t.commit), Some(tip));
+
+        assert_eq!(
+            forks_on_this_thread(),
+            forks + 1,
+            "a server git spawn used fork(); see git::command()"
+        );
     }
 
     /// ls-remote reads the upstream tip with no object transfer. A short name
