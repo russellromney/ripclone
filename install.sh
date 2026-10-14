@@ -63,7 +63,7 @@ mkdir -p "$BIN_DIR"
 # The tarball contains a top-level dir; install the binaries from it.
 src="$(find "$tmp" -type f -name ripclone -perm -u+x | head -n1)"
 src_dir="$(dirname "$src")"
-for b in ripclone ripclone-server ripclone-worker; do
+for b in ripclone ripclone-server; do
   if [ ! -f "$src_dir/$b" ]; then
     echo "ripclone: release archive is missing $b" >&2
     exit 1

@@ -28,7 +28,7 @@ pick_test_exe() {
     | tail -n1
 }
 
-BINS=(ripclone ripclone-server ripclone-worker)
+BINS=(ripclone ripclone-server)
 
 TESTS=(
   contract

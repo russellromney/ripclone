@@ -1897,7 +1897,7 @@ fn kill_ls_remote_process_group(child: &mut std::process::Child) -> std::io::Res
 /// Cross-process advisory lock guarding a repo's bare mirror directory.
 ///
 /// The in-process per-repo lock only serializes syncs within one process. When
-/// several `ripclone-worker` processes (or a server + worker) share a repo root,
+/// several processes share a repo root,
 /// two of them can try to `git clone --mirror` / `git fetch` into the same bare
 /// dir at once — git's own lock files don't cover the initial clone, so the
 /// clones collide ("could not lock config file ...: File exists"). This flock

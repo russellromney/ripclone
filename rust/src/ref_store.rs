@@ -11,10 +11,6 @@ pub struct AddedRepo {
     pub added_at: u64,
     pub history_enabled: bool,
     pub source: AddedRepoSource,
-    /// Upstream size used to classify the first build. `None` selects the
-    /// largest configured class.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repo_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

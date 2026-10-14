@@ -248,7 +248,6 @@ jobs:
       - name: Smoke-test the binaries run in the image
         run: |
           docker run --rm ripclone-server:ci ripclone-server --help
-          docker run --rm ripclone-server:ci ripclone-worker --help
 
   # The static-musl release target. ONLY job that compiles under
   # `target_env = "musl"` (mimalloc global allocator + hand-written statx).

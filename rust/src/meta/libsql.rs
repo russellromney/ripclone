@@ -1,4 +1,4 @@
-//! Exact-result metadata over the server's Turso embedded-replica handle.
+//! Exact-result metadata over the server's control database handle.
 
 use super::ResultRow;
 use anyhow::{Context, Result};
