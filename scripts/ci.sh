@@ -21,15 +21,13 @@ lint() {
     cargo clippy --all-targets --locked -- -D warnings )
 }
 
-# Unit tests run one at a time: io_uring queue allocation must stay under the
-# runner's locked-memory limit. The contract suite runs in parallel: each test
-# owns its server, port, and temp dir, and races only show up under
-# concurrent load.
+# Unit tests and the contract suite run in parallel. Each contract test owns
+# its server, port, and temp dir, and races only show up under concurrent load.
 #
 # This job self-compiles (ci profile + sccache/rust-cache). Fan-out jobs
 # (gitea/e2e/s3/…) use prebuilt binaries from ci-build instead.
 run_tests() {
-  ( cd "$ROOT/rust" && cargo test --profile ci --locked --lib --bins -- --test-threads=1 )
+  ( cd "$ROOT/rust" && cargo test --profile ci --locked --lib --bins )
   s3_unit_test
   ( cd "$ROOT/rust" && cargo test --profile ci --locked --test contract )
 }

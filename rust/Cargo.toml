@@ -70,9 +70,6 @@ rpassword = "7"
 toml = "1.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
-
 # mimalloc is the global allocator ONLY on the static-musl Linux release builds
 # (see the #[global_allocator] in src/lib.rs) to offset musl's slower default
 # allocator. Target-gated so glibc/macOS builds neither pull nor compile it.
