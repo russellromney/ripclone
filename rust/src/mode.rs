@@ -26,18 +26,6 @@ impl CloneMode {
     pub fn needs_prebuilt_blob_pack(self) -> bool {
         matches!(self, CloneMode::Editable)
     }
-
-    /// True for modes that materialize the working tree from the zstd files
-    /// artifact (archive chunks).
-    pub fn needs_archive(self) -> bool {
-        matches!(self, CloneMode::Files)
-    }
-
-    /// True for modes that materialize the working tree by reading blobs out of
-    /// the installed depth pack (the single-download editable path).
-    pub fn needs_pack_worktree(self) -> bool {
-        matches!(self, CloneMode::Editable)
-    }
 }
 
 impl FromStr for CloneMode {
@@ -82,19 +70,6 @@ fn resolve_mode_from(
             .map_err(|error| anyhow::anyhow!("invalid clone.mode value {value:?}: {error}")),
         None => Ok(CloneMode::default()),
     }
-}
-
-/// Map a requested clone depth to the clonepack variant the server should
-/// return. depth == 1 → the shallow (HEAD-only) clonepack; depth == 0 (full
-/// history) → the full clonepack.
-///
-/// Only depths 0 and 1 are meaningful: arbitrary depth-N shallow clones are not
-/// implemented, and the CLI rejects `N > 1`
-/// with a clear error rather than silently serving full history that git would
-/// record as a complete, non-shallow clone (P1). This mapping still treats any
-/// other value as full as a defensive default.
-pub fn clonepack_kind_for_depth(depth: usize) -> &'static str {
-    if depth == 1 { "shallow" } else { "full" }
 }
 
 #[cfg(test)]
