@@ -161,7 +161,7 @@ jobs:
           chmod +x bin/*
           bash scripts/ci.sh e2e
 
-  # Contract rows F7 and H2 against S3 storage. Each test starts its own
+  # Contract rows that need S3 storage (`s3_` tests). Each test starts its own
   # versitygw emulator (scripts/s3_emulator.sh), so they are ignored in the
   # default run and selected here.
   s3:
@@ -176,15 +176,18 @@ jobs:
         with:
           name: ci-artifacts
           path: bin
-      - name: Contract S3 rows (F7, H2)
+      - name: Contract S3 rows
         env:
           RIPCLONE_BIN_DIR: ${{ github.workspace }}/bin
         run: |
           set -euo pipefail
           chmod +x bin/*
+          # A filter that matched nothing would also pass, so require every
+          # listed s3_ row to have run.
+          want="$(bin/contract --ignored --list s3_ | grep -c ': test$')"
+          test "$want" -gt 0
           bin/contract --ignored s3_ 2>&1 | tee "$RUNNER_TEMP/s3.log"
-          # A filter that matched nothing would also pass.
-          grep -Eq "test result: ok\. 2 passed; 0 failed" "$RUNNER_TEMP/s3.log"
+          grep -Eq "test result: ok\. $want passed; 0 failed" "$RUNNER_TEMP/s3.log"
 
   # Contract row: a private repo on a live Gitea, read with the server's token.
   # Prebuilt contract binary from ci-build — no cargo on this runner.

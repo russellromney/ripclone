@@ -21,7 +21,7 @@ listed.
 | `RIPCLONE_CACHE_DIR` | Turn on the local artifact cache at this path. Off by default. |
 | `RIPCLONE_NO_CACHE` | Force the cache off. |
 | `RIPCLONE_NO_METRICS` | Skip the post-clone metrics POST. |
-| `RIPCLONE_POLL_MS` | Longest wait between polls while a build is pending or a ref is resolving, default 2000. Polling starts at 100 ms and doubles up to this cap. Tests set it low. |
+| `RIPCLONE_POLL_MS` | Longest wait between polls while an output the CLI needs is pending, default 2000. Polling starts at 100 ms and doubles up to this cap. Tests set it low. |
 | `RIPCLONE_FETCH_MAX_ATTEMPTS`, `RIPCLONE_FETCH_BACKOFF_MS` | Download retry budget (defaults 3 and 100 ms). |
 | `RIPCLONE_FSYNC` | Flush the tree, index, and rename before reporting success. Off by default, like `git checkout`. |
 | `RIPCLONE_BENCH` | Same as `--bench`. On the server, emits structured build timing logs. |

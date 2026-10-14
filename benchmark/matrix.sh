@@ -109,7 +109,10 @@ cas_path() {
   local h="$1"
   echo "$CAS_DIR/${h:0:2}/${h}"
 }
-ref_json=$(curl -fsS -H "$AUTH_HEADER" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/refs/HEAD")
+# Read the default branch tip's Full output so we can report artifact sizes.
+commit=$(curl -fsS -X POST -H "$AUTH_HEADER" -H 'Content-Type: application/json' -d '{"selector":"HEAD"}' \
+  "$SERVER_URL/v1/repos/github/$OWNER/$NAME/builds" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
+ref_json=$(curl -fsS -H "$AUTH_HEADER" "$SERVER_URL/v1/repos/github/$OWNER/$NAME/commits/$commit?kind=full")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 
 echo ""

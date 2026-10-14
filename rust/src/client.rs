@@ -35,138 +35,123 @@ struct ServerError {
     code: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ArtifactPendingResponse {
-    code: String,
-    commit: String,
-    branch: String,
-    status: String,
-    queue_depth: usize,
-    top_up_supported: Option<bool>,
-    top_up_base: Option<RefResponse>,
+/// The state of one output of a build.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct OutputState {
+    /// `pending`, `ready` or `failed`.
+    pub state: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SyncAcceptedResponse {
-    status: String,
-    queue_depth: usize,
-    commit: String,
-    branch: String,
+/// The answer to `POST .../builds` and `POST .../add`, and the summary from
+/// `GET .../commits/{sha}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuildSummary {
+    pub commit: String,
+    /// The branch a clone of this build checks out; `None` is detached. Only
+    /// a POST answer carries it.
+    #[serde(default)]
+    pub checkout_name: Option<String>,
+    pub head: OutputState,
+    pub files: OutputState,
+    pub full: OutputState,
 }
 
-#[derive(Debug, Deserialize)]
-struct ExactRevisionUnavailableResponse {
-    error: String,
-    commit: String,
-    branch: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SyncAtPin {
-    commit: String,
-    branch: Option<String>,
-}
-
-fn exact_commit_from_revision(rev: Option<&str>) -> Option<String> {
-    rev.filter(|value| crate::validation::validate_object_id(value).is_ok())
-        .map(str::to_string)
-}
-
-fn observe_sync_at_identity(
-    pin: &mut Option<SyncAtPin>,
-    commit: &str,
-    branch: &str,
-    response_kind: &str,
-) -> Result<()> {
-    crate::validation::validate_object_id(commit)
-        .with_context(|| format!("validate commit in exact revision {response_kind} response"))?;
-    let detached_allowed = pin
-        .as_ref()
-        .is_some_and(|identity| identity.branch.as_deref().is_none_or(str::is_empty));
-    if branch.is_empty() && !detached_allowed {
-        anyhow::bail!(
-            "sync integrity error: exact revision {response_kind} response omitted branch"
-        );
-    }
-    if !branch.is_empty() {
-        crate::validation::validate_checkout_name(branch).with_context(|| {
-            format!("validate branch in exact revision {response_kind} response")
-        })?;
+impl BuildSummary {
+    fn outputs(&self) -> [(ExactResultKind, &OutputState); 3] {
+        [
+            (ExactResultKind::Head, &self.head),
+            (ExactResultKind::Files, &self.files),
+            (ExactResultKind::Full, &self.full),
+        ]
     }
 
-    if let Some(expected) = pin {
-        if expected.commit != commit
-            || expected
-                .branch
-                .as_deref()
-                .is_some_and(|expected_branch| expected_branch != branch)
-        {
-            anyhow::bail!(
-                "sync integrity error: exact revision pin {}@{} changed to {branch}@{commit} in a {response_kind} response",
-                expected.branch.as_deref().unwrap_or("<unresolved>"),
-                expected.commit
-            );
-        }
-        if expected.branch.is_none() {
-            expected.branch = Some(branch.to_string());
-        }
-    } else {
-        *pin = Some(SyncAtPin {
-            commit: commit.to_string(),
-            branch: Some(branch.to_string()),
-        });
+    /// Whether any output is still pending.
+    pub fn pending(&self) -> bool {
+        self.outputs()
+            .iter()
+            .any(|(_, output)| output.state == "pending")
+    }
+
+    /// Whether every output is ready.
+    pub fn ready(&self) -> bool {
+        self.outputs()
+            .iter()
+            .all(|(_, output)| output.state == "ready")
+    }
+
+    /// The first failed output and its error.
+    pub fn failed(&self) -> Option<(ExactResultKind, &str)> {
+        self.outputs().into_iter().find_map(|(kind, output)| {
+            (output.state == "failed").then(|| (kind, output.error.as_deref().unwrap_or("")))
+        })
+    }
+}
+
+/// `GET .../commits/{sha}?kind=`: one body per state of that output.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+enum CommitOutput {
+    Ready(Box<RefResponse>),
+    Pending {
+        commit: String,
+        #[serde(default)]
+        top_up: Option<TopUpPlan>,
+    },
+    Failed {
+        commit: String,
+        error: String,
+    },
+}
+
+/// A ready Full of an older commit that a full clone can install and then
+/// fetch the pending commit on top of.
+#[derive(Debug, Deserialize)]
+struct TopUpPlan {
+    base_commit: String,
+    base: Box<RefResponse>,
+}
+
+fn validate_summary(summary: &BuildSummary, repo_path: &str) -> Result<()> {
+    crate::validation::validate_object_id(&summary.commit)
+        .with_context(|| format!("invalid build commit for {repo_path}"))?;
+    if let Some(name) = summary.checkout_name.as_deref() {
+        crate::validation::validate_checkout_name(name)
+            .with_context(|| format!("invalid checkout name for {repo_path}"))?;
     }
     Ok(())
 }
 
-fn validate_ref_response_identity(
-    expected_commit: Option<&str>,
-    expected_branch: Option<&str>,
-    detached_checkout_allowed: bool,
+/// Check that a ready body is the `kind` output of `commit`.
+fn validate_output(
+    info: &RefResponse,
     commit: &str,
-    branch: &str,
-    response_kind: &str,
+    kind: ExactResultKind,
     repo_path: &str,
 ) -> Result<()> {
-    crate::validation::validate_object_id(commit)
-        .with_context(|| format!("invalid {response_kind} commit for {repo_path}"))?;
-    if branch.is_empty() && !detached_checkout_allowed {
-        anyhow::bail!("invalid {response_kind} branch for {repo_path}: checkout name is empty");
-    }
-    if !branch.is_empty() {
-        crate::validation::validate_checkout_name(branch)
-            .with_context(|| format!("invalid {response_kind} branch for {repo_path}"))?;
-    }
-    if let Some(expected) = expected_commit
-        && commit != expected
-    {
-        anyhow::bail!(
-            "ref integrity error: expected commit {expected} changed to {commit} in a {response_kind} response"
-        );
-    }
-    if let Some(expected) = expected_branch
-        && expected != "HEAD"
-        && branch != expected
-    {
-        anyhow::bail!(
-            "ref integrity error: resolved branch {expected} changed to {branch} in a {response_kind} response"
-        );
-    }
+    anyhow::ensure!(
+        info.commit == commit,
+        "ref integrity error: expected commit {commit} changed to {} in a ready response for {repo_path}",
+        info.commit
+    );
+    anyhow::ensure!(
+        info.result == kind,
+        "ref result mismatch for {repo_path}: requested {kind}, server returned {}",
+        info.result
+    );
+    anyhow::ensure!(
+        !info.clonepack_manifest.is_empty(),
+        "{kind} output of {commit} has no clonepack manifest"
+    );
     Ok(())
 }
 
-/// Result of one ordinary sync/add admission request. A caller that only needs
-/// readiness can use [`Client::sync_repo`] / [`Client::add_repo`], which poll
-/// exact pinned metadata after a 202. CLI and webhook-style callers can use the
-/// admission methods and return as soon as this value is available.
-#[derive(Debug, Clone)]
-pub struct SyncAdmission {
-    pub commit: String,
-    pub branch: String,
-    pub accepted: bool,
-    pub ready: Option<RefResponse>,
-    pub status: String,
-    pub queue_depth: usize,
+/// A failed output. `sync --at` asks for it again.
+fn failed_output_error(commit: &str, kind: ExactResultKind, error: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{kind} output of {commit} failed: {error}\n  → run `ripclone sync <repo> --at {commit}` to build it again"
+    )
 }
 
 /// The selected artifact is not yet available for the commit this clone pinned.
@@ -291,6 +276,13 @@ fn error_hint(status: u16, code: Option<&str>, is_cloud: bool) -> &'static str {
         (403, _, _) => "\n  → access denied by the configured server",
         (429, _, _) => "\n  → rate limited; wait a moment and retry",
         (404, Some("repo_not_added"), _) => "\n  → run `ripclone add <repo>`",
+        (404, Some("repo_not_found"), _) => {
+            "\n  → check the repository name and the server's access to it"
+        }
+        (404, Some("ref_not_found"), _) => "\n  → check the branch or tag name",
+        (400, Some("invalid_selector"), _) => {
+            "\n  → use HEAD, a full commit SHA, or a branch or tag name"
+        }
         (502 | 503, _, _) => "\n  → ripclone is briefly unavailable; retry shortly",
         _ => "",
     }
@@ -317,6 +309,9 @@ pub struct RefResponse {
     pub provider: String,
     pub host: String,
     pub origin_url: String,
+    /// The checkout name of this clone, filled in by the client; empty is
+    /// detached. Not on the wire.
+    #[serde(default, skip_deserializing)]
     pub branch: String,
     pub commit: String,
     pub parent_commit: Option<String>,
@@ -341,14 +336,15 @@ pub struct RefResponse {
     /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
     #[serde(default)]
     pub idx_bundle_url: Option<String>,
+    #[serde(rename = "kind")]
     pub result: ExactResultKind,
     /// The hosted server's per-clone id, captured from the `X-Ripclone-Clone-Id`
     /// response header (not part of the JSON body). `None` when the server does
     /// not mint one; in that case the post-clone metrics report is skipped.
     #[serde(skip)]
     pub clone_id: Option<String>,
-    /// True when resolving this ref required a 202/poll (a cold build) rather
-    /// than hitting an already-warm repo. Captured from the resolve loop, not the
+    /// True when resolving this ref had to poll a pending build rather than
+    /// hitting an already-warm repo. Captured from the resolve loop, not the
     /// JSON body.
     #[serde(skip)]
     pub cold: bool,
@@ -356,14 +352,10 @@ pub struct RefResponse {
 
 /// Immutable identity used when one streamed artifact needs a fresh signed
 /// URL. This is operation-local and contains no durable clone state: every
-/// refresh asks the existing ref endpoint for the exact target already pinned
-/// by the initial response.
+/// refresh reads the same `GET .../commits/{artifact}?kind=` the clone polled.
 #[derive(Clone)]
 struct PinnedArtifactRefresh {
     repo_path: String,
-    request_branch: String,
-    checkout_branch: String,
-    rev: Option<String>,
     result: ExactResultKind,
     target: String,
     artifact: String,
@@ -468,10 +460,9 @@ fn fetch_retry_config() -> (u32, u64) {
     (attempts, backoff_ms)
 }
 
-/// Wait before poll `attempt` (0-based) while a build is pending (202/503
-/// sync responses) or a ref is resolving. Starts at 100 ms and doubles up to
-/// a 2 s cap, so a short build is seen at once and a long one is not polled
-/// hard. `RIPCLONE_POLL_MS` overrides the cap.
+/// Wait before poll `attempt` (0-based) while an output is pending. Starts at
+/// 100 ms and doubles up to a 2 s cap, so a short build is seen at once and a
+/// long one is not polled hard. `RIPCLONE_POLL_MS` overrides the cap.
 fn poll_delay(attempt: usize) -> std::time::Duration {
     let cap = std::env::var("RIPCLONE_POLL_MS")
         .ok()
@@ -1113,7 +1104,7 @@ pub struct CloneOutcome {
     pub commit: String,
     /// `head` | `full` | `files`.
     pub mode: &'static str,
-    /// True when the resolve had to poll a cold build (202) before succeeding.
+    /// True when the resolve saw its output pending before it was ready.
     pub cold: bool,
     /// The cloud's `X-Ripclone-Clone-Id`. `None` means no metrics report.
     pub clone_id: Option<String>,
@@ -1552,359 +1543,219 @@ impl Client {
         Ok(())
     }
 
-    pub async fn resolve_ref(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
-        self.resolve_exact_result(repo_path, branch, ExactResultKind::Full, None)
-            .await
-    }
-
-    pub async fn resolve_exact_result(
+    /// `POST .../builds`: resolve `selector` on the server and admit its
+    /// commit. `retry` puts failed outputs back to pending.
+    pub async fn post_build(
         &self,
         repo_path: &str,
-        branch: &str,
-        result: ExactResultKind,
-        rev: Option<&str>,
-    ) -> Result<RefResponse> {
-        let expected_commit = exact_commit_from_revision(rev);
-        let mut pinned = None;
-        let mut resolved_branch = None;
-        let mut clone_id = None;
-        let mut cold = false;
-        match self
-            .resolve_ref_for_operation(
-                repo_path,
-                branch,
-                result,
-                rev,
-                expected_commit.as_deref(),
-                &mut pinned,
-                &mut resolved_branch,
-                &result.to_string(),
-                false,
-                &mut clone_id,
-                &mut cold,
-            )
-            .await?
-        {
-            InstallPlan::Exact { response, .. } => Ok(response),
-            InstallPlan::TopUp { .. } => unreachable!("top-up was not requested"),
+        selector: &str,
+        retry: bool,
+    ) -> Result<BuildSummary> {
+        Ok(self.request_build(repo_path, selector, retry).await?.0)
+    }
+
+    /// [`Self::post_build`], plus the hosted server's per-clone id.
+    async fn request_build(
+        &self,
+        repo_path: &str,
+        selector: &str,
+        retry: bool,
+    ) -> Result<(BuildSummary, Option<String>)> {
+        crate::validation::Selector::parse(selector)?;
+        let url = self.repo_url(repo_path, "/builds");
+        let request = self
+            .http
+            .request(reqwest::Method::POST, &url)
+            .json(&serde_json::json!({"selector": selector, "retry": retry}));
+        let resp = self.send(request).await?;
+        if !resp.status().is_success() {
+            return Err(server_error("build request failed", resp).await);
         }
+        let clone_id = resp
+            .headers()
+            .get("x-ripclone-clone-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let summary: BuildSummary = resp
+            .json()
+            .await
+            .with_context(|| format!("invalid build response for {repo_path}"))?;
+        validate_summary(&summary, repo_path)?;
+        if crate::validation::validate_object_id(selector).is_ok() {
+            anyhow::ensure!(
+                summary.commit == selector,
+                "ref integrity error: build of {selector} answered for {}",
+                summary.commit
+            );
+        }
+        Ok((summary, clone_id))
     }
 
-    async fn resolve_ref_for_operation(
+    /// `GET .../commits/{sha}`: the state of each output of one build.
+    pub async fn build_summary(&self, repo_path: &str, commit: &str) -> Result<BuildSummary> {
+        let url = self.repo_url(repo_path, &format!("/commits/{commit}"));
+        let resp = self
+            .send(self.http.request(reqwest::Method::GET, &url))
+            .await?;
+        if !resp.status().is_success() {
+            return Err(server_error("build lookup failed", resp).await);
+        }
+        let summary: BuildSummary = resp
+            .json()
+            .await
+            .with_context(|| format!("invalid build summary for {repo_path}"))?;
+        validate_summary(&summary, repo_path)?;
+        anyhow::ensure!(
+            summary.commit == commit,
+            "ref integrity error: build summary of {commit} answered for {}",
+            summary.commit
+        );
+        Ok(summary)
+    }
+
+    /// `GET .../commits/{sha}?kind=`.
+    async fn commit_output(
         &self,
         repo_path: &str,
-        branch: &str,
-        result: ExactResultKind,
-        rev: Option<&str>,
-        expected_commit: Option<&str>,
-        pinned: &mut Option<String>,
-        resolved_branch: &mut Option<String>,
-        pending_mode: &str,
-        allow_top_up: bool,
-        first_clone_id: &mut Option<String>,
-        cold: &mut bool,
-    ) -> Result<InstallPlan> {
+        commit: &str,
+        kind: ExactResultKind,
+    ) -> Result<CommitOutput> {
+        let url = self.repo_url(repo_path, &format!("/commits/{commit}?kind={kind}"));
+        let resp = self
+            .send(self.http.request(reqwest::Method::GET, &url))
+            .await?;
+        if !resp.status().is_success() {
+            return Err(server_error("build lookup failed", resp).await);
+        }
+        resp.json()
+            .await
+            .with_context(|| format!("invalid {kind} build response for {repo_path}"))
+    }
+
+    /// Request a build of `selector`, failed outputs included, and wait until
+    /// no output is pending.
+    pub async fn build_and_wait(&self, repo_path: &str, selector: &str) -> Result<BuildSummary> {
+        let summary = self.post_build(repo_path, selector, true).await?;
+        self.wait_for_build(repo_path, summary).await
+    }
+
+    /// Poll a build until no output is pending. Fails when an output failed
+    /// or the poll budget runs out.
+    pub async fn wait_for_build(
+        &self,
+        repo_path: &str,
+        mut summary: BuildSummary,
+    ) -> Result<BuildSummary> {
         let max_attempts = 40;
-        let detached_checkout_allowed = branch == "HEAD"
-            && rev.is_some_and(|value| crate::validation::validate_object_id(value).is_ok());
-        // Track whether any attempt polled a cold build (202/503) before
-        // success, so the post-clone metrics report can label the clone cold.
-        let mut polled = false;
-        for attempt in 0..max_attempts {
-            let request_was_pinned = pinned.is_some();
-            let requested_top_up = allow_top_up && pinned.is_some() && rev.is_none();
-            let request_branch = if pinned.is_some() {
-                resolved_branch
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(branch)
-            } else {
-                branch
+        let mut attempt = 0;
+        while summary.pending() {
+            if attempt == max_attempts {
+                anyhow::bail!(
+                    "{repo_path} is still building {} after {max_attempts} polls; run the command again to keep waiting",
+                    summary.commit
+                );
+            }
+            tokio::time::sleep(poll_delay(attempt)).await;
+            attempt += 1;
+            let checkout_name = summary.checkout_name.take();
+            summary = BuildSummary {
+                checkout_name,
+                ..self.build_summary(repo_path, &summary.commit).await?
             };
-            // Branches are wildcard path values, not URL syntax. Re-encode the
-            // concrete branch learned from the first response before composing
-            // the next request so valid delimiters such as `#` and `%` cannot
-            // become a fragment or otherwise change the request target.
-            let encoded_branch = urlencoding::encode(request_branch);
-            let mut url = self.repo_url(repo_path, &format!("/refs/{encoded_branch}"));
-            let mut q: Vec<String> = Vec::new();
-            q.push(format!("result={result}"));
-            if let Some(commit) = pinned.as_deref() {
-                q.push(format!("pinned={commit}"));
-                if requested_top_up {
-                    q.push("top_up=true".to_string());
-                }
-            }
-            // Keep the explicit historical selector on pinned readiness polls.
-            // This is what distinguishes the established `sync --at` result
-            // lane from an ordinary branch pin. Ordinary pins may reuse an
-            // already-existing exact artifact, but never create historical work.
-            if let Some(r) = rev {
-                q.push(format!("rev={}", urlencoding::encode(r)));
-            }
-            if !q.is_empty() {
-                url.push('?');
-                url.push_str(&q.join("&"));
-            }
-            let resp = self
-                .send(self.http.request(reqwest::Method::GET, &url))
-                .await?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::ACCEPTED {
-                let response_clone_id = resp
-                    .headers()
-                    .get("x-ripclone-clone-id")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string);
-                if first_clone_id.is_none() {
-                    *first_clone_id = response_clone_id;
-                }
-                let pending_branch = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_LOCATION)
-                    .map(|value| {
-                        value
-                            .to_str()
-                            .context("invalid Content-Location on pending ref response")
-                            .and_then(|value| {
-                                urlencoding::decode(value)
-                                    .context("invalid escaped branch in pending Content-Location")
-                                    .map(|value| value.into_owned())
-                            })
-                    })
-                    .transpose()?;
-                let pending: ArtifactPendingResponse = resp
-                    .json()
-                    .await
-                    .with_context(|| format!("invalid pending response for {repo_path}"))?;
-                if pending.code != "artifact_pending" || pending.status != "building" {
-                    anyhow::bail!(
-                        "invalid pending response for {repo_path}: code={:?}, status={:?}",
-                        pending.code,
-                        pending.status
-                    );
-                }
-                validate_ref_response_identity(
-                    pinned.as_deref().or(expected_commit),
-                    resolved_branch.as_deref().or(Some(branch)),
-                    detached_checkout_allowed,
-                    &pending.commit,
-                    &pending.branch,
-                    "pending",
-                    repo_path,
-                )?;
-                if let Some(content_location_branch) = pending_branch.as_deref()
-                    && content_location_branch != pending.branch
-                {
-                    anyhow::bail!(
-                        "ref integrity error: pending response branch {} disagrees with Content-Location {content_location_branch}",
-                        pending.branch
-                    );
-                }
-                *pinned = Some(pending.commit.clone());
-                *resolved_branch = Some(pending.branch.clone());
-                polled = true;
-                *cold = true;
-                if requested_top_up {
-                    if pending.top_up_supported != Some(true) {
-                        anyhow::bail!(
-                            "invalid pending response for {repo_path}: pinned Full top-up support was not declared"
-                        );
-                    }
-                    let target = pinned
-                        .clone()
-                        .context("pending response did not establish a pinned commit")?;
-                    let Some(base_response) = pending.top_up_base else {
-                        return Err(anyhow::Error::new(ArtifactPending {
-                            commit: target,
-                            mode: pending_mode.to_string(),
-                        }));
-                    };
-                    crate::validation::validate_object_id(&base_response.commit)
-                        .with_context(|| format!("invalid top-up base commit for {repo_path}"))?;
-                    crate::validation::validate_checkout_name(&base_response.branch)
-                        .with_context(|| format!("invalid top-up base branch for {repo_path}"))?;
-                    if let Some(expected) = resolved_branch.as_deref()
-                        && base_response.branch != expected
-                    {
-                        anyhow::bail!(
-                            "ref integrity error: top-up base branch {} does not match resolved branch {expected}",
-                            base_response.branch
-                        );
-                    }
-                    if base_response.result != ExactResultKind::Full
-                        || base_response.clonepack_manifest.is_empty()
-                    {
-                        anyhow::bail!(
-                            "invalid top-up plan for pinned commit {target}: base is not a complete Full artifact"
-                        );
-                    }
-                    if base_response.commit == target {
-                        anyhow::bail!(
-                            "invalid top-up plan for pinned commit {target}: base is not distinct"
-                        );
-                    }
-                    return Ok(InstallPlan::TopUp {
+        }
+        if let Some((kind, error)) = summary.failed() {
+            return Err(failed_output_error(&summary.commit, kind, error));
+        }
+        Ok(summary)
+    }
+
+    /// Request the build of `selector` once, then poll its `kind` output
+    /// until it is ready or failed. A full clone that may top up takes the
+    /// first pending answer that names a base. Every poll reads the one
+    /// commit the request resolved to.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_for_install(
+        &self,
+        repo_path: &str,
+        selector: &str,
+        checkout_override: Option<&str>,
+        kind: ExactResultKind,
+        allow_top_up: bool,
+        pending_mode: &str,
+        identity: &mut InstallIdentity,
+    ) -> Result<InstallPlan> {
+        if let Some(name) = checkout_override {
+            crate::validation::validate_checkout_name(name)
+                .with_context(|| format!("invalid checkout branch {name}"))?;
+        }
+        let (summary, clone_id) = self.request_build(repo_path, selector, false).await?;
+        let target = summary.commit;
+        let checkout = checkout_override
+            .map(str::to_string)
+            .or(summary.checkout_name)
+            .unwrap_or_default();
+        identity.pinned = Some(target.clone());
+        identity.resolved_branch = Some(checkout.clone());
+        identity.clone_id = clone_id;
+        // A top-up moves the checked-out branch to the target, so a detached
+        // checkout cannot use one.
+        let allow_top_up = allow_top_up && !checkout.is_empty();
+        let max_attempts = 40;
+        for attempt in 0..max_attempts {
+            match self.commit_output(repo_path, &target, kind).await? {
+                CommitOutput::Ready(info) => {
+                    let mut info = *info;
+                    validate_output(&info, &target, kind, repo_path)?;
+                    info.branch = checkout;
+                    info.clone_id = identity.clone_id.clone();
+                    info.cold = identity.cold;
+                    return Ok(InstallPlan::Exact {
+                        artifact: target.clone(),
                         target,
-                        artifact: base_response.commit.clone(),
-                        base_response,
+                        response: info,
                     });
                 }
-                if attempt == 0 {
-                    eprintln!(
-                        "ripclone: warming {repo_path} (queue depth {}) — this can take a moment…",
-                        pending.queue_depth
+                CommitOutput::Failed { commit, error } => {
+                    anyhow::ensure!(
+                        commit == target,
+                        "ref integrity error: expected commit {target} changed to {commit} in a failed response"
                     );
+                    return Err(failed_output_error(&target, kind, &error));
                 }
-                // The first ordinary 202 exists to establish B. Eligible Full
-                // clones immediately make the one pinned opt-in request.
-                if allow_top_up && !requested_top_up {
-                    continue;
-                }
-                if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll_delay(attempt)).await;
-                    continue;
-                }
-                let commit = pinned
-                    .clone()
-                    .context("pending responses did not establish a pinned commit")?;
-                return Err(anyhow::Error::new(ArtifactPending {
-                    commit,
-                    mode: pending_mode.to_string(),
-                }));
-            }
-            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                polled = true;
-                let body = resp
-                    .bytes()
-                    .await
-                    .with_context(|| format!("read unavailable response for {repo_path}"))?;
-                let unavailable =
-                    match serde_json::from_slice::<ExactRevisionUnavailableResponse>(&body) {
-                        Ok(unavailable) => {
-                            validate_ref_response_identity(
-                                pinned.as_deref().or(expected_commit),
-                                resolved_branch.as_deref().or(Some(branch)),
-                                detached_checkout_allowed,
-                                &unavailable.commit,
-                                &unavailable.branch,
-                                "503",
-                                repo_path,
-                            )?;
-                            if pinned.is_none() {
-                                *pinned = Some(unavailable.commit.clone());
-                            }
-                            *resolved_branch = Some(unavailable.branch.clone());
-                            Some(unavailable)
-                        }
-                        Err(_) => {
-                            // Not an exact-revision answer: the server itself
-                            // is unavailable (a proxy, a restart, overload).
-                            let text = String::from_utf8_lossy(&body);
-                            let detail = serde_json::from_slice::<ServerError>(&body)
-                                .ok()
-                                .and_then(|parsed| parsed.error)
-                                .filter(|error| !error.is_empty())
-                                .unwrap_or_else(|| {
-                                    if text.trim().is_empty() {
-                                        status.to_string()
-                                    } else {
-                                        text.trim().to_string()
-                                    }
-                                });
-                            return Err(HttpFailure::status(
-                                status.as_u16(),
-                                format!(
-                                    "ref lookup failed: {detail}{}",
-                                    error_hint(status.as_u16(), None, false)
-                                ),
-                            ));
-                        }
-                    };
-                if request_was_pinned && let Some(unavailable) = unavailable.as_ref() {
-                    anyhow::bail!(
-                        "ref lookup for pinned commit {} failed: {}",
-                        unavailable.commit,
-                        unavailable.error
+                CommitOutput::Pending { commit, top_up } => {
+                    anyhow::ensure!(
+                        commit == target,
+                        "ref integrity error: expected commit {target} changed to {commit} in a pending response"
                     );
+                    identity.cold = true;
+                    if allow_top_up && let Some(plan) = top_up {
+                        let mut base = *plan.base;
+                        validate_output(&base, &plan.base_commit, ExactResultKind::Full, repo_path)
+                            .context("invalid top-up base")?;
+                        anyhow::ensure!(
+                            plan.base_commit != target,
+                            "invalid top-up plan for pinned commit {target}: base is not distinct"
+                        );
+                        base.branch = checkout;
+                        return Ok(InstallPlan::TopUp {
+                            target,
+                            artifact: plan.base_commit,
+                            base_response: base,
+                        });
+                    }
+                    if attempt == 0 {
+                        eprintln!("ripclone: warming {repo_path} — this can take a moment…");
+                    }
+                    if attempt + 1 < max_attempts {
+                        tokio::time::sleep(poll_delay(attempt)).await;
+                    }
                 }
-                if attempt == 0 {
-                    eprintln!("ripclone: warming {repo_path} — this can take a moment…");
-                }
-                if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll_delay(attempt)).await;
-                    continue;
-                }
-                if let Some(commit) = pinned.as_deref() {
-                    anyhow::bail!(
-                        "ref lookup for pinned commit {commit} remained unavailable after {max_attempts} attempts"
-                    );
-                }
-                if let Some(unavailable) = unavailable {
-                    anyhow::bail!(
-                        "ref lookup for exact commit {} remained unavailable after {max_attempts} attempts: {}",
-                        unavailable.commit,
-                        unavailable.error
-                    );
-                }
-                anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
             }
-            if status == reqwest::StatusCode::OK {
-                // Capture the hosted server's per-clone id from the response
-                // header before the body is consumed. If absent, `clone_id`
-                // remains `None`.
-                let clone_id = resp
-                    .headers()
-                    .get("x-ripclone-clone-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                if first_clone_id.is_none() {
-                    *first_clone_id = clone_id;
-                }
-                let mut info: RefResponse = resp.json().await?;
-                validate_ref_response_identity(
-                    pinned.as_deref().or(expected_commit),
-                    resolved_branch.as_deref().or(Some(branch)),
-                    detached_checkout_allowed,
-                    &info.commit,
-                    &info.branch,
-                    "ready",
-                    repo_path,
-                )?;
-                anyhow::ensure!(
-                    info.result == result,
-                    "ref result mismatch for {repo_path}: requested {result}, server returned {}",
-                    info.result
-                );
-                *pinned = Some(info.commit.clone());
-                *resolved_branch = Some(info.branch.clone());
-                *cold |= polled;
-                info.clone_id = first_clone_id.clone();
-                info.cold = *cold;
-                return Ok(InstallPlan::Exact {
-                    target: pinned
-                        .clone()
-                        .context("ready response did not establish a pinned commit")?,
-                    artifact: info.commit.clone(),
-                    response: info,
-                });
-            }
-            let authorization_failure = matches!(
-                status,
-                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-            );
-            let error = server_error("ref lookup failed", resp).await;
-            if let Some(commit) = pinned.as_deref() {
-                let context = if authorization_failure {
-                    format!("refresh of pinned commit {commit} was not authorized")
-                } else {
-                    format!("refresh of pinned commit {commit} failed")
-                };
-                return Err(error.context(context));
-            }
-            return Err(error);
         }
-        anyhow::bail!("ref lookup did not complete")
+        Err(anyhow::Error::new(ArtifactPending {
+            commit: target,
+            mode: pending_mode.to_string(),
+        }))
     }
 
     /// Refresh one signed artifact URL without re-running selector resolution
@@ -1937,54 +1788,21 @@ impl Client {
             return Ok(latest);
         }
 
-        let encoded_branch = urlencoding::encode(&refresh.request_branch);
-        let mut url = self.repo_url(&refresh.repo_path, &format!("/refs/{encoded_branch}"));
-        url.push_str(&format!(
-            "?result={}&pinned={}",
-            refresh.result, refresh.artifact
-        ));
-        if let Some(rev) = refresh.rev.as_deref() {
-            url.push_str("&rev=");
-            url.push_str(&urlencoding::encode(rev));
-        }
-
-        let response = self
-            .send(self.http.request(reqwest::Method::GET, &url))
-            .await?;
-        let status = response.status();
-        let info = if status == reqwest::StatusCode::OK {
-            response
-                .json::<RefResponse>()
-                .await
-                .context("decode pinned URL refresh response")?
-        } else {
-            let authorization_failure = matches!(
-                status,
-                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        let output = self
+            .commit_output(&refresh.repo_path, &refresh.artifact, refresh.result)
+            .await
+            .with_context(|| format!("refresh of pinned commit {} failed", refresh.target))?;
+        let CommitOutput::Ready(info) = output else {
+            anyhow::bail!(
+                "refresh of pinned commit {} failed: {} output of {} is no longer ready",
+                refresh.target,
+                refresh.result,
+                refresh.artifact
             );
-            let error = server_error("pinned artifact URL refresh failed", response).await;
-            let context = if authorization_failure {
-                format!(
-                    "refresh of pinned commit {} was not authorized",
-                    refresh.target
-                )
-            } else {
-                format!("refresh of pinned commit {} failed", refresh.target)
-            };
-            return Err(error.context(context));
         };
-
-        validate_ref_response_identity(
-            Some(&refresh.artifact),
-            Some(&refresh.checkout_branch),
-            refresh.checkout_branch.is_empty(),
-            &info.commit,
-            &info.branch,
-            "artifact URL refresh",
-            &refresh.repo_path,
-        )?;
-        let artifact_unchanged = info.result == refresh.result
-            && info.clonepack_manifest == refresh.clonepack_manifest
+        let info = *info;
+        validate_output(&info, &refresh.artifact, refresh.result, &refresh.repo_path)?;
+        let artifact_unchanged = info.clonepack_manifest == refresh.clonepack_manifest
             && info.metadata_chunk == refresh.metadata_chunk;
         anyhow::ensure!(
             artifact_unchanged,
@@ -2092,254 +1910,21 @@ impl Client {
         fetch_artifact_to_temp(self, &hash, chunk.len, dir, refresh, pack_index).await
     }
 
-    pub async fn sync_repo(&self, repo_path: &str, depth: Option<usize>) -> Result<RefResponse> {
-        let admission = self.admit_sync_repo(repo_path, depth).await?;
-        if let Some(ready) = admission.ready {
-            return Ok(ready);
-        }
-        self.wait_for_admitted_sync(repo_path, &admission).await
-    }
-
-    pub async fn add_repo(&self, repo_path: &str) -> Result<RefResponse> {
-        let admission = self.admit_add_repo(repo_path).await?;
-        if let Some(ready) = admission.ready {
-            return Ok(ready);
-        }
-        self.wait_for_admitted_sync(repo_path, &admission).await
-    }
-
-    /// Admit an ordinary default-branch sync and return immediately after a
-    /// ready hit or queue acceptance. This is the fast path used by the CLI.
-    pub async fn admit_sync_repo(
-        &self,
-        repo_path: &str,
-        depth: Option<usize>,
-    ) -> Result<SyncAdmission> {
-        self.admit_sync_request(repo_path, None, depth).await
-    }
-
-    /// Register and admit an ordinary default-branch build, returning after the
-    /// durable registration plus ready detection or queue acceptance.
-    pub async fn admit_add_repo(&self, repo_path: &str) -> Result<SyncAdmission> {
+    /// `POST .../add`: register the repository and admit its HEAD.
+    pub async fn add_repo(&self, repo_path: &str) -> Result<BuildSummary> {
         let url = self.repo_url(repo_path, "/add");
         let resp = self
             .send(self.http.request(reqwest::Method::POST, &url))
             .await?;
-        if resp.status() == reqwest::StatusCode::OK {
-            let ready: RefResponse = resp.json().await?;
-            return Ok(SyncAdmission {
-                commit: ready.commit.clone(),
-                branch: ready.branch.clone(),
-                accepted: false,
-                ready: Some(ready),
-                status: "ready".to_string(),
-                queue_depth: 0,
-            });
+        if !resp.status().is_success() {
+            return Err(server_error("add failed", resp).await);
         }
-        self.parse_sync_admission_response(resp, "add").await
-    }
-
-    /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of
-    /// the branch tip. The resolved commit is the result and job identity, so
-    /// different revs that resolve to the same commit share a build. Useful for
-    /// exercising the incremental build path deterministically without waiting for
-    /// upstream to advance.
-    pub async fn sync_repo_at(
-        &self,
-        repo_path: &str,
-        rev: Option<&str>,
-        depth: Option<usize>,
-    ) -> Result<RefResponse> {
-        if let Some(rev) = rev {
-            self.sync_at_revision(repo_path, None, rev, depth).await
-        } else {
-            self.sync_repo(repo_path, depth).await
-        }
-    }
-
-    async fn admit_sync_request(
-        &self,
-        repo_path: &str,
-        branch: Option<&str>,
-        depth: Option<usize>,
-    ) -> Result<SyncAdmission> {
-        let mut url = self.repo_url(repo_path, "/sync");
-        let mut q: Vec<String> = Vec::new();
-        if let Some(branch) = branch {
-            q.push(format!("branch={}", urlencoding::encode(branch)));
-        }
-        if let Some(depth) = depth {
-            q.push(format!("depth={depth}"));
-        }
-        if !q.is_empty() {
-            url.push('?');
-            url.push_str(&q.join("&"));
-        }
-        let resp = self
-            .send(self.http.request(reqwest::Method::POST, &url))
-            .await?;
-        if resp.status() == reqwest::StatusCode::OK {
-            let ready: RefResponse = resp.json().await?;
-            return Ok(SyncAdmission {
-                commit: ready.commit.clone(),
-                branch: ready.branch.clone(),
-                accepted: false,
-                ready: Some(ready),
-                status: "ready".to_string(),
-                queue_depth: 0,
-            });
-        }
-        self.parse_sync_admission_response(resp, "sync").await
-    }
-
-    async fn parse_sync_admission_response(
-        &self,
-        resp: reqwest::Response,
-        context: &str,
-    ) -> Result<SyncAdmission> {
-        if resp.status() != reqwest::StatusCode::ACCEPTED {
-            return Err(server_error(&format!("{context} failed"), resp).await);
-        }
-        let accepted: SyncAcceptedResponse = resp
+        let summary: BuildSummary = resp
             .json()
             .await
-            .with_context(|| format!("invalid exact {context} admission response"))?;
-        let commit = accepted.commit;
-        let branch = accepted.branch;
-        crate::validation::validate_object_id(&commit)
-            .context("server returned invalid admitted commit")?;
-        if branch != "HEAD" {
-            crate::validation::validate_checkout_name(&branch)
-                .context("server returned invalid admitted branch")?;
-        }
-        Ok(SyncAdmission {
-            commit,
-            branch,
-            accepted: true,
-            ready: None,
-            status: accepted.status,
-            queue_depth: accepted.queue_depth,
-        })
-    }
-
-    async fn wait_for_admitted_sync(
-        &self,
-        repo_path: &str,
-        admission: &SyncAdmission,
-    ) -> Result<RefResponse> {
-        let mut pinned = Some(admission.commit.clone());
-        // HEAD is a selector, not the concrete metadata key. Let the first
-        // exact pinned GET learn the advertised default branch (for example,
-        // `main`) from its response identity; concrete admissions remain pinned to
-        // their admitted branch.
-        let mut resolved_branch = (admission.branch != "HEAD").then(|| admission.branch.clone());
-        let mut clone_id = None;
-        let mut cold = false;
-        match self
-            .resolve_ref_for_operation(
-                repo_path,
-                &admission.branch,
-                ExactResultKind::Full,
-                None,
-                None,
-                &mut pinned,
-                &mut resolved_branch,
-                "full",
-                false,
-                &mut clone_id,
-                &mut cold,
-            )
-            .await?
-        {
-            InstallPlan::Exact { response, .. } => Ok(response),
-            InstallPlan::TopUp { .. } => unreachable!("sync readiness does not top up"),
-        }
-    }
-
-    async fn sync_at_revision(
-        &self,
-        repo_path: &str,
-        branch: Option<&str>,
-        rev: &str,
-        depth: Option<usize>,
-    ) -> Result<RefResponse> {
-        let mut selected_rev = rev.to_string();
-        let mut selected_branch = branch.map(str::to_string);
-        let mut pin = exact_commit_from_revision(Some(rev)).map(|commit| SyncAtPin {
-            commit,
-            branch: branch.map(str::to_string),
-        });
-        // With the async build queue the server may return 202 (build still
-        // running) or 503 (queue full). Each POST blocks server-side until its
-        // wait window elapses, so we just retry — coalescing means a retry
-        // re-attaches to the same in-flight build rather than starting a new one.
-        let max_attempts = 40;
-        for attempt in 0..max_attempts {
-            let mut url = self.repo_url(repo_path, "/sync");
-            let mut q: Vec<String> = Vec::new();
-            if let Some(branch) = selected_branch.as_deref() {
-                q.push(format!("branch={}", urlencoding::encode(branch)));
-            }
-            if let Some(depth) = depth {
-                q.push(format!("depth={depth}"));
-            }
-            q.push(format!("rev={}", urlencoding::encode(&selected_rev)));
-            url.push('?');
-            url.push_str(&q.join("&"));
-            let resp = self
-                .send(self.http.request(reqwest::Method::POST, &url))
-                .await?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::OK {
-                let ready: RefResponse = resp
-                    .json()
-                    .await
-                    .context("decode exact revision ready response")?;
-                observe_sync_at_identity(&mut pin, &ready.commit, &ready.branch, "200")?;
-                return Ok(ready);
-            }
-            if status == reqwest::StatusCode::ACCEPTED {
-                let pending: ArtifactPendingResponse = resp
-                    .json()
-                    .await
-                    .context("decode exact revision pending response")?;
-                if pending.code != "artifact_pending" || pending.status != "building" {
-                    anyhow::bail!("invalid exact revision pending response");
-                }
-                observe_sync_at_identity(&mut pin, &pending.commit, &pending.branch, "202")?;
-                selected_rev = pending.commit;
-                selected_branch = (!pending.branch.is_empty()).then_some(pending.branch);
-                if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll_delay(attempt)).await;
-                    continue;
-                }
-                anyhow::bail!("sync still building after {max_attempts} attempts");
-            }
-            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                let unavailable: ExactRevisionUnavailableResponse = resp
-                    .json()
-                    .await
-                    .context("decode exact revision queue response")?;
-                observe_sync_at_identity(
-                    &mut pin,
-                    &unavailable.commit,
-                    &unavailable.branch,
-                    "503",
-                )?;
-                selected_rev = unavailable.commit;
-                selected_branch = (!unavailable.branch.is_empty()).then_some(unavailable.branch);
-                if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll_delay(attempt)).await;
-                    continue;
-                }
-                anyhow::bail!(
-                    "sync unavailable after {max_attempts} attempts: {}",
-                    unavailable.error
-                );
-            }
-            return Err(server_error("sync failed", resp).await);
-        }
-        anyhow::bail!("sync did not complete")
+            .with_context(|| format!("invalid add response for {repo_path}"))?;
+        validate_summary(&summary, repo_path)?;
+        Ok(summary)
     }
 
     /// Fast install: download prebuilt `.git` artifacts and the working-tree
@@ -2434,7 +2019,6 @@ impl Client {
 
         let mut local_bench = Benchmark::new();
         let bench = bench.unwrap_or(&mut local_bench);
-        let expected_commit = exact_commit_from_revision(rev);
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
@@ -2450,24 +2034,25 @@ impl Client {
             ExactResultKind::Full => "full",
             ExactResultKind::Files => "files",
         };
-        // 1. Resolve the moving selector once. A pending or ready response
-        // establishes `identity.pinned`; every later poll and retry uses the
-        // metadata-only pinned query.
+        // 1. Resolve the selector once. The build request establishes
+        // `identity.pinned`; every later poll reads that commit only.
+        // `--at` names the commit; an explicit `--branch` then names the
+        // checkout.
+        let (selector, checkout_override) = match rev {
+            Some(rev) => (rev, (branch != "HEAD").then_some(branch)),
+            None => (branch, None),
+        };
         let allow_top_up =
             rev.is_none() && mode == CloneMode::Editable && result == ExactResultKind::Full;
         let plan = self
-            .resolve_ref_for_operation(
+            .resolve_for_install(
                 repo_path,
-                branch,
+                selector,
+                checkout_override,
                 result,
-                rev,
-                expected_commit.as_deref(),
-                &mut identity.pinned,
-                &mut identity.resolved_branch,
-                metric_mode,
                 allow_top_up,
-                &mut identity.clone_id,
-                &mut identity.cold,
+                metric_mode,
+                identity,
             )
             .await?;
         bench.mark_resolve();
@@ -2509,16 +2094,6 @@ impl Client {
         });
         let artifact_refresh = PinnedArtifactRefresh {
             repo_path: repo_path.to_string(),
-            request_branch: identity
-                .resolved_branch
-                .clone()
-                .filter(|branch| !branch.is_empty())
-                .unwrap_or_else(|| branch.to_string()),
-            checkout_branch: identity
-                .resolved_branch
-                .clone()
-                .context("ref resolution completed without a checkout branch")?,
-            rev: rev.map(str::to_string),
             result,
             target: pinned.clone(),
             artifact: artifact.clone(),
@@ -3503,23 +3078,6 @@ impl Client {
             .await
             .with_context(|| format!("exact upstream fetch of pinned commit {target}"))?;
 
-        let repo = install_root.to_path_buf();
-        let target_for_parse = target.to_string();
-        let parent = AbortOnDrop::new(
-            tokio::task::spawn_blocking(move || {
-                crate::git::parent_commit(&repo, &target_for_parse)
-            }),
-            cleanup.clone(),
-        )
-        .join()
-        .await
-        .context("join top-up commit validation")??;
-        if parent.as_deref() != Some(base) {
-            anyhow::bail!(
-                "pinned commit {target} is not a single-parent child of top-up base {base}"
-            );
-        }
-
         self.run_managed_git(install_root, ["reset", "--hard", target], None, cleanup)
             .await
             .with_context(|| format!("update staged worktree to pinned commit {target}"))?;
@@ -3715,106 +3273,96 @@ impl Client {
 mod tests {
     use super::*;
 
-    const SYNC_AT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const SYNC_AT_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    fn ready_body(commit: &str, kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "state": "ready",
+            "kind": kind,
+            "owner": "acme",
+            "repo": "app",
+            "provider": "github",
+            "host": "github.com",
+            "origin_url": "https://github.com/acme/app.git",
+            "commit": commit,
+            "parent_commit": null,
+            "clonepack_manifest": "m",
+            "metadata_chunk": "d",
+        })
+    }
 
-    /// A sync-at operation pins one commit and branch: the first response (or
-    /// an explicit SHA) sets it, and any later response that changes it fails.
+    /// The client reads each state of `GET .../commits/{sha}?kind=`.
     #[test]
-    fn sync_at_pin_holds_one_identity_across_responses() {
-        let (b, c) = (SYNC_AT_B, SYNC_AT_C);
-        let pinned = |branch: &str| {
-            Some(SyncAtPin {
-                commit: b.to_string(),
-                branch: Some(branch.to_string()),
-            })
+    fn commit_output_parses_each_state() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let ready: CommitOutput = serde_json::from_value(ready_body(&a, "full")).unwrap();
+        let CommitOutput::Ready(info) = ready else {
+            panic!("ready body")
         };
-        type Response<'a> = (&'a str, &'a str, &'a str);
-        // (case, explicit revision, responses, Ok(final pin) or Err(index of the
-        // rejected response))
-        let cases: Vec<(
-            &str,
-            Option<&str>,
-            Vec<Response>,
-            Result<Option<SyncAtPin>, usize>,
-        )> = vec![
-            (
-                "same identity across statuses",
-                None,
-                vec![(b, "main", "202"), (b, "main", "503"), (b, "main", "200")],
-                Ok(pinned("main")),
-            ),
-            (
-                "explicit SHA learns the branch",
-                Some(b),
-                vec![(b, "main", "202")],
-                Ok(pinned("main")),
-            ),
-            (
-                "explicit SHA, other commit on 202",
-                Some(b),
-                vec![(c, "main", "202")],
-                Err(0),
-            ),
-            (
-                "explicit SHA, other commit on 503",
-                Some(b),
-                vec![(c, "main", "503")],
-                Err(0),
-            ),
-            (
-                "explicit SHA, other commit on 200",
-                Some(b),
-                vec![(c, "main", "200")],
-                Err(0),
-            ),
-            (
-                "commit change on a later 202",
-                None,
-                vec![(b, "main", "202"), (c, "main", "202")],
-                Err(1),
-            ),
-            (
-                "branch change on a later 503",
-                None,
-                vec![(b, "main", "202"), (b, "release", "503")],
-                Err(1),
-            ),
-            (
-                "commit change on the final 200",
-                None,
-                vec![(b, "main", "202"), (c, "main", "200")],
-                Err(1),
-            ),
-            (
-                "pending response without a branch",
-                None,
-                vec![(b, "", "202")],
-                Err(0),
-            ),
-        ];
-        for (case, revision, responses, want) in cases {
-            let mut pin = exact_commit_from_revision(revision).map(|commit| SyncAtPin {
-                commit,
-                branch: None,
-            });
-            let mut failed_at = None;
-            for (i, (commit, branch, status)) in responses.iter().enumerate() {
-                let before = pin.clone();
-                if observe_sync_at_identity(&mut pin, commit, branch, status).is_err() {
-                    assert_eq!(pin, before, "{case}: a rejected response changed the pin");
-                    failed_at = Some(i);
-                    break;
+        assert_eq!(info.commit, a);
+        assert_eq!(info.result, ExactResultKind::Full);
+        assert_eq!(info.branch, "");
+        validate_output(&info, &a, ExactResultKind::Full, "acme/app").unwrap();
+        assert!(validate_output(&info, &b, ExactResultKind::Full, "acme/app").is_err());
+        assert!(validate_output(&info, &a, ExactResultKind::Head, "acme/app").is_err());
+
+        let pending: CommitOutput = serde_json::from_value(serde_json::json!({
+            "state": "pending",
+            "commit": b,
+            "kind": "full",
+            "attempts": 1,
+            "error": "upstream timed out",
+            "top_up": {
+                "base_commit": a,
+                "upstream_url": "https://github.com/acme/app.git",
+                "base": ready_body(&a, "full"),
+            },
+        }))
+        .unwrap();
+        let CommitOutput::Pending { commit, top_up } = pending else {
+            panic!("pending body")
+        };
+        assert_eq!(commit, b);
+        let plan = top_up.unwrap();
+        assert_eq!(plan.base_commit, a);
+        assert_eq!(plan.base.commit, a);
+
+        let failed: CommitOutput = serde_json::from_value(serde_json::json!({
+            "state": "failed", "commit": b, "kind": "files", "error": "archive broke",
+        }))
+        .unwrap();
+        assert!(matches!(failed, CommitOutput::Failed { error, .. } if error == "archive broke"));
+        let message = failed_output_error(&b, ExactResultKind::Files, "archive broke").to_string();
+        assert!(message.contains("archive broke"), "{message}");
+        assert!(message.contains("ripclone sync"), "{message}");
+    }
+
+    #[test]
+    fn build_summary_reports_pending_ready_and_failed() {
+        let summary = |head: &str, files: &str, full: &str| -> BuildSummary {
+            let out = |state: &str| {
+                if state == "failed" {
+                    serde_json::json!({"state": state, "error": "boom"})
+                } else {
+                    serde_json::json!({"state": state})
                 }
-            }
-            match want {
-                Ok(final_pin) => {
-                    assert_eq!(failed_at, None, "{case}");
-                    assert_eq!(pin, final_pin, "{case}");
-                }
-                Err(index) => assert_eq!(failed_at, Some(index), "{case}"),
-            }
-        }
+            };
+            serde_json::from_value(serde_json::json!({
+                "commit": "a".repeat(40),
+                "checkout_name": "main",
+                "head": out(head),
+                "files": out(files),
+                "full": out(full),
+            }))
+            .unwrap()
+        };
+        let pending = summary("ready", "pending", "failed");
+        assert!(pending.pending());
+        assert!(!pending.ready());
+        assert_eq!(pending.failed(), Some((ExactResultKind::Full, "boom")));
+        assert_eq!(pending.checkout_name.as_deref(), Some("main"));
+        let ready = summary("ready", "ready", "ready");
+        assert!(!ready.pending());
+        assert!(ready.ready());
+        assert_eq!(ready.failed(), None);
     }
 
     #[cfg(unix)]

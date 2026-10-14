@@ -39,5 +39,6 @@ Published artifacts never expire. See [Artifact lifecycle](ARTIFACT_LIFECYCLE.md
 
 ## Per-repo build settings
 
-`GET` and `POST /v1/admin/config/{owner}/{repo}` read and replace a repo's
+`GET` and `POST /v1/admin/config/{provider}/{path}` (for example
+`/v1/admin/config/github/acme/app`) read and replace a repo's
 build settings. A repo with no settings uses the defaults (zstd level 6).

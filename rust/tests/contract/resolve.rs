@@ -105,8 +105,55 @@ fn a4_clone_at_full_sha_is_detached_at_that_commit() {
     assert_eq!(listing(&target), origin.tree(&a));
 }
 
+/// A5: a rev expression is not a selector. The CLI rejects it before asking
+/// the server, and the API rejects it too; nothing builds.
+#[test]
+fn a5_rev_expression_is_rejected_without_a_build() {
+    let world = World::new();
+    let origin = world.origin("acme", "a5");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/a5", "--wait"]).ok();
+    let queued = server.metric("ripclone_builds_queued_total");
+    let proxy = FaultProxy::start(&server);
+
+    let target = world.target("a5");
+    let clone = world.cli(
+        &proxy,
+        &[
+            "clone",
+            "acme/a5",
+            target.to_str().unwrap(),
+            "--at",
+            "HEAD~1",
+        ],
+    );
+    let sync = world.cli(&proxy, &["sync", "acme/a5", "--at", "HEAD~1"]);
+    for (verb, out) in [("clone", &clone), ("sync", &sync)] {
+        let err = out.err();
+        assert!(
+            err.contains("HEAD~1") && err.contains("full commit SHA"),
+            "{verb}: {err}"
+        );
+    }
+    assert!(!target.exists(), "failed clone left {}", target.display());
+    assert!(
+        !proxy.seen().iter().any(api::is_build_post),
+        "the CLI sent a rev expression to the server"
+    );
+
+    let (status, body) = api::post_build(&server, "acme/a5", "HEAD~1", true);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_selector"))
+    );
+    assert_eq!(server.metric("ripclone_builds_queued_total"), queued);
+}
+
 /// A6: each bad request fails with its own error kind and builds nothing.
-/// The kind is the CLI exit code, and for the two 404s the API's `code`.
+/// The kind is the CLI exit code and the API's `code`.
 #[test]
 fn a6_bad_requests_fail_without_building() {
     let world = World::new();
@@ -115,20 +162,19 @@ fn a6_bad_requests_fail_without_building() {
     origin.publish();
     let server = world.server(&[]);
     let queued = || server.metric("ripclone_builds_queued_total");
-    let api_code = |path: &str| {
-        let resp = server.get(path);
-        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap_or_default();
-        (resp.status, body["code"].as_str().map(str::to_string))
+    let code = |(status, body): (u16, serde_json::Value)| {
+        (status, body["code"].as_str().map(str::to_string))
     };
 
     // Not added: the server refuses to build an unregistered repo.
     let target = world.target("not-added");
     let not_added = world.cli(&server, &["clone", "acme/a6", target.to_str().unwrap()]);
     assert!(!target.exists(), "failed clone left {}", target.display());
-    let not_added_api = api_code("/v1/repos/github/acme/a6/refs/HEAD?result=full");
+    let not_added_api = code(api::post_build(&server, "acme/a6", "HEAD", false));
 
-    // Missing upstream: `add` fails on the upstream probe.
+    // Missing upstream: `add` resolves HEAD first and finds no repository.
     let missing = world.cli(&server, &["add", "acme/does-not-exist"]);
+    let missing_api = code(api::add(&server, "acme/does-not-exist"));
     assert_eq!(queued(), 0, "a failed request queued a build");
 
     // Unknown branch on an added repo.
@@ -146,29 +192,21 @@ fn a6_bad_requests_fail_without_building() {
         ],
     );
     assert!(!target.exists(), "failed clone left {}", target.display());
+    let unknown_ref_api = code(api::post_build(&server, "acme/a6", "no-such-branch", false));
     assert_eq!(queued(), before, "an unknown ref queued a build");
-    let unknown_ref_api = api_code("/v1/repos/github/acme/a6/refs/no-such-branch?result=full");
 
-    let not_found = |code: &str| Some((404, Some(code.to_string())));
     let cases = [
-        (
-            "not added",
-            &not_added,
-            5,
-            Some(not_added_api),
-            not_found("repo_not_added"),
-        ),
-        ("missing upstream", &missing, 6, None, None),
+        ("not added", &not_added, not_added_api, "repo_not_added"),
+        ("missing upstream", &missing, missing_api, "repo_not_found"),
         (
             "unknown ref",
             &unknown_ref,
-            5,
-            Some(unknown_ref_api),
-            not_found("ref_not_found"),
+            unknown_ref_api,
+            "ref_not_found",
         ),
     ];
-    for (case, out, exit, api, want_api) in cases {
-        assert_eq!(out.code(), Some(exit), "{case}: {}", out.stderr());
-        assert_eq!(api, want_api, "{case}");
+    for (case, out, api, want) in cases {
+        assert_eq!(out.code(), Some(5), "{case}: {}", out.stderr());
+        assert_eq!(api, (404, Some(want.to_string())), "{case}");
     }
 }

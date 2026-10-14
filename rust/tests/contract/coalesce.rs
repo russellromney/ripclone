@@ -22,10 +22,11 @@ fn building(world: &World, name: &str) -> (GitHttp, Origin, Server, u64, String)
     (http, origin, server, queued, b)
 }
 
-/// First ref lookups (not pinned polls) the proxy has answered with 202.
-fn pending_lookups(seen: &[Seen]) -> usize {
+/// Build admissions the proxy has answered. Each clone posts once, then polls
+/// its commit.
+fn admissions(seen: &[Seen]) -> usize {
     seen.iter()
-        .filter(|s| s.path.contains("/refs/") && !s.query.contains("pinned=") && s.status == 202)
+        .filter(|s| api::is_build_post(s) && s.status == 200)
         .count()
 }
 
@@ -48,7 +49,7 @@ fn b1_concurrent_clones_share_one_build() {
             )
         })
         .collect();
-    proxy.wait_seen("five pending clones", |seen| pending_lookups(seen) >= 5);
+    proxy.wait_seen("five clone admissions", |seen| admissions(seen) >= 5);
     world.cli(&server, &["sync", "acme/b1"]).ok();
     http.release_fetches();
 
@@ -112,12 +113,7 @@ fn b2_branch_sha_and_default_share_one_build() {
             SLOW_POLL,
         ),
     ];
-    proxy.wait_seen("three first lookups", |seen| {
-        seen.iter()
-            .filter(|s| s.path.contains("/refs/") && !s.query.contains("pinned="))
-            .count()
-            >= 3
-    });
+    proxy.wait_seen("three admissions", |seen| admissions(seen) >= 3);
     http.release_fetches();
 
     for clone in clones {
@@ -164,7 +160,7 @@ fn b3_move_during_build_builds_both() {
         ],
         SLOW_POLL,
     );
-    proxy.wait_seen("the clone to pin B", |seen| pending_lookups(seen) >= 1);
+    proxy.wait_seen("the clone to pin B", |seen| admissions(seen) >= 1);
     let c = origin.commit(&[("f.txt", "c\n")], "C");
     origin.publish();
     world.cli(&server, &["sync", "acme/b3"]).ok();

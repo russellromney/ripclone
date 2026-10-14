@@ -132,7 +132,7 @@ fn f1_flipped_byte_fails_on_hash() {
 #[test]
 fn f2_truncated_body_fails_without_retry() {
     let world = World::new();
-    let (_origin, _server, proxy, _tip) = big_history(&world, "f2");
+    let (_origin, _server, proxy, tip) = big_history(&world, "f2");
     proxy.fault_artifacts(Fault::Truncate(BIG / 2), BIG, 1);
 
     let target = world.target("f2");
@@ -147,12 +147,13 @@ fn f2_truncated_body_fails_without_retry() {
         gets.iter().all(|s| count(&s.path) == 1),
         "an artifact was fetched twice: {gets:#?}"
     );
-    let refreshes = proxy
+    // One read finds the commit ready; any further read is a URL refresh.
+    let reads = proxy
         .seen()
         .into_iter()
-        .filter(|s| s.path.contains("/refs/") && s.query.contains("pinned="))
+        .filter(|s| api::is_commit_read(s, &tip))
         .count();
-    assert_eq!(refreshes, 0, "a short body must not refresh URLs");
+    assert_eq!(reads, 1, "a short body must not refresh URLs");
     assert_clean_failure(&world, &target);
 }
 

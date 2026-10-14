@@ -160,40 +160,35 @@ keepalive_server() {
   done
 }
 
-# A repo must be `add`ed before the server will serve `/refs`, `/sync` or a
-# clone for it; otherwise every request answers 404 with {"code":"repo_not_added"}.
-# `add` is idempotent (it overwrites the added-repos record), so re-running the
-# benchmark against an already-added repo is fine. Servers predating the
-# added-repos model have no `/add` route and answer a plain 404 "not found" —
-# treat that as "nothing to add" so the harness keeps working against them.
+# A repo must be `add`ed before the server builds or serves it; otherwise
+# every request answers 404 with {"code":"repo_not_added"}. `add` is
+# idempotent, so re-running the benchmark against an added repo is fine.
 #
-# Memoized: `add` triggers an initial build, so it must not be re-POSTed from
-# inside a poll loop. Keep the exact admission returned by `add`; after a 202,
-# warm_server must poll that commit rather than immediately probing a moving
-# branch row or POSTing a second moving sync. All progress goes to stderr
-# because the callers downstream of this run inside command substitutions that
-# capture stdout.
+# Memoized: `add` admits the default branch's tip, so it must not be re-POSTed
+# from inside a poll loop. Keep the exact commit it returns and poll that
+# commit. All progress goes to stderr because the callers downstream of this
+# run inside command substitutions that capture stdout.
 REPO_ADDED=0
 ADMITTED_COMMIT=""
 ADMITTED_BRANCH=""
 
-record_admission() {
-  local body="$1" fields
-  fields="$(printf '%s' "$body" | python3 -c '
+api_repo_url() {
+  echo "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)"
+}
+
+# Print "commit<TAB>checkout_name" from a build summary.
+summary_fields() {
+  python3 -c '
 import json, sys
 try:
     value = json.load(sys.stdin)
 except (json.JSONDecodeError, ValueError):
     raise SystemExit(0)
 commit = value.get("commit") or ""
-branch = value.get("branch") or value.get("default_branch") or ""
+name = value.get("checkout_name") or ""
 if commit:
-    print(f"{commit}\t{branch}")
-' 2>/dev/null || true)"
-  if [ -n "$fields" ]; then
-    ADMITTED_COMMIT="${fields%%$'\t'*}"
-    ADMITTED_BRANCH="${fields#*$'\t'}"
-  fi
+    print(f"{commit}\t{name}")
+' 2>/dev/null || true
 }
 
 ensure_repo_added() {
@@ -202,33 +197,25 @@ ensure_repo_added() {
     REPO_ADDED=1
     return 0
   fi
-  local url status body tmp attempt
-  url="${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/add?source=api"
+  local status fields tmp attempt
   tmp="$(mktemp)"
   for attempt in $(seq 1 5); do
     status="000"
-    status=$(curl --connect-timeout 5 --max-time 30 -s -o "$tmp" -w '%{http_code}' -X POST -H "$(auth_header)" "$url") || status="000"
+    status=$(curl --connect-timeout 5 --max-time 30 -s -o "$tmp" -w '%{http_code}' -X POST -H "$(auth_header)" "$(api_repo_url)/add") || status="000"
     case "$status" in
-      200|201|204)
-        body="$(cat "$tmp")"
-        record_admission "$body"
-        echo "  repo $REPO is added" >&2
-        REPO_ADDED=1; rm -f "$tmp"; return 0 ;;
-      202)
-        body="$(cat "$tmp")"
-        record_admission "$body"
-        if [ -z "$ADMITTED_COMMIT" ]; then
-          echo "  add attempt $attempt: HTTP 202 omitted the admitted commit, retrying ..." >&2
-          sleep 2
-          continue
+      200)
+        fields="$(summary_fields < "$tmp")"
+        if [ -z "$fields" ]; then
+          echo "error: add returned no commit" >&2
+          cat "$tmp" >&2
+          rm -f "$tmp"; return 1
         fi
-        echo "  repo $REPO is added; initial build in progress (HTTP $status)" >&2
+        ADMITTED_COMMIT="${fields%%$'\t'*}"
+        ADMITTED_BRANCH="${fields#*$'\t'}"
+        echo "  repo $REPO is added at $ADMITTED_COMMIT" >&2
         REPO_ADDED=1; rm -f "$tmp"; return 0 ;;
-      503)
-        echo "  add attempt $attempt: HTTP 503, retrying ..." >&2
-        sleep 2 ;;
-      000)
-        echo "  add attempt $attempt: no response from $SERVER_URL, retrying ..." >&2
+      502|503|000)
+        echo "  add attempt $attempt: HTTP $status, retrying ..." >&2
         sleep 2 ;;
       *)
         echo "error: add returned HTTP $status" >&2
@@ -241,107 +228,52 @@ ensure_repo_added() {
   return 1
 }
 
+# Admit a selector (HEAD, a full SHA, a branch or a tag) and print
+# "commit<TAB>checkout_name".
+post_build() {
+  local selector="$1" body
+  body="$(SELECTOR="$selector" python3 -c 'import json, os; print(json.dumps({"selector": os.environ["SELECTOR"], "retry": True}))')"
+  curl --connect-timeout 5 --max-time 30 -fsS -X POST -H "$(auth_header)" \
+    -H 'Content-Type: application/json' -d "$body" "$(api_repo_url)/builds" | summary_fields
+}
+
 get_default_branch() {
-  curl --connect-timeout 5 --max-time 30 -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/HEAD?result=head" 2>/dev/null \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("branch","HEAD"))'
+  local fields
+  fields="$(post_build HEAD)"
+  echo "${fields#*$'\t'}"
 }
 
-head_ref_json() {
-  local branch="${1:-HEAD}"
-  local result="${2:-full}"
-  # The server path already includes /refs/, so strip a leading "refs/" from
-  # the caller's branch name (e.g. "refs/tags/v2.2.2" -> "tags/v2.2.2").
-  branch="${branch#refs/}"
-  curl --connect-timeout 5 --max-time 30 -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/$branch?result=$result" 2>/dev/null
-}
-
-probe_ready_clone() {
-  local result="$1"
-  local dir="$TARGET/probe.$$"
-  rm -rf "$dir"
-  local depth=0
-  if [ "$result" = "head" ]; then depth=1; fi
-  local mode_args=()
-  if [ "$result" = "files" ]; then mode_args=(--mode files); fi
-  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$dir" --at "$REF" --depth "$depth" "${mode_args[@]}" >/dev/null 2>&1; then
-    rm -rf "$dir"
-    return 0
-  else
-    rm -rf "$dir"
-    return 1
-  fi
-}
-
-wait_for_artifacts() {
-  local timeout="${1:-1200}"
-  local start end
+# Poll one output of an admitted commit until it is ready. A failed output
+# stops the benchmark.
+wait_for_one_result_ready() {
+  local commit="$1"
+  local timeout="$2"
+  local kind="$3"
+  local start end out state status tmp
   start=$(now_ms)
-  echo "  waiting for results [$READY_RESULTS] to be consistent ..."
+  echo "  waiting for $kind of $commit ..." >&2
   while true; do
-    local all_ready=1 result
-    for result in $READY_RESULTS; do
-      if ! probe_ready_clone "$result"; then all_ready=0; break; fi
-    done
-    if [ "$all_ready" -eq 1 ]; then
-      echo "  artifacts ready (all requested clones succeeded)"
-      return 0
-    fi
-    end=$(now_ms)
-    if [ $((end - start)) -ge $((timeout * 1000)) ]; then
-      echo "error: artifacts not ready after ${timeout}s" >&2
+    tmp="$(mktemp)"
+    status="000"
+    status=$(curl --connect-timeout 5 --max-time 30 -sS -o "$tmp" -w '%{http_code}' \
+      -H "$(auth_header)" "$(api_repo_url)/commits/$commit?kind=$kind") || status="000"
+    out="$(cat "$tmp")"
+    rm -f "$tmp"
+    if [ "$status" != "200" ]; then
+      echo "error: commit read returned HTTP $status" >&2
+      printf '%s\n' "$out" >&2
       return 1
     fi
-    echo "    not ready yet, retrying in 10s ..."
-    sleep 10
-  done
-}
-
-# Poll the selected source ref until the current server reports the requested
-# clonepack manifest. Normal admission passes the exact commit from /add and
-# uses the pinned branch below, which cannot drift while upstream moves; this
-# unpinned path remains for an explicitly requested BENCH_REF branch or tag.
-wait_for_one_result_ready() {
-  local branch="${1:-HEAD}"
-  local timeout="${2:-1200}"
-  local pinned="${3:-}"
-  local ready_result="$4"
-  local start end
-  start=$(now_ms)
-  echo "  waiting for $ready_result result to be consistent ..." >&2
-  while true; do
-    local out commit ready status tmp
-    if [ -n "$pinned" ]; then
-      tmp="$(mktemp)"
-      status="000"
-      status=$(curl --connect-timeout 5 --max-time 30 -sS -o "$tmp" -w '%{http_code}' \
-        -H "$(auth_header)" \
-        -H 'x-ripclone-protocol: 2' \
-        "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/${branch#refs/}?result=$ready_result&pinned=$pinned") || status="000"
-      out="$(cat "$tmp")"
-      rm -f "$tmp"
-      if [ "$status" = "200" ]; then
-        commit="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))' 2>/dev/null || true)"
-        ready="$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("1" if d.get("clonepack_manifest") else "")' 2>/dev/null || true)"
-        if [ "$commit" = "$pinned" ] && [ -n "$ready" ]; then
-          echo "  artifacts ready for admitted $commit" >&2
-          echo "$commit"
-          return 0
-        fi
-      elif [ "$status" != "202" ] && [ "$status" != "404" ]; then
-        echo "error: pinned ref lookup returned HTTP $status" >&2
+    state="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
+    case "$state" in
+      ready)
+        echo "  artifacts ready for admitted $commit" >&2
+        return 0 ;;
+      failed)
+        echo "error: $kind of $commit failed" >&2
         printf '%s\n' "$out" >&2
-        return 1
-      fi
-    else
-      out="$(head_ref_json "$branch" "$ready_result" || true)"
-      commit="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))' 2>/dev/null || true)"
-      ready="$(printf '%s' "$out" | READY_RESULT="$ready_result" python3 -c 'import os,sys,json; d=json.load(sys.stdin); print("1" if d.get("clonepack_manifest") and d.get("result") == os.environ["READY_RESULT"] else "")' 2>/dev/null || true)"
-      if [ -n "$commit" ] && [ -n "$ready" ]; then
-        echo "  artifacts ready for $commit" >&2
-        echo "$commit"
-        return 0
-      fi
-    fi
+        return 1 ;;
+    esac
     end=$(now_ms)
     if [ $((end - start)) -ge $((timeout * 1000)) ]; then
       echo "error: artifacts not ready after ${timeout}s" >&2
@@ -352,43 +284,25 @@ wait_for_one_result_ready() {
   done
 }
 
-wait_for_ref_ready() {
-  local branch="${1:-HEAD}"
+wait_for_commit_ready() {
+  local commit="$1"
   local timeout="${2:-1200}"
-  local selected="${3:-}"
   local result
   for result in $READY_RESULTS; do
-    selected="$(wait_for_one_result_ready "$branch" "$timeout" "$selected" "$result")"
+    wait_for_one_result_ready "$commit" "$timeout" "$result" || return 1
   done
-  echo "$selected"
 }
 
 warm_server() {
-  local owner name branch_or_ref
+  local branch_or_ref fields
   ensure_repo_added
-  owner=$(repo_owner)
-  name=$(repo_name)
-  if [ -n "${BENCH_REF:-}" ]; then
-    branch_or_ref="$BENCH_REF"
-  elif [ -n "$ADMITTED_BRANCH" ]; then
-    branch_or_ref="$ADMITTED_BRANCH"
-  elif [ -n "$ADMITTED_COMMIT" ]; then
-    # A valid admission always carries the exact commit. HEAD is a stable
-    # selector for the pinned lookup, so do not probe moving HEAD just to learn
-    # the branch name.
-    branch_or_ref="HEAD"
-  else
-    branch_or_ref="$(get_default_branch)"
-  fi
 
   # CLONE_REF is the branch/tag name passed to `ripclone clone --branch`.
-  # AT_REF is an optional `--at <rev>` override; we only use it for explicit
-  # commit SHAs because branch/tag builds are keyed by the branch/tag name.
-  CLONE_REF="$branch_or_ref"
-  AT_REF=""
-
+  # AT_REF is the exact commit passed to `--at`, so a branch advance after
+  # readiness cannot change what is measured.
   if [ "${SKIP_SYNC:-0}" = "1" ]; then
-    REF="${BENCH_REF:-${ADMITTED_COMMIT:-$(cat "$RESOLVED_REF_FILE" 2>/dev/null || get_default_branch)}}"
+    REF="${BENCH_REF:-${ADMITTED_COMMIT:-$(cat "$RESOLVED_REF_FILE" 2>/dev/null || true)}}"
+    [ -n "$REF" ] || REF="$(get_default_branch)"
     echo "  using pinned ref: $REF (skipping sync)"
     if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
       CLONE_REF="HEAD"
@@ -400,46 +314,28 @@ warm_server() {
     return 0
   fi
 
-  # A current server returns the exact commit from /add. That admission already
-  # queued the initial build, so wait on its pinned metadata without a second
-  # moving sync POST. Keep the commit as --at for benchmark clones so a branch
-  # advance after readiness cannot change what is measured.
-  if [ -n "$ADMITTED_COMMIT" ] && [ -z "${BENCH_REF:-}" ]; then
-    REF="$(wait_for_ref_ready "$branch_or_ref" 1200 "$ADMITTED_COMMIT")"
-    CLONE_REF="$branch_or_ref"
-    AT_REF="$REF"
-    echo "  resolved admitted $branch_or_ref -> $REF"
-    printf '%s\n' "$REF" > "$RESOLVED_REF_FILE"
-    return 0
-  fi
-
-  # If the caller passed a full commit SHA, pin it directly.  Otherwise treat the
-  # value as a branch/tag name, sync it, and capture the exact commit the server
-  # built artifacts for.
-  if [[ "$branch_or_ref" =~ ^[0-9a-f]{40}$ ]]; then
-    REF="$branch_or_ref"
-    # Use the repo's default branch as the ref key and pass the commit via --at.
-    # This lets the server serve the commit through the branch's history even when
-    # the commit is no longer the branch tip.
-    CLONE_REF="HEAD"
-    AT_REF="$REF"
-    echo "  using pinned commit $REF"
-    curl --connect-timeout 5 --max-time 30 -fsS -X POST \
-      -H "$(auth_header)" \
-      "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?rev=$REF" >/dev/null 2>&1
-    wait_for_artifacts
+  if [ -n "${BENCH_REF:-}" ]; then
+    # A full SHA, branch or tag: admit it and wait on the commit it names.
+    branch_or_ref="${BENCH_REF#refs/heads/}"
+    branch_or_ref="${branch_or_ref#refs/tags/}"
+    echo "  warming server for $REPO @ $branch_or_ref ..."
+    fields="$(post_build "$branch_or_ref")"
+    [ -n "$fields" ] || { echo "error: could not admit $branch_or_ref" >&2; return 1; }
+    REF="${fields%%$'\t'*}"
+    if [[ "$branch_or_ref" =~ ^[0-9a-f]{40}$ ]]; then
+      CLONE_REF="HEAD"
+    else
+      CLONE_REF="$branch_or_ref"
+    fi
   else
-    echo "  warming server mirror for $REPO @ $branch_or_ref ..."
-    curl --connect-timeout 5 --max-time 30 -fsS -X POST \
-      -H "$(auth_header)" \
-      "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?branch=$branch_or_ref" >/dev/null 2>&1
-    REF=$(wait_for_ref_ready "$branch_or_ref")
-    CLONE_REF="$branch_or_ref"
-    # Every timed run must consume the exact artifact selected before the
-    # sample. Upstream branches can advance even during ten repetitions.
-    AT_REF="$REF"
-    echo "  resolved $branch_or_ref -> $REF"
+    # `add` already admitted the default branch's tip.
+    REF="$ADMITTED_COMMIT"
+    [ -n "$REF" ] || { fields="$(post_build HEAD)"; REF="${fields%%$'\t'*}"; ADMITTED_BRANCH="${fields#*$'\t'}"; }
+    CLONE_REF="${ADMITTED_BRANCH:-HEAD}"
   fi
+  wait_for_commit_ready "$REF" 1200 || return 1
+  AT_REF="$REF"
+  echo "  resolved admitted $CLONE_REF -> $REF"
 
   # Persist the resolved commit so a multi-rate sweep stays on the same tip even
   # if the upstream branch moves while later rates run.
@@ -683,7 +579,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The repo has to be added before the server will answer /refs, /sync or a clone
+# The repo has to be added before the server will build or serve a clone
 # for it. Admission and the entire artifact-readiness wait happen before any
 # clone timer in run_one starts; build time is reported separately, never
 # included in a clone result.

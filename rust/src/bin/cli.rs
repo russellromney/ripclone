@@ -8,6 +8,7 @@ use ripclone::config::ProviderEntry;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
 use ripclone::provider::{ProviderInstance, ProviderKind, ProviderRegistry, RepoId};
+use ripclone::validation::Selector;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
@@ -76,7 +77,7 @@ enum Commands {
     /// Make a repo available and admit its exact first build; returns fast.
     Add {
         repo: String,
-        /// Wait for the admitted commit's Full artifacts before returning.
+        /// Wait until every output of the admitted commit is ready.
         #[arg(long)]
         wait: bool,
     },
@@ -84,18 +85,16 @@ enum Commands {
     List,
     /// Remove a repository from the configured server's added set.
     Rm { repo: String },
-    /// Admit the exact branch tip for a background sync; returns fast unless --at is used.
+    /// Admit the default branch tip, or `--at` a commit, branch or tag, for a
+    /// build; returns fast unless --at or --wait is used. Failed outputs of
+    /// that commit are built again.
     Sync {
         repo: String,
-        /// Git history depth to mirror. 1 gives a shallow clonepack; 0 means no
-        /// depth limit (full history). Defaults to the server's configured default.
-        #[arg(short, long)]
-        depth: Option<usize>,
-        /// Resolve this git rev instead of the branch tip (e.g. "HEAD~5" or a
-        /// SHA). The resolved commit is the build and result identity.
+        /// Build this full commit SHA, branch or tag instead of the default
+        /// branch tip, and wait for it.
         #[arg(long)]
         at: Option<String>,
-        /// Wait for the admitted commit's Full artifacts before returning.
+        /// Wait until every output of the admitted commit is ready.
         #[arg(long)]
         wait: bool,
     },
@@ -114,8 +113,7 @@ enum Commands {
         /// to the value in `ripclone.toml` or 0.
         #[arg(long)]
         depth: Option<usize>,
-        /// Clone the artifacts built for this git rev (e.g. "HEAD~5") instead of
-        /// the branch tip. Pairs with `sync --at <rev>`.
+        /// Clone this full commit SHA, branch or tag instead of the branch tip.
         #[arg(long)]
         at: Option<String>,
         /// Print a per-phase benchmark report after the clone.
@@ -783,29 +781,28 @@ async fn run() -> Result<()> {
             }
             ProviderAction::Test { id, repo, branch } => {
                 let test_client = client.with_provider(&id);
-                let info = test_client.resolve_ref(&repo, &branch).await?;
+                let summary = test_client.post_build(&repo, &branch, false).await?;
                 println!(
                     "provider '{}' resolved {}@{} → {} (checkout: {})",
-                    id, repo, branch, info.commit, info.branch
+                    id,
+                    repo,
+                    branch,
+                    summary.commit,
+                    summary.checkout_name.as_deref().unwrap_or("detached")
                 );
             }
         },
         Commands::Add { repo, wait } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let client = client.with_provider(&provider);
+            let summary = client.add_repo(&repo_path).await?;
             if wait {
-                let info = client.add_repo(&repo_path).await?;
-                println!("added {} at {}", repo_path, info.commit);
+                let summary = client.wait_for_build(&repo_path, summary).await?;
+                println!("added {} at {}", repo_path, summary.commit);
+            } else if summary.ready() {
+                println!("added {}; already current at {}", repo_path, summary.commit);
             } else {
-                let admission = client.admit_add_repo(&repo_path).await?;
-                if admission.accepted {
-                    println!("added {}; accepted {}", repo_path, admission.commit);
-                } else {
-                    println!(
-                        "added {}; already current at {}",
-                        repo_path, admission.commit
-                    );
-                }
+                println!("added {}; accepted {}", repo_path, summary.commit);
             }
         }
         Commands::List => {
@@ -833,27 +830,22 @@ async fn run() -> Result<()> {
                 .await?;
             println!("removed {cli_name}");
         }
-        Commands::Sync {
-            repo,
-            depth,
-            at,
-            wait,
-        } => {
+        Commands::Sync { repo, at, wait } => {
+            if let Some(at) = at.as_deref() {
+                Selector::parse(at)?;
+            }
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let client = client.with_provider(&provider);
-            let depth = depth.or(config.clone.depth);
-            if let Some(at) = at.as_deref() {
-                let info = client.sync_repo_at(&repo_path, Some(at), depth).await?;
-                println!("synced {} to {}", repo_path, info.commit);
-            } else if wait {
-                let info = client.sync_repo(&repo_path, depth).await?;
-                println!("synced {} to {}", repo_path, info.commit);
+            if wait || at.is_some() {
+                let selector = at.as_deref().unwrap_or("HEAD");
+                let summary = client.build_and_wait(&repo_path, selector).await?;
+                println!("synced {} to {}", repo_path, summary.commit);
             } else {
-                let admission = client.admit_sync_repo(&repo_path, depth).await?;
-                if admission.accepted {
-                    println!("accepted {}", admission.commit);
+                let summary = client.post_build(&repo_path, "HEAD", true).await?;
+                if summary.ready() {
+                    println!("already current at {}", summary.commit);
                 } else {
-                    println!("already current at {}", admission.commit);
+                    println!("accepted {}", summary.commit);
                 }
             }
         }
@@ -868,6 +860,9 @@ async fn run() -> Result<()> {
             no_metrics,
             verify_upstream,
         } => {
+            if let Some(at) = at.as_deref() {
+                Selector::parse(at)?;
+            }
             let mode = resolve_mode(mode, config.clone.mode.as_deref())?;
             if mode.needs_prebuilt_blob_pack() {
                 ripclone::git::require_system_git()?;
@@ -986,20 +981,7 @@ async fn run() -> Result<()> {
                 .split_once('/')
                 .map(|(o, n)| (o.to_string(), n.to_string()))
                 .unwrap_or(("".to_string(), repo_path.clone()));
-            let info = client.sync_repo(&repo_path, None).await?;
-            let commit = if branch == "HEAD" {
-                info.commit
-            } else {
-                client
-                    .resolve_exact_result(
-                        &repo_path,
-                        &branch,
-                        ripclone::ExactResultKind::Full,
-                        None,
-                    )
-                    .await?
-                    .commit
-            };
+            let commit = client.build_and_wait(&repo_path, &branch).await?.commit;
             println!("building archive for {} at {}", repo_path, &commit[..7]);
             let start = std::time::Instant::now();
             let stats = tokio::task::spawn_blocking(move || {
