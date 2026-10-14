@@ -547,7 +547,7 @@ async fn run_provider_add(
     let kind_str = kind.as_deref().unwrap_or("generic");
     let kind_parsed: ProviderKind = kind_str.parse()?;
 
-    // Preset kinds (GitHub/GitLab/Bitbucket) get their default host from
+    // Preset kinds (GitHub, GitLab) get their default host from
     // ProviderRegistry::merge_one when the registry is loaded. Custom hosts are
     // still honored if supplied, but never hardcoded here.
 
@@ -627,7 +627,7 @@ async fn run_provider_rm(id: &str) -> Result<()> {
 }
 
 /// Exit codes, so scripts and agents can route a failure without parsing text.
-/// Documented in docs/CLI.md.
+/// Documented in the README.
 mod exit {
     pub const FAILURE: u8 = 1;
     // 2 is clap's usage error.

@@ -29,21 +29,8 @@ message ClonepackManifest {
   // commits and immutable.
   repeated ChunkRef archive_chunks = 5;
 
-  // Head-blobs pack + idx contain every HEAD blob object. They are optional:
-  // direct-install needs them so `git checkout-index` can materialize files,
-  // but archive-extraction can skip them because the working tree is built
-  // from archive chunks.
-  //
-  // The pack is split into multiple content-addressed chunks so the client can
-  // fetch it in parallel. The chunks are concatenated in order to reconstruct
-  // the original pack file.
-  // The complete object pack for the requested depth: commits, trees, and every
-  // blob reachable from HEAD (and from the last `depth` commits). Built with
-  // `git pack-objects --window=0` so objects are undeltified. This is the single
-  // pack the client installs and materializes the working tree from. Split into
-  // content-addressed chunks for parallel fetch; the chunks concatenate in order
-  // to reconstruct the pack. (Field names are historical; the pack now carries
-  // the full closure, not only HEAD blobs.)
+  // No build writes these two fields. The status route still counts the
+  // chunks they name in a stored manifest.
   repeated ChunkRef head_blobs_chunks = 8;
   ChunkRef head_blobs_idx = 7;
 
