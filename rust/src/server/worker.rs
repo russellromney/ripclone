@@ -397,6 +397,17 @@ async fn record_published(
     }
 }
 
+async fn repo_lock(
+    locks: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    repo_id: &RepoId,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let key = repo_id.storage_key();
+    let mut map = locks.lock().await;
+    map.entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Fetch `commit` into the mirror under the process-wide fetch cap. The
 /// caller holds the repo lock.
 async fn fetch_commit(
