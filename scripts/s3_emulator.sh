@@ -37,18 +37,23 @@ sha256() {
 cache="${RIPCLONE_TOOL_CACHE:-$HOME/.cache/ripclone-tools}/versitygw-$VERSION-$asset"
 bin="$cache/versitygw"
 if [ ! -x "$bin" ]; then
+  # Parallel tests install at the same time. Each one unpacks into its own
+  # directory and renames the binary into place, so no process ever runs a
+  # half-written file.
   mkdir -p "$cache"
-  tarball="$cache/versitygw.tar.gz"
-  curl -fsSL --retry 3 --max-time 120 -o "$tarball" \
+  tmp="$(mktemp -d "$cache/install.XXXXXX")"
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL --retry 3 --max-time 120 -o "$tmp/versitygw.tar.gz" \
     "https://github.com/versity/versitygw/releases/download/$VERSION/versitygw_${VERSION}_${asset}.tar.gz"
-  got="$(sha256 "$tarball")"
+  got="$(sha256 "$tmp/versitygw.tar.gz")"
   if [ "$got" != "$sha" ]; then
-    rm -f "$tarball"
     echo "error: versitygw checksum mismatch: got $got, want $sha" >&2
     exit 1
   fi
-  tar -xzf "$tarball" -C "$cache" --strip-components=1
-  rm -f "$tarball"
+  tar -xzf "$tmp/versitygw.tar.gz" -C "$tmp" --strip-components=1
+  mv -f "$tmp/versitygw" "$bin"
+  rm -rf "$tmp"
+  trap - EXIT
 fi
 
 # Bind port 0 and ask the OS which port the process got. Choosing a free
