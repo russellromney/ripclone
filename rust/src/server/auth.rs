@@ -18,8 +18,13 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
-/// Simple in-memory token-bucket rate limiter keyed by real client IP.
-/// The map is bounded and pruned periodically to avoid unbounded memory growth.
+/// In-memory token-bucket rate limiter keyed by real client IP.
+///
+/// The map holds at most `max_entries` buckets. When a new key would pass that
+/// bound, one sweep drops every bucket that has refilled (the same as no
+/// bucket) or sat idle for an hour, then the least recently seen until half
+/// the bound is left. A sweep is O(n) and frees at least n/2 slots, so `check`
+/// is O(1) amortized.
 #[derive(Clone)]
 pub struct RateLimiter {
     buckets: Arc<StdMutex<HashMap<String, (Instant, f64)>>>,
@@ -27,6 +32,8 @@ pub struct RateLimiter {
     restore_rate_per_sec: f64,
     max_entries: usize,
 }
+
+const RATE_LIMIT_IDLE: Duration = Duration::from_secs(3600);
 
 impl RateLimiter {
     pub fn new(max_burst: u32, restore_rate_per_sec: f64) -> Self {
@@ -47,27 +54,14 @@ impl RateLimiter {
         let now = Instant::now();
         // Recover from a poisoned mutex rather than wedging the server.
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Prune stale entries before adding a new one.
-        let stale_threshold = Duration::from_secs(3600);
-        buckets.retain(|_, (last, _)| now.duration_since(*last) < stale_threshold);
         if buckets.len() >= self.max_entries && !buckets.contains_key(key) {
-            // Map is full of live entries and this IP is new: evict the oldest.
-            if let Some(oldest) = buckets
-                .iter()
-                .min_by_key(|(_, (last, _))| *last)
-                .map(|(k, _)| k.clone())
-            {
-                buckets.remove(&oldest);
-            }
+            self.sweep(&mut buckets, now);
         }
 
         let entry = buckets
             .entry(key.to_string())
             .or_insert_with(|| (now, f64::from(self.max_burst)));
-        let elapsed = now.duration_since(entry.0).as_secs_f64();
-        entry.1 =
-            (entry.1 + elapsed * self.restore_rate_per_sec).clamp(0.0, f64::from(self.max_burst));
+        entry.1 = self.tokens(*entry, now);
         entry.0 = now;
         let allowed = if entry.1 < 1.0 {
             false
@@ -77,6 +71,32 @@ impl RateLimiter {
         };
         drop(buckets);
         allowed
+    }
+
+    /// Tokens in a bucket at `now`, after refill.
+    fn tokens(&self, (last, tokens): (Instant, f64), now: Instant) -> f64 {
+        let elapsed = now.duration_since(last).as_secs_f64();
+        (tokens + elapsed * self.restore_rate_per_sec).clamp(0.0, f64::from(self.max_burst))
+    }
+
+    fn sweep(&self, buckets: &mut HashMap<String, (Instant, f64)>, now: Instant) {
+        let full = f64::from(self.max_burst);
+        buckets.retain(|_, bucket| {
+            now.duration_since(bucket.0) < RATE_LIMIT_IDLE && self.tokens(*bucket, now) < full
+        });
+        let keep = self.max_entries / 2;
+        if buckets.len() <= keep {
+            return;
+        }
+        let mut by_age: Vec<(Instant, String)> = buckets
+            .iter()
+            .map(|(key, (last, _))| (*last, key.clone()))
+            .collect();
+        let evict = by_age.len() - keep;
+        by_age.select_nth_unstable(evict - 1);
+        for (_, key) in &by_age[..evict] {
+            buckets.remove(key);
+        }
     }
 }
 
@@ -354,11 +374,30 @@ mod tests {
 
         // Many distinct IPs should not grow the map without bound.
         for i in 0..20_000u64 {
-            let ip = format!("10.0.{}. {}", i / 256, i % 256);
+            let ip = format!("10.0.{}.{}", i / 256, i % 256);
             limiter.check(&ip);
+            let len = limiter.buckets.lock().unwrap().len();
+            assert!(len <= 10_000, "rate limiter map grew unbounded: {len}");
         }
-        let len = limiter.buckets.lock().unwrap().len();
-        assert!(len <= 10_000, "rate limiter map grew unbounded: {}", len);
+    }
+
+    #[test]
+    fn rate_limiter_sweep_drops_refilled_buckets_first() {
+        let mut limiter = RateLimiter::new(1, 1.0);
+        limiter.max_entries = 4;
+        for key in ["a", "b", "c", "d"] {
+            assert!(limiter.check(key));
+        }
+        // a and b have refilled; c and d are still empty.
+        for key in ["a", "b"] {
+            limiter.buckets.lock().unwrap().get_mut(key).unwrap().0 =
+                Instant::now() - Duration::from_secs(2);
+        }
+        assert!(limiter.check("e"));
+        let mut keys: Vec<String> = limiter.buckets.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["c", "d", "e"]);
+        assert!(!limiter.check("c"), "a sweep must not reset a live bucket");
     }
 
     #[test]
