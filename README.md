@@ -4,8 +4,8 @@
 
 # ripclone
 
-ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup;
-small repos are also a bit faster.
+ripclone is the fastest way to clone git repos. In our benchmarks, clones were
+6x-30x faster than `git clone` from GitHub.
 
 ripclone pre-builds git artifacts for every pushed commit so that agents, CI
 systems, and humans can clone a repo and start working in seconds instead of
