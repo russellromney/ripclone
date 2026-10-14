@@ -82,7 +82,7 @@ impl S3Storage {
         // this barely ever matters.
         //
         // Override with RIPCLONE_S3_REQUEST_TIMEOUT_SECS (e.g. tighter on
-        // localhost MinIO in tests). Must stay >0.
+        // a local S3 emulator in tests). Must stay >0.
         let request_timeout = env_duration_secs("RIPCLONE_S3_REQUEST_TIMEOUT_SECS", 30);
 
         // Retry budget. Transient 5xx / throttling / brief blips still retry;

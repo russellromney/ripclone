@@ -29,7 +29,7 @@ a unit test or it is not needed.
      fail `upload-pack` per caller credential, check auth headers, and move
      refs between steps.
    - **Fault proxy.** A reverse proxy in front of artifact URLs and, for S3,
-     in front of MinIO. Rules: cut after N bytes, 503 once, flip a byte, 404,
+     in front of the S3 emulator. Rules: cut after N bytes, 503 once, flip a byte, 404,
      drop Range support, expire a signed URL, fail PUTs.
    - **Process control.** SIGKILL and restart the server; restart it with
      different config.
@@ -111,7 +111,7 @@ Ripclone token reaches the origin.
 | F4 | One 503: retried, clone succeeds. | now |
 | F5 | Connection cut after N bytes: resumes with Range from the saved offset (proxy counts Range requests). | now |
 | F6 | Proxy without Range support: restarts only that artifact. | now |
-| F7 | MinIO: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes. | now |
+| F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes. | now |
 | F8 | SIGINT during install: no staging directory, marker, or partial file left; the next clone succeeds. | now |
 
 ### G. Clone shapes produce correct trees (5)
@@ -129,7 +129,7 @@ Ripclone token reaches the origin.
 | # | Test | Lands |
 |---|---|---|
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | now |
-| H2 | MinIO: same lifecycle; artifacts are in the bucket. | now |
+| H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | now |
 | H3 | A second server on the same control database is rejected before it binds. | now |
 | H4 | Table: invalid storage or control config is rejected before any side effect. | now (with #181) |
 
@@ -150,7 +150,7 @@ Total: 47 tests. Several are table-driven.
 ## What this deletes
 
 Per map-tests.md 6c: `e2e_sync_admission.rs`, `exact_results.rs`,
-`e2e_full_topup.rs` (except its MinIO refresh case, rewritten as F7),
+`e2e_full_topup.rs` (except its S3 refresh case, rewritten as F7),
 `client_surface.rs`, `e2e_freshness.rs`, `e2e_sync_head_timing.rs`,
 `e2e_roundtrip.rs`, the matrix and `lifecycle_battery` suites, the LSM and
 compaction suites (folded into G5), the split-storage harness, all `Probed*`
@@ -166,12 +166,12 @@ step 2, after the contract suite is green.
 
 - `test`: unit tests plus the contract suite, parallel. Target under 5 minutes
   after compile.
-- `s3`: F7 and H2 against MinIO.
+- `s3`: F7 and H2 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
 - `gitea`: the live Gitea provider job, unchanged.
 - `lint`, `musl`, `docker`, `cargo-deny`: unchanged.
 - Nightly: stress tests, benchmarks.
 
-Removed: the `lsm` passes, `turso-api-worker-minio`, `full-topup-minio`, the
+Removed: the `lsm` passes, `turso-api-worker-s3`, `full-topup-s3`, the
 `databases` stage, and the separate `e2e` script job (its cases are in G).
 
 ## Open points

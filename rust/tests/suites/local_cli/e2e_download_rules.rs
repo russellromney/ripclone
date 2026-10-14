@@ -1188,7 +1188,7 @@ async fn a_failed_clone_leaves_no_incomplete_cache_object() {
 }
 
 /// The credential rule has two halves. The signed-URL half (no Ripclone header)
-/// is proved against MinIO; this is the gateway half: the by-hash artifact route
+/// is proved against the S3 emulator; this is the gateway half: the by-hash artifact route
 /// is authenticated, the configured client credential reaches it, and a wrong or
 /// absent credential is refused there — permanently, since the gateway has no
 /// signed URL to refresh.
