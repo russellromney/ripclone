@@ -32,7 +32,12 @@ for i in $(seq 1 30); do
 done
 
 echo "==> syncing $REPO..."
-"$RIPCLONE" --server "$SERVER_URL" sync "$REPO" > "$BASE_DIR/sync.log" 2>&1
+"$RIPCLONE" --server "$SERVER_URL" add "$REPO" > "$BASE_DIR/sync.log" 2>&1
+# `sync --wait` gives up after about 70 s; run it again while the build runs.
+until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+  case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
+done
+echo "$out" >> "$BASE_DIR/sync.log"
 
 echo "==> cloning $MODE..."
 "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$BASE_DIR/$MODE" --mode "$MODE" > "$BASE_DIR/clone.log" 2>&1

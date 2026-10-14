@@ -17,6 +17,8 @@ REPO="${REPO:-oven-sh/bun}"
 LATENCY="${LATENCY:-0.05}"
 BANDWIDTH="${BANDWIDTH:-0}"
 ITER="${ITER:-3}"
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-token}"
+export RIPCLONE_SERVER_TOKEN
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -112,7 +114,12 @@ fi
 echo ""
 echo "==> Syncing mirror and building artifacts (one-time, no proxy)..."
 sync_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" sync "$REPO"
+"$RIPCLONE" --server "$SERVER_URL" add "$REPO"
+# `sync --wait` gives up after about 70 s; run it again while the build runs.
+until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+  case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
+done
+echo "$out"
 sync_end=$(now_ms)
 printf "sync=%d ms\n" $((sync_end - sync_start))
 
@@ -131,7 +138,7 @@ cas_path() {
   local h="$1"
   echo "$CAS_DIR/${h:0:2}/${h}"
 }
-AUTH_HASH=$(printf '%s' "${RIPCLONE_SERVER_TOKEN:-}" | shasum -a 256 | awk '{print $1}')
+AUTH_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
 # Read the default branch tip's Full output so we can report artifact sizes.
 commit=$(curl -fsS -X POST -H "Authorization: Ripclone $AUTH_HASH" -H 'Content-Type: application/json' -d '{"selector":"HEAD"}' \
   "$SERVER_URL/v1/repos/github/$OWNER/$NAME/builds" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
