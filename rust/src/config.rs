@@ -4,8 +4,8 @@
 //! optional project-level `ripclone.toml` discovered by walking up from the
 //! current directory. Environment variables and CLI flags still take precedence.
 //!
-//! Provider tokens may be declared here for self-host/server-side syncs. CLI
-//! session tokens are stored separately in the ripclone token file.
+//! Provider tokens may be declared here for self-host/server-side syncs. The
+//! CLI's saved server token is stored separately in the ripclone token file.
 
 use crate::provider::ProviderConfig;
 use anyhow::{Context, Result};
@@ -181,8 +181,8 @@ fn try_load_from(path: &Path) -> Result<Config> {
     toml::from_str(&data).with_context(|| format!("parse config {}", path.display()))
 }
 
-/// Save the global configuration. CLI session tokens are not written; use the
-/// token store for those.
+/// Save the global configuration. The saved server token is not written; use
+/// the token store for it.
 pub fn save(config: &Config) -> Result<()> {
     let path = global_config_path().context("no HOME for config path")?;
     save_to(&path, config)

@@ -91,8 +91,6 @@ pub mod meta;
 pub mod metrics;
 pub mod mode;
 #[doc(hidden)]
-pub mod oidc;
-#[doc(hidden)]
 pub mod overlay;
 pub mod pack;
 pub mod perf;

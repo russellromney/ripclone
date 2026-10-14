@@ -1,4 +1,4 @@
-//! File-based token storage for CLI session credentials.
+//! File-based storage for the CLI's saved server token.
 //!
 //! It never talks to the OS keychain/keyring.
 

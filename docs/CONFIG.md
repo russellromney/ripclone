@@ -39,7 +39,7 @@ Flags: `--cas-dir`, `--repo-root`, `--control-db`, `--host` (default
 | `RIPCLONE_PROVIDERS` | JSON provider registry. See [Providers](PROVIDERS.md). |
 | `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`, `RIPCLONE_S3_PREFIX` | S3-compatible artifact storage. Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. See [Server state and storage](BACKENDS.md). |
 | `RIPCLONE_S3_REQUEST_TIMEOUT_SECS`, `RIPCLONE_S3_MAX_ATTEMPTS`, `RIPCLONE_S3_MAX_RETRY_DELAY_MS` | S3 client timeouts and retries. |
-| `RIPCLONE_SIGNED_URL_TTL_SECS`, `RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS` | Signed artifact URL lifetimes for public and private repos. |
+| `RIPCLONE_SIGNED_URL_TTL_SECS` | Signed artifact URL lifetime, default 1200 seconds. |
 | `RIPCLONE_RETENTION_INTERVAL_SECS`, `RIPCLONE_RETENTION_MAX_AGE_DAYS`, `RIPCLONE_RETENTION_MAX_GB` | Trim the local build cache when S3 is the durable store. Never deletes S3 objects or published results. |
 | `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>` | Webhook secret per provider instance. See [Webhooks](WEBHOOKS.md). |
 | `RIPCLONE_WEBHOOK_ALLOWLIST` | Optional comma-separated repos that webhooks may build. |

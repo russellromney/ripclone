@@ -31,9 +31,6 @@ for bin in "$SERVER_BIN" "$CLI_BIN"; do
 done
 
 export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-smoke-token}"
-# Per-repo access enforcement probes the provider over HTTP and cannot reach a
-# file:// origin. Single-tenant local run; the shared token is the only auth.
-export RIPCLONE_TRUST_GATEWAY=1
 
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi; }
 TOKEN_HASH="$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | sha256)"

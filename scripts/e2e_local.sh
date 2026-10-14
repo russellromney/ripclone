@@ -25,10 +25,6 @@ export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-e2e-local-token}"
 # This script does `sync` then `clone`. Builds are always asynchronous: Head
 # publishes first, while Full and Files finish concurrently in the background,
 # so the clone helpers below retry until their requested result is ready.
-# Per-repo access enforcement (AU1) probes the provider over HTTP and can't
-# reach this file:// origin. This is a single-tenant local e2e, so use the
-# documented trust-mode escape hatch (the shared token is the only auth here).
-export RIPCLONE_TRUST_GATEWAY=1
 sha256() { if command -v sha256sum >/dev/null; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi; }
 TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | sha256)
 

@@ -9,9 +9,6 @@
 //! accepts bare `owner/repo` input for its configured default provider.
 //!
 //! Phase 3+ handoff notes:
-//! - Add OIDC / `Principal` / `authorize()` integration; `CredentialBroker` is
-//!   already the seam where a verified principal can influence credential
-//!   selection.
 //! - Add Tier-A token minting (`AppTokenBroker`) behind the same
 //!   `CredentialBroker` trait.
 //! - Add per-provider id charset validation rules once opaque paths can contain
