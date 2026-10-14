@@ -14,10 +14,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+pub use crate::net::{Fault, FaultProxy, GitHttp, Seen};
+
 pub const TOKEN: &str = "ripclone-contract-token";
 
 /// How long any wait in this suite may take before the test fails.
 pub const WAIT: Duration = Duration::from_secs(10);
+
+/// CLI env for clones that wait on a held build: 40 polls at 200 ms, so the
+/// CLI keeps polling for 8 s instead of giving up after 2 s.
+pub const SLOW_POLL: &[(&str, &str)] = &[("RIPCLONE_POLL_MS", "200")];
 
 /// A built binary. `RIPCLONE_BIN_DIR` points at prebuilt binaries (CI fan-out
 /// jobs); otherwise Cargo's own build of this package is used.
@@ -69,6 +75,9 @@ fn git_cmd() -> Command {
 /// Everything one test needs, under one temp dir.
 pub struct World {
     pub dir: TempDir,
+    /// Where the server and CLI find origins: `file://` by default, or the
+    /// URL of a [`GitHttp`] after [`World::serve_origins_over_http`].
+    origin_base: Mutex<String>,
 }
 
 impl Default for World {
@@ -83,7 +92,20 @@ impl World {
         for sub in ["origins", "server", "home", "work"] {
             std::fs::create_dir_all(dir.path().join(sub)).unwrap();
         }
-        Self { dir }
+        let origin_base = Mutex::new(format!("file://{}", dir.path().join("origins").display()));
+        Self { dir, origin_base }
+    }
+
+    /// Serve this world's origins over smart HTTP from now on, through a
+    /// server the test can gate. Start servers after calling this.
+    pub fn serve_origins_over_http(&self) -> GitHttp {
+        let http = GitHttp::start(self.path("origins"));
+        *self.origin_base.lock().unwrap() = http.url().to_string();
+        http
+    }
+
+    fn origin_base(&self) -> String {
+        self.origin_base.lock().unwrap().clone()
     }
 
     pub fn path(&self, sub: &str) -> PathBuf {
@@ -136,7 +158,7 @@ impl World {
     fn server_config(&self, env: &[(&str, &str)]) -> ServerConfig {
         ServerConfig {
             state: self.path("server"),
-            origins: self.path("origins"),
+            origin_base: self.origin_base(),
             env: env
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -144,12 +166,32 @@ impl World {
         }
     }
 
-    /// Run the CLI against `server` from this world's HOME.
-    pub fn cli(&self, server: &Server, args: &[&str]) -> CliOutput {
+    /// Run the CLI against `server` (a [`Server`] or a [`FaultProxy`] in
+    /// front of one) from this world's HOME.
+    pub fn cli(&self, server: &impl Endpoint, args: &[&str]) -> CliOutput {
         self.cli_env(server, args, &[])
     }
 
-    pub fn cli_env(&self, server: &Server, args: &[&str], env: &[(&str, &str)]) -> CliOutput {
+    pub fn cli_env(
+        &self,
+        server: &impl Endpoint,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> CliOutput {
+        self.cli_spawn_env(server, args, env).wait()
+    }
+
+    /// Start the CLI without waiting for it.
+    pub fn cli_spawn(&self, server: &impl Endpoint, args: &[&str]) -> RunningCli {
+        self.cli_spawn_env(server, args, &[])
+    }
+
+    pub fn cli_spawn_env(
+        &self,
+        server: &impl Endpoint,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> RunningCli {
         let home = self.path("home");
         let mut cmd = Command::new(bin("ripclone"));
         cmd.args(args)
@@ -162,20 +204,22 @@ impl World {
             .env("RIPCLONE_CONFIG", home.join("ripclone.toml"))
             .env("RIPCLONE_SERVER", server.url())
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
-            .env("RIPCLONE_ORIGIN_BASE", origin_base(&self.path("origins")))
+            .env("RIPCLONE_ORIGIN_BASE", self.origin_base())
             .env("RIPCLONE_NO_METRICS", "1")
             .env("RIPCLONE_POLL_MS", "50")
             .stdin(Stdio::null());
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let started = Instant::now();
-        let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-        let output = wait_output(child.expect("spawn ripclone"), Duration::from_secs(60));
-        CliOutput {
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ripclone");
+        RunningCli {
             args: args.iter().map(|a| a.to_string()).collect(),
-            output,
-            elapsed: started.elapsed(),
+            child,
+            started: Instant::now(),
         }
     }
 
@@ -183,10 +227,50 @@ impl World {
     pub fn target(&self, name: &str) -> PathBuf {
         self.path("home").join(name)
     }
+
+    /// Clone staging dirs and markers (`<target>.ripclone-*`) left in HOME.
+    pub fn staging_leftovers(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.path("home"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".ripclone-"))
+            .collect();
+        names.sort();
+        names
+    }
 }
 
-fn origin_base(origins: &Path) -> String {
-    format!("file://{}", origins.display())
+/// Something the CLI can talk to as its server.
+pub trait Endpoint {
+    fn url(&self) -> String;
+}
+
+/// A CLI process started with [`World::cli_spawn`].
+pub struct RunningCli {
+    args: Vec<String>,
+    child: Child,
+    started: Instant,
+}
+
+impl RunningCli {
+    pub fn wait(self) -> CliOutput {
+        let output = wait_output(self.child, Duration::from_secs(60));
+        CliOutput {
+            args: self.args,
+            output,
+            elapsed: self.started.elapsed(),
+        }
+    }
+
+    /// Send SIGINT, as Ctrl-C would.
+    pub fn interrupt(&self) {
+        let status = Command::new("kill")
+            .args(["-INT", &self.child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -INT failed");
+    }
 }
 
 /// Wait for a child, killing it if it outlives `limit`.
@@ -358,7 +442,7 @@ fn ls_files_to_tree(ls_files: &str) -> String {
 
 struct ServerConfig {
     state: PathBuf,
-    origins: PathBuf,
+    origin_base: String,
     env: Vec<(String, String)>,
 }
 
@@ -383,7 +467,7 @@ impl ServerConfig {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("RIPCLONE_CONFIG", state.join("ripclone.toml"))
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
-            .env("RIPCLONE_ORIGIN_BASE", origin_base(&self.origins))
+            .env("RIPCLONE_ORIGIN_BASE", &self.origin_base)
             // file:// origins cannot answer the provider's access probe; the
             // shared token is the only auth in these single-tenant tests.
             .env("RIPCLONE_TRUST_GATEWAY", "1")
@@ -454,10 +538,6 @@ impl Server {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-    }
-
-    pub fn url(&self) -> &str {
-        &self.url
     }
 
     /// Everything the server printed so far.
@@ -535,9 +615,18 @@ impl Server {
     }
 }
 
+impl Endpoint for Server {
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.kill();
+        if std::thread::panicking() {
+            eprintln!("--- ripclone-server log ---\n{}", self.log());
+        }
     }
 }
 

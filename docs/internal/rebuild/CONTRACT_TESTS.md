@@ -64,7 +64,7 @@ against the CLI) or the plan step that introduces the behavior.
 
 | # | Test | Lands |
 |---|---|---|
-| B1 | With the origin holding the server's fetch: 5 concurrent clones plus a webhook for B produce one build. All installs are B. | now |
+| B1 | With the origin holding the server's fetch: 5 concurrent clones plus a sync for B produce one build. All installs are B. (Webhooks are I4.) | now |
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | now |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | now |
 
@@ -86,7 +86,7 @@ against the CLI) or the plan step that introduces the behavior.
 | D2 | Proxy rewrites a later poll to name a different commit: integrity error, no target directory. | now |
 | D3 | Pinned commit removed upstream before it is built: clone fails and does not fall back to the branch. | now |
 | D4 | `--wait` with Full(B) pending and `background_slots = 0`: the CLI waits, reports pending, and exits at its timeout without installing anything else. | step 4 |
-| D5 | 401, 403, 404 and 5xx from the server give distinct CLI errors and exit codes. | now |
+| D5 | 401, 403, 404 and 5xx from the server give distinct CLI errors and exit codes. | later (the CLI exits 1 for every error today) |
 
 ### E. Top-up (4)
 
@@ -112,7 +112,7 @@ Ripclone token reaches the origin.
 | F5 | Connection cut after N bytes: resumes with Range from the saved offset (proxy counts Range requests). | now |
 | F6 | Proxy without Range support: restarts only that artifact. | now |
 | F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes. | now |
-| F8 | SIGINT during install: no staging directory, marker, or partial file left; the next clone succeeds. | now |
+| F8 | SIGINT during the download: no target directory; the next clone into the same path succeeds and leaves no staging directory or marker. | now |
 
 ### G. Clone shapes produce correct trees (5)
 
@@ -181,9 +181,21 @@ first PR added the harness, the bound-address log line, `RIPCLONE_POLL_MS`
 (replacing `RIPCLONE_TEST_REF_POLL_MS` and `RIPCLONE_TEST_SYNC_POLL_MS`), and
 A1-A4, A6, G1-G5, H1, H3, I1, I5.
 
+The second PR added the fault tools in `rust/tests/contract/net.rs`: a gated
+smart-HTTP origin (`git http-backend` behind a gate that parks upload-pack
+fetches but still answers ref listings) and a fault proxy in front of the
+server (cut, flip, truncate, status, hold, ignore Range, rewrite). With them:
+B1-B3, D1-D3, F1-F6 and F8. It also runs the suite in parallel in CI, which
+exposed a server race: a pinned ref lookup could read "result missing" just
+before the build published it and "no job active" just after, and answer 409.
+The lookup now rereads the result before failing.
+
+The CLI has no SIGINT handler, so an interrupted clone leaves its staging
+directory; the next clone into the same parent removes it. F8 checks that.
+
 ## Open points
 
 - C1, C2, D4 and E1 depend on `background_slots`, which arrives in step 3. Until
   then, the "now" tests run against today's main.
-- Next: the gated origin and fault proxy (B, D, F), then integrations (I3, I4,
-  I7) and the S3 rows (F7, H2).
+- D5 needs the CLI to map server statuses to distinct exit codes.
+- Next: integrations (I3, I4, I7) and the S3 rows (F7, H2).
