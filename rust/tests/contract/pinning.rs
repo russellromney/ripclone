@@ -1,6 +1,7 @@
 //! D. A clone pins the commit it first resolved.
 
 use crate::harness::*;
+use std::os::unix::fs::PermissionsExt;
 
 /// D1: the branch moves to C while a clone of B downloads; the clone installs
 /// B.
@@ -172,7 +173,10 @@ fn d5_server_failures_have_distinct_exit_codes() {
 /// code and leave nothing behind: a target that exists and is not empty
 /// (exit 1, its files untouched), an unreachable server (exit 6), and no
 /// `git` on PATH for an editable clone (exit 1, before any request). A Files
-/// clone does not need git.
+/// clone does not need git. Like `git clone`, an existing empty directory is
+/// a valid target: the clone lands in it and keeps its permissions, and a
+/// failed clone (unreachable server, no git, artifacts failing mid-clone)
+/// leaves it in place and empty.
 #[test]
 fn d6_client_side_failures_leave_nothing() {
     let world = World::new();
@@ -244,6 +248,68 @@ fn d6_client_side_failures_leave_nothing() {
     }
     for target in [&unreachable_target, &no_git_target] {
         assert!(!target.exists(), "failed clone left {}", target.display());
+    }
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+
+    let empty = |name: &str| {
+        let dir = world.target(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        dir
+    };
+    let into_empty = empty("d6-empty");
+    world
+        .cli(&proxy, &["clone", "acme/d6", into_empty.to_str().unwrap()])
+        .ok();
+    assert_eq!(listing(&into_empty), origin.tree(&tip));
+    assert_eq!(git(&into_empty, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(git(&into_empty, &["status", "--porcelain"]), "");
+    let mode = std::fs::metadata(&into_empty).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o750,
+        "the clone changed the directory's mode"
+    );
+
+    let empty_unreachable = empty("d6-empty-unreachable");
+    let out = world.cli(
+        &Closed::new(),
+        &[
+            "clone",
+            "acme/d6",
+            empty_unreachable.to_str().unwrap(),
+            "--verify-upstream",
+            "never",
+        ],
+    );
+    assert_eq!(out.code(), Some(6), "{}", out.err());
+    let empty_no_git = empty("d6-empty-no-git");
+    let out = world.cli_env(
+        &proxy,
+        &["clone", "acme/d6", empty_no_git.to_str().unwrap()],
+        &no_git_env,
+    );
+    assert_eq!(out.code(), Some(1), "{}", out.err());
+    // Every artifact download fails, so the clone fails after it has staged.
+    let failing = FaultProxy::start(&server);
+    failing.fault_artifacts(Fault::Status(503), 0, usize::MAX);
+    let empty_failing = empty("d6-empty-failing");
+    let out = world.cli(
+        &failing,
+        &["clone", "acme/d6", empty_failing.to_str().unwrap()],
+    );
+    assert_eq!(out.code(), Some(6), "{}", out.err());
+    assert!(
+        !failing.artifact_gets().is_empty(),
+        "no artifact was fetched"
+    );
+    for dir in [&empty_unreachable, &empty_no_git, &empty_failing] {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{} is gone: {e}", dir.display()))
+            .count();
+        assert_eq!(entries, 0, "{} is not empty", dir.display());
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o750, "{}", dir.display());
     }
     assert_eq!(world.staging_leftovers(), Vec::<String>::new());
 

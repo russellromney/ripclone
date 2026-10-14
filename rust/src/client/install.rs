@@ -4,7 +4,8 @@
 
 use super::download::{Artifact, Downloaded, OutputUrls, Sink, UrlSlot};
 use super::staging::{
-    AbortOnDrop, Cleanup, CloseOnDrop, GitChild, Staging, publish, spawn_reaper, temp_install_dir,
+    AbortOnDrop, Cleanup, CloseOnDrop, GitChild, Staging, check_target, publish, spawn_reaper,
+    temp_install_dir,
 };
 use super::tuning::{self, ClientTuning};
 use super::{
@@ -93,7 +94,8 @@ fn validate_manifest_commit(manifest: &ClonepackManifest, commit: &str) -> Resul
 }
 
 impl Client {
-    /// Clone `request` into `target`, which must not exist. Downloads the
+    /// Clone `request` into `target`, which must be missing or an empty
+    /// directory. Downloads the
     /// prebuilt `.git` and working tree of one ready output and lays them
     /// down directly; the server already ran every git step.
     pub async fn clone_repo(
@@ -109,11 +111,7 @@ impl Client {
             target.display(),
             request.kind
         );
-        anyhow::ensure!(
-            !target.exists(),
-            "target directory already exists: {}",
-            target.display()
-        );
+        let keep = check_target(target)?;
         let mut local_bench = Benchmark::new();
         let bench = bench.unwrap_or(&mut local_bench);
         crate::perf::reset_perf_counters();
@@ -149,7 +147,7 @@ impl Client {
             let root = self
                 .materialize(repo_path, &pin, &plan, target, &staging, &cleanup, bench)
                 .await?;
-            publish(&root, target)
+            publish(&root, target, keep)
         }
         .await;
         drop(close_on_drop);
