@@ -54,15 +54,14 @@ async fn admin_get(
         .expect("admin get request")
 }
 
-async fn spawn_persistent_server(root: &Path, port: u16) -> tokio::process::Child {
-    spawn_persistent_server_env(root, port, &[]).await
+async fn spawn_persistent_server(root: &Path) -> (tokio::process::Child, String) {
+    spawn_persistent_server_env(root, &[]).await
 }
 
 async fn spawn_persistent_server_env(
     root: &Path,
-    port: u16,
     extra_env: &[(&str, &str)],
-) -> tokio::process::Child {
+) -> (tokio::process::Child, String) {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ripclone-server"));
     command
         .env_clear()
@@ -84,32 +83,11 @@ async fn spawn_persistent_server_env(
         .arg(root.join("repos"))
         .arg("--control-db")
         .arg(root.join("control.db"))
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stderr(Stdio::null());
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let child = command.spawn().unwrap();
-    let ready = format!("http://127.0.0.1:{port}/readyz");
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if reqwest::get(&ready)
-                .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("persistent server became ready within the bound");
-    child
+    spawn_server_binary(command).await
 }
 
 async fn exact_row_json(control_path: &Path, repo_key: &str, commit: &str) -> String {
@@ -446,9 +424,7 @@ async fn repository_config_survives_server_restart_and_drives_embedded_job_snaps
     let commit = origin.commit(&[("value.txt", "persisted config\n")], "configured");
     origin.publish();
 
-    let first_port = free_port();
-    let first_url = format!("http://127.0.0.1:{first_port}");
-    let mut first = spawn_persistent_server(root.path(), first_port).await;
+    let (mut first, first_url) = spawn_persistent_server(root.path()).await;
     let stored = reqwest::Client::new()
         .post(format!("{first_url}/v1/admin/config/acme/restart-config"))
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -461,9 +437,7 @@ async fn repository_config_survives_server_restart_and_drives_embedded_job_snaps
     first.kill().await.unwrap();
     first.wait().await.unwrap();
 
-    let second_port = free_port();
-    let second_url = format!("http://127.0.0.1:{second_port}");
-    let mut second = spawn_persistent_server(root.path(), second_port).await;
+    let (mut second, second_url) = spawn_persistent_server(root.path()).await;
     let persisted: serde_json::Value = reqwest::Client::new()
         .get(format!("{second_url}/v1/admin/config/acme/restart-config"))
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -546,9 +520,7 @@ async fn published_local_results_and_artifacts_survive_cache_retention_restart()
     );
     origin.publish();
 
-    let first_port = free_port();
-    let first_url = format!("http://127.0.0.1:{first_port}");
-    let mut first = spawn_persistent_server(root.path(), first_port).await;
+    let (mut first, first_url) = spawn_persistent_server(root.path()).await;
     let first_client = ripclone::client::Client::new_with_token(first_url, Some(token_hash()));
     first_client
         .add_repo("acme/durable-local")
@@ -584,11 +556,8 @@ async fn published_local_results_and_artifacts_survive_cache_retention_restart()
         filetime::set_file_mtime(artifact, old).unwrap();
     }
 
-    let second_port = free_port();
-    let second_url = format!("http://127.0.0.1:{second_port}");
-    let mut second = spawn_persistent_server_env(
+    let (mut second, second_url) = spawn_persistent_server_env(
         root.path(),
-        second_port,
         &[
             ("RIPCLONE_RETENTION_INTERVAL_SECS", "1"),
             ("RIPCLONE_RETENTION_MAX_AGE_DAYS", "1"),

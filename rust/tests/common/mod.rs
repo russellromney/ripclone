@@ -5,12 +5,14 @@
 //! `ripclone::client::Client` then drives real sync + clone round-trips.
 #![allow(dead_code)]
 
+pub mod server_bin;
+#[allow(unused_imports)]
+pub use server_bin::spawn_server_binary;
+
 use anyhow::Context;
 use prost::Message;
 use ripclone::client::Client;
-use ripclone::server::{
-    ArtifactBarrier, RateLimiter, ServerState, build_app, run_server_with_barrier,
-};
+use ripclone::server::{ArtifactBarrier, RateLimiter, ServerState, build_app, run_server_on};
 use ripclone::storage::{StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -112,65 +114,31 @@ pub fn token_hash() -> String {
     hex::encode(Sha256::digest(TOKEN.as_bytes()))
 }
 
-/// Hand out a distinct loopback port per call, process-wide.
-///
-/// Binding `:0`, reading the port, then dropping the listener leaves a window
-/// where the OS can re-hand the same freed port to a *concurrent* test's
-/// `free_port()` before the first test's server binds it. Two servers then
-/// target one port: the loser's bind fails silently, but its readiness probe
-/// connects to the winner's listener and passes — so the loser runs against the
-/// winner and, once the winner's `#[tokio::test]` runtime drops (killing its
-/// listener), the loser's next request hits a dead port ("Connection refused").
-/// CI runs the test binaries sequentially, so a monotonically-growing issued set
-/// (ports stay reserved by live servers for the whole run) makes collisions
-/// within a binary impossible.
-pub(crate) fn free_port() -> u16 {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static ISSUED: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
-    let mut guard = ISSUED.lock().unwrap_or_else(|e| e.into_inner());
-    let issued = guard.get_or_insert_with(HashSet::new);
-    for _ in 0..1000 {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if issued.insert(port) {
-            return port;
-        }
-    }
-    panic!("free_port: no unused loopback port after 1000 attempts");
+/// Bind a loopback listener on port 0 and keep it. The server serves on this
+/// listener, so the port is never free between choosing and binding it.
+fn loopback_listener() -> tokio::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    listener.set_nonblocking(true).unwrap();
+    tokio::net::TcpListener::from_std(listener).unwrap()
 }
 
-/// Wait for the actual HTTP service, not merely for the listener socket.
-///
-/// A raw TCP connect can succeed in the narrow interval before Axum is ready
-/// to serve requests. Requiring two consecutive `/readyz` responses also
-/// catches a listener that starts and then immediately exits during parallel
-/// test startup.
-async fn wait_for_server_ready(port: u16, label: &str) {
+/// Wait until the server answers `/readyz`. The listener is already bound,
+/// so connections queue until the app starts serving.
+async fn wait_for_server_ready(url: &str, label: &str) {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{port}/readyz");
-    let mut consecutive = 0;
+    let readyz = format!("{url}/readyz");
     for _ in 0..400 {
         if client
-            .get(&url)
+            .get(&readyz)
             .send()
             .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
+            .is_ok_and(|response| response.status().is_success())
         {
-            consecutive += 1;
-            if consecutive == 2 {
-                return;
-            }
-        } else {
-            consecutive = 0;
+            return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("{label} server on port {port} did not become HTTP-ready");
+    panic!("{label} server at {url} did not become HTTP-ready");
 }
 
 /// A running in-process server. Keeps its storage dir alive for the test.
@@ -798,22 +766,18 @@ async fn start_server_split_storage_inner(
     }
 
     let app = build_app(state);
-    // Choose the port only when the listener is ready to spawn. Selecting it
-    // before constructing the server leaves a long unbound window in which an
-    // unrelated process can claim it.
-    let port = free_port();
+    let listener = loopback_listener();
+    let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let _ = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await;
     });
-    wait_for_server_ready(port, "split-storage").await;
+    wait_for_server_ready(&url, "split-storage").await;
     Server {
-        url: format!("http://127.0.0.1:{port}"),
+        url,
         cas_dir,
         storage_dir,
         repo_root,
@@ -1166,9 +1130,8 @@ async fn start_server_inner(
     let (cas2, repos2) = (cas_dir.clone(), repo_root.clone());
 
     let _start_guard = SERVER_START_LOCK.lock().await;
-    // Tests can queue on SERVER_START_LOCK for several seconds. Do not choose
-    // a free port until this server can actually start binding it.
-    let port = free_port();
+    let listener = loopback_listener();
+    let url = format!("http://{}", listener.local_addr().unwrap());
     let fail_first_original = std::env::var_os("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
     let extra_original = extra_env
         .iter()
@@ -1188,16 +1151,14 @@ async fn start_server_inner(
         }
     }
     tokio::spawn(async move {
-        if let Err(error) =
-            run_server_with_barrier(&cas2, &repos2, "127.0.0.1", port, artifact_barrier).await
-        {
-            eprintln!("default test server on port {port} exited: {error:#}");
+        if let Err(error) = run_server_on(listener, &cas2, &repos2, artifact_barrier).await {
+            eprintln!("default test server exited: {error:#}");
         }
     });
     // Wait for the HTTP service. The server state (including the fault
     // threshold read) is constructed before `/readyz` can succeed, so by then
     // the temporary env vars have been consumed.
-    wait_for_server_ready(port, "default").await;
+    wait_for_server_ready(&url, "default").await;
     if fail_first > 0 {
         // SAFETY: restored under the same construction lock used for the
         // temporary override.
@@ -1220,7 +1181,7 @@ async fn start_server_inner(
     }
     drop(_start_guard);
     Server {
-        url: format!("http://127.0.0.1:{port}"),
+        url,
         storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
@@ -1402,7 +1363,6 @@ pub struct HttpOrigin {
     pub work: PathBuf,
     pub bare: PathBuf,
     pub url: String,
-    pub port: u16,
     auth_log: Option<PathBuf>,
     _dir: TempDir,
     _server: std::process::Child,
@@ -1568,22 +1528,30 @@ fn make_http_origin_inner(repo_path: &str, auth_policy: Option<HttpOriginAuth>) 
     git(&bare, &["config", "http.receivepack", "true"]);
     git(&bare, &["update-server-info"]);
 
-    let port = free_port();
-    let auth_log = auth_policy.as_ref().map(|_| dir.path().join("auth.log"));
-    let server = if let Some(auth_policy) = auth_policy {
-        // A tiny real HTTP server that gates every request on the exact
-        // Authorization header ripclone is expected to inject.
-        let script = dir.path().join("auth_server.py");
-        let script_body = r#"import http.server
+    let auth_log = dir.path().join("auth.log");
+    std::fs::write(&auth_log, "").unwrap();
+    let (fetch_auth, alternate_discovery_auth) = match &auth_policy {
+        None => (String::new(), String::new()),
+        Some(HttpOriginAuth::Exact(fetch)) => (fetch.clone(), String::new()),
+        Some(HttpOriginAuth::DiscoveryAlternate {
+            fetch,
+            alternate_discovery,
+        }) => (fetch.clone(), alternate_discovery.clone()),
+    };
+    let auth_log = auth_policy.is_some().then_some(auth_log);
+    // A tiny real HTTP server. With an expected Authorization header it gates
+    // every request on it; with none it serves everything. It binds port 0
+    // and prints the port it got, so no other process can take it first.
+    let script = dir.path().join("origin_server.py");
+    let script_body = r#"import http.server
 import os
 import socketserver
 import sys
 
 EXPECTED_AUTH = sys.argv[1]
 ALTERNATE_DISCOVERY_AUTH = sys.argv[2]
-PORT = int(sys.argv[3])
-ROOT = sys.argv[4]
-LOG = sys.argv[5]
+ROOT = sys.argv[3]
+LOG = sys.argv[4]
 
 class AuthHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -1594,6 +1562,8 @@ class AuthHandler(http.server.SimpleHTTPRequestHandler):
         return path.endswith('/info/refs') or path.endswith('/HEAD')
 
     def check_auth(self):
+        if not EXPECTED_AUTH:
+            return True
         auth = self.headers.get('Authorization')
         return auth == EXPECTED_AUTH or (
             ALTERNATE_DISCOVERY_AUTH and
@@ -1629,59 +1599,40 @@ class AuthHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-class ReusableTCPServer(socketserver.TCPServer):
-    allow_reuse_address = True
+class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
 
-with ReusableTCPServer(('', PORT), AuthHandler) as httpd:
+with Server(('127.0.0.1', 0), AuthHandler) as httpd:
+    print(httpd.server_address[1], flush=True)
     httpd.serve_forever()
 "#;
-        std::fs::write(&script, script_body).unwrap();
-        let log = auth_log.as_ref().expect("auth log path");
-        std::fs::write(log, "").unwrap();
-        let (fetch_auth, alternate_discovery_auth) = match auth_policy {
-            HttpOriginAuth::Exact(fetch) => (fetch, String::new()),
-            HttpOriginAuth::DiscoveryAlternate {
-                fetch,
-                alternate_discovery,
-            } => (fetch, alternate_discovery),
-        };
-        Command::new("python3")
-            .arg(script.to_str().unwrap())
-            .arg(fetch_auth)
-            .arg(alternate_discovery_auth)
-            .arg(port.to_string())
-            .arg(dir.path().to_str().unwrap())
-            .arg(log.to_str().unwrap())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("start python auth http.server")
-    } else {
-        Command::new("python3")
-            .arg("-m")
-            .arg("http.server")
-            .arg(port.to_string())
-            .current_dir(dir.path())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("start python http.server")
-    };
-
-    // Wait for the server to accept connections.
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    std::fs::write(&script, script_body).unwrap();
+    let mut server = Command::new("python3")
+        .arg(script.to_str().unwrap())
+        .arg(fetch_auth)
+        .arg(alternate_discovery_auth)
+        .arg(dir.path().to_str().unwrap())
+        .arg(dir.path().join("auth.log").to_str().unwrap())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start python origin server");
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(server.stdout.take().unwrap()),
+        &mut line,
+    )
+    .unwrap();
+    let port: u16 = line
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("python origin did not report its port: {line:?}"));
 
     HttpOrigin {
         path: repo_path.to_string(),
         work,
         bare,
         url: format!("http://127.0.0.1:{port}"),
-        port,
         auth_log,
         _dir: dir,
         _server: server,

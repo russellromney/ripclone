@@ -51,18 +51,33 @@ if [ ! -x "$bin" ]; then
   rm -f "$tarball"
 fi
 
-port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-endpoint="http://127.0.0.1:$port"
+# Bind port 0 and ask the OS which port the process got. Choosing a free
+# port first and passing it in races with every other process on the host.
+# versitygw's banner echoes the requested port, so read the socket instead.
+listen_port() { # pid
+  if command -v lsof >/dev/null; then
+    lsof -nP -a -p "$1" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n.*:\([0-9]*\)$/\1/p' | head -1
+  else
+    ss -Hltnp 2>/dev/null | grep "pid=$1," | awk '{print $4}' | sed 's/.*://' | head -1
+  fi
+}
+
 mkdir -p "$data_dir/store"
 nohup "$bin" --access "$ACCESS_KEY" --secret "$SECRET_KEY" --region "$REGION" \
-  --port "127.0.0.1:$port" posix "$data_dir/store" \
+  --port "127.0.0.1:0" posix "$data_dir/store" \
   </dev/null >"$data_dir/versitygw.log" 2>&1 &
 pid=$!
 
 # Any HTTP status means the listener is up; 000 means not yet.
+port=""
+code="000"
 for _ in $(seq 1 100); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "$endpoint/" || true)"
-  [ "$code" != "000" ] && break
+  kill -0 "$pid" 2>/dev/null || break
+  [ -n "$port" ] || port="$(listen_port "$pid" || true)"
+  if [ -n "$port" ]; then
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$port/" || true)"
+    [ "$code" != "000" ] && break
+  fi
   sleep 0.1
 done
 if [ "$code" = "000" ]; then
@@ -71,6 +86,7 @@ if [ "$code" = "000" ]; then
   cat "$data_dir/versitygw.log" >&2
   exit 1
 fi
+endpoint="http://127.0.0.1:$port"
 
 curl -fsS --max-time 10 -X PUT --aws-sigv4 "aws:amz:$REGION:s3" \
   --user "$ACCESS_KEY:$SECRET_KEY" "$endpoint/$bucket" >/dev/null

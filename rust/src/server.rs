@@ -7764,8 +7764,7 @@ async fn run_server_with_barrier_at_control(
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
     explicit_control_path: Option<&std::path::Path>,
-    host: &str,
-    port: u16,
+    listen: Listen<'_>,
     artifact_barrier: Option<ArtifactBarrier>,
 ) -> Result<()> {
     let default_control_path = repo_root.parent().unwrap_or(repo_root).join("control.db");
@@ -7891,7 +7890,6 @@ async fn run_server_with_barrier_at_control(
     spawn_poll_loop(state.clone(), poll_interval);
 
     let app = build_app(state);
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
     if require_repo_auth_from_env() {
         info!(
@@ -7902,7 +7900,15 @@ async fn run_server_with_barrier_at_control(
             "per-repo access enforcement OFF (RIPCLONE_TRUST_GATEWAY): any holder of the shared server token can read any cached repo — keep this backend network-isolated and single-tenant"
         );
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Bind only after config and control ownership are checked, so a rejected
+    // server never takes the port.
+    let listener = match listen {
+        Listen::Bound(listener) => listener,
+        Listen::Addr(host, port) => {
+            let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+            tokio::net::TcpListener::bind(addr).await?
+        }
+    };
     // Log the bound address, not the requested one: with `--port 0` this line
     // is how a caller learns the port.
     info!(
@@ -7917,6 +7923,13 @@ async fn run_server_with_barrier_at_control(
     Ok(())
 }
 
+/// Where the server listens: an address it binds itself, or a listener the
+/// caller already bound.
+enum Listen<'a> {
+    Addr(&'a str, u16),
+    Bound(tokio::net::TcpListener),
+}
+
 /// Run the server with any test artifact barrier installed via
 /// [`set_test_artifact_barrier`].
 pub async fn run_server(
@@ -7929,8 +7942,7 @@ pub async fn run_server(
         cas_dir,
         repo_root,
         None,
-        host,
-        port,
+        Listen::Addr(host, port),
         take_test_artifact_barrier(),
     )
     .await
@@ -7947,21 +7959,29 @@ pub async fn run_server_with_control(
         cas_dir,
         repo_root,
         Some(control_path),
-        host,
-        port,
+        Listen::Addr(host, port),
         take_test_artifact_barrier(),
     )
     .await
 }
 
-pub async fn run_server_with_barrier(
+/// Serve on a listener the caller already bound. Tests bind port 0 and keep
+/// the listener, so no other process can take the port between choosing and
+/// binding it.
+pub async fn run_server_on(
+    listener: tokio::net::TcpListener,
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
-    host: &str,
-    port: u16,
     artifact_barrier: Option<ArtifactBarrier>,
 ) -> Result<()> {
-    run_server_with_barrier_at_control(cas_dir, repo_root, None, host, port, artifact_barrier).await
+    run_server_with_barrier_at_control(
+        cas_dir,
+        repo_root,
+        None,
+        Listen::Bound(listener),
+        artifact_barrier,
+    )
+    .await
 }
 
 #[cfg(test)]

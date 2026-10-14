@@ -246,13 +246,23 @@ pub trait Endpoint {
     fn url(&self) -> String;
 }
 
-/// A local address with nothing listening, for "server unreachable".
-pub struct Closed(String);
+/// A local address with nothing listening, for "server unreachable". The
+/// socket is bound but never listens, so connects are refused and no other
+/// process can take the port while the test runs.
+pub struct Closed {
+    url: String,
+    _socket: tokio::net::TcpSocket,
+}
 
 impl Closed {
     pub fn new() -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        Self(format!("http://{}", listener.local_addr().unwrap()))
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = format!("http://{}", socket.local_addr().unwrap());
+        Self {
+            url,
+            _socket: socket,
+        }
     }
 }
 
@@ -264,7 +274,7 @@ impl Default for Closed {
 
 impl Endpoint for Closed {
     fn url(&self) -> String {
-        self.0.clone()
+        self.url.clone()
     }
 }
 
