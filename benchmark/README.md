@@ -45,7 +45,7 @@ the variables documented in that script.
 ## Local and focused tools
 
 - `latency.sh` runs through the local latency/bandwidth proxy.
-- `matrix.sh` sweeps cores, RTT, and bandwidth across clone modes.
+- `matrix.sh` sweeps RTT at a fixed bandwidth for one clone mode.
 - `profile_one.sh` profiles one shaped cell.
 - `archive.sh` measures archive compression and artifact size.
 - `measure_archive.sh` measures archive extraction.

@@ -1047,7 +1047,6 @@ async fn config_is_absent_until_written(backend: &dyn Backend) {
     assert_eq!(store.get_config(&missing).await.unwrap(), None);
     let config = RepoConfig {
         compression_level: Some(3),
-        archive_chunk_size: Some(1024),
         ..Default::default()
     };
     store.set_config(&repo(), &config).await.unwrap();

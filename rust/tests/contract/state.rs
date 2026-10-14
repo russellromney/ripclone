@@ -266,16 +266,10 @@ fn h7_repo_config_survives_restart() {
     let world = World::new();
     let mut server = world.server(&[]);
     let path = "/v1/admin/config/github/acme/h7";
-    let config = serde_json::json!({
-        "clonepack_depths": [
-            { "name": "shallow", "depth": 1 },
-            { "name": "full", "depth": null }
-        ],
-        "compression_level": 9,
-        "archive_chunk_size": 8_388_608
-    });
+    let config = serde_json::json!({ "compression_level": 9 });
     let (status, stored) = api::parse(server.post_json(path, &config));
     assert_eq!(status, 200, "{stored}");
+    assert_eq!(stored, config);
 
     server.restart();
     let (status, read) = api::parse(server.get(path));

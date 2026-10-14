@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Matrix benchmark for the unified archive+blob-pack clone path.
-#
-# Sweeps cores (via fetch/write thread env vars), RTT, and a fixed bandwidth.
+# Clone time across RTTs at a fixed bandwidth, through the shaping proxy.
 #
 # Environment:
 #   REPO      - "owner/repo" to clone (default oven-sh/bun)
 #   BANDWIDTH - cap in Mbps (default 250)
 #   ITER      - runs per cell (default 3)
-#   CORES     - space-separated list (default "4 8")
 #   RTTS      - space-separated list in ms (default "50 125 250")
 
 REPO="${REPO:-oven-sh/bun}"
 MODE="${MODE:-editable}"
 BANDWIDTH="${BANDWIDTH:-250}"
 ITER="${ITER:-3}"
-CORES="${CORES:-4 8}"
 RTTS="${RTTS:-50 125 250}"
 RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-token}"
 export RIPCLONE_SERVER_TOKEN
@@ -64,7 +60,6 @@ trap cleanup EXIT
 
 echo "==> repo: $REPO"
 echo "==> bandwidth: ${BANDWIDTH} Mbps"
-echo "==> cores: $CORES"
 echo "==> rtts (ms): $RTTS"
 echo "==> iterations per cell: $ITER"
 echo "==> data dir: $BASE_DIR"
@@ -91,7 +86,12 @@ fi
 echo ""
 echo "==> Syncing mirror and building artifacts (one-time, no proxy)..."
 sync_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" sync "$REPO"
+"$RIPCLONE" --server "$SERVER_URL" add "$REPO"
+# `sync --wait` gives up after about 70 s; run it again while the build runs.
+until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+  case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
+done
+echo "$out"
 sync_end=$(now_ms)
 printf "sync=%d ms\n" $((sync_end - sync_start))
 
@@ -133,62 +133,54 @@ rm -rf "$BASE_DIR/warmup"
 
 echo ""
 echo "==> Matrix results (ms)"
-printf "%-6s %-8s %-10s %-12s %-12s %-12s\n" "cores" "rtt_ms" "avg_ms" "min_ms" "max_ms" "runs"
+printf "%-8s %-10s %-12s %-12s %-12s\n" "rtt_ms" "avg_ms" "min_ms" "max_ms" "runs"
 
-for cores in $CORES; do
-  # Simulate N cores by capping fetch/write threads to N-1 each, matching the
-  # default formula used in the extractor.
-  threads=$(( cores - 1 ))
-  if [ "$threads" -lt 1 ]; then threads=1; fi
+for rtt_ms in $RTTS; do
+  # LATENCY is one-way delay; RTT is two hops.
+  latency=$(awk "BEGIN {printf \"%.6f\", $rtt_ms/2000}")
 
-  for rtt_ms in $RTTS; do
-    # LATENCY is one-way delay; RTT is two hops.
-    latency=$(awk "BEGIN {printf \"%.6f\", $rtt_ms/2000}")
-
+  PROXY_PORT=$(( 10000 + RANDOM % 50000 ))
+  while [ "$PROXY_PORT" -eq "$SERVER_PORT" ]; do
     PROXY_PORT=$(( 10000 + RANDOM % 50000 ))
-    while [ "$PROXY_PORT" -eq "$SERVER_PORT" ]; do
-      PROXY_PORT=$(( 10000 + RANDOM % 50000 ))
-    done
-    PROXY_URL="http://127.0.0.1:$PROXY_PORT"
-
-    UPSTREAM_URL="http://127.0.0.1:$SERVER_PORT"
-    "$PROXY" "127.0.0.1:$PROXY_PORT" "$UPSTREAM_URL" "$latency" "$BANDWIDTH" --forward-auth \
-      > "$BASE_DIR/proxy-${cores}-${rtt_ms}.log" 2>&1 &
-    PROXY_PID=$!
-
-    for i in $(seq 1 30); do
-      if curl -fsS "$PROXY_URL/healthz" >/dev/null 2>&1; then break; fi
-      sleep 0.2
-    done
-    if ! curl -fsS "$PROXY_URL/healthz" >/dev/null 2>&1; then
-      echo "error: proxy failed to start for cores=$cores rtt=$rtt_ms"
-      cat "$BASE_DIR/proxy-${cores}-${rtt_ms}.log"
-      exit 1
-    fi
-
-    min_ms=999999
-    max_ms=0
-    total_ms=0
-    for n in $(seq 1 "$ITER"); do
-      install_dir="$BASE_DIR/install-${cores}-${rtt_ms}-${n}"
-      install_start=$(now_ms)
-      RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
-        "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$install_dir" --mode "$MODE" 2>&1
-      install_end=$(now_ms)
-      elapsed=$((install_end - install_start))
-      total_ms=$((total_ms + elapsed))
-      if [ "$elapsed" -lt "$min_ms" ]; then min_ms=$elapsed; fi
-      if [ "$elapsed" -gt "$max_ms" ]; then max_ms=$elapsed; fi
-    done
-
-    kill "$PROXY_PID" 2>/dev/null || true
-    wait "$PROXY_PID" 2>/dev/null || true
-    PROXY_PID=""
-
-    avg_ms=$((total_ms / ITER))
-    printf "%-6s %-8s %-10s %-12s %-12s %-12s\n" \
-      "$cores" "$rtt_ms" "$avg_ms" "$min_ms" "$max_ms" "$ITER"
   done
+  PROXY_URL="http://127.0.0.1:$PROXY_PORT"
+
+  UPSTREAM_URL="http://127.0.0.1:$SERVER_PORT"
+  "$PROXY" "127.0.0.1:$PROXY_PORT" "$UPSTREAM_URL" "$latency" "$BANDWIDTH" --forward-auth \
+    > "$BASE_DIR/proxy-${rtt_ms}.log" 2>&1 &
+  PROXY_PID=$!
+
+  for i in $(seq 1 30); do
+    if curl -fsS "$PROXY_URL/healthz" >/dev/null 2>&1; then break; fi
+    sleep 0.2
+  done
+  if ! curl -fsS "$PROXY_URL/healthz" >/dev/null 2>&1; then
+    echo "error: proxy failed to start for rtt=$rtt_ms"
+    cat "$BASE_DIR/proxy-${rtt_ms}.log"
+    exit 1
+  fi
+
+  min_ms=999999
+  max_ms=0
+  total_ms=0
+  for n in $(seq 1 "$ITER"); do
+    install_dir="$BASE_DIR/install-${rtt_ms}-${n}"
+    install_start=$(now_ms)
+    "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$install_dir" --mode "$MODE" 2>&1
+    install_end=$(now_ms)
+    elapsed=$((install_end - install_start))
+    total_ms=$((total_ms + elapsed))
+    if [ "$elapsed" -lt "$min_ms" ]; then min_ms=$elapsed; fi
+    if [ "$elapsed" -gt "$max_ms" ]; then max_ms=$elapsed; fi
+  done
+
+  kill "$PROXY_PID" 2>/dev/null || true
+  wait "$PROXY_PID" 2>/dev/null || true
+  PROXY_PID=""
+
+  avg_ms=$((total_ms / ITER))
+  printf "%-8s %-10s %-12s %-12s %-12s\n" \
+    "$rtt_ms" "$avg_ms" "$min_ms" "$max_ms" "$ITER"
 done
 
 echo ""

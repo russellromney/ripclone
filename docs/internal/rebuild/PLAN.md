@@ -1,10 +1,8 @@
 # Ripclone rebuild: keep, cut, redo
 
-Status: draft for decision, 2026-10-13. Based on origin/main `85cf0e0`.
-Evidence: the three code maps in this folder (`map-lifecycle.md`,
-`map-integrations.md`, `map-tests.md`) plus direct reading of `control.rs`
-admission, `server.rs` `get_ref_inner`, top-up, and the embedded worker loop.
-Nothing was compiled or run (local `protoc` is broken).
+Status: steps 1–5 are done; step 6 is in progress. See [Order of
+work](#order-of-work). The diagnosis below describes origin/main `85cf0e0`,
+before the rebuild.
 
 ## Diagnosis
 
@@ -213,14 +211,14 @@ the archive, so superseded docs are deleted, not moved.
 | Doc | Action |
 |---|---|
 | `docs/superpowers/`, both roadmaps, dated reports (`ADVERSARIAL_REVIEW`, `ARCHIVE_AB_RESULTS`, `WRITER_SCHEDULER_EXPERIMENT`, `WRITER_PERF_ANALYSIS`, `giant-repo-gate`) | Deleted (PR #182). |
-| `AGENTS.md`, `AUTH.md`, `SYNC.md`, `FRESHNESS.md`, `SYNC_LATENCY_PROFILE.md`, `SCALING_WORKERS.md`, `BUILD_OPTIONS.md`, `TROUBLESHOOTING.md`, `CHANGELOG.md`, `internal/GITHUB_INTEGRATION.md`, `internal/RELEASE_DRYRUN.md` | Deleted (PR #182). They described cut features, the admission machinery being replaced, nonexistent install paths, or pre-release history. Agent guidance and build requirements moved to the README and `CONTRIBUTING.md`; GitHub App settings moved to `CONFIG.md`. |
+| `AGENTS.md`, `AUTH.md`, `SYNC.md`, `FRESHNESS.md`, `SYNC_LATENCY_PROFILE.md`, `SCALING_WORKERS.md`, `BUILD_OPTIONS.md`, `TROUBLESHOOTING.md`, `CHANGELOG.md`, `internal/GITHUB_INTEGRATION.md`, `internal/RELEASE_DRYRUN.md` | Deleted (PR #182). They described cut features, the admission machinery being replaced, nonexistent install paths, or pre-release history. Agent guidance and build requirements moved to the README; GitHub App settings moved to `CONFIG.md`. |
 | `README.md`, `CONFIG.md`, `BACKENDS.md`, `PROVIDERS.md`, `WEBHOOKS.md` | Rewritten in PR #182 to the surface that stays. They omit features being cut. |
 | `DESIGN.md` | Kept. Becomes the target model as the control plane lands (step 3), including top-up. |
 | `ARTIFACT_LIFECYCLE.md`, `BENCHMARKS.md`, `benchmark/README.md`, `SECURITY.md`, `rust/README.md` | Kept. Benchmarks rerun at step 6. `docs/SUPPORT.md` (added by #171) folded into the README build section. |
-| `docs/internal/rebuild/map-*.md` | Delete when the rebuild finishes; they cite line numbers that will go stale. |
+| `docs/internal/rebuild/map-*.md` | Deleted at step 5. |
 
-A user doc for freshness (how a push becomes clonable, top-up, timings) is
-written at step 4, when top-up lands.
+`FRESHNESS.md` is the user doc for how a push becomes clonable, top-up, and
+timings.
 
 ## Order of work
 
@@ -230,8 +228,14 @@ Each step is a separate PR with green CI. No step mixes a cut with a redo.
    HTTP behavior that must survive, with external fault injection. They should
    pass on today's main where the contract is unchanged. Include top-up: a full
    clone right after a push must not wait for any server build step.
+   **Done:** #186, #188 (suite and faults), #189 (CLI exit codes and Ctrl-C),
+   #190 (port races), #191 (integrations), #192 (poll backoff), #193 (legacy
+   suites deleted).
 2. **Pure cuts.** Delete the Cut list, one area per PR, deleting the tests that
    only covered the removed code.
+   **Done:** #194 (test hooks), #195 (remote worker, Turso, size classes,
+   workers registry), #196 (one auth path), #197 (build toggles), #198 (dead
+   code), #199 (S3 emulator), #200 (unit tests), #201 (rustls).
 3. **Control plane.** Introduce the `builds` row model, the split API, one
    resolve function, leases, and capped sequencing. Delete `jobs`, `workers`,
    `meta/`, `queue/` adapters, and the hook suites that pinned them. No data
@@ -239,11 +243,18 @@ Each step is a separate PR with green CI. No step mixes a cut with a redo.
    is replaced here by an immutable scheme: Full(A) records a compacted Head
    base that the next Head(B) builds its delta against, because cutting the
    republish alone lets the Head delta grow without bound.
+   **Done:** #202 (`ControlStore` and `builds`), #203 (`POST builds`, `GET
+   commits`), #207 (bitmap writes off the request lock).
 4. **Client.** Resolver, download layer, install plan.
+   **Done:** #204 (resolve, plan, materialize, publish), #205 (top-up with
+   the user's git, `clone --wait`, `FRESHNESS.md`).
 5. **Module split and docs.** Split `server.rs`; make README, `CONFIG.md`, and
    `ARTIFACT_LIFECYCLE.md` match the code.
+   **Done:** #206 (`server.rs` split), #208 (contract gaps), #209 (follow-ups),
+   and the `docs/rebuild` branch (docs pass, unread `RepoConfig` keys removed).
 6. **Release work.** Benchmarks rerun on the final binaries, then the OSS gate.
+   **In progress:** benchmarks.
 
 Rough effect: `server.rs` from ~11k lines to ~4-5k across modules; production
 Rust from ~47k to somewhere near 35-38k; integration tests from 219 to ~50.
-These are estimates from the maps, not measurements.
+These were estimates, not measurements.

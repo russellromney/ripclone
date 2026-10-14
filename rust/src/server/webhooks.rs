@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             claim_admitted_job(&state).await.is_none(),
-            "ping must not enqueue"
+            "ping must not admit a build"
         );
     }
 
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             claim_admitted_job(&state).await.is_none(),
-            "non-default push must not enqueue"
+            "non-default push must not admit a build"
         );
     }
 
@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             claim_admitted_job(&state).await.is_none(),
-            "unlisted repo must not enqueue"
+            "unlisted repo must not admit a build"
         );
     }
 
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             claim_admitted_job(&state).await.is_none(),
-            "a tag push must not enqueue"
+            "a tag push must not admit a build"
         );
     }
 
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             claim_admitted_job(&state).await.is_none(),
-            "an invalid branch must not enqueue"
+            "an invalid branch must not admit a build"
         );
     }
 
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(
             claim_admitted_job(&state)
                 .await
-                .expect("allowlisted gitlab repo enqueues")
+                .expect("allowlisted gitlab repo admits a build")
                 .repo
                 .path,
             "group/sub/proj"

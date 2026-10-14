@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-token}"
+export RIPCLONE_SERVER_TOKEN
+AUTH="Authorization: Ripclone $(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')"
+
 WORKDIR=$(mktemp -d /tmp/ripclone-size.XXXXXX)
 PORT=${PORT:-18769}
 SERVER_PID=""
@@ -27,10 +31,10 @@ curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null || { echo "server did not s
 REPO="${REPO:-oven-sh/bun}"
 API="http://127.0.0.1:$PORT/v1/repos/github/$REPO"
 echo "==> Adding $REPO..."
-commit=$(curl -sf -X POST "$API/add" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
+commit=$(curl -sf -X POST -H "$AUTH" "$API/add" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
 echo "==> Waiting for the Files output of $commit..."
 while true; do
-  curl -sf "$API/commits/$commit?kind=files" > "$WORKDIR/sync.json"
+  curl -sf -H "$AUTH" "$API/commits/$commit?kind=files" > "$WORKDIR/sync.json"
   state=$(python3 -c 'import sys,json; print(json.load(open(sys.argv[1]))["state"])' "$WORKDIR/sync.json")
   [ "$state" = "pending" ] || break
   sleep 2
@@ -41,11 +45,10 @@ echo "==> CAS total"
 du -sh "$WORKDIR/cas"
 
 echo "==> Clonepack artifact sizes"
-python3 - "$WORKDIR/sync.json" "$WORKDIR/cas" "http://127.0.0.1:$PORT" <<'PY'
-import json, sys, os, urllib.request
+python3 - "$WORKDIR/sync.json" "$WORKDIR/cas" <<'PY'
+import json, sys, os
 sync = json.load(open(sys.argv[1]))
 cas = sys.argv[2]
-base = sys.argv[3]
 
 def size(h):
     p = os.path.join(cas, h[:2], h)
@@ -81,7 +84,7 @@ if not cpm_hash:
     print('no clonepack_manifest in sync response')
     sys.exit(0)
 
-cpm_data = urllib.request.urlopen(f'{base}/v1/artifacts/{cpm_hash}').read()
+cpm_data = open(os.path.join(cas, cpm_hash[:2], cpm_hash), 'rb').read()
 cpm = parse_message(cpm_data)
 meta_ref = cpm.get(4, [b''])[0]
 meta = parse_message(meta_ref)

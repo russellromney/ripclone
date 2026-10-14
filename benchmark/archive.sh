@@ -77,7 +77,12 @@ fi
 echo ""
 echo "==> Syncing mirror and building artifacts (one-time)..."
 sync_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" sync "$REPO"
+"$RIPCLONE" --server "$SERVER_URL" add "$REPO"
+# `sync --wait` gives up after about 70 s; run it again while the build runs.
+until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+  case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
+done
+echo "$out"
 sync_end=$(now_ms)
 printf "sync=%d ms\n" $((sync_end - sync_start))
 

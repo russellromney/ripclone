@@ -26,7 +26,8 @@ Per provider:
   (`after`). Other branches, tag pushes, deletes, and pings are acknowledged
   without a build.
 - The response is fast: `200` means accepted, not built.
-- No secret configured for the provider: `503`. Bad signature: `401`.
+- No secret configured for the provider: `503`. Bad signature: `401`. A
+  `generic` provider has no webhooks: `501`.
 - The signature is checked over the raw body, in constant time, before parsing.
 - The payload is used only to identify the repo and commit. It never selects a
   credential, and the server never fetches a URL from it.

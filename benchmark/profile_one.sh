@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Quick single-cell profile: Full vs Fast clone through shaped proxy.
+# One shaped cell: files, depth-1, and full clones through the shaping proxy.
 REPO="${REPO:-oven-sh/bun}"
 BANDWIDTH="${BANDWIDTH:-250}"
 RTT_MS="${RTT_MS:-50}"
-CORES="${CORES:-4}"
 RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-bench-token}"
 export RIPCLONE_SERVER_TOKEN
 
@@ -41,7 +40,12 @@ done
 
 echo "==> syncing $REPO..."
 sync_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" sync "$REPO" > "$BASE_DIR/sync.log" 2>&1
+"$RIPCLONE" --server "$SERVER_URL" add "$REPO" > "$BASE_DIR/sync.log" 2>&1
+# `sync --wait` gives up after about 70 s; run it again while the build runs.
+until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+  case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
+done
+echo "$out" >> "$BASE_DIR/sync.log"
 sync_end=$(now_ms)
 echo "sync=$((sync_end - sync_start)) ms"
 
@@ -71,41 +75,15 @@ for i in $(seq 1 30); do
   sleep 0.2
 done
 
-threads=$(( CORES - 1 )); [ "$threads" -lt 1 ] && threads=1
-
-wait_for_full() {
-  local timeout="${1:-300}"
-  local start end
-  start=$(now_ms)
-  echo ""
-  echo "==> waiting for full (depth=0) artifacts ..."
-  while true; do
-    if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$BASE_DIR/probe-full" --depth 0 >/dev/null 2>&1; then
-      rm -rf "$BASE_DIR/probe-full"
-      end=$(now_ms)
-      echo "full artifacts ready in $((end - start)) ms"
-      return 0
-    fi
-    rm -rf "$BASE_DIR/probe-full" 2>/dev/null || true
-    end=$(now_ms)
-    if [ $((end - start)) -ge $((timeout * 1000)) ]; then
-      echo "error: full artifacts not ready after ${timeout}s" >&2
-      return 1
-    fi
-    sleep 2
-  done
-}
-
 run_clone() {
   local label="$1" mode="$2" extra_args="$3" log="$4" outdir="$5"
   rm -rf "$outdir"
   echo ""
-  echo "==> cloning $label (mode=$mode cores=$CORES rtt=${RTT_MS}ms bw=${BANDWIDTH}Mbps)..."
+  echo "==> cloning $label (mode=$mode rtt=${RTT_MS}ms bw=${BANDWIDTH}Mbps)..."
   local s e
   s=$(now_ms)
   # shellcheck disable=SC2086
-  RUST_LOG=info RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
-    "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$outdir" --mode "$mode" $extra_args > "$log" 2>&1
+  RUST_LOG=info "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$outdir" --mode "$mode" $extra_args > "$log" 2>&1
   e=$(now_ms)
   echo "$label=$((e - s)) ms"
   echo "--- top log lines ---"
@@ -114,8 +92,6 @@ run_clone() {
 
 run_clone "files" files "" "$BASE_DIR/clone-files.log" "$BASE_DIR/install-files"
 run_clone "editable-depth1" editable "--depth 1" "$BASE_DIR/clone-editable-depth1.log" "$BASE_DIR/install-editable-depth1"
-
-wait_for_full
 
 run_clone "editable-full" editable "--depth 0" "$BASE_DIR/clone-editable-full.log" "$BASE_DIR/install-editable-full"
 

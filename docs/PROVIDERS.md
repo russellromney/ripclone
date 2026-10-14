@@ -1,8 +1,9 @@
 # Providers
 
-By default ripclone knows one host, the built-in `github` instance. To build
-from GitLab, Gitea/Forgejo/Codeberg, or a self-hosted host, register provider
-instances on the server with `RIPCLONE_PROVIDERS` or `config.toml`:
+By default ripclone knows one host, the built-in `github` instance
+(`github.com`). To build from GitLab, Gitea/Forgejo/Codeberg, or a self-hosted
+host, register provider instances with `RIPCLONE_PROVIDERS` or in
+`config.toml`:
 
 ```bash
 export RIPCLONE_PROVIDERS='{"providers":[
@@ -11,11 +12,40 @@ export RIPCLONE_PROVIDERS='{"providers":[
 ]}'
 ```
 
-Supported `kind` values: `github`, `gitlab`, `gitea`, `generic`. A `generic`
-host needs an `auth_template` (for example `"token {token}"`) so ripclone can
-build the auth header. Address a repo by instance id: `gitlab:mygroup/project`
-on the CLI, `/v1/repos/gitlab/mygroup/project/...` on the API.
+```toml
+[providers.company-gitea]
+kind = "gitea"
+host = "git.example.com"
+token = "gitea-token"
+```
 
-For private repos the server needs read access to the upstream: set a `token`
-on the provider instance, or use a GitHub App for GitHub (see
-[Configuration](CONFIG.md#github-app-credentials)).
+Each instance has:
+
+| Key | Meaning |
+|---|---|
+| `kind` | `github`, `gitlab`, `gitea` (also `forgejo`, `codeberg`), or `generic`. |
+| `host` | Hostname or base URL. Default `github.com` for `github` and `gitlab.com` for `gitlab`; required for the others. |
+| `token` | Read token for private repos. |
+| `auth_template` | How the token is sent, with one `{token}` placeholder, for example `"token {token}"`. Required for `generic`. |
+| `auth_header_name` | Header that carries the token. Default `Authorization`. |
+
+An entry with id `github` replaces the built-in instance's settings. In
+`RIPCLONE_PROVIDERS` the id is the `id` field; in `config.toml` it is the
+table name. A `[providers]` entry beats a `RIPCLONE_PROVIDERS` entry with the
+same id.
+
+Address a repo by instance id: `gitlab:mygroup/project` on the CLI,
+`/v1/repos/gitlab/mygroup/project/...` on the API.
+
+## Server and CLI
+
+The server needs the instance to build and serve its repos. For private repos
+it needs read access to the upstream: a `token` on the instance, or a GitHub
+App for GitHub (see [Configuration](CONFIG.md#github-app-credentials)).
+
+The CLI needs the instance too, to clone. A full clone that tops up fetches
+from the instance's host with your own git, and `--verify-upstream` reads the
+same host. The CLI never sends the instance's token to the ripclone server.
+`ripclone provider add <id> --kind <kind> --host <host>` writes an instance to
+the CLI's `config.toml`; `ripclone provider list` and `ripclone provider rm
+<id>` manage them.

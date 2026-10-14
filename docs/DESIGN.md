@@ -44,28 +44,20 @@ files mode needs Files. Each result is `pending`, `ready`, or `failed`.
 
 ### API
 
-Two routes carry every build and clone:
-
-- `POST /v1/repos/{provider}/{path}/builds` with `{"selector", "retry"}`
-  resolves the selector to one commit and admits a build of it. The selector
-  is `HEAD`, a full commit SHA (trusted as given), or a branch or tag name;
-  anything else is `400 invalid_selector`. `retry: true` also rebuilds failed
-  results. The answer is `{commit, checkout_name, head, files, full}`, each
-  result as `{state, error?}`.
-- `GET /v1/repos/{provider}/{path}/commits/{sha}?kind=head|full|files` reads
-  one result: a ready body with signed URLs, a pending body, or a failed body
-  with the error. Without `kind` it returns the same summary as the POST. It
-  never builds and is never cached.
+Two routes carry every build and clone. `POST /v1/repos/{provider}/{path}/builds`
+resolves a selector (`HEAD`, a full commit SHA, or a branch or tag name) to one
+commit and admits a build of it. `GET /v1/repos/{provider}/{path}/commits/{sha}?kind=head|full|files`
+reads one result: ready with its artifacts, pending, or failed. The GET never
+builds.
 
 A clone POSTs once, then polls the GET for the commit it was given, so a
 branch moving mid-clone cannot change what it installs. It uses the same GET
 to refresh expired URLs. While Full is pending, the GET offers a ready Full of
-an earlier commit (the ref's latest, or the parent) as `top_up`; a full clone
-installs that and fetches the rest with the user's own git from the URL its
-own provider config gives, so it never waits on the server (`--wait` opts
-out; see [Freshness](FRESHNESS.md)). Errors are `{error, code}`:
-`repo_not_added`, `repo_not_found`, `ref_not_found`, `build_not_found`,
-`upstream_unavailable` and `control_unavailable` among them.
+an earlier commit (the branch's latest, or the parent's) as `top_up`. A full
+clone installs that and fetches the rest with the user's own git from the URL
+its own provider config gives, so it never waits on the server (`--wait` opts
+out; see [Freshness](FRESHNESS.md)). Request and response shapes and error
+codes: [API](API.md).
 
 ### Content-defined chunking and cheap re-syncs
 
