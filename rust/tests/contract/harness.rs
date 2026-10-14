@@ -133,13 +133,27 @@ impl World {
     /// Start a server whose state lives in this world. `env` adds or
     /// overrides server env vars.
     pub fn server(&self, env: &[(&str, &str)]) -> Server {
-        Server::start(self.server_config(env))
+        self.server_with(ServerOpts {
+            env,
+            ..ServerOpts::default()
+        })
+    }
+
+    pub fn server_with(&self, opts: ServerOpts) -> Server {
+        Server::start(self.server_config(opts))
     }
 
     /// Start a server that must exit with an error before it listens. Returns
     /// what it printed.
     pub fn server_must_fail(&self, env: &[(&str, &str)]) -> String {
-        let mut cmd = self.server_config(env).command();
+        self.server_must_fail_with(ServerOpts {
+            env,
+            ..ServerOpts::default()
+        })
+    }
+
+    pub fn server_must_fail_with(&self, opts: ServerOpts) -> String {
+        let mut cmd = self.server_config(opts).command();
         let child = cmd.spawn().expect("spawn ripclone-server");
         let out = wait_output(child, WAIT);
         let text = format!(
@@ -155,14 +169,17 @@ impl World {
         text
     }
 
-    fn server_config(&self, env: &[(&str, &str)]) -> ServerConfig {
+    fn server_config(&self, opts: ServerOpts) -> ServerConfig {
         ServerConfig {
             state: self.path("server"),
             origin_base: self.origin_base(),
-            env: env
+            env: opts
+                .env
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            unset: opts.unset.iter().map(|k| k.to_string()).collect(),
+            control_flag: !opts.no_control_flag,
         }
     }
 
@@ -192,6 +209,27 @@ impl World {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> RunningCli {
+        self.cli_spawn_unset(server, args, env, &[])
+    }
+
+    /// Run the CLI with `unset` removed from the env the harness gives it.
+    pub fn cli_unset(
+        &self,
+        server: &impl Endpoint,
+        args: &[&str],
+        env: &[(&str, &str)],
+        unset: &[&str],
+    ) -> CliOutput {
+        self.cli_spawn_unset(server, args, env, unset).wait()
+    }
+
+    fn cli_spawn_unset(
+        &self,
+        server: &impl Endpoint,
+        args: &[&str],
+        env: &[(&str, &str)],
+        unset: &[&str],
+    ) -> RunningCli {
         let home = self.path("home");
         let mut cmd = Command::new(bin("ripclone"));
         cmd.args(args)
@@ -210,6 +248,9 @@ impl World {
             .stdin(Stdio::null());
         for (k, v) in env {
             cmd.env(k, v);
+        }
+        for k in unset {
+            cmd.env_remove(k);
         }
         let child = cmd
             .stdout(Stdio::piped())
@@ -246,22 +287,19 @@ pub trait Endpoint {
     fn url(&self) -> String;
 }
 
-/// A local address with nothing listening, for "server unreachable". The
-/// socket is bound but never listens, so connects are refused and no other
-/// process can take the port while the test runs.
+/// A local address nothing can listen on, for "server unreachable": port 0,
+/// which no process can bind. Connects fail at once on every OS (refused on
+/// Linux, "can't assign requested address" on macOS). A bound port that is
+/// not listening is refused on Linux but silently dropped on macOS, where the
+/// connect waits for a timeout.
 pub struct Closed {
     url: String,
-    _socket: tokio::net::TcpSocket,
 }
 
 impl Closed {
     pub fn new() -> Self {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let url = format!("http://{}", socket.local_addr().unwrap());
         Self {
-            url,
-            _socket: socket,
+            url: "http://127.0.0.1:0".to_string(),
         }
     }
 }
@@ -279,8 +317,7 @@ impl Endpoint for Closed {
 }
 
 /// A local address that accepts every connection and closes it at once, for
-/// "upstream broken". Fails fast on every OS, where a [`Closed`] port can take
-/// seconds to refuse on macOS.
+/// "upstream broken": the host is up but drops every request.
 pub struct Hangup {
     url: String,
 }
@@ -300,6 +337,32 @@ impl Hangup {
 }
 
 impl Endpoint for Hangup {
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+}
+
+/// A local address that accepts every connection and never answers, for
+/// "upstream hangs". Connections stay open until the test process exits.
+pub struct Silent {
+    url: String,
+}
+
+impl Silent {
+    pub fn new() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut open = Vec::new();
+            for stream in listener.incoming() {
+                open.push(stream);
+            }
+        });
+        Self { url }
+    }
+}
+
+impl Endpoint for Silent {
     fn url(&self) -> String {
         self.url.clone()
     }
@@ -504,10 +567,24 @@ fn ls_files_to_tree(ls_files: &str) -> String {
         .join("\n")
 }
 
+/// How to start a server, beyond the harness defaults.
+#[derive(Default)]
+pub struct ServerOpts<'a> {
+    /// Env vars to add or override.
+    pub env: &'a [(&'a str, &'a str)],
+    /// Harness env vars this server must not see.
+    pub unset: &'a [&'a str],
+    /// Leave out `--control-db`, so the server picks its control path from
+    /// env, config, or its default.
+    pub no_control_flag: bool,
+}
+
 struct ServerConfig {
     state: PathBuf,
     origin_base: String,
     env: Vec<(String, String)>,
+    unset: Vec<String>,
+    control_flag: bool,
 }
 
 impl ServerConfig {
@@ -517,10 +594,11 @@ impl ServerConfig {
         cmd.arg("--cas-dir")
             .arg(state.join("cache"))
             .arg("--repo-root")
-            .arg(state.join("repos"))
-            .arg("--control-db")
-            .arg(state.join("control.db"))
-            .args(["--host", "127.0.0.1", "--port", "0"])
+            .arg(state.join("repos"));
+        if self.control_flag {
+            cmd.arg("--control-db").arg(state.join("control.db"));
+        }
+        cmd.args(["--host", "127.0.0.1", "--port", "0"])
             .current_dir(state)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -540,6 +618,9 @@ impl ServerConfig {
             .stderr(Stdio::piped());
         for (k, v) in &self.env {
             cmd.env(k, v);
+        }
+        for k in &self.unset {
+            cmd.env_remove(k);
         }
         cmd
     }

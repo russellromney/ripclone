@@ -262,6 +262,12 @@ fn error_hint(status: u16, code: Option<&str>, is_cloud: bool) -> &'static str {
         (400, Some("invalid_selector"), _) => {
             "\n  → use HEAD, a full commit SHA, or a branch or tag name"
         }
+        (426, _, _) => {
+            "\n  → this CLI and the server speak different protocols; run `ripclone version` and update the older one"
+        }
+        (502, Some("upstream_unavailable"), _) => {
+            "\n  → the server could not reach the upstream git host; check the host, then retry"
+        }
         (502 | 503, _, _) => "\n  → ripclone is briefly unavailable; retry shortly",
         _ => "",
     }

@@ -170,6 +170,7 @@ fn a6_bad_requests_fail_without_building() {
     let target = world.target("not-added");
     let not_added = world.cli(&server, &["clone", "acme/a6", target.to_str().unwrap()]);
     assert!(!target.exists(), "failed clone left {}", target.display());
+    let not_added_sync = world.cli(&server, &["sync", "acme/a6", "--wait"]);
     let not_added_api = code(api::post_build(&server, "acme/a6", "HEAD", false));
 
     // Missing upstream: `add` resolves HEAD first and finds no repository.
@@ -196,7 +197,18 @@ fn a6_bad_requests_fail_without_building() {
     assert_eq!(queued(), before, "an unknown ref queued a build");
 
     let cases = [
-        ("not added", &not_added, not_added_api, "repo_not_added"),
+        (
+            "not added",
+            &not_added,
+            not_added_api.clone(),
+            "repo_not_added",
+        ),
+        (
+            "not added sync",
+            &not_added_sync,
+            not_added_api,
+            "repo_not_added",
+        ),
         ("missing upstream", &missing, missing_api, "repo_not_found"),
         (
             "unknown ref",
@@ -209,4 +221,93 @@ fn a6_bad_requests_fail_without_building() {
         assert_eq!(out.code(), Some(5), "{case}: {}", out.stderr());
         assert_eq!(api, (404, Some(want.to_string())), "{case}");
     }
+}
+
+/// A7: after `add`, the upstream fails. Each failure has its own error and
+/// exit code, and nothing builds; what was already built still clones by SHA.
+/// - The origin is deleted: `repo_not_found`, exit 5.
+/// - The origin accepts the connection and never answers: the server's
+///   `ls-remote` times out, `upstream_unavailable`, exit 6.
+#[test]
+fn a7_upstream_failure_after_add_builds_nothing() {
+    let world = World::new();
+    let origin = world.origin("acme", "a7");
+    let tip = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let mut server = world.server(&[]);
+    world.cli(&server, &["add", "acme/a7", "--wait"]).ok();
+    let queued = server.metric("ripclone_builds_queued_total");
+    let tree = origin.tree(&tip);
+
+    std::fs::remove_dir_all(&origin.bare).unwrap();
+    let deleted = run_a7_case(&world, &server, "deleted");
+    assert_eq!(server.metric("ripclone_builds_queued_total"), queued);
+
+    let silent = Silent::new();
+    server.restart_with(&[
+        ("RIPCLONE_ORIGIN_BASE", &silent.url()),
+        ("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", "1"),
+    ]);
+    let hangs = run_a7_case(&world, &server, "hangs");
+    // Counters start at zero in the restarted process.
+    assert_eq!(server.metric("ripclone_builds_queued_total"), 0);
+
+    let cases = [
+        (deleted, 5, (404, "repo_not_found"), "not found"),
+        (hangs, 6, (502, "upstream_unavailable"), "timed out"),
+    ];
+    for ((outs, api), exit, (status, code), text) in cases {
+        for out in &outs {
+            let err = out.err();
+            assert_eq!(out.code(), Some(exit), "{:?}: {err}", out.args);
+            assert!(err.contains(text), "{:?}: {err}", out.args);
+        }
+        assert_eq!(api, (status, Some(code.to_string())));
+    }
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+
+    let target = world.target("a7-by-sha");
+    world
+        .cli(
+            &server,
+            &[
+                "clone",
+                "acme/a7",
+                target.to_str().unwrap(),
+                "--at",
+                &tip,
+                "--verify-upstream",
+                "never",
+            ],
+        )
+        .ok();
+    assert_eq!(listing(&target), tree);
+}
+
+/// Clone and sync the branch, and admit it through the API.
+fn run_a7_case(
+    world: &World,
+    server: &Server,
+    case: &str,
+) -> (Vec<CliOutput>, (u16, Option<String>)) {
+    let target = world.target(&format!("a7-{case}"));
+    let clone = world.cli(
+        server,
+        &[
+            "clone",
+            "acme/a7",
+            target.to_str().unwrap(),
+            "--verify-upstream",
+            "never",
+        ],
+    );
+    assert!(
+        !target.exists(),
+        "{case}: failed clone left {}",
+        target.display()
+    );
+    let sync = world.cli(server, &["sync", "acme/a7"]);
+    let (status, body) = api::post_build(server, "acme/a7", "main", false);
+    let code = body["code"].as_str().map(str::to_string);
+    (vec![clone, sync], (status, code))
 }

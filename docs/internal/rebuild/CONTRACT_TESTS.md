@@ -49,7 +49,7 @@ a unit test or it is not needed.
 "Lands" says when a test can pass: **now** (passes on today's main, written
 against the CLI) or the plan step that introduces the behavior.
 
-### A. Resolve and admit (6)
+### A. Resolve and admit (7)
 
 | # | Test | Lands |
 |---|---|---|
@@ -58,7 +58,8 @@ against the CLI) or the plan step that introduces the behavior.
 | A3 | Push C, sync: exactly one new build; clone gets C. | now |
 | A4 | Clone at a full SHA of an older commit: detached checkout at that SHA. | now |
 | A5 | `--at HEAD~1` (a rev expression) is rejected with a clear error and no build. | step 3 PR B |
-| A6 | Table: repo not added, unknown ref, missing upstream repo. Each gives its own error code and no build. | now |
+| A6 | Table: repo not added (clone and sync), unknown ref, missing upstream repo. Each gives its own error code and no build. | now |
+| A7 | After `add`, the origin is deleted (`repo_not_found`, exit 5) or accepts and never answers (`RIPCLONE_LS_REMOTE_TIMEOUT_SECS=1`: `upstream_unavailable`, exit 6). Clone, sync and the API fail with no build; the built commit still clones by SHA. | now |
 
 ### B. Coalescing (3)
 
@@ -78,7 +79,7 @@ against the CLI) or the plan step that introduces the behavior.
 | C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | step 3 PR A (short lease) |
 | C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). | step 3 PR A |
 
-### D. Clone pins B (5)
+### D. Clone pins B (6)
 
 | # | Test | Lands |
 |---|---|---|
@@ -87,6 +88,7 @@ against the CLI) or the plan step that introduces the behavior.
 | D3 | Pinned commit removed upstream before it is built: clone fails and does not fall back to the branch. | now |
 | D4 | `--wait` with Full(B) pending and `background_slots = 0`: the CLI waits, reports pending, and exits at its timeout without installing anything else. | step 4 |
 | D5 | 401, 403, 404, 5xx, and an unreachable server give distinct CLI errors and exit codes (3, 4, 5, 6, 6; see the README). | now |
+| D6 | Client-side failures: target exists and is not empty (exit 1, its files untouched), server unreachable (exit 6), no `git` on PATH for an editable clone (exit 1, before any request). Nothing left behind; a Files clone works without git. | now |
 
 ### E. Top-up (4)
 
@@ -101,7 +103,7 @@ Top-up uses the user's git credentials. E1-E3 run against an auth-checking
 origin to prove the clone works with only git's own credential and that no
 Ripclone token reaches the origin.
 
-### F. Downloads (8)
+### F. Downloads (9)
 
 | # | Test | Lands |
 |---|---|---|
@@ -113,8 +115,9 @@ Ripclone token reaches the origin.
 | F6 | Proxy without Range support: restarts only that artifact. | now |
 | F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes. | now |
 | F8 | SIGINT during the download: exit 130, no target, staging directory, or marker left; the next clone succeeds. | now |
+| F9 | An artifact that answers 503 every time: exactly 3 attempts, then exit 6; no target, no staging. | now |
 
-### G. Clone shapes produce correct trees (5)
+### G. Clone shapes produce correct trees (10)
 
 | # | Test | Lands |
 |---|---|---|
@@ -123,17 +126,25 @@ Ripclone token reaches the origin.
 | G3 | Files mode: tree equals `git archive` of B, including symlinks and exec bits. | now |
 | G4 | Push, rewind force-push, and non-ancestor force-push in sequence: each new full clone equals the new tip. | now |
 | G5 | Enough pushes to seal and compact history levels: full clone stays complete. | now |
+| G6 | Small push after a 12 MiB tree: B's Files clone reuses chunks A's Files clone downloaded, the store grows by under half the tree, and B's tree is exact. | now |
+| G7 | Delete a file, then re-add the same bytes (same blob id): depth-1, full and Files clones of the tip all have it. | now |
+| G8 | Empty trees: a root commit with no files, and a later commit that deletes every file. Every shape installs an empty tree. | now |
+| G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | now |
+| G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | now |
 
-### H. Storage and server state (4)
+### H. Storage and server state (7)
 
 | # | Test | Lands |
 |---|---|---|
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | now |
 | H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | now |
 | H3 | A second server on the same control database is rejected before it binds. | now |
-| H4 | Table: invalid storage or control config is rejected before any side effect. | now (with #181) |
+| H4 | Table: invalid storage, control, rate-limit and worker config (file or env, malformed file, removed `[queue]` section) is rejected before anything is created in the state dir. | now |
+| H5 | Local disk with retention every second and a 1-day limit: the server reports retention off; month-old artifacts stay and clone. | now |
+| H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | now (S3 row) |
+| H7 | A repository's config (`/v1/admin/config`) survives a server restart. | now |
 
-### I. Auth, integrations, CLI (7)
+### I. Auth, integrations, CLI (11)
 
 | # | Test | Lands |
 |---|---|---|
@@ -144,8 +155,12 @@ Ripclone token reaches the origin.
 | I5 | Poller: with no webhook, a push is built within one poll interval. | now |
 | I6 | Every documented CLI verb exists (keep `docs_cli_surface`). | now |
 | I7 | `--verify-upstream` auto, always, never (table). | now |
+| I8 | Only `/healthz`, `/readyz`, `/metrics` and `/v1/version` answer without the token; unsigned webhooks fail closed (503 without a secret); every other route, `/v1/artifacts/{hash}` included, gives 401 to a missing or wrong token. | now |
+| I9 | A client declaring another protocol gets 426; the CLI names the mismatch and says to run `ripclone version`; nothing builds. | now |
+| I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | now |
+| I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | now |
 
-Total: 47 tests. Several are table-driven.
+Total: 62 tests. Several are table-driven.
 
 ## What this deletes
 
@@ -167,7 +182,7 @@ step 2, after the contract suite is green.
 - `test`: unit tests plus the contract suite, parallel. Target under 5 minutes
   after compile. The one S3 unit test (multipart upload) runs here against
   `scripts/s3_emulator.sh`, reusing the unit-test binary.
-- `s3`: C2, C3, F7 and H2 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
+- `s3`: C2, C3, F7, H2 and H6 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
 - `gitea`: the live Gitea provider job, unchanged.
 - `lint`, `musl`, `docker`, `cargo-deny`: unchanged.
 - Nightly: stress tests, benchmarks.
@@ -267,16 +282,24 @@ while the user's git fetches it; each checks tree, `rev-list --count`, and
 CLI's provider config gives, and that the Ripclone token never reached the
 origin. E4 holds the origin until the clone has polled B twice.
 
+The open-points PR closed the coverage gaps. New rows: A7, D6, F9, G6-G10,
+H4-H7, I8-I11; A6 also covers a sync of a repo that was never added. H4 no
+longer waits on #181 (closed unmerged): storage preflight already runs before
+the control database or any directory is created. The harness gained a
+`Silent` endpoint (accepts and never answers), `ServerOpts` (unset env, no
+`--control-db`), `World::cli_unset`, and a request-header override on the
+fault proxy (I9). `Closed` now points at port 0: a bound port that does not
+listen is refused on Linux but dropped on macOS, so D5 waited about 8 s there
+for a connect timeout. Bugs fixed: `--verify-upstream=always` on a Files clone
+only warned and skipped verification; it now fails before any download (I10).
+A 426 and a 502 `upstream_unavailable` now carry their own CLI hint instead of
+none and "ripclone is briefly unavailable" (I9, A7).
+
 ## Open points
 
-- Every "now" row has a contract test except H4, which waits on #181.
-- Behavior the deleted suites checked that no row covers yet, to add with the
-  matching step: the artifact-by-hash route needs the token (I1);
-  retention keeps durable artifacts (H1); A6 cases (not-added sync, origin
-  deleted after add, upstream hang); I7 in Files mode; a persistent 503 (F4);
-  incremental Files rebuild, depth-1 re-add of an identical blob, empty tree,
-  and concurrent builds of different branches (G); repo config survives
-  restart; config file discovery. The ControlStore conformance suite takes the
-  queue rules from `queue/sql.rs`, the stale-owner and ready-is-immutable
-  rules from `control.rs`, and lease reclaim from `e2e_sync_admission`.
-- Next: the deletions listed above.
+- Every row has a contract test.
+- Found while writing these rows, not fixed here: the server's git children
+  write `hint:` lines and bare SHAs into the server log; an existing empty
+  target directory is rejected, where `git clone` accepts it; an unparsable
+  `RIPCLONE_RETENTION_INTERVAL_SECS` or `RIPCLONE_POLL_INTERVAL_SECS` falls back
+  to the default instead of failing at startup.

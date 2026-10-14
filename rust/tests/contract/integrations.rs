@@ -432,3 +432,51 @@ fn i7_verify_upstream_moved_tip() {
         ],
     );
 }
+
+/// I10: a Files clone has no git objects to check against the upstream.
+/// `never` and `auto` clone without contacting the upstream (here a host that
+/// hangs up, which `auto` would warn about); `always` fails before any
+/// download.
+#[test]
+fn i10_verify_upstream_in_files_mode() {
+    let (world, server, origin, tip) = i7_world("i10");
+    let proxy = FaultProxy::start(&server);
+    let broken = Hangup::new();
+    let env = [("RIPCLONE_ORIGIN_BASE", broken.url())];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    for (mode, clones) in [("never", true), ("auto", true), ("always", false)] {
+        let target = world.target(&format!("i10-{mode}"));
+        let downloads = proxy.artifact_gets().len();
+        let out = world.cli_env(
+            &proxy,
+            &[
+                "clone",
+                "acme/i10",
+                target.to_str().unwrap(),
+                "--mode",
+                "files",
+                &format!("--verify-upstream={mode}"),
+            ],
+            &env,
+        );
+        if clones {
+            out.ok();
+            assert!(
+                !out.stderr().contains("verify-upstream"),
+                "{mode}: {}",
+                out.stderr()
+            );
+            assert_eq!(listing(&target), origin.tree(&tip), "{mode}");
+        } else {
+            let err = out.err();
+            assert_eq!(out.code(), Some(1), "{mode}: {err}");
+            assert!(
+                err.contains("cannot verify a files-mode clone"),
+                "{mode}: {err}"
+            );
+            assert!(!target.exists(), "failed clone left {}", target.display());
+            assert_eq!(proxy.artifact_gets().len(), downloads, "{mode} downloaded");
+            assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+        }
+    }
+}
