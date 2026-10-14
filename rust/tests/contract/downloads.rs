@@ -6,9 +6,9 @@ use crate::harness::*;
 /// Artifacts at least this large are the history pack holding the big blob.
 pub const BIG: usize = 1 << 20;
 
-/// Deterministic incompressible bytes.
-fn noise(len: usize) -> Vec<u8> {
-    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Deterministic incompressible bytes; each seed gives different bytes.
+pub fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0x2545_f491_4f6c_dd1d);
     (0..len)
         .map(|_| {
             x ^= x << 13;
@@ -23,7 +23,7 @@ fn noise(len: usize) -> Vec<u8> {
 /// streams one large history pack. Returns the origin and its tip.
 pub fn big_history_origin(world: &World, name: &str) -> (Origin, String) {
     let origin = world.origin("acme", name);
-    std::fs::write(origin.work.join("blob.bin"), noise(2 << 20)).unwrap();
+    std::fs::write(origin.work.join("blob.bin"), noise(0, 2 << 20)).unwrap();
     origin.commit(&[("README.md", "a\n")], "A");
     std::fs::write(origin.work.join("blob.bin"), "small\n").unwrap();
     let tip = origin.commit(&[("README.md", "b\n")], "B");
@@ -197,6 +197,27 @@ fn f4_one_503_is_retried() {
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
     git(&target, &["fsck", "--full"]);
     assert_eq!(listing(&target), origin.tree(&tip));
+}
+
+/// F9: an artifact that answers 503 every time is tried a bounded number of
+/// times (`RIPCLONE_FETCH_MAX_ATTEMPTS`, default 3), then the clone fails as
+/// "unavailable" (exit 6) and leaves no target and no staging.
+#[test]
+fn f9_persistent_503_fails_after_bounded_retries() {
+    let world = World::new();
+    let (_origin, _server, proxy, _tip) = big_history(&world, "f9");
+    proxy.fault_artifacts(Fault::Status(503), BIG, usize::MAX);
+
+    let target = world.target("f9");
+    let out = world.cli(&proxy, &["clone", "acme/f9", target.to_str().unwrap()]);
+    let err = out.err();
+
+    assert_eq!(out.code(), Some(6), "{err}");
+    assert!(err.contains("503"), "{err}");
+    let path = faulted_path(&proxy);
+    let statuses: Vec<u16> = big_gets(&proxy, &path).iter().map(|s| s.status).collect();
+    assert_eq!(statuses, [503, 503, 503]);
+    assert_clean_failure(&world, &target);
 }
 
 /// F5: a connection cut mid-body resumes with Range from the saved offset.

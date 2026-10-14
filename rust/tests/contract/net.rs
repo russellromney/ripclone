@@ -369,6 +369,8 @@ struct ProxyState {
     http: reqwest::Client,
     rules: Mutex<Vec<Rule>>,
     rewrites: Mutex<Vec<Rewrite>>,
+    /// Request headers set (replaced) before forwarding.
+    set_headers: Mutex<Vec<(header::HeaderName, header::HeaderValue)>>,
     ignore_range: AtomicBool,
     preserve_host: AtomicBool,
     gate: Gate,
@@ -393,6 +395,7 @@ impl FaultProxy {
                 .unwrap(),
             rules: Mutex::new(Vec::new()),
             rewrites: Mutex::new(Vec::new()),
+            set_headers: Mutex::new(Vec::new()),
             ignore_range: AtomicBool::new(false),
             preserve_host: AtomicBool::new(false),
             gate: Gate::new(),
@@ -468,6 +471,14 @@ impl FaultProxy {
         crate::harness::wait_for(&format!("{n} held response(s)"), || {
             (self.state.gate.waiting.load(Ordering::SeqCst) >= n).then_some(())
         });
+    }
+
+    /// Forward every request with header `name` set to `value`, replacing
+    /// what the client sent.
+    pub fn set_request_header(&self, name: &str, value: &str) {
+        let name = header::HeaderName::from_bytes(name.as_bytes()).unwrap();
+        let value = header::HeaderValue::from_str(value).unwrap();
+        self.state.set_headers.lock().unwrap().push((name, value));
     }
 
     /// Strip `Range` from requests, as a server without Range support would
@@ -551,6 +562,9 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
         if (keep_host || !HOP_HEADERS.contains(name)) && !drop_range {
             headers.append(name, value.clone());
         }
+    }
+    for (name, value) in state.set_headers.lock().unwrap().iter() {
+        headers.insert(name.clone(), value.clone());
     }
     let target = format!("{}{}", state.upstream, parts.uri);
     let upstream = state

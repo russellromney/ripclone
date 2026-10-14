@@ -221,3 +221,56 @@ fn s3_c3_retry_rebuilds_only_failed_outputs() {
     git(&target, &["fsck", "--full"]);
     assert_eq!(listing(&target), origin.tree(&tip));
 }
+
+/// H6: with S3 storage the server's local cache is disposable. Retention
+/// trims cache objects older than its limit once their bucket copy is
+/// confirmed; the bucket is untouched, published artifacts still clone
+/// without a rebuild, and the next push still builds.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_h6_retention_trims_only_the_local_cache() {
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let origin = world.origin("acme", "h6");
+    let a = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "A");
+    origin.publish();
+    let mut env = s3.server_env(&s3.endpoint);
+    env.push(("RIPCLONE_RETENTION_INTERVAL_SECS".into(), "1".into()));
+    env.push(("RIPCLONE_RETENTION_MAX_AGE_DAYS".into(), "1".into()));
+    let server = world.server(&env_refs(&env));
+    world.cli(&server, &["add", "acme/h6", "--wait"]).ok();
+    let objects = s3.objects();
+    let cached = server.storage_listing();
+    assert!(!cached.is_empty(), "the build cached nothing locally");
+
+    crate::state::backdate(&world.path("server").join("cache"), 30);
+    wait_for("retention to trim the local cache", || {
+        (server.metric("ripclone_local_cache_removed_objects_total") > 0).then_some(())
+    });
+    assert!(server.storage_listing().len() < cached.len());
+    assert_eq!(s3.objects(), objects, "retention changed the bucket");
+
+    let queued = server.metric("ripclone_builds_queued_total");
+    let target = world.target("h6-a");
+    world
+        .cli(&server, &["clone", "acme/h6", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), a);
+    assert_eq!(listing(&target), origin.tree(&a));
+    assert_eq!(server.metric("ripclone_builds_queued_total"), queued);
+
+    let b = origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+    world.cli(&server, &["sync", "acme/h6", "--wait"]).ok();
+    for (shape, args) in [("full", &[][..]), ("files", &["--mode", "files"][..])] {
+        let target = world.target(&format!("h6-b-{shape}"));
+        let mut argv = vec!["clone", "acme/h6", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&server, &argv).ok();
+        assert_eq!(listing(&target), origin.tree(&b), "{shape}");
+    }
+    assert_eq!(
+        server.metric("ripclone_local_cache_cleanup_errors_total"),
+        0
+    );
+}

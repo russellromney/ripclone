@@ -167,3 +167,99 @@ fn d5_server_failures_have_distinct_exit_codes() {
         }
     }
 }
+
+/// D6: failures on the user's side each give their own message and exit
+/// code and leave nothing behind: a target that exists and is not empty
+/// (exit 1, its files untouched), an unreachable server (exit 6), and no
+/// `git` on PATH for an editable clone (exit 1, before any request). A Files
+/// clone does not need git.
+#[test]
+fn d6_client_side_failures_leave_nothing() {
+    let world = World::new();
+    let origin = world.origin("acme", "d6");
+    let tip = origin.commit(&[("f.txt", "a\n")], "A");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/d6", "--wait"]).ok();
+    let proxy = FaultProxy::start(&server);
+    let no_git = world.path("no-git");
+    std::fs::create_dir_all(&no_git).unwrap();
+    let no_git_env = [("PATH", no_git.to_str().unwrap())];
+
+    let existing = world.target("d6-existing");
+    std::fs::create_dir_all(&existing).unwrap();
+    std::fs::write(existing.join("mine.txt"), "keep\n").unwrap();
+    let exists = world.cli(&proxy, &["clone", "acme/d6", existing.to_str().unwrap()]);
+    let mine: Vec<_> = std::fs::read_dir(&existing).unwrap().flatten().collect();
+    assert_eq!(mine.len(), 1, "the clone wrote into an existing directory");
+    assert_eq!(
+        std::fs::read_to_string(existing.join("mine.txt")).unwrap(),
+        "keep\n"
+    );
+
+    let unreachable_target = world.target("d6-unreachable");
+    let unreachable = world.cli(
+        &Closed::new(),
+        &[
+            "clone",
+            "acme/d6",
+            unreachable_target.to_str().unwrap(),
+            "--verify-upstream",
+            "never",
+        ],
+    );
+
+    let requests = proxy.seen().len();
+    let no_git_target = world.target("d6-no-git");
+    let missing_git = world.cli_env(
+        &proxy,
+        &["clone", "acme/d6", no_git_target.to_str().unwrap()],
+        &no_git_env,
+    );
+    assert_eq!(
+        proxy.seen().len(),
+        requests,
+        "the CLI asked the server first"
+    );
+
+    let cases = [
+        (
+            "target exists",
+            &exists,
+            1,
+            "target directory already exists",
+        ),
+        (
+            "unreachable",
+            &unreachable,
+            6,
+            "could not reach ripclone server",
+        ),
+        ("no git", &missing_git, 1, "system Git is required"),
+    ];
+    for (case, out, code, text) in cases {
+        let err = out.err();
+        assert_eq!(out.code(), Some(code), "{case}: {err}");
+        assert!(err.contains(text), "{case}: {err}");
+    }
+    for target in [&unreachable_target, &no_git_target] {
+        assert!(!target.exists(), "failed clone left {}", target.display());
+    }
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+
+    let files = world.target("d6-files-no-git");
+    world
+        .cli_env(
+            &proxy,
+            &[
+                "clone",
+                "acme/d6",
+                files.to_str().unwrap(),
+                "--mode",
+                "files",
+            ],
+            &no_git_env,
+        )
+        .ok();
+    assert_eq!(listing(&files), origin.tree(&tip));
+}
