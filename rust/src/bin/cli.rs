@@ -690,6 +690,9 @@ async fn run() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    for (name, _) in ripclone::control::removed_environment() {
+        eprintln!("ripclone: warning: {name} is set but was removed; it has no effect");
+    }
     let config = ripclone::config::load();
 
     // Server precedence: --server / RIPCLONE_SERVER (both land in args.server) >

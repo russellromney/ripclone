@@ -6,7 +6,9 @@ over env, env wins over the file.
 
 This file lists the settings that are staying. Settings for features being
 removed (see [`internal/rebuild/PLAN.md`](internal/rebuild/PLAN.md)) are not
-listed.
+listed. The server and the CLI warn once at startup for each removed variable
+that is set; a removed control setting (`[queue]`, `[metadata]`, dispatch)
+stops the server instead.
 
 ## Client
 

@@ -146,7 +146,7 @@ Ripclone token reaches the origin.
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | now |
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | follow-ups |
 
-### I. Auth, integrations, CLI (11)
+### I. Auth, integrations, CLI (12)
 
 | # | Test | Lands |
 |---|---|---|
@@ -161,8 +161,9 @@ Ripclone token reaches the origin.
 | I9 | A client declaring another protocol gets 426; the CLI names the mismatch and says to run `ripclone version`; nothing builds. | now |
 | I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | now |
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | now |
+| I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | follow-ups |
 
-Total: 64 tests. Several are table-driven.
+Total: 65 tests. Several are table-driven.
 
 ## What this deletes
 
