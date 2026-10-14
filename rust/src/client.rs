@@ -28,8 +28,6 @@ use tuning::ClientTuning;
 /// Sent on every request so the server can attribute usage and nudge upgrades.
 const USER_AGENT: &str = concat!("ripclone/", env!("CARGO_PKG_VERSION"));
 
-static TEST_DOWNLOAD_AUDIT_LOCK: Mutex<()> = Mutex::new(());
-
 #[derive(Debug, Deserialize)]
 struct ServerError {
     #[serde(default)]
@@ -441,30 +439,7 @@ impl PinnedArtifactRefresh {
     }
 }
 
-fn ref_poll_attempts() -> usize {
-    const DEFAULT_ATTEMPTS: usize = 40;
-    if std::env::var_os("RIPCLONE_TESTING").is_none() {
-        return DEFAULT_ATTEMPTS;
-    }
-    std::env::var("RIPCLONE_TEST_REF_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_ATTEMPTS)
-}
-
-fn managed_git_timeout() -> Duration {
-    const PRODUCTION_TIMEOUT: Duration = Duration::from_secs(300);
-    if std::env::var_os("RIPCLONE_TESTING").is_none() {
-        return PRODUCTION_TIMEOUT;
-    }
-    std::env::var("RIPCLONE_TEST_GIT_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(PRODUCTION_TIMEOUT)
-}
+const MANAGED_GIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn local_provider_origin(provider: &ProviderInstance, repo_path: &str) -> String {
     if provider.is_github_default()
@@ -477,90 +452,6 @@ fn local_provider_origin(provider: &ProviderInstance, repo_path: &str) -> String
     } else {
         provider.clone_url(repo_path)
     }
-}
-
-async fn wait_test_top_up_staging_barrier(staging: &Path) -> Result<()> {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return Ok(());
-    }
-    let Some(dir) = std::env::var_os("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR").map(PathBuf::from)
-    else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(&dir).context("create top-up staging barrier directory")?;
-    let entered = dir.join("entered");
-    let mut entered_file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&entered)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(error) => return Err(error).context("create top-up staging barrier marker"),
-    };
-    use std::io::Write;
-    writeln!(entered_file, "{}", staging.display()).context("record first top-up staging path")?;
-    let proceed = dir.join("proceed");
-    for _ in 0..1_000 {
-        if proceed.exists() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    anyhow::bail!("top-up staging barrier was not released within 10 seconds")
-}
-
-/// Test-only synchronization point after the first ordinary pending response
-/// has established B, but before the client makes its pinned top-up request.
-/// This lets the direct proof advance the upstream branch only after pinning.
-async fn wait_test_top_up_pin_barrier() -> Result<()> {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return Ok(());
-    }
-    let Some(dir) = std::env::var_os("RIPCLONE_TEST_TOP_UP_PIN_BARRIER_DIR").map(PathBuf::from)
-    else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(&dir).context("create top-up pin barrier directory")?;
-    let entered = dir.join("entered");
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&entered)
-    {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(error) => return Err(error).context("create top-up pin barrier marker"),
-    }
-    let proceed = dir.join("proceed");
-    for _ in 0..1_000 {
-        if proceed.exists() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    anyhow::bail!("top-up pin barrier was not released within 10 seconds")
-}
-
-fn record_test_managed_git(command: &str, elapsed: Duration) -> Result<()> {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return Ok(());
-    }
-    let Some(log) = std::env::var_os("RIPCLONE_TEST_TOP_UP_GIT_LOG") else {
-        return Ok(());
-    };
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .context("open managed top-up Git timing log")?;
-    writeln!(
-        file,
-        "command={command}\tduration_us={}",
-        elapsed.as_micros()
-    )
-    .context("record managed top-up Git timing")
 }
 
 /// `(max_attempts, base_backoff_ms)` for artifact downloads, from the
@@ -770,10 +661,6 @@ async fn fetch_artifact_bytes_once(
     expected_len: Option<u64>,
     signed: bool,
 ) -> std::result::Result<bytes::Bytes, FetchFailure> {
-    wait_for_test_before_buffered_artifact(hash)
-        .await
-        .map_err(FetchFailure::Permanent)?;
-    record_test_download_request(hash, 0, signed, url);
     let resp = client.get(url).send().await.map_err(|e| {
         // Transport errors (connect/reset/timeout) are transient.
         FetchFailure::Retry(anyhow::anyhow!("artifact fetch transport error: {e}"))
@@ -833,104 +720,6 @@ fn validate_content_range(
     Ok(())
 }
 
-fn record_test_download_request(hash: &str, offset: u64, signed: bool, url: &str) {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return;
-    }
-    let Some(path) = std::env::var_os("RIPCLONE_TEST_DOWNLOAD_AUDIT").map(PathBuf::from) else {
-        return;
-    };
-    let host = url::Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_else(|| "invalid".to_string());
-    let Ok(_guard) = TEST_DOWNLOAD_AUDIT_LOCK.lock() else {
-        return;
-    };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            file,
-            "hash={hash} offset={offset} signed={signed} ripclone_authorization={} host={host}",
-            !signed,
-        );
-    }
-}
-
-/// Test-fixture-only deterministic client interruption. The real response is
-/// cancelled after bytes have been persisted, then the fixture controls when
-/// the retry may proceed (for example, after an S3 URL really expires).
-async fn wait_for_test_download_interrupt(hash: &str, saved: u64) -> Result<bool> {
-    if std::env::var_os("RIPCLONE_TESTING").is_none()
-        || std::env::var("RIPCLONE_TEST_INTERRUPT_ARTIFACT")
-            .ok()
-            .as_deref()
-            != Some(hash)
-    {
-        return Ok(false);
-    }
-    let after = std::env::var("RIPCLONE_TEST_INTERRUPT_AFTER_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1);
-    if saved < after {
-        return Ok(false);
-    }
-    let Some(dir) = std::env::var_os("RIPCLONE_TEST_INTERRUPT_DIR").map(PathBuf::from) else {
-        return Ok(false);
-    };
-    std::fs::create_dir_all(&dir).context("create download interruption fixture directory")?;
-    let entered = dir.join("entered");
-    if entered.exists() {
-        return Ok(false);
-    }
-    std::fs::write(&entered, saved.to_string())
-        .context("record interrupted download byte count")?;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !dir.join("proceed").exists() {
-        if Instant::now() >= deadline {
-            anyhow::bail!("download interruption fixture exceeded 120 seconds");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Ok(true)
-}
-
-/// Test-fixture-only pause before a buffered artifact's first real request.
-/// This lets the S3 emulator acceptance row expire the signed URL without inserting
-/// a proxy or changing production retry timing.
-async fn wait_for_test_before_buffered_artifact(hash: &str) -> Result<()> {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1"))
-        || std::env::var("RIPCLONE_TEST_PAUSE_BUFFERED_ARTIFACT")
-            .ok()
-            .as_deref()
-            != Some(hash)
-    {
-        return Ok(());
-    }
-    let Some(dir) = std::env::var_os("RIPCLONE_TEST_PAUSE_BUFFERED_DIR").map(PathBuf::from) else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(&dir).context("create buffered artifact pause directory")?;
-    let entered = dir.join("entered");
-    if entered.exists() {
-        return Ok(());
-    }
-    std::fs::write(&entered, hash).context("record paused buffered artifact")?;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !dir.join("proceed").exists() {
-        if Instant::now() >= deadline {
-            anyhow::bail!("buffered artifact pause exceeded 120 seconds");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Ok(())
-}
-
 /// Download one large history pack into one temporary file. Connection retries
 /// append from the verified saved byte count with an open-ended Range request;
 /// a server that ignores Range restarts this artifact (and only this artifact)
@@ -980,7 +769,6 @@ async fn fetch_artifact_to_temp(
         let gateway_url = format!("{}/v1/artifacts/{hash}", client.server);
         let (http, url, signed) =
             client.artifact_endpoint(artifact_url.signed_url.as_deref(), &gateway_url);
-        record_test_download_request(hash, saved, signed, url);
         let mut request = http.get(url);
         if saved > 0 {
             request = request.header(reqwest::header::RANGE, format!("bytes={saved}-"));
@@ -1066,12 +854,6 @@ async fn fetch_artifact_to_temp(
                         anyhow::bail!(
                             "artifact {hash} size mismatch: expected {expected_len}, got at least {saved}"
                         );
-                    }
-                    if wait_for_test_download_interrupt(hash, saved).await? {
-                        body_error = Some(anyhow::anyhow!(
-                            "deterministic client-side artifact interruption after {saved} bytes"
-                        ));
-                        break;
                     }
                 }
                 Err(error) => {
@@ -1366,50 +1148,6 @@ fn fsync_tree(root: &Path) -> Result<()> {
     let mut dirs = Vec::new();
     collect_fsync_targets(root, &mut files, &mut dirs)?;
     crate::worktree_writer::fsync_paths_durable(&files, &dirs)
-}
-
-/// Pause one real pack-install worker after its pack and index have been
-/// written into attempt staging. This test-only barrier proves cancellation
-/// drains already-running blocking work before removing private staging.
-fn wait_for_test_pack_worker(pack_index: usize) -> Result<()> {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return Ok(());
-    }
-    let Some(selected) = std::env::var_os("RIPCLONE_TEST_PACK_WORKER_INDEX") else {
-        return Ok(());
-    };
-    if selected.to_string_lossy().parse::<usize>().ok() != Some(pack_index) {
-        return Ok(());
-    }
-    let (Some(entered), Some(proceed)) = (
-        std::env::var_os("RIPCLONE_TEST_PACK_WORKER_ENTERED"),
-        std::env::var_os("RIPCLONE_TEST_PACK_WORKER_PROCEED"),
-    ) else {
-        return Ok(());
-    };
-    let entered = PathBuf::from(entered);
-    let proceed = PathBuf::from(proceed);
-    let mut entered_file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&entered)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(error) => return Err(error).context("create pack-worker test marker"),
-    };
-    use std::io::Write;
-    entered_file
-        .write_all(b"active")
-        .context("mark pack worker active")?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    while !proceed.exists() {
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("pack-worker test barrier exceeded 120 seconds");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::fs::write(entered, b"released").context("mark pack worker released")
 }
 
 /// What a finished clone learned, for the best-effort post-clone metrics report.
@@ -1943,7 +1681,7 @@ impl Client {
         first_clone_id: &mut Option<String>,
         cold: &mut bool,
     ) -> Result<InstallPlan> {
-        let max_attempts = ref_poll_attempts();
+        let max_attempts = 40;
         let detached_checkout_allowed = branch == "HEAD"
             && rev.is_some_and(|value| crate::validation::validate_object_id(value).is_ok());
         // Track whether any attempt polled a cold build (202/503) before
@@ -2096,9 +1834,6 @@ impl Client {
                 // The first ordinary 202 exists to establish B. Eligible Full
                 // clones immediately make the one pinned opt-in request.
                 if allow_top_up && !requested_top_up {
-                    // This is after the ordinary 202 has established B and
-                    // before the first pinned/top_up request.
-                    wait_test_top_up_pin_barrier().await?;
                     continue;
                 }
                 if attempt + 1 < max_attempts {
@@ -2779,13 +2514,7 @@ impl Client {
         // running) or 503 (queue full). Each POST blocks server-side until its
         // wait window elapses, so we just retry — coalescing means a retry
         // re-attaches to the same in-flight build rather than starting a new one.
-        // Test hooks (never set in production):
-        //   RIPCLONE_TEST_SYNC_MAX_ATTEMPTS — bound the poll for negative-case tests
-        let max_attempts = std::env::var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(40);
+        let max_attempts = 40;
         for attempt in 0..max_attempts {
             let mut url = self.repo_url(repo_path, "/sync");
             let mut q: Vec<String> = Vec::new();
@@ -3177,9 +2906,6 @@ impl Client {
                 .temp_install = Some(tmp);
             path
         };
-        if top_up {
-            wait_test_top_up_staging_barrier(&install_root).await?;
-        }
         let git_dir = install_root.join(".git");
         let files_only = matches!(mode, CloneMode::Files);
         if !files_only {
@@ -3768,7 +3494,6 @@ impl Client {
                                     &idx_bytes,
                                 )
                                 .with_context(|| format!("write idx {}", name))?;
-                                wait_for_test_pack_worker(i)?;
                                 if history_only {
                                     return Ok(crate::extract::PackExtractResult {
                                         files: 0,
@@ -4024,7 +3749,6 @@ impl Client {
         target: &str,
         cleanup: &AttemptCleanup,
     ) -> Result<()> {
-        let top_up_started = Instant::now();
         crate::validation::validate_object_id(base).context("invalid top-up base object id")?;
         crate::validation::validate_object_id(target).context("invalid top-up target object id")?;
         let provider = self.top_up_provider_for(repo_path)?;
@@ -4041,16 +3765,6 @@ impl Client {
                 installed.trim()
             );
         }
-        let test_unchanged = if std::env::var_os("RIPCLONE_TESTING").is_some() {
-            std::env::var_os("RIPCLONE_TEST_TOP_UP_UNCHANGED_PATH").map(PathBuf::from)
-        } else {
-            None
-        };
-        let unchanged_mtime_before = test_unchanged
-            .as_ref()
-            .and_then(|path| std::fs::metadata(install_root.join(path)).ok())
-            .and_then(|metadata| metadata.modified().ok());
-
         let origin = local_provider_origin(provider, repo_path);
         let auth_header = match self.upstream_token.as_deref() {
             Some(token) => Some(provider.auth_header(token).context(
@@ -4118,31 +3832,6 @@ impl Client {
         if !status.trim().is_empty() {
             anyhow::bail!("top-up staged worktree is not clean");
         }
-        if let (Some(path), Some(before), Some(log)) = (
-            test_unchanged,
-            unchanged_mtime_before,
-            std::env::var_os("RIPCLONE_TEST_TOP_UP_METRICS_LOG"),
-        ) {
-            let after = std::fs::metadata(install_root.join(path))
-                .context("stat test top-up unchanged path after update")?
-                .modified()
-                .context("read test top-up unchanged mtime after update")?;
-            let nanos = |time: std::time::SystemTime| {
-                time.duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            };
-            std::fs::write(
-                log,
-                format!(
-                    "before_mtime_ns={}\nafter_mtime_ns={}\ntop_up_phase_us={}\n",
-                    nanos(before),
-                    nanos(after),
-                    top_up_started.elapsed().as_micros()
-                ),
-            )
-            .context("write test top-up metrics log")?;
-        }
         Ok(())
     }
 
@@ -4172,8 +3861,6 @@ impl Client {
         use std::io::{Read, Seek};
         use std::process::Stdio;
 
-        let command_started = Instant::now();
-        let command_name = args.first().cloned().unwrap_or_default();
         let mut stdout_file = tempfile::tempfile().context("create top-up Git stdout file")?;
         let child_stdout = stdout_file
             .try_clone()
@@ -4241,7 +3928,7 @@ impl Client {
             .spawn()
             .context("spawn managed top-up Git command")?;
         let mut managed = ManagedGitChild::new(child, cleanup.clone());
-        let timeout = managed_git_timeout();
+        let timeout = MANAGED_GIT_TIMEOUT;
         let status = match tokio::time::timeout(
             timeout,
             managed
@@ -4303,7 +3990,6 @@ impl Client {
         stdout_file
             .read_to_end(&mut stdout)
             .context("read managed top-up Git stdout")?;
-        record_test_managed_git(&command_name, command_started.elapsed())?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
     async fn should_use_overlay(&self, metadata: &MetadataChunk, staging_dir: &Path) -> bool {

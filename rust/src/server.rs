@@ -39,769 +39,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{error, info, warn};
 
-/// Test-only deterministic barrier for artifact downloads. The first matching
-/// artifact response splits its body into a stream: it sends the prefix,
-/// signals `entered`, waits on `proceed`, and then either sends the remainder
-/// or closes the connection (when `close_on_proceed`). This lets tests pause a
-/// download mid-body without relying on wall-clock timing or first-request
-/// fault injection.
-///
-/// A response matches when its body is larger than `after_bytes` and it
-/// satisfies [`BarrierTarget`].
-#[derive(Clone)]
-pub struct ArtifactBarrier {
-    pub after_bytes: usize,
-    pub target: BarrierTarget,
-    pub entered: Arc<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
-    pub proceed: Arc<StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
-    pub close_on_proceed: bool,
-    pub range_behavior: ArtifactRangeBehavior,
-    pub range_requests: Arc<StdMutex<Vec<String>>>,
-    /// Every artifact request observed while the fixture is installed. The
-    /// optional string is the request's Range header.
-    pub artifact_requests: Arc<StdMutex<Vec<(String, Option<String>)>>>,
-    pub max_chunk_sent: Arc<AtomicUsize>,
-    pub consumed: Arc<AtomicBool>,
-}
-
-#[derive(Clone, Copy, Default)]
-pub enum ArtifactRangeBehavior {
-    #[default]
-    Normal,
-    Ignore,
-    InvalidContentRange,
-    CorruptBody,
-}
-
-/// Which artifact the barrier holds.
-#[derive(Clone)]
-pub enum BarrierTarget {
-    /// The first response whose body exceeds `after_bytes`.
-    FirstLargeBody,
-    /// Only the artifact whose content hash the test has written into the slot,
-    /// and only once it has been named — an empty slot matches nothing. This
-    /// lets a test start the server, sync, discover the exact chunk or pack it
-    /// wants to hold, and then arm the barrier.
-    Hash(Arc<StdMutex<Option<String>>>),
-}
-
-impl BarrierTarget {
-    fn matches(&self, hash: &str) -> bool {
-        match self {
-            BarrierTarget::FirstLargeBody => true,
-            BarrierTarget::Hash(slot) => {
-                slot.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(hash)
-            }
-        }
-    }
-}
-
-static TEST_ARTIFACT_BARRIER: StdMutex<Option<ArtifactBarrier>> = StdMutex::new(None);
-
-/// Install a barrier for the next server constructed in this process. Returns a
-/// guard that clears the slot when dropped, so a panicked test cannot leak the
-/// barrier into the next test in the same binary.
-pub fn set_test_artifact_barrier(barrier: ArtifactBarrier) -> TestArtifactBarrierGuard {
-    *TEST_ARTIFACT_BARRIER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(barrier);
-    TestArtifactBarrierGuard
-}
-
-/// RAII guard for [`set_test_artifact_barrier`].
-pub struct TestArtifactBarrierGuard;
-
-impl Drop for TestArtifactBarrierGuard {
-    fn drop(&mut self) {
-        *TEST_ARTIFACT_BARRIER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-    }
-}
-
-fn take_test_artifact_barrier() -> Option<ArtifactBarrier> {
-    TEST_ARTIFACT_BARRIER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-}
-
-/// Narrow test-only synchronization for the immutable-admission proof. The
-/// production path has no counters or barriers unless `RIPCLONE_TESTING=1`
-/// and an integration test installs this probe. Each gate is notification-
-/// based so tests never infer concurrency from a sleep duration.
-pub struct AdmissionTestBarrier {
-    armed: AtomicBool,
-    released: AtomicBool,
-    entered: AtomicUsize,
-    signal: tokio::sync::watch::Sender<u64>,
-}
-
-impl Default for AdmissionTestBarrier {
-    fn default() -> Self {
-        let (signal, _) = tokio::sync::watch::channel(0);
-        Self {
-            armed: AtomicBool::new(false),
-            released: AtomicBool::new(false),
-            entered: AtomicUsize::new(0),
-            signal,
-        }
-    }
-}
-
-impl AdmissionTestBarrier {
-    fn signal(&self) {
-        self.signal.send_modify(|epoch| {
-            *epoch = epoch.wrapping_add(1);
-        });
-    }
-
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.signal.subscribe()
-    }
-
-    pub fn arm(&self) {
-        self.entered.store(0, Ordering::SeqCst);
-        self.released.store(false, Ordering::SeqCst);
-        self.armed.store(true, Ordering::SeqCst);
-        self.signal();
-    }
-
-    pub fn disarm(&self) {
-        self.armed.store(false, Ordering::SeqCst);
-        self.released.store(true, Ordering::SeqCst);
-        self.signal();
-    }
-
-    pub fn release(&self) {
-        self.released.store(true, Ordering::SeqCst);
-        self.signal();
-    }
-
-    pub fn entered(&self) -> usize {
-        self.entered.load(Ordering::SeqCst)
-    }
-
-    pub async fn wait_until_entered(&self, count: usize) {
-        while self.entered() < count {
-            let mut signal = self.subscribe();
-            if self.entered() >= count {
-                break;
-            }
-            let _ = signal.changed().await;
-        }
-    }
-
-    async fn wait(&self) {
-        if !self.armed.load(Ordering::SeqCst) {
-            return;
-        }
-        self.entered.fetch_add(1, Ordering::SeqCst);
-        self.signal();
-        loop {
-            let mut signal = self.subscribe();
-            if self.released.load(Ordering::SeqCst) || !self.armed.load(Ordering::SeqCst) {
-                return;
-            }
-            let _ = signal.changed().await;
-        }
-    }
-}
-
-/// Operation counters and barriers used by `e2e_sync_admission`. These are
-/// intentionally test-only hooks; they are not metrics, API state, or a
-/// production scheduler mechanism.
-pub struct AdmissionTestProbe {
-    pub before_claim: AdmissionTestBarrier,
-    pub after_claim: AdmissionTestBarrier,
-    pub fetch_entry: AdmissionTestBarrier,
-    pub builder_entry: AdmissionTestBarrier,
-    pub after_head_entry: AdmissionTestBarrier,
-    pub before_full_publish: AdmissionTestBarrier,
-    pub before_files_publish: AdmissionTestBarrier,
-    pub after_full_publish: AdmissionTestBarrier,
-    pub after_files_publish: AdmissionTestBarrier,
-    pub embedded_idle_wait: AdmissionTestBarrier,
-    pub before_admission_tx: AdmissionTestBarrier,
-    pub inside_admission_tx: AdmissionTestBarrier,
-    pub enqueue_attempts: AtomicUsize,
-    pub queue_inserts: AtomicUsize,
-    pub coalesces: AtomicUsize,
-    pub pending_responses: AtomicUsize,
-    pub tip_probes: AtomicUsize,
-    pub exact_fetches: AtomicUsize,
-    pub builder_entries: AtomicUsize,
-    pub head_builds: AtomicUsize,
-    pub full_builds: AtomicUsize,
-    pub files_builds: AtomicUsize,
-    pub bitmap_writes: AtomicUsize,
-    pub head_publishes: AtomicUsize,
-    pub full_publishes: AtomicUsize,
-    pub files_publishes: AtomicUsize,
-    pub ref_store_writes: AtomicUsize,
-    pub artifact_uploads: AtomicUsize,
-    pub embedded_notification_wakes: AtomicUsize,
-    pub embedded_fallback_polls: AtomicUsize,
-    pub claim_losses: AtomicUsize,
-    repo_reads_denied: AtomicBool,
-    pub fetch_targets: StdMutex<Vec<String>>,
-    pub builder_targets: StdMutex<Vec<String>>,
-    pub failure_targets: StdMutex<Vec<(String, String)>>,
-    full_failure_targets: StdMutex<std::collections::HashSet<String>>,
-    files_failure_targets: StdMutex<std::collections::HashSet<String>>,
-    pub http_trace: StdMutex<Vec<String>>,
-    admission_tx_target: StdMutex<Option<String>>,
-    inside_admission_tx_target: StdMutex<Option<String>>,
-    full_notify: Arc<tokio::sync::Notify>,
-    failure_notify: Arc<tokio::sync::Notify>,
-    http_notify: Arc<tokio::sync::Notify>,
-    claim_loss_notify: Arc<tokio::sync::Notify>,
-}
-
-impl Default for AdmissionTestProbe {
-    fn default() -> Self {
-        Self {
-            before_claim: AdmissionTestBarrier::default(),
-            after_claim: AdmissionTestBarrier::default(),
-            fetch_entry: AdmissionTestBarrier::default(),
-            builder_entry: AdmissionTestBarrier::default(),
-            after_head_entry: AdmissionTestBarrier::default(),
-            before_full_publish: AdmissionTestBarrier::default(),
-            before_files_publish: AdmissionTestBarrier::default(),
-            after_full_publish: AdmissionTestBarrier::default(),
-            after_files_publish: AdmissionTestBarrier::default(),
-            embedded_idle_wait: AdmissionTestBarrier::default(),
-            before_admission_tx: AdmissionTestBarrier::default(),
-            inside_admission_tx: AdmissionTestBarrier::default(),
-            enqueue_attempts: AtomicUsize::new(0),
-            queue_inserts: AtomicUsize::new(0),
-            coalesces: AtomicUsize::new(0),
-            pending_responses: AtomicUsize::new(0),
-            tip_probes: AtomicUsize::new(0),
-            exact_fetches: AtomicUsize::new(0),
-            builder_entries: AtomicUsize::new(0),
-            head_builds: AtomicUsize::new(0),
-            full_builds: AtomicUsize::new(0),
-            files_builds: AtomicUsize::new(0),
-            bitmap_writes: AtomicUsize::new(0),
-            head_publishes: AtomicUsize::new(0),
-            full_publishes: AtomicUsize::new(0),
-            files_publishes: AtomicUsize::new(0),
-            ref_store_writes: AtomicUsize::new(0),
-            artifact_uploads: AtomicUsize::new(0),
-            embedded_notification_wakes: AtomicUsize::new(0),
-            embedded_fallback_polls: AtomicUsize::new(0),
-            claim_losses: AtomicUsize::new(0),
-            repo_reads_denied: AtomicBool::new(false),
-            fetch_targets: StdMutex::new(Vec::new()),
-            builder_targets: StdMutex::new(Vec::new()),
-            failure_targets: StdMutex::new(Vec::new()),
-            full_failure_targets: StdMutex::new(std::collections::HashSet::new()),
-            files_failure_targets: StdMutex::new(std::collections::HashSet::new()),
-            http_trace: StdMutex::new(Vec::new()),
-            admission_tx_target: StdMutex::new(None),
-            inside_admission_tx_target: StdMutex::new(None),
-            full_notify: Arc::new(tokio::sync::Notify::new()),
-            failure_notify: Arc::new(tokio::sync::Notify::new()),
-            http_notify: Arc::new(tokio::sync::Notify::new()),
-            claim_loss_notify: Arc::new(tokio::sync::Notify::new()),
-        }
-    }
-}
-
-impl AdmissionTestProbe {
-    /// Make subsequent repository authorization checks fail. This models an
-    /// active access revocation after a clone has already received a signed
-    /// artifact URL.
-    pub fn deny_repo_reads(&self) {
-        self.repo_reads_denied.store(true, Ordering::SeqCst);
-    }
-
-    pub fn allow_repo_reads(&self) {
-        self.repo_reads_denied.store(false, Ordering::SeqCst);
-    }
-
-    pub fn fail_full_for(&self, commit: &str) {
-        self.full_failure_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(commit.to_string());
-    }
-
-    pub fn allow_full_for(&self, commit: &str) {
-        self.full_failure_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(commit);
-    }
-
-    pub fn fail_files_for(&self, commit: &str) {
-        self.files_failure_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(commit.to_string());
-    }
-
-    pub fn allow_files_for(&self, commit: &str) {
-        self.files_failure_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(commit);
-    }
-
-    pub fn hold_admission_transaction(&self, commit: &str) {
-        *self
-            .admission_tx_target
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(commit.to_string());
-        self.before_admission_tx.arm();
-    }
-
-    pub fn hold_inside_admission_transaction(&self, commit: &str) {
-        *self
-            .inside_admission_tx_target
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(commit.to_string());
-        self.inside_admission_tx.arm();
-    }
-
-    pub async fn wait_until_full_published(&self, count: usize) {
-        while self.full_publishes.load(Ordering::SeqCst) < count {
-            let notified = self.full_notify.notified();
-            if self.full_publishes.load(Ordering::SeqCst) >= count {
-                break;
-            }
-            notified.await;
-        }
-    }
-
-    pub async fn wait_until_failure(&self, count: usize) {
-        loop {
-            let notified = self.failure_notify.notified();
-            if self
-                .failure_targets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len()
-                >= count
-            {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    pub async fn wait_until_http_trace_len(&self, count: usize) {
-        loop {
-            let notified = self.http_notify.notified();
-            if self
-                .http_trace
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len()
-                >= count
-            {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    pub async fn wait_until_claim_lost(&self, count: usize) {
-        while self.claim_losses.load(Ordering::SeqCst) < count {
-            let notified = self.claim_loss_notify.notified();
-            if self.claim_losses.load(Ordering::SeqCst) >= count {
-                break;
-            }
-            notified.await;
-        }
-    }
-}
-
-static ADMISSION_TEST_PROBE: StdMutex<Option<Arc<AdmissionTestProbe>>> = StdMutex::new(None);
-
-pub struct AdmissionTestProbeGuard {
-    probe: Arc<AdmissionTestProbe>,
-}
-
-pub fn install_admission_test_probe(probe: Arc<AdmissionTestProbe>) -> AdmissionTestProbeGuard {
-    *ADMISSION_TEST_PROBE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&probe));
-    AdmissionTestProbeGuard { probe }
-}
-
-impl Drop for AdmissionTestProbeGuard {
-    fn drop(&mut self) {
-        self.probe.before_claim.disarm();
-        self.probe.after_claim.disarm();
-        self.probe.fetch_entry.disarm();
-        self.probe.builder_entry.disarm();
-        self.probe.after_head_entry.disarm();
-        self.probe.before_full_publish.disarm();
-        self.probe.before_files_publish.disarm();
-        self.probe.after_full_publish.disarm();
-        self.probe.after_files_publish.disarm();
-        self.probe.embedded_idle_wait.disarm();
-        self.probe.before_admission_tx.disarm();
-        self.probe.inside_admission_tx.disarm();
-        let mut slot = ADMISSION_TEST_PROBE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if slot
-            .as_ref()
-            .is_some_and(|installed| Arc::ptr_eq(installed, &self.probe))
-        {
-            slot.take();
-        }
-    }
-}
-
-fn admission_test_probe() -> Option<Arc<AdmissionTestProbe>> {
-    std::env::var_os("RIPCLONE_TESTING")?;
-    ADMISSION_TEST_PROBE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-/// A single interception point in production control flow where a test may
-/// want to observe or pause execution. One variant per point; adding a new
-/// hook means adding a variant here, not a new function.
-pub enum TestStage<'a> {
-    BeforeClaim,
-    AfterClaim,
-    BeforeAdmissionTx(&'a str),
-    InsideAdmissionTx(&'a str),
-    TipProbe,
-    RefStoreWrite,
-    ArtifactUpload,
-    FetchEntry(Option<&'a str>),
-    BuilderEntry(&'a str),
-    HeadBuild,
-    /// Merges the in-process `after_head_entry` probe wait with the
-    /// cross-process, file-signaled after-Head barrier (used when the test
-    /// drives a separately spawned server binary).
-    AfterHeadBarrier(&'a str),
-    HeadPublished,
-    FullBuild(&'a str),
-    FilesBuild(&'a str),
-    BitmapWrite,
-    BeforeFullPublish,
-    AfterFullPublish,
-    FullPublished(&'a str),
-    BeforeFilesPublish,
-    AfterFilesPublish,
-    FilesPublished,
-    EmbeddedIdleWait,
-    EmbeddedWake {
-        fallback: bool,
-    },
-    ClaimLost,
-    BuildFailure {
-        commit: Option<&'a str>,
-        message: &'a str,
-    },
-    Http(String),
-    Enqueue(EnqueueOutcome),
-    PendingResponse,
-    RepoReadsDenied,
-    /// Cross-process, file-signaled barrier used only by the direct
-    /// worker-crash tests, keyed by an upload-pipeline stage name
-    /// (`before_upload`, `during_upload`, `after_upload`,
-    /// `before_ready_publication`).
-    BuildCrash {
-        stage: &'static str,
-        commit: &'a str,
-    },
-}
-
-/// The one call form production code uses to reach every test hook:
-/// `test_hook(TestStage::Whatever).await?`. A no-op unless `RIPCLONE_TESTING`
-/// is set and the relevant fixture (probe or barrier directory) is installed.
-/// The bool result is meaningful only for stages that report one
-/// (`FullBuild`, `FilesBuild`, `RepoReadsDenied`); everywhere else it is
-/// `false` and ignored.
-pub async fn test_hook(stage: TestStage<'_>) -> Result<bool> {
-    match stage {
-        TestStage::BeforeClaim => {
-            if let Some(probe) = admission_test_probe() {
-                probe.before_claim.wait().await;
-            }
-        }
-        TestStage::AfterClaim => {
-            if let Some(probe) = admission_test_probe() {
-                probe.after_claim.wait().await;
-            }
-        }
-        TestStage::BeforeAdmissionTx(commit) => {
-            if let Some(probe) = admission_test_probe() {
-                let held = probe
-                    .admission_tx_target
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .as_deref()
-                    == Some(commit);
-                if held {
-                    probe.before_admission_tx.wait().await;
-                }
-            }
-        }
-        TestStage::InsideAdmissionTx(commit) => {
-            if let Some(probe) = admission_test_probe() {
-                let held = probe
-                    .inside_admission_tx_target
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .as_deref()
-                    == Some(commit);
-                if held {
-                    probe.inside_admission_tx.wait().await;
-                }
-            }
-        }
-        TestStage::TipProbe => {
-            if let Some(probe) = admission_test_probe() {
-                probe.tip_probes.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        TestStage::RefStoreWrite => {
-            if let Some(probe) = admission_test_probe() {
-                probe.ref_store_writes.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        TestStage::ArtifactUpload => {
-            if let Some(probe) = admission_test_probe() {
-                probe.artifact_uploads.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        TestStage::FetchEntry(target) => {
-            if let Some(probe) = admission_test_probe() {
-                probe.exact_fetches.fetch_add(1, Ordering::SeqCst);
-                if let Some(target) = target {
-                    probe
-                        .fetch_targets
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(target.to_string());
-                }
-                probe.fetch_entry.wait().await;
-            }
-        }
-        TestStage::BuilderEntry(commit) => {
-            if let Some(probe) = admission_test_probe() {
-                probe.builder_entries.fetch_add(1, Ordering::SeqCst);
-                probe
-                    .builder_targets
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(commit.to_string());
-                probe.builder_entry.wait().await;
-            }
-        }
-        TestStage::HeadBuild => {
-            if let Some(probe) = admission_test_probe() {
-                probe.head_builds.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        TestStage::HeadPublished => {
-            if let Some(probe) = admission_test_probe() {
-                probe.head_publishes.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        TestStage::AfterHeadBarrier(commit) => {
-            if !explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref()) {
-                return Ok(false);
-            }
-            if let Some(probe) = admission_test_probe() {
-                probe.after_head_entry.wait().await;
-            }
-            let Some(dir) =
-                std::env::var_os("RIPCLONE_TEST_AFTER_HEAD_BARRIER_DIR").map(PathBuf::from)
-            else {
-                return Ok(false);
-            };
-            if let Some(target) = std::env::var_os("RIPCLONE_TEST_AFTER_HEAD_BARRIER_COMMIT")
-                && target.to_str() != Some(commit)
-            {
-                return Ok(false);
-            }
-            std::fs::create_dir_all(&dir).context("create test after-Head barrier directory")?;
-            std::fs::write(dir.join("entered"), format!("{commit}\n"))
-                .context("signal test after-Head barrier")?;
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while !dir.join("proceed").exists() {
-                if Instant::now() >= deadline {
-                    anyhow::bail!("test after-Head barrier was not released within 60 seconds");
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }
-        TestStage::FullBuild(commit) => {
-            if let Some(probe) = admission_test_probe() {
-                probe.full_builds.fetch_add(1, Ordering::SeqCst);
-                return Ok(probe
-                    .full_failure_targets
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .contains(commit));
-            }
-        }
-        TestStage::FilesBuild(commit) => {
-            if let Some(probe) = admission_test_probe() {
-                probe.files_builds.fetch_add(1, Ordering::SeqCst);
-                return Ok(probe
-                    .files_failure_targets
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .contains(commit));
-            }
-        }
-        TestStage::BitmapWrite => {
-            if let Some(probe) = admission_test_probe() {
-                probe.bitmap_writes.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        TestStage::BeforeFullPublish => {
-            if let Some(probe) = admission_test_probe() {
-                probe.before_full_publish.wait().await;
-            }
-        }
-        TestStage::AfterFullPublish => {
-            if let Some(probe) = admission_test_probe() {
-                probe.after_full_publish.wait().await;
-            }
-        }
-        TestStage::FullPublished(commit) => {
-            if let Some(probe) = admission_test_probe() {
-                probe.full_publishes.fetch_add(1, Ordering::SeqCst);
-                probe.full_notify.notify_waiters();
-                tracing::debug!("admission test observed full publication for {commit}");
-            }
-        }
-        TestStage::BeforeFilesPublish => {
-            if let Some(probe) = admission_test_probe() {
-                probe.before_files_publish.wait().await;
-            }
-        }
-        TestStage::AfterFilesPublish => {
-            if let Some(probe) = admission_test_probe() {
-                probe.after_files_publish.wait().await;
-            }
-        }
-        TestStage::FilesPublished => {
-            if let Some(probe) = admission_test_probe() {
-                probe.files_publishes.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        TestStage::EmbeddedIdleWait => {
-            if let Some(probe) = admission_test_probe() {
-                probe.embedded_idle_wait.wait().await;
-            }
-        }
-        TestStage::EmbeddedWake { fallback } => {
-            if let Some(probe) = admission_test_probe() {
-                if fallback {
-                    probe.embedded_fallback_polls.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    probe
-                        .embedded_notification_wakes
-                        .fetch_add(1, Ordering::SeqCst);
-                }
-            }
-        }
-        TestStage::ClaimLost => {
-            if let Some(probe) = admission_test_probe() {
-                probe.claim_losses.fetch_add(1, Ordering::SeqCst);
-                probe.claim_loss_notify.notify_waiters();
-            }
-        }
-        TestStage::BuildFailure { commit, message } => {
-            if let Some(probe) = admission_test_probe() {
-                probe
-                    .failure_targets
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((commit.unwrap_or_default().to_string(), message.to_string()));
-                probe.failure_notify.notify_waiters();
-            }
-        }
-        TestStage::Http(event) => {
-            if let Some(probe) = admission_test_probe() {
-                probe
-                    .http_trace
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(event);
-                probe.http_notify.notify_waiters();
-            }
-        }
-        TestStage::Enqueue(outcome) => {
-            if let Some(probe) = admission_test_probe() {
-                probe.enqueue_attempts.fetch_add(1, Ordering::SeqCst);
-                match outcome {
-                    EnqueueOutcome::Enqueued => {
-                        probe.queue_inserts.fetch_add(1, Ordering::SeqCst);
-                    }
-                    EnqueueOutcome::Coalesced => {
-                        probe.coalesces.fetch_add(1, Ordering::SeqCst);
-                    }
-                    EnqueueOutcome::Full => {}
-                }
-            }
-        }
-        TestStage::PendingResponse => {
-            if let Some(probe) = admission_test_probe() {
-                probe.pending_responses.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        TestStage::RepoReadsDenied => {
-            return Ok(admission_test_probe()
-                .is_some_and(|probe| probe.repo_reads_denied.load(Ordering::SeqCst)));
-        }
-        TestStage::BuildCrash { stage, commit } => {
-            if !test_build_crash_barrier_matches(stage, commit) {
-                return Ok(false);
-            }
-            let Some(dir) =
-                std::env::var_os("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR").map(PathBuf::from)
-            else {
-                return Ok(false);
-            };
-            std::fs::create_dir_all(&dir).context("create test build-crash barrier directory")?;
-            let entered = dir.join("entered");
-            if entered.exists() {
-                return Ok(false);
-            }
-            std::fs::write(&entered, format!("{stage} {commit}\n"))
-                .context("signal test build-crash barrier")?;
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while !dir.join("proceed").exists() {
-                if Instant::now() >= deadline {
-                    anyhow::bail!("test build-crash barrier was not released within 60 seconds");
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }
-    }
-    Ok(false)
-}
-
-fn explicit_test_mode(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
-
-fn test_build_crash_barrier_matches(stage: &str, commit: &str) -> bool {
-    explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref())
-        && std::env::var("RIPCLONE_TEST_BUILD_CRASH_STAGE").as_deref() == Ok(stage)
-        && std::env::var("RIPCLONE_TEST_BUILD_CRASH_COMMIT")
-            .ok()
-            .is_none_or(|target| target == commit)
-}
 #[derive(Clone)]
 pub struct ServerState {
     pub cas: Cas,
@@ -833,16 +73,6 @@ pub struct ServerState {
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
     pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Count of artifact GETs served, used only by the test-only fault injector.
-    /// Per-server so tests don't leak state into each other.
-    pub artifact_fetch_count: Arc<AtomicUsize>,
-    /// Test-only fault injection: make the first N artifact GETs fail with 503.
-    /// Read once from `RIPCLONE_TEST_FAIL_FIRST_FETCHES` at construction (0 =
-    /// off), so the hot path never touches the environment in production.
-    pub fail_first_fetches: usize,
-    /// Test-only deterministic barrier for the first artifact download that is
-    /// larger than `after_bytes`. See [`ArtifactBarrier`].
-    pub artifact_barrier: Option<ArtifactBarrier>,
     /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
     /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
     pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
@@ -860,7 +90,7 @@ pub struct ServerState {
 impl ServerState {
     /// Assemble state for a standalone `ripclone-worker`. It uses the real
     /// durable backends but none of the HTTP-only features (auth, rate limiting,
-    /// OIDC, fault injection) since it never serves requests — it only runs
+    /// OIDC) since it never serves requests — it only runs
     /// [`process_build_job`]. It builds its own provider registry + credential
     /// broker from the environment, exactly as the server does, so it can resolve
     /// upstream credentials for the repos it builds.
@@ -890,9 +120,6 @@ impl ServerState {
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
-            fail_first_fetches: 0,
-            artifact_barrier: None,
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
             // The worker never serves reads; a verifier is required by the type
             // but unused, and auth enforcement is irrelevant here.
@@ -909,22 +136,6 @@ fn require_repo_auth_from_env() -> bool {
     !std::env::var("RIPCLONE_TRUST_GATEWAY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-}
-
-/// Read the test-only fault-injection threshold once at startup. Logs loudly if
-/// it is active so it can never silently degrade a production server.
-fn fail_first_fetches_from_env() -> usize {
-    let n = std::env::var("RIPCLONE_TEST_FAIL_FIRST_FETCHES")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    if n > 0 {
-        tracing::warn!(
-            "TEST FAULT INJECTION ACTIVE: failing the first {n} artifact fetches \
-             (RIPCLONE_TEST_FAIL_FIRST_FETCHES); this must NOT be set in production"
-        );
-    }
-    n
 }
 
 /// Simple in-memory token-bucket rate limiter keyed by real client IP.
@@ -2442,7 +1653,6 @@ async fn ref_report_handler(
                 )
                     .into_response();
             }
-            let _ = test_hook(TestStage::RefStoreWrite).await;
             match state.control_db.as_ref() {
                 Some(control) => {
                     control
@@ -2876,7 +2086,6 @@ async fn dispatch_repos_post(
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
     if let Some(repo_path) = path.strip_suffix("/add") {
-        let _ = test_hook(TestStage::Http(format!("POST /v1/repos/{repo_path}/add"))).await;
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -2901,7 +2110,6 @@ async fn dispatch_repos_post(
     }
 
     if let Some(repo_path) = path.strip_suffix("/sync") {
-        let _ = test_hook(TestStage::Http(format!("POST /v1/repos/{repo_path}/sync"))).await;
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -3133,7 +2341,6 @@ async fn artifact_pending_response_with_top_up(
     top_up_supported: Option<bool>,
     top_up_base: Option<RefResponse>,
 ) -> Response {
-    let _ = test_hook(TestStage::PendingResponse).await;
     let mut response = (
         StatusCode::ACCEPTED,
         Json(ArtifactPendingResponse {
@@ -3269,24 +2476,10 @@ async fn carried_full_top_up_response(
     }
     let storage_for_read = Arc::clone(storage);
     let manifest_hash_for_read = manifest_hash.to_string();
-    let test_read_log = (std::env::var_os("RIPCLONE_TESTING").is_some())
-        .then(|| std::env::var_os("RIPCLONE_TEST_TOP_UP_MANIFEST_READ_LOG"))
-        .flatten();
-    let bytes = tokio::task::spawn_blocking(move || {
-        let bytes = storage_for_read.get(&manifest_hash_for_read)?;
-        if let Some(log) = test_read_log {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log)?;
-            writeln!(file, "{manifest_hash_for_read}")?;
-        }
-        anyhow::Ok(bytes)
-    })
-    .await
-    .ok()?
-    .ok()?;
+    let bytes = tokio::task::spawn_blocking(move || storage_for_read.get(&manifest_hash_for_read))
+        .await
+        .ok()?
+        .ok()?;
     if crate::cas::hash(&bytes) != manifest_hash {
         return None;
     }
@@ -3356,12 +2549,6 @@ async fn get_ref_inner(
 
     state.metrics.record_ref_lookup();
     let (commit, checkout_name, already_pinned) = if let Some(pinned) = params.pinned.as_deref() {
-        let _ = test_hook(TestStage::Http(format!(
-            "GET /v1/repos/{}/refs/{requested_checkout}?pinned={pinned}&result={}",
-            repo_id.storage_key(),
-            params.result
-        )))
-        .await;
         let checkout_name = if requested_checkout == "HEAD"
             && params.rev.as_deref() == Some(pinned)
             && validation::validate_object_id(pinned).is_ok()
@@ -3449,7 +2636,6 @@ async fn get_ref_inner(
             (commit, checkout_name, false)
         }
     } else {
-        let _ = test_hook(TestStage::TipProbe).await;
         let tip = {
             let _permit = fetch_semaphore()
                 .acquire()
@@ -3885,9 +3071,6 @@ async fn authorize_repo_read(
     credential: Option<&secrecy::SecretString>,
     headers: &HeaderMap,
 ) -> Result<bool, Response> {
-    if test_hook(TestStage::RepoReadsDenied).await.unwrap_or(false) {
-        return Err(forbidden_repo_response());
-    }
     if !state.require_repo_auth {
         return Ok(visibility_is_private(headers));
     }
@@ -4099,7 +3282,6 @@ async fn sync_repo_inner(
 
     let start = Instant::now();
     let requested_branch = params.branch;
-    let _ = test_hook(TestStage::TipProbe).await;
     let tip = {
         let _permit = fetch_semaphore()
             .acquire()
@@ -4600,7 +3782,6 @@ async fn enqueue_admitted_build(
         pending: pending_exact_result(&job),
     };
     state.metrics.record_build_queued();
-    let _ = test_hook(TestStage::BeforeAdmissionTx(&job.admitted_commit)).await;
     match control.admit_exact_and_job(&job, &admission.pending).await {
         Ok(enqueued) => {
             if enqueued.outcome == EnqueueOutcome::Enqueued {
@@ -4608,7 +3789,6 @@ async fn enqueue_admitted_build(
             } else {
                 state.metrics.rollback_build_queued();
             }
-            let _ = test_hook(TestStage::Enqueue(enqueued.outcome)).await;
             Ok(enqueued.outcome)
         }
         Err(error) => {
@@ -4889,7 +4069,6 @@ async fn build_handler(
         Ok(c) => c,
         Err(e) => return credential_error_response(e),
     };
-    let _ = test_hook(TestStage::TipProbe).await;
     let tip = {
         let _permit = fetch_semaphore()
             .acquire()
@@ -5151,32 +4330,11 @@ fn validate_artifact_hash(hash: &str) -> Option<Response> {
     None
 }
 
-/// Test-only fault injection. When the server was started with
-/// `RIPCLONE_TEST_FAIL_FIRST_FETCHES=N`, the first N artifact GETs return 503 so
-/// the client's retry/backoff can be exercised end to end. The threshold is read
-/// once at construction (0 = off, the production default), so this is a single
-/// atomic load on the hot path. The counter lives in `ServerState`, so each
-/// test's server starts fresh.
-fn maybe_inject_artifact_fault(state: &ServerState) -> Option<Response> {
-    if state.fail_first_fetches == 0 {
-        return None;
-    }
-    let seen = state.artifact_fetch_count.fetch_add(1, Ordering::Relaxed);
-    if seen < state.fail_first_fetches {
-        Some((StatusCode::SERVICE_UNAVAILABLE, "injected transient fault").into_response())
-    } else {
-        None
-    }
-}
-
 async fn get_artifact(
     Path(hash): Path<String>,
     headers: axum::http::HeaderMap,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
-    if let Some(resp) = maybe_inject_artifact_fault(&state) {
-        return resp;
-    }
     if let Some(resp) = validate_artifact_hash(&hash) {
         return resp;
     }
@@ -5199,65 +4357,15 @@ enum ArtifactBodySource {
 /// Stream an artifact through a two-chunk bounded channel. Local storage uses
 /// one open file; uncommon non-file backends without signed URLs use fixed-size
 /// range reads. Neither path allocates according to the artifact's total size.
-fn artifact_body(
-    mut source: ArtifactBodySource,
-    len: u64,
-    barrier: Option<ArtifactBarrier>,
-) -> Body {
+fn artifact_body(mut source: ArtifactBodySource, len: u64) -> Body {
     let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
 
         let mut sent = 0u64;
-        let corrupt_body = barrier.as_ref().is_some_and(|barrier| {
-            matches!(barrier.range_behavior, ArtifactRangeBehavior::CorruptBody)
-        });
-        let mut corrupted = false;
-        let barrier_after = barrier.as_ref().map(|barrier| {
-            u64::try_from(barrier.after_bytes)
-                .unwrap_or(u64::MAX)
-                .min(len)
-        });
-        let mut barrier = barrier;
         while sent < len {
-            if barrier_after == Some(sent) {
-                let barrier = barrier.take().expect("barrier exists at its boundary");
-                let entered = barrier
-                    .entered
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-                if let Some(entered) = entered {
-                    let _ = entered.send(());
-                }
-                let proceed = barrier
-                    .proceed
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-                let should_continue = if let Some(proceed) = proceed {
-                    proceed.await.is_ok() && !barrier.close_on_proceed
-                } else {
-                    false
-                };
-                if !should_continue {
-                    let _ = tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "injected test barrier close",
-                        )))
-                        .await;
-                    return;
-                }
-            }
-
-            let until_barrier = barrier_after
-                .filter(|after| *after > sent)
-                .map_or(u64::MAX, |after| after - sent);
             let wanted = usize::try_from(
-                (len - sent)
-                    .min(until_barrier)
-                    .min(u64::try_from(ARTIFACT_STREAM_CHUNK_BYTES).unwrap_or(u64::MAX)),
+                (len - sent).min(u64::try_from(ARTIFACT_STREAM_CHUNK_BYTES).unwrap_or(u64::MAX)),
             )
             .unwrap_or(ARTIFACT_STREAM_CHUNK_BYTES);
             let read = match &mut source {
@@ -5302,19 +4410,7 @@ fn artifact_body(
                 }
             };
             match read {
-                Ok(mut bytes) => {
-                    if let Some(barrier) = barrier.as_ref() {
-                        barrier
-                            .max_chunk_sent
-                            .fetch_max(bytes.len(), Ordering::SeqCst);
-                    }
-                    if corrupt_body
-                        && !corrupted
-                        && let Some(byte) = bytes.first_mut()
-                    {
-                        *byte ^= 0x01;
-                        corrupted = true;
-                    }
+                Ok(bytes) => {
                     sent += bytes.len() as u64;
                     if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
                         return;
@@ -5335,19 +4431,6 @@ async fn serve_artifact(
     state: ServerState,
     headers: Option<axum::http::HeaderMap>,
 ) -> impl IntoResponse {
-    if let Some(barrier) = state.artifact_barrier.as_ref() {
-        let range = headers.as_ref().and_then(|headers| {
-            headers
-                .get(axum::http::header::RANGE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        });
-        barrier
-            .artifact_requests
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push((hash.clone(), range));
-    }
     // If the backend can hand out a signed URL, redirect the client there.
     // The client can then use its own Range requests against the CDN/object store.
     // Use the same visibility-aware TTL as the ref path (a private repo gets a
@@ -5384,35 +4467,12 @@ async fn serve_artifact(
     };
 
     // Parse Range header if present.
-    let requested_range = headers.as_ref().and_then(|h| {
+    let range = headers.as_ref().and_then(|h| {
         let value = h
             .get(axum::http::header::RANGE)
             .and_then(|v| v.to_str().ok())?;
-        if let Some(barrier) = state
-            .artifact_barrier
-            .as_ref()
-            .filter(|barrier| barrier.target.matches(&hash))
-        {
-            barrier
-                .range_requests
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(value.to_string());
-        }
         parse_byte_range(value, total_size)
     });
-    let range_behavior = state
-        .artifact_barrier
-        .as_ref()
-        .filter(|barrier| barrier.consumed.load(Ordering::SeqCst) && barrier.target.matches(&hash))
-        .map_or(ArtifactRangeBehavior::Normal, |barrier| {
-            barrier.range_behavior
-        });
-    let range = if matches!(range_behavior, ArtifactRangeBehavior::Ignore) {
-        None
-    } else {
-        requested_range
-    };
 
     if total_size == 0 {
         state.metrics.record_artifact_request(0);
@@ -5455,24 +4515,9 @@ async fn serve_artifact(
         }
     };
     state.metrics.record_artifact_request(len);
-    let barrier = state.artifact_barrier.clone().and_then(|barrier| {
-        let matches = status == StatusCode::OK
-            && !barrier.consumed.load(Ordering::SeqCst)
-            && len > barrier.after_bytes as u64
-            && barrier.target.matches(&hash);
-        matches.then(|| {
-            barrier.consumed.store(true, Ordering::SeqCst);
-            barrier
-        })
-    });
-    let body = artifact_body(source, len, barrier);
+    let body = artifact_body(source, len);
     if status == StatusCode::PARTIAL_CONTENT {
-        let content_range = if matches!(range_behavior, ArtifactRangeBehavior::InvalidContentRange)
-        {
-            format!("bytes 0-{end}/{total_size}")
-        } else {
-            format!("bytes {start}-{end}/{total_size}")
-        };
+        let content_range = format!("bytes {start}-{end}/{total_size}");
         (
             status,
             [
@@ -5818,36 +4863,16 @@ fn upload_concurrency() -> usize {
 }
 
 /// Upload `hashes` from CAS to storage with bounded concurrency.
-/// `crash_commit`, when set, drives the direct worker-crash test: when the
-/// `during_upload` barrier is armed for that commit, the first hash uploads
-/// alone, the hook fires, and only then do the remaining hashes start. That
-/// keeps exactly one upload path for tests and production while the crash
-/// still lands with precisely one artifact in storage.
 async fn upload_artifacts(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
     hashes: Vec<String>,
     conc: usize,
-    crash_commit: Option<&str>,
 ) -> Result<()> {
-    let crash_gate = crash_commit
-        .filter(|commit| test_build_crash_barrier_matches("during_upload", commit))
-        .map(|commit| {
-            let (opened, wait) = tokio::sync::watch::channel(false);
-            (commit.to_string(), Arc::new(opened), wait)
-        });
-    futures::stream::iter(hashes.into_iter().enumerate().map(|(index, hash)| {
+    futures::stream::iter(hashes.into_iter().map(|hash| {
         let cas = cas.clone();
         let storage = storage.clone();
-        let mut crash_gate = crash_gate.clone();
         async move {
-            if index > 0
-                && let Some((_, _, wait)) = crash_gate.as_mut()
-            {
-                wait.wait_for(|opened| *opened)
-                    .await
-                    .context("during_upload crash gate closed before opening")?;
-            }
             let read_hash = hash.clone();
             let (path, len) = tokio::task::spawn_blocking(move || {
                 let len = cas
@@ -5858,22 +4883,11 @@ async fn upload_artifacts(
             .await
             .context("verify artifact task")??;
             let upload_start = std::time::Instant::now();
-            let _ = test_hook(TestStage::ArtifactUpload).await;
             storage
                 .put_file_async(&hash, &path)
                 .await
                 .with_context(|| format!("upload artifact {}", hash))?;
             crate::perf::record_storage_upload(upload_start.elapsed(), len);
-            if index == 0
-                && let Some((commit, opened, _)) = crash_gate.as_ref()
-            {
-                test_hook(TestStage::BuildCrash {
-                    stage: "during_upload",
-                    commit,
-                })
-                .await?;
-                let _ = opened.send(true);
-            }
             Ok(())
         }
     }))
@@ -5982,7 +4996,6 @@ async fn do_sync(
     let repo_id_sync = repo_id.clone();
     let admitted_commit_sync = admitted_commit.to_string();
     let credential_sync = credential.cloned();
-    let _ = test_hook(TestStage::FetchEntry(Some(admitted_commit))).await;
     // Cap concurrent upstream fetches across the process (bandwidth + upstream
     // abuse limits). Held only across the fetch, not the build.
     let fetch_permit = fetch_semaphore()
@@ -6130,8 +5143,6 @@ async fn build_and_publish_results(
     mut phases: SyncPhases,
     mut foreground_release: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<SyncBuildResult> {
-    let _ = test_hook(TestStage::HeadBuild).await;
-    let _ = test_hook(TestStage::BuilderEntry(commit)).await;
     let upload_conc = upload_concurrency();
 
     // Load the previous synced ref once: used both for the files-table by-diff
@@ -6388,34 +5399,11 @@ async fn build_and_publish_results(
     let head_idx_keep: std::collections::HashSet<String> =
         head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
     let upload_start = Instant::now();
-    test_hook(TestStage::BuildCrash {
-        stage: "before_upload",
-        commit,
-    })
-    .await?;
-    upload_artifacts(
-        cas,
-        storage,
-        head_uploads.clone(),
-        upload_conc,
-        Some(commit),
-    )
-    .await?;
-    test_hook(TestStage::BuildCrash {
-        stage: "after_upload",
-        commit,
-    })
-    .await?;
+    upload_artifacts(cas, storage, head_uploads.clone(), upload_conc).await?;
     settle_storage(cas, storage, head_uploads, head_idx_keep).await;
     phases.upload_head_ms = Some(duration_ms(upload_start.elapsed()));
 
     let publish_start = Instant::now();
-    test_hook(TestStage::BuildCrash {
-        stage: "before_ready_publication",
-        commit,
-    })
-    .await?;
-    let _ = test_hook(TestStage::RefStoreWrite).await;
     let head_result = info
         .head
         .clone()
@@ -6431,7 +5419,6 @@ async fn build_and_publish_results(
         "job no longer owns Head publication for {}@{commit}",
         repo_id.storage_key()
     );
-    let _ = test_hook(TestStage::HeadPublished).await;
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
     info!(
         "published Head for {} in {:?}",
@@ -6443,7 +5430,6 @@ async fn build_and_publish_results(
     if let Some(release) = foreground_release.take() {
         let _ = release.send(());
     }
-    test_hook(TestStage::AfterHeadBarrier(commit)).await?;
 
     // Every durable claim owns Head, Files, and Full. A process death before
     // this completes leaves the SQL claim stale for the next worker to reclaim.
@@ -6778,14 +5764,9 @@ async fn build_full_result(
     storage: &crate::storage::StorageRef,
     allow_head_compaction: bool,
 ) -> Result<()> {
-    if test_hook(TestStage::FullBuild(commit)).await? {
-        anyhow::bail!("forced Full failure for {commit}");
-    }
-
     // Full history walks are substantially faster on large repositories when
     // Git can use a reachability bitmap. This is best-effort and happens only
     // when Full itself is missing.
-    let _ = test_hook(TestStage::BitmapWrite).await;
     let bitmap_mirror = mirror_dir.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bitmap_mirror)).await;
 
@@ -6886,14 +5867,7 @@ async fn build_full_result(
             .iter()
             .map(|(_, _, idx, _)| idx.clone())
             .collect();
-        upload_artifacts(
-            cas,
-            storage,
-            compact_uploads.clone(),
-            upload_concurrency(),
-            None,
-        )
-        .await?;
+        upload_artifacts(cas, storage, compact_uploads.clone(), upload_concurrency()).await?;
         let compact_head = crate::HeadResult {
             clonepack: crate::ClonepackArtifacts {
                 manifest: compact_manifest_hash,
@@ -6910,7 +5884,6 @@ async fn build_full_result(
             base_commit: commit.to_string(),
             base_packs: compact_packs.iter().map(tuple_to_sized).collect(),
         };
-        let _ = test_hook(TestStage::RefStoreWrite).await;
         anyhow::ensure!(
             ref_store
                 .publish_head(repo_id, commit, compact_head.clone())
@@ -6957,7 +5930,7 @@ async fn build_full_result(
         .iter()
         .map(|(_, _, idx, _)| idx.clone())
         .collect();
-    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency(), None).await?;
+    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
 
     let mut all_packs = head_packs;
     all_packs.extend(history_packs);
@@ -6975,16 +5948,12 @@ async fn build_full_result(
         packs: pack_artifacts_of(&all_packs),
         history_levels: levels,
     };
-    let _ = test_hook(TestStage::BeforeFullPublish).await;
-    let _ = test_hook(TestStage::RefStoreWrite).await;
     anyhow::ensure!(
         ref_store.publish_full(repo_id, commit, full).await?,
         "job no longer owns Full publication for {}@{commit}",
         repo_id.storage_key()
     );
     settle_storage(cas, storage, uploads, keep_idx).await;
-    let _ = test_hook(TestStage::FullPublished(commit)).await;
-    let _ = test_hook(TestStage::AfterFullPublish).await;
     info!(
         "published Full result for {}@{}",
         repo_id.storage_key(),
@@ -7006,10 +5975,6 @@ async fn build_files_result(
     storage: &crate::storage::StorageRef,
     compression_level: i32,
 ) -> Result<()> {
-    if test_hook(TestStage::FilesBuild(commit)).await? {
-        anyhow::bail!("forced Files failure for {commit}");
-    }
-
     let parent_files = parent_result.and_then(|result| {
         if exact_result_ready(result, ExactResultKind::Files, &result.commit) {
             result.files.as_ref()
@@ -7100,7 +6065,7 @@ async fn build_files_result(
         &archive_chunk_hashes,
         &archive_output.new_reuse_frame_hashes,
     );
-    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency(), None).await?;
+    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
 
     let files = crate::FilesResult {
         clonepack: crate::ClonepackArtifacts {
@@ -7116,16 +6081,12 @@ async fn build_files_result(
         archive_chunks: archive_chunk_hashes,
         archive_frames: archive_output.archive_frames,
     };
-    let _ = test_hook(TestStage::BeforeFilesPublish).await;
-    let _ = test_hook(TestStage::RefStoreWrite).await;
     anyhow::ensure!(
         ref_store.publish_files(repo_id, commit, files).await?,
         "job no longer owns Files publication for {}@{commit}",
         repo_id.storage_key()
     );
     settle_storage(cas, storage, uploads, std::collections::HashSet::new()).await;
-    let _ = test_hook(TestStage::FilesPublished).await;
-    let _ = test_hook(TestStage::AfterFilesPublish).await;
     info!(
         "published Files result for {}@{}",
         repo_id.storage_key(),
@@ -7375,15 +6336,6 @@ async fn process_build_job_with_foreground_release(
                     repo_id.storage_key()
                 );
             }
-            // The deterministic hook observes that artifact work stopped. The
-            // embedded worker acknowledges the job immediately after this
-            // function returns; tests that require the durable Failed state
-            // must observe the queue as well.
-            let _ = test_hook(TestStage::BuildFailure {
-                commit: Some(&job.admitted_commit),
-                message: classified.message(),
-            })
-            .await;
             Err(classified)
         }
     }
@@ -7501,18 +6453,12 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                     // permit wins the select below instead of being lost.
                     let notified = admission_notify.notified();
                     tokio::pin!(notified);
-                    let _ = test_hook(TestStage::BeforeClaim).await;
                     match queue.claim(&worker_id).await {
                         Ok(Some(claimed)) => break claimed,
                         Ok(None) => {
-                            let _ = test_hook(TestStage::EmbeddedIdleWait).await;
                             tokio::select! {
-                                () = &mut notified => {
-                                    let _ = test_hook(TestStage::EmbeddedWake { fallback: false }).await;
-                                }
-                                () = tokio::time::sleep(Duration::from_millis(250)) => {
-                                    let _ = test_hook(TestStage::EmbeddedWake { fallback: true }).await;
-                                }
+                                () = &mut notified => {}
+                                () = tokio::time::sleep(Duration::from_millis(250)) => {}
                             }
                         }
                         Err(error) => {
@@ -7521,7 +6467,6 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                         }
                     }
                 };
-                let _ = test_hook(TestStage::AfterClaim).await;
                 let (foreground_release, foreground_released) = tokio::sync::oneshot::channel();
                 let worker_state = state.clone();
                 let worker_queue = queue.clone();
@@ -7599,7 +6544,6 @@ fn spawn_durable_build_worker(state: ServerState, queue: Arc<crate::queue::SqlJo
                                                 "embedded worker lost claim for job {}: {error:#}",
                                                 claimed.id
                                             );
-                                            let _ = test_hook(TestStage::ClaimLost).await;
                                             build.abort();
                                             let _ = build.await;
                                             break Err(BuildError::retryable(format!(
@@ -7684,7 +6628,6 @@ pub async fn poll_once(state: &ServerState) -> usize {
                 .acquire()
                 .await
                 .expect("fetch semaphore never closed");
-            let _ = test_hook(TestStage::TipProbe).await;
             git::ls_remote_tip_async(&provider, &repo_id, "HEAD", credential.as_ref()).await
         };
         let Ok(Some(tip)) = tip else {
@@ -7760,12 +6703,12 @@ fn read_server_auth_token() -> Result<String> {
     auth_token_hash(None)
 }
 
-async fn run_server_with_barrier_at_control(
+async fn serve(
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
     explicit_control_path: Option<&std::path::Path>,
-    listen: Listen<'_>,
-    artifact_barrier: Option<ArtifactBarrier>,
+    host: &str,
+    port: u16,
 ) -> Result<()> {
     let default_control_path = repo_root.parent().unwrap_or(repo_root).join("control.db");
     let control_settings = crate::control::ControlSettings::from_sources(
@@ -7867,9 +6810,6 @@ async fn run_server_with_barrier_at_control(
         oidc_verifier,
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
-        fail_first_fetches: fail_first_fetches_from_env(),
-        artifact_barrier,
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(HttpAccessVerifier::new()),
         require_repo_auth: require_repo_auth_from_env(),
@@ -7902,13 +6842,8 @@ async fn run_server_with_barrier_at_control(
     }
     // Bind only after config and control ownership are checked, so a rejected
     // server never takes the port.
-    let listener = match listen {
-        Listen::Bound(listener) => listener,
-        Listen::Addr(host, port) => {
-            let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-            tokio::net::TcpListener::bind(addr).await?
-        }
-    };
+    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     // Log the bound address, not the requested one: with `--port 0` this line
     // is how a caller learns the port.
     info!(
@@ -7923,29 +6858,13 @@ async fn run_server_with_barrier_at_control(
     Ok(())
 }
 
-/// Where the server listens: an address it binds itself, or a listener the
-/// caller already bound.
-enum Listen<'a> {
-    Addr(&'a str, u16),
-    Bound(tokio::net::TcpListener),
-}
-
-/// Run the server with any test artifact barrier installed via
-/// [`set_test_artifact_barrier`].
 pub async fn run_server(
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
     host: &str,
     port: u16,
 ) -> Result<()> {
-    run_server_with_barrier_at_control(
-        cas_dir,
-        repo_root,
-        None,
-        Listen::Addr(host, port),
-        take_test_artifact_barrier(),
-    )
-    .await
+    serve(cas_dir, repo_root, None, host, port).await
 }
 
 pub async fn run_server_with_control(
@@ -7955,38 +6874,13 @@ pub async fn run_server_with_control(
     host: &str,
     port: u16,
 ) -> Result<()> {
-    run_server_with_barrier_at_control(
-        cas_dir,
-        repo_root,
-        Some(control_path),
-        Listen::Addr(host, port),
-        take_test_artifact_barrier(),
-    )
-    .await
-}
-
-/// Serve on a listener the caller already bound. Tests bind port 0 and keep
-/// the listener, so no other process can take the port between choosing and
-/// binding it.
-pub async fn run_server_on(
-    listener: tokio::net::TcpListener,
-    cas_dir: &std::path::Path,
-    repo_root: &std::path::Path,
-    artifact_barrier: Option<ArtifactBarrier>,
-) -> Result<()> {
-    run_server_with_barrier_at_control(
-        cas_dir,
-        repo_root,
-        None,
-        Listen::Bound(listener),
-        artifact_barrier,
-    )
-    .await
+    serve(cas_dir, repo_root, Some(control_path), host, port).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tower::util::ServiceExt;
 
     fn ready_artifacts(commit: &str, label: &str) -> crate::ClonepackArtifacts {
@@ -8398,9 +7292,6 @@ mod tests {
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
-            fail_first_fetches: fail_first_fetches_from_env(),
-            artifact_barrier: take_test_artifact_barrier(),
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
             // Default tests to single-tenant trust (no network access checks);
             // the authz-specific tests override these two fields with a fake.
@@ -9429,11 +8320,8 @@ mod tests {
             "commit": decoy,
             "ref": "refs/heads/body-decoy"
         });
-        let probe = Arc::new(AdmissionTestProbe::default());
-        let _probe_guard = install_admission_test_probe(Arc::clone(&probe));
         unsafe {
             std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
-            std::env::set_var("RIPCLONE_TESTING", "1");
         }
         let response = build_app(state.clone())
             .oneshot(
@@ -9451,7 +8339,6 @@ mod tests {
             .unwrap();
         unsafe {
             std::env::remove_var("RIPCLONE_ORIGIN_BASE");
-            std::env::remove_var("RIPCLONE_TESTING");
         }
 
         let response_status = response.status();
@@ -9464,8 +8351,6 @@ mod tests {
             "OIDC build response: {}",
             String::from_utf8_lossy(&response_body)
         );
-        assert_eq!(probe.tip_probes.load(Ordering::SeqCst), 1);
-        assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
         let job = claim_admitted_job(&state)
             .await
             .expect("OIDC wakeup enqueued exact HEAD job");
@@ -9533,145 +8418,6 @@ mod tests {
                 .is_none(),
             "an unavailable exact target must not publish branch metadata"
         );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn worker_crashes_at_artifact_boundaries_never_publish_false_ready_results() {
-        let _env = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
-            std::env::set_var("RIPCLONE_TESTING", "1");
-        }
-        let probe = Arc::new(AdmissionTestProbe::default());
-        let _probe_guard = install_admission_test_probe(Arc::clone(&probe));
-
-        for stage in [
-            "before_upload",
-            "during_upload",
-            "after_upload",
-            "before_ready_publication",
-        ] {
-            let repo_path = format!("acme/crash-{}", stage.replace('_', "-"));
-            let origin_path = origin_base.path().join(format!("{repo_path}.git"));
-            std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-            let origin = crate::test_fixture::init_bare(&origin_path);
-            let admitted = crate::test_fixture::commit(
-                &origin,
-                &[("value.txt", format!("{stage}\n").as_bytes())],
-            );
-            let later = crate::test_fixture::commit(&origin, &[("value.txt", b"later\n")]);
-
-            let tmp = tempfile::tempdir().unwrap();
-            let state = test_state(&tmp);
-            let repo_id = RepoId::github(&repo_path);
-            let job = BuildJob {
-                repo_id: repo_id.clone(),
-                admitted_commit: admitted.clone(),
-                repo_config: crate::repo_config::RepoConfig::default(),
-                credential: None,
-                size_bytes: None,
-            };
-            let pending = pending_exact_result(&job);
-            state
-                .ref_store
-                .save_result(&repo_id, &pending)
-                .await
-                .unwrap();
-
-            let barrier = tmp.path().join(format!("crash-{stage}"));
-            unsafe {
-                std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_STAGE", stage);
-                std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_COMMIT", &admitted);
-                std::env::set_var("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR", &barrier);
-            }
-            let uploads_before = probe.artifact_uploads.load(Ordering::SeqCst);
-            let crashed_state = state.clone();
-            let crashed_job = job.clone();
-            let attempt = tokio::spawn(async move {
-                process_build_job(&crashed_state, &crashed_job, 0, "test-worker").await
-            });
-            tokio::time::timeout(Duration::from_secs(30), async {
-                while !barrier.join("entered").exists() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("worker reached deterministic {stage} barrier"));
-            attempt.abort();
-            assert!(
-                attempt.await.unwrap_err().is_cancelled(),
-                "{stage}: the admitted worker task is the crashed attempt"
-            );
-            let uploads_started = probe.artifact_uploads.load(Ordering::SeqCst) - uploads_before;
-            match stage {
-                "before_upload" => assert_eq!(uploads_started, 0, "{stage}: no Head upload began"),
-                "during_upload" => assert_eq!(
-                    uploads_started, 1,
-                    "{stage}: exactly one Head artifact uploaded before the crash"
-                ),
-                _ => assert!(
-                    uploads_started > 1,
-                    "{stage}: every Head artifact uploaded before the crash (saw {uploads_started})"
-                ),
-            }
-
-            let interrupted = state
-                .ref_store
-                .load_result(&repo_id, &admitted)
-                .await
-                .unwrap()
-                .expect("interrupted exact row remains retryable");
-            assert_eq!(interrupted.commit, admitted, "{stage}: no wrong commit");
-            assert!(
-                interrupted.head.is_none(),
-                "{stage}: Head must remain missing"
-            );
-            assert!(
-                interrupted.full.is_none(),
-                "{stage}: Full must remain missing"
-            );
-            assert!(
-                state
-                    .ref_store
-                    .load_result(&repo_id, &later)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "{stage}: the worker must not publish the branch's later commit"
-            );
-
-            let recovered = process_build_job(&state, &job, 0, "test-worker")
-                .await
-                .unwrap_or_else(|error| panic!("{stage}: exact retry failed: {error:#}"));
-            assert_eq!(recovered.info.commit, admitted);
-            assert!(exact_result_ready(
-                &recovered.info,
-                ExactResultKind::Head,
-                &admitted
-            ));
-            assert!(exact_result_ready(
-                &recovered.info,
-                ExactResultKind::Full,
-                &admitted
-            ));
-            assert_eq!(
-                state.ref_store.list_commits(&repo_id).await.unwrap(),
-                vec![admitted],
-                "{stage}: crash and retry must not create an extra result"
-            );
-        }
-
-        unsafe {
-            std::env::remove_var("RIPCLONE_TEST_BUILD_CRASH_STAGE");
-            std::env::remove_var("RIPCLONE_TEST_BUILD_CRASH_COMMIT");
-            std::env::remove_var("RIPCLONE_TEST_BUILD_CRASH_BARRIER_DIR");
-            std::env::remove_var("RIPCLONE_TESTING");
-            std::env::remove_var("RIPCLONE_ORIGIN_BASE");
-        }
     }
 
     fn gh_sign(secret: &str, body: &[u8]) -> String {
@@ -10403,11 +9149,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state_with_control(&tmp).await;
         mark_added(&state, RepoId::github("acme/widget")).await;
-        let probe = Arc::new(AdmissionTestProbe::default());
-        let _probe_guard = install_admission_test_probe(Arc::clone(&probe));
         unsafe {
             std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path());
-            std::env::set_var("RIPCLONE_TESTING", "1");
         }
         assert_eq!(poll_once(&state).await, 1);
         let first = claim_admitted_job(&state)
@@ -10421,9 +9164,7 @@ mod tests {
         );
         unsafe {
             std::env::remove_var("RIPCLONE_ORIGIN_BASE");
-            std::env::remove_var("RIPCLONE_TESTING");
         }
-        assert_eq!(probe.tip_probes.load(Ordering::SeqCst), 2);
     }
     #[tokio::test]
     async fn version_endpoint_reports_build_and_protocol() {

@@ -63,17 +63,9 @@ impl ClientTuning {
             .unwrap_or(4)
             .max(1);
         let fetch_concurrency = 6;
-        // Test hook: set archive downloads and both pack pipeline stages so
-        // barrier-based tests can pin their race windows deterministically.
-        // Never set in production (the defaults remain 16 archive requests and
-        // one pack worker per core).
-        let test_download_concurrency = std::env::var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0);
-        let archive_fetch_concurrency = test_download_concurrency.unwrap_or(16);
-        let editable_download_concurrency = test_download_concurrency.unwrap_or(cores);
-        let requested_pack_threads = test_download_concurrency.unwrap_or(cores);
+        let archive_fetch_concurrency = 16;
+        let editable_download_concurrency = cores;
+        let requested_pack_threads = cores;
         #[cfg(target_os = "linux")]
         let pack_parse_threads = requested_pack_threads
             .min(process_pack_fd_budget().capacity)
