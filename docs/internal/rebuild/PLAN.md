@@ -57,7 +57,7 @@ replaced, so several half-models now run at once:
    - `GET /v1/repos/{repo}/commits/{sha}?kind=head|files|full` is a pure read:
      `ready` (manifest plus signed URLs), `pending`, or `failed`. The client
      uses the same call to poll and to refresh URLs. A `pending` Full also
-     carries `top_up: {base_commit, manifest, upstream_url}` when a ready Full
+     carries `top_up: {base_commit, base}` when a ready Full
      exists for that ref (one indexed read, no storage read, no Head(B) needed).
    - Webhook, poller, and `sync` all call the same `admit(repo, commit)`.
 4. **One row per (repo, commit) is both the job and the result.**
@@ -134,7 +134,7 @@ replaced, so several half-models now run at once:
 | Embedded worker loop and sequencing | Foreground release, unbounded background work, PID worker IDs, 30-minute recovery | Two capped pools, short leases, claim order by Head-pending. |
 | Remote worker protocol (if kept) | ~2,200 lines, 6 endpoints, credential shipping, local ref cache | 4 endpoints mapping 1:1 to claim, renew, publish, fail. Credentials from the broker. |
 | Client resolver | Polling loop with pin, top-up branch, mixed 503 handling | POST once, poll the pure GET, same GET for URL refresh. |
-| Top-up | Needs Head(B) built first (reads its parent from storage), B must be a single-parent child of the base, local provider config on every clone, test env reads in production | Base is the newest ready Full for the ref, known as soon as B is admitted. Client installs it, runs one `git fetch <upstream_url> B` with the user's git credentials, then checks out B. `git fetch` guarantees B is complete; if the base is not an ancestor (force-push), the fetch just sends more. Provider config is not needed. Full(B) still builds in the background for later clones. |
+| Top-up | Needs Head(B) built first (reads its parent from storage), B must be a single-parent child of the base, local provider config on every clone, test env reads in production | Base is the newest ready Full for the ref, known as soon as B is admitted. Client installs it, runs one `git fetch <upstream> B` with the user's git credentials, then checks out B. The upstream URL comes from the client's own provider config, never from the server, so a server cannot point the user's git at another host. `git fetch` guarantees B is complete; if the base is not an ancestor (force-push), the fetch just sends more. Full(B) still builds in the background for later clones. |
 | Client download layer | Two refresh-aware loops plus a test-only third; duplicated cache lookup | One `download(artifact, sink)` with Range resume and URL refresh; sinks: memory or temp file. |
 | Client install function | One 530-line function steered by 4 flags | `resolve -> plan {Files, Head, Full} -> materialize -> publish`. |
 | `server.rs` (11k lines) | Routes, auth, workers, builder, webhooks, test hooks in one file | `api`, `builder`, `worker`, `auth`, `webhooks` modules. |

@@ -1211,7 +1211,6 @@ async fn top_up_plan(
     };
     Ok(Some(serde_json::json!({
         "base_commit": base_commit,
-        "upstream_url": git::upstream_url(provider, repo_id),
         "base": ready_body(state, repo_id, provider, &base, ExactResultKind::Full),
     })))
 }
@@ -3473,12 +3472,6 @@ mod tests {
         assert_eq!(pending["attempts"], 0);
         assert_eq!(pending["top_up"]["base_commit"], base);
         assert_eq!(pending["top_up"]["base"], ready);
-        assert!(
-            pending["top_up"]["upstream_url"]
-                .as_str()
-                .unwrap()
-                .ends_with("/acme/api.git")
-        );
         let (_, _, head) = call(&app, "GET", &format!("{commits}/{tip}?kind=head"), None).await;
         assert_eq!(
             head,

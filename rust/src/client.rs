@@ -1,6 +1,6 @@
 use crate::ExactResultKind;
 use crate::cas::Cas;
-use crate::provider::{ProviderInstance, ProviderInstanceId, ProviderKind, RepoId};
+use crate::provider::{ProviderInstance, RepoId};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -358,13 +358,9 @@ pub struct Client {
     cache: Option<Cas>,
     /// Upstream git provider instance id (e.g. "github", "gitlab").
     provider: String,
-    /// Locally configured provider boundary used for a pending Full top-up.
-    /// A non-default provider id alone is insufficient: its host/template must
-    /// come from the client's own registry, never from the server response.
+    /// The locally configured provider a top-up fetches from. Its URL comes
+    /// from the client's own registry, never from the server.
     provider_instance: Option<ProviderInstance>,
-    /// Upstream credential for the local top-up fetch. Never sent to the
-    /// ripclone server.
-    upstream_token: Option<String>,
     /// When true, suppress the post-clone metrics report regardless of env.
     skip_metrics: bool,
 }
@@ -420,34 +416,21 @@ impl Client {
             raw_http: build_http_client(reqwest::header::HeaderMap::new()),
             cache,
             provider: "github".to_string(),
-            provider_instance: Some(ProviderInstance {
-                id: ProviderInstanceId::new("github"),
-                kind: ProviderKind::GitHub,
-                host: "github.com".to_string(),
-                auth_template: None,
-                auth_header_name: None,
-            }),
-            upstream_token: None,
+            provider_instance: None,
             skip_metrics: false,
         }
     }
 
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = provider.into();
-        if self.provider != "github" {
-            self.provider_instance = None;
-        }
+        self.provider_instance = None;
         self
     }
 
+    /// Use a locally configured provider, which also enables top-up.
     pub fn with_provider_instance(mut self, provider: ProviderInstance) -> Self {
         self.provider = provider.id.as_str().to_string();
         self.provider_instance = Some(provider);
-        self
-    }
-
-    pub fn with_upstream_token_opt(mut self, token: Option<String>) -> Self {
-        self.upstream_token = token;
         self
     }
 
@@ -753,7 +736,6 @@ mod tests {
             "error": "upstream timed out",
             "top_up": {
                 "base_commit": a,
-                "upstream_url": "https://github.com/acme/app.git",
                 "base": ready_body(&a, "full"),
             },
         }))

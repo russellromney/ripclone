@@ -99,6 +99,40 @@ fn d3_removed_pinned_commit_fails_without_fallback() {
     assert!(!target.exists(), "failed clone left {}", target.display());
 }
 
+/// D4: `--wait` asks for Full(B) itself. While it stays pending, the clone
+/// polls until its budget runs out, reports pending, and installs nothing,
+/// not even the ready Full(A) a top-up would start from.
+#[test]
+fn d4_wait_reports_pending_without_installing() {
+    let world = World::new();
+    let origin = world.origin("acme", "d4");
+    origin.commit(&[("f.txt", "a\n")], "A");
+    origin.publish();
+    let mut server = world.server(&[]);
+    world.cli(&server, &["add", "acme/d4", "--wait"]).ok();
+    server.restart_with(&[("RIPCLONE_BACKGROUND_SLOTS", "0")]);
+    let b = origin.commit(&[("f.txt", "b\n")], "B");
+    origin.publish();
+
+    let proxy = FaultProxy::start(&server);
+    let target = world.target("d4");
+    let out = world.cli(
+        &proxy,
+        &["clone", "acme/d4", target.to_str().unwrap(), "--wait"],
+    );
+    let err = out.err();
+
+    assert!(err.contains("warming"), "{err}");
+    assert!(err.contains("pending") && err.contains(&b), "{err}");
+    assert_eq!(out.code(), Some(1), "{err}");
+    let reads = proxy.seen();
+    let reads = reads.iter().filter(|s| api::is_commit_read(s, &b)).count();
+    assert!(reads > 1, "the clone read B {reads} time(s)");
+    assert!(proxy.artifact_gets().is_empty(), "the clone downloaded");
+    assert!(!target.exists(), "failed clone left {}", target.display());
+    assert!(world.staging_leftovers().is_empty());
+}
+
 /// D5: 401, 403, 404, a 5xx, and an unreachable server each give their own
 /// message and exit code, and install nothing.
 #[test]

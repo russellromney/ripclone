@@ -2,16 +2,7 @@
 //! upstream verification.
 
 use crate::harness::*;
-use base64::Engine;
 use hmac::{KeyInit, Mac};
-
-fn basic(user: &str, token: &str) -> String {
-    let raw = format!("{user}:{token}");
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(raw)
-    )
-}
 
 /// I3: for each provider kind, the server sends that provider's auth header
 /// on every request to the origin, and the origin accepts nothing else.

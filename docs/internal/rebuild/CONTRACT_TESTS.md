@@ -97,7 +97,7 @@ against the CLI) or the plan step that introduces the behavior.
 | E3 | Same after a force-push (A is not an ancestor): clone still equals origin at B. | step 4 |
 | E4 | No ready Full exists for the ref: full clone waits for Full(B) instead of failing. | step 4 |
 
-Top-up uses the user's git credentials. E1 runs once against an auth-checking
+Top-up uses the user's git credentials. E1-E3 run against an auth-checking
 origin to prove the clone works with only git's own credential and that no
 Ripclone token reaches the origin.
 
@@ -253,10 +253,22 @@ the fault proxy in front of the emulator answers every `PUT` with 403, so
 Full and Files fail with the storage error while Head still clones; after a
 restart on the emulator directly, `sync --at` publishes only Full and Files.
 
+Step 4 rebuilt the client install as resolve, plan, materialize, publish, with
+one download routine for every artifact, and moved top-up onto the server's
+plan: the CLI installs the `top_up.base` Full and runs one `git fetch
+<upstream> <B>` with the user's own git, env, and credential helpers, then
+checks out B. The upstream URL comes from the CLI's own provider config, never
+from the server; top-up no longer injects a token. `clone --wait` asks for the
+exact Full instead. D4 is in `pinning.rs`; E1-E4
+are in `topup.rs`. The gated origin can accept several credentials and can
+hold every fetch except one caller's, so E1-E3 park the server's build of B
+while the user's git fetches it; each checks tree, `rev-list --count`, and
+`git fsck` against the origin at B, that the clone's origin is the URL the
+CLI's provider config gives, and that the Ripclone token never reached the
+origin. E4 holds the origin until the clone has polled B twice.
+
 ## Open points
 
-- D4 and E1-E4 wait on step 4 (top-up with the user's git credentials and the
-  `--wait` rule).
 - Every "now" row has a contract test except H4, which waits on #181.
 - Behavior the deleted suites checked that no row covers yet, to add with the
   matching step: the artifact-by-hash route needs the token (I1);
@@ -267,4 +279,4 @@ restart on the emulator directly, `sync --at` publishes only Full and Files.
   restart; config file discovery. The ControlStore conformance suite takes the
   queue rules from `queue/sql.rs`, the stale-owner and ready-is-immutable
   rules from `control.rs`, and lease reclaim from `e2e_sync_admission`.
-- Next: the step-4 rows (D4, E1-E4), then the deletions listed above.
+- Next: the deletions listed above.

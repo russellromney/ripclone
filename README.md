@@ -118,13 +118,15 @@ fastest to slowest:
 - **Polling**: the server `ls-remote`s added repos every 5 minutes
   (`RIPCLONE_POLL_INTERVAL_SECS`; `0` turns it off).
 
-`ripclone sync owner/repo` triggers a build by hand.
+`ripclone sync owner/repo` triggers a build by hand. What a clone does while
+a new commit is still building: **[Freshness](docs/FRESHNESS.md)**.
 
 ## CLI
 
 ```bash
 ripclone clone owner/repo [dir] [--branch B] [--depth 1] [--mode files]
 ripclone clone owner/repo --at <ref>        # a full commit SHA, branch, or tag
+ripclone clone owner/repo --wait            # wait for the exact full build, no top-up
 ripclone clone gitlab:group/project         # another provider
 ripclone clone owner/repo --bench           # print a per-phase timing report
 ripclone sync owner/repo [--wait]
