@@ -19,6 +19,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 BENCH="$ROOT_DIR/benchmark/shaped_benchmark.sh"
+# shellcheck source=server_url.sh
+source "$SCRIPT_DIR/server_url.sh"
 
 # Debug binaries are enough: this asserts on the request/response contract, not
 # on clone throughput.
@@ -55,18 +57,6 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "  ok: $*"; }
 
-free_port() { echo $(( 20000 + RANDOM % 40000 )); }
-
-wait_healthy() { # url pid
-  local _
-  for _ in $(seq 1 200); do
-    curl -fsS -o /dev/null "$1/healthz" 2>/dev/null && return 0
-    kill -0 "$2" 2>/dev/null || return 1
-    sleep 0.1
-  done
-  return 1
-}
-
 # --- fixture: a bare origin the built-in github provider fetches over file:// --
 make_origin() {
   local work="$BASE_DIR/work"
@@ -86,16 +76,15 @@ make_origin() {
 
 run_current_server() {
   echo "==> benchmark harness against a real ripclone-server"
-  local port url log body
-  port="$(free_port)"
-  url="http://127.0.0.1:$port"
+  local url log body
 
-  RUST_LOG=warn RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml" \
+  RUST_LOG=warn,ripclone::server=info RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml" \
     RIPCLONE_ORIGIN_BASE="file://$ORIGIN_ROOT" \
     "$SERVER_BIN" --cas-dir "$BASE_DIR/cas" --repo-root "$BASE_DIR/repos" \
-    --host 127.0.0.1 --port "$port" >"$BASE_DIR/server.log" 2>&1 &
+    --host 127.0.0.1 --port 0 >"$BASE_DIR/server.log" 2>&1 &
   SERVER_PID=$!
-  wait_healthy "$url" "$SERVER_PID" || { cat "$BASE_DIR/server.log"; fail "server not ready"; }
+  url="$(server_url "$BASE_DIR/server.log" "$SERVER_PID")" ||
+    { cat "$BASE_DIR/server.log"; fail "server not ready"; }
 
   # Control: the gate must actually be live on the server under test, otherwise
   # the assertion below proves nothing. A sync on a repo that was never added

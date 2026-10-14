@@ -3564,6 +3564,26 @@ async fn get_ref_inner(
                 .into_response();
         }
         if !matches!(job_state, JobState::Pending) {
+            // The job may have published and finished between the result
+            // read above and the job read. Read the result again before
+            // reporting it missing.
+            if let Ok(Some(info)) = state.ref_store.load_result(&repo_id, &commit).await
+                && exact_result_ready(&info, params.result, &commit)
+            {
+                return (
+                    StatusCode::OK,
+                    Json(ref_response(
+                        &repo_id,
+                        &provider,
+                        checkout_name,
+                        &info,
+                        &state.storage,
+                        params.result,
+                        private,
+                    )),
+                )
+                    .into_response();
+            }
             return (
                 StatusCode::CONFLICT,
                 Json(ExactRevisionUnavailableResponse {

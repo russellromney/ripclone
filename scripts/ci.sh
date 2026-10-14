@@ -49,6 +49,10 @@ run_tests() {
     ( cd "$ROOT/rust" && cargo test --profile ci --locked --test local_server -- \
         "$filter" --test-threads=1 )
   done
+
+  # The contract suite also runs in parallel: each test owns its server, port,
+  # and temp dir, and races only show up under concurrent load.
+  ( cd "$ROOT/rust" && cargo test --profile ci --locked --test contract )
 }
 
 e2e() {

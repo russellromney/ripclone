@@ -4,7 +4,11 @@
 //! product. Spec: docs/internal/rebuild/CONTRACT_TESTS.md.
 
 mod harness;
+mod net;
 
+mod coalesce;
+mod downloads;
+mod pinning;
 mod resolve;
 mod shapes;
 mod state;

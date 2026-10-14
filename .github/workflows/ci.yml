@@ -48,6 +48,7 @@ jobs:
               - 'rust/**'
               - 'benchmark/**'
               - 'scripts/benchmark_smoke.sh'
+              - 'scripts/server_url.sh'
               - 'scripts/ci.sh'
               - '.github/workflows/ci.yml'
             # musl is a separate target_env (mimalloc global allocator, hand-

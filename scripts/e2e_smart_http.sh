@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=server_url.sh
+source "$ROOT/scripts/server_url.sh"
 BIN_DIR="${RIPCLONE_BIN_DIR:-$ROOT/rust/target/release}"
 SERVER_BIN="$BIN_DIR/ripclone-server"
 for bin in "$SERVER_BIN" git curl; do
@@ -17,8 +19,7 @@ BASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ripclone-smart-http.XXXXXX")"
 export RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml"
 ORIGIN_ROOT="$BASE_DIR/origins"
 WORK="$BASE_DIR/work"
-PORT=$((20000 + RANDOM % 40000))
-SERVER_URL="http://127.0.0.1:$PORT"
+SERVER_URL=""
 SERVER_PID=""
 cleanup() {
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
@@ -47,20 +48,13 @@ else
   TOKEN_HASH="$(printf %s "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')"
 fi
 
-RUST_LOG=warn "$SERVER_BIN" \
+RUST_LOG=warn,ripclone::server=info "$SERVER_BIN" \
   --cas-dir "$BASE_DIR/cas" \
   --repo-root "$BASE_DIR/repos" \
   --host 127.0.0.1 \
-  --port "$PORT" >"$BASE_DIR/server.log" 2>&1 &
+  --port 0 >"$BASE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 200); do
-  if curl -fsS "$SERVER_URL/readyz" >/dev/null 2>&1; then break; fi
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    cat "$BASE_DIR/server.log"
-    exit 1
-  fi
-  sleep 0.1
-done
+SERVER_URL="$(server_url "$BASE_DIR/server.log" "$SERVER_PID")" || { cat "$BASE_DIR/server.log"; exit 1; }
 curl -fsS "$SERVER_URL/readyz" >/dev/null || { cat "$BASE_DIR/server.log"; exit 1; }
 
 # Ordinary HTTP integrations do not need a private protocol declaration.
@@ -70,7 +64,7 @@ curl -fsS -X POST \
 
 # Vanilla Git sends Basic authentication but no x-ripclone-protocol header.
 git clone --quiet \
-  "http://ripclone:${TOKEN_HASH}@127.0.0.1:$PORT/v1/git/github/acme/smart-http" \
+  "http://ripclone:${TOKEN_HASH}@${SERVER_URL#http://}/v1/git/github/acme/smart-http" \
   "$BASE_DIR/clone"
 test "$(git -C "$BASE_DIR/clone" rev-parse HEAD)" = "$EXPECTED_COMMIT"
 test "$(cat "$BASE_DIR/clone/proof.txt")" = "served by vanilla git"

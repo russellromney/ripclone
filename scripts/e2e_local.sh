@@ -9,6 +9,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=server_url.sh
+source "$SCRIPT_DIR/server_url.sh"
 # Prefer RIPCLONE_BIN_DIR (set by scripts/ci.sh e2e when using the ci profile);
 # fall back to the historical release path for a bare local `cargo build --release`.
 BIN_DIR="${RIPCLONE_BIN_DIR:-$ROOT_DIR/rust/target/release}"
@@ -58,12 +60,12 @@ cat > "$GITCONFIG" <<'EOF'
 EOF
 export GIT_CONFIG_GLOBAL="$GITCONFIG"
 
-PORT=$(( 20000 + RANDOM % 40000 ))
-SERVER_URL="http://127.0.0.1:$PORT"
+SERVER_URL=""
 SERVER_PID=""
 
 cleanup() {
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+  [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null || true
   rm -rf "$BASE_DIR"
 }
 trap cleanup EXIT
@@ -96,25 +98,19 @@ publish() { # work_dir owner repo
 }
 
 start_server() {
-  # Fully reap any previous server and bind a fresh port. Reusing the same port
-  # right after killing the old process races the OS releasing it ("Address
-  # already in use"), e.g. on the LSM restart below.
+  # Fully reap any previous server. The new one binds port 0 and logs the
+  # address it got, so no port is ever guessed or reused.
   if [ -n "$SERVER_PID" ]; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
   fi
-  PORT=$(( 20000 + RANDOM % 40000 ))
-  SERVER_URL="http://127.0.0.1:$PORT"
-  RUST_LOG=warn "$SERVER_BIN" --cas-dir "$CAS_DIR" --repo-root "$REPO_ROOT" \
-    --host 127.0.0.1 --port "$PORT" >"$BASE_DIR/server.log" 2>&1 &
+  RUST_LOG=warn,ripclone::server=info "$SERVER_BIN" --cas-dir "$CAS_DIR" --repo-root "$REPO_ROOT" \
+    --host 127.0.0.1 --port 0 >"$BASE_DIR/server.log" 2>&1 &
   SERVER_PID=$!
-  for _ in $(seq 1 200); do
-    if curl -fsS -o /dev/null "$SERVER_URL/readyz" 2>/dev/null; then return 0; fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then cat "$BASE_DIR/server.log"; fail "server died"; fi
-    sleep 0.1
-  done
-  cat "$BASE_DIR/server.log"; fail "server not ready"
+  SERVER_URL="$(server_url "$BASE_DIR/server.log" "$SERVER_PID")" ||
+    { cat "$BASE_DIR/server.log"; fail "server not ready"; }
+  curl -fsS -o /dev/null "$SERVER_URL/readyz" || { cat "$BASE_DIR/server.log"; fail "server not ready"; }
 }
 
 add_repo() { "$CLI_BIN" --server "$SERVER_URL" add "$1/$2" >/dev/null; }
@@ -156,8 +152,8 @@ assert_clean() { [ -z "$(gitc "$1" status --porcelain)" ] || fail "$2: worktree 
 assert_file() { [ "$(cat "$1/$2")" = "$3" ] || fail "$1/$2 != '$3'"; }
 assert_count() { [ "$(gitc "$1" rev-list --count HEAD)" = "$2" ] || fail "$1: rev-list != $2"; }
 
-echo "==> starting server ($SERVER_URL)"
 start_server
+echo "==> started server ($SERVER_URL)"
 
 # === editable depth=1 (shallow) ===============================================
 echo "==> editable --depth 1"
