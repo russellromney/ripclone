@@ -133,7 +133,7 @@ Ripclone token reaches the origin.
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | #208 |
 | G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | #208 |
 
-### H. Storage and server state (8)
+### H. Storage and server state (9)
 
 | # | Test | Added |
 |---|---|---|
@@ -145,6 +145,7 @@ Ripclone token reaches the origin.
 | H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | #208 (S3 job) |
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | #208 |
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | #209 |
+| H9 | Build scratch goes under `<cache>/tmp`, which startup empties: with a read-only `TMPDIR`, a stale scratch entry is removed and a full build and clone succeed. | #211 |
 
 ### I. Auth, integrations, CLI (12)
 
@@ -163,7 +164,7 @@ Ripclone token reaches the origin.
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | #208 |
 | I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | #209 |
 
-Total: 65 tests. Several are table-driven.
+Total: 66 tests. Several are table-driven.
 
 ## What it replaced
 
