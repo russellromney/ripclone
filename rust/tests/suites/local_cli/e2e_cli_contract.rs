@@ -37,9 +37,8 @@ async fn run_cli(
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .env("RIPCLONE_TESTING", "1")
         .env("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2")
-        .env("RIPCLONE_TEST_REF_POLL_MS", "50")
+        .env("RIPCLONE_POLL_MS", "50")
         .env("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "2")
-        .env("RIPCLONE_TEST_SYNC_POLL_MS", "50")
         .kill_on_drop(true);
     for (key, value) in envs {
         command.env(key, value);
