@@ -115,22 +115,7 @@ for GitHub repos:
 
 ## Removed settings
 
-These stop the server at startup: the `[metadata]` and `[queue]` config
-sections, and the variables `RIPCLONE_METADATA`, `RIPCLONE_METADATA_DB_URL`,
-`RIPCLONE_METADATA_DB_TOKEN`, `RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`,
-`RIPCLONE_QUEUE_DB_TOKEN`, `RIPCLONE_DISPATCH`, `RIPCLONE_DISPATCH_CMD`,
-`RIPCLONE_DISPATCH_CMD_ARGS`, `RIPCLONE_DISPATCH_INTERVAL_SECS`,
-`RIPCLONE_DISPATCH_MAX_WORKERS`, `RIPCLONE_DISPATCH_TOKEN`,
-`RIPCLONE_DISPATCH_URL`, `RIPCLONE_HEARTBEAT_URL`, `RIPCLONE_RECHECK_MAX` and
-`RIPCLONE_REF_CACHE_TTL_SECS`.
-
-These have no effect, and the server and the CLI warn once at startup for each
-one that is set: any other `RIPCLONE_METADATA_*`, `RIPCLONE_QUEUE_*`,
-`RIPCLONE_DISPATCH_*`, `RIPCLONE_TEST_*`, `RIPCLONE_JWT_*`, `RIPCLONE_TURSO_*`
-or `RIPCLONE_WORKER_HEARTBEAT*` variable, and `RIPCLONE_TESTING`,
-`RIPCLONE_JOB_TOKEN_SECRET`, `RIPCLONE_OIDC_AUDIENCE`,
-`RIPCLONE_TRUST_GATEWAY`, `RIPCLONE_LSM`, `RIPCLONE_SIZE_CLASSES`,
-`RIPCLONE_MAX_SIZE_CLASS`, `RIPCLONE_MAX_JOBS`, `RIPCLONE_IDLE_EXIT_SECS`,
-`RIPCLONE_BUILD_CONCURRENCY`, `RIPCLONE_ARCHIVE_BOUNDED`,
-`RIPCLONE_NO_OVERLAY`, `RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS`,
-`RIPCLONE_STAGING_DIR` and `RIPCLONE_TEMP`. The CLI only warns, for both lists.
+Settings for removed features are not read. A removed control-store setting
+(the old `[metadata]` and `[queue]` sections and their variables) stops the
+server at startup; any other removed variable that is set gets one warning at
+startup naming it. The full list is `REMOVED_ENVIRONMENT` in `rust/src/control/mod.rs`.
