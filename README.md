@@ -160,7 +160,8 @@ provider instance ([Providers](docs/PROVIDERS.md)) or a GitHub App
 ([Configuration](docs/CONFIG.md)).
 
 **Checking the server.** `--verify-upstream` (`auto` by default) cross-checks an
-editable clone's commit against the git host when it can.
+editable clone's commit against the git host when it can. A Files clone has no
+git objects to check, so `--verify-upstream=always` fails for one.
 
 ## Architecture
 

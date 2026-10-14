@@ -1101,10 +1101,14 @@ async fn observe_upstream_for_verification(
             VerifyUpstream::Never => unreachable!(),
         }
     }
+    // A Files clone has no git objects to check against the upstream, so it
+    // cannot be verified. `always` requires verification and fails here,
+    // before anything is downloaded.
     if !mode.needs_prebuilt_blob_pack() {
         if requested == VerifyUpstream::Always {
-            eprintln!(
-                "warning: --verify-upstream is not supported for files-mode clones; skipping"
+            anyhow::bail!(
+                "--verify-upstream=always cannot verify a files-mode clone; \
+                 use --mode editable or --verify-upstream=auto"
             );
         }
         return Ok(None);
