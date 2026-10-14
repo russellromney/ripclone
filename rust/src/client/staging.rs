@@ -654,8 +654,7 @@ mod tests {
         assert!(dirs.iter().any(|p| p.ends_with("src")));
         assert!(dirs.iter().any(|p| p == root));
 
-        // The batched barrier itself must run cleanly over the collected set
-        // (POSIX path here; the io_uring path is exercised on Linux CI).
+        // The barrier itself must run cleanly over the collected set.
         crate::worktree_writer::fsync_paths_durable(&files, &dirs)
             .expect("durable fsync over collected tree");
     }

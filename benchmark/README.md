@@ -51,11 +51,11 @@ the variables documented in that script.
 - `measure_archive.sh` measures archive extraction.
 - `verify_full_clone.sh` checks Git status, diff, and basic Git operations.
 
-The Rust shaping proxy and writer micro-benchmark are developer tools, not
-installed release programs. Build them explicitly:
+The Rust shaping proxy is a developer tool, not an installed release program.
+Build it explicitly:
 
 ```bash
-cargo build --release --example ripclone-proxy --example writer_bench
+cargo build --release --example ripclone-proxy
 ```
 
 ## Common variables

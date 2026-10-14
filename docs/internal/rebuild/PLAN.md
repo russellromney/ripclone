@@ -95,7 +95,7 @@ replaced, so several half-models now run at once:
 | Clonepack format, Head/Files/Full builders, LSM history, incremental archive (`pack.rs`, `archive.rs`, history code) | The product's value. Format is content-addressed and not tied to writer internals. |
 | CAS, local and S3 storage, signed URLs, local cache retention | Clean boundary, five small backend branches. |
 | Client staging plus rename publish, hash verification of every artifact | Correct and simple. |
-| Extract and worktree writer (POSIX path) | Core install path. io_uring is a decision below. |
+| Extract and worktree writer (POSIX path) | Core install path. The io_uring writer was deleted (decision 7). |
 | Provider registry | Data only; all providers share one git transport. |
 | Webhook verification (GitHub, GitLab, Gitea) and the poller | Isolated; both become callers of `admit`. |
 | GitHub App credential broker | Isolated behind a trait; the server-side credential source. |
@@ -116,7 +116,7 @@ replaced, so several half-models now run at once:
 | zstd dictionary and `train-dictionary` | ~100 plus plumbing | Server always passes `None`. |
 | `--temp` overlay | ~190 plus client threading | Needs mount privileges; niche. |
 | Non-refresh client fetch API, `fetch_chunk_refs`, ~525 lines of zero-reference functions | ~800 | Test-only or unused. |
-| `ripclone-proxy`, `writer_bench` as shipped binaries | 633 | Move under `benchmark/` or tests. |
+| `ripclone-proxy`, `writer_bench` as shipped binaries | 633 | Move under `benchmark/` or tests. `writer_bench` was deleted with the io_uring writer. |
 | Test hooks in production code (`TestStage`, `RIPCLONE_TEST_*`) | ~750 plus ~76 call sites | Replaced by external fault injection in contract tests. |
 | Head republish after Full compaction | ~80 | Breaks immutability. |
 | Dead CI pieces (`ci.sh databases`, never-run Turso test, unused staged binaries) | small | Dead. |
@@ -157,7 +157,7 @@ replaced, so several half-models now run at once:
 6. **Login session.** Decided: one token scheme for v1; cut `/login`, the
    session JWT, and `auth login`.
 7. **io_uring writer.** Decided: one Linux-kernel A/B run; delete it if the gain
-   is within noise.
+   is within noise. Done: deleted; A/B within noise, 2026-10-14.
 8. **Slice 12 PRs.** Decided: merge #171, carry #174's blocker fixes
    (`0cee9f5` staged clone marker and memory permit, `6223af5` + `b88cc25`
    strict storage preflight) as a small PR, close #170, #172, #173, #174.

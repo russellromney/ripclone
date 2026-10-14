@@ -1,7 +1,8 @@
 use crate::fsutil::{path_from_bytes, safe_create_dir_all, validate_relative_path};
 use crate::manifest::{FileEntry, FrameInfo, MetadataChunk as Manifest};
 use crate::worktree_writer::{
-    FileSlice, FileWriteContent, OwnedFileWrite, WorktreeWriter, WriteOptions,
+    FRESH_INDEXED_CHECKOUT, FileSlice, FileWriteContent, OwnedFileWrite, WriteOptions,
+    write_owned_entries,
 };
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -274,17 +275,10 @@ const ARCHIVE_WRITE_OPTIONS: WriteOptions = WriteOptions {
 };
 
 fn flush_archive_writes(
-    writer: &WorktreeWriter,
     target_dir: &Path,
     pending_writes: &mut Vec<OwnedFileWrite>,
 ) -> Result<crate::worktree_writer::WriteOutcome> {
-    if pending_writes.is_empty() {
-        return Ok(crate::worktree_writer::WriteOutcome {
-            written: 0,
-            stats: Vec::new(),
-        });
-    }
-    writer.write_owned_entries_with_options(
+    write_owned_entries(
         target_dir,
         std::mem::take(pending_writes),
         ARCHIVE_WRITE_OPTIONS,
@@ -530,14 +524,8 @@ fn extract_archive_from_chunk_receiver_with_chunks(
         let pending_files2 = pending_files.clone();
         let target_dir2 = target_dir.clone();
         std::thread::spawn(move || {
-            let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
             while let Ok((idx, res)) = compressed_rx.recv() {
                 let result: Result<ArchiveFrameWriteResult> = (|| {
-                    let writer = match writer.as_ref() {
-                        Some(Ok(writer)) => Some(writer),
-                        Some(Err(e)) => anyhow::bail!("create worktree writer: {e:#}"),
-                        None => None,
-                    };
                     let compressed = res?;
                     let frame = &manifest2.frames[idx];
                     let raw = Arc::new(decompress_frame_recorded(compressed.as_ref(), frame, idx)?);
@@ -593,17 +581,14 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                                     String::from_utf8_lossy(&entry.path)
                                 );
                             }
-                            if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer) {
+                            if let Some(target_dir) = target_dir2.as_ref() {
                                 pending_writes.push(OwnedFileWrite {
                                     entry: entry.clone(),
                                     content: FileWriteContent::shared(Arc::clone(&raw), off, len),
                                 });
                                 if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                    let outcome = flush_archive_writes(
-                                        writer,
-                                        target_dir,
-                                        &mut pending_writes,
-                                    )?;
+                                    let outcome =
+                                        flush_archive_writes(target_dir, &mut pending_writes)?;
                                     written += outcome.written;
                                     stats.extend(outcome.stats);
                                 }
@@ -673,18 +658,14 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer)
-                                {
+                                if let Some(target_dir) = target_dir2.as_ref() {
                                     pending_writes.push(OwnedFileWrite {
                                         entry: entry.clone(),
                                         content: FileWriteContent::Fragments(fragments),
                                     });
                                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                        let outcome = flush_archive_writes(
-                                            writer,
-                                            target_dir,
-                                            &mut pending_writes,
-                                        )?;
+                                        let outcome =
+                                            flush_archive_writes(target_dir, &mut pending_writes)?;
                                         written += outcome.written;
                                         stats.extend(outcome.stats);
                                     }
@@ -692,9 +673,8 @@ fn extract_archive_from_chunk_receiver_with_chunks(
                             }
                         }
                     }
-                    if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer) {
-                        let outcome =
-                            flush_archive_writes(writer, target_dir, &mut pending_writes)?;
+                    if let Some(target_dir) = target_dir2.as_ref() {
+                        let outcome = flush_archive_writes(target_dir, &mut pending_writes)?;
                         written += outcome.written;
                         stats.extend(outcome.stats);
                     }
@@ -826,7 +806,6 @@ pub fn extract_blobs_from_pack_bytes(
     pack: &[u8],
     blob_paths: &BlobPathMap,
     target_dir: &Path,
-    writer: &WorktreeWriter,
 ) -> Result<PackExtractResult> {
     if pack.len() < 12 || &pack[0..4] != b"PACK" {
         anyhow::bail!("invalid pack header");
@@ -902,11 +881,11 @@ pub fn extract_blobs_from_pack_bytes(
                         content: content.into(),
                     });
                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                        let outcome = writer
-                            .write_owned_entries_for_fresh_indexed_checkout_deferred(
-                                target_dir,
-                                std::mem::take(&mut pending_writes),
-                            )?;
+                        let outcome = write_owned_entries(
+                            target_dir,
+                            std::mem::take(&mut pending_writes),
+                            FRESH_INDEXED_CHECKOUT,
+                        )?;
                         written += outcome.written;
                         stats.extend(outcome.stats);
                     }
@@ -914,11 +893,7 @@ pub fn extract_blobs_from_pack_bytes(
             }
         }
     }
-    let outcome = writer
-        .write_owned_entries_for_fresh_indexed_checkout_deferred(target_dir, pending_writes)?;
-    written += outcome.written;
-    stats.extend(outcome.stats);
-    let outcome = writer.flush_deferred_writes()?;
+    let outcome = write_owned_entries(target_dir, pending_writes, FRESH_INDEXED_CHECKOUT)?;
     written += outcome.written;
     stats.extend(outcome.stats);
     Ok(PackExtractResult {

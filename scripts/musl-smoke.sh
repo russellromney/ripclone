@@ -3,10 +3,9 @@
 # on a clean Alpine container.
 #
 # musl is a different `target_env` from every other job in CI: it is the only one
-# that compiles the mimalloc `#[global_allocator]` and the hand-written kernel
-# `struct statx` in src/statx_compat.rs. Without this script a musl-only break
-# (wrong struct offset, a symbol musl does not have, a dynamic library sneaking
-# into the link) would first surface when a release tag is pushed.
+# that compiles the mimalloc `#[global_allocator]`. Without this script a
+# musl-only break (a symbol musl does not have, a dynamic library sneaking into
+# the link) would first surface when a release tag is pushed.
 #
 #   scripts/musl-smoke.sh
 #
@@ -138,15 +137,12 @@ docker run --rm --platform "$PLATFORM" \
       echo "attempt $attempt GET /v1/version -> $version"
     done
 
-    # The musl-only code paths: the hand-written statx layout and the mimalloc
-    # global allocator. Only these two are run here — the rest of the library
-    # suite is target-independent and already runs on the glibc `test` job, and a
-    # good part of it shells out to `git`, which a clean Alpine does not have.
+    # The musl-only code path: the mimalloc global allocator. Only this test
+    # runs here — the rest of the library suite is target-independent and already
+    # runs on the glibc `test` job, and a good part of it shells out to `git`,
+    # which a clean Alpine does not have.
     echo "--- musl-only library tests"
     /d/'"$(basename "$test_bin")"' --exact \
-      statx_compat::tests::statx_fields_match_stat_for_a_regular_file \
-      statx_compat::tests::statx_fields_match_stat_for_a_directory \
-      statx_compat::tests::index_stat_from_statx_matches_index_stat_from_metadata \
       musl_global_allocator::rust_allocations_are_served_by_mimalloc
   '
 

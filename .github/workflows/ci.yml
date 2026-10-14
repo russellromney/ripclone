@@ -49,8 +49,8 @@ jobs:
               - 'scripts/server_url.sh'
               - 'scripts/ci.sh'
               - '.github/workflows/ci.yml'
-            # musl is a separate target_env (mimalloc global allocator, hand-
-            # written statx, fully-static link). Skip pure-test / docs PRs; still
+            # musl is a separate target_env (mimalloc global allocator,
+            # fully-static link). Skip pure-test / docs PRs; still
             # always run on main so main never drifts silently.
             musl:
               - 'rust/src/**'
@@ -252,7 +252,7 @@ jobs:
           docker run --rm ripclone-server:ci ripclone-server --help
 
   # The static-musl release target. ONLY job that compiles under
-  # `target_env = "musl"` (mimalloc global allocator + hand-written statx).
+  # `target_env = "musl"` (mimalloc global allocator).
   # Path-gated on PRs; always runs on main so release-shape never drifts silent.
   musl:
     needs: changes

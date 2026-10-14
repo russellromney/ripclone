@@ -40,7 +40,6 @@ the token. Hashing gives no protection if the hash leaks.
 | `RIPCLONE_POLL_MS` | Longest wait between polls while an output the CLI needs is pending, default 2000. Polls start at 100 ms and double up to this cap. A command stops after 40 polls. |
 | `RIPCLONE_FETCH_MAX_ATTEMPTS`, `RIPCLONE_FETCH_BACKOFF_MS` | Attempts per artifact download and the first retry delay, defaults 3 and 100 ms. |
 | `RIPCLONE_FSYNC` | `1` or `true`: flush the tree, index, and rename before reporting success. Off by default, like `git checkout`. |
-| `RIPCLONE_IO_URING` | Linux worktree writer. Unset or `auto`: io_uring when the kernel has it, else POSIX. `1`, `true`, `on`, `yes`: io_uring or fail. `0`, `false`, `off`, `no`: POSIX. Other platforms use POSIX unless forced. |
 | `--bench`, `RIPCLONE_BENCH` | Print a per-phase timing report after a clone. |
 | `RIPCLONE_NO_BROWSER` | Set: `ripclone login` does not open a browser. |
 | `RIPCLONE_ORIGIN_BASE` | Top up and verify repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. |

@@ -272,6 +272,7 @@ const REMOVED_ENVIRONMENT: &[(&str, Removal)] = &[
     ("RIPCLONE_STAGING_DIR", Removal::Warn),
     ("RIPCLONE_TEMP", Removal::Warn),
     ("RIPCLONE_BACKGROUND_SLOTS", Removal::Warn),
+    ("RIPCLONE_IO_URING", Removal::Warn),
 ];
 
 fn removal(name: &str) -> Option<Removal> {

@@ -241,8 +241,7 @@ pass "LSM full clone complete across two seals"
 
 # === byte-for-byte equivalence oracle =========================================
 run_equivalence_oracle() {
-  local writer_label="$1" io_uring="$2"
-  echo "==> equivalence oracle ($writer_label)"
+  echo "==> equivalence oracle"
 
   local w sub_w sub_bare sub_sha
   w=$(new_origin equivalence fixture)
@@ -295,8 +294,8 @@ run_equivalence_oracle() {
   sync_repo equivalence fixture
 
   local git_shallow git_full
-  git_shallow="$BASE_DIR/git-fixture-shallow-$writer_label"
-  git_full="$BASE_DIR/git-fixture-full-$writer_label"
+  git_shallow="$BASE_DIR/git-fixture-shallow"
+  git_full="$BASE_DIR/git-fixture-full"
 
   rm -rf "$git_shallow" "$git_full"
   git clone -q --depth 1 \
@@ -313,48 +312,35 @@ run_equivalence_oracle() {
       "file://$ORIGIN_ROOT/equivalence/fixture.git" "$git_full"
 
   local rip_shallow rip_full rip_files
-  rip_shallow="$BASE_DIR/rip-fixture-shallow-$writer_label"
-  rip_full="$BASE_DIR/rip-fixture-full-$writer_label"
-  rip_files="$BASE_DIR/rip-fixture-files-$writer_label"
+  rip_shallow="$BASE_DIR/rip-fixture-shallow"
+  rip_full="$BASE_DIR/rip-fixture-full"
+  rip_files="$BASE_DIR/rip-fixture-files"
 
-  # Run ripclone clones under the chosen writer backend.
-  (
-    [ "$io_uring" = "1" ] && export RIPCLONE_IO_URING=1 || export RIPCLONE_IO_URING=0
-    clone_repo equivalence fixture "$rip_shallow" --depth 1
-  )
-  (
-    [ "$io_uring" = "1" ] && export RIPCLONE_IO_URING=1 || export RIPCLONE_IO_URING=0
-    clone_until_count equivalence fixture "$rip_full" 1 --depth 0
-  )
-  (
-    [ "$io_uring" = "1" ] && export RIPCLONE_IO_URING=1 || export RIPCLONE_IO_URING=0
-    clone_repo equivalence fixture "$rip_files" --mode files
-  )
+  clone_repo equivalence fixture "$rip_shallow" --depth 1
+  clone_until_count equivalence fixture "$rip_full" 1 --depth 0
+  clone_repo equivalence fixture "$rip_files" --mode files
 
   diff_worktree() {
     diff -r --no-dereference --exclude=.git "$1" "$2" >/dev/null || fail "$3 worktree differs"
   }
 
-  diff_worktree "$git_shallow" "$rip_shallow" "editable depth=1 ($writer_label)"
-  diff_worktree "$git_full" "$rip_full" "editable depth=0 ($writer_label)"
-  diff_worktree "$git_full" "$rip_files" "files mode ($writer_label)"
+  diff_worktree "$git_shallow" "$rip_shallow" "editable depth=1"
+  diff_worktree "$git_full" "$rip_full" "editable depth=0"
+  diff_worktree "$git_full" "$rip_files" "files mode"
 
-  [ "$(gitc "$rip_shallow" rev-parse HEAD)" = "$(gitc "$git_shallow" rev-parse HEAD)" ] || fail "shallow HEAD mismatch ($writer_label)"
-  [ "$(gitc "$rip_shallow" rev-parse refs/heads/main)" = "$(gitc "$git_shallow" rev-parse refs/heads/main)" ] || fail "shallow branch ref mismatch ($writer_label)"
-  [ "$(gitc "$rip_full" rev-parse HEAD)" = "$(gitc "$git_full" rev-parse HEAD)" ] || fail "full HEAD mismatch ($writer_label)"
-  [ "$(gitc "$rip_full" rev-parse refs/heads/main)" = "$(gitc "$git_full" rev-parse refs/heads/main)" ] || fail "full branch ref mismatch ($writer_label)"
+  [ "$(gitc "$rip_shallow" rev-parse HEAD)" = "$(gitc "$git_shallow" rev-parse HEAD)" ] || fail "shallow HEAD mismatch"
+  [ "$(gitc "$rip_shallow" rev-parse refs/heads/main)" = "$(gitc "$git_shallow" rev-parse refs/heads/main)" ] || fail "shallow branch ref mismatch"
+  [ "$(gitc "$rip_full" rev-parse HEAD)" = "$(gitc "$git_full" rev-parse HEAD)" ] || fail "full HEAD mismatch"
+  [ "$(gitc "$rip_full" rev-parse refs/heads/main)" = "$(gitc "$git_full" rev-parse refs/heads/main)" ] || fail "full branch ref mismatch"
 
-  gitc "$rip_shallow" fsck --connectivity-only HEAD >/dev/null || fail "shallow fsck ($writer_label)"
-  gitc "$rip_full" fsck --connectivity-only HEAD >/dev/null || fail "full fsck ($writer_label)"
-  assert_clean "$rip_shallow" "shallow ($writer_label)"
-  assert_clean "$rip_full" "full ($writer_label)"
+  gitc "$rip_shallow" fsck --connectivity-only HEAD >/dev/null || fail "shallow fsck"
+  gitc "$rip_full" fsck --connectivity-only HEAD >/dev/null || fail "full fsck"
+  assert_clean "$rip_shallow" "shallow"
+  assert_clean "$rip_full" "full"
 
-  pass "equivalence oracle ($writer_label)"
+  pass "equivalence oracle"
 }
 
-run_equivalence_oracle posix 0
-if [ "$(uname -s)" = "Linux" ]; then
-  run_equivalence_oracle io_uring 1
-fi
+run_equivalence_oracle
 
 echo "ALL E2E PASSED"

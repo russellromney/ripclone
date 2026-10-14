@@ -596,13 +596,10 @@ impl Client {
         let blob_map = Arc::new(crate::extract::build_blob_path_map(&metadata.files));
         crate::extract::prepare_worktree_dirs(work_tree, &metadata.files)
             .context("prepare worktree dirs")?;
-        let worktree_writer = Arc::new(crate::worktree_writer::WorktreeWriter::new()?);
 
         // Download and pack parsing are decoupled stages with independent
         // concurrency. Keep zlib inflate + SHA-1 parse workers capped at core
-        // count even when the writer backend can profit from deeper io_uring
-        // submission; otherwise `2 * cores` write defaults turn into `2 * cores`
-        // CPU parse tasks.
+        // count.
         let tuning = ClientTuning::load();
         let download_conc = tuning.editable_download_concurrency;
         let parse_conc = tuning.pack_parse_threads;
@@ -675,7 +672,7 @@ impl Client {
                         pack_fetch_start.elapsed(),
                         pack_body.len(),
                     );
-                    anyhow::Ok((i, entry.history_only, pack_body, idx_bytes))
+                    anyhow::Ok((i, pack_body, idx_bytes))
                 }
             },
         );
@@ -689,23 +686,12 @@ impl Client {
                 let pack_dir = pack_dir.to_path_buf();
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
-                let worktree_writer = Arc::clone(&worktree_writer);
                 async move {
-                    let (i, history_only, pack_body, idx_bytes) = res?;
+                    let (i, pack_body, idx_bytes) = res?;
                     let bytes = pack_body.len() + idx_bytes.len() as u64;
-                    let fd_permit = if history_only {
-                        None
-                    } else {
-                        Some(tuning::acquire_pack_parse_fd_permit().await)
-                    };
                     let result = AbortOnDrop::new(
                         tokio::task::spawn_blocking(
                             move || -> Result<crate::extract::PackExtractResult> {
-                                // Own the global Linux descriptor lease for the
-                                // complete parser/writer lifetime, including
-                                // deferred io_uring windows. On other platforms
-                                // this is a zero-sized no-op guard.
-                                let _fd_permit = fd_permit;
                                 if pack_body.len() < 20 {
                                     anyhow::bail!("pack {i} too short ({} bytes)", pack_body.len());
                                 }
@@ -764,7 +750,6 @@ impl Client {
                                     &pack_bytes,
                                     &blob_map,
                                     &work_tree,
-                                    &worktree_writer,
                                 )
                                 .with_context(|| format!("extract pack {name}"))
                             },

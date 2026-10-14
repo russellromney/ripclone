@@ -103,9 +103,6 @@ pub mod retention;
 #[doc(hidden)]
 pub mod secure_file;
 pub mod server;
-#[cfg(target_os = "linux")]
-#[doc(hidden)]
-pub mod statx_compat;
 pub mod storage;
 
 #[cfg(test)]

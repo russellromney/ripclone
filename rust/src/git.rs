@@ -222,17 +222,6 @@ pub fn materialized_path_stat_from_metadata(
     }
 }
 
-#[cfg(target_os = "linux")]
-pub fn materialized_path_stat_from_statx(
-    path: Vec<u8>,
-    statx: &crate::statx_compat::statx,
-) -> MaterializedPathStat {
-    MaterializedPathStat {
-        path,
-        stat: index_stat_from_statx(statx),
-    }
-}
-
 #[cfg(unix)]
 fn index_path_from_bytes(path: &[u8]) -> std::path::PathBuf {
     use std::ffi::OsStr;
@@ -276,35 +265,6 @@ fn index_stat_from_metadata(metadata: &std::fs::Metadata) -> IndexStat {
         gid: 0,
         size: clamp_u64_to_u32(metadata.len()),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn index_stat_from_statx(statx: &crate::statx_compat::statx) -> IndexStat {
-    IndexStat {
-        ctime: gix::index::entry::stat::Time {
-            secs: clamp_i64_to_u32(statx.stx_ctime.tv_sec),
-            nsecs: statx.stx_ctime.tv_nsec,
-        },
-        mtime: gix::index::entry::stat::Time {
-            secs: clamp_i64_to_u32(statx.stx_mtime.tv_sec),
-            nsecs: statx.stx_mtime.tv_nsec,
-        },
-        dev: clamp_u64_to_u32(make_dev(statx.stx_dev_major, statx.stx_dev_minor)),
-        ino: clamp_u64_to_u32(statx.stx_ino),
-        uid: statx.stx_uid,
-        gid: statx.stx_gid,
-        size: clamp_u64_to_u32(statx.stx_size),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn make_dev(major: u32, minor: u32) -> u64 {
-    let major = u64::from(major);
-    let minor = u64::from(minor);
-    ((major & 0x00000fff) << 8)
-        | (minor & 0x000000ff)
-        | ((minor & 0xffffff00) << 12)
-        | ((major & 0xfffff000) << 32)
 }
 
 fn clamp_i64_to_u32(value: i64) -> u32 {

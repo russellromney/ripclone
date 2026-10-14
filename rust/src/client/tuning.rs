@@ -63,20 +63,7 @@ impl ClientTuning {
             .max(1);
         let archive_fetch_concurrency = 16;
         let editable_download_concurrency = cores;
-        let requested_pack_threads = cores;
-        #[cfg(target_os = "linux")]
-        let pack_parse_threads = requested_pack_threads
-            .min(process_pack_fd_budget().capacity)
-            .max(1);
-        #[cfg(not(target_os = "linux"))]
-        let pack_parse_threads = requested_pack_threads;
-        if pack_parse_threads < requested_pack_threads {
-            tracing::debug!(
-                requested_pack_threads,
-                pack_parse_threads,
-                "capping pack parser concurrency to the process file-descriptor budget"
-            );
-        }
+        let pack_parse_threads = cores;
         tracing::debug!(
             archive_fetch_concurrency,
             editable_download_concurrency,
@@ -91,68 +78,7 @@ impl ClientTuning {
     }
 }
 
-/// One permit represents the maximum direct descriptors a pack parser's
-/// io_uring writer can keep live. The owned permit moves into the blocking
-/// parser task and is released only when extraction (including deferred-window
-/// draining) exits, so concurrent clones cannot each spend the full process
-/// `RLIMIT_NOFILE` independently.
-#[cfg(target_os = "linux")]
-pub(super) struct PackParseFdPermit {
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) struct PackParseFdPermit;
-
-#[cfg(target_os = "linux")]
-struct ProcessPackFdBudget {
-    semaphore: Arc<tokio::sync::Semaphore>,
-    capacity: usize,
-}
-
-#[cfg(target_os = "linux")]
-impl ProcessPackFdBudget {
-    fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
-        Self {
-            semaphore: Arc::new(tokio::sync::Semaphore::new(capacity)),
-            capacity,
-        }
-    }
-
-    async fn acquire(&self) -> PackParseFdPermit {
-        let permit = Arc::clone(&self.semaphore)
-            .acquire_owned()
-            .await
-            .expect("process pack FD semaphore is never closed");
-        PackParseFdPermit { _permit: permit }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn process_pack_fd_budget() -> &'static ProcessPackFdBudget {
-    static BUDGET: OnceLock<ProcessPackFdBudget> = OnceLock::new();
-    BUDGET.get_or_init(|| {
-        let capacity = crate::worktree_writer::linux_fd_safe_writer_concurrency(usize::MAX);
-        tracing::debug!(
-            capacity,
-            "initialized process-wide pack parser file-descriptor budget"
-        );
-        ProcessPackFdBudget::new(capacity)
-    })
-}
-
-#[cfg(target_os = "linux")]
-pub(super) async fn acquire_pack_parse_fd_permit() -> PackParseFdPermit {
-    process_pack_fd_budget().acquire().await
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) async fn acquire_pack_parse_fd_permit() -> PackParseFdPermit {
-    PackParseFdPermit
-}
-
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::{EDITABLE_PACK_MEMORY_BUDGET_BYTES, ProcessEditablePackMemoryBudget};
     use std::sync::Arc;
