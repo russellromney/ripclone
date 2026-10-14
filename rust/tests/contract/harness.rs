@@ -780,6 +780,16 @@ pub fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+/// An HTTP Basic `Authorization` value.
+pub fn basic(user: &str, token: &str) -> String {
+    use base64::Engine;
+    let raw = format!("{user}:{token}");
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    )
+}
+
 /// `RIPCLONE_PROVIDERS` JSON for provider instances on `host`. Each entry is
 /// `(id, kind, token, extra fields)`; a `None` token is left out.
 pub fn providers_json(

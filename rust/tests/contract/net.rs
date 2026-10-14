@@ -78,7 +78,10 @@ struct GitState {
     gate: Gate,
     fetches: AtomicUsize,
     requests: Mutex<Vec<OriginRequest>>,
-    required: Mutex<Option<(String, String)>>,
+    /// Accepted `name: value` headers; empty accepts every request.
+    accepted: Mutex<Vec<(String, String)>>,
+    /// A fetch carrying this header passes a closed gate.
+    unheld: Mutex<Option<(String, String)>>,
 }
 
 /// One request the origin received.
@@ -115,7 +118,8 @@ impl GitHttp {
             gate: Gate::new(),
             fetches: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
-            required: Mutex::new(None),
+            accepted: Mutex::new(Vec::new()),
+            unheld: Mutex::new(None),
         });
         let router = Router::new()
             .fallback(git_backend)
@@ -137,6 +141,13 @@ impl GitHttp {
         self.state.gate.open.send_replace(false);
     }
 
+    /// Park upload-pack fetches except those carrying `name: value`, so one
+    /// caller's fetches pass while every other caller's wait.
+    pub fn hold_fetches_without(&self, name: &str, value: &str) {
+        *self.state.unheld.lock().unwrap() = Some((name.to_string(), value.to_string()));
+        self.hold_fetches();
+    }
+
     pub fn release_fetches(&self) {
         self.state.gate.open.send_replace(true);
     }
@@ -153,9 +164,11 @@ impl GitHttp {
         self.state.fetches.load(Ordering::SeqCst)
     }
 
-    /// Answer 403 to any request without header `name: value`.
+    /// Answer 403 to any request that carries none of the required headers.
+    /// Each call accepts one more `name: value`.
     pub fn require_header(&self, name: &str, value: &str) {
-        *self.state.required.lock().unwrap() = Some((name.to_string(), value.to_string()));
+        let header = (name.to_string(), value.to_string());
+        self.state.accepted.lock().unwrap().push(header);
     }
 
     /// Every request received so far, in order.
@@ -193,8 +206,12 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
             })
             .collect(),
     };
-    let required = state.required.lock().unwrap().clone();
-    let allowed = required.is_none_or(|(name, value)| request.header(&name) == Some(&value));
+    let carries = |(name, value): &(String, String)| request.header(name) == Some(value);
+    let allowed = {
+        let accepted = state.accepted.lock().unwrap();
+        accepted.is_empty() || accepted.iter().any(carries)
+    };
+    let unheld = state.unheld.lock().unwrap().as_ref().is_some_and(carries);
     state.requests.lock().unwrap().push(request);
     if !allowed {
         return plain(StatusCode::FORBIDDEN, "missing required header".into());
@@ -207,7 +224,9 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
         && !contains(&body, b"command=ls-refs");
     if is_fetch {
         state.fetches.fetch_add(1, Ordering::SeqCst);
-        state.gate.pass().await;
+        if !unheld {
+            state.gate.pass().await;
+        }
     }
 
     let mut cmd = tokio::process::Command::new("git");
