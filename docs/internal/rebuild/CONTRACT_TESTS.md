@@ -298,6 +298,11 @@ only warned and skipped verification; it now fails before any download (I10).
 A 426 and a 502 `upstream_unavailable` now carry their own CLI hint instead of
 none and "ripclone is briefly unavailable" (I9, A7).
 
+The follow-ups PR added C6 (Linux: the server's git children die with a
+SIGKILLed server, through `PR_SET_PDEATHSIG` in `git::command()`), H8
+(`/readyz` fails once the control database file is deleted or replaced) and
+I12 (removed environment variables warn once in the server and the CLI).
+
 ## Open points
 
 - Every row has a contract test.
@@ -305,4 +310,6 @@ none and "ripclone is briefly unavailable" (I9, A7).
   write `hint:` lines and bare SHAs into the server log; an existing empty
   target directory is rejected, where `git clone` accepts it; an unparsable
   `RIPCLONE_RETENTION_INTERVAL_SECS` or `RIPCLONE_POLL_INTERVAL_SECS` falls back
-  to the default instead of failing at startup.
+  to the default instead of failing at startup; `RepoConfig.clonepack_depths`
+  and `archive_chunk_size` are validated and stored but the builder reads
+  neither (it reads only `compression_level`).
