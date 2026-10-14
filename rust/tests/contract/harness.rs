@@ -630,6 +630,26 @@ impl Server {
         }
     }
 
+    /// An unauthenticated POST with extra headers, as a webhook sender.
+    pub fn post(&self, path: &str, headers: &[(&str, &str)], body: &str) -> HttpResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(WAIT)
+            .build()
+            .unwrap();
+        let mut req = client
+            .post(format!("{}{path}", self.url))
+            .header("Content-Type", "application/json")
+            .body(body.to_string());
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let resp = req.send().expect("http request");
+        HttpResponse {
+            status: resp.status().as_u16(),
+            body: resp.text().unwrap_or_default(),
+        }
+    }
+
     /// Value of an unlabeled Prometheus counter or gauge from `/metrics`.
     pub fn metric(&self, name: &str) -> u64 {
         let body = self.get("/metrics").body;
@@ -711,4 +731,120 @@ pub fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// `RIPCLONE_PROVIDERS` JSON for provider instances on `host`. Each entry is
+/// `(id, kind, token, extra fields)`; a `None` token is left out.
+pub fn providers_json(
+    host: &str,
+    entries: &[(&str, &str, Option<&str>, serde_json::Value)],
+) -> String {
+    let providers: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(id, kind, token, extra)| {
+            let mut entry = serde_json::json!({ "id": id, "kind": kind, "host": host });
+            if let Some(token) = token {
+                entry["token"] = (*token).into();
+            }
+            if let Some(extra) = extra.as_object() {
+                for (k, v) in extra {
+                    entry[k] = v.clone();
+                }
+            }
+            entry
+        })
+        .collect();
+    serde_json::json!({ "providers": providers }).to_string()
+}
+
+/// A versitygw S3 emulator started by `scripts/s3_emulator.sh` for one test,
+/// with its own data dir and bucket. Killed on drop.
+pub struct S3 {
+    pub endpoint: String,
+    pub bucket: String,
+    vars: Vec<(String, String)>,
+    store: PathBuf,
+    pid: String,
+}
+
+impl S3 {
+    pub fn start(world: &World) -> Self {
+        let dir = world.path("s3");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/s3_emulator.sh");
+        let bucket = "contract";
+        let out = Command::new("bash")
+            .arg(&script)
+            .arg(&dir)
+            .arg(bucket)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run s3_emulator.sh");
+        assert!(
+            out.status.success(),
+            "s3_emulator.sh failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let vars: Vec<(String, String)> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let var = |name: &str| {
+            vars.iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("s3_emulator.sh printed no {name}"))
+        };
+        Self {
+            endpoint: var("RIPCLONE_S3_ENDPOINT"),
+            bucket: bucket.to_string(),
+            pid: var("S3_EMULATOR_PID"),
+            store: dir.join("store").join(bucket),
+            vars,
+        }
+    }
+
+    /// Server env for S3 storage reached at `endpoint` (this emulator, or a
+    /// proxy in front of it).
+    pub fn server_env(&self, endpoint: &str) -> Vec<(String, String)> {
+        self.vars
+            .iter()
+            .filter(|(k, _)| k != "S3_EMULATOR_PID")
+            .map(|(k, v)| {
+                let v = if k == "RIPCLONE_S3_ENDPOINT" {
+                    endpoint
+                } else {
+                    v
+                };
+                (k.clone(), v.to_string())
+            })
+            .collect()
+    }
+
+    /// Object keys in the bucket, sorted.
+    pub fn objects(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(&self.store, &self.store, &mut out);
+        out.retain(|key| !key.starts_with('.'));
+        out.sort();
+        out
+    }
+}
+
+impl Endpoint for S3 {
+    fn url(&self) -> String {
+        self.endpoint.clone()
+    }
+}
+
+impl Drop for S3 {
+    fn drop(&mut self) {
+        let _ = Command::new("kill").arg(&self.pid).status();
+    }
+}
+
+/// Borrow owned env pairs as the `&[(&str, &str)]` the harness takes.
+pub fn env_refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
+    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
 }

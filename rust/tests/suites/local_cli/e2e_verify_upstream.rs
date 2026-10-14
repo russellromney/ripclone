@@ -240,54 +240,6 @@ async fn wait_for_warm(server: &Server, repo: &str, result: ripclone::ExactResul
 }
 
 #[tokio::test]
-async fn verify_upstream_default_succeeds_for_public() {
-    init(false);
-    let server = start_server().await;
-    let origin = make_origin("acme", "verify-default");
-    origin.commit(&[("a.txt", "hello\n")], "c1");
-    origin.publish();
-    server
-        .client()
-        .add_repo("acme/verify-default")
-        .await
-        .expect("add repo");
-    server
-        .client()
-        .sync_repo("acme/verify-default", None)
-        .await
-        .expect("sync");
-    wait_for_warm(
-        &server,
-        "acme/verify-default",
-        ripclone::ExactResultKind::Head,
-    )
-    .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("clone");
-    let out = run_clone(&server, "acme/verify-default", &target, &[]).await;
-
-    assert!(
-        out.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        std::fs::read_to_string(target.join("a.txt")).unwrap(),
-        "hello\n"
-    );
-    // Editable clone: .git exists.
-    assert!(target.join(".git").is_dir());
-    // Default auto mode verified the public upstream; no skip warning was emitted.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("skipped"),
-        "expected verification to run, got stderr: {stderr}"
-    );
-}
-
-#[tokio::test]
 async fn upstream_snapshot_a_rejects_later_pinned_install_b_without_repinning() {
     init(false);
     let server = start_server().await;
@@ -532,57 +484,6 @@ async fn verify_upstream_always_uses_the_new_exact_tip() {
 }
 
 #[tokio::test]
-async fn verify_upstream_always_fails_when_unreachable() {
-    init(false);
-    let server = start_server().await;
-    let origin = make_origin("acme", "verify-unreachable");
-    origin.commit(&[("a.txt", "hello\n")], "c1");
-    origin.publish();
-    server
-        .client()
-        .add_repo("acme/verify-unreachable")
-        .await
-        .expect("add repo");
-    server
-        .client()
-        .sync_repo("acme/verify-unreachable", None)
-        .await
-        .expect("sync");
-    wait_for_warm(
-        &server,
-        "acme/verify-unreachable",
-        ripclone::ExactResultKind::Head,
-    )
-    .await;
-
-    // Remove the origin so the upstream ls-remote fails. The server's cached
-    // mirror is still fresh, so the clone itself would succeed without
-    // verification.
-    std::fs::remove_dir_all(&origin.bare).unwrap();
-
-    let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("clone");
-    let out = run_clone(
-        &server,
-        "acme/verify-unreachable",
-        &target,
-        &["--verify-upstream"],
-    )
-    .await;
-
-    assert!(
-        !out.status.success(),
-        "expected verification to fail, got stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("upstream verification failed"),
-        "stderr: {stderr}"
-    );
-}
-
-#[tokio::test]
 async fn verify_upstream_never_does_not_bypass_exact_symbolic_resolution() {
     init(false);
     let server = start_server().await;
@@ -628,51 +529,6 @@ async fn verify_upstream_never_does_not_bypass_exact_symbolic_resolution() {
     assert!(
         !stderr.contains("verify-upstream"),
         "expected silent skip, got stderr: {stderr}"
-    );
-    assert!(stderr.contains("upstream tip probe failed"), "{stderr}");
-    assert!(!target.exists(), "failed lookup left a partial target");
-}
-
-#[tokio::test]
-async fn verify_upstream_auto_warns_and_skips_unreachable() {
-    init(false);
-    let server = start_server().await;
-    let origin = make_origin("acme", "verify-auto-unreachable");
-    origin.commit(&[("a.txt", "hello\n")], "c1");
-    origin.publish();
-    server
-        .client()
-        .add_repo("acme/verify-auto-unreachable")
-        .await
-        .expect("add repo");
-    server
-        .client()
-        .sync_repo("acme/verify-auto-unreachable", None)
-        .await
-        .expect("sync");
-    wait_for_warm(
-        &server,
-        "acme/verify-auto-unreachable",
-        ripclone::ExactResultKind::Head,
-    )
-    .await;
-
-    // Remove the origin so the anonymous upstream probe fails. Default auto mode
-    // (no credential) must degrade with a warning rather than failing the clone.
-    std::fs::remove_dir_all(&origin.bare).unwrap();
-
-    let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("clone");
-    let out = run_clone(&server, "acme/verify-auto-unreachable", &target, &[]).await;
-
-    assert!(
-        !out.status.success(),
-        "symbolic lookup unexpectedly succeeded"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("warning: --verify-upstream skipped"),
-        "expected degrade warning, got stderr: {stderr}"
     );
     assert!(stderr.contains("upstream tip probe failed"), "{stderr}");
     assert!(!target.exists(), "failed lookup left a partial target");

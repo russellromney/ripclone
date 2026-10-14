@@ -1,0 +1,355 @@
+//! I. Integrations: provider auth headers, signed webhooks, and the CLI's
+//! upstream verification.
+
+use crate::harness::*;
+use base64::Engine;
+use hmac::{KeyInit, Mac};
+
+fn basic(user: &str, token: &str) -> String {
+    let raw = format!("{user}:{token}");
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    )
+}
+
+/// I3: for each provider kind, the server sends that provider's auth header
+/// on every request to the origin, and the origin accepts nothing else.
+#[test]
+fn i3_provider_auth_header_reaches_origin() {
+    // (id, kind, token, extra provider fields, header name, header value)
+    let cases = [
+        (
+            "gh-http",
+            "github",
+            "gh-secret",
+            serde_json::json!({}),
+            "authorization",
+            basic("x-access-token", "gh-secret"),
+        ),
+        (
+            "gl",
+            "gitlab",
+            "gl-secret",
+            serde_json::json!({}),
+            "authorization",
+            basic("oauth2", "gl-secret"),
+        ),
+        (
+            "gt",
+            "gitea",
+            "gt-secret",
+            serde_json::json!({}),
+            "authorization",
+            "token gt-secret".to_string(),
+        ),
+        (
+            "gen",
+            "generic",
+            "gen-secret",
+            serde_json::json!({
+                "auth_template": "Bearer {token}",
+                "auth_header_name": "X-Origin-Token",
+            }),
+            "x-origin-token",
+            "Bearer gen-secret".to_string(),
+        ),
+    ];
+    for (id, kind, token, extra, header, value) in cases {
+        let world = World::new();
+        let http = world.serve_origins_over_http();
+        http.require_header(header, &value);
+        let name = format!("i3-{kind}");
+        let origin = world.origin("acme", &name);
+        let tip = origin.commit(&[("a.txt", "a\n")], "A");
+        origin.publish();
+
+        let server_providers =
+            providers_json(http.url(), &[(id, kind, Some(token), extra.clone())]);
+        let server = world.server(&[("RIPCLONE_PROVIDERS", &server_providers)]);
+        // The CLI must know the provider id, but holds no upstream token, so
+        // only the server's credential can reach the origin.
+        let cli_providers = providers_json(http.url(), &[(id, kind, None, extra)]);
+        let target = world.target(&name);
+        let repo = format!("{id}:acme/{name}");
+        let cli_env = [("RIPCLONE_PROVIDERS", cli_providers.as_str())];
+        world
+            .cli_env(&server, &["add", &repo, "--wait"], &cli_env)
+            .ok();
+        world
+            .cli_env(
+                &server,
+                &[
+                    "clone",
+                    &repo,
+                    target.to_str().unwrap(),
+                    "--depth",
+                    "1",
+                    "--verify-upstream",
+                    "never",
+                ],
+                &cli_env,
+            )
+            .ok();
+
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "{kind}");
+        assert_eq!(listing(&target), origin.tree(&tip), "{kind}");
+        let requests = http.requests();
+        assert!(http.fetches() > 0, "{kind}: the origin served no fetch");
+        for request in &requests {
+            assert_eq!(
+                request.header(header),
+                Some(value.as_str()),
+                "{kind}: {} {} lacked the provider header",
+                request.method,
+                request.path
+            );
+        }
+    }
+}
+
+fn hmac_hex(secret: &str, body: &str) -> String {
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// A signed push webhook for `kind`: (headers, body).
+fn push_hook(
+    kind: &str,
+    secret: &str,
+    repo: &str,
+    after: &str,
+) -> (Vec<(&'static str, String)>, String) {
+    let (owner, name) = repo.split_once('/').unwrap();
+    match kind {
+        "github" => {
+            let body = serde_json::json!({
+                "ref": "refs/heads/main",
+                "after": after,
+                "repository": {
+                    "name": name,
+                    "owner": { "login": owner },
+                    "default_branch": "main",
+                    "private": false,
+                },
+            })
+            .to_string();
+            let sig = format!("sha256={}", hmac_hex(secret, &body));
+            (
+                vec![
+                    ("X-GitHub-Event", "push".into()),
+                    ("X-Hub-Signature-256", sig),
+                ],
+                body,
+            )
+        }
+        "gitlab" => {
+            let body = serde_json::json!({
+                "ref": "refs/heads/main",
+                "after": after,
+                "project": {
+                    "path_with_namespace": repo,
+                    "default_branch": "main",
+                    "visibility_level": 20,
+                },
+            })
+            .to_string();
+            (
+                vec![
+                    ("X-Gitlab-Event", "Push Hook".into()),
+                    ("X-Gitlab-Token", secret.into()),
+                ],
+                body,
+            )
+        }
+        "gitea" => {
+            let body = serde_json::json!({
+                "ref": "refs/heads/main",
+                "after": after,
+                "repository": {
+                    "full_name": repo,
+                    "default_branch": "main",
+                    "private": false,
+                },
+            })
+            .to_string();
+            let sig = hmac_hex(secret, &body);
+            (
+                vec![("X-Gitea-Event", "push".into()), ("X-Gitea-Signature", sig)],
+                body,
+            )
+        }
+        other => panic!("no webhook format for {other}"),
+    }
+}
+
+/// I4: for each provider's webhook, a bad signature gets 401 and builds
+/// nothing; a signed push builds the new tip before any clone asks for it.
+#[test]
+fn i4_signed_webhook_builds_before_clone() {
+    for (id, kind) in [
+        ("gh-hook", "github"),
+        ("gl-hook", "gitlab"),
+        ("gt-hook", "gitea"),
+    ] {
+        let world = World::new();
+        let http = world.serve_origins_over_http();
+        let name = format!("i4-{kind}");
+        let slug = format!("acme/{name}");
+        let origin = world.origin("acme", &name);
+        origin.commit(&[("a.txt", "a\n")], "A");
+        origin.publish();
+
+        let secret = format!("{kind}-hook-secret");
+        let secret_var = format!(
+            "RIPCLONE_WEBHOOK_SECRET_{}",
+            id.to_uppercase().replace('-', "_")
+        );
+        let providers = providers_json(http.url(), &[(id, kind, None, serde_json::json!({}))]);
+        let server = world.server(&[("RIPCLONE_PROVIDERS", &providers), (&secret_var, &secret)]);
+        let cli_env = [("RIPCLONE_PROVIDERS", providers.as_str())];
+        let repo = format!("{id}:{slug}");
+        world
+            .cli_env(&server, &["add", &repo, "--wait"], &cli_env)
+            .ok();
+        assert_eq!(server.metric("ripclone_builds_queued_total"), 1);
+
+        let tip = origin.commit(&[("a.txt", "b\n")], "B");
+        origin.publish();
+        let hook = format!("/webhooks/{id}");
+
+        let (headers, body) = push_hook(kind, "wrong-secret", &slug, &tip);
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let bad = server.post(&hook, &headers, &body);
+        assert_eq!(bad.status, 401, "{kind}: {}", bad.body);
+        assert_eq!(server.metric("ripclone_builds_queued_total"), 1, "{kind}");
+
+        let (headers, body) = push_hook(kind, &secret, &slug, &tip);
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let good = server.post(&hook, &headers, &body);
+        assert_eq!(good.status, 200, "{kind}: {}", good.body);
+        assert_eq!(server.metric("ripclone_builds_queued_total"), 2, "{kind}");
+        wait_for(&format!("{kind} webhook build"), || {
+            (server.metric("ripclone_builds_completed_total") == 2).then_some(())
+        });
+
+        let target = world.target(&name);
+        world
+            .cli_env(
+                &server,
+                &["clone", &repo, target.to_str().unwrap()],
+                &cli_env,
+            )
+            .ok();
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "{kind}");
+        assert_eq!(listing(&target), origin.tree(&tip), "{kind}");
+        assert_eq!(
+            server.metric("ripclone_builds_queued_total"),
+            2,
+            "{kind}: the clone needed a build"
+        );
+    }
+}
+
+/// I7: `--verify-upstream` against the upstream the CLI sees. The server
+/// always builds the real origin; the CLI's upstream is that origin, a closed
+/// port, or a copy whose tip has moved on.
+#[test]
+fn i7_verify_upstream_modes() {
+    let world = World::new();
+    let origin = world.origin("acme", "i7");
+    let tip = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/i7", "--wait"]).ok();
+
+    // A copy of the origin whose main has a commit the server never saw.
+    let moved = world.path("moved");
+    let moved_bare = moved.join("acme").join("i7.git");
+    std::fs::create_dir_all(moved_bare.parent().unwrap()).unwrap();
+    git(
+        &moved,
+        &[
+            "clone",
+            "--bare",
+            "-q",
+            origin.bare.to_str().unwrap(),
+            moved_bare.to_str().unwrap(),
+        ],
+    );
+    origin.commit(&[("a.txt", "moved\n")], "moved");
+    git(
+        &origin.work,
+        &["push", "-q", moved_bare.to_str().unwrap(), "HEAD:main"],
+    );
+    let closed = Closed::new();
+    let same = String::new();
+    let moved_base = format!("file://{}", moved.display());
+
+    // (upstream, its base for the CLI, mode, expected: Ok(warns) or Err(text))
+    let cases: [(&str, &str, &str, Result<bool, &str>); 9] = [
+        ("same", &same, "never", Ok(false)),
+        ("same", &same, "auto", Ok(false)),
+        ("same", &same, "always", Ok(false)),
+        ("closed", &closed.url(), "never", Ok(false)),
+        ("closed", &closed.url(), "auto", Ok(true)),
+        (
+            "closed",
+            &closed.url(),
+            "always",
+            Err("upstream verification failed"),
+        ),
+        ("moved", &moved_base, "never", Ok(false)),
+        (
+            "moved",
+            &moved_base,
+            "auto",
+            Err("does not match upstream tip"),
+        ),
+        (
+            "moved",
+            &moved_base,
+            "always",
+            Err("does not match upstream tip"),
+        ),
+    ];
+    for (upstream, base, mode, expected) in cases {
+        let case = format!("{upstream}-{mode}");
+        let target = world.target(&case);
+        let mut env = vec![];
+        if !base.is_empty() {
+            env.push(("RIPCLONE_ORIGIN_BASE", base));
+        }
+        let out = world.cli_env(
+            &server,
+            &[
+                "clone",
+                "acme/i7",
+                target.to_str().unwrap(),
+                "--depth",
+                "1",
+                &format!("--verify-upstream={mode}"),
+            ],
+            &env,
+        );
+        match expected {
+            Ok(warns) => {
+                out.ok();
+                assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "{case}");
+                assert_eq!(
+                    out.stderr().contains("--verify-upstream skipped"),
+                    warns,
+                    "{case}: {}",
+                    out.stderr()
+                );
+            }
+            Err(text) => {
+                let err = out.err();
+                assert!(err.contains(text), "{case}: {err}");
+                assert!(!target.exists(), "{case} left {}", target.display());
+            }
+        }
+    }
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+}

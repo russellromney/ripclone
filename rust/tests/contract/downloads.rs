@@ -4,7 +4,7 @@
 use crate::harness::*;
 
 /// Artifacts at least this large are the history pack holding the big blob.
-const BIG: usize = 1 << 20;
+pub const BIG: usize = 1 << 20;
 
 /// Deterministic incompressible bytes.
 fn noise(len: usize) -> Vec<u8> {
@@ -19,15 +19,21 @@ fn noise(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// An added repo whose history (not its tip) holds a 2 MiB blob, so a full
-/// clone streams one large history pack. Returns the proxy and the tip.
-fn big_history(world: &World, name: &str) -> (Origin, Server, FaultProxy, String) {
+/// An origin whose history (not its tip) holds a 2 MiB blob, so a full clone
+/// streams one large history pack. Returns the origin and its tip.
+pub fn big_history_origin(world: &World, name: &str) -> (Origin, String) {
     let origin = world.origin("acme", name);
     std::fs::write(origin.work.join("blob.bin"), noise(2 << 20)).unwrap();
     origin.commit(&[("README.md", "a\n")], "A");
     std::fs::write(origin.work.join("blob.bin"), "small\n").unwrap();
     let tip = origin.commit(&[("README.md", "b\n")], "B");
     origin.publish();
+    (origin, tip)
+}
+
+/// [`big_history_origin`], added to a server behind a fault proxy.
+fn big_history(world: &World, name: &str) -> (Origin, Server, FaultProxy, String) {
+    let (origin, tip) = big_history_origin(world, name);
     let server = world.server(&[]);
     world
         .cli(&server, &["add", &format!("acme/{name}"), "--wait"])

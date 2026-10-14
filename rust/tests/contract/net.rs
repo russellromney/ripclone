@@ -77,6 +77,26 @@ struct GitState {
     root: PathBuf,
     gate: Gate,
     fetches: AtomicUsize,
+    requests: Mutex<Vec<OriginRequest>>,
+    required: Mutex<Option<(String, String)>>,
+}
+
+/// One request the origin received.
+#[derive(Clone, Debug)]
+pub struct OriginRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl OriginRequest {
+    /// The value of header `name` (case-insensitive), if sent.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// `git http-backend` over HTTP for a directory of bare repos. While held, it
@@ -94,6 +114,8 @@ impl GitHttp {
             root,
             gate: Gate::new(),
             fetches: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            required: Mutex::new(None),
         });
         let router = Router::new()
             .fallback(git_backend)
@@ -130,6 +152,16 @@ impl GitHttp {
     pub fn fetches(&self) -> usize {
         self.state.fetches.load(Ordering::SeqCst)
     }
+
+    /// Answer 403 to any request without header `name: value`.
+    pub fn require_header(&self, name: &str, value: &str) {
+        *self.state.required.lock().unwrap() = Some((name.to_string(), value.to_string()));
+    }
+
+    /// Every request received so far, in order.
+    pub fn requests(&self) -> Vec<OriginRequest> {
+        self.state.requests.lock().unwrap().clone()
+    }
 }
 
 impl Drop for GitHttp {
@@ -147,6 +179,26 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
         .await
         .unwrap_or_default();
     let path = parts.uri.path().to_string();
+    let request = OriginRequest {
+        method: parts.method.to_string(),
+        path: path.clone(),
+        headers: parts
+            .headers
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect(),
+    };
+    let required = state.required.lock().unwrap().clone();
+    let allowed = required.is_none_or(|(name, value)| request.header(&name) == Some(&value));
+    state.requests.lock().unwrap().push(request);
+    if !allowed {
+        return plain(StatusCode::FORBIDDEN, "missing required header".into());
+    }
     // A v2 fetch and a v0 negotiation are both POSTs to git-upload-pack; a v2
     // `ls-refs` is too, but it only lists refs. Large request bodies may be
     // gzipped, and only fetches are large.
@@ -254,6 +306,8 @@ pub enum Fault {
     /// Promise the full Content-Length, send this many bytes, then drop the
     /// connection.
     CutAfter(usize),
+    /// Like `CutAfter`, but stall this long before dropping the connection.
+    StallThenCut(usize, Duration),
     /// Flip one byte in the middle of the body.
     FlipByte,
     /// Send only this many bytes, with a matching Content-Length.
@@ -293,6 +347,7 @@ struct ProxyState {
     rules: Mutex<Vec<Rule>>,
     rewrites: Mutex<Vec<Rewrite>>,
     ignore_range: AtomicBool,
+    preserve_host: AtomicBool,
     gate: Gate,
     seen: Mutex<Vec<Seen>>,
 }
@@ -316,6 +371,7 @@ impl FaultProxy {
             rules: Mutex::new(Vec::new()),
             rewrites: Mutex::new(Vec::new()),
             ignore_range: AtomicBool::new(false),
+            preserve_host: AtomicBool::new(false),
             gate: Gate::new(),
             seen: Mutex::new(Vec::new()),
         });
@@ -338,6 +394,18 @@ impl FaultProxy {
     /// starts with `prefix`.
     pub fn fault_requests(&self, prefix: &str, fault: Fault, times: usize) {
         self.add_rule(prefix, fault, 0, times);
+    }
+
+    /// Apply `fault` to the next `times` responses of at least `min_len`
+    /// bytes to requests whose path starts with `prefix`.
+    pub fn fault_large(&self, prefix: &str, fault: Fault, min_len: usize, times: usize) {
+        self.add_rule(prefix, fault, min_len, times);
+    }
+
+    /// Forward the client's Host header instead of the upstream's, so
+    /// signatures over the host (S3 presigned URLs) still verify.
+    pub fn preserve_host(&self) {
+        self.state.preserve_host.store(true, Ordering::SeqCst);
     }
 
     fn add_rule(&self, prefix: &str, fault: Fault, min_len: usize, times: usize) {
@@ -387,9 +455,14 @@ impl FaultProxy {
 
     /// Artifact GETs, in order.
     pub fn artifact_gets(&self) -> Vec<Seen> {
+        self.gets("/v1/artifacts/")
+    }
+
+    /// GETs whose path starts with `prefix`, in order.
+    pub fn gets(&self, prefix: &str) -> Vec<Seen> {
         self.seen()
             .into_iter()
-            .filter(|s| s.method == "GET" && s.path.starts_with("/v1/artifacts/"))
+            .filter(|s| s.method == "GET" && s.path.starts_with(prefix))
             .collect()
     }
 
@@ -437,7 +510,8 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     let mut headers = HeaderMap::new();
     for (name, value) in &parts.headers {
         let drop_range = name == header::RANGE && state.ignore_range.load(Ordering::SeqCst);
-        if !HOP_HEADERS.contains(name) && !drop_range {
+        let keep_host = name == header::HOST && state.preserve_host.load(Ordering::SeqCst);
+        if (keep_host || !HOP_HEADERS.contains(name)) && !drop_range {
             headers.append(name, value.clone());
         }
     }
@@ -496,7 +570,10 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
             data.clear();
             resp_headers.remove(header::CONTENT_RANGE);
         }
-        Some(Fault::CutAfter(n)) => cut = Some(n.min(data.len())),
+        // hyper flushes written bytes when the body is pending, so pause
+        // before failing; otherwise the cut can discard the head.
+        Some(Fault::CutAfter(n)) => cut = Some((n.min(data.len()), Duration::from_millis(20))),
+        Some(Fault::StallThenCut(n, stall)) => cut = Some((n.min(data.len()), stall)),
     }
 
     state.seen.lock().unwrap().push(Seen {
@@ -514,13 +591,11 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     builder = builder.header(header::CONTENT_LENGTH, data.len());
     match cut {
         None => builder.body(Body::from(data)).unwrap(),
-        Some(n) => {
+        Some((n, stall)) => {
             use futures::StreamExt;
             let head = Bytes::from(data).slice(..n);
-            // hyper flushes written bytes when the body is pending, so pause
-            // before failing; otherwise the cut can discard the head.
-            let cut = futures::stream::once(async {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            let cut = futures::stream::once(async move {
+                tokio::time::sleep(stall).await;
                 Err(std::io::Error::other("fault proxy cut"))
             });
             let body = futures::stream::once(async move { Ok(head) }).chain(cut);

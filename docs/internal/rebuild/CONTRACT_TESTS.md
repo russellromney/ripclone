@@ -194,8 +194,22 @@ The third PR fixed the CLI: exit codes by failure kind (D5), and Ctrl-C
 cancels the command and waits for the clone's cleanup to remove staging
 before exiting 130 (F8).
 
+The fourth PR added the integrations and S3 rows: I3, I4, I7, F7, H2. The
+gated origin records request headers and can require one (I3). The fault
+proxy can keep the Host header, so S3 presigned URLs signed for its address
+still verify, and can stall before cutting a response so the resume reaches
+S3 after the URL expired (F7). F7 and H2 start their own versitygw per test
+and are `#[ignore]`d; the `s3` CI job runs them with `--ignored s3_`. That job
+replaces `full-topup-s3`. Deleted as covered: the S3 refresh test in
+`e2e_full_topup.rs` and its script, the per-kind provider header tests, the
+webhook build-before-clone tests, the missed-push poller test (I5), and three
+`--verify-upstream` cases.
+
 ## Open points
 
 - C1, C2, D4 and E1 depend on `background_slots`, which arrives in step 3. Until
   then, the "now" tests run against today's main.
-- Next: integrations (I3, I4, I7) and the S3 rows (F7, H2).
+- Every "now" row has a contract test except H4, which waits on #181, and
+  I6, which the existing `docs_cli_surface` test covers.
+- Next: the step-3 rows (A5, C1, C2, D4, E1, I2) once `background_slots` and
+  the `--at` rule land, then the deletions listed above.
