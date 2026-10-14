@@ -447,47 +447,33 @@ impl<T: Send + 'static> Drop for AbortOnDrop<T> {
     }
 }
 
-/// A git child process working in staging. Dropping it kills the process
-/// group and leaves the wait to the reaper.
+/// A git child process working in staging. Dropping it before it exits
+/// kills it and leaves the wait to the reaper.
 pub(super) struct GitChild {
-    pub(super) child: Option<tokio::process::Child>,
-    process_group: Option<i32>,
+    child: Option<tokio::process::Child>,
     cleanup: Cleanup,
 }
 
 impl GitChild {
     pub(super) fn new(child: tokio::process::Child, cleanup: Cleanup) -> Self {
         Self {
-            process_group: child.id().and_then(|pid| i32::try_from(pid).ok()),
             child: Some(child),
             cleanup,
         }
     }
 
-    pub(super) fn terminate(&mut self) {
-        #[cfg(unix)]
-        if let Some(group) = self.process_group {
-            // The child starts a fresh process group, so this also kills its
-            // transport helpers before staging drops.
-            // SAFETY: `group` is the positive pid of a child placed in its own
-            // process group; negating it targets that group. `kill` does not
-            // dereference any Rust memory.
-            unsafe {
-                libc::kill(-group, libc::SIGKILL);
-            }
-        }
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
-        }
+    pub(super) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let child = self.child.as_mut().expect("git child present until exit");
+        let status = child.wait().await?;
+        self.child = None;
+        Ok(status)
     }
 }
 
 impl Drop for GitChild {
     fn drop(&mut self) {
-        if self.child.is_some() {
-            self.terminate();
-        }
         if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
             self.cleanup.push(Box::pin(async move {
                 let _ = child.wait().await;
             }));

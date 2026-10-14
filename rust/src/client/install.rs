@@ -16,12 +16,12 @@ use crate::bench::{Benchmark, BenchmarkReport};
 use crate::cas::hash as cas_hash;
 use crate::clonepack::{ClonepackManifest, MetadataChunk, PackEntry, manifest_pack_idx_bytes};
 use crate::extract::extract_archive_from_chunk_receiver;
-use crate::provider::{ProviderInstance, RepoId};
+use crate::provider::RepoId;
 use anyhow::{Context, Result};
 use prost::Message;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::info;
 
 /// What to clone.
@@ -34,6 +34,8 @@ pub struct CloneRequest<'a> {
     pub at: Option<&'a str>,
     /// The output to install: Head (depth 1), Full, or Files.
     pub kind: ExactResultKind,
+    /// `--wait`: install the exact output, waiting for it, never a top-up.
+    pub wait: bool,
 }
 
 /// The commit a clone resolved to. Every later read names this commit.
@@ -50,8 +52,12 @@ enum Plan {
     Files(RefResponse),
     Head(RefResponse),
     Full(RefResponse),
-    /// Full of an older commit; the pinned commit is fetched on top.
-    TopUp(RefResponse),
+    /// Full of an older commit; the pinned commit is fetched on top from
+    /// `upstream_url`, which the client derives from its own provider config.
+    TopUp {
+        base: RefResponse,
+        upstream_url: String,
+    },
 }
 
 impl Plan {
@@ -65,30 +71,16 @@ impl Plan {
 
     fn output(&self) -> &RefResponse {
         match self {
-            Self::Files(output) | Self::Head(output) | Self::Full(output) | Self::TopUp(output) => {
-                output
-            }
+            Self::Files(output)
+            | Self::Head(output)
+            | Self::Full(output)
+            | Self::TopUp { base: output, .. } => output,
         }
     }
 }
 
 /// One chunk of the files archive on its way to the extractor.
 type ArchiveChunk = (usize, Result<bytes::Bytes>);
-
-/// A configured provider's clone URL; for the default GitHub provider,
-/// `RIPCLONE_ORIGIN_BASE` replaces `https://github.com`, as on the server.
-fn local_provider_origin(provider: &ProviderInstance, repo_path: &str) -> String {
-    if provider.is_github_default()
-        && provider.host == "github.com"
-        && let Some(base) = std::env::var("RIPCLONE_ORIGIN_BASE")
-            .ok()
-            .filter(|base| !base.is_empty())
-    {
-        format!("{}/{}.git", base.trim_end_matches('/'), repo_path)
-    } else {
-        provider.clone_url(repo_path)
-    }
-}
 
 fn validate_manifest_commit(manifest: &ClonepackManifest, commit: &str) -> Result<()> {
     if manifest.commit != commit {
@@ -128,9 +120,9 @@ impl Client {
         let _ = crate::worktree_writer::take_write_timing();
 
         let pin = self.resolve(request).await?;
-        let allow_top_up = request.at.is_none()
-            && request.kind == ExactResultKind::Full
-            && !pin.checkout.is_empty();
+        // A full clone never waits on the server: while Full(B) builds, it
+        // installs the newest ready Full and fetches the rest upstream.
+        let allow_top_up = !request.wait && request.kind == ExactResultKind::Full;
         let (plan, cold) = self
             .plan(repo_path, &pin, request.kind, allow_top_up)
             .await?;
@@ -139,7 +131,7 @@ impl Client {
         info!(
             "resolved target {} using {} artifact {}",
             &pin.commit[..7],
-            if matches!(plan, Plan::TopUp(_)) {
+            if matches!(plan, Plan::TopUp { .. }) {
                 "base"
             } else {
                 "exact"
@@ -246,6 +238,8 @@ impl Client {
                     );
                     cold = true;
                     if allow_top_up && let Some(plan) = top_up {
+                        crate::validation::validate_object_id(&plan.base_commit)
+                            .context("invalid top-up base")?;
                         validate_output(&plan.base, &plan.base_commit, kind, repo_path)
                             .context("invalid top-up base")?;
                         anyhow::ensure!(
@@ -253,8 +247,11 @@ impl Client {
                             "invalid top-up plan for pinned commit {target}: base is not distinct"
                         );
                         // Fail before downloading the base, not after.
-                        self.top_up_provider_for(repo_path)?;
-                        return Ok((Plan::TopUp(*plan.base), cold));
+                        let plan = Plan::TopUp {
+                            base: *plan.base,
+                            upstream_url: self.top_up_url(repo_path)?,
+                        };
+                        return Ok((plan, cold));
                     }
                     if attempt == 0 {
                         eprintln!("ripclone: warming {repo_path} — this can take a moment…");
@@ -294,17 +291,16 @@ impl Client {
         let root = self
             .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
             .await?;
-        let origin_url = if let Plan::TopUp(base) = plan {
-            self.top_up(repo_path, &root, &base.commit, &pin.commit, cleanup)
+        let origin_url = if let Plan::TopUp { base, upstream_url } = plan {
+            top_up(&root, upstream_url, &pin.commit, cleanup)
                 .await
                 .with_context(|| {
                     format!(
-                        "top-up of pinned commit {} from base {}",
+                        "top-up of {} from base {} failed; `--wait` clones the exact build instead",
                         pin.commit, base.commit
                     )
                 })?;
-            let provider = self.top_up_provider_for(repo_path)?;
-            local_provider_origin(provider, repo_path)
+            upstream_url.clone()
         } else if output.origin_url.is_empty() {
             format!("https://github.com/{repo_path}.git")
         } else {
@@ -852,10 +848,11 @@ impl Client {
         Ok(total)
     }
 
-    /// The configured provider a top-up fetches from. A non-default provider
-    /// id alone is not enough: its host and URL template must come from the
-    /// client's own registry, never from the server.
-    fn top_up_provider_for(&self, repo_path: &str) -> Result<&ProviderInstance> {
+    /// The URL a top-up fetches `repo_path` from: the locally configured
+    /// provider's clone URL (`RIPCLONE_ORIGIN_BASE` applies to the default
+    /// GitHub provider, as on the server). Never a URL from the server, so a
+    /// server cannot point the user's git and credentials at another host.
+    fn top_up_url(&self, repo_path: &str) -> Result<String> {
         let provider = self
             .provider_instance
             .as_ref()
@@ -869,230 +866,71 @@ impl Client {
         };
         crate::validation::validate_repo_path(provider, &repo_id)
             .context("invalid local provider repository path for top-up")?;
-        Ok(provider)
-    }
-
-    /// Fetch `target` from the upstream into the staged base clone and check
-    /// it out, before anything is published.
-    async fn top_up(
-        &self,
-        repo_path: &str,
-        root: &Path,
-        base: &str,
-        target: &str,
-        cleanup: &Cleanup,
-    ) -> Result<()> {
-        crate::validation::validate_object_id(base).context("invalid top-up base object id")?;
-        crate::validation::validate_object_id(target).context("invalid top-up target object id")?;
-        let provider = self.top_up_provider_for(repo_path)?;
-
-        if root.join(".git/shallow").exists() {
-            anyhow::bail!("top-up base unexpectedly contains a shallow boundary");
-        }
-        let installed = self
-            .run_git(root, &["rev-parse", "HEAD"], None, cleanup)
-            .await?;
-        if installed.trim() != base {
-            anyhow::bail!(
-                "installed top-up base HEAD {} does not match declared base {base}",
-                installed.trim()
-            );
-        }
-        let origin = local_provider_origin(provider, repo_path);
-        let auth_header = match self.upstream_token.as_deref() {
-            Some(token) => Some(provider.auth_header(token).context(
-                "the locally configured provider cannot construct its authentication header",
-            )?),
-            None => None,
-        };
-        let fetch = [
-            "fetch",
-            "--no-write-fetch-head",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "--refmap=",
-            "--",
-            &origin,
-            target,
-        ];
-        self.run_git(root, &fetch, auth_header.as_ref(), cleanup)
-            .await
-            .with_context(|| format!("exact upstream fetch of pinned commit {target}"))?;
-
-        self.run_git(root, &["reset", "--hard", target], None, cleanup)
-            .await
-            .with_context(|| format!("update staged worktree to pinned commit {target}"))?;
-        let head = self
-            .run_git(root, &["rev-parse", "HEAD"], None, cleanup)
-            .await?;
-        if head.trim() != target {
-            anyhow::bail!(
-                "top-up staged HEAD {} does not match pinned commit {target}",
-                head.trim()
-            );
-        }
-        let head_ref = self
-            .run_git(root, &["symbolic-ref", "-q", "HEAD"], None, cleanup)
-            .await?;
-        if !head_ref.trim().starts_with("refs/heads/") {
-            anyhow::bail!("top-up staged HEAD is not attached to a branch");
-        }
-        let status = self
-            .run_git(
-                root,
-                &["status", "--porcelain=v1", "--untracked-files=all"],
-                None,
-                cleanup,
-            )
-            .await?;
-        if !status.trim().is_empty() {
-            anyhow::bail!("top-up staged worktree is not clean");
-        }
-        Ok(())
-    }
-
-    /// Run one git command in `repo` with no user or system config, and
-    /// return its stdout. Cancelling the clone kills the command.
-    async fn run_git(
-        &self,
-        repo: &Path,
-        args: &[&str],
-        auth_header: Option<&(String, String)>,
-        cleanup: &Cleanup,
-    ) -> Result<String> {
-        use std::io::{Read, Seek};
-        use std::process::Stdio;
-
-        let mut stdout_file = tempfile::tempfile().context("create top-up Git stdout file")?;
-        let child_stdout = stdout_file
-            .try_clone()
-            .context("clone top-up Git stdout file")?;
-        let mut stderr = tempfile::tempfile().context("create top-up Git stderr file")?;
-        let child_stderr = stderr.try_clone().context("clone top-up Git stderr file")?;
-        let mut command = tokio::process::Command::new("git");
-        command
-            .env_clear()
-            .env("HOME", "/nonexistent")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_PAGER", "cat")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(child_stdout))
-            .stderr(Stdio::from(child_stderr));
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            command.env("SystemRoot", root);
-        }
-        command.args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "credential.helper=",
-            "-c",
-            "maintenance.auto=false",
-            "-c",
-            "gc.auto=0",
-            "-c",
-            "protocol.version=2",
-            "-c",
-            "fetch.fsckObjects=true",
-            "-c",
-            "transfer.fsckObjects=true",
-        ]);
-        if let Some((name, value)) = auth_header {
-            command
-                .args(["-c", &format!("http.extraHeader={name}: {value}")])
-                .args(["-c", "http.followRedirects=false"]);
-        }
-        command.arg("-C").arg(repo).args(args);
-        #[cfg(unix)]
-        // SAFETY: `pre_exec` runs after fork and before exec. The closure only
-        // calls async-signal-safe `setpgid` and constructs an OS error from
-        // thread-local errno on failure; it captures no borrowed state.
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.as_std_mut().pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        let child = command
-            .spawn()
-            .context("spawn managed top-up Git command")?;
-        let mut git = GitChild::new(child, cleanup.clone());
-        let timeout = MANAGED_GIT_TIMEOUT;
-        let wait = git
-            .child
-            .as_mut()
-            .context("managed top-up child missing")?
-            .wait();
-        let status = match tokio::time::timeout(timeout, wait).await {
-            Ok(status) => status.context("wait for managed top-up Git command")?,
-            Err(_) => {
-                git.terminate();
-                let _ = git
-                    .child
-                    .as_mut()
-                    .context("managed top-up child missing during timeout cleanup")?
-                    .wait()
-                    .await;
-                git.child.take();
-                anyhow::bail!(
-                    "top-up Git command timed out after {} seconds",
-                    timeout.as_secs()
-                );
-            }
-        };
-        git.child.take();
-        if !status.success() {
-            stderr.rewind().context("rewind top-up Git stderr")?;
-            let mut detail = String::new();
-            stderr
-                .read_to_string(&mut detail)
-                .context("read top-up Git stderr")?;
-            if let Some((_, value)) = auth_header {
-                detail = detail.replace(value, "<redacted>");
-            }
-            if let Some(token) = self.upstream_token.as_deref() {
-                detail = detail.replace(token, "<redacted>");
-            }
-            let detail = detail
-                .lines()
-                .rev()
-                .filter(|line| !line.trim().is_empty())
-                .take(4)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-            if detail.is_empty() {
-                anyhow::bail!("top-up Git command failed with {status}");
-            }
-            anyhow::bail!("top-up Git command failed: {detail}");
-        }
-        stdout_file
-            .rewind()
-            .context("rewind managed top-up Git stdout")?;
-        let mut stdout = Vec::new();
-        stdout_file
-            .read_to_end(&mut stdout)
-            .context("read managed top-up Git stdout")?;
-        Ok(String::from_utf8_lossy(&stdout).into_owned())
+        Ok(crate::git::upstream_url(provider, &repo_id))
     }
 }
 
-const MANAGED_GIT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bring the staged base clone to `target` with the user's own git: one
+/// fetch of that exact commit from the upstream, then a checkout. The user's
+/// config and credential helpers apply; no ripclone token or provider config
+/// takes part. When the base is not an ancestor of `target` (a force-push),
+/// the fetch just transfers more.
+async fn top_up(root: &Path, upstream_url: &str, target: &str, cleanup: &Cleanup) -> Result<()> {
+    let fetch = [
+        "fetch",
+        "--no-write-fetch-head",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--refmap=",
+        "--",
+        upstream_url,
+        target,
+    ];
+    run_git(root, &fetch, cleanup)
+        .await
+        .with_context(|| format!("fetch {target} from {upstream_url}"))?;
+    run_git(root, &["reset", "--hard", "--quiet", target], cleanup)
+        .await
+        .with_context(|| format!("check out {target}"))
+}
+
+/// Run the user's git in `repo`, with their environment and config. On
+/// failure the error carries the end of its stderr. Cancelling the clone
+/// kills it.
+async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
+    use std::io::{Read, Seek};
+    use std::process::Stdio;
+
+    let mut stderr = tempfile::tempfile().context("create git stderr file")?;
+    let child = tokio::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "-c", "gc.auto=0"])
+        .args(["-c", "maintenance.auto=false", "-C"])
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            stderr.try_clone().context("clone git stderr file")?,
+        ))
+        .spawn()
+        .context("run git")?;
+    let mut git = GitChild::new(child, cleanup.clone());
+    let status = git.wait().await.context("wait for git")?;
+    if status.success() {
+        return Ok(());
+    }
+    stderr.rewind().context("rewind git stderr")?;
+    let mut detail = String::new();
+    stderr
+        .read_to_string(&mut detail)
+        .context("read git stderr")?;
+    let lines: Vec<&str> = detail.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(4)..].join("\n");
+    if tail.is_empty() {
+        anyhow::bail!("git {} failed with {status}", args[0]);
+    }
+    anyhow::bail!("git {} failed: {tail}", args[0]);
+}
 
 /// Create the clone's staging directory and hand it to the reaper.
 fn stage(target: &Path, staging: &Staging) -> Result<PathBuf> {

@@ -1035,7 +1035,8 @@ fn upstream_url_and_auth(
     (url, git_args)
 }
 
-/// The URL the server fetches `repo_id` from, without credentials.
+/// The upstream URL of `repo_id`, without credentials. The server fetches
+/// from it, and a client tops up from it using its own provider config.
 pub fn upstream_url(provider: &ProviderInstance, repo_id: &RepoId) -> String {
     upstream_url_with(provider, repo_id, origin_base().as_deref())
 }

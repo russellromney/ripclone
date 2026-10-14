@@ -55,9 +55,8 @@ struct Args {
     #[arg(short, long)]
     provider: Option<String>,
 
-    /// Upstream credential token for this machine's own upstream access
-    /// (`--verify-upstream` and top-up fetches). Overrides any configured
-    /// provider token. Never sent to the ripclone server.
+    /// Upstream credential token for `--verify-upstream`. Overrides any
+    /// configured provider token. Never sent to the ripclone server.
     #[arg(short, long, env = "RIPCLONE_UPSTREAM_TOKEN")]
     token: Option<String>,
 
@@ -117,6 +116,11 @@ enum Commands {
         /// Clone this full commit SHA, branch or tag instead of the branch tip.
         #[arg(long)]
         at: Option<String>,
+        /// Wait for the server's exact build of the commit. Without it, a
+        /// full clone whose build is still pending installs the newest ready
+        /// build and fetches the rest from the upstream with your git.
+        #[arg(long)]
+        wait: bool,
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
@@ -860,6 +864,7 @@ async fn run() -> Result<()> {
             bench,
             no_metrics,
             verify_upstream,
+            wait,
         } => {
             if let Some(at) = at.as_deref() {
                 Selector::parse(at)?;
@@ -869,14 +874,14 @@ async fn run() -> Result<()> {
                 ripclone::git::require_system_git()?;
             }
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let local_provider = provider_instance(&provider, &provider_registry)
-                .with_context(|| format!("provider '{provider}' is not configured locally"))?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
                     .await?;
-            let mut client = client
-                .with_provider_instance(local_provider)
-                .with_upstream_token_opt(upstream_token.clone());
+            // A top-up fetches from the URL this provider config gives, never
+            // from one the server names.
+            let local_provider = provider_instance(&provider, &provider_registry)
+                .with_context(|| format!("provider '{provider}' is not configured locally"))?;
+            let mut client = client.with_provider_instance(local_provider);
             if no_metrics {
                 client = client.with_metrics_disabled();
             }
@@ -936,6 +941,7 @@ async fn run() -> Result<()> {
                 branch: &branch,
                 at: at.as_deref(),
                 kind,
+                wait,
             };
             let outcome = client
                 .clone_repo(&request, &target, enable_bench.then_some(&mut benchmark))
