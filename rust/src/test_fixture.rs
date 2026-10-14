@@ -56,19 +56,7 @@ pub fn commit_bytes(repo: &gix::Repository, files: &[(&[u8], &[u8])]) -> String 
     commit_bytes_with_modes(repo, &files)
 }
 
-fn ensure_committer_env() {
-    // gix needs a committer identity to write the reflog. CI runners don't always
-    // have git user config, so fall back to the test identity.
-    if std::env::var_os("GIT_COMMITTER_NAME").is_none() {
-        unsafe { std::env::set_var("GIT_COMMITTER_NAME", TEST_AUTHOR) };
-    }
-    if std::env::var_os("GIT_COMMITTER_EMAIL").is_none() {
-        unsafe { std::env::set_var("GIT_COMMITTER_EMAIL", TEST_EMAIL) };
-    }
-}
-
 fn commit_bytes_with_modes(repo: &gix::Repository, files: &[(&[u8], u32, &[u8])]) -> String {
-    ensure_committer_env();
     let parents = head_commit_ids(repo);
     let tree_id = build_tree(repo, files).expect("build tree");
 
@@ -85,6 +73,12 @@ fn commit_bytes_with_modes(repo: &gix::Repository, files: &[(&[u8], u32, &[u8])]
         .expect("write commit")
         .detach();
 
+    // gix needs a committer identity to write the reflog. CI runners don't
+    // always have git user config, so give this handle a fallback identity
+    // (process env stays untouched; tests run in parallel).
+    let mut repo = repo.clone();
+    repo.committer_or_set_generic_fallback()
+        .expect("committer fallback");
     repo.reference("refs/heads/main", commit_id, PreviousValue::Any, "commit")
         .expect("update main");
 

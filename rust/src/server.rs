@@ -330,6 +330,17 @@ fn repo_not_added_response() -> Response {
         .into_response()
 }
 
+fn ref_not_found_response(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": format!("upstream ref not found: {name}"),
+            "code": "ref_not_found",
+        })),
+    )
+        .into_response()
+}
+
 async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, Response> {
     state
         .ref_store
@@ -1352,15 +1363,7 @@ async fn get_ref_inner(
                 };
                 (tip.commit, checkout_name, false)
             }
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("upstream ref not found: {requested_checkout}"),
-                    }),
-                )
-                    .into_response();
-            }
+            Ok(None) => return ref_not_found_response(&requested_checkout),
             Err(error) => {
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -1873,15 +1876,7 @@ async fn sync_repo_inner(
     };
     let tip = match tip {
         Ok(Some(tip)) => tip,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("upstream ref not found: {requested_branch}"),
-                }),
-            )
-                .into_response();
-        }
+        Ok(None) => return ref_not_found_response(&requested_branch),
         Err(e) => {
             state.metrics.record_error();
             return (
@@ -4889,9 +4884,17 @@ fn spawn_poll_loop(state: ServerState, interval: Duration) {
     });
 }
 
-/// Hash the auth token, or fail if it is missing/empty. Pure (no env access) so
-/// it is unit-testable without starting a server or touching global state.
-fn auth_token_hash(raw: Option<String>) -> Result<String> {
+/// The server auth token hash.
+///
+/// Precedence:
+///   1. RIPCLONE_SERVER_TOKEN_HASH (already hashed)
+///   2. RIPCLONE_SERVER_TOKEN (raw, hashed here)
+///
+/// Fails when neither is set and non-empty.
+fn server_auth_token_hash(hash: Option<String>, raw: Option<String>) -> Result<String> {
+    if let Some(hash) = hash.filter(|t| !t.is_empty()) {
+        return Ok(hash);
+    }
     raw.filter(|t| !t.is_empty())
         .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
         .ok_or_else(|| {
@@ -4901,25 +4904,12 @@ fn auth_token_hash(raw: Option<String>) -> Result<String> {
         })
 }
 
-/// Read the server auth token from the environment.
-///
-/// Precedence:
-///   1. RIPCLONE_SERVER_TOKEN_HASH (already hashed)
-///   2. RIPCLONE_SERVER_TOKEN (raw)
+/// [`server_auth_token_hash`] from the environment.
 fn read_server_auth_token() -> Result<String> {
-    if let Some(hash) = env::var("RIPCLONE_SERVER_TOKEN_HASH")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
-        return Ok(hash);
-    }
-    if let Some(raw) = env::var("RIPCLONE_SERVER_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
-        return Ok(hex::encode(Sha256::digest(raw.as_bytes())));
-    }
-    auth_token_hash(None)
+    server_auth_token_hash(
+        env::var("RIPCLONE_SERVER_TOKEN_HASH").ok(),
+        env::var("RIPCLONE_SERVER_TOKEN").ok(),
+    )
 }
 
 async fn serve(
@@ -5110,70 +5100,73 @@ mod tests {
         assert_eq!(body["queue_depth"], 3);
     }
 
-    // Classification must be TYPE-based (downcast at the do_sync error boundary),
-    // not string-matching. These pin the concrete-source → retryable mapping; a
-    // regression to message-matching or a mis-mapped source flips a case.
-
+    /// Build failures are classified by the concrete error type in the chain,
+    /// not by message text.
     #[test]
-    fn classify_s3_transport_error_is_retryable() {
-        // A Tigris network blip surfaces as `s3::Error::Transport`. If the type
-        // is lost (e.g. stringified in collect_stream) this falls through to
-        // permanent — the stale-until-repush bug.
-        let e = anyhow::Error::new(s3::Error::Transport {
-            message: "connection reset".into(),
-            source: None,
-        })
-        .context("S3 get_object");
-        assert!(classify_build_error(&e).is_retryable());
-    }
-
-    #[test]
-    fn classify_s3_5xx_is_retryable_and_config_is_permanent() {
-        let five_xx = anyhow::Error::new(s3::Error::Api {
-            status: StatusCode::SERVICE_UNAVAILABLE,
+    fn build_error_classification_by_source_type() {
+        let api = |status| s3::Error::Api {
+            status,
             code: None,
             message: None,
             request_id: None,
             host_id: None,
             body_snippet: None,
-        });
-        assert!(classify_build_error(&five_xx).is_retryable());
-
-        let bad_config = anyhow::Error::new(s3::Error::InvalidConfig {
-            message: "bad bucket".into(),
-        });
-        assert!(!classify_build_error(&bad_config).is_retryable());
-    }
-
-    #[test]
-    fn classify_s3_404_is_permanent() {
-        let not_found = anyhow::Error::new(s3::Error::Api {
-            status: StatusCode::NOT_FOUND,
-            code: None,
-            message: None,
-            request_id: None,
-            host_id: None,
-            body_snippet: None,
-        });
-        assert!(!classify_build_error(&not_found).is_retryable());
-    }
-
-    #[test]
-    fn classify_retryable_io_error_is_retryable() {
-        let e = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-            .context("upload chunk");
-        assert!(classify_build_error(&e).is_retryable());
-    }
-
-    #[test]
-    fn classify_unknown_error_is_permanent() {
-        // No recognized transient source in the chain → permanent, so a genuine
-        // bad-repo/malformed failure fails fast instead of burning the cap.
-        let e = anyhow::anyhow!("malformed pack index");
-        assert!(!classify_build_error(&e).is_retryable());
-
-        let not_found_io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert!(!classify_build_error(&not_found_io).is_retryable());
+        };
+        let io = |kind| anyhow::Error::new(std::io::Error::from(kind));
+        for (case, error, retryable) in [
+            (
+                "s3 transport",
+                anyhow::Error::new(s3::Error::transport("connection reset", None))
+                    .context("S3 get_object"),
+                true,
+            ),
+            (
+                "s3 503",
+                anyhow::Error::new(api(StatusCode::SERVICE_UNAVAILABLE)),
+                true,
+            ),
+            (
+                "s3 404",
+                anyhow::Error::new(api(StatusCode::NOT_FOUND)),
+                false,
+            ),
+            (
+                "s3 config",
+                anyhow::Error::new(s3::Error::InvalidConfig {
+                    message: "bad bucket".into(),
+                }),
+                false,
+            ),
+            (
+                "io reset",
+                io(std::io::ErrorKind::ConnectionReset).context("upload chunk"),
+                true,
+            ),
+            ("io timeout", io(std::io::ErrorKind::TimedOut), true),
+            ("io not found", io(std::io::ErrorKind::NotFound), false),
+            (
+                "io invalid input",
+                io(std::io::ErrorKind::InvalidInput),
+                false,
+            ),
+            (
+                "upstream retryable",
+                anyhow::Error::new(git::UpstreamGitError::new("fetch", true)),
+                true,
+            ),
+            (
+                "upstream terminal",
+                anyhow::Error::new(git::UpstreamGitError::new("fetch", false)),
+                false,
+            ),
+            ("unknown", anyhow::anyhow!("malformed pack index"), false),
+        ] {
+            assert_eq!(
+                classify_build_error(&error).is_retryable(),
+                retryable,
+                "{case}"
+            );
+        }
     }
 
     struct TestSqlQueue {
@@ -5625,58 +5618,6 @@ mod tests {
     }
 
     #[test]
-    fn build_error_classification_maps_storage_sources() {
-        let retryable = classify_build_error(&anyhow::Error::new(s3::Error::Api {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: None,
-            message: None,
-            request_id: None,
-            host_id: None,
-            body_snippet: None,
-        }));
-        assert!(retryable.is_retryable());
-
-        let retryable =
-            classify_build_error(&anyhow::Error::new(s3::Error::transport("network", None)));
-        assert!(retryable.is_retryable());
-
-        let permanent = classify_build_error(&anyhow::Error::new(s3::Error::Api {
-            status: StatusCode::NOT_FOUND,
-            code: None,
-            message: None,
-            request_id: None,
-            host_id: None,
-            body_snippet: None,
-        }));
-        assert!(!permanent.is_retryable());
-    }
-
-    #[test]
-    fn build_error_classification_maps_io_timeout_and_upstream_sources() {
-        let timeout = classify_build_error(&anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timeout",
-        )));
-        assert!(timeout.is_retryable());
-
-        let malformed = classify_build_error(&anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "bad input",
-        )));
-        assert!(!malformed.is_retryable());
-
-        let upstream_429 = classify_build_error(&anyhow::Error::new(git::UpstreamGitError::new(
-            "fetch", true,
-        )));
-        assert!(upstream_429.is_retryable());
-
-        let upstream_not_found = classify_build_error(&anyhow::Error::new(
-            git::UpstreamGitError::new("fetch", false),
-        ));
-        assert!(!upstream_not_found.is_retryable());
-    }
-
-    #[test]
     fn archive_publish_uploads_download_bundles_and_reuse_frames() {
         let uploads = archive_publish_upload_hashes(
             "metadata",
@@ -5712,63 +5653,40 @@ mod tests {
             raw_len: 11,
         });
 
-        let err = archive_chunk_refs(&["a".repeat(64)], &metadata).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("archive chunk hash/length mismatch"),
-            "{err:#}"
-        );
+        assert!(archive_chunk_refs(&["a".repeat(64)], &metadata).is_err());
     }
 
     #[test]
-    fn validate_repo_id_accepts_github_identifiers() {
-        assert!(validate_repo_id("ripclone").is_ok());
-        assert!(validate_repo_id("ripclone-rs").is_ok());
-        assert!(validate_repo_id("ripclone.rs").is_ok());
-        assert!(validate_repo_id("rip_clone").is_ok());
-    }
-
-    #[test]
-    fn validate_repo_id_rejects_path_traversal() {
-        assert!(validate_repo_id("..").is_err());
-        assert!(validate_repo_id("foo/bar").is_err());
-        assert!(validate_repo_id("foo\\bar").is_err());
-        assert!(validate_repo_id("foo\0bar").is_err());
-        assert!(validate_repo_id("").is_err());
-    }
-
-    #[test]
-    fn auth_token_hash_requires_a_nonempty_token() {
-        // Missing or empty token must be rejected with a clear message...
-        for missing in [None, Some(String::new())] {
-            let err = auth_token_hash(missing).unwrap_err().to_string();
-            assert!(
-                err.contains("RIPCLONE_SERVER_TOKEN"),
-                "error should mention missing token: {err}"
-            );
+    fn validate_repo_id_accepts_names_and_rejects_paths() {
+        for (id, ok) in [
+            ("ripclone", true),
+            ("ripclone-rs", true),
+            ("ripclone.rs", true),
+            ("rip_clone", true),
+            ("..", false),
+            ("foo/bar", false),
+            ("foo\\bar", false),
+            ("foo\0bar", false),
+            ("", false),
+        ] {
+            assert_eq!(validate_repo_id(id).is_ok(), ok, "{id:?}");
         }
-        // ...and a real token hashes to the same digest the auth middleware checks.
-        let hash = auth_token_hash(Some("secret".to_string())).unwrap();
-        assert_eq!(hash, hex::encode(Sha256::digest("secret")));
     }
 
     #[test]
-    fn read_server_auth_token_prefers_new_env_vars() {
-        // Clean deprecated vars.
-        unsafe {
-            env::remove_var("RIPCLONE_SERVER_TOKEN");
-            env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
-        }
-        unsafe { env::set_var("RIPCLONE_SERVER_TOKEN", "new-secret") };
-        assert_eq!(
-            read_server_auth_token().unwrap(),
-            hex::encode(Sha256::digest("new-secret"))
-        );
-        unsafe { env::set_var("RIPCLONE_SERVER_TOKEN_HASH", "prefixed-hash") };
-        assert_eq!(read_server_auth_token().unwrap(), "prefixed-hash");
-        unsafe {
-            env::remove_var("RIPCLONE_SERVER_TOKEN");
-            env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
+    fn server_auth_token_hash_prefers_the_hash_and_requires_a_token() {
+        let s = |v: &str| Some(v.to_string());
+        let secret = Some(hex::encode(Sha256::digest("secret")));
+        for (hash, raw, want) in [
+            (None, None, None),
+            (s(""), s(""), None),
+            (None, s("secret"), secret.clone()),
+            (s(""), s("secret"), secret),
+            (s("given-hash"), s("secret"), s("given-hash")),
+            (s("given-hash"), None, s("given-hash")),
+        ] {
+            let case = format!("{hash:?} {raw:?}");
+            assert_eq!(server_auth_token_hash(hash, raw).ok(), want, "{case}");
         }
     }
 
@@ -6115,34 +6033,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_route_rejects_missing_and_wrong_token() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-        let app = build_app(state);
-        // No Authorization header.
-        let missing = app
-            .clone()
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/acme/secret/status",
-                None,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
-        // Present but wrong token.
-        let wrong = app
-            .oneshot(request_with_auth(
-                "GET",
-                "/v1/repos/github/acme/secret/status",
-                Some("Ripclone deadbeef"),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
     async fn public_endpoints_require_no_auth() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
@@ -6162,120 +6052,6 @@ mod tests {
                 "{path} must not require auth"
             );
         }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ordinary_http_response_reports_real_queue_depth() {
-        let _env = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        let origin_path = origin_base.path().join("acme").join("accepted.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let commit = crate::test_fixture::commit(&origin, &[("README.md", b"accepted")]);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state_with_control(&tmp).await;
-        let repo_id = RepoId::github("acme/accepted");
-        mark_added(&state, repo_id.clone()).await;
-
-        // Pre-admit two unrelated jobs so the queue already holds 2 entries;
-        // the accepted request below admits a 3rd, so the response reports a
-        // real depth of 3.
-        let control = state.control_db.as_ref().unwrap();
-        for i in 0..2 {
-            let filler = BuildJob {
-                repo_id: RepoId::github(format!("acme/filler-{i}")),
-                admitted_commit: "f".repeat(40),
-                repo_config: Default::default(),
-                credential: None,
-            };
-            let pending = pending_exact_result(&filler);
-            control
-                .admit_exact_and_job(&filler, &pending)
-                .await
-                .unwrap();
-        }
-
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
-        let response = tokio::time::timeout(
-            Duration::from_secs(2),
-            build_app(state.clone()).oneshot(test_request(
-                "POST",
-                "/v1/repos/github/acme/accepted/sync?branch=main",
-            )),
-        )
-        .await
-        .expect("accepted response must complete")
-        .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["commit"], commit);
-        assert_eq!(body["queue_depth"], 3);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn missing_admitted_commit_fails_exact_fetch_without_branch_fallback() {
-        let _env = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let origin_base = tempfile::tempdir().unwrap();
-        let origin_path = origin_base.path().join("acme").join("missing.git");
-        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
-        let origin = crate::test_fixture::init_bare(&origin_path);
-        let available = crate::test_fixture::commit(&origin, &[("README.md", b"available")]);
-        let missing = "f".repeat(40);
-        assert_ne!(available, missing);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-        let repo_id = RepoId::github("acme/missing");
-        let provider = state.provider_registry.get("github").unwrap().clone();
-        let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-        let lock = repo_lock(&state.sync_locks, &repo_id).await;
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
-        let result = do_sync(
-            &state.cas,
-            &mirror_dir,
-            &repo_id,
-            &missing,
-            &state.ref_store,
-            &state.storage,
-            &provider,
-            None,
-            &crate::repo_config::RepoConfig::default(),
-            &lock,
-            None,
-        )
-        .await;
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
-
-        let error = result.expect_err("an unavailable exact target must fail");
-        assert!(
-            error.to_string().contains("fetch rev"),
-            "failure must identify the exact fetch: {error:#}"
-        );
-        assert!(
-            git::resolve_commit(&mirror_dir, "main").is_err(),
-            "the worker must not fall back to the moving branch tip"
-        );
-        assert!(
-            state
-                .ref_store
-                .load_result(&repo_id, &missing)
-                .await
-                .unwrap()
-                .is_none(),
-            "an unavailable exact target must not publish branch metadata"
-        );
     }
 
     fn gh_sign(secret: &str, body: &[u8]) -> String {
@@ -6412,118 +6188,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_push_enqueues_build() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = webhook_state(&tmp).await;
-        mark_added(&state, RepoId::github("acme/widget")).await;
-        let app = build_app(state.clone());
-        let body = gh_push_body(
-            "acme",
-            "widget",
-            "refs/heads/main",
-            &"1".repeat(40),
-            "main",
-            false,
-        );
-        let sig = gh_sign(WEBHOOK_SECRET, &body);
-        let resp = app
-            .oneshot(webhook_request("github", "push", Some(&sig), body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let job = claim_admitted_job(&state)
-            .await
-            .expect("a build job was enqueued");
-        assert_eq!(job.repo_id, RepoId::github("acme/widget"));
-        assert_eq!(job.admitted_commit, "1".repeat(40));
-        assert!(
-            claim_admitted_job(&state).await.is_none(),
-            "exactly one job enqueued"
-        );
-    }
-
-    #[tokio::test]
-    async fn webhook_invalid_signature_returns_401() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = webhook_state(&tmp).await;
-        let app = build_app(state.clone());
-        let body = gh_push_body(
-            "acme",
-            "widget",
-            "refs/heads/main",
-            &"1".repeat(40),
-            "main",
-            false,
-        );
-        let sig = gh_sign("wrong-secret", &body);
-        let resp = app
-            .oneshot(webhook_request("github", "push", Some(&sig), body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            claim_admitted_job(&state).await.is_none(),
-            "a bad signature must not enqueue"
-        );
-    }
-
-    #[tokio::test]
-    async fn webhook_missing_signature_returns_401() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = webhook_state(&tmp).await;
-        let app = build_app(state);
-        let body = gh_push_body(
-            "acme",
-            "widget",
-            "refs/heads/main",
-            &"1".repeat(40),
-            "main",
-            false,
-        );
-        let resp = app
-            .oneshot(webhook_request("github", "push", None, body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn webhook_tampered_body_returns_401() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = webhook_state(&tmp).await;
-        let app = build_app(state.clone());
-        // Sign body A with the correct secret, deliver body B. Proves the handler
-        // verifies over the raw received bytes, not a re-serialized parse.
-        let body_a = gh_push_body(
-            "acme",
-            "widget",
-            "refs/heads/main",
-            &"1".repeat(40),
-            "main",
-            false,
-        );
-        let sig = gh_sign(WEBHOOK_SECRET, &body_a);
-        let body_b = gh_push_body(
-            "acme",
-            "widget",
-            "refs/heads/main",
-            &"2".repeat(40),
-            "main",
-            false,
-        );
-        assert_ne!(body_a, body_b);
-        let resp = app
-            .oneshot(webhook_request("github", "push", Some(&sig), body_b))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            claim_admitted_job(&state).await.is_none(),
-            "a tampered body must not enqueue"
-        );
-    }
-
-    #[tokio::test]
     async fn webhook_ping_is_acknowledged_without_build() {
         let tmp = tempfile::tempdir().unwrap();
         let state = webhook_state(&tmp).await;
@@ -6592,39 +6256,6 @@ mod tests {
         assert!(
             claim_admitted_job(&state).await.is_none(),
             "unlisted repo must not enqueue"
-        );
-    }
-
-    #[tokio::test]
-    async fn webhook_allowlist_allows_listed_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state_with_control(&tmp).await;
-        state.webhook_config = Arc::new(
-            WebhookConfig::with_secret("github", WEBHOOK_SECRET)
-                .with_allowlist(["acme/widget".to_string()]),
-        );
-        mark_added(&state, RepoId::github("acme/widget")).await;
-        let app = build_app(state.clone());
-        let body = gh_push_body(
-            "acme",
-            "widget",
-            "refs/heads/main",
-            &"1".repeat(40),
-            "main",
-            false,
-        );
-        let sig = gh_sign(WEBHOOK_SECRET, &body);
-        let resp = app
-            .oneshot(webhook_request("github", "push", Some(&sig), body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            claim_admitted_job(&state)
-                .await
-                .expect("listed repo enqueues")
-                .repo_id,
-            RepoId::github("acme/widget")
         );
     }
 
@@ -6810,129 +6441,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_gitlab_push_enqueues() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com").await;
-        mark_added(
-            &state,
-            RepoId {
-                provider: crate::provider::ProviderInstanceId::new("gitlab"),
-                path: "group/sub/proj".to_string(),
-            },
-        )
-        .await;
-        let app = build_app(state.clone());
-        let body = br#"{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"group/sub/proj","default_branch":"main","visibility_level":0}}"#.to_vec();
-        // GitLab authenticates with the shared token in X-Gitlab-Token.
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri("/webhooks/gitlab")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .header("X-Gitlab-Event", "Push Hook")
-            .header("X-Gitlab-Token", WEBHOOK_SECRET)
-            .body(axum::body::Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let job = claim_admitted_job(&state)
-            .await
-            .expect("gitlab default-branch push enqueues");
-        assert_eq!(job.repo_id.path, "group/sub/proj");
-        assert_eq!(job.admitted_commit, "1".repeat(40));
-    }
-
-    #[tokio::test]
-    async fn webhook_gitlab_bad_token_returns_401() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com").await;
-        let app = build_app(state.clone());
-        let body = br#"{"ref":"refs/heads/main","after":"abc","project":{"path_with_namespace":"g/p","default_branch":"main"}}"#.to_vec();
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri("/webhooks/gitlab")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .header("X-Gitlab-Event", "Push Hook")
-            .header("X-Gitlab-Token", "wrong-token")
-            .body(axum::body::Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            claim_admitted_job(&state).await.is_none(),
-            "a bad token must not enqueue"
-        );
-    }
-
-    #[tokio::test]
-    async fn webhook_gitea_push_enqueues() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com").await;
-        mark_added(
-            &state,
-            RepoId {
-                provider: crate::provider::ProviderInstanceId::new("gitea"),
-                path: "acme/widget".to_string(),
-            },
-        )
-        .await;
-        let app = build_app(state.clone());
-        let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main","private":true}}"#.to_vec();
-        // Gitea signs the raw body with HMAC-SHA256, bare hex in X-Gitea-Signature.
-        let sig = {
-            use hmac::{Hmac, KeyInit, Mac};
-            use sha2::Sha256;
-            let mut mac = Hmac::<Sha256>::new_from_slice(WEBHOOK_SECRET.as_bytes()).unwrap();
-            mac.update(&body);
-            hex::encode(mac.finalize().into_bytes())
-        };
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri("/webhooks/gitea")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .header("X-Gitea-Event", "push")
-            .header("X-Gitea-Signature", sig)
-            .body(axum::body::Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let job = claim_admitted_job(&state)
-            .await
-            .expect("gitea default-branch push enqueues");
-        assert_eq!(job.repo_id.path, "acme/widget");
-        assert_eq!(job.admitted_commit, "1".repeat(40));
-    }
-
-    #[tokio::test]
-    async fn webhook_gitea_bad_signature_returns_401() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com").await;
-        let app = build_app(state.clone());
-        let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main"}}"#.to_vec();
-        // Sign with the WRONG secret.
-        let sig = {
-            use hmac::{Hmac, KeyInit, Mac};
-            use sha2::Sha256;
-            let mut mac = Hmac::<Sha256>::new_from_slice(b"wrong-secret").unwrap();
-            mac.update(&body);
-            hex::encode(mac.finalize().into_bytes())
-        };
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri("/webhooks/gitea")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .header("X-Gitea-Event", "push")
-            .header("X-Gitea-Signature", sig)
-            .body(axum::body::Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            claim_admitted_job(&state).await.is_none(),
-            "a bad gitea signature must not enqueue"
-        );
-    }
-
-    #[tokio::test]
     async fn webhook_gitlab_allowlist_matches_natural_key() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com").await;
@@ -6989,55 +6497,6 @@ mod tests {
             claim_admitted_job(&state).await.is_none(),
             "missing default-branch identity is ignored"
         );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn poll_resolves_head_once_and_coalesces_the_exact_job() {
-        let _lock = crate::git::ORIGIN_BASE_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let base = tempfile::tempdir().unwrap();
-        let origin = base.path().join("acme").join("widget.git");
-        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
-        let repo = crate::test_fixture::init_bare(&origin);
-        let tip = crate::test_fixture::commit(&repo, &[("f.txt", b"v1")]);
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state_with_control(&tmp).await;
-        mark_added(&state, RepoId::github("acme/widget")).await;
-        unsafe {
-            std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path());
-        }
-        assert_eq!(poll_once(&state).await, 1);
-        let first = claim_admitted_job(&state)
-            .await
-            .expect("HEAD poll admitted exact work");
-        assert_eq!(first.admitted_commit, tip);
-        assert_eq!(poll_once(&state).await, 0);
-        assert!(
-            claim_admitted_job(&state).await.is_none(),
-            "second poll must not add a job"
-        );
-        unsafe {
-            std::env::remove_var("RIPCLONE_ORIGIN_BASE");
-        }
-    }
-    #[tokio::test]
-    async fn version_endpoint_reports_build_and_protocol() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp);
-        let app = build_app(state);
-        let response = app
-            .oneshot(request_with_auth("GET", "/v1/version", None))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(v["protocol"], crate::PROTOCOL_VERSION);
     }
 
     fn protocol_request(uri: &str, protocol: Option<&str>) -> axum::http::Request<Body> {

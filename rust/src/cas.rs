@@ -471,24 +471,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_artifact_id_accepts_sha256() {
-        let h = "a".repeat(64);
-        assert!(Cas::validate_artifact_id(&h).is_ok());
-    }
-
-    #[test]
-    fn validate_artifact_id_rejects_traversal_and_non_hex() {
-        assert!(Cas::validate_artifact_id("../etc/passwd").is_err());
-        assert!(Cas::validate_artifact_id("..%2F..%2Fetc%2Fpasswd").is_err());
-        assert!(Cas::validate_artifact_id(&"G".repeat(64)).is_err());
-        assert!(Cas::validate_artifact_id("0123456789abcdef").is_err());
-    }
-
-    #[test]
-    fn validate_object_id_accepts_sha1_and_sha256() {
-        assert!(Cas::validate_object_id(&"a".repeat(40)).is_ok());
-        assert!(Cas::validate_object_id(&"a".repeat(64)).is_ok());
-        assert!(Cas::validate_object_id(&"a".repeat(50)).is_err());
+    fn artifact_and_object_id_validation() {
+        // (id, valid artifact id (sha256), valid object id (sha1 or sha256))
+        for (id, artifact, object) in [
+            ("a".repeat(64), true, true),
+            ("a".repeat(40), false, true),
+            ("a".repeat(50), false, false),
+            ("G".repeat(64), false, false),
+            ("0123456789abcdef".to_string(), false, false),
+            ("../etc/passwd".to_string(), false, false),
+            ("..%2F..%2Fetc%2Fpasswd".to_string(), false, false),
+        ] {
+            assert_eq!(Cas::validate_artifact_id(&id).is_ok(), artifact, "{id}");
+            assert_eq!(Cas::validate_object_id(&id).is_ok(), object, "{id}");
+        }
     }
 
     #[test]
@@ -501,19 +497,6 @@ mod tests {
         assert!(valid.starts_with(tmp.path()));
         let sha1 = cas.object_path(&"a".repeat(40)).unwrap();
         assert!(sha1.starts_with(tmp.path()));
-    }
-
-    #[test]
-    fn put_with_hash_repairs_existing_corrupt_object() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cas = Cas::new(tmp.path()).unwrap();
-        let hash = hash(b"correct");
-        let object_path = cas.path(&hash);
-        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
-        std::fs::write(&object_path, b"wrong").unwrap();
-
-        cas.put_with_hash(&hash, b"correct").unwrap();
-        assert_eq!(std::fs::read(&object_path).unwrap(), b"correct");
     }
 
     #[test]
@@ -531,74 +514,64 @@ mod tests {
         assert!(cas.get_range(&hash, u64::MAX, 1).is_err());
     }
 
+    /// Every write path replaces a corrupt object already at the hash's path.
     #[test]
-    fn put_file_with_hash_repairs_existing_corrupt_object() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cas = Cas::new(tmp.path()).unwrap();
-        let source = tmp.path().join("source");
-        std::fs::write(&source, b"correct").unwrap();
-        let hash = hash(b"correct");
-        let object_path = cas.path(&hash);
-        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
-        std::fs::write(&object_path, b"wrong").unwrap();
+    fn writes_repair_an_existing_corrupt_object() {
+        type WriteFn = fn(&Cas, &str, &Path) -> Result<()>;
+        let writes: [(&str, WriteFn, bool); 3] = [
+            (
+                "put_with_hash",
+                |cas, hash, source| cas.put_with_hash(hash, &std::fs::read(source)?),
+                true,
+            ),
+            (
+                "put_file_with_hash",
+                |cas, hash, source| cas.put_file_with_hash(hash, source).map(|_| ()),
+                true,
+            ),
+            (
+                "install_hashed_file",
+                |cas, hash, source| cas.install_hashed_file(hash, source),
+                false,
+            ),
+        ];
+        for (case, write, keeps_source) in writes {
+            let tmp = tempfile::tempdir().unwrap();
+            let cas = Cas::new(tmp.path()).unwrap();
+            let source = tmp.path().join("source");
+            std::fs::write(&source, b"correct").unwrap();
+            let hash = hash(b"correct");
+            let object_path = cas.path(&hash);
+            std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+            std::fs::write(&object_path, b"wrong").unwrap();
 
-        cas.put_file_with_hash(&hash, &source).unwrap();
-        assert_eq!(std::fs::read(&object_path).unwrap(), b"correct");
-        assert_eq!(std::fs::read(&source).unwrap(), b"correct");
+            write(&cas, &hash, &source).unwrap();
+            assert_eq!(std::fs::read(&object_path).unwrap(), b"correct", "{case}");
+            assert_eq!(source.exists(), keeps_source, "{case}");
+        }
     }
 
+    /// A source that does not match its hash is never installed, whether or
+    /// not an object (here a corrupt one) already sits at the path; the source
+    /// is kept.
     #[test]
-    fn install_hashed_file_repairs_existing_corrupt_object_and_removes_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cas = Cas::new(tmp.path()).unwrap();
-        let source = tmp.path().join("bundle.tmp");
-        std::fs::write(&source, b"correct bundle").unwrap();
-        let hash = hash(b"correct bundle");
-        let object_path = cas.path(&hash);
-        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
-        std::fs::write(&object_path, b"corrupt bundle").unwrap();
+    fn install_hashed_file_rejects_a_mismatched_source() {
+        for existing in [None, Some(&b"corrupt"[..])] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cas = Cas::new(tmp.path()).unwrap();
+            let source = tmp.path().join("bundle.tmp");
+            std::fs::write(&source, b"wrong").unwrap();
+            let hash = hash(b"correct");
+            let object_path = cas.path(&hash);
+            if let Some(existing) = existing {
+                std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+                std::fs::write(&object_path, existing).unwrap();
+            }
 
-        cas.install_hashed_file(&hash, &source).unwrap();
-        assert_eq!(std::fs::read(&object_path).unwrap(), b"correct bundle");
-        assert!(!source.exists(), "source temp file should be installed");
-    }
-
-    #[test]
-    fn install_hashed_file_rejects_mismatched_replacement_and_keeps_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cas = Cas::new(tmp.path()).unwrap();
-        let source = tmp.path().join("bundle.tmp");
-        std::fs::write(&source, b"wrong replacement").unwrap();
-        let hash = hash(b"correct bundle");
-        let object_path = cas.path(&hash);
-        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
-        std::fs::write(&object_path, b"corrupt bundle").unwrap();
-
-        let err = cas.install_hashed_file(&hash, &source).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("hash mismatch"),
-            "unexpected error: {err:#}"
-        );
-        assert_eq!(std::fs::read(&source).unwrap(), b"wrong replacement");
-        assert_eq!(std::fs::read(&object_path).unwrap(), b"corrupt bundle");
-    }
-
-    #[test]
-    fn install_hashed_file_rejects_mismatched_new_object_and_keeps_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cas = Cas::new(tmp.path()).unwrap();
-        let source = tmp.path().join("bundle.tmp");
-        std::fs::write(&source, b"wrong bundle").unwrap();
-        let hash = hash(b"correct bundle");
-        let object_path = cas.path(&hash);
-
-        let err = cas.install_hashed_file(&hash, &source).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("hash mismatch"),
-            "unexpected error: {err:#}"
-        );
-        assert_eq!(std::fs::read(&source).unwrap(), b"wrong bundle");
-        assert!(!object_path.exists());
+            assert!(cas.install_hashed_file(&hash, &source).is_err());
+            assert_eq!(std::fs::read(&source).unwrap(), b"wrong");
+            assert_eq!(std::fs::read(&object_path).ok().as_deref(), existing);
+        }
     }
 
     #[test]

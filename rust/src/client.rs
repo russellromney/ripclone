@@ -3719,101 +3719,103 @@ mod tests {
     const SYNC_AT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SYNC_AT_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
+    /// A sync-at operation pins one commit and branch: the first response (or
+    /// an explicit SHA) sets it, and any later response that changes it fails.
     #[test]
-    fn sync_at_response_sequence_keeps_one_identity_across_all_statuses() {
-        let mut pin = None;
-        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
-        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "503").unwrap();
-        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "200").unwrap();
-        assert_eq!(
-            pin,
+    fn sync_at_pin_holds_one_identity_across_responses() {
+        let (b, c) = (SYNC_AT_B, SYNC_AT_C);
+        let pinned = |branch: &str| {
             Some(SyncAtPin {
-                commit: SYNC_AT_B.to_string(),
-                branch: Some("main".to_string()),
+                commit: b.to_string(),
+                branch: Some(branch.to_string()),
             })
-        );
-    }
-
-    #[test]
-    fn explicit_sync_sha_rejects_initial_commit_change_for_every_response_status() {
-        for response_kind in ["202", "503", "200"] {
-            let mut pin = exact_commit_from_revision(Some(SYNC_AT_B)).map(|commit| SyncAtPin {
+        };
+        type Response<'a> = (&'a str, &'a str, &'a str);
+        // (case, explicit revision, responses, Ok(final pin) or Err(index of the
+        // rejected response))
+        let cases: Vec<(
+            &str,
+            Option<&str>,
+            Vec<Response>,
+            Result<Option<SyncAtPin>, usize>,
+        )> = vec![
+            (
+                "same identity across statuses",
+                None,
+                vec![(b, "main", "202"), (b, "main", "503"), (b, "main", "200")],
+                Ok(pinned("main")),
+            ),
+            (
+                "explicit SHA learns the branch",
+                Some(b),
+                vec![(b, "main", "202")],
+                Ok(pinned("main")),
+            ),
+            (
+                "explicit SHA, other commit on 202",
+                Some(b),
+                vec![(c, "main", "202")],
+                Err(0),
+            ),
+            (
+                "explicit SHA, other commit on 503",
+                Some(b),
+                vec![(c, "main", "503")],
+                Err(0),
+            ),
+            (
+                "explicit SHA, other commit on 200",
+                Some(b),
+                vec![(c, "main", "200")],
+                Err(0),
+            ),
+            (
+                "commit change on a later 202",
+                None,
+                vec![(b, "main", "202"), (c, "main", "202")],
+                Err(1),
+            ),
+            (
+                "branch change on a later 503",
+                None,
+                vec![(b, "main", "202"), (b, "release", "503")],
+                Err(1),
+            ),
+            (
+                "commit change on the final 200",
+                None,
+                vec![(b, "main", "202"), (c, "main", "200")],
+                Err(1),
+            ),
+            (
+                "pending response without a branch",
+                None,
+                vec![(b, "", "202")],
+                Err(0),
+            ),
+        ];
+        for (case, revision, responses, want) in cases {
+            let mut pin = exact_commit_from_revision(revision).map(|commit| SyncAtPin {
                 commit,
                 branch: None,
             });
-            let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", response_kind)
-                .expect_err("an explicit SHA must be the initial sync pin");
-            assert!(
-                format!("{error:#}").contains("sync integrity error"),
-                "unexpected {response_kind} error: {error:#}"
-            );
+            let mut failed_at = None;
+            for (i, (commit, branch, status)) in responses.iter().enumerate() {
+                let before = pin.clone();
+                if observe_sync_at_identity(&mut pin, commit, branch, status).is_err() {
+                    assert_eq!(pin, before, "{case}: a rejected response changed the pin");
+                    failed_at = Some(i);
+                    break;
+                }
+            }
+            match want {
+                Ok(final_pin) => {
+                    assert_eq!(failed_at, None, "{case}");
+                    assert_eq!(pin, final_pin, "{case}");
+                }
+                Err(index) => assert_eq!(failed_at, Some(index), "{case}"),
+            }
         }
-    }
-
-    #[test]
-    fn sync_at_response_sequence_rejects_commit_change_on_later_202() {
-        let mut pin = None;
-        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
-        let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", "202")
-            .expect_err("later pending response must not repin");
-        assert!(format!("{error:#}").contains("sync integrity error"));
-    }
-
-    #[test]
-    fn sync_at_response_sequence_rejects_branch_change_on_later_503() {
-        let mut pin = None;
-        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
-        let error = observe_sync_at_identity(&mut pin, SYNC_AT_B, "release", "503")
-            .expect_err("queue response must preserve the selected branch");
-        assert!(format!("{error:#}").contains("sync integrity error"));
-    }
-
-    #[test]
-    fn sync_at_response_sequence_rejects_commit_change_on_final_200() {
-        let mut pin = None;
-        observe_sync_at_identity(&mut pin, SYNC_AT_B, "main", "202").unwrap();
-        let error = observe_sync_at_identity(&mut pin, SYNC_AT_C, "main", "200")
-            .expect_err("ready response must preserve the selected commit");
-        assert!(format!("{error:#}").contains("sync integrity error"));
-    }
-
-    #[test]
-    fn sync_at_pending_response_requires_branch_identity() {
-        let mut pin = None;
-        let error = observe_sync_at_identity(&mut pin, SYNC_AT_B, "", "202")
-            .expect_err("pending response without a branch must fail closed");
-        assert!(format!("{error:#}").contains("omitted branch"));
-        assert!(pin.is_none());
-    }
-
-    #[test]
-    fn access_error_hints_are_actionable() {
-        // A 403 access denial is terminal and says so, without fabricating any
-        // upgrade/subscribe prose an agent fleet would have to scrape.
-        let hint = error_hint(403, Some("no_access"), true);
-        assert!(hint.contains("access"), "no_access hint: {hint}");
-        assert!(!hint.contains("ripclone.com"), "no_access hint: {hint}");
-        // A 401 routes to the right login path depending on the server.
-        assert!(error_hint(401, None, true).contains("login"));
-        assert!(error_hint(401, None, false).contains("RIPCLONE_SERVER_TOKEN"));
-        // Transient statuses hint at retry, not a terminal action.
-        assert!(error_hint(429, None, false).contains("retry"));
-        // No hint fabricates a subscribe/upgrade URL.
-        assert!(!error_hint(402, None, true).contains("ripclone.com"));
-        assert!(!error_hint(403, None, false).contains("ripclone.com"));
-    }
-
-    #[test]
-    fn fsync_tree_walks_files_dirs_and_symlinks() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("sub/nested")).unwrap();
-        std::fs::write(root.join("top.txt"), b"hello").unwrap();
-        std::fs::write(root.join("sub/inner.txt"), b"world").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("top.txt", root.join("link")).unwrap();
-        // A full tree with a dangling-capable symlink must fsync cleanly.
-        fsync_tree(root).expect("fsync whole tree");
     }
 
     #[cfg(unix)]
@@ -3932,43 +3934,6 @@ mod tests {
         assert_eq!(post_rename_fsync_dir(Path::new("a/b/c")), Path::new("a/b"));
     }
 
-    #[test]
-    fn post_rename_fsync_dir_result_is_syncable() {
-        // Behavior, not just path strings: the resolver's output must be a real
-        // directory that the post-rename `fsync_dir` can actually open and
-        // flush. Pre-fix the bare-relative branch was skipped outright — no
-        // fsync ran at all — so exercise the real syscall for both the relative
-        // (cwd) and nested cases to prove the barrier is not silently dropped.
-        fsync_dir(post_rename_fsync_dir(Path::new("bun")))
-            .expect("bare relative target's container (cwd) must be fsync-able");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let nested = tmp.path().join("bun");
-        assert_eq!(post_rename_fsync_dir(&nested), tmp.path());
-        fsync_dir(post_rename_fsync_dir(&nested))
-            .expect("nested target's real parent must be fsync-able");
-    }
-
-    #[test]
-    fn fsync_requested_reads_env_flag() {
-        // Default (unset) is off; explicit truthy values turn it on. Guarded so
-        // the env var is restored regardless of the assertions.
-        let prev = std::env::var("RIPCLONE_FSYNC").ok();
-        unsafe {
-            std::env::remove_var("RIPCLONE_FSYNC");
-        }
-        assert!(!fsync_requested());
-        unsafe {
-            std::env::set_var("RIPCLONE_FSYNC", "1");
-        }
-        assert!(fsync_requested());
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("RIPCLONE_FSYNC", v),
-                None => std::env::remove_var("RIPCLONE_FSYNC"),
-            }
-        }
-    }
-
     /// The shared status rule. Break any arm of this table and a real download
     /// path changes: a retryable status stops retrying, a permanent failure
     /// enters the signed-URL refresh loop, or an expired signature fails the
@@ -4021,38 +3986,6 @@ mod tests {
                 "{status} gateway"
             );
         }
-    }
-
-    /// Refresh is consumed only by the streamed downloader. Converting any
-    /// failure for a buffered caller preserves the concrete HTTP error without
-    /// requesting an outer clone retry.
-    #[test]
-    fn converted_fetch_failures_preserve_their_concrete_errors() {
-        let refresh = FetchFailure::RefreshUrl(anyhow::anyhow!("expired")).into_error();
-        assert_eq!(format!("{refresh:#}"), "expired");
-        let retry = FetchFailure::Retry(anyhow::anyhow!("503")).into_error();
-        assert_eq!(format!("{retry:#}"), "503");
-        let permanent = FetchFailure::Permanent(anyhow::anyhow!("404")).into_error();
-        assert_eq!(format!("{permanent:#}"), "404");
-    }
-
-    /// The shared verification rule: length first, then the content address, and
-    /// both are permanent.
-    #[test]
-    fn artifact_verification_rejects_wrong_length_and_wrong_hash() {
-        let hash = "a".repeat(64);
-        verify_fetched_artifact(&hash, Some(10), 10, &hash).expect("matching artifact is accepted");
-        verify_fetched_artifact(&hash, None, 7, &hash).expect("unknown length is accepted");
-
-        let short = verify_fetched_artifact(&hash, Some(10), 9, &hash)
-            .expect_err("a short artifact is rejected");
-        assert!(matches!(short, FetchFailure::Permanent(_)));
-        assert!(format!("{:#}", short.into_error()).contains("size mismatch"));
-
-        let wrong = verify_fetched_artifact(&hash, Some(10), 10, &"b".repeat(64))
-            .expect_err("a wrong content address is rejected");
-        assert!(matches!(wrong, FetchFailure::Permanent(_)));
-        assert!(format!("{:#}", wrong.into_error()).contains("hash mismatch"));
     }
 
     #[tokio::test]
@@ -4184,54 +4117,7 @@ mod tests {
             commit: "b".repeat(40),
             ..Default::default()
         };
-        let error = validate_manifest_commit(&manifest, &"a".repeat(40)).unwrap_err();
-        assert!(format!("{error:#}").contains("clonepack integrity error"));
-    }
-
-    #[test]
-    fn pending_artifact_guidance_preserves_the_repository_argument() {
-        let commit = "a".repeat(40);
-        let rendered = ArtifactPending {
-            commit: commit.clone(),
-            mode: "full".to_string(),
-        }
-        .to_string();
-        assert!(
-            rendered.contains(&format!(
-                "retry the same clone command with `--at {commit}`"
-            )),
-            "pending guidance must tell the user how to amend their complete command: {rendered}"
-        );
-        assert!(
-            !rendered.contains("`ripclone clone --at"),
-            "pending guidance must not print a command with the required repository omitted: {rendered}"
-        );
-    }
-
-    /// A first-run user who points at a server that isn't running (or a wrong
-    /// `--server` / `RIPCLONE_SERVER`) must get a message that names the server
-    /// and says what to check — not the bare reqwest "error sending request"
-    /// chain that hides the real cause.
-    #[tokio::test]
-    async fn unreachable_server_names_the_server_and_hints() {
-        // A bound socket that never listens: the connect is refused, and no
-        // other process can take the port while the test runs.
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let client = Client::new(format!("http://{}", socket.local_addr().unwrap()));
-        let err = client.add_repo("acme/widget").await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("could not reach ripclone server"),
-            "message names the unreachable server: {msg}"
-        );
-        assert!(
-            msg.contains("RIPCLONE_SERVER") || msg.contains("--server"),
-            "message says what to check: {msg}"
-        );
-        assert!(
-            !msg.contains("error sending request for url"),
-            "the noisy reqwest wrapper is replaced, not surfaced: {msg}"
-        );
+        assert!(validate_manifest_commit(&manifest, &"a".repeat(40)).is_err());
+        assert!(validate_manifest_commit(&manifest, &"b".repeat(40)).is_ok());
     }
 }

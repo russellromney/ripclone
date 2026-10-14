@@ -55,10 +55,19 @@ impl FromStr for CloneMode {
 /// Resolve a mode from the CLI argument, the `RIPCLONE_MODE` environment
 /// variable, or a config file value, falling back to `Editable`.
 pub fn resolve_mode(cli: Option<CloneMode>, config: Option<&str>) -> anyhow::Result<CloneMode> {
+    resolve_mode_from(cli, std::env::var("RIPCLONE_MODE"), config)
+}
+
+/// [`resolve_mode`] with the `RIPCLONE_MODE` lookup result given.
+fn resolve_mode_from(
+    cli: Option<CloneMode>,
+    env: Result<String, std::env::VarError>,
+    config: Option<&str>,
+) -> anyhow::Result<CloneMode> {
     if let Some(mode) = cli {
         return Ok(mode);
     }
-    match std::env::var("RIPCLONE_MODE") {
+    match env {
         Ok(value) => {
             return value.parse().map_err(|error| {
                 anyhow::anyhow!("invalid RIPCLONE_MODE value {value:?}: {error}")
@@ -91,59 +100,48 @@ pub fn clonepack_kind_for_depth(depth: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::env::VarError;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_mode_env(value: Option<&str>, test: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let previous = std::env::var_os("RIPCLONE_MODE");
-        unsafe {
-            match value {
-                Some(value) => std::env::set_var("RIPCLONE_MODE", value),
-                None => std::env::remove_var("RIPCLONE_MODE"),
-            }
+    /// CLI wins, then `RIPCLONE_MODE`, then config, then Editable. An invalid
+    /// value at the level that applies is an error, never a fallback.
+    #[test]
+    fn resolve_mode_precedence_and_invalid_values() {
+        let set = |v: &str| Ok(v.to_string());
+        let unset = || Err(VarError::NotPresent);
+        for (case, cli, env, config, want) in [
+            (
+                "cli wins",
+                Some(CloneMode::Files),
+                set("fast"),
+                Some("fast"),
+                Some(CloneMode::Files),
+            ),
+            (
+                "env",
+                None,
+                set("files"),
+                Some("editable"),
+                Some(CloneMode::Files),
+            ),
+            ("env invalid", None, set("fast"), Some("files"), None),
+            (
+                "env not unicode",
+                None,
+                Err(VarError::NotUnicode("x".into())),
+                None,
+                None,
+            ),
+            (
+                "config",
+                None,
+                unset(),
+                Some("files"),
+                Some(CloneMode::Files),
+            ),
+            ("config invalid", None, unset(), Some("fast"), None),
+            ("default", None, unset(), None, Some(CloneMode::Editable)),
+        ] {
+            assert_eq!(resolve_mode_from(cli, env, config).ok(), want, "{case}");
         }
-        test();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("RIPCLONE_MODE", value),
-                None => std::env::remove_var("RIPCLONE_MODE"),
-            }
-        }
-    }
-
-    #[test]
-    fn resolve_mode_accepts_valid_environment_values() {
-        with_mode_env(Some("files"), || {
-            assert_eq!(resolve_mode(None, None).unwrap(), CloneMode::Files);
-        });
-    }
-
-    #[test]
-    fn resolve_mode_rejects_invalid_environment_values() {
-        with_mode_env(Some("fast"), || {
-            let error = resolve_mode(None, None).expect_err("retired mode must not fall back");
-            assert!(format!("{error:#}").contains("invalid RIPCLONE_MODE"));
-        });
-    }
-
-    #[test]
-    fn resolve_mode_accepts_valid_config_values() {
-        with_mode_env(None, || {
-            assert_eq!(
-                resolve_mode(None, Some("editable")).unwrap(),
-                CloneMode::Editable
-            );
-        });
-    }
-
-    #[test]
-    fn resolve_mode_rejects_invalid_config_values() {
-        with_mode_env(None, || {
-            let error =
-                resolve_mode(None, Some("fast")).expect_err("retired config mode must fail");
-            assert!(format!("{error:#}").contains("invalid clone.mode"));
-        });
     }
 }

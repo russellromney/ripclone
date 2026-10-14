@@ -135,45 +135,32 @@ mod tests {
     }
 
     #[test]
-    fn verify_accepts_a_valid_signature() {
+    fn verify_accepts_only_a_valid_signature_of_this_body() {
         let secret = "s3cr3t";
-        let body = br#"{"hello":"world"}"#;
-        let h = headers("push", Some(&sign(secret, body)));
-        assert!(GitHub.verify(&h, body, secret));
-    }
-
-    #[test]
-    fn verify_rejects_a_wrong_signature() {
-        let body = br#"{"hello":"world"}"#;
-        // Signed with a different secret than the one we verify against.
-        let h = headers("push", Some(&sign("other", body)));
-        assert!(!GitHub.verify(&h, body, "s3cr3t"));
-    }
-
-    #[test]
-    fn verify_rejects_a_tampered_body() {
-        let secret = "s3cr3t";
-        let h = headers("push", Some(&sign(secret, b"original")));
-        assert!(!GitHub.verify(&h, b"tampered", secret));
-    }
-
-    #[test]
-    fn verify_rejects_missing_and_malformed_headers() {
-        let secret = "s3cr3t";
-        let body = b"{}";
-        // No signature header at all.
-        assert!(!GitHub.verify(&headers("push", None), body, secret));
-        // Missing the `sha256=` prefix.
-        assert!(!GitHub.verify(&headers("push", Some("deadbeef")), body, secret));
-        // Right prefix, non-hex payload.
-        assert!(!GitHub.verify(&headers("push", Some("sha256=nothex")), body, secret));
-        // Valid hex, but the wrong length: 4 bytes vs the 32-byte MAC. This is
-        // the input that reaches the `ct_eq` length-mismatch branch — a
-        // truncated-but-decodable signature must not match.
-        assert!(!GitHub.verify(&headers("push", Some("sha256=deadbeef")), body, secret));
-        // Valid hex, correct 32-byte length, but wrong bytes.
-        let wrong_len_ok = format!("sha256={}", "00".repeat(32));
-        assert!(!GitHub.verify(&headers("push", Some(&wrong_len_ok)), body, secret));
+        let body: &[u8] = br#"{"hello":"world"}"#;
+        let valid = sign(secret, body);
+        for (case, signature, ok) in [
+            ("valid", Some(valid.clone()), true),
+            ("other secret", Some(sign("other", body)), false),
+            ("other body", Some(sign(secret, b"tampered")), false),
+            ("no header", None, false),
+            (
+                "no sha256= prefix",
+                Some(valid.trim_start_matches("sha256=").to_string()),
+                false,
+            ),
+            ("not hex", Some("sha256=nothex".to_string()), false),
+            // Decodable but 4 bytes: the length-mismatch branch of the compare.
+            ("short", Some("sha256=deadbeef".to_string()), false),
+            (
+                "right length, wrong bytes",
+                Some(format!("sha256={}", "00".repeat(32))),
+                false,
+            ),
+        ] {
+            let h = headers("push", signature.as_deref());
+            assert_eq!(GitHub.verify(&h, body, secret), ok, "{case}");
+        }
     }
 
     #[test]

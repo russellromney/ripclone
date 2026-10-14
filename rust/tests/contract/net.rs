@@ -339,6 +339,8 @@ pub struct Seen {
     pub query: String,
     pub range: Option<String>,
     pub status: u16,
+    /// A fault rule fired on this response.
+    pub faulted: bool,
 }
 
 struct ProxyState {
@@ -556,6 +558,7 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
             })
     };
 
+    let faulted = fault.is_some();
     let mut cut = None;
     match fault {
         None => {}
@@ -582,6 +585,7 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
         query,
         range,
         status: status.as_u16(),
+        faulted,
     });
 
     let mut builder = Response::builder().status(status);

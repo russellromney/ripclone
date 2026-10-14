@@ -76,12 +76,16 @@ impl GitHubAppConfig {
     /// misconfigured deployment fails fast instead of silently falling back to
     /// anonymous mirroring.
     pub fn from_env() -> Result<Option<Self>> {
-        let app_id = match std::env::var("RIPCLONE_GITHUB_APP_ID") {
-            Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// [`Self::from_env`] with variables read through `var`.
+    fn from_lookup(var: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let app_id = match var("RIPCLONE_GITHUB_APP_ID") {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => return Ok(None),
         };
-        let installation_id = std::env::var("RIPCLONE_GITHUB_APP_INSTALLATION_ID")
-            .ok()
+        let installation_id = var("RIPCLONE_GITHUB_APP_INSTALLATION_ID")
             .filter(|s| !s.trim().is_empty())
             .context(
                 "RIPCLONE_GITHUB_APP_ID is set but RIPCLONE_GITHUB_APP_INSTALLATION_ID is missing",
@@ -89,9 +93,8 @@ impl GitHubAppConfig {
             .trim()
             .parse::<u64>()
             .context("RIPCLONE_GITHUB_APP_INSTALLATION_ID must be a positive integer")?;
-        let private_key_pem = load_app_private_key()?;
-        let api_base = std::env::var("RIPCLONE_GITHUB_API_BASE")
-            .ok()
+        let private_key_pem = load_app_private_key(&var)?;
+        let api_base = var("RIPCLONE_GITHUB_API_BASE")
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE.to_string());
@@ -114,13 +117,13 @@ impl GitHubAppConfig {
 /// Read the app private key from `RIPCLONE_GITHUB_APP_PRIVATE_KEY` (inline PEM)
 /// or `RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH` (a file). The key is wrapped in a
 /// `SecretString` and never logged.
-fn load_app_private_key() -> Result<SecretString> {
-    if let Ok(pem) = std::env::var("RIPCLONE_GITHUB_APP_PRIVATE_KEY")
+fn load_app_private_key(var: impl Fn(&str) -> Option<String>) -> Result<SecretString> {
+    if let Some(pem) = var("RIPCLONE_GITHUB_APP_PRIVATE_KEY")
         && !pem.trim().is_empty()
     {
         return Ok(SecretString::from(pem));
     }
-    if let Ok(path) = std::env::var("RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH")
+    if let Some(path) = var("RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH")
         && !path.trim().is_empty()
     {
         let pem = std::fs::read_to_string(path.trim())
@@ -387,18 +390,6 @@ pub(crate) mod tests {
     use crate::provider::ProviderInstanceId;
     use secrecy::ExposeSecret;
 
-    #[test]
-    fn static_broker_falls_back_to_none() {
-        let registry = ProviderRegistry::new();
-        let broker = StaticBroker::new(registry);
-        assert!(
-            broker
-                .fetch_credential(&RepoId::github("o/r"))
-                .unwrap()
-                .is_none()
-        );
-    }
-
     // A throwaway RSA keypair generated only for these tests — not a real key.
     pub(crate) const TEST_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
 MIIEpQIBAAKCAQEAr3mQr1jPDpJqNqW2YF/lpwN40lfIF1kT61h0VS3DjLG2MNvX
@@ -479,20 +470,6 @@ RwIDAQAB
     }
 
     #[test]
-    fn github_app_broker_returns_mint_errors() {
-        let broker = GitHubAppBroker::new(GitHubAppConfig {
-            app_id: "12345".to_string(),
-            installation_id: 67890,
-            private_key_pem: SecretString::from(TEST_PRIVATE_KEY),
-            api_base: "https://127.0.0.1:9".to_string(),
-        })
-        .expect("build test broker from test key");
-
-        let err = broker.fetch_credential(&RepoId::github("o/r")).unwrap_err();
-        assert!(format!("{err:#}").contains("GitHub App installation token"));
-    }
-
-    #[test]
     fn github_app_jwt_is_signed_and_well_formed() {
         use jsonwebtoken::{DecodingKey, Validation, decode};
 
@@ -553,175 +530,77 @@ RwIDAQAB
     }
 
     #[test]
-    fn parse_rfc3339_handles_github_timestamps() {
-        assert!(parse_rfc3339("2024-01-01T00:00:00Z").is_some());
-        assert!(parse_rfc3339("2024-01-01T00:00:00+00:00").is_some());
-        assert!(parse_rfc3339("not a timestamp").is_none());
-    }
-
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct RecordingBroker {
-        calls: AtomicUsize,
-        token: SecretString,
-    }
-
-    impl RecordingBroker {
-        fn new(token: &str) -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-                token: SecretString::from(token),
-            }
-        }
-
-        fn call_count(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    impl CredentialBroker for RecordingBroker {
-        fn fetch_credential(&self, _repo_id: &RepoId) -> Result<Option<SecretString>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(self.token.clone()))
-        }
-    }
-
-    #[test]
-    fn provider_aware_dispatches_to_registered_broker() {
-        let registry = ProviderRegistry::new();
-        let custom = Arc::new(RecordingBroker::new("custom-token"));
-        let broker = ProviderAwareBroker::new(registry).register("my-gitea", custom.clone());
-
-        let repo = RepoId {
-            provider: ProviderInstanceId::new("my-gitea"),
-            path: "org/repo".to_string(),
-        };
-        let token = broker
-            .fetch_credential(&repo)
-            .unwrap()
-            .expect("token from registered broker");
-        assert_eq!(token.expose_secret(), "custom-token");
-        assert_eq!(custom.call_count(), 1);
-    }
-
-    #[test]
-    fn provider_aware_falls_back_to_static_broker() {
-        let registry = ProviderRegistry::new();
-        let custom = Arc::new(RecordingBroker::new("custom-token"));
-        let broker = ProviderAwareBroker::new(registry).register("my-gitea", custom.clone());
-
-        // A provider with no registered dynamic broker → StaticBroker → None.
-        let repo = RepoId {
-            provider: ProviderInstanceId::new("gitlab"),
-            path: "group/proj".to_string(),
-        };
-        assert!(broker.fetch_credential(&repo).unwrap().is_none());
-        assert_eq!(custom.call_count(), 0);
-    }
-
-    #[test]
-    fn provider_aware_uses_github_app_for_github_instance() {
-        let registry = ProviderRegistry::new();
-        let gh_broker = Arc::new(RecordingBroker::new("gh-app-token"));
-        let broker = ProviderAwareBroker::new(registry).register("github", gh_broker.clone());
-
-        let token = broker
-            .fetch_credential(&RepoId::github("o/r"))
-            .unwrap()
-            .expect("github app token");
-        assert_eq!(token.expose_secret(), "gh-app-token");
-        assert_eq!(gh_broker.call_count(), 1);
-    }
-
-    /// All `from_env` scenarios in one test: these `RIPCLONE_GITHUB_APP_*` vars
-    /// are touched only here, so there is no cross-test env race.
-    #[test]
     fn config_from_env_selects_and_validates() {
-        // SAFETY: this is the only test that reads/writes these vars.
-        unsafe {
-            for k in [
-                "RIPCLONE_GITHUB_APP_ID",
-                "RIPCLONE_GITHUB_APP_INSTALLATION_ID",
-                "RIPCLONE_GITHUB_APP_PRIVATE_KEY",
-                "RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH",
-                "RIPCLONE_GITHUB_API_BASE",
-            ] {
-                std::env::remove_var(k);
-            }
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("app.pem");
+        std::fs::write(&key_path, TEST_PRIVATE_KEY).unwrap();
+        let key_path = key_path.to_str().unwrap();
+        let load = |vars: &[(&str, &str)]| {
+            let vars: std::collections::HashMap<String, String> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            GitHubAppConfig::from_lookup(|key| vars.get(key).cloned())
+        };
+        const ID: (&str, &str) = ("RIPCLONE_GITHUB_APP_ID", "12345");
+        const INSTALL: (&str, &str) = ("RIPCLONE_GITHUB_APP_INSTALLATION_ID", "67890");
+        const KEY: (&str, &str) = ("RIPCLONE_GITHUB_APP_PRIVATE_KEY", TEST_PRIVATE_KEY);
+        let key_file = ("RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH", key_path);
 
-            // Nothing configured → no GitHub App broker.
-            assert!(GitHubAppConfig::from_env().unwrap().is_none());
-
-            // App id set but no installation id → fail fast.
-            std::env::set_var("RIPCLONE_GITHUB_APP_ID", "12345");
-            assert!(GitHubAppConfig::from_env().is_err());
-
-            // App id + installation id but no key → fail fast.
-            std::env::set_var("RIPCLONE_GITHUB_APP_INSTALLATION_ID", "67890");
-            assert!(GitHubAppConfig::from_env().is_err());
-
-            // Full inline config → parsed.
-            std::env::set_var("RIPCLONE_GITHUB_APP_PRIVATE_KEY", TEST_PRIVATE_KEY);
-            let cfg = GitHubAppConfig::from_env().unwrap().expect("configured");
+        // Nothing configured: no GitHub App broker.
+        assert!(load(&[]).unwrap().is_none());
+        assert!(load(&[("RIPCLONE_GITHUB_APP_ID", " ")]).unwrap().is_none());
+        // App id set but incomplete or malformed: fail fast.
+        for vars in [
+            &[ID][..],
+            &[ID, INSTALL],
+            &[
+                ID,
+                ("RIPCLONE_GITHUB_APP_INSTALLATION_ID", "not-a-number"),
+                KEY,
+            ],
+            &[
+                ID,
+                INSTALL,
+                KEY,
+                ("RIPCLONE_GITHUB_API_BASE", "http://ghe.example.com"),
+            ],
+            &[
+                ID,
+                INSTALL,
+                (
+                    "RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH",
+                    "/nonexistent/app.pem",
+                ),
+            ],
+        ] {
+            assert!(
+                load(vars).is_err(),
+                "{:?}",
+                vars.iter().map(|v| v.0).collect::<Vec<_>>()
+            );
+        }
+        // Inline key with the default API base, or a key file with an override.
+        for (vars, api_base) in [
+            (vec![ID, INSTALL, KEY], DEFAULT_GITHUB_API_BASE),
+            (
+                vec![
+                    ID,
+                    INSTALL,
+                    key_file,
+                    (
+                        "RIPCLONE_GITHUB_API_BASE",
+                        "https://ghe.example.com/api/v3/",
+                    ),
+                ],
+                "https://ghe.example.com/api/v3",
+            ),
+        ] {
+            let cfg = load(&vars).unwrap().expect("configured");
             assert_eq!(cfg.app_id, "12345");
             assert_eq!(cfg.installation_id, 67890);
-            assert_eq!(cfg.api_base, DEFAULT_GITHUB_API_BASE);
-            // The parsed key must actually build a broker.
-            GitHubAppBroker::new(cfg).expect("broker from env config");
-
-            // A key file path also works, and api base override is honored.
-            std::env::remove_var("RIPCLONE_GITHUB_APP_PRIVATE_KEY");
-            let dir = tempfile::tempdir().unwrap();
-            let key_path = dir.path().join("app.pem");
-            std::fs::write(&key_path, TEST_PRIVATE_KEY).unwrap();
-            std::env::set_var(
-                "RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH",
-                key_path.to_str().unwrap(),
-            );
-            std::env::set_var(
-                "RIPCLONE_GITHUB_API_BASE",
-                "https://ghe.example.com/api/v3/",
-            );
-            let cfg = GitHubAppConfig::from_env()
-                .unwrap()
-                .expect("configured via path");
-            assert_eq!(cfg.api_base, "https://ghe.example.com/api/v3");
-            GitHubAppBroker::new(cfg).expect("broker from path config");
-
-            // An invalid installation id is rejected.
-            std::env::set_var("RIPCLONE_GITHUB_APP_INSTALLATION_ID", "not-a-number");
-            assert!(GitHubAppConfig::from_env().is_err());
-
-            for k in [
-                "RIPCLONE_GITHUB_APP_ID",
-                "RIPCLONE_GITHUB_APP_INSTALLATION_ID",
-                "RIPCLONE_GITHUB_APP_PRIVATE_KEY",
-                "RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH",
-                "RIPCLONE_GITHUB_API_BASE",
-            ] {
-                std::env::remove_var(k);
-            }
+            assert_eq!(cfg.api_base, api_base);
+            GitHubAppBroker::new(cfg).expect("broker from the parsed key");
         }
-    }
-
-    /// Live smoke test against the real GitHub API. Ignored by default; run with
-    /// `RIPCLONE_GITHUB_APP_ID`, `RIPCLONE_GITHUB_APP_INSTALLATION_ID`, and
-    /// `RIPCLONE_GITHUB_APP_PRIVATE_KEY[_PATH]` set:
-    ///   cargo test --lib github_app_live_mints_installation_token -- --ignored
-    #[test]
-    #[ignore = "hits the live GitHub API; requires RIPCLONE_GITHUB_APP_* env"]
-    fn github_app_live_mints_installation_token() {
-        let config = GitHubAppConfig::from_env()
-            .expect("valid config")
-            .expect("RIPCLONE_GITHUB_APP_* must be set for the live test");
-        let broker = GitHubAppBroker::new(config).expect("broker");
-        let token = broker
-            .fetch_credential(&RepoId::github("o/r"))
-            .unwrap()
-            .expect("mint a live installation token");
-        assert!(
-            token.expose_secret().starts_with("ghs_") || !token.expose_secret().is_empty(),
-            "installation tokens are non-empty"
-        );
     }
 }

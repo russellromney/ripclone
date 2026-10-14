@@ -51,15 +51,26 @@ fn big_gets(proxy: &FaultProxy, big_path: &str) -> Vec<Seen> {
         .collect()
 }
 
-/// The path of the artifact the fault hit: the first non-200, non-206
-/// response, or with no status fault, the first GET that sent a Range.
+/// The path of the first artifact a fault rule hit.
 fn faulted_path(proxy: &FaultProxy) -> String {
     let gets = proxy.artifact_gets();
     gets.iter()
-        .find(|s| s.status != 200 && s.status != 206)
-        .or_else(|| gets.iter().find(|s| s.range.is_some()))
+        .find(|s| s.faulted)
         .map(|s| s.path.clone())
         .unwrap_or_else(|| panic!("no faulted artifact among {gets:#?}"))
+}
+
+/// The object names in a client artifact cache.
+fn cached_objects(dir: &std::path::Path) -> Vec<String> {
+    let Ok(shards) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    shards
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .flat_map(|e| std::fs::read_dir(e.path()).unwrap().flatten())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 fn assert_clean_failure(world: &World, target: &std::path::Path) {
@@ -67,20 +78,53 @@ fn assert_clean_failure(world: &World, target: &std::path::Path) {
     assert_eq!(world.staging_leftovers(), Vec::<String>::new());
 }
 
-/// F1: one flipped byte fails the clone on the hash check and leaves nothing.
+/// F1: one flipped byte fails the clone on the hash check, leaves nothing,
+/// and puts nothing in the client's artifact cache. Covers the streamed
+/// history pack and a buffered artifact (the only kind the cache holds).
 #[test]
 fn f1_flipped_byte_fails_on_hash() {
     let world = World::new();
-    let (_origin, _server, proxy, _tip) = big_history(&world, "f1");
-    proxy.fault_artifacts(Fault::FlipByte, BIG, 1);
+    let (_origin, server, _proxy, _tip) = big_history(&world, "f1");
+    let cache = world.path("cli-cache");
+    let env = [("RIPCLONE_CACHE_DIR", cache.to_str().unwrap())];
 
-    let target = world.target("f1");
-    let err = world
-        .cli(&proxy, &["clone", "acme/f1", target.to_str().unwrap()])
-        .err();
+    // Control: an intact clone caches its buffered artifacts.
+    let warm = world.target("f1-warm");
+    world
+        .cli_env(&server, &["clone", "acme/f1", warm.to_str().unwrap()], &env)
+        .ok();
+    let buffered = cached_objects(&cache);
+    assert!(!buffered.is_empty(), "an intact clone cached nothing");
 
-    assert!(err.contains("hash mismatch"), "{err}");
-    assert_clean_failure(&world, &target);
+    // `None` faults the streamed pack; `Some` one buffered artifact.
+    for (case, buffered_hash) in [("streamed", None), ("buffered", Some(&buffered[0]))] {
+        std::fs::remove_dir_all(&cache).unwrap();
+        let proxy = FaultProxy::start(&server);
+        match buffered_hash {
+            None => proxy.fault_artifacts(Fault::FlipByte, BIG, 1),
+            Some(hash) => {
+                proxy.fault_requests(&format!("/v1/artifacts/{hash}"), Fault::FlipByte, 1)
+            }
+        }
+
+        let target = world.target(&format!("f1-{case}"));
+        let err = world
+            .cli_env(
+                &proxy,
+                &["clone", "acme/f1", target.to_str().unwrap()],
+                &env,
+            )
+            .err();
+
+        assert!(err.contains("hash mismatch"), "{case}: {err}");
+        assert_clean_failure(&world, &target);
+        let path = faulted_path(&proxy);
+        let hash = path.rsplit('/').next().unwrap();
+        assert!(
+            !cached_objects(&cache).iter().any(|h| h == hash),
+            "{case}: the corrupt artifact {hash} was cached"
+        );
+    }
 }
 
 /// F2: a body shorter than the manifest promised fails at once, without a

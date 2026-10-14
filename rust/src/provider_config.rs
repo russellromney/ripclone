@@ -19,13 +19,19 @@ fn parse_providers_json(data: &str) -> Result<ProvidersFile> {
 
 /// Build a registry from env JSON and the provided unified config.
 pub fn load_registry_with_config(config: &crate::config::Config) -> Result<ProviderRegistry> {
+    registry_from(std::env::var("RIPCLONE_PROVIDERS").ok().as_deref(), config)
+}
+
+/// [`load_registry_with_config`] with the `RIPCLONE_PROVIDERS` value given.
+/// Config entries merge after the JSON ones, so they win on the same id.
+fn registry_from(
+    providers_json: Option<&str>,
+    config: &crate::config::Config,
+) -> Result<ProviderRegistry> {
     let mut registry = ProviderRegistry::new();
 
-    if let Some(json) = std::env::var("RIPCLONE_PROVIDERS")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
-        let file = parse_providers_json(&json).with_context(|| "parse RIPCLONE_PROVIDERS JSON")?;
+    if let Some(json) = providers_json.filter(|t| !t.is_empty()) {
+        let file = parse_providers_json(json).with_context(|| "parse RIPCLONE_PROVIDERS JSON")?;
         merge_configs(&mut registry, file.providers)?;
     }
 
@@ -52,71 +58,47 @@ mod tests {
     use crate::config::{Config, ProviderEntry};
     use secrecy::ExposeSecret;
     use std::collections::HashMap;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap()
-    }
-
-    fn restore_env(key: &str, old: Option<std::ffi::OsString>) {
-        unsafe {
-            match old {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
 
     #[test]
-    fn load_registry_with_config_merges_toml_providers() {
-        let mut providers = HashMap::new();
-        providers.insert(
-            "my-gitea".to_string(),
-            ProviderEntry {
-                kind: "gitea".into(),
-                host: Some("https://gitea.example.com".into()),
-                token: Some("gitea-secret".into()),
-                auth_template: None,
-                auth_header_name: None,
-            },
-        );
+    fn registry_merges_env_json_then_config() {
+        let entry = |host: &str, token: &str| ProviderEntry {
+            kind: "gitea".into(),
+            host: Some(host.into()),
+            token: Some(token.into()),
+            auth_template: None,
+            auth_header_name: None,
+        };
         let config = Config {
-            providers,
+            providers: HashMap::from([
+                (
+                    "my-gitea".to_string(),
+                    entry("https://gitea.example.com", "gitea-secret"),
+                ),
+                (
+                    "shared".to_string(),
+                    entry("https://from-config.example.com", "config-token"),
+                ),
+            ]),
             ..Config::default()
         };
+        let json = r#"{"providers":[
+            {"id":"gitlab","kind":"gitlab","host":"gitlab.com","token":"gl-token"},
+            {"id":"shared","kind":"gitea","host":"https://from-json.example.com","token":"json-token"}
+        ]}"#;
 
-        let registry = load_registry_with_config(&config).unwrap();
-        let token = registry.token("my-gitea").unwrap().expose_secret();
-        assert_eq!(token, "gitea-secret");
-        assert_eq!(
-            registry.get("my-gitea").map(|p| p.host.as_str()),
-            Some("https://gitea.example.com")
-        );
-    }
-
-    #[test]
-    fn load_registry_merges_env_json() {
-        let _guard = lock_env();
-        let old = std::env::var_os("RIPCLONE_PROVIDERS");
-        unsafe {
-            std::env::set_var(
-                "RIPCLONE_PROVIDERS",
-                r#"{"providers":[{"id":"gitlab","kind":"gitlab","host":"gitlab.com","token":"gl-token"}]}"#,
+        let registry = registry_from(Some(json), &config).unwrap();
+        for (id, host, token) in [
+            ("gitlab", "gitlab.com", "gl-token"),
+            ("my-gitea", "https://gitea.example.com", "gitea-secret"),
+            ("shared", "https://from-config.example.com", "config-token"),
+        ] {
+            assert_eq!(
+                registry.get(id).map(|p| p.host.as_str()),
+                Some(host),
+                "{id}"
             );
+            assert_eq!(registry.token(id).unwrap().expose_secret(), token, "{id}");
         }
-
-        let registry = load_registry_with_config(&Config::default()).unwrap();
-        restore_env("RIPCLONE_PROVIDERS", old);
-
-        assert_eq!(
-            registry.get("gitlab").map(|p| p.host.as_str()),
-            Some("gitlab.com")
-        );
-        assert_eq!(
-            registry.token("gitlab").unwrap().expose_secret(),
-            "gl-token"
-        );
+        assert!(registry_from(Some("not json"), &config).is_err());
     }
 }

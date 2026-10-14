@@ -449,6 +449,7 @@ mod lsm_incremental_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// Commit `files` onto a bare repo's HEAD (parent = current HEAD if any) and
     /// return the new commit oid.
@@ -456,10 +457,49 @@ mod tests {
         crate::test_fixture::commit(repo, files)
     }
 
-    /// A cold build packs the full HEAD closure; a re-sync after changing one file
-    /// packs only the *delta* — the depth-1 objects new at the new commit (the
-    /// changed blob + root tree + commit), not the whole worktree. The delta is
-    /// exactly the set difference of the two depth-1 closures.
+    /// Object ids in the packs `build_head_*` returned, read from their idx
+    /// files with `git show-index`.
+    fn packed_objects(cas: &Cas, packs: &[(String, u64, String, u64)]) -> BTreeSet<String> {
+        use std::io::Write;
+        let mut out = BTreeSet::new();
+        for (_, _, idx_hash, _) in packs {
+            let idx = cas.get(idx_hash).unwrap();
+            let mut child = std::process::Command::new("git")
+                .arg("show-index")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(&idx).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            // Each line: `<offset> <object id> (<crc>)`.
+            for line in String::from_utf8(output.stdout).unwrap().lines() {
+                out.insert(line.split_whitespace().nth(1).unwrap().to_string());
+            }
+        }
+        out
+    }
+
+    fn rev_parse(repo: &Path, revs: &[String]) -> BTreeSet<String> {
+        revs.iter()
+            .map(|rev| {
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["rev-parse", "--verify", rev])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "rev-parse {rev}");
+                String::from_utf8(output.stdout).unwrap().trim().to_string()
+            })
+            .collect()
+    }
+
+    /// A cold build packs the full HEAD closure; a re-sync packs only the
+    /// depth-1 objects that are new since the base commit. An object the base
+    /// already has (here a blob restored to its base content) is not packed
+    /// again.
     #[test]
     fn head_delta_pack_is_minimal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -467,8 +507,8 @@ mod tests {
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let pb = PackBuilder::new(tmp.path(), &cas);
-
-        let files1: Vec<(&str, &[u8])> = vec![
+        let target = 12 * 1024 * 1024;
+        let base_files: Vec<(&str, &[u8])> = vec![
             ("a", b"aaa"),
             ("b", b"bbb"),
             ("c", b"ccc"),
@@ -476,83 +516,29 @@ mod tests {
             ("e", b"eee"),
             ("f", b"fff"),
         ];
-        let c1 = commit_onto(&repo, &files1);
-        let base = pb.build_head_packs(&c1, 12 * 1024 * 1024).unwrap();
-        assert!(!base.is_empty(), "cold build packs the full closure");
+        let c1 = commit_onto(&repo, &base_files);
+        let base = packed_objects(&cas, &pb.build_head_packs(&c1, target).unwrap());
+        let mut c1_objects = vec![c1.clone(), format!("{c1}^{{tree}}")];
+        c1_objects.extend(base_files.iter().map(|(name, _)| format!("{c1}:{name}")));
+        assert_eq!(base, rev_parse(tmp.path(), &c1_objects));
 
-        // c2 changes one file's content (blob b, the root tree, and the commit).
-        let files2: Vec<(&str, &[u8])> = vec![
-            ("a", b"aaa"),
-            ("b", b"bbb-CHANGED"),
-            ("c", b"ccc"),
-            ("d", b"ddd"),
-            ("e", b"eee"),
-            ("f", b"fff"),
-        ];
-        let c2 = commit_onto(&repo, &files2);
-        // Delta is always taken against the immutable base commit (c1).
-        let delta = pb
-            .build_head_delta_pack(&c2, &c1, 12 * 1024 * 1024)
-            .unwrap();
-        assert!(!delta.is_empty(), "a changed file yields a non-empty delta");
+        // c2 changes b: the delta is c2, its root tree, and the new blob.
+        let mut c2_files = base_files.clone();
+        c2_files[1] = ("b", b"bbb-CHANGED");
+        let c2 = commit_onto(&repo, &c2_files);
+        let delta = pb.build_head_delta_pack(&c2, &c1, target).unwrap();
+        let want = [c2.clone(), format!("{c2}^{{tree}}"), format!("{c2}:b")];
+        assert_eq!(packed_objects(&cas, &delta), rev_parse(tmp.path(), &want));
 
-        // The delta is the set difference of the two depth-1 closures. For a flat
-        // tree with one changed file that is exactly {commit, root tree, blob} = 3
-        // objects — far fewer than the full closure (commit + tree + 6 blobs = 8).
-        let full_c1 = git::list_object_shas_with_depth(tmp.path(), &c1, Some(1)).unwrap();
-        let full_c2 = git::list_object_shas_with_depth(tmp.path(), &c2, Some(1)).unwrap();
-        let base_set: std::collections::HashSet<&str> =
-            full_c1.iter().map(String::as_str).collect();
-        let expected_delta: Vec<&str> = full_c2
-            .iter()
-            .map(String::as_str)
-            .filter(|o| !base_set.contains(o))
-            .collect();
-        assert_eq!(
-            expected_delta.len(),
-            3,
-            "single-file change in a flat tree: changed blob + root tree + commit"
-        );
-        assert!(
-            expected_delta.len() < full_c2.len(),
-            "delta is smaller than the full closure"
-        );
-
-        // Re-add disjointness: c3 deletes b.txt then ... actually re-adds the
-        // ORIGINAL content. The original blob is reachable from the base (c1), so
-        // the delta against the base must NOT contain it — base ∩ delta = ∅, so no
-        // object is ever materialized from two packs.
-        let files3: Vec<(&str, &[u8])> = vec![
-            ("a", b"aaa"),
-            ("b", b"bbb"), // restored to the c1 (base) content
-            ("c", b"ccc"),
-            ("d", b"ddd"),
-            ("e", b"eee"),
-            ("f", b"fff"),
-            ("g", b"ggg"), // one genuinely new file
-        ];
-        let c3 = commit_onto(&repo, &files3);
-        let delta3 = pb
-            .build_head_delta_pack(&c3, &c1, 12 * 1024 * 1024)
-            .unwrap();
-        assert!(!delta3.is_empty(), "new file g yields a non-empty delta");
-        let full_c3 = git::list_object_shas_with_depth(tmp.path(), &c3, Some(1)).unwrap();
-        let delta3_set: std::collections::HashSet<&str> = full_c3
-            .iter()
-            .map(String::as_str)
-            .filter(|o| !base_set.contains(o))
-            .collect();
-        // The restored-to-base "bbb" blob is in the base, so it is absent from the
-        // delta (no duplication); the new "ggg" blob is in the delta.
-        for o in &delta3_set {
-            assert!(
-                !base_set.contains(o),
-                "delta and base must be disjoint (no object in both packs)"
-            );
-        }
-        assert!(
-            full_c3.len() > delta3_set.len(),
-            "base still serves the unchanged + restored objects"
-        );
+        // c3 restores b to its base content and adds g. Against the base c1,
+        // the delta is c3, its root tree, and g; the restored blob is in the
+        // base packs only.
+        let mut c3_files = base_files.clone();
+        c3_files.push(("g", b"ggg"));
+        let c3 = commit_onto(&repo, &c3_files);
+        let delta = packed_objects(&cas, &pb.build_head_delta_pack(&c3, &c1, target).unwrap());
+        let want = [c3.clone(), format!("{c3}^{{tree}}"), format!("{c3}:g")];
+        assert_eq!(delta, rev_parse(tmp.path(), &want));
+        assert!(delta.is_disjoint(&base));
     }
 }

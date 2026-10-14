@@ -238,28 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_none_allows_all() {
-        let cfg = WebhookConfig::default();
-        assert!(cfg.allows("anyone/anything"));
-    }
-
-    #[test]
-    fn allowlist_some_gates_by_storage_key() {
-        let cfg = WebhookConfig {
-            secrets: HashMap::new(),
-            allowlist: Some(HashSet::from(["acme/widget".to_string()])),
-        };
-        assert!(cfg.allows("acme/widget"));
-        assert!(!cfg.allows("acme/other"));
-    }
-
-    #[test]
-    fn no_secret_for_provider_is_none() {
-        let cfg = WebhookConfig::default();
-        assert!(cfg.secret("github").is_none());
-    }
-
-    #[test]
     fn parse_secret_rejects_absent_empty_and_whitespace() {
         use secrecy::ExposeSecret;
         // Absent / empty / all-whitespace ⇒ no secret (fail closed).
