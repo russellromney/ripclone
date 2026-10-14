@@ -101,94 +101,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_uses_default_compression_and_validates() {
-        let cfg = RepoConfig::default();
-        assert_eq!(cfg.compression_level(), DEFAULT_COMPRESSION_LEVEL);
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn validate_rejects_bad_values() {
-        assert!(
-            RepoConfig {
-                compression_level: Some(99),
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            RepoConfig {
-                clonepack_depths: vec![DepthSpec {
-                    name: "x".into(),
-                    depth: Some(0)
-                }],
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn validate_rejects_more_than_two_structural_variants() {
-        // Two finite depths need the deferred multi-variant build.
-        let cfg = RepoConfig {
-            clonepack_depths: vec![
-                DepthSpec {
-                    name: "shallow".into(),
-                    depth: Some(1),
-                },
-                DepthSpec {
-                    name: "recent".into(),
-                    depth: Some(50),
-                },
-                DepthSpec {
-                    name: "full".into(),
-                    depth: None,
-                },
-            ],
+    fn validate_accepts_defaults_and_rejects_bad_values() {
+        let depth = |name: &str, depth| DepthSpec {
+            name: name.into(),
+            depth,
+        };
+        let depths = |clonepack_depths| RepoConfig {
+            clonepack_depths,
             ..Default::default()
         };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_duplicate_names() {
-        let cfg = RepoConfig {
-            clonepack_depths: vec![
-                DepthSpec {
-                    name: "dup".into(),
-                    depth: Some(1),
+        for (case, cfg, ok) in [
+            ("default", RepoConfig::default(), true),
+            (
+                "compression 99",
+                RepoConfig {
+                    compression_level: Some(99),
+                    ..Default::default()
                 },
-                DepthSpec {
-                    name: "dup".into(),
-                    depth: None,
-                },
-            ],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn deserialize_rejects_removed_configuration_fields() {
-        let hot_files = serde_json::from_str::<RepoConfig>(r#"{"hot_files":["src/**"]}"#)
-            .expect_err("removed hot_files must not be silently ignored");
-        assert!(hot_files.to_string().contains("unknown field `hot_files`"));
-
-        let enabled_modes = serde_json::from_str::<RepoConfig>(r#"{"enabled_modes":["files"]}"#)
-            .expect_err("removed enabled_modes must not be silently ignored");
-        assert!(
-            enabled_modes
-                .to_string()
-                .contains("unknown field `enabled_modes`")
-        );
-
-        let nested = serde_json::from_str::<RepoConfig>(
-            r#"{"clonepack_depths":[{"name":"shallow","depth":1,"unexpected":true}]}"#,
-        )
-        .expect_err("nested unknown clonepack fields must not be silently ignored");
-        assert!(nested.to_string().contains("unknown field `unexpected`"));
+                false,
+            ),
+            ("depth 0", depths(vec![depth("x", Some(0))]), false),
+            (
+                "three structural variants",
+                depths(vec![
+                    depth("shallow", Some(1)),
+                    depth("recent", Some(50)),
+                    depth("full", None),
+                ]),
+                false,
+            ),
+            (
+                "duplicate names",
+                depths(vec![depth("dup", Some(1)), depth("dup", None)]),
+                false,
+            ),
+        ] {
+            assert_eq!(cfg.validate().is_ok(), ok, "{case}");
+        }
     }
 }

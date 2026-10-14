@@ -21,16 +21,36 @@ lint() {
     cargo clippy --all-targets --locked -- -D warnings )
 }
 
-# Unit tests run one at a time: some still mutate process env, and io_uring
-# queue allocation must stay under the runner's locked-memory limit. The
-# contract suite runs in parallel: each test owns its server, port, and temp
-# dir, and races only show up under concurrent load.
+# Unit tests run one at a time: io_uring queue allocation must stay under the
+# runner's locked-memory limit. The contract suite runs in parallel: each test
+# owns its server, port, and temp dir, and races only show up under
+# concurrent load.
 #
 # This job self-compiles (ci profile + sccache/rust-cache). Fan-out jobs
 # (gitea/e2e/s3/…) use prebuilt binaries from ci-build instead.
 run_tests() {
   ( cd "$ROOT/rust" && cargo test --profile ci --locked --lib --bins -- --test-threads=1 )
+  s3_unit_test
   ( cd "$ROOT/rust" && cargo test --profile ci --locked --test contract )
+}
+
+# The one unit test that needs real S3 (multipart upload), against the
+# emulator. It reuses the lib test binary built just above.
+s3_unit_test() {
+  local data env status=0
+  data="$(mktemp -d)"
+  env="$(bash "$ROOT/scripts/s3_emulator.sh" "$data" ripclone-unit)"
+  ( cd "$ROOT/rust"
+    while IFS= read -r line; do export "$line"; done <<<"$env"
+    cargo test --profile ci --locked --lib -- --ignored --exact \
+      storage::s3_storage::tests::multipart_file_upload_roundtrips_exact_bytes
+  ) 2>&1 | tee "$data/test.log" || status=$?
+  kill "$(sed -n 's/^S3_EMULATOR_PID=//p' <<<"$env")" 2>/dev/null || true
+  if [ "$status" != 0 ]; then
+    return "$status"
+  fi
+  # A filter that matched nothing would also pass.
+  grep -q "test result: ok. 1 passed" "$data/test.log"
 }
 
 e2e() {

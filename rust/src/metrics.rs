@@ -361,40 +361,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prometheus_format_has_help_type_and_values() {
-        let m = Metrics::new();
-        m.record_ref_lookup();
-        m.record_ref_lookup();
-        m.record_sync(std::time::Duration::from_millis(10));
-        m.record_sync_phases(SyncPhaseMetrics {
-            mirror_fetch_ms: Some(3),
-            publish_head_ms: Some(7),
-            ..SyncPhaseMetrics::default()
-        });
-        m.record_artifact_request(1234);
-        m.record_build_queued();
-
-        let out = m.prometheus();
-
-        // Counter: HELP + TYPE + value.
-        assert!(out.contains("# HELP ripclone_ref_lookups_total Ref lookups served"));
-        assert!(out.contains("# TYPE ripclone_ref_lookups_total counter"));
-        assert!(out.contains("\nripclone_ref_lookups_total 2\n"));
-        assert!(out.contains("\nripclone_sync_mirror_fetch_ms_total 3\n"));
-        assert!(out.contains("\nripclone_sync_publish_head_ms_total 7\n"));
-        assert!(out.contains("\nripclone_artifact_bytes_served_total 1234\n"));
-
-        // Gauge.
-        assert!(out.contains("# TYPE ripclone_build_queue_depth gauge"));
-        assert!(out.contains("\nripclone_build_queue_depth 1\n"));
-
-        // Every metric (23 counters + 1 gauge) carries a TYPE line.
-        assert_eq!(out.matches("# TYPE ").count(), 24);
-        // Output is a complete set of lines (no dangling partial line).
-        assert!(out.ends_with('\n'));
-    }
-
-    #[test]
     fn build_queue_depth_gauge_is_balanced_and_saturating() {
         let m = Metrics::new();
         m.record_build_queued();

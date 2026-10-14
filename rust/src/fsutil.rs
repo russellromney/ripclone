@@ -98,30 +98,18 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     #[test]
-    fn validate_relative_path_accepts_simple_relative() {
-        validate_relative_path(Path::new("src/foo/bar.txt")).unwrap();
-    }
-
-    #[test]
-    fn validate_relative_path_rejects_empty() {
-        assert!(validate_relative_path(Path::new("")).is_err());
-    }
-
-    #[test]
-    fn validate_relative_path_rejects_absolute() {
-        assert!(validate_relative_path(Path::new("/etc/passwd")).is_err());
-    }
-
-    #[test]
-    fn validate_relative_path_rejects_parent_dir() {
-        assert!(validate_relative_path(Path::new("../foo")).is_err());
-        assert!(validate_relative_path(Path::new("foo/../bar")).is_err());
-    }
-
-    #[test]
-    fn validate_relative_path_rejects_nul_byte() {
-        let p = std::ffi::OsStr::from_bytes(b"foo/bar\0baz");
-        assert!(validate_relative_path(Path::new(p)).is_err());
+    fn validate_relative_path_accepts_only_plain_relative_paths() {
+        for (path, ok) in [
+            (&b"src/foo/bar.txt"[..], true),
+            (b"", false),
+            (b"/etc/passwd", false),
+            (b"../foo", false),
+            (b"foo/../bar", false),
+            (b"foo/bar\0baz", false),
+        ] {
+            let path = Path::new(std::ffi::OsStr::from_bytes(path));
+            assert_eq!(validate_relative_path(path).is_ok(), ok, "{path:?}");
+        }
     }
 
     #[test]

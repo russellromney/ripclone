@@ -1258,124 +1258,86 @@ async fn verify_upstream_snapshot(
 mod tests {
     use super::*;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn protocol_verdict_compatible_outdated_and_newer() {
-        assert_eq!(protocol_verdict(1, 1), ProtocolVerdict::Compatible);
-        // Client older than the server -> the CLI should update.
-        assert_eq!(protocol_verdict(1, 2), ProtocolVerdict::ClientOutdated);
-        // Client newer than the server -> the server should update.
-        assert_eq!(protocol_verdict(3, 2), ProtocolVerdict::ServerOutdated);
+    fn provider(id: &str, kind: &str, host: &str) -> ripclone::provider::ProviderConfig {
+        ripclone::provider::ProviderConfig {
+            id: id.to_string(),
+            kind: Some(kind.to_string()),
+            host: Some(host.to_string()),
+            token: None,
+            auth_template: None,
+            auth_header_name: None,
+        }
     }
 
+    /// `[provider:]path` resolution: the prefix overrides the default
+    /// provider; data-plane commands need a configured provider, control-plane
+    /// commands do not.
     #[test]
-    fn release_status_none_uptodate_and_newer() {
-        // No release published / empty tag.
-        assert_eq!(release_status("0.1.0", ""), ReleaseStatus::None);
-        // Up to date, with and without the leading `v` on the tag.
-        assert_eq!(release_status("0.1.0", "v0.1.0"), ReleaseStatus::UpToDate);
-        assert_eq!(release_status("0.1.0", "0.1.0"), ReleaseStatus::UpToDate);
-        // A newer release is reported with its original tag.
-        assert_eq!(
-            release_status("0.1.0", "v0.2.0"),
-            ReleaseStatus::Newer("v0.2.0".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_repo_arg_without_prefix() {
-        assert_eq!(
-            parse_repo_arg("oven-sh/bun"),
-            (None, "oven-sh/bun".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_repo_arg_with_provider_prefix() {
-        assert_eq!(
-            parse_repo_arg("gitlab:oven-sh/bun"),
-            (Some("gitlab".to_string()), "oven-sh/bun".to_string())
-        );
-    }
-
-    #[test]
-    fn control_repo_accepts_unconfigured_explicit_and_default_providers() {
-        assert_eq!(
-            resolve_control_repo("gitlab:group/sub/repo", "github"),
-            ("gitlab".to_string(), "group/sub/repo".to_string())
-        );
-        assert_eq!(
-            resolve_control_repo("group/sub/repo", "gitlab"),
-            ("gitlab".to_string(), "group/sub/repo".to_string())
-        );
-    }
-
-    fn test_registry() -> ripclone::provider::ProviderRegistry {
+    fn repo_argument_resolution() {
         let mut registry = ripclone::provider::ProviderRegistry::new();
         registry
-            .merge_one(ripclone::provider::ProviderConfig {
-                id: "gitlab".to_string(),
-                kind: Some("gitlab".to_string()),
-                host: Some("gitlab.com".to_string()),
-                token: None,
-                auth_template: None,
-                auth_header_name: None,
-            })
+            .merge_one(provider("gitlab", "gitlab", "gitlab.com"))
             .unwrap();
         registry
-    }
-
-    #[test]
-    fn resolve_repo_defaults_to_github() {
-        let registry = test_registry();
-        let (provider, repo_path) = resolve_repo("oven-sh/bun", "github", &registry).unwrap();
-        assert_eq!(provider, "github");
-        assert_eq!(repo_path, "oven-sh/bun");
-    }
-
-    #[test]
-    fn resolve_repo_overrides_provider_from_prefix() {
-        let registry = test_registry();
-        let (provider, repo_path) =
-            resolve_repo("gitlab:oven-sh/bun", "github", &registry).unwrap();
-        assert_eq!(provider, "gitlab");
-        assert_eq!(repo_path, "oven-sh/bun");
-    }
-
-    #[test]
-    fn resolve_repo_rejects_unregistered_prefix() {
-        let registry = test_registry();
-        let err = resolve_repo("gitea.example.com:oven-sh/bun", "github", &registry).unwrap_err();
-        assert!(err.to_string().contains("unknown provider"));
-    }
-
-    #[test]
-    fn resolve_repo_preserves_non_github_path() {
-        let registry = test_registry();
-        let (provider, repo_path) = resolve_repo("group/sub/repo", "gitlab", &registry).unwrap();
-        assert_eq!(provider, "gitlab");
-        assert_eq!(repo_path, "group/sub/repo");
-    }
-
-    #[test]
-    fn resolve_repo_normalizes_github_enterprise_path() {
-        let mut registry = ripclone::provider::ProviderRegistry::new();
-        registry
-            .merge_one(ripclone::provider::ProviderConfig {
-                id: "company-github".to_string(),
-                kind: Some("github".to_string()),
-                host: Some("github.example.com".to_string()),
-                token: None,
-                auth_template: None,
-                auth_header_name: None,
-            })
+            .merge_one(provider("company-github", "github", "github.example.com"))
             .unwrap();
-        let (provider, repo_path) =
-            resolve_repo("group/sub/repo", "company-github", &registry).unwrap();
-        assert_eq!(provider, "company-github");
-        // A GitHub-kind instance normalizes to owner/name even with a custom id/host.
-        assert_eq!(repo_path, "group/sub/repo");
+        let pair = |p: &str, path: &str| Some((p.to_string(), path.to_string()));
+        // (argument, default provider, resolve_repo, resolve_control_repo)
+        for (arg, default, data, control) in [
+            (
+                "oven-sh/bun",
+                "github",
+                pair("github", "oven-sh/bun"),
+                pair("github", "oven-sh/bun"),
+            ),
+            (
+                "gitlab:oven-sh/bun",
+                "github",
+                pair("gitlab", "oven-sh/bun"),
+                pair("gitlab", "oven-sh/bun"),
+            ),
+            (
+                "group/sub/repo",
+                "gitlab",
+                pair("gitlab", "group/sub/repo"),
+                pair("gitlab", "group/sub/repo"),
+            ),
+            (
+                "group/sub/repo",
+                "company-github",
+                pair("company-github", "group/sub/repo"),
+                pair("company-github", "group/sub/repo"),
+            ),
+            (
+                "gitea.example.com:oven-sh/bun",
+                "github",
+                None,
+                pair("gitea.example.com", "oven-sh/bun"),
+            ),
+            (
+                "gitlab:group/sub/repo",
+                "github",
+                pair("gitlab", "group/sub/repo"),
+                pair("gitlab", "group/sub/repo"),
+            ),
+            (
+                ":oven-sh/bun",
+                "gitlab",
+                pair("gitlab", ":oven-sh/bun"),
+                pair("gitlab", ":oven-sh/bun"),
+            ),
+        ] {
+            assert_eq!(
+                resolve_repo(arg, default, &registry).ok(),
+                data,
+                "{arg} {default}"
+            );
+            assert_eq!(
+                Some(resolve_control_repo(arg, default)),
+                control,
+                "{arg} {default}"
+            );
+        }
     }
 
     #[test]
@@ -1387,98 +1349,5 @@ mod tests {
             "gitea.example.com:3000"
         );
         assert_eq!(clean_host("github.com"), "github.com");
-    }
-
-    #[test]
-    fn provider_instance_resolves_from_registry_and_returns_none_for_unknown() {
-        let registry = test_registry();
-        let inst = provider_instance("gitlab", &registry).expect("gitlab instance");
-        assert_eq!(inst.kind, ProviderKind::GitLab);
-        assert_eq!(inst.host, "gitlab.com");
-        assert!(provider_instance("unknown", &registry).is_none());
-    }
-
-    #[test]
-    fn clap_accepts_provider_subcommands() {
-        // `ripclone provider add localgit --kind gitea --host localhost:3000`
-        let args = Args::parse_from([
-            "ripclone",
-            "provider",
-            "add",
-            "localgit",
-            "--kind",
-            "gitea",
-            "--host",
-            "localhost:3000",
-        ]);
-        match args.command {
-            Commands::Provider {
-                action: ProviderAction::Add { id, kind, host, .. },
-            } => {
-                assert_eq!(id, "localgit");
-                assert_eq!(kind.as_deref(), Some("gitea"));
-                assert_eq!(host.as_deref(), Some("localhost:3000"));
-            }
-            _ => panic!("expected provider add subcommand"),
-        }
-    }
-
-    #[test]
-    fn resolve_upstream_token_prefers_explicit_override() {
-        let registry = ripclone::provider::ProviderRegistry::new();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let token = rt
-            .block_on(resolve_upstream_token(
-                "github",
-                Some("from-explicit"),
-                &registry,
-            ))
-            .unwrap();
-        assert_eq!(token, Some("from-explicit".to_string()));
-    }
-
-    #[test]
-    fn resolve_upstream_token_uses_configured_provider_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let old_config = std::env::var_os("RIPCLONE_CONFIG");
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            r#"[providers.github]
-kind = "github"
-token = "from-config"
-"#,
-        )
-        .unwrap();
-        unsafe { std::env::set_var("RIPCLONE_CONFIG", &config_path) };
-
-        let config = ripclone::config::load();
-        let registry = ripclone::provider_config::load_registry_with_config(&config).unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let token = rt
-            .block_on(resolve_upstream_token("github", None, &registry))
-            .unwrap();
-
-        unsafe { restore_env("RIPCLONE_CONFIG", old_config) };
-        assert_eq!(token, Some("from-config".to_string()));
-    }
-
-    unsafe fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
-        match value {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
-
-    #[test]
-    fn provider_add_prompts_only_on_a_tty_outside_agent_mode() {
-        assert!(should_prompt_for_token(true, false));
-        // Agent mode never prompts, however it was turned on — RIPCLONE_AGENT=1
-        // or `agent = true` in config both resolve to `agent == true` here.
-        assert!(!should_prompt_for_token(true, true));
-        // No TTY: never prompt, agent or not.
-        assert!(!should_prompt_for_token(false, false));
-        assert!(!should_prompt_for_token(false, true));
     }
 }

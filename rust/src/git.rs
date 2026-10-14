@@ -1005,9 +1005,9 @@ pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
 
 /// Build the upstream URL and the credential-injection git config args for a
 /// repo. The secret rides in `http.extraHeader`, never in the URL, so it stays
-/// out of argv, `.git/config`, and logs. The `RIPCLONE_ORIGIN_BASE` override is
-/// honored for the github default instance so offline e2e tests can use local
-/// `file://` origins.
+/// out of argv, `.git/config`, and logs. `origin_base` (the
+/// `RIPCLONE_ORIGIN_BASE` override, see [`origin_base`]) replaces the github
+/// default instance's host so offline e2e tests can use local `file://` origins.
 ///
 /// Whenever the credential header is attached, redirect following is turned off
 /// (`http.followRedirects=false`). git's default follows the smart-HTTP
@@ -1023,11 +1023,10 @@ fn upstream_url_and_auth(
     provider: &ProviderInstance,
     repo_id: &RepoId,
     credential: Option<&secrecy::SecretString>,
+    origin_base: Option<&str>,
 ) -> (String, Vec<String>) {
     let url = if repo_id.is_github_default()
-        && let Some(base) = std::env::var("RIPCLONE_ORIGIN_BASE")
-            .ok()
-            .filter(|b| !b.is_empty())
+        && let Some(base) = origin_base.filter(|b| !b.is_empty())
     {
         format!("{}/{}.git", base.trim_end_matches('/'), repo_id.path)
     } else {
@@ -1044,6 +1043,25 @@ fn upstream_url_and_auth(
         git_args.push("http.followRedirects=false".to_string());
     }
     (url, git_args)
+}
+
+/// `RIPCLONE_ORIGIN_BASE`: when set and non-empty, github default-instance
+/// repos are fetched from `<base>/<owner>/<repo>.git` instead of github.com.
+pub fn origin_base() -> Option<String> {
+    std::env::var("RIPCLONE_ORIGIN_BASE")
+        .ok()
+        .filter(|b| !b.is_empty())
+}
+
+/// `RIPCLONE_LS_REMOTE_TIMEOUT_SECS`, default 30 s; zero or unparsable means
+/// the default.
+fn ls_remote_timeout() -> Duration {
+    std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(30))
 }
 
 fn upstream_auth_header(
@@ -1205,13 +1223,14 @@ pub fn ls_remote_tip(
     ref_name: &str,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<Option<RemoteTip>> {
-    let timeout = std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(30));
-    ls_remote_tip_with_timeout(provider, repo_id, ref_name, credential, timeout)
+    ls_remote_tip_with(
+        provider,
+        repo_id,
+        ref_name,
+        credential,
+        origin_base().as_deref(),
+        ls_remote_timeout(),
+    )
 }
 
 /// Resolve a remote ref without detaching the Git process from the calling
@@ -1225,25 +1244,28 @@ pub async fn ls_remote_tip_async(
     ref_name: &str,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<Option<RemoteTip>> {
-    let timeout = std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(30));
-    ls_remote_tip_async_with_timeout(provider, repo_id, ref_name, credential, timeout).await
+    ls_remote_tip_async_with(
+        provider,
+        repo_id,
+        ref_name,
+        credential,
+        origin_base().as_deref(),
+        ls_remote_timeout(),
+    )
+    .await
 }
 
-/// Testable cancellation-owned form of [`ls_remote_tip_async`].
-pub async fn ls_remote_tip_async_with_timeout(
+/// [`ls_remote_tip_async`] with the origin base and timeout given.
+async fn ls_remote_tip_async_with(
     provider: &ProviderInstance,
     repo_id: &RepoId,
     ref_name: &str,
     credential: Option<&secrecy::SecretString>,
+    origin_base: Option<&str>,
     timeout: Duration,
 ) -> Result<Option<RemoteTip>> {
     let (url, git_args, auth_header, queries, requested_remote_ref) =
-        prepare_ls_remote(provider, repo_id, ref_name, credential)?;
+        prepare_ls_remote(provider, repo_id, ref_name, credential, origin_base)?;
     if url.is_empty() {
         return Ok(None);
     }
@@ -1369,6 +1391,7 @@ fn prepare_ls_remote(
     repo_id: &RepoId,
     ref_name: &str,
     credential: Option<&secrecy::SecretString>,
+    origin_base: Option<&str>,
 ) -> Result<(
     String,
     Vec<String>,
@@ -1385,7 +1408,7 @@ fn prepare_ls_remote(
             return Ok((String::new(), Vec::new(), None, Vec::new(), String::new()));
         }
     }
-    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential, origin_base);
     let auth_header = upstream_auth_header(provider, credential);
     let requested_remote_ref = if ref_name == "HEAD" {
         "HEAD".to_string()
@@ -1449,16 +1472,17 @@ fn parse_ls_remote_output(stdout: &[u8], requested_remote_ref: &str) -> Result<O
     }))
 }
 
-/// Testable form of [`ls_remote_tip`] with an explicit bound.
-pub fn ls_remote_tip_with_timeout(
+/// [`ls_remote_tip`] with the origin base and timeout given.
+fn ls_remote_tip_with(
     provider: &ProviderInstance,
     repo_id: &RepoId,
     ref_name: &str,
     credential: Option<&secrecy::SecretString>,
+    origin_base: Option<&str>,
     timeout: Duration,
 ) -> Result<Option<RemoteTip>> {
     let (url, git_args, auth_header, queries, requested_remote_ref) =
-        prepare_ls_remote(provider, repo_id, ref_name, credential)?;
+        prepare_ls_remote(provider, repo_id, ref_name, credential, origin_base)?;
     if url.is_empty() {
         return Ok(None);
     }
@@ -1656,6 +1680,27 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     rev: Option<&str>,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<()> {
+    sync_bare_mirror_from(
+        mirror_dir.as_ref(),
+        provider,
+        repo_id,
+        branch,
+        rev,
+        credential,
+        origin_base().as_deref(),
+    )
+}
+
+/// [`sync_bare_mirror`] with the origin base given.
+fn sync_bare_mirror_from(
+    mirror_dir: &Path,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    branch: &str,
+    rev: Option<&str>,
+    credential: Option<&secrecy::SecretString>,
+    origin_base: Option<&str>,
+) -> Result<()> {
     crate::validation::validate_repo_path(provider, repo_id)
         .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
     if branch != "HEAD" {
@@ -1671,15 +1716,23 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // worker plus the server) can otherwise run concurrent clones into the same
     // bare dir and collide on git's config lock. Held only across the mutation
     // below; released when this function returns.
-    let _mirror_lock = MirrorLock::acquire(mirror_dir.as_ref())?;
+    let _mirror_lock = MirrorLock::acquire(mirror_dir)?;
 
-    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential, origin_base);
     let auth_header = upstream_auth_header(provider, credential);
     // Exact jobs deliberately leave branch authority out of the mirror. When a
     // request needs symbolic HEAD, learn the upstream default at that request
     // boundary and refresh the local symbolic ref before resolving it.
     let default_branch = if branch == "HEAD" {
-        ls_remote_tip(provider, repo_id, "HEAD", credential)?.and_then(|tip| tip.default_branch)
+        ls_remote_tip_with(
+            provider,
+            repo_id,
+            "HEAD",
+            credential,
+            origin_base,
+            ls_remote_timeout(),
+        )?
+        .and_then(|tip| tip.default_branch)
     } else {
         None
     };
@@ -1696,27 +1749,19 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // tags. Ordinary admitted work uses `sync_bare_mirror_admitted` and retains
     // only the exact object; it never installs checkout-name state.
     if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev)) {
-        sync_bare_mirror_rev(
-            mirror_dir.as_ref(),
-            &url,
-            &git_args,
-            auth_header,
-            branch,
-            rev,
-            true,
-        )?;
-    } else if mirror_dir.as_ref().exists() {
+        sync_bare_mirror_rev(mirror_dir, &url, &git_args, auth_header, branch, rev, true)?;
+    } else if mirror_dir.exists() {
         // A `--mirror` clone is configured with `+refs/*:refs/*` (and prunes), so
         // a plain `git fetch origin` advances every branch + HEAD to the latest.
         // Do NOT fetch an explicit ref like `HEAD` here: that only updates
         // FETCH_HEAD and leaves the mirror's branch refs stale, so a re-sync after
         // a new push would silently keep serving the old commit.
         // Persist gc-off before fetching so this mutation cannot auto-gc.
-        disable_auto_gc(mirror_dir.as_ref())?;
+        disable_auto_gc(mirror_dir)?;
         let output = Command::new("git")
             .args(&git_args)
             .arg("-C")
-            .arg(mirror_dir.as_ref().as_os_str())
+            .arg(mirror_dir.as_os_str())
             .args(["fetch", "--prune", "origin"])
             .output()
             .context("git fetch")?;
@@ -1731,7 +1776,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     } else {
         // A fresh `--mirror` clone copies every ref (branches, tags, HEAD), so no
         // follow-up branch fetch is needed.
-        std::fs::create_dir_all(mirror_dir.as_ref().parent().unwrap_or(Path::new("")))?;
+        std::fs::create_dir_all(mirror_dir.parent().unwrap_or(Path::new("")))?;
         let output = Command::new("git")
             .args(&git_args)
             .args([
@@ -1746,7 +1791,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
                 "maintenance.auto=false",
                 "--mirror",
                 &url,
-                &mirror_dir.as_ref().to_string_lossy(),
+                &mirror_dir.to_string_lossy(),
             ])
             .output()
             .context("git clone mirror")?;
@@ -1760,10 +1805,10 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         }
         // Belt and suspenders: confirm the keys are persisted regardless of how a
         // given git version applied `clone --config`.
-        disable_auto_gc(mirror_dir.as_ref())?;
+        disable_auto_gc(mirror_dir)?;
     }
     if let Some(default_branch) = default_branch.as_deref() {
-        set_bare_default_branch(mirror_dir.as_ref(), default_branch)?;
+        set_bare_default_branch(mirror_dir, default_branch)?;
     }
     Ok(())
 }
@@ -1778,6 +1823,25 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
     commit: &str,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<()> {
+    sync_bare_mirror_admitted_from(
+        mirror_dir.as_ref(),
+        provider,
+        repo_id,
+        commit,
+        credential,
+        origin_base().as_deref(),
+    )
+}
+
+/// [`sync_bare_mirror_admitted`] with the origin base given.
+fn sync_bare_mirror_admitted_from(
+    mirror_dir: &Path,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    commit: &str,
+    credential: Option<&secrecy::SecretString>,
+    origin_base: Option<&str>,
+) -> Result<()> {
     crate::validation::validate_repo_path(provider, repo_id)
         .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
     crate::validation::validate_object_id(commit)
@@ -1786,11 +1850,11 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
         bail!("admitted commit must be a full object id: {commit}");
     }
 
-    let _mirror_lock = MirrorLock::acquire(mirror_dir.as_ref())?;
-    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    let _mirror_lock = MirrorLock::acquire(mirror_dir)?;
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential, origin_base);
     let auth_header = upstream_auth_header(provider, credential);
     sync_bare_mirror_rev(
-        mirror_dir.as_ref(),
+        mirror_dir,
         &url,
         &git_args,
         auth_header,
@@ -1928,11 +1992,6 @@ pub fn parent_commit<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Option<Str
     crate::gix_util::parent_commit(repo, commit)
 }
 
-/// Serializes tests that mutate the process-global `RIPCLONE_ORIGIN_BASE`, so
-/// parallel test threads don't clobber each other's origin redirection.
-#[cfg(test)]
-pub(crate) static ORIGIN_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2004,7 +2063,7 @@ mod tests {
         };
         let token = secrecy::SecretString::new("SECRETTOKEN".to_string().into());
 
-        let (_url, git_args) = upstream_url_and_auth(&provider, &repo_id, Some(&token));
+        let (_url, git_args) = upstream_url_and_auth(&provider, &repo_id, Some(&token), None);
         assert!(
             git_args.iter().any(|a| a == "http.followRedirects=false"),
             "authenticated git args must disable redirect following, got {git_args:?}"
@@ -2018,7 +2077,7 @@ mod tests {
 
         // No credential -> no header and no redirect override; public clones may
         // still legitimately follow redirects.
-        let (_url, no_auth) = upstream_url_and_auth(&provider, &repo_id, None);
+        let (_url, no_auth) = upstream_url_and_auth(&provider, &repo_id, None, None);
         assert!(
             no_auth.is_empty(),
             "unauthenticated args stay empty, got {no_auth:?}"
@@ -2068,7 +2127,7 @@ mod tests {
             path: "repo".to_string(),
         };
         let token = secrecy::SecretString::new("SECRETTOKEN".to_string().into());
-        let (url, git_args) = upstream_url_and_auth(&provider, &repo_id, Some(&token));
+        let (url, git_args) = upstream_url_and_auth(&provider, &repo_id, Some(&token), None);
 
         // Mirror the real ls-remote invocation shape.
         let status = Command::new("git")
@@ -2149,18 +2208,21 @@ mod tests {
         let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/widget");
 
-        // Redirect the github default origin to the local bare repo, serialized
-        // against other RIPCLONE_ORIGIN_BASE tests.
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
         let tip = |ref_name| {
-            ls_remote_tip(provider, &repo_id, ref_name, None).map(|tip| tip.map(|t| t.commit))
+            ls_remote_tip_with(
+                provider,
+                &repo_id,
+                ref_name,
+                None,
+                base.path().to_str(),
+                Duration::from_secs(30),
+            )
+            .map(|tip| tip.map(|t| t.commit))
         };
         let head = tip("HEAD");
         let missing = tip("no-such-branch");
         // A glob in the ref name must not turn the query into a pattern match.
         let globbed = tip("wid*");
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(
             head.unwrap().as_deref(),
@@ -2193,18 +2255,16 @@ mod tests {
             let _ = stream.read(&mut buf);
         });
 
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", format!("http://{addr}")) };
         let registry = crate::provider::ProviderRegistry::new();
         let provider = registry.get("github").unwrap();
-        let result = ls_remote_tip_with_timeout(
+        let result = ls_remote_tip_with(
             provider,
             &crate::provider::RepoId::github("acme/timeout"),
             "HEAD",
             None,
+            Some(&format!("http://{addr}")),
             Duration::from_secs(1),
         );
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         accepted_rx
             .recv_timeout(Duration::from_secs(5))
@@ -2276,10 +2336,16 @@ mod tests {
         let repo_id = RepoId::github("acme/widget");
         let mirror = base.path().join("mirror.git");
 
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", None, None).unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        sync_bare_mirror_from(
+            &mirror,
+            provider,
+            &repo_id,
+            "HEAD",
+            None,
+            None,
+            base.path().to_str(),
+        )
+        .unwrap();
 
         let out = Command::new("git")
             .arg("-C")
@@ -2318,10 +2384,16 @@ mod tests {
         let repo_id = RepoId::github("acme/widget");
         let mirror = base.path().join("mirror-rev.git");
 
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror(&mirror, provider, &repo_id, "main", Some(&commit), None).unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        sync_bare_mirror_from(
+            &mirror,
+            provider,
+            &repo_id,
+            "main",
+            Some(&commit),
+            None,
+            base.path().to_str(),
+        )
+        .unwrap();
 
         assert_eq!(resolve_commit(&mirror, &commit).unwrap(), commit);
         assert_eq!(resolve_commit(&mirror, "main").unwrap(), commit);
@@ -2355,10 +2427,16 @@ mod tests {
         let repo_id = RepoId::github("acme/head-rev");
         let mirror = base.path().join("mirror-head-rev.git");
 
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", Some(&commit), None).unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        sync_bare_mirror_from(
+            &mirror,
+            provider,
+            &repo_id,
+            "HEAD",
+            Some(&commit),
+            None,
+            base.path().to_str(),
+        )
+        .unwrap();
 
         assert_eq!(default_branch(&mirror).unwrap(), "main");
         assert_eq!(resolve_commit(&mirror, &commit).unwrap(), commit);
@@ -2397,12 +2475,16 @@ mod tests {
         let registry = ProviderRegistry::new();
         let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/named-tip");
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        let tip = ls_remote_tip(provider, &repo_id, "feature", None)
-            .unwrap()
-            .expect("feature advertised");
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        let tip = ls_remote_tip_with(
+            provider,
+            &repo_id,
+            "feature",
+            None,
+            base.path().to_str(),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .expect("feature advertised");
 
         assert_eq!(tip.commit, main);
         assert_eq!(tip.default_branch.as_deref(), Some("main"));
@@ -2422,10 +2504,15 @@ mod tests {
         let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/widget");
 
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, None).unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        sync_bare_mirror_admitted_from(
+            &mirror,
+            provider,
+            &repo_id,
+            &commit_b,
+            None,
+            base.path().to_str(),
+        )
+        .unwrap();
 
         assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
         assert!(
@@ -2438,9 +2525,16 @@ mod tests {
         );
         // A later symbolic sync updates the mirror. HEAD must use the
         // request-time upstream default branch rather than the bare-init default.
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", Some("HEAD~1"), None).unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        sync_bare_mirror_from(
+            &mirror,
+            provider,
+            &repo_id,
+            "HEAD",
+            Some("HEAD~1"),
+            None,
+            base.path().to_str(),
+        )
+        .unwrap();
         assert_eq!(resolve_commit(&mirror, "HEAD~1").unwrap(), commit_b);
         assert_eq!(resolve_commit(&mirror, "HEAD").unwrap(), commit_c);
     }
@@ -2476,10 +2570,15 @@ mod tests {
         let registry = ProviderRegistry::new();
         let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/deleted");
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, None).unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        sync_bare_mirror_admitted_from(
+            &mirror,
+            provider,
+            &repo_id,
+            &commit_b,
+            None,
+            base.path().to_str(),
+        )
+        .unwrap();
 
         assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
         assert!(resolve_commit(&mirror, "main").is_err());
@@ -2509,10 +2608,16 @@ mod tests {
         let repo_id = RepoId::github("acme/widget");
         let mirror = base.path().join("mirror-non-sha-rev.git");
 
-        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror(&mirror, provider, &repo_id, "main", Some("HEAD~0"), None).unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        sync_bare_mirror_from(
+            &mirror,
+            provider,
+            &repo_id,
+            "main",
+            Some("HEAD~0"),
+            None,
+            base.path().to_str(),
+        )
+        .unwrap();
 
         assert_eq!(resolve_commit(&mirror, "main").unwrap(), commit);
         assert_eq!(

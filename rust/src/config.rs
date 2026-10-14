@@ -86,12 +86,23 @@ pub struct ControlConfig {
 
 /// Path to the global config file (`~/.config/ripclone/config.toml`).
 pub fn global_config_path() -> Option<PathBuf> {
+    global_config_path_from(
+        std::env::var_os("RIPCLONE_CONFIG"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// [`global_config_path`] from the `RIPCLONE_CONFIG` and `HOME` values.
+fn global_config_path_from(
+    explicit: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
     // An explicit override wins, so a daemon/container can point at a fixed file
     // (e.g. /etc/ripclone/config.toml) instead of depending on $HOME.
-    if let Some(p) = std::env::var_os("RIPCLONE_CONFIG").filter(|v| !v.is_empty()) {
+    if let Some(p) = explicit.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(p));
     }
-    std::env::var_os("HOME").map(|home| {
+    home.map(|home| {
         let mut p = PathBuf::from(home);
         p.push(".config");
         p.push("ripclone");
@@ -125,11 +136,16 @@ pub fn project_config_path(start: &Path) -> Option<PathBuf> {
 /// then to off. This is intentionally an explicit opt-in, never inferred from
 /// repo size — a silent switch would surprise humans on giant repos.
 pub fn agent_mode(config_default: Option<bool>) -> bool {
-    match std::env::var("RIPCLONE_AGENT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    {
-        Some(v) => is_truthy(&v),
+    agent_mode_from(
+        std::env::var("RIPCLONE_AGENT").ok().as_deref(),
+        config_default,
+    )
+}
+
+/// [`agent_mode`] from the `RIPCLONE_AGENT` value.
+fn agent_mode_from(env: Option<&str>, config_default: Option<bool>) -> bool {
+    match env.filter(|v| !v.trim().is_empty()) {
+        Some(v) => is_truthy(v),
         None => config_default.unwrap_or(false),
     }
 }
@@ -250,9 +266,6 @@ fn merge(overrides: Config, base: Config) -> Config {
 mod tests {
     use super::*;
 
-    // Process environment mutations must not race under parallel tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn project_config_discovered_by_walking_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -297,157 +310,61 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_toml_provider_token() {
+    fn missing_file_is_default_and_malformed_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let mut providers = HashMap::new();
-        providers.insert(
-            "my-gitea".to_string(),
-            ProviderEntry {
-                kind: "gitea".into(),
-                host: Some("https://gitea.example.com".into()),
-                token: Some("provider-token".into()),
-                auth_template: None,
-                auth_header_name: None,
-            },
-        );
-        let cfg = Config {
-            server: Some("https://ripclone.example.com".into()),
-            default_provider: Some("my-gitea".into()),
-            agent: None,
-            clone: CloneConfig {
-                depth: Some(1),
-                mode: Some("editable".into()),
-            },
-            providers,
-            storage: StorageConfig {
-                backend: Some("s3".into()),
-                bucket: Some("my-bucket".into()),
-                ..Default::default()
-            },
-            control: ControlConfig {
-                path: Some("/var/lib/ripclone/control.db".into()),
-            },
-            removed_metadata: None,
-            removed_queue: None,
-        };
-        save_to(&path, &cfg).unwrap();
-
-        let loaded = load_from(&path);
-        assert_eq!(
-            loaded.server.as_deref(),
-            Some("https://ripclone.example.com")
-        );
-        assert_eq!(loaded.default_provider.as_deref(), Some("my-gitea"));
-        assert!(loaded.providers.contains_key("my-gitea"));
-        assert_eq!(
-            loaded
-                .providers
-                .get("my-gitea")
-                .and_then(|entry| entry.token.as_deref()),
-            Some("provider-token")
-        );
-        assert_eq!(
-            loaded.control.path.as_deref(),
-            Some("/var/lib/ripclone/control.db")
-        );
-        assert_eq!(loaded.storage.backend.as_deref(), Some("s3"));
-        assert_eq!(loaded.storage.bucket.as_deref(), Some("my-bucket"));
-    }
-
-    #[test]
-    fn existing_toml_parse_error_is_reported() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "server = [").unwrap();
-
-        let err = try_load_from(&path).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("parse config"));
-        assert!(msg.contains(path.to_str().unwrap()));
-    }
-
-    #[test]
-    fn missing_toml_loads_default_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-
         let cfg = try_load_from(&path).unwrap();
         assert!(cfg.server.is_none());
         assert!(cfg.default_provider.is_none());
-    }
 
-    #[test]
-    fn provider_configs_maps_entries() {
-        let mut providers = HashMap::new();
-        providers.insert(
-            "my-gitea".to_string(),
-            ProviderEntry {
-                kind: "gitea".into(),
-                host: Some("https://gitea.example.com".into()),
-                token: Some("secret".into()),
-                auth_template: Some("token {{token}}".into()),
-                auth_header_name: None,
-            },
-        );
-        let cfg = Config {
-            providers,
-            ..Config::default()
-        };
-
-        let configs = cfg.provider_configs();
-        assert_eq!(configs.len(), 1);
-        let p = &configs[0];
-        assert_eq!(p.id, "my-gitea");
-        assert_eq!(p.kind.as_deref(), Some("gitea"));
-        assert_eq!(p.host.as_deref(), Some("https://gitea.example.com"));
-        assert_eq!(p.auth_template.as_deref(), Some("token {{token}}"));
-        assert_eq!(p.token.as_deref(), Some("secret"));
+        std::fs::write(&path, "server = [").unwrap();
+        assert!(try_load_from(&path).is_err());
     }
 
     #[test]
     fn agent_mode_env_wins_over_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let old = std::env::var_os("RIPCLONE_AGENT");
-
-        // Truthy env turns it on regardless of config.
-        unsafe { std::env::set_var("RIPCLONE_AGENT", "1") };
-        assert!(agent_mode(None));
-        assert!(agent_mode(Some(false)));
-
-        // Explicit falsey env turns it off even when config default is on.
-        unsafe { std::env::set_var("RIPCLONE_AGENT", "0") };
-        assert!(!agent_mode(Some(true)));
-
-        // Empty/unset env falls back to the config default.
-        unsafe { std::env::set_var("RIPCLONE_AGENT", "") };
-        assert!(agent_mode(Some(true)));
-        assert!(!agent_mode(Some(false)));
-        assert!(!agent_mode(None));
-
-        unsafe { std::env::remove_var("RIPCLONE_AGENT") };
-        assert!(agent_mode(Some(true)));
-        assert!(!agent_mode(None));
-
-        match old {
-            Some(v) => unsafe { std::env::set_var("RIPCLONE_AGENT", v) },
-            None => unsafe { std::env::remove_var("RIPCLONE_AGENT") },
+        // (RIPCLONE_AGENT, config default, active)
+        for (env, config, want) in [
+            (Some("1"), None, true),
+            (Some("1"), Some(false), true),
+            (Some("TRUE"), Some(false), true),
+            (Some("0"), Some(true), false),
+            (Some("off"), Some(true), false),
+            (Some(""), Some(true), true),
+            (Some("  "), Some(false), false),
+            (Some(""), None, false),
+            (None, Some(true), true),
+            (None, None, false),
+        ] {
+            assert_eq!(agent_mode_from(env, config), want, "{env:?} {config:?}");
         }
     }
 
     #[test]
-    fn ripclone_config_env_overrides_home_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let old = std::env::var_os("RIPCLONE_CONFIG");
-        unsafe { std::env::set_var("RIPCLONE_CONFIG", "/etc/ripclone/config.toml") };
-        assert_eq!(
-            global_config_path(),
-            Some(PathBuf::from("/etc/ripclone/config.toml")),
-            "RIPCLONE_CONFIG must override the $HOME-based path"
-        );
-        match old {
-            Some(v) => unsafe { std::env::set_var("RIPCLONE_CONFIG", v) },
-            None => unsafe { std::env::remove_var("RIPCLONE_CONFIG") },
+    fn global_config_path_prefers_ripclone_config_over_home() {
+        let os = |v: &str| Some(std::ffi::OsString::from(v));
+        for (explicit, home, want) in [
+            (
+                os("/etc/ripclone/config.toml"),
+                os("/home/u"),
+                Some("/etc/ripclone/config.toml"),
+            ),
+            (
+                os(""),
+                os("/home/u"),
+                Some("/home/u/.config/ripclone/config.toml"),
+            ),
+            (
+                None,
+                os("/home/u"),
+                Some("/home/u/.config/ripclone/config.toml"),
+            ),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                global_config_path_from(explicit, home),
+                want.map(PathBuf::from)
+            );
         }
     }
 }

@@ -160,20 +160,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_git_rev_rejects_injection_attempts() {
-        assert!(validate_git_rev("--output=/tmp/x").is_err());
-        assert!(validate_git_rev("--all").is_err());
-        assert!(validate_git_rev("HEAD..main").is_err());
-        assert!(validate_git_rev("../secret").is_err());
-        assert!(validate_git_rev("-").is_err());
-    }
-
-    #[test]
-    fn validate_git_rev_accepts_normal_refs() {
-        assert!(validate_git_rev("HEAD").is_ok());
-        assert!(validate_git_rev("main").is_ok());
-        assert!(validate_git_rev("feature/foo-bar").is_ok());
-        assert!(validate_git_rev("abc123").is_ok());
+    fn validate_git_rev_accepts_refs_and_rejects_options_and_ranges() {
+        for (rev, ok) in [
+            ("HEAD", true),
+            ("main", true),
+            ("feature/foo-bar", true),
+            ("abc123", true),
+            ("--output=/tmp/x", false),
+            ("--all", false),
+            ("HEAD..main", false),
+            ("../secret", false),
+            ("-", false),
+        ] {
+            assert_eq!(validate_git_rev(rev).is_ok(), ok, "{rev}");
+        }
     }
 
     #[test]

@@ -154,43 +154,9 @@ pub(super) async fn acquire_pack_parse_fd_permit() -> PackParseFdPermit {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{
-        EDITABLE_PACK_MEMORY_BUDGET_BYTES, ProcessEditablePackMemoryBudget, ProcessPackFdBudget,
-    };
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use super::{EDITABLE_PACK_MEMORY_BUDGET_BYTES, ProcessEditablePackMemoryBudget};
+    use std::sync::Arc;
     use std::time::Duration;
-
-    #[tokio::test]
-    async fn process_fd_budget_is_shared_across_concurrent_callers() {
-        let budget = Arc::new(ProcessPackFdBudget::new(2));
-        let start = Arc::new(tokio::sync::Barrier::new(9));
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let mut tasks = Vec::new();
-        for _ in 0..8 {
-            let budget = Arc::clone(&budget);
-            let start = Arc::clone(&start);
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            tasks.push(tokio::spawn(async move {
-                start.wait().await;
-                let _permit = budget.acquire().await;
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(15)).await;
-                active.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-        start.wait().await;
-        for task in tasks {
-            task.await.expect("budget caller");
-        }
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert_eq!(active.load(Ordering::SeqCst), 0);
-    }
 
     #[tokio::test]
     async fn editable_pack_memory_budget_is_byte_weighted_and_process_shared() {

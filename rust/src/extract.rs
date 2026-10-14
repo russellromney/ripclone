@@ -1231,32 +1231,44 @@ mod tests {
         );
     }
 
-    /// Negative: content that does not match the recorded blob_sha1 must fail.
+    /// Content that decodes cleanly but does not match the recorded blob_sha1
+    /// fails on the hash check. The same manifest with the right sha1 extracts,
+    /// so the failure is the hash and nothing else.
     #[test]
     fn rejects_blob_sha1_mismatch() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("out");
-        std::fs::create_dir(&target).unwrap();
+        let content = b"yyy";
+        let compressed = zstd::encode_all(&content[..], 1).unwrap();
+        let manifest = |blob_sha1: [u8; 20]| {
+            let mut manifest = empty_manifest();
+            manifest.files.push(FileEntry {
+                path: b"x.txt".to_vec(),
+                mode: 0o100644,
+                blob_sha1: blob_sha1.to_vec(),
+                fragments: vec![Fragment {
+                    frame_index: 0,
+                    frame_offset: 0,
+                    raw_len: content.len() as u32,
+                }],
+            });
+            manifest.frames.push(FrameInfo {
+                chunk_index: 0,
+                chunk_offset: 0,
+                compressed_len: compressed.len() as u32,
+                raw_len: content.len() as u32,
+            });
+            manifest
+        };
+        let extract = |blob_sha1| {
+            let tmp = TempDir::new().unwrap();
+            let target = tmp.path().join("out");
+            std::fs::create_dir(&target).unwrap();
+            extract_manifest(&manifest(blob_sha1), &target, vec![compressed.clone()])
+                .map(|_| std::fs::read(target.join("x.txt")).unwrap())
+        };
 
-        let mut manifest = empty_manifest();
-        manifest.files.push(FileEntry {
-            path: b"x.txt".to_vec(),
-            mode: 0o100644,
-            blob_sha1: sha1_bytes(b"not-the-frame-content").to_vec(),
-            fragments: vec![Fragment {
-                frame_index: 0,
-                frame_offset: 0,
-                raw_len: 3,
-            }],
-        });
-        manifest.frames.push(FrameInfo {
-            chunk_index: 0,
-            chunk_offset: 0,
-            compressed_len: 3,
-            raw_len: 3,
-        });
-
-        assert!(extract_manifest(&manifest, &target, vec![vec![b'y'; 3]]).is_err());
+        assert_eq!(extract(sha1_bytes(content)).unwrap(), content);
+        let err = extract(sha1_bytes(b"zzz")).unwrap_err();
+        assert!(format!("{err:#}").contains("sha1 mismatch"), "{err:#}");
     }
 
     #[test]

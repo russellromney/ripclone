@@ -2140,74 +2140,60 @@ mod tests {
             .map(|_| ())
     }
 
-    #[test]
-    fn posix_writer_writes_regular_file_modes_and_content() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let writer = WorktreeWriter::posix();
-        let entry = FileEntry {
-            path: b"bin/tool".to_vec(),
-            mode: 0o100755,
-            blob_sha1: Vec::new(),
-            fragments: Vec::new(),
-        };
+    /// The POSIX writer, and the io_uring writer where the kernel provides one.
+    fn backends() -> Vec<(&'static str, WorktreeWriter)> {
+        #[allow(unused_mut)]
+        let mut backends = vec![("posix", WorktreeWriter::posix())];
+        #[cfg(target_os = "linux")]
+        match WorktreeWriter::io_uring() {
+            Ok(writer) => backends.push(("io_uring", writer)),
+            Err(e) => eprintln!("io_uring unavailable, testing posix only: {e:#}"),
+        }
+        backends
+    }
 
-        write_one(&writer, dir.path(), entry, b"#!/bin/sh\n").unwrap();
-
-        let path = dir.path().join("bin/tool");
-        assert_eq!(std::fs::read(&path).unwrap(), b"#!/bin/sh\n");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o755
-            );
+    fn regular_write(path: &str, mode: u32, content: &[u8]) -> OwnedFileWrite {
+        OwnedFileWrite {
+            entry: FileEntry {
+                path: path.as_bytes().to_vec(),
+                mode,
+                blob_sha1: Vec::new(),
+                fragments: Vec::new(),
+            },
+            content: content.to_vec().into(),
         }
     }
 
     #[test]
-    fn fsync_paths_durable_flushes_files_and_dirs() {
-        // The opt-in durability barrier must run cleanly over a real set of
-        // files and directories. On non-Linux this exercises the POSIX fallback;
-        // on Linux it drives the io_uring `IORING_OP_FSYNC` batch (falling back to
-        // POSIX only if the kernel lacks io_uring).
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("a/b")).unwrap();
-        let mut files = Vec::new();
-        let mut dirs = vec![root.to_path_buf(), root.join("a"), root.join("a/b")];
-        for i in 0..8 {
-            let p = root.join(format!("a/b/f{i}.txt"));
-            std::fs::write(&p, format!("content {i}")).unwrap();
-            files.push(p);
-        }
-        fsync_paths_durable(&files, &dirs).expect("durable fsync");
+    fn writer_writes_regular_file_modes_and_content() {
+        for (backend, writer) in backends() {
+            let dir = tempfile::TempDir::new().unwrap();
+            // At least IO_URING_MIN_BATCH_FILES so the io_uring batch path is taken.
+            let files = [
+                ("bin/tool", 0o100755, &b"#!/bin/sh\n"[..]),
+                ("docs/readme.txt", 0o100644, b"hello\n"),
+            ];
+            let writes = files
+                .iter()
+                .map(|(path, mode, content)| regular_write(path, *mode, content))
+                .collect();
+            writer
+                .write_owned_entries_with_options(dir.path(), writes, WriteOptions::default())
+                .unwrap();
 
-        // Empty input is a no-op.
-        fsync_paths_durable(&[], &[]).expect("empty fsync is a no-op");
-        dirs.clear();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn io_uring_fsync_batch_flushes_many_files() {
-        // Directly exercise the batched io_uring fsync helper so a Linux CI run
-        // covers the `IORING_OP_FSYNC` submit/complete loop, including a batch
-        // large enough to span multiple submissions.
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        let mut files = Vec::new();
-        for i in 0..64 {
-            let p = root.join(format!("f{i}.bin"));
-            std::fs::write(&p, format!("data-{i}")).unwrap();
-            files.push(p);
-        }
-        let dirs = vec![root.to_path_buf()];
-        // If the kernel lacks io_uring this returns Err and the POSIX fallback
-        // covers durability; only assert success when a ring is available.
-        match linux_uring::fsync_paths_batched(&files, &dirs) {
-            Ok(()) => {}
-            Err(e) => eprintln!("io_uring fsync unavailable in test env: {e:#}"),
+            for (path, mode, content) in files {
+                let path = dir.path().join(path);
+                assert_eq!(std::fs::read(&path).unwrap(), content, "{backend}");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        mode & 0o777,
+                        "{backend}"
+                    );
+                }
+            }
         }
     }
 
@@ -2282,84 +2268,35 @@ mod tests {
 
     #[test]
     fn deferred_fresh_indexed_writer_flushes_all_batches() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let writer = WorktreeWriter::posix();
-        let mut total = 0usize;
-
-        for batch in 0..3 {
-            let writes = (0..4)
-                .map(|i| {
-                    let rel = format!("file-{batch}-{i}.txt");
-                    let content = format!("batch={batch} file={i}\n").into_bytes();
-                    OwnedFileWrite {
-                        entry: FileEntry {
-                            path: rel.as_bytes().to_vec(),
-                            mode: 0o100644,
-                            blob_sha1: Vec::new(),
-                            fragments: Vec::new(),
-                        },
-                        content: content.into(),
-                    }
-                })
-                .collect();
-            let outcome = writer
-                .write_owned_entries_for_fresh_indexed_checkout_deferred(dir.path(), writes)
-                .unwrap();
-            total += outcome.written;
-        }
-        total += writer.flush_deferred_writes().unwrap().written;
-
-        assert_eq!(total, 12);
-        for batch in 0..3 {
-            for i in 0..4 {
-                let rel = format!("file-{batch}-{i}.txt");
-                let content = format!("batch={batch} file={i}\n");
-                assert_eq!(
-                    std::fs::read(dir.path().join(rel)).unwrap(),
-                    content.as_bytes()
-                );
+        for (backend, writer) in backends() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let content = |batch, i| format!("batch={batch} file={i}\n");
+            let mut total = 0usize;
+            for batch in 0..4 {
+                let writes = (0..8)
+                    .map(|i| {
+                        let path = format!("deferred-{batch}-{i}.txt");
+                        regular_write(&path, 0o100644, content(batch, i).as_bytes())
+                    })
+                    .collect();
+                let outcome = writer
+                    .write_owned_entries_for_fresh_indexed_checkout_deferred(dir.path(), writes)
+                    .unwrap();
+                total += outcome.written;
             }
-        }
-    }
+            total += writer.flush_deferred_writes().unwrap().written;
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn io_uring_writer_writes_regular_file_when_available() {
-        let writer = match WorktreeWriter::io_uring() {
-            Ok(writer) => writer,
-            Err(e) => {
-                eprintln!("skipping io_uring test: {e:#}");
-                return;
+            assert_eq!(total, 32, "{backend}");
+            for batch in 0..4 {
+                for i in 0..8 {
+                    let path = dir.path().join(format!("deferred-{batch}-{i}.txt"));
+                    assert_eq!(
+                        std::fs::read(path).unwrap(),
+                        content(batch, i).as_bytes(),
+                        "{backend}"
+                    );
+                }
             }
-        };
-        let dir = tempfile::TempDir::new().unwrap();
-        // At least IO_URING_MIN_BATCH_FILES so the io_uring batch path is taken.
-        let writes = ["docs/readme.txt", "docs/other.txt"]
-            .into_iter()
-            .map(|path| OwnedFileWrite {
-                entry: FileEntry {
-                    path: path.as_bytes().to_vec(),
-                    mode: 0o100644,
-                    blob_sha1: Vec::new(),
-                    fragments: Vec::new(),
-                },
-                content: b"hello from io_uring\n".to_vec().into(),
-            })
-            .collect();
-
-        writer
-            .write_owned_entries_with_options(dir.path(), writes, WriteOptions::default())
-            .unwrap();
-
-        let path = dir.path().join("docs/readme.txt");
-        assert_eq!(std::fs::read(&path).unwrap(), b"hello from io_uring\n");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o644
-            );
         }
     }
 
@@ -2401,55 +2338,6 @@ mod tests {
             for i in 0..32 {
                 let rel = format!("shard-{worker}/file-{i}.txt");
                 let content = format!("worker={worker} file={i}\n");
-                assert_eq!(
-                    std::fs::read(dir.path().join(rel)).unwrap(),
-                    content.as_bytes()
-                );
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn io_uring_deferred_writer_flushes_all_batches_when_available() {
-        let writer = match WorktreeWriter::io_uring() {
-            Ok(writer) => writer,
-            Err(e) => {
-                eprintln!("skipping io_uring deferred test: {e:#}");
-                return;
-            }
-        };
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut total = 0usize;
-
-        for batch in 0..4 {
-            let writes = (0..8)
-                .map(|i| {
-                    let rel = format!("deferred-{batch}-{i}.txt");
-                    let content = format!("batch={batch} file={i}\n").into_bytes();
-                    OwnedFileWrite {
-                        entry: FileEntry {
-                            path: rel.as_bytes().to_vec(),
-                            mode: 0o100644,
-                            blob_sha1: Vec::new(),
-                            fragments: Vec::new(),
-                        },
-                        content: content.into(),
-                    }
-                })
-                .collect();
-            let outcome = writer
-                .write_owned_entries_for_fresh_indexed_checkout_deferred(dir.path(), writes)
-                .unwrap();
-            total += outcome.written;
-        }
-        total += writer.flush_deferred_writes().unwrap().written;
-
-        assert_eq!(total, 32);
-        for batch in 0..4 {
-            for i in 0..8 {
-                let rel = format!("deferred-{batch}-{i}.txt");
-                let content = format!("batch={batch} file={i}\n");
                 assert_eq!(
                     std::fs::read(dir.path().join(rel)).unwrap(),
                     content.as_bytes()

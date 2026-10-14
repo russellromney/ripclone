@@ -89,12 +89,6 @@ fn s3_h2_artifacts_live_in_bucket_and_survive_restart() {
 
     let objects = s3.objects();
     assert!(!objects.is_empty(), "the build put nothing in the bucket");
-    for key in &objects {
-        assert!(
-            key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
-            "unexpected object {key}"
-        );
-    }
 
     server.kill();
     let cache = world.path("server").join("cache");

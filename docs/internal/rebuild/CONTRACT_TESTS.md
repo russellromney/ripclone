@@ -165,7 +165,8 @@ step 2, after the contract suite is green.
 ## CI shape
 
 - `test`: unit tests plus the contract suite, parallel. Target under 5 minutes
-  after compile.
+  after compile. The one S3 unit test (multipart upload) runs here against
+  `scripts/s3_emulator.sh`, reusing the unit-test binary.
 - `s3`: F7 and H2 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
 - `gitea`: the live Gitea provider job, unchanged.
 - `lint`, `musl`, `docker`, `cargo-deny`: unchanged.
@@ -219,14 +220,21 @@ well under 15 s. CI now runs unit tests and the contract suite once each;
 `ci-build` no longer builds an unused unit-test binary, and the Turso worker
 job is gone.
 
+The sixth PR cleaned up the unit tests: it deleted tests of dependencies,
+restated implementations, and contract duplicates, folded copy-paste groups
+into tables, and replaced every process-env mutation in unit tests with
+config passed as parameters. A6 now checks exit codes and the API `code` (the
+upstream-ref 404 gained `ref_not_found`). F1 sets `RIPCLONE_CACHE_DIR` and
+checks that the corrupt artifact is not cached. G4 rewinds to a commit the
+server never built. G5 checks the server logged a compaction.
+
 ## Open points
 
 - C1, C2, D4 and E1 depend on `background_slots`, which arrives in step 3. Until
   then, the "now" tests run against today's main.
 - Every "now" row has a contract test except H4, which waits on #181.
 - Behavior the deleted suites checked that no row covers yet, to add with the
-  matching step: F1's "no cache object" clause (the harness never sets
-  `RIPCLONE_CACHE_DIR`); the artifact-by-hash route needs the token (I1);
+  matching step: the artifact-by-hash route needs the token (I1);
   retention keeps durable artifacts (H1); A6 cases (not-added sync, origin
   deleted after add, upstream hang); I7 in Files mode; a persistent 503 (F4);
   incremental Files rebuild, depth-1 re-add of an identical blob, empty tree,

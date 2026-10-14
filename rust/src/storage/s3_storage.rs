@@ -616,24 +616,35 @@ impl StorageBackend for S3Storage {
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+    u32_or(std::env::var(key).ok(), default)
 }
 
 fn env_duration_secs(key: &str, default_secs: u64) -> Duration {
-    let secs = std::env::var(key)
-        .ok()
+    secs_or(std::env::var(key).ok(), default_secs)
+}
+
+fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
+    ms_or(std::env::var(key).ok(), default_ms)
+}
+
+/// `value` parsed, or `default` when unset or unparsable.
+fn u32_or(value: Option<String>, default: u32) -> u32 {
+    value.and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+/// Seconds from `value` (else `default_secs`), at least 1: the S3 client
+/// rejects a zero timeout as invalid config.
+fn secs_or(value: Option<String>, default_secs: u64) -> Duration {
+    let secs = value
         .and_then(|s| s.parse().ok())
         .unwrap_or(default_secs)
         .max(1);
     Duration::from_secs(secs)
 }
 
-fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
-    let ms = std::env::var(key)
-        .ok()
+/// Milliseconds from `value` (else `default_ms`), at least 1.
+fn ms_or(value: Option<String>, default_ms: u64) -> Duration {
+    let ms = value
         .and_then(|s| s.parse().ok())
         .unwrap_or(default_ms)
         .max(1);
@@ -644,8 +655,8 @@ fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
 mod tests {
     use super::{
         MULTIPART_UPLOAD_MAX_OBJECT_BYTES, MULTIPART_UPLOAD_MAX_PART_BYTES,
-        MULTIPART_UPLOAD_PART_BYTES, S3Storage, env_duration_ms, env_duration_secs, env_u32,
-        multipart_upload_concurrency_for_cores, multipart_upload_part_bytes,
+        MULTIPART_UPLOAD_PART_BYTES, S3Storage, ms_or, multipart_upload_concurrency_for_cores,
+        multipart_upload_part_bytes, secs_or, u32_or,
     };
     use crate::storage::StorageBackend;
     use std::io::Write;
@@ -673,12 +684,15 @@ mod tests {
         assert!(multipart_upload_part_bytes(MULTIPART_UPLOAD_MAX_OBJECT_BYTES + 1).is_err());
     }
 
+    /// Needs an S3 endpoint in `RIPCLONE_S3_*` (see `scripts/s3_emulator.sh`);
+    /// the CI `test` job runs it.
     #[tokio::test]
+    #[ignore = "needs an S3 endpoint; run by CI with scripts/s3_emulator.sh"]
     async fn multipart_file_upload_roundtrips_exact_bytes() {
-        if std::env::var_os("RIPCLONE_S3_ENDPOINT").is_none() {
-            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT is required");
-            return;
-        }
+        assert!(
+            std::env::var_os("RIPCLONE_S3_ENDPOINT").is_some(),
+            "RIPCLONE_S3_ENDPOINT is required"
+        );
         let storage = S3Storage::from_env_or_config(&crate::config::StorageConfig::default())
             .expect("construct S3 storage")
             .expect("RIPCLONE_S3_ENDPOINT must enable S3 storage");
@@ -702,39 +716,16 @@ mod tests {
     }
 
     #[test]
-    fn timeout_env_helpers_default_and_clamp_zero() {
-        // Defaults when unset.
-        assert_eq!(env_u32("RIPCLONE_S3_TEST_UNSET_U32", 5), 5);
-        assert_eq!(
-            env_duration_secs("RIPCLONE_S3_TEST_UNSET_SECS", 30),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            env_duration_ms("RIPCLONE_S3_TEST_UNSET_MS", 2_000),
-            Duration::from_millis(2_000)
-        );
-
-        // Zero / invalid values clamp to 1 so the s3 client never sees a
-        // zero timeout (it rejects that as invalid config).
-        // SAFETY: single-threaded test; we restore after.
-        unsafe {
-            std::env::set_var("RIPCLONE_S3_TEST_ZERO_SECS", "0");
-            std::env::set_var("RIPCLONE_S3_TEST_ZERO_MS", "0");
-            std::env::set_var("RIPCLONE_S3_TEST_BAD_U32", "not-a-number");
+    fn timeout_settings_default_and_clamp_zero() {
+        let v = |s: &str| Some(s.to_string());
+        for (value, want) in [(None, 5), (v("7"), 7), (v("not-a-number"), 5)] {
+            assert_eq!(u32_or(value, 5), want);
         }
-        assert_eq!(
-            env_duration_secs("RIPCLONE_S3_TEST_ZERO_SECS", 30),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            env_duration_ms("RIPCLONE_S3_TEST_ZERO_MS", 2_000),
-            Duration::from_millis(1)
-        );
-        assert_eq!(env_u32("RIPCLONE_S3_TEST_BAD_U32", 5), 5);
-        unsafe {
-            std::env::remove_var("RIPCLONE_S3_TEST_ZERO_SECS");
-            std::env::remove_var("RIPCLONE_S3_TEST_ZERO_MS");
-            std::env::remove_var("RIPCLONE_S3_TEST_BAD_U32");
+        for (value, want) in [(None, 30), (v("0"), 1), (v("12"), 12), (v("-1"), 30)] {
+            assert_eq!(secs_or(value, 30), Duration::from_secs(want));
+        }
+        for (value, want) in [(None, 2_000), (v("0"), 1), (v("250"), 250)] {
+            assert_eq!(ms_or(value, 2_000), Duration::from_millis(want));
         }
     }
 }

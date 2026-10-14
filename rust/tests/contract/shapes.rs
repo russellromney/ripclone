@@ -100,12 +100,14 @@ fn g3_files_clone_matches_tree() {
 }
 
 /// G4: after a push, a rewind force-push, and a non-ancestor force-push, each
-/// new full clone equals the new tip.
+/// new full clone equals the new tip. The rewind target is an ancestor the
+/// server never built as a tip.
 #[test]
 fn g4_force_pushes_clone_the_new_tip() {
     let world = World::new();
     let origin = world.origin("acme", "g4");
     let a = origin.commit(&[("f.txt", "a\n")], "A");
+    origin.commit(&[("f.txt", "a2\n")], "A2");
     origin.publish();
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g4", "--wait"]).ok();
@@ -181,4 +183,10 @@ fn g5_many_pushes_keep_full_clone_complete() {
     );
     git(&target, &["fsck", "--full"]);
     assert_eq!(listing(&target), origin.tree(&tip));
+
+    let log = server.log();
+    assert!(
+        log.lines().any(|l| l.contains("LSM: compacted")),
+        "no compaction ran:\n{log}"
+    );
 }

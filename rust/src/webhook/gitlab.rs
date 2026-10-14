@@ -98,15 +98,15 @@ mod tests {
     }"#;
 
     #[test]
-    fn verify_matches_the_shared_token_constant_time() {
-        let h = headers("Push Hook", Some("s3cr3t"));
-        assert!(GitLab.verify(&h, PUSH, "s3cr3t"));
-        assert!(!GitLab.verify(&h, PUSH, "other"), "wrong token rejected");
-    }
-
-    #[test]
-    fn verify_rejects_missing_token() {
-        assert!(!GitLab.verify(&headers("Push Hook", None), PUSH, "s3cr3t"));
+    fn verify_requires_the_shared_token() {
+        for (token, ok) in [
+            (Some("s3cr3t"), true),
+            (Some("other"), false),
+            (None, false),
+        ] {
+            let h = headers("Push Hook", token);
+            assert_eq!(GitLab.verify(&h, PUSH, "s3cr3t"), ok, "{token:?}");
+        }
     }
 
     #[test]

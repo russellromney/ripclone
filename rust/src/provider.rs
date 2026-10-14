@@ -545,24 +545,68 @@ mod tests {
         }
     }
 
+    /// Storage keys and mirror dirs escape the path and carry the provider;
+    /// the natural key is unescaped, and bare for the github default.
     #[test]
-    fn github_default_storage_key_is_provider_prefixed() {
-        let repo = RepoId::github("ripclone/test");
-        assert_eq!(repo.storage_key(), "github/ripclone%2Ftest");
-        assert_eq!(repo.mirror_dir_name(), "github_ripclone%2Ftest.git");
-    }
-
-    #[test]
-    fn natural_key_is_unescaped_and_provider_prefixed() {
-        // github default: bare owner/repo.
-        assert_eq!(RepoId::github("acme/widget").natural_key(), "acme/widget");
-        // non-github: provider-prefixed, NOT slash-escaped (unlike storage_key).
-        let gl = RepoId {
-            provider: ProviderInstanceId::new("gitlab"),
-            path: "group/sub/proj".to_string(),
+    fn repo_id_keys() {
+        let id = |provider: &str, path: &str| RepoId {
+            provider: ProviderInstanceId::new(provider),
+            path: path.to_string(),
         };
-        assert_eq!(gl.natural_key(), "gitlab/group/sub/proj");
-        assert_eq!(gl.storage_key(), "gitlab/group%2Fsub%2Fproj");
+        // (repo, storage key, mirror dir, natural key)
+        let rows = [
+            (
+                RepoId::github("ripclone/test"),
+                "github/ripclone%2Ftest",
+                "github_ripclone%2Ftest.git",
+                "ripclone/test",
+            ),
+            (
+                id("gitlab", "g/sub/proj"),
+                "gitlab/g%2Fsub%2Fproj",
+                "gitlab_g%2Fsub%2Fproj.git",
+                "gitlab/g/sub/proj",
+            ),
+            (
+                id("sourcehut", "~user/repo"),
+                "sourcehut/~user%2Frepo",
+                "sourcehut_~user%2Frepo.git",
+                "sourcehut/~user/repo",
+            ),
+            (
+                id("launchpad", "~owner/project/+git/repo"),
+                "launchpad/~owner%2Fproject%2F+git%2Frepo",
+                "launchpad_~owner%2Fproject%2F+git%2Frepo.git",
+                "launchpad/~owner/project/+git/repo",
+            ),
+            (
+                id("gitea", "a/b"),
+                "gitea/a%2Fb",
+                "gitea_a%2Fb.git",
+                "gitea/a/b",
+            ),
+            (
+                id("gitea", "a%2Fb"),
+                "gitea/a%252Fb",
+                "gitea_a%252Fb.git",
+                "gitea/a%2Fb",
+            ),
+            (
+                id("gitea", "a\\b"),
+                "gitea/a%5Cb",
+                "gitea_a%5Cb.git",
+                "gitea/a\\b",
+            ),
+        ];
+        for (repo, storage, mirror, natural) in &rows {
+            assert_eq!(repo.storage_key(), *storage);
+            assert_eq!(repo.mirror_dir_name(), *mirror);
+            assert_eq!(repo.natural_key(), *natural);
+        }
+        let mut keys: Vec<String> = rows.iter().map(|r| r.0.storage_key()).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), rows.len(), "two repos share a storage key");
     }
 
     #[test]
@@ -572,21 +616,14 @@ mod tests {
             provider: ProviderInstanceId::new("gitlab"),
             path: "group/sub/proj".to_string(),
         };
-
-        assert_eq!(github.cli_name("github"), "acme/widget");
-        assert_eq!(gitlab.cli_name("github"), "gitlab:group/sub/proj");
-        assert_eq!(gitlab.cli_name("gitlab"), "group/sub/proj");
-        assert_eq!(gitlab.natural_key(), "gitlab/group/sub/proj");
-    }
-
-    #[test]
-    fn gitlab_subgroup_path_is_escaped_and_prefixed() {
-        let repo = RepoId {
-            provider: ProviderInstanceId::new("gitlab"),
-            path: "g/sub/proj".to_string(),
-        };
-        assert_eq!(repo.storage_key(), "gitlab/g%2Fsub%2Fproj");
-        assert_eq!(repo.mirror_dir_name(), "gitlab_g%2Fsub%2Fproj.git");
+        for (repo, default, want) in [
+            (&github, "github", "acme/widget"),
+            (&github, "gitlab", "github:acme/widget"),
+            (&gitlab, "github", "gitlab:group/sub/proj"),
+            (&gitlab, "gitlab", "group/sub/proj"),
+        ] {
+            assert_eq!(repo.cli_name(default), want);
+        }
     }
 
     fn gitlab_cfg(token: Option<&str>) -> ProviderConfig {
@@ -600,156 +637,28 @@ mod tests {
         }
     }
 
+    /// A blank token is never stored, and never overwrites a real one from an
+    /// earlier layer (e.g. `provider add gitlab --token ""` after
+    /// RIPCLONE_PROVIDERS set one). An empty token would surface as
+    /// `Basic oauth2:` and be rejected by GitLab.
     #[test]
-    fn blank_token_does_not_clobber_a_real_one() {
+    fn blank_token_is_never_stored() {
         use secrecy::ExposeSecret;
-        let mut registry = ProviderRegistry::new();
-        // A real token from an earlier layer (e.g. RIPCLONE_PROVIDERS).
-        registry.merge_one(gitlab_cfg(Some("real-token"))).unwrap();
-        // A later layer re-declares the provider with a blank token (e.g. a
-        // client `provider add gitlab --token ""` writing the shared config).
-        registry.merge_one(gitlab_cfg(Some("   "))).unwrap();
-        registry.merge_one(gitlab_cfg(Some(""))).unwrap();
-        assert_eq!(
+        let token = |layers: &[&str]| {
+            let mut registry = ProviderRegistry::new();
+            for layer in layers {
+                registry.merge_one(gitlab_cfg(Some(layer))).unwrap();
+            }
             registry
                 .token("gitlab")
-                .map(|t| t.expose_secret().to_string()),
-            Some("real-token".to_string()),
-            "a blank token must not overwrite a real one"
-        );
-    }
-
-    #[test]
-    fn blank_token_is_never_stored_as_empty_credential() {
-        let mut registry = ProviderRegistry::new();
-        registry.merge_one(gitlab_cfg(Some(""))).unwrap();
-        // Must be None, not Some("") — an empty token would surface as
-        // `Basic oauth2:` and be rejected by GitLab.
-        assert!(
-            registry.token("gitlab").is_none(),
-            "a blank-only token config must leave the credential absent"
-        );
-    }
-
-    #[test]
-    fn sourcehut_user_path_is_escaped_and_prefixed() {
-        let repo = RepoId {
-            provider: ProviderInstanceId::new("sourcehut"),
-            path: "~user/repo".to_string(),
+                .map(|t| t.expose_secret().to_string())
         };
-        assert_eq!(repo.storage_key(), "sourcehut/~user%2Frepo");
-        assert_eq!(repo.mirror_dir_name(), "sourcehut_~user%2Frepo.git");
-    }
-
-    #[test]
-    fn launchpad_git_path_is_escaped_and_prefixed() {
-        let repo = RepoId {
-            provider: ProviderInstanceId::new("launchpad"),
-            path: "~owner/project/+git/repo".to_string(),
-        };
-        // `+` does not need escaping for collision freedom; only `/`, `\`, `%`
-        // are escaped.
+        assert_eq!(token(&[""]), None);
+        assert_eq!(token(&["   "]), None);
         assert_eq!(
-            repo.storage_key(),
-            "launchpad/~owner%2Fproject%2F+git%2Frepo"
+            token(&["real-token", "   ", ""]),
+            Some("real-token".to_string())
         );
-        assert_eq!(
-            repo.mirror_dir_name(),
-            "launchpad_~owner%2Fproject%2F+git%2Frepo.git"
-        );
-    }
-
-    #[test]
-    fn escape_is_collision_free_around_encoded_slash() {
-        // "a/b" and "a%2Fb" must not collide after escaping.
-        let plain = RepoId {
-            provider: ProviderInstanceId::new("gitea"),
-            path: "a/b".to_string(),
-        };
-        let encoded = RepoId {
-            provider: ProviderInstanceId::new("gitea"),
-            path: "a%2Fb".to_string(),
-        };
-        assert_ne!(plain.storage_key(), encoded.storage_key());
-        assert_ne!(plain.mirror_dir_name(), encoded.mirror_dir_name());
-    }
-
-    #[test]
-    fn github_auth_header_is_basic_x_access_token() {
-        let github = ProviderRegistry::new()
-            .get(DEFAULT_PROVIDER_ID)
-            .unwrap()
-            .clone();
-        let (name, value) = github.auth_header("pat123").unwrap();
-        assert_eq!(name, "Authorization");
-        let expected = format!(
-            "Basic {}",
-            base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                b"x-access-token:pat123",
-            )
-        );
-        assert_eq!(value, expected);
-    }
-
-    #[test]
-    fn gitlab_auth_header_is_basic_oauth2() {
-        let gitlab = ProviderInstance {
-            id: ProviderInstanceId::new("gitlab"),
-            kind: ProviderKind::GitLab,
-            host: "gitlab.com".to_string(),
-            auth_template: None,
-            auth_header_name: None,
-        };
-        let (name, value) = gitlab.auth_header("gltok").unwrap();
-        assert_eq!(name, "Authorization");
-        let expected = format!(
-            "Basic {}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"oauth2:gltok",)
-        );
-        assert_eq!(value, expected);
-    }
-
-    #[test]
-    fn gitea_auth_header_is_token() {
-        let gitea = ProviderInstance {
-            id: ProviderInstanceId::new("gitea"),
-            kind: ProviderKind::Gitea,
-            host: "gitea.example.com".to_string(),
-            auth_template: None,
-            auth_header_name: None,
-        };
-        let (name, value) = gitea.auth_header("gtok").unwrap();
-        assert_eq!(name, "Authorization");
-        assert_eq!(value, "token gtok");
-    }
-
-    #[test]
-    fn generic_auth_template_overrides_preset() {
-        let generic = ProviderInstance {
-            id: ProviderInstanceId::new("myhost"),
-            kind: ProviderKind::Generic,
-            host: "git.example.com".to_string(),
-            auth_template: Some("X-Custom {token}".to_string()),
-            auth_header_name: None,
-        };
-        let (name, value) = generic.auth_header("sekrit").unwrap();
-        assert_eq!(name, "Authorization");
-        assert_eq!(value, "X-Custom sekrit");
-    }
-
-    #[test]
-    fn custom_auth_header_name_overrides_authorization() {
-        let p = ProviderInstance {
-            id: ProviderInstanceId::new("gl"),
-            kind: ProviderKind::Generic,
-            host: "git.example.com".to_string(),
-            auth_template: Some("{token}".to_string()),
-            auth_header_name: Some("PRIVATE-TOKEN".to_string()),
-        };
-        let (name, value) = p.auth_header("sekrit").unwrap();
-        assert_eq!(name, "PRIVATE-TOKEN");
-        assert_eq!(value, "sekrit");
     }
 
     #[test]
@@ -780,42 +689,5 @@ mod tests {
                 "header name {bad:?} must be rejected"
             );
         }
-    }
-
-    #[test]
-    fn github_clone_url_is_clean() {
-        let github = ProviderRegistry::new()
-            .get(DEFAULT_PROVIDER_ID)
-            .unwrap()
-            .clone();
-        assert_eq!(
-            github.clone_url("owner/repo"),
-            "https://github.com/owner/repo.git"
-        );
-    }
-
-    #[test]
-    fn generic_clone_url_preserves_http_scheme() {
-        let generic = ProviderInstance {
-            id: ProviderInstanceId::new("local"),
-            kind: ProviderKind::Generic,
-            host: "http://127.0.0.1:8080".to_string(),
-            auth_template: Some("token {token}".to_string()),
-            auth_header_name: None,
-        };
-        assert_eq!(
-            generic.clone_url("acme/http"),
-            "http://127.0.0.1:8080/acme/http.git"
-        );
-    }
-
-    #[test]
-    fn registry_default_has_github_provider() {
-        let registry = ProviderRegistry::new();
-        let github = registry.get(DEFAULT_PROVIDER_ID).unwrap();
-        assert_eq!(github.id.as_str(), "github");
-        assert_eq!(github.kind, ProviderKind::GitHub);
-        assert_eq!(github.host, "github.com");
-        assert!(registry.token("github").is_none());
     }
 }

@@ -225,69 +225,26 @@ mod tests {
         }
     }
 
+    /// `put_file_async` checks the source against its hash before storing it,
+    /// for the local backend and the trait's default implementation.
     #[tokio::test]
-    async fn put_file_async_rejects_source_hash_mismatch() {
+    async fn put_file_async_stores_nothing_for_a_mismatched_source() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = LocalStorage::new(tmp.path()).unwrap();
-        let source = tmp.path().join("source.bin");
-        std::fs::write(&source, b"wrong bytes").unwrap();
+        let local = LocalStorage::new(tmp.path().join("cas")).unwrap();
+        let recording = RecordingStorage::default();
+        let wrong = tmp.path().join("wrong.bin");
+        std::fs::write(&wrong, b"wrong bytes").unwrap();
+        let right = tmp.path().join("right.bin");
+        std::fs::write(&right, b"right bytes").unwrap();
         let expected = crate::cas::hash(b"right bytes");
 
-        let err = s.put_file_async(&expected, &source).await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("hash mismatch"),
-            "unexpected error: {err:#}"
-        );
-        assert!(
-            !s.cas.path(&expected).exists(),
-            "mismatched file upload must not publish a final object"
-        );
-    }
+        assert!(local.put_file_async(&expected, &wrong).await.is_err());
+        assert!(!local.cas.path(&expected).exists());
+        assert!(recording.put_file_async(&expected, &wrong).await.is_err());
+        assert!(recording.puts.lock().unwrap().is_empty());
 
-    #[tokio::test]
-    async fn put_file_async_repairs_existing_corrupt_object() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = LocalStorage::new(tmp.path()).unwrap();
-        let source = tmp.path().join("source.bin");
-        std::fs::write(&source, b"correct bytes").unwrap();
-        let expected = crate::cas::hash(b"correct bytes");
-        let object_path = s.cas.path(&expected);
-        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
-        std::fs::write(&object_path, b"corrupt bytes").unwrap();
-
-        s.put_file_async(&expected, &source).await.unwrap();
-        assert_eq!(std::fs::read(&source).unwrap(), b"correct bytes");
-        assert_eq!(std::fs::read(&object_path).unwrap(), b"correct bytes");
-    }
-
-    #[tokio::test]
-    async fn default_put_file_async_rejects_source_hash_mismatch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source.bin");
-        std::fs::write(&source, b"wrong bytes").unwrap();
-        let s = RecordingStorage::default();
-        let expected = crate::cas::hash(b"right bytes");
-
-        let err = s.put_file_async(&expected, &source).await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("hash mismatch"),
-            "unexpected error: {err:#}"
-        );
-        assert!(s.puts.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn default_put_file_async_uploads_matching_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source.bin");
-        std::fs::write(&source, b"correct bytes").unwrap();
-        let s = RecordingStorage::default();
-        let expected = crate::cas::hash(b"correct bytes");
-
-        s.put_file_async(&expected, &source).await.unwrap();
-        assert_eq!(
-            *s.puts.lock().unwrap(),
-            vec![(expected, b"correct bytes".to_vec())]
-        );
+        // Control: the matching source is accepted by both.
+        local.put_file_async(&expected, &right).await.unwrap();
+        recording.put_file_async(&expected, &right).await.unwrap();
     }
 }
