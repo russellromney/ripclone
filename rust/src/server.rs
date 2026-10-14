@@ -7882,8 +7882,13 @@ async fn run_server_with_barrier_at_control(
             "per-repo access enforcement OFF (RIPCLONE_TRUST_GATEWAY): any holder of the shared server token can read any cached repo — keep this backend network-isolated and single-tenant"
         );
     }
-    info!("ripclone server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Log the bound address, not the requested one: with `--port 0` this line
+    // is how a caller learns the port.
+    info!(
+        "ripclone server listening on http://{}",
+        listener.local_addr()?
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

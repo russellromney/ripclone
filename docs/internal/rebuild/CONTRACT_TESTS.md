@@ -174,11 +174,16 @@ step 2, after the contract suite is green.
 Removed: the `lsm` passes, `turso-api-worker-minio`, `full-topup-minio`, the
 `databases` stage, and the separate `e2e` script job (its cases are in G).
 
+## Status
+
+The suite lives in `rust/tests/contract/` (`cargo test --test contract`). The
+first PR added the harness, the bound-address log line, `RIPCLONE_POLL_MS`
+(replacing `RIPCLONE_TEST_REF_POLL_MS` and `RIPCLONE_TEST_SYNC_POLL_MS`), and
+A1-A4, A6, G1-G5, H1, H3, I1, I5.
+
 ## Open points
 
 - C1, C2, D4 and E1 depend on `background_slots`, which arrives in step 3. Until
   then, the "now" tests run against today's main.
-- The server must print its bound address when given port 0. That is a small
-  product change and the first PR of step 1.
-- `RIPCLONE_POLL_MS` replaces `RIPCLONE_TEST_REF_POLL_MS` and
-  `RIPCLONE_TEST_SYNC_POLL_MS`. It is also part of the first PR.
+- Next: the gated origin and fault proxy (B, D, F), then integrations (I3, I4,
+  I7) and the S3 rows (F7, H2).

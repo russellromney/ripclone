@@ -299,7 +299,7 @@ async fn changing_pending_commit_is_an_integrity_error() {
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2");
-        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+        std::env::set_var("RIPCLONE_POLL_MS", "0");
     }
     let (url, requests, task) = scripted_server(vec![pending(A), pending(B)]).await;
     let error = Client::new(url)
@@ -310,7 +310,7 @@ async fn changing_pending_commit_is_an_integrity_error() {
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
-        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+        std::env::remove_var("RIPCLONE_POLL_MS");
     }
     assert!(format!("{error:#}").contains("integrity error"));
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
@@ -371,7 +371,7 @@ async fn pinned_top_up_requires_the_current_pending_shape() {
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2");
-        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+        std::env::set_var("RIPCLONE_POLL_MS", "0");
     }
     let (url, requests, task) = scripted_server(vec![pending(A), pending(A)]).await;
     let output = tempfile::tempdir().unwrap();
@@ -392,7 +392,7 @@ async fn pinned_top_up_requires_the_current_pending_shape() {
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
-        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+        std::env::remove_var("RIPCLONE_POLL_MS");
     }
     let error = format!("{error:#}");
     assert!(error.contains("top-up support was not declared"), "{error}");
@@ -411,7 +411,7 @@ async fn unpinned_unavailable_establishes_a_pin_and_pinned_failure_is_immediate(
     let _guard = env_lock().lock().await;
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+        std::env::set_var("RIPCLONE_POLL_MS", "0");
         std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "3");
     }
     let exact_unavailable = || {
@@ -470,7 +470,7 @@ async fn unpinned_unavailable_establishes_a_pin_and_pinned_failure_is_immediate(
     );
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
-        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+        std::env::remove_var("RIPCLONE_POLL_MS");
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
     }
 }
@@ -480,7 +480,7 @@ async fn unidentified_503_fails_instead_of_repinning_after_branch_moves() {
     let _guard = env_lock().lock().await;
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+        std::env::set_var("RIPCLONE_POLL_MS", "0");
         std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2");
     }
     // The proxy-style generic 503 represents an operation that selected B but
@@ -507,7 +507,7 @@ async fn unidentified_503_fails_instead_of_repinning_after_branch_moves() {
     );
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
-        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+        std::env::remove_var("RIPCLONE_POLL_MS");
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
     }
 }
@@ -588,7 +588,7 @@ async fn pending_historical_head_keeps_rev_on_concrete_pinned_polls() {
     let _guard = env_lock().lock().await;
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+        std::env::set_var("RIPCLONE_POLL_MS", "0");
     }
     assert!(
         std::process::Command::new("git")
@@ -630,7 +630,7 @@ async fn pending_historical_head_keeps_rev_on_concrete_pinned_polls() {
     }
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
-        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+        std::env::remove_var("RIPCLONE_POLL_MS");
     }
 }
 
@@ -654,7 +654,7 @@ async fn pinned_refresh_distinguishes_authorization_from_server_failure() {
     let _guard = env_lock().lock().await;
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+        std::env::set_var("RIPCLONE_POLL_MS", "0");
     }
 
     let (url, _, forbidden_task) = scripted_server(vec![
@@ -691,7 +691,7 @@ async fn pinned_refresh_distinguishes_authorization_from_server_failure() {
 
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
-        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+        std::env::remove_var("RIPCLONE_POLL_MS");
     }
 }
 

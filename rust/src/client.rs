@@ -410,21 +410,15 @@ impl PinnedArtifactRefresh {
 
 fn ref_poll_config() -> (usize, std::time::Duration) {
     const DEFAULT_ATTEMPTS: usize = 40;
-    const DEFAULT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
     if std::env::var_os("RIPCLONE_TESTING").is_none() {
-        return (DEFAULT_ATTEMPTS, DEFAULT_DELAY);
+        return (DEFAULT_ATTEMPTS, poll_interval());
     }
     let attempts = std::env::var("RIPCLONE_TEST_REF_MAX_ATTEMPTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_ATTEMPTS);
-    let delay = std::env::var("RIPCLONE_TEST_REF_POLL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(DEFAULT_DELAY);
-    (attempts, delay)
+    (attempts, poll_interval())
 }
 
 fn managed_git_timeout() -> Duration {
@@ -552,15 +546,14 @@ fn fetch_retry_config() -> (u32, u64) {
     (attempts, backoff_ms)
 }
 
-/// Sleep between 202/503 sync polls. Production default is 2s. E2e suites may
-/// set `RIPCLONE_TEST_SYNC_POLL_MS` (e.g. 100) so a build that outlives the
-/// server's wait window is re-attached quickly without changing prod traffic.
-fn test_sync_poll_interval() -> std::time::Duration {
-    let ms = std::env::var("RIPCLONE_TEST_SYNC_POLL_MS")
+/// Wait between polls while a build is pending (202/503 sync responses) or a
+/// ref is resolving. `RIPCLONE_POLL_MS` overrides the 2 s default; tests set it
+/// low so a pending build is seen quickly.
+fn poll_interval() -> std::time::Duration {
+    let ms = std::env::var("RIPCLONE_POLL_MS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(2_000u64)
-        .max(1);
+        .unwrap_or(2_000u64);
     std::time::Duration::from_millis(ms)
 }
 
@@ -2698,13 +2691,12 @@ impl Client {
         // re-attaches to the same in-flight build rather than starting a new one.
         // Test hooks (never set in production):
         //   RIPCLONE_TEST_SYNC_MAX_ATTEMPTS — bound the poll for negative-case tests
-        //   RIPCLONE_TEST_SYNC_POLL_MS — shorter sleep between 202s (e2e speed)
         let max_attempts = std::env::var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(40);
-        let poll = test_sync_poll_interval();
+        let poll = poll_interval();
         for attempt in 0..max_attempts {
             let mut url = self.repo_url(repo_path, "/sync");
             let mut q: Vec<String> = Vec::new();
