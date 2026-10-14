@@ -108,6 +108,59 @@ fn i3_provider_auth_header_reaches_origin() {
     }
 }
 
+/// I2: a private repo builds with the server's provider credential alone.
+/// The CLI holds no upstream token and still adds, waits and clones with
+/// default upstream verification; the origin refuses unauthenticated reads.
+#[test]
+fn i2_server_credential_builds_a_private_repo() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let header = basic("x-access-token", "i2-secret");
+    http.require_header("authorization", &header);
+    let origin = world.origin("acme", "i2");
+    let tip = origin.commit(&[("a.txt", "a\n"), ("d/b.txt", "b\n")], "A");
+    origin.publish();
+
+    let anonymous = git_output(
+        &world.path("work"),
+        &["ls-remote", &format!("{}/acme/i2.git", http.url())],
+    );
+    assert!(
+        !anonymous.status.success() && String::from_utf8_lossy(&anonymous.stderr).contains("403"),
+        "the origin must refuse an unauthenticated read: {anonymous:?}"
+    );
+
+    let server_providers = providers_json(
+        http.url(),
+        &[("gh", "github", Some("i2-secret"), serde_json::json!({}))],
+    );
+    let server = world.server(&[("RIPCLONE_PROVIDERS", &server_providers)]);
+    let cli_providers =
+        providers_json(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
+    let cli_env = [("RIPCLONE_PROVIDERS", cli_providers.as_str())];
+    world
+        .cli_env(&server, &["add", "gh:acme/i2", "--wait"], &cli_env)
+        .ok();
+    let target = world.target("i2");
+    world
+        .cli_env(
+            &server,
+            &["clone", "gh:acme/i2", target.to_str().unwrap()],
+            &cli_env,
+        )
+        .ok();
+
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(listing(&target), origin.tree(&tip));
+    assert!(http.fetches() > 0, "the origin served no fetch");
+    // Only the server's credential ever reached the origin.
+    for request in http.requests() {
+        if let Some(sent) = request.header("authorization") {
+            assert_eq!(sent, header, "{} {}", request.method, request.path);
+        }
+    }
+}
+
 fn hmac_hex(secret: &str, body: &str) -> String {
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(body.as_bytes());

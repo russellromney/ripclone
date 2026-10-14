@@ -11,6 +11,7 @@ mod docs;
 mod downloads;
 mod gitea;
 mod integrations;
+mod outputs;
 mod pinning;
 mod resolve;
 mod s3;
