@@ -1,4 +1,4 @@
-//! C2, C3, F7 and H2 against S3 storage: a versitygw emulator per test,
+//! C2, C3, C7, F7, H2 and H6 against S3 storage: a versitygw emulator per test,
 //! started by `scripts/s3_emulator.sh`. Ignored by default because the script fetches
 //! the emulator binary; the `s3` CI job runs them with `--ignored`.
 
@@ -112,9 +112,9 @@ fn s3_h2_artifacts_live_in_bucket_and_survive_restart() {
     assert_eq!(s3.objects(), objects);
 }
 
-/// Head(B) ready on a server with no background slots; then a restart with
-/// background builds on and the bucket refusing every PUT, until Full and
-/// Files have failed. Returns the S3 proxy so the caller keeps it alive.
+/// Head(B) ready on a server with no Files or Full slots; then a restart
+/// with them on and the bucket refusing every PUT, until Full and Files have
+/// failed. Returns the S3 proxy so the caller keeps it alive.
 fn background_failed(world: &World, s3: &S3, name: &str) -> (Origin, Server, FaultProxy, String) {
     let s3_proxy = FaultProxy::start(s3);
     s3_proxy.preserve_host();
@@ -123,7 +123,8 @@ fn background_failed(world: &World, s3: &S3, name: &str) -> (Origin, Server, Fau
     origin.publish();
     let repo = format!("acme/{name}");
     let mut env = s3.server_env(&s3_proxy.url());
-    env.push(("RIPCLONE_BACKGROUND_SLOTS".into(), "0".into()));
+    env.push(("RIPCLONE_FILES_SLOTS".into(), "0".into()));
+    env.push(("RIPCLONE_FULL_SLOTS".into(), "0".into()));
     let mut server = world.server(&env_refs(&env));
     world.cli(&server, &["add", &repo]).ok();
     wait_for("Head ready", || {
@@ -132,7 +133,7 @@ fn background_failed(world: &World, s3: &S3, name: &str) -> (Origin, Server, Fau
 
     // A 403 is permanent, so each output fails on its first attempt.
     s3_proxy.fail_puts(&format!("/{}/", s3.bucket), Fault::Status(403));
-    server.restart_with(&[("RIPCLONE_BACKGROUND_SLOTS", "1")]);
+    server.restart_with(&[("RIPCLONE_FILES_SLOTS", "1"), ("RIPCLONE_FULL_SLOTS", "1")]);
     wait_for("Full and Files failed", || {
         (output_states(&server, &repo, &tip) == ["ready", "failed", "failed"]).then_some(())
     });
@@ -187,6 +188,63 @@ fn s3_c2_failed_background_outputs_leave_head_cloneable() {
         "{err}"
     );
     assert!(!full.exists(), "failed clone left {}", full.display());
+}
+
+/// C7: a new push's Files does not wait behind another commit's Full. The
+/// bucket holds Full(B)'s first write while push C arrives: C's Head and
+/// Files become ready with Full(B) still building. Once released, Full(B)
+/// lands before Full(C), so Full(C) builds on B's history.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_c7_new_push_files_skip_a_running_full() {
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let s3_proxy = FaultProxy::start(&s3);
+    s3_proxy.preserve_host();
+    let origin = world.origin("acme", "c7");
+    let b = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "B");
+    origin.publish();
+    let mut env = s3.server_env(&s3_proxy.url());
+    env.push(("RIPCLONE_FULL_SLOTS".into(), "0".into()));
+    let mut server = world.server(&env_refs(&env));
+    world.cli(&server, &["add", "acme/c7"]).ok();
+    wait_for("Head(B) and Files(B) ready", || {
+        (output_states(&server, "acme/c7", &b) == ["ready", "pending", "ready"]).then_some(())
+    });
+
+    // Nothing else writes while Full(B) starts, so the held PUT is Full's.
+    s3_proxy.hold_puts(&format!("/{}/", s3.bucket), 1);
+    server.restart_with(&[("RIPCLONE_FULL_SLOTS", "1")]);
+    s3_proxy.wait_held(1);
+
+    let c = origin.commit(&[("a.txt", "c\n")], "C");
+    origin.publish();
+    world.cli(&server, &["sync", "acme/c7"]).ok();
+    wait_for("Head(C) and Files(C) ready", || {
+        (output_states(&server, "acme/c7", &c) == ["ready", "pending", "ready"]).then_some(())
+    });
+    assert_eq!(
+        output_states(&server, "acme/c7", &b),
+        ["ready", "pending", "ready"],
+        "Full(B) finished while its write was held"
+    );
+
+    s3_proxy.release();
+    wait_for("Full(C) ready", || {
+        (output_states(&server, "acme/c7", &c) == ["ready"; 3]).then_some(())
+    });
+    assert_eq!(output_states(&server, "acme/c7", &b), ["ready"; 3]);
+    let log = server.log();
+    let published = |commit: &str| {
+        let suffix = format!("/acme%2Fc7@{}", &commit[..7]);
+        log.lines()
+            .position(|l| l.contains("published full result for") && l.ends_with(&suffix))
+            .unwrap_or_else(|| panic!("no Full published for {commit}:\n{log}"))
+    };
+    assert!(
+        published(&b) < published(&c),
+        "Full(C) before Full(B):\n{log}"
+    );
 }
 
 /// C3: with the fault gone, `sync --at` retries the failed outputs. Only Full

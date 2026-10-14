@@ -1,11 +1,12 @@
-//! Build workers: two capped pools of slots that lease rows from the control
-//! store.
+//! Build workers: three capped pools of slots that lease rows from the
+//! control store.
 //!
 //! A Head slot fetches the admitted commit, builds Head and publishes it. A
-//! Background slot builds the missing Full and Files of a row whose Head is
-//! ready; each publishes or fails on its own. A slot holds a 60 s lease and
-//! renews it every 20 s; a lost lease aborts the build. Failures record a
-//! retry time instead of sleeping, so no slot waits while holding a lease.
+//! Files slot builds Files of a row whose Head is ready. A Full slot builds
+//! Full of a row whose Files is ready or failed, so a new push's Files never
+//! waits behind another commit's Full. A slot holds a 60 s lease and renews it
+//! every 20 s; a lost lease aborts the build. Failures record a retry time
+//! instead of sleeping, so no slot waits while holding a lease.
 
 use super::api::row_info;
 use super::builder::{
@@ -13,7 +14,7 @@ use super::builder::{
     report_sync_phases, sweep_stale_tempdirs,
 };
 use super::{ServerState, duration_ms, fetch_semaphore};
-use crate::control::{BuildRow, Claim, Out, Output, Pool, Published};
+use crate::control::{BuildRow, Claim, Output, Pool, Published};
 use crate::provider::RepoId;
 use crate::{ExactResultKind, git, validation};
 use anyhow::{Context, Result};
@@ -34,8 +35,10 @@ const RETRY_CAP: Duration = Duration::from_secs(300);
 pub(super) struct WorkerSettings {
     /// Concurrent Head builds. At least 1.
     pub head_slots: usize,
-    /// Concurrent Full and Files builds. 0 pauses them.
-    pub background_slots: usize,
+    /// Concurrent Files builds. 0 pauses Files, and so Full.
+    pub files_slots: usize,
+    /// Concurrent Full builds. 0 pauses them.
+    pub full_slots: usize,
     /// First retry delay; doubles per attempt up to `RETRY_CAP`.
     pub retry_base: Duration,
     /// Claims per phase before an output fails.
@@ -53,7 +56,8 @@ impl WorkerSettings {
         };
         let head_slots = number("RIPCLONE_HEAD_SLOTS", 2)?;
         anyhow::ensure!(head_slots >= 1, "RIPCLONE_HEAD_SLOTS must be at least 1");
-        let background_slots = number("RIPCLONE_BACKGROUND_SLOTS", 1)?;
+        let files_slots = number("RIPCLONE_FILES_SLOTS", 1)?;
+        let full_slots = number("RIPCLONE_FULL_SLOTS", 1)?;
         let retry_base = number("RIPCLONE_BUILD_RETRY_BASE_MS", 2000)?;
         let max_attempts = number("RIPCLONE_BUILD_MAX_ATTEMPTS", 5)?;
         anyhow::ensure!(
@@ -62,8 +66,9 @@ impl WorkerSettings {
         );
         Ok(Self {
             head_slots: usize::try_from(head_slots).context("RIPCLONE_HEAD_SLOTS is too large")?,
-            background_slots: usize::try_from(background_slots)
-                .context("RIPCLONE_BACKGROUND_SLOTS is too large")?,
+            files_slots: usize::try_from(files_slots)
+                .context("RIPCLONE_FILES_SLOTS is too large")?,
+            full_slots: usize::try_from(full_slots).context("RIPCLONE_FULL_SLOTS is too large")?,
             retry_base: Duration::from_millis(retry_base),
             max_attempts: i64::try_from(max_attempts)
                 .context("RIPCLONE_BUILD_MAX_ATTEMPTS is too large")?,
@@ -183,34 +188,30 @@ pub(super) fn spawn_workers(state: &ServerState, settings: &WorkerSettings) {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     let boot = format!("{}-{boot_nanos:x}", std::process::id());
-    for slot in 0..settings.head_slots {
-        tokio::spawn(run_slot(
-            state.clone(),
-            *settings,
-            Pool::Head,
-            format!("{boot}-head-{slot}"),
-        ));
-    }
-    for slot in 0..settings.background_slots {
-        tokio::spawn(run_slot(
-            state.clone(),
-            *settings,
-            Pool::Background,
-            format!("{boot}-background-{slot}"),
-        ));
+    for (pool, slots, name) in [
+        (Pool::Head, settings.head_slots, "head"),
+        (Pool::Files, settings.files_slots, "files"),
+        (Pool::Full, settings.full_slots, "full"),
+    ] {
+        for slot in 0..slots {
+            tokio::spawn(run_slot(
+                state.clone(),
+                *settings,
+                pool,
+                format!("{boot}-{name}-{slot}"),
+            ));
+        }
     }
     info!(
         head_slots = settings.head_slots,
-        background_slots = settings.background_slots,
+        files_slots = settings.files_slots,
+        full_slots = settings.full_slots,
         "build workers started"
     );
 }
 
 async fn run_slot(state: ServerState, settings: WorkerSettings, pool: Pool, slot: String) {
-    let wake = match pool {
-        Pool::Head => Arc::clone(&state.head_wake),
-        Pool::Background => Arc::clone(&state.background_wake),
-    };
+    let wake = Arc::clone(state.wake(pool));
     let mut sequence = 0u64;
     loop {
         // Register for a wake-up before reading SQLite, so an admission that
@@ -244,7 +245,8 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
     let mut task = tokio::spawn(async move {
         match pool {
             Pool::Head => build_head(&task_state, settings, &task_claim).await,
-            Pool::Background => build_background(&task_state, settings, &task_claim).await,
+            Pool::Files => build_files(&task_state, settings, &task_claim).await,
+            Pool::Full => build_full(&task_state, settings, &task_claim).await,
         }
     });
     let mut renew =
@@ -255,9 +257,7 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
             joined = &mut task => {
                 if let Err(error) = joined {
                     let failure = BuildError::retryable(format!("build task panicked: {error}"));
-                    for kind in pool_kinds(pool) {
-                        record_failure(state, settings, &claim, *kind, &failure).await;
-                    }
+                    record_failure(state, settings, &claim, pool_kind(pool), &failure).await;
                 }
                 break;
             }
@@ -288,16 +288,20 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
             claim.build.commit
         );
     }
-    // The row is claimable by the Background pool only once released.
-    if pool == Pool::Head {
-        state.background_wake.notify_one();
+    // The row is claimable by the next pool only once released.
+    match pool {
+        Pool::Head => state.wake(Pool::Files).notify_one(),
+        Pool::Files => state.wake(Pool::Full).notify_one(),
+        Pool::Full => {}
     }
 }
 
-fn pool_kinds(pool: Pool) -> &'static [ExactResultKind] {
+/// The output a pool builds.
+fn pool_kind(pool: Pool) -> ExactResultKind {
     match pool {
-        Pool::Head => &[ExactResultKind::Head],
-        Pool::Background => &[ExactResultKind::Full, ExactResultKind::Files],
+        Pool::Head => ExactResultKind::Head,
+        Pool::Files => ExactResultKind::Files,
+        Pool::Full => ExactResultKind::Full,
     }
 }
 
@@ -550,30 +554,38 @@ async fn head_output(
     Ok(Output::Head { result, parent })
 }
 
-async fn build_background(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
-    let need_full = matches!(claim.build.full, Out::Pending { .. });
-    let need_files = matches!(claim.build.files, Out::Pending { .. });
-    let (head, parent_row, config, mirror_dir) = match background_prep(state, claim).await {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let failure = classify_build_error(&error);
-            for (kind, needed) in [
-                (ExactResultKind::Full, need_full),
-                (ExactResultKind::Files, need_files),
-            ] {
-                if needed {
-                    record_failure(state, settings, claim, kind, &failure).await;
-                }
-            }
-            return;
-        }
-    };
-    let repo_id = &claim.repo;
-    let commit = claim.build.commit.as_str();
-    let full = async {
-        if !need_full {
-            return;
-        }
+async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
+    let built = async {
+        let (head, parent_row, mirror_dir) = background_prep(state, claim).await?;
+        let config = state
+            .control
+            .get_config(&claim.repo)
+            .await?
+            .unwrap_or_default();
+        let parent_files = parent_row
+            .as_ref()
+            .and_then(|row| row.files.ready().map(|files| (row.commit.as_str(), files)));
+        build_files_result(
+            &state.cas,
+            &mirror_dir,
+            &claim.build.commit,
+            &head,
+            parent_files,
+            &state.storage,
+            config.compression_level(),
+        )
+        .await
+        .map(Output::Files)
+    }
+    .await;
+    settle(state, settings, claim, ExactResultKind::Files, built).await;
+}
+
+async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
+    let built = async {
+        let (head, parent_row, mirror_dir) = background_prep(state, claim).await?;
+        // Full builds on the parent's history levels. Full claims go oldest
+        // first, so with one Full slot Full(parent) usually lands first.
         let levels = parent_row
             .as_ref()
             .and_then(|row| row.full.ready())
@@ -585,53 +597,28 @@ async fn build_background(state: &ServerState, settings: WorkerSettings, claim: 
         // path.
         let bitmap_dir = mirror_dir.clone();
         let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bitmap_dir)).await;
-        let built = build_full_result(
+        build_full_result(
             &state.cas,
             &mirror_dir,
-            repo_id,
-            commit,
+            &claim.repo,
+            &claim.build.commit,
             &head,
             levels,
             &state.storage,
         )
         .await
-        .map(Output::Full);
-        settle(state, settings, claim, ExactResultKind::Full, built).await;
-    };
-    let files = async {
-        if !need_files {
-            return;
-        }
-        let parent_files = parent_row
-            .as_ref()
-            .and_then(|row| row.files.ready().map(|files| (row.commit.as_str(), files)));
-        let built = build_files_result(
-            &state.cas,
-            &mirror_dir,
-            commit,
-            &head,
-            parent_files,
-            &state.storage,
-            config.compression_level(),
-        )
-        .await
-        .map(Output::Files);
-        settle(state, settings, claim, ExactResultKind::Files, built).await;
-    };
-    tokio::join!(full, files);
+        .map(Output::Full)
+    }
+    .await;
+    settle(state, settings, claim, ExactResultKind::Full, built).await;
 }
 
-/// Everything Full and Files share: the ready Head, the parent's row, the
-/// repository config as stored now, and a mirror holding the commit.
+/// What Files and Full share: the ready Head, the parent's row as stored
+/// now, and a mirror holding the commit.
 async fn background_prep(
     state: &ServerState,
     claim: &Claim,
-) -> Result<(
-    crate::HeadResult,
-    Option<BuildRow>,
-    crate::repo_config::RepoConfig,
-    std::path::PathBuf,
-)> {
+) -> Result<(crate::HeadResult, Option<BuildRow>, std::path::PathBuf)> {
     let repo_id = &claim.repo;
     let commit = claim.build.commit.as_str();
     let head = claim
@@ -640,7 +627,6 @@ async fn background_prep(
         .ready()
         .cloned()
         .context("Head result is not ready")?;
-    let config = state.control.get_config(repo_id).await?.unwrap_or_default();
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     {
         let lock = repo_lock(&state.sync_locks, repo_id).await;
@@ -652,7 +638,7 @@ async fn background_prep(
         Some(parent) => state.control.status(repo_id, parent).await?,
         None => None,
     };
-    Ok((head, parent_row, config, mirror_dir))
+    Ok((head, parent_row, mirror_dir))
 }
 
 #[cfg(test)]
@@ -666,7 +652,8 @@ mod tests {
             defaults,
             WorkerSettings {
                 head_slots: 2,
-                background_slots: 1,
+                files_slots: 1,
+                full_slots: 1,
                 retry_base: Duration::from_millis(2000),
                 max_attempts: 5,
             }
@@ -675,7 +662,8 @@ mod tests {
             Some(
                 match key {
                     "RIPCLONE_HEAD_SLOTS" => "3",
-                    "RIPCLONE_BACKGROUND_SLOTS" => "0",
+                    "RIPCLONE_FILES_SLOTS" => "0",
+                    "RIPCLONE_FULL_SLOTS" => "4",
                     "RIPCLONE_BUILD_RETRY_BASE_MS" => "50",
                     "RIPCLONE_BUILD_MAX_ATTEMPTS" => "2",
                     _ => return None,
@@ -685,13 +673,15 @@ mod tests {
         })
         .unwrap();
         assert_eq!(set.head_slots, 3);
-        assert_eq!(set.background_slots, 0);
+        assert_eq!(set.files_slots, 0);
+        assert_eq!(set.full_slots, 4);
         assert_eq!(set.retry_base, Duration::from_millis(50));
         assert_eq!(set.max_attempts, 2);
         for (key, value) in [
             ("RIPCLONE_HEAD_SLOTS", "0"),
             ("RIPCLONE_HEAD_SLOTS", "two"),
-            ("RIPCLONE_BACKGROUND_SLOTS", "-1"),
+            ("RIPCLONE_FILES_SLOTS", "-1"),
+            ("RIPCLONE_FULL_SLOTS", "many"),
             ("RIPCLONE_BUILD_RETRY_BASE_MS", "soon"),
             ("RIPCLONE_BUILD_MAX_ATTEMPTS", "0"),
         ] {

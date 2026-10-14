@@ -27,15 +27,15 @@ pub fn output_states(server: &Server, repo: &str, commit: &str) -> [String; 3] {
     ["head", "full", "files"].map(|kind| body[kind]["state"].as_str().unwrap_or("").to_string())
 }
 
-/// C1: with no background slots, a depth-1 clone succeeds on Head alone while
-/// Full and Files stay pending.
+/// C1: with no Files or Full slots, a depth-1 clone succeeds on Head alone
+/// while Full and Files stay pending.
 #[test]
 fn c1_head_clones_while_background_outputs_pend() {
     let world = World::new();
     let origin = world.origin("acme", "c1");
     let tip = origin.commit(&[("a.txt", "a\n"), ("b/c.txt", "c\n")], "B");
     origin.publish();
-    let server = world.server(&[("RIPCLONE_BACKGROUND_SLOTS", "0")]);
+    let server = world.server(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
     world.cli(&server, &["add", "acme/c1"]).ok();
 
     let target = world.target("c1");

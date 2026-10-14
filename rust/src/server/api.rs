@@ -988,9 +988,8 @@ pub(super) async fn admit_build(
     }
     match (&row.head, &row.files, &row.full) {
         (Out::Pending { .. }, _, _) => state.head_wake.notify_one(),
-        (Out::Ready(_), Out::Pending { .. }, _) | (Out::Ready(_), _, Out::Pending { .. }) => {
-            state.background_wake.notify_one();
-        }
+        (Out::Ready(_), Out::Pending { .. }, _) => state.files_wake.notify_one(),
+        (Out::Ready(_), _, Out::Pending { .. }) => state.full_wake.notify_one(),
         _ => {}
     }
     Ok((row, inserted))
@@ -1153,9 +1152,21 @@ mod tests {
         };
         assert!(state.control.publish(&head, output).await.unwrap().applied);
         state.control.release(&head).await.unwrap();
-        let background = state
+        let files = state
             .control
-            .claim("test-background", crate::control::Pool::Background, lease)
+            .claim("test-files", crate::control::Pool::Files, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .control
+            .fail(&files, ExactResultKind::Files, "archive broke", None)
+            .await
+            .unwrap();
+        state.control.release(&files).await.unwrap();
+        let full = state
+            .control
+            .claim("test-full", crate::control::Pool::Full, lease)
             .await
             .unwrap()
             .unwrap();
@@ -1163,20 +1174,8 @@ mod tests {
             clonepack: artifacts("full"),
             ..Default::default()
         });
-        assert!(
-            state
-                .control
-                .publish(&background, output)
-                .await
-                .unwrap()
-                .applied
-        );
-        state
-            .control
-            .fail(&background, ExactResultKind::Files, "archive broke", None)
-            .await
-            .unwrap();
-        state.control.release(&background).await.unwrap();
+        assert!(state.control.publish(&full, output).await.unwrap().applied);
+        state.control.release(&full).await.unwrap();
     }
 
     async fn call(
@@ -1780,9 +1779,11 @@ mod tests {
                 .applied
         );
         state.control.release(&head_claim).await.unwrap();
+        // Full ready while Files is pending, as after a retry of a failed
+        // Files.
         let background = state
             .control
-            .claim("status-background", crate::control::Pool::Background, lease)
+            .claim("status-files", crate::control::Pool::Files, lease)
             .await
             .unwrap()
             .unwrap();

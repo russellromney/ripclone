@@ -33,7 +33,7 @@ a unit test or it is not needed.
      drop Range support, expire a signed URL, fail PUTs.
    - **Process control.** SIGKILL and restart the server; restart it with
      different config.
-   - **Real config.** `background_slots = 0` pauses Full and Files builds.
+   - **Real config.** `files_slots = 0` and `full_slots = 0` pause Files and Full builds.
      This is an operator setting (Head-only server), not a test seam, and it
      makes "Full is pending" deterministic.
 4. **Parallel.** Each test gets its own tempdir, server process, and port (the
@@ -69,20 +69,21 @@ after the row (`a1_...`, `s3_c2_...`).
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | #188 |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | #188 |
 
-### C. Outputs are independent and immutable (5)
+### C. Outputs are independent and immutable (6)
 
 | # | Test | Added |
 |---|---|---|
-| C1 | `background_slots = 0`: depth-1 clone of B succeeds while Full and Files stay pending (API status shows it). | #203 |
+| C1 | `files_slots = 0` and `full_slots = 0`: depth-1 clone of B succeeds while Full and Files stay pending (API status shows it). | #203 |
 | C2 | Head ready, then restart with the storage proxy failing PUTs and background builds on: Full and Files fail, Head stays cloneable, status shows `failed` per output. | #203 (S3 job) |
 | C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | #203 (S3 job) |
 | C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | #202 |
 | C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). Over the three builds, every server log line is the server's own: no git output. | #202 |
+| C7 | S3 only: the bucket holds Full(B)'s first write while push C arrives. Head(C) and Files(C) become ready while Full(B) is still pending; after release, Full(B) publishes before Full(C). | Hetzner benchmark |
 
 A SIGKILLed server's `git` children run until their command ends, on every
 OS. #209 killed them on Linux with a parent-death signal (row C6), but
 setting it needs a `pre_exec` hook, and any `pre_exec` makes std `fork()` the
-whole server for every git spawn. C6 is gone. The unit test
+whole server for every git spawn. C6 is retired. The unit test
 `git::tests::server_git_spawns_do_not_fork` keeps server spawns on
 `posix_spawn`.
 
@@ -93,7 +94,7 @@ whole server for every git spawn. C6 is gone. The unit test
 | D1 | Branch moves B to C during the clone: the clone installs B. | #188 |
 | D2 | Proxy rewrites a later poll to name a different commit: integrity error, no target directory. | #188 |
 | D3 | Pinned commit removed upstream before it is built: clone fails and does not fall back to the branch. | #188 |
-| D4 | `--wait` with Full(B) pending and `background_slots = 0`: the CLI waits, reports pending, and exits at its timeout without installing anything else. | #205 |
+| D4 | `--wait` with Full(B) pending and `files_slots = 0`, `full_slots = 0`: the CLI waits, reports pending, and exits at its timeout without installing anything else. | #205 |
 | D5 | 401, 403, 404, 5xx, and an unreachable server give distinct CLI errors and exit codes (3, 4, 5, 6, 6; see the README). | #189 |
 | D6 | Client-side failures: target exists and is not empty (exit 1, its files untouched), server unreachable (exit 6), no `git` on PATH for an editable clone (exit 1, before any request). Nothing left behind; a Files clone works without git. An existing empty directory is a valid target, as for `git clone`: the clone lands in it and keeps its mode; an unreachable server, no git, or artifacts failing mid-clone leave it in place, empty, with its mode. | #208 |
 
@@ -101,7 +102,7 @@ whole server for every git spawn. C6 is gone. The unit test
 
 | # | Test | Added |
 |---|---|---|
-| E1 | Full(A) ready; restart with `background_slots = 0`; push B; full clone: installs B by top-up without waiting on any server build. Tree and `rev-list --count` equal origin at B, `git fsck` clean. | #205 |
+| E1 | Full(A) ready; restart with `files_slots = 0` and `full_slots = 0`; push B; full clone: installs B by top-up without waiting on any server build. Tree and `rev-list --count` equal origin at B, `git fsck` clean. | #205 |
 | E2 | Same with a push of several commits including a merge (A is an ancestor, not the parent). | #205 |
 | E3 | Same after a force-push (A is not an ancestor): clone still equals origin at B. | #205 |
 | E4 | No ready Full exists for the ref: full clone waits for Full(B) instead of failing. | #205 |
@@ -170,7 +171,7 @@ Ripclone token reaches the origin.
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | #208 |
 | I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | #209 |
 
-Total: 65 tests. Several are table-driven.
+Total: 66 tests. Several are table-driven.
 
 ## What it replaced
 
@@ -185,7 +186,7 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
 - `test`: unit tests plus the contract suite, parallel. Target under 5 minutes
   after compile. The one S3 unit test (multipart upload) runs here against
   `scripts/s3_emulator.sh`, reusing the unit-test binary.
-- `s3`: C2, C3, F7, H2 and H6 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
+- `s3`: C2, C3, C7, F7, H2 and H6 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
 - `gitea`: the live Gitea provider row.
 - `lint`, `musl`, `docker`, `cargo-deny`.
 - `e2e`: `scripts/e2e_local.sh` against prebuilt binaries.
@@ -198,7 +199,7 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
   contract`, in parallel. The tools are in `net.rs` (gated origin, fault
   proxy, silent endpoint) and `harness.rs`; wire details are in one module,
   `harness::api`.
-- The five `s3_` rows start their own versitygw and are `#[ignore]`d; the
+- The six `s3_` rows start their own versitygw and are `#[ignore]`d; the
   `s3` CI job runs them with `--ignored s3_`. The live Gitea row runs in the
   `gitea` job with `--ignored gitea_`.
 - The CLI polls at most 200 ms apart in every test, so `--wait` lasts about

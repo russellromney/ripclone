@@ -52,14 +52,17 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
     run!(
         admits_coalesce_to_one_row_per_commit,
         ref_name_is_filled_never_replaced,
-        pools_offer_head_then_background,
+        pools_offer_head_then_files_then_full,
         claims_take_the_oldest_row,
+        files_does_not_wait_for_another_rows_full,
+        full_claims_follow_admission_order,
         expired_lease_is_reclaimed_from_its_old_owner,
         renew_extends_the_lease,
         retry_after_gates_claims,
         failed_head_fails_every_output,
         retryable_failure_on_last_attempt_fails,
-        background_outputs_fail_independently,
+        failed_files_does_not_stop_full,
+        retryable_files_failure_holds_full,
         retry_touches_only_failed_outputs,
         exhausted_attempts_are_given_up,
         stale_claim_cannot_overwrite_any_ready_result,
@@ -193,41 +196,16 @@ macro_rules! assert_out {
 /// Admit `commit` and publish all three outputs through claims.
 async fn complete(store: &dyn ControlStore, repo: &RepoId, commit: &str, ref_name: Option<&str>) {
     store.admit(repo, commit, ref_name).await.unwrap();
-    let claim = store
-        .claim("builder", Pool::Head, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(claim.build.commit, commit);
-    assert!(
-        store
-            .publish(&claim, head(commit, "head"))
-            .await
-            .unwrap()
-            .applied
-    );
-    store.release(&claim).await.unwrap();
-    let claim = store
-        .claim("builder", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(claim.build.commit, commit);
-    assert!(
-        store
-            .publish(&claim, files(commit, "files"))
-            .await
-            .unwrap()
-            .applied
-    );
-    assert!(
-        store
-            .publish(&claim, full(commit, "full"))
-            .await
-            .unwrap()
-            .applied
-    );
-    store.release(&claim).await.unwrap();
+    for (pool, output) in [
+        (Pool::Head, head(commit, "head")),
+        (Pool::Files, files(commit, "files")),
+        (Pool::Full, full(commit, "full")),
+    ] {
+        let claim = store.claim("builder", pool, LEASE).await.unwrap().unwrap();
+        assert_eq!(claim.build.commit, commit);
+        assert!(store.publish(&claim, output).await.unwrap().applied);
+        store.release(&claim).await.unwrap();
+    }
 }
 
 async fn admits_coalesce_to_one_row_per_commit(backend: &dyn Backend) {
@@ -286,17 +264,13 @@ async fn ref_name_is_filled_never_replaced(backend: &dyn Backend) {
     assert_eq!(row.ref_name.as_deref(), Some(MAIN));
 }
 
-async fn pools_offer_head_then_background(backend: &dyn Backend) {
+async fn pools_offer_head_then_files_then_full(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     let commit = sha(1);
     store.admit(&repo(), &commit, Some(MAIN)).await.unwrap();
-    assert!(
-        store
-            .claim("b", Pool::Background, LEASE)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    for pool in [Pool::Files, Pool::Full] {
+        assert!(store.claim("b", pool, LEASE).await.unwrap().is_none());
+    }
     let claim = store.claim("h", Pool::Head, LEASE).await.unwrap().unwrap();
     assert_eq!(claim.repo, repo());
     assert_eq!(claim.owner, "h");
@@ -324,13 +298,10 @@ async fn pools_offer_head_then_background(backend: &dyn Backend) {
     let row = store.status(&repo(), &commit).await.unwrap().unwrap();
     assert_eq!(ready_manifest(&row.head), Some(manifest(&commit, "head")));
     assert_eq!(row.parent, Some(sha(0xfeed)));
-    assert_eq!(
-        row.attempts, 0,
-        "publishing Head starts the Background phase"
-    );
+    assert_eq!(row.attempts, 0, "publishing Head starts the Files phase");
     assert!(
         store
-            .claim("b", Pool::Background, LEASE)
+            .claim("f", Pool::Files, LEASE)
             .await
             .unwrap()
             .is_none(),
@@ -347,12 +318,12 @@ async fn pools_offer_head_then_background(backend: &dyn Backend) {
         None
     );
     assert!(store.claim("h", Pool::Head, LEASE).await.unwrap().is_none());
+    assert!(
+        store.claim("u", Pool::Full, LEASE).await.unwrap().is_none(),
+        "Full waits for the row's Files"
+    );
 
-    let claim = store
-        .claim("b", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
+    let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
     assert_eq!(claim.build.attempts, 1);
     assert!(claim.build.head.ready().is_some());
     let published = store
@@ -360,20 +331,110 @@ async fn pools_offer_head_then_background(backend: &dyn Backend) {
         .await
         .unwrap();
     assert!(published.applied && !published.row_complete);
-    let published = store.publish(&claim, full(&commit, "full")).await.unwrap();
-    assert!(published.applied && published.row_complete);
+    let row = store.status(&repo(), &commit).await.unwrap().unwrap();
+    assert_eq!(row.attempts, 0, "publishing Files starts the Full phase");
+    assert!(
+        store.claim("u", Pool::Full, LEASE).await.unwrap().is_none(),
+        "the Files lease still holds the row"
+    );
     store.release(&claim).await.unwrap();
-    assert!(store.claim("h", Pool::Head, LEASE).await.unwrap().is_none());
     assert!(
         store
-            .claim("b", Pool::Background, LEASE)
+            .claim("f", Pool::Files, LEASE)
             .await
             .unwrap()
             .is_none()
     );
+
+    let claim = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
+    assert_eq!(claim.build.attempts, 1);
+    let published = store.publish(&claim, full(&commit, "full")).await.unwrap();
+    assert!(published.applied && published.row_complete);
+    store.release(&claim).await.unwrap();
+    for pool in [Pool::Head, Pool::Files, Pool::Full] {
+        assert!(store.claim("x", pool, LEASE).await.unwrap().is_none());
+    }
     let row = store.status(&repo(), &commit).await.unwrap().unwrap();
     assert_eq!(ready_manifest(&row.files), Some(manifest(&commit, "files")));
     assert_eq!(ready_manifest(&row.full), Some(manifest(&commit, "full")));
+}
+
+/// Publish Head of `commit` through a claim.
+async fn publish_head(store: &dyn ControlStore, commit: &str) {
+    let claim = store.claim("h", Pool::Head, LEASE).await.unwrap().unwrap();
+    assert_eq!(claim.build.commit, commit);
+    assert!(
+        store
+            .publish(&claim, head(commit, "head"))
+            .await
+            .unwrap()
+            .applied
+    );
+    store.release(&claim).await.unwrap();
+}
+
+/// Publish Files of `commit` through a claim.
+async fn publish_files(store: &dyn ControlStore, commit: &str) {
+    let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
+    assert_eq!(claim.build.commit, commit);
+    assert!(
+        store
+            .publish(&claim, files(commit, "files"))
+            .await
+            .unwrap()
+            .applied
+    );
+    store.release(&claim).await.unwrap();
+}
+
+/// A new push's Files is claimable while an older row's Full is building.
+async fn files_does_not_wait_for_another_rows_full(backend: &dyn Backend) {
+    let (clock, store) = open(backend).await;
+    let (b, c) = (sha(1), sha(2));
+    store.admit(&repo(), &b, Some(MAIN)).await.unwrap();
+    publish_head(store.as_ref(), &b).await;
+    publish_files(store.as_ref(), &b).await;
+    let full_b = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
+    assert_eq!(full_b.build.commit, b);
+
+    clock.advance(1);
+    store.admit(&repo(), &c, Some(MAIN)).await.unwrap();
+    publish_head(store.as_ref(), &c).await;
+    let files_c = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
+    assert_eq!(files_c.build.commit, c);
+    assert!(
+        store
+            .publish(&files_c, files(&c, "files"))
+            .await
+            .unwrap()
+            .applied
+    );
+    store.release(&files_c).await.unwrap();
+    let row = store.status(&repo(), &b).await.unwrap().unwrap();
+    assert_out!(row.full, pending(None));
+    assert_eq!(row.lease_until, Some(START + 60), "Full(B) still holds B");
+}
+
+/// Full claims go oldest admission first, so with one Full slot Full(C)
+/// builds after Full(B) and on its history levels.
+async fn full_claims_follow_admission_order(backend: &dyn Backend) {
+    let (clock, store) = open(backend).await;
+    let (b, c) = (sha(2), sha(1));
+    store.admit(&repo(), &b, Some(MAIN)).await.unwrap();
+    clock.advance(1);
+    store.admit(&repo(), &c, Some(MAIN)).await.unwrap();
+    for commit in [&b, &c] {
+        publish_head(store.as_ref(), commit).await;
+    }
+    for commit in [&b, &c] {
+        publish_files(store.as_ref(), commit).await;
+    }
+    for commit in [&b, &c] {
+        let claim = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
+        assert_eq!(&claim.build.commit, commit);
+        store.publish(&claim, full(commit, "full")).await.unwrap();
+        store.release(&claim).await.unwrap();
+    }
 }
 
 async fn claims_take_the_oldest_row(backend: &dyn Backend) {
@@ -506,14 +567,9 @@ async fn failed_head_fails_every_output(backend: &dyn Backend) {
     assert_out!(row.head, failed("bad object"));
     assert_out!(row.files, failed("head failed: bad object"));
     assert_out!(row.full, failed("head failed: bad object"));
-    assert!(store.claim("a", Pool::Head, LEASE).await.unwrap().is_none());
-    assert!(
-        store
-            .claim("a", Pool::Background, LEASE)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    for pool in [Pool::Head, Pool::Files, Pool::Full] {
+        assert!(store.claim("a", pool, LEASE).await.unwrap().is_none());
+    }
 }
 
 async fn retryable_failure_on_last_attempt_fails(backend: &dyn Backend) {
@@ -541,22 +597,14 @@ async fn retryable_failure_on_last_attempt_fails(backend: &dyn Backend) {
     assert!(store.claim("a", Pool::Head, LEASE).await.unwrap().is_none());
 }
 
-async fn background_outputs_fail_independently(backend: &dyn Backend) {
+/// A failed Files ends the Files phase: Full still builds, with fresh
+/// attempts.
+async fn failed_files_does_not_stop_full(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     let commit = sha(1);
     store.admit(&repo(), &commit, None).await.unwrap();
-    let claim = store.claim("h", Pool::Head, LEASE).await.unwrap().unwrap();
-    store.publish(&claim, head(&commit, "head")).await.unwrap();
-    store.release(&claim).await.unwrap();
-    let claim = store
-        .claim("b", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    store
-        .fail(&claim, ExactResultKind::Full, "out of memory", None)
-        .await
-        .unwrap();
+    publish_head(store.as_ref(), &commit).await;
+    let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
     store
         .fail(
             &claim,
@@ -566,23 +614,62 @@ async fn background_outputs_fail_independently(backend: &dyn Backend) {
         )
         .await
         .unwrap();
-    let published = store
-        .publish(&claim, files(&commit, "files"))
+    store
+        .fail(&claim, ExactResultKind::Files, "out of memory", None)
         .await
         .unwrap();
-    assert!(published.applied && !published.row_complete);
     store.release(&claim).await.unwrap();
     let row = store.status(&repo(), &commit).await.unwrap().unwrap();
     assert_eq!(ready_manifest(&row.head), Some(manifest(&commit, "head")));
-    assert_eq!(ready_manifest(&row.files), Some(manifest(&commit, "files")));
-    assert_out!(row.full, failed("out of memory"));
+    assert_out!(row.files, failed("out of memory"));
+    assert_out!(row.full, pending(None));
+    assert_eq!(row.attempts, 0, "a failed Files starts the Full phase");
     assert!(
         store
-            .claim("b", Pool::Background, LEASE)
+            .claim("f", Pool::Files, LEASE)
             .await
             .unwrap()
             .is_none()
     );
+
+    let claim = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
+    assert_eq!(claim.build.attempts, 1);
+    let published = store.publish(&claim, full(&commit, "full")).await.unwrap();
+    assert!(published.applied && !published.row_complete);
+    store.release(&claim).await.unwrap();
+    let row = store.status(&repo(), &commit).await.unwrap().unwrap();
+    assert_out!(row.files, failed("out of memory"));
+    assert_eq!(ready_manifest(&row.full), Some(manifest(&commit, "full")));
+    for pool in [Pool::Files, Pool::Full] {
+        assert!(store.claim("x", pool, LEASE).await.unwrap().is_none());
+    }
+}
+
+/// A Files failure with attempts left keeps Files pending, so Full waits
+/// and the next Files attempt follows the backoff.
+async fn retryable_files_failure_holds_full(backend: &dyn Backend) {
+    let (clock, store) = open(backend).await;
+    let commit = sha(1);
+    store.admit(&repo(), &commit, None).await.unwrap();
+    publish_head(store.as_ref(), &commit).await;
+    let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
+    store
+        .fail(
+            &claim,
+            ExactResultKind::Files,
+            "flaky",
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+    store.release(&claim).await.unwrap();
+    let row = store.status(&repo(), &commit).await.unwrap().unwrap();
+    assert_out!(row.files, pending(Some("flaky")));
+    assert_eq!(row.attempts, 1);
+    clock.advance(30);
+    assert!(store.claim("u", Pool::Full, LEASE).await.unwrap().is_none());
+    let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
+    assert_eq!(claim.build.attempts, 2);
 }
 
 async fn retry_touches_only_failed_outputs(backend: &dyn Backend) {
@@ -592,18 +679,9 @@ async fn retry_touches_only_failed_outputs(backend: &dyn Backend) {
     // Head and Files ready, Full failed.
     let commit = sha(1);
     store.admit(&repo(), &commit, None).await.unwrap();
-    let claim = store.claim("h", Pool::Head, LEASE).await.unwrap().unwrap();
-    store.publish(&claim, head(&commit, "head")).await.unwrap();
-    store.release(&claim).await.unwrap();
-    let claim = store
-        .claim("b", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    store
-        .publish(&claim, files(&commit, "files"))
-        .await
-        .unwrap();
+    publish_head(store.as_ref(), &commit).await;
+    publish_files(store.as_ref(), &commit).await;
+    let claim = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
     store
         .fail(&claim, ExactResultKind::Full, "out of memory", None)
         .await
@@ -615,11 +693,14 @@ async fn retry_touches_only_failed_outputs(backend: &dyn Backend) {
     assert_eq!(ready_manifest(&row.files), Some(manifest(&commit, "files")));
     assert_out!(row.full, pending(None));
     assert_eq!(row.attempts, 0);
-    let claim = store
-        .claim("b", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
+    assert!(
+        store
+            .claim("f", Pool::Files, LEASE)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let claim = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
     assert!(
         !store
             .publish(&claim, files(&commit, "again"))
@@ -717,90 +798,68 @@ async fn exhausted_attempts_are_given_up(backend: &dyn Backend) {
             .applied
     );
 
-    // Background phase: Head stays ready, only the pending outputs fail.
+    // Files phase: Head stays ready and only Files fails; Full then gets
+    // its own attempts.
     let other = sha(2);
     store.admit(&repo(), &other, None).await.unwrap();
-    let claim = store.claim("h", Pool::Head, LEASE).await.unwrap().unwrap();
-    store.publish(&claim, head(&other, "head")).await.unwrap();
-    store.release(&claim).await.unwrap();
-    let claim = store
-        .claim("b", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    store.publish(&claim, files(&other, "files")).await.unwrap();
-    clock.advance(60);
-    for _ in 2..=MAX_ATTEMPTS {
-        store
-            .claim("b", Pool::Background, LEASE)
-            .await
-            .unwrap()
-            .unwrap();
+    publish_head(store.as_ref(), &other).await;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
+        assert_eq!(claim.build.attempts, attempt);
+        assert!(store.claim("u", Pool::Full, LEASE).await.unwrap().is_none());
         clock.advance(60);
     }
     assert!(
         store
-            .claim("b", Pool::Background, LEASE)
+            .claim("f", Pool::Files, LEASE)
             .await
             .unwrap()
             .is_none()
     );
     let row = store.status(&repo(), &other).await.unwrap().unwrap();
     assert_eq!(ready_manifest(&row.head), Some(manifest(&other, "head")));
-    assert_eq!(ready_manifest(&row.files), Some(manifest(&other, "files")));
+    assert_out!(row.files, failed("gave up after 3 attempts"));
+    assert_out!(row.full, pending(None));
+    assert_eq!(row.attempts, 0);
+
+    // Full phase: only Full fails.
+    for attempt in 1..=MAX_ATTEMPTS {
+        let claim = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
+        assert_eq!(claim.build.attempts, attempt);
+        clock.advance(60);
+    }
+    assert!(store.claim("u", Pool::Full, LEASE).await.unwrap().is_none());
+    let row = store.status(&repo(), &other).await.unwrap().unwrap();
+    assert_eq!(ready_manifest(&row.head), Some(manifest(&other, "head")));
+    assert_out!(row.files, failed("gave up after 3 attempts"));
     assert_out!(row.full, failed("gave up after 3 attempts"));
+    assert_eq!(row.lease_until, None);
 }
 
 async fn stale_claim_cannot_overwrite_any_ready_result(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     let commit = sha(1);
     store.admit(&repo(), &commit, None).await.unwrap();
-    let first = store
-        .claim("first", Pool::Head, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .publish(&first, head(&commit, "head"))
-            .await
-            .unwrap()
-            .applied
-    );
-    store.release(&first).await.unwrap();
-    let second = store
-        .claim("second", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .publish(&second, files(&commit, "files"))
-            .await
-            .unwrap()
-            .applied
-    );
-    assert!(
-        store
-            .publish(&second, full(&commit, "full"))
-            .await
-            .unwrap()
-            .applied
-    );
-
-    for output in [
-        head(&commit, "stale"),
-        files(&commit, "stale"),
-        full(&commit, "stale"),
+    let mut claims = Vec::new();
+    for (pool, output) in [
+        (Pool::Head, head(&commit, "head")),
+        (Pool::Files, files(&commit, "files")),
+        (Pool::Full, full(&commit, "full")),
     ] {
-        assert!(!store.publish(&first, output).await.unwrap().applied);
+        let claim = store.claim("c", pool, LEASE).await.unwrap().unwrap();
+        assert!(store.publish(&claim, output).await.unwrap().applied);
+        store.release(&claim).await.unwrap();
+        claims.push(claim);
     }
-    for output in [
-        head(&commit, "again"),
-        files(&commit, "again"),
-        full(&commit, "again"),
-    ] {
-        assert!(!store.publish(&second, output).await.unwrap().applied);
+
+    for claim in &claims {
+        for output in [
+            head(&commit, "stale"),
+            files(&commit, "stale"),
+            full(&commit, "stale"),
+        ] {
+            assert!(!store.publish(claim, output).await.unwrap().applied);
+        }
     }
     let row = store.status(&repo(), &commit).await.unwrap().unwrap();
     assert_eq!(ready_manifest(&row.head), Some(manifest(&commit, "head")));
@@ -937,15 +996,8 @@ async fn state_survives_restart(backend: &dyn Backend) {
     store.add_repo(&repo()).await.unwrap();
     store.set_config(&repo(), &config).await.unwrap();
     store.admit(&repo(), &commit, Some(MAIN)).await.unwrap();
-    let claim = store.claim("h", Pool::Head, LEASE).await.unwrap().unwrap();
-    store.publish(&claim, head(&commit, "head")).await.unwrap();
-    store.release(&claim).await.unwrap();
-    let claim = store
-        .claim("b", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    store.publish(&claim, full(&commit, "full")).await.unwrap();
+    publish_head(store.as_ref(), &commit).await;
+    let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
     store
         .fail(
             &claim,
@@ -967,8 +1019,8 @@ async fn state_survives_restart(backend: &dyn Backend) {
     assert_eq!(row.attempts, 1);
     assert_eq!(row.lease_until, Some(START + 60));
     assert_eq!(ready_manifest(&row.head), Some(manifest(&commit, "head")));
-    assert_eq!(ready_manifest(&row.full), Some(manifest(&commit, "full")));
     assert_out!(row.files, pending(Some("flaky")));
+    assert_out!(row.full, pending(None));
     assert_eq!(
         store.get_repo(&repo()).await.unwrap().unwrap().added_at,
         START as u64
@@ -977,6 +1029,21 @@ async fn state_survives_restart(backend: &dyn Backend) {
         store.get_config(&repo()).await.unwrap(),
         Some(config.clone())
     );
+    // The dead process's lease survives until reset at startup.
+    assert_eq!(store.reset_leases().await.unwrap(), 1);
+    clock.advance(5);
+    publish_files(store.as_ref(), &commit).await;
+    let claim = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
+    assert!(
+        store
+            .publish(&claim, full(&commit, "full"))
+            .await
+            .unwrap()
+            .row_complete
+    );
+    drop(store);
+
+    let store = backend.open(clock.clone(), MAX_ATTEMPTS).await.unwrap();
     assert_eq!(
         store
             .latest_ready_full(&repo(), MAIN)
@@ -985,21 +1052,6 @@ async fn state_survives_restart(backend: &dyn Backend) {
             .unwrap()
             .0,
         commit
-    );
-    // The dead process's lease survives until reset at startup.
-    assert_eq!(store.reset_leases().await.unwrap(), 1);
-    clock.advance(5);
-    let claim = store
-        .claim("b2", Pool::Background, LEASE)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .publish(&claim, files(&commit, "files"))
-            .await
-            .unwrap()
-            .row_complete
     );
 }
 

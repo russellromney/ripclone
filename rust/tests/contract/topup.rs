@@ -5,7 +5,7 @@ use crate::harness::*;
 
 /// A private repo on an origin that accepts two credentials: the server's
 /// provider token and the user's own git credential. Full(A) is ready; then
-/// the server restarts with `background_slots = 0` and the origin parks every
+/// the server restarts with no Files or Full slots and the origin parks every
 /// fetch except the user's, so no build of a later commit can finish.
 struct TopUp {
     world: World,
@@ -48,7 +48,7 @@ impl TopUp {
                 &[("RIPCLONE_PROVIDERS", &cli_providers)],
             )
             .ok();
-        server.restart_with(&[("RIPCLONE_BACKGROUND_SLOTS", "0")]);
+        server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
         http.hold_fetches_without("authorization", &user_auth);
         Self {
             world,

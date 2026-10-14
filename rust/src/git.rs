@@ -1555,8 +1555,8 @@ fn sync_bare_mirror_admitted_from(
     }
 
     let _mirror_lock = MirrorLock::acquire(mirror_dir)?;
-    // A commit already in the mirror (an earlier attempt, or the Background
-    // phase after Head) needs no upstream round trip. Auto-gc is off, so it
+    // A commit already in the mirror (an earlier attempt, or the Files and
+    // Full phases after Head) needs no upstream round trip. Auto-gc is off, so it
     // stays.
     if mirror_has_commit(mirror_dir, commit) {
         return Ok(());

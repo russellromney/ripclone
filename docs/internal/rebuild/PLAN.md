@@ -76,10 +76,10 @@ replaced, so several half-models now run at once:
    - status: read the row. One place.
    No jobs table, no workers table, no size classes, no key strings, no stored
    credentials.
-5. **Bounded sequencing.** A claimed build runs fetch, then Head, then Files and
-   Full in parallel. Two process-wide caps: Head slots and background slots. The
-   build holds a background slot for Full and Files. Claim order prefers rows
-   whose Head is pending.
+5. **Bounded sequencing.** Each commit's build runs Head, then Files, then
+   Full. Three process-wide caps: Head, Files and Full slots, one pool each, so
+   a long Full never holds back another commit's Files. Each pool claims in
+   admission order.
 6. **Published outputs are immutable.** Head compaction, if kept, applies to the
    next commit's Head, never by republishing this one.
 7. **Credentials come from the server's broker at build time** (GitHub App,
@@ -129,7 +129,7 @@ replaced, so several half-models now run at once:
 | Control state | `results` JSON + `jobs` + `workers` + `repository_configs`; DDL in 3 places; `meta/` and `queue/` adapter layers | One `builds` table, `added_repos`, `repo_config`. One module with admit, claim, renew, publish, fail, status. |
 | Ref API | `GET /refs` that resolves, fetches, admits, and reports; two 202 shapes for sync | `POST builds` plus pure `GET commits/{sha}`. One response shape per state. |
 | Commit resolution | 3 mechanisms in 6 entry points | One `resolve` function. |
-| Embedded worker loop and sequencing | Foreground release, unbounded background work, PID worker IDs, 30-minute recovery | Two capped pools, short leases, claim order by Head-pending. |
+| Embedded worker loop and sequencing | Foreground release, unbounded background work, PID worker IDs, 30-minute recovery | Three capped pools (Head, Files, Full), short leases, claim order by admission. |
 | Remote worker protocol (if kept) | ~2,200 lines, 6 endpoints, credential shipping, local ref cache | 4 endpoints mapping 1:1 to claim, renew, publish, fail. Credentials from the broker. |
 | Client resolver | Polling loop with pin, top-up branch, mixed 503 handling | POST once, poll the pure GET, same GET for URL refresh. |
 | Top-up | Needs Head(B) built first (reads its parent from storage), B must be a single-parent child of the base, local provider config on every clone, test env reads in production | Base is the newest ready Full for the ref, known as soon as B is admitted. Client installs it, runs one `git fetch <upstream> B` with the user's git credentials, then checks out B. The upstream URL comes from the client's own provider config, never from the server, so a server cannot point the user's git at another host. `git fetch` guarantees B is complete; if the base is not an ancestor (force-push), the fetch just sends more. Full(B) still builds in the background for later clones. |
