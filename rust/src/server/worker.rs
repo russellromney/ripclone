@@ -558,22 +558,21 @@ async fn head_output(
 async fn build_background(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
     let need_full = matches!(claim.build.full, Out::Pending { .. });
     let need_files = matches!(claim.build.files, Out::Pending { .. });
-    let (head, parent_row, config, mirror_dir) =
-        match background_prep(state, claim, need_full).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let failure = classify_build_error(&error);
-                for (kind, needed) in [
-                    (ExactResultKind::Full, need_full),
-                    (ExactResultKind::Files, need_files),
-                ] {
-                    if needed {
-                        record_failure(state, settings, claim, kind, &failure).await;
-                    }
+    let (head, parent_row, config, mirror_dir) = match background_prep(state, claim).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let failure = classify_build_error(&error);
+            for (kind, needed) in [
+                (ExactResultKind::Full, need_full),
+                (ExactResultKind::Files, need_files),
+            ] {
+                if needed {
+                    record_failure(state, settings, claim, kind, &failure).await;
                 }
-                return;
             }
-        };
+            return;
+        }
+    };
     let repo_id = &claim.repo;
     let commit = claim.build.commit.as_str();
     let full = async {
@@ -585,6 +584,12 @@ async fn build_background(state: &ServerState, settings: WorkerSettings, claim: 
             .and_then(|row| row.full.ready())
             .map(|full| full.history_levels.clone())
             .unwrap_or_default();
+        // Best-effort: a reachability bitmap makes the history walk much
+        // faster on large repositories. It takes minutes on Linux-sized
+        // mirrors, so it runs here, outside the repo lock and off the Files
+        // path.
+        let bitmap_dir = mirror_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bitmap_dir)).await;
         let built = build_full_result(
             &state.cas,
             &mirror_dir,
@@ -626,7 +631,6 @@ async fn build_background(state: &ServerState, settings: WorkerSettings, claim: 
 async fn background_prep(
     state: &ServerState,
     claim: &Claim,
-    need_full: bool,
 ) -> Result<(
     crate::HeadResult,
     Option<BuildRow>,
@@ -648,12 +652,6 @@ async fn background_prep(
         let _guard = lock.lock().await;
         // Usually a no-op: the Head build fetched the commit.
         fetch_commit(state, repo_id, commit, &mirror_dir).await?;
-        if need_full {
-            // Best-effort: a reachability bitmap makes the history walk much
-            // faster on large repositories.
-            let bitmap_dir = mirror_dir.clone();
-            let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bitmap_dir)).await;
-        }
     }
     let parent_row = match head.parent_commit.as_deref() {
         Some(parent) => state.control.status(repo_id, parent).await?,
