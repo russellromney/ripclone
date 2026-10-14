@@ -42,11 +42,13 @@ if [ -n "$dependency_matches" ]; then
   exit 1
 fi
 
-# The control store links one SQLite, sqlx's. libsql bundles a second one.
-libsql_matches="$(cd "$ROOT" && git grep -niE 'libsql([^i]|$)' -- . ':!docs/internal' ':!scripts/audit_control_support.sh' || true)"
-if [ -n "$libsql_matches" ]; then
-  echo "libsql is present; the control store uses sqlx's SQLite only:" >&2
-  echo "$libsql_matches" >&2
+# The control store links one SQLite, sqlx's. Turso's SQLite fork bundles a
+# second one, so any mention of it fails. The bracket keeps this script out of
+# its own match. sqlx's own binding crate (SQLite 3 sys) is allowed.
+second_sqlite="$(cd "$ROOT" && git grep -niE 'lib[s]ql([^i]|$)' -- . ':!docs/internal' || true)"
+if [ -n "$second_sqlite" ]; then
+  echo "Turso's SQLite fork is present; the control store uses sqlx's SQLite only:" >&2
+  echo "$second_sqlite" >&2
   exit 1
 fi
 
