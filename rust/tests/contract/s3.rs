@@ -34,10 +34,13 @@ fn s3_f7_expired_url_refreshes_and_resumes() {
         BIG,
         1,
     );
-    let api = FaultProxy::start(&server);
+    let server_proxy = FaultProxy::start(&server);
     let target = world.target("f7");
     world
-        .cli(&api, &["clone", "acme/f7", target.to_str().unwrap()])
+        .cli(
+            &server_proxy,
+            &["clone", "acme/f7", target.to_str().unwrap()],
+        )
         .ok();
 
     let mut by_path: BTreeMap<String, Vec<Seen>> = BTreeMap::new();
@@ -58,16 +61,17 @@ fn s3_f7_expired_url_refreshes_and_resumes() {
         "the resume reused the expired URL"
     );
 
-    let refreshes: Vec<String> = api
+    // The first read of the commit finds it ready; later reads refresh URLs.
+    // Every read names the same commit.
+    let reads: Vec<Seen> = server_proxy
         .seen()
         .into_iter()
-        .filter(|s| s.path.contains("/refs/") && s.query.contains("pinned="))
-        .map(|s| s.query)
+        .filter(|s| s.path.contains(api::COMMIT_READS))
         .collect();
-    assert!(!refreshes.is_empty(), "the CLI never refreshed URLs");
-    for query in &refreshes {
-        assert!(query.contains(&format!("pinned={tip}")), "{query}");
-    }
+    assert!(
+        reads.len() >= 2 && reads.iter().all(|s| api::is_commit_read(s, &tip)),
+        "the CLI never refreshed URLs for {tip}: {reads:#?}"
+    );
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
     git(&target, &["fsck", "--full"]);
     assert_eq!(listing(&target), origin.tree(&tip));

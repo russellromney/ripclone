@@ -639,6 +639,26 @@ impl Server {
         path: &str,
         token: Option<&str>,
     ) -> HttpResponse {
+        self.send(method, path, token, None)
+    }
+
+    /// An authenticated POST of a JSON body.
+    pub fn post_json(&self, path: &str, body: &serde_json::Value) -> HttpResponse {
+        self.send(
+            reqwest::Method::POST,
+            path,
+            Some(TOKEN),
+            Some(body.to_string()),
+        )
+    }
+
+    fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        token: Option<&str>,
+        body: Option<String>,
+    ) -> HttpResponse {
         let client = reqwest::blocking::Client::builder()
             .timeout(WAIT)
             .build()
@@ -646,6 +666,9 @@ impl Server {
         let mut req = client.request(method, format!("{}{path}", self.url));
         if let Some(token) = token {
             req = req.header("Authorization", format!("Ripclone {}", sha256_hex(token)));
+        }
+        if let Some(body) = body {
+            req = req.header("Content-Type", "application/json").body(body);
         }
         let resp = req.send().expect("http request");
         HttpResponse {
@@ -871,4 +894,71 @@ impl Drop for S3 {
 /// Borrow owned env pairs as the `&[(&str, &str)]` the harness takes.
 pub fn env_refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+/// The build API's wire format, kept in one place: `POST .../builds` admits a
+/// selector, `GET .../commits/{sha}[?kind=]` reads one commit's outputs.
+pub mod api {
+    use super::{HttpResponse, Server};
+    use crate::net::Seen;
+
+    pub fn builds_path(repo: &str) -> String {
+        format!("/v1/repos/github/{repo}/builds")
+    }
+
+    pub fn commit_path(repo: &str, commit: &str, kind: Option<&str>) -> String {
+        match kind {
+            Some(kind) => format!("/v1/repos/github/{repo}/commits/{commit}?kind={kind}"),
+            None => format!("/v1/repos/github/{repo}/commits/{commit}"),
+        }
+    }
+
+    /// Whether the fault proxy saw a build admission.
+    pub fn is_build_post(seen: &Seen) -> bool {
+        seen.method == "POST" && seen.path.ends_with("/builds")
+    }
+
+    /// Whether the fault proxy saw a read of `commit`'s outputs.
+    pub fn is_commit_read(seen: &Seen, commit: &str) -> bool {
+        seen.method == "GET" && seen.path.ends_with(&format!("/commits/{commit}"))
+    }
+
+    /// Text in a commit read's URL, for a proxy rule that matches only those.
+    pub const COMMIT_READS: &str = "/commits/";
+
+    /// Status and parsed body (Null if not JSON).
+    pub fn parse(resp: HttpResponse) -> (u16, serde_json::Value) {
+        let body = serde_json::from_str(&resp.body).unwrap_or_default();
+        (resp.status, body)
+    }
+
+    pub fn post_build(
+        server: &Server,
+        repo: &str,
+        selector: &str,
+        retry: bool,
+    ) -> (u16, serde_json::Value) {
+        parse(server.post_json(
+            &builds_path(repo),
+            &serde_json::json!({ "selector": selector, "retry": retry }),
+        ))
+    }
+
+    /// `POST .../add`: register the repo and admit its default branch.
+    pub fn add(server: &Server, repo: &str) -> (u16, serde_json::Value) {
+        parse(server.request(
+            reqwest::Method::POST,
+            &format!("/v1/repos/github/{repo}/add"),
+            Some(super::TOKEN),
+        ))
+    }
+
+    pub fn read_commit(
+        server: &Server,
+        repo: &str,
+        commit: &str,
+        kind: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        parse(server.get(&commit_path(repo, commit, kind)))
+    }
 }

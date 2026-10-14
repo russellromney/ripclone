@@ -83,17 +83,15 @@ fn without_queries(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Every pinned ref response for `commit`, without queries, plus the bytes of
-/// each manifest.
+/// Every output of `commit` as the API reads it, without queries, plus the
+/// bytes of each manifest.
 fn published(server: &Server, commit: &str) -> Vec<(serde_json::Value, String)> {
     ["head", "full", "files"]
         .iter()
         .map(|kind| {
-            let resp = server.get(&format!(
-                "/v1/repos/github/acme/c5/refs/main?result={kind}&pinned={commit}"
-            ));
-            assert_eq!(resp.status, 200, "{kind}: {}", resp.body);
-            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            let (status, body) = api::read_commit(server, "acme/c5", commit, Some(kind));
+            assert_eq!(status, 200, "{kind}: {body}");
+            assert_eq!(body["state"], "ready", "{kind}: {body}");
             let manifest = body["clonepack_manifest"].as_str().unwrap().to_string();
             let bytes = server.get(&format!("/v1/artifacts/{manifest}"));
             assert_eq!(bytes.status, 200, "{kind} manifest {manifest}");

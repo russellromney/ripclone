@@ -29,8 +29,8 @@ fn d1_branch_move_during_clone_installs_b() {
     assert_eq!(listing(&target), origin.tree(&b));
 }
 
-/// D2: a later poll that names a different commit is an integrity error, and
-/// nothing is installed.
+/// D2: a poll that names a different commit than the admission is an
+/// integrity error, and nothing is installed.
 #[test]
 fn d2_changed_commit_in_later_poll_fails() {
     let world = World::new();
@@ -44,9 +44,9 @@ fn d2_changed_commit_in_later_poll_fails() {
     world.cli(&server, &["add", "acme/d2"]).ok();
     http.wait_held(1);
 
-    // The first lookup establishes B; every pinned poll after it says A.
+    // The admission names B; every commit read after it says A.
     let proxy = FaultProxy::start(&server);
-    proxy.rewrite("pinned=", &b, &a);
+    proxy.rewrite(api::COMMIT_READS, &b, &a);
     let target = world.target("d2");
     let out = world.cli_env(
         &proxy,

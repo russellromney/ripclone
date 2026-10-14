@@ -12,7 +12,7 @@ use crate::metrics::{Metrics, SyncPhaseMetrics};
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::storage::StorageRef;
-use crate::validation;
+use crate::validation::{self, Selector};
 use crate::webhook::{EventKind, WebhookConfig};
 use crate::{ExactResultKind, RefInfo};
 use anyhow::{Context, Result};
@@ -159,60 +159,22 @@ fn parse_rate_limit_settings(
     Ok((burst, restore_rate_per_sec))
 }
 
+/// `POST .../builds` body.
 #[derive(Deserialize)]
-pub struct SyncRequest {
-    #[serde(default = "default_branch_value")]
-    pub branch: String,
-    /// Optional git rev to resolve instead of the branch tip (e.g. `HEAD~5` or
-    /// a SHA). The resolved commit is the build and result identity.
+#[serde(deny_unknown_fields)]
+pub struct BuildRequest {
+    /// `HEAD`, a full commit SHA, or a branch or tag name.
+    pub selector: String,
+    /// Put failed outputs of the commit back to pending.
     #[serde(default)]
-    pub rev: Option<String>,
+    pub retry: bool,
 }
 
 #[derive(Deserialize)]
-pub struct RefQuery {
-    pub result: ExactResultKind,
-    /// Optional git rev to resolve instead of the branch tip (e.g. "HEAD~5").
-    /// Pairs with `sync?rev=...`: clone the artifacts built for that commit.
+#[serde(deny_unknown_fields)]
+struct CommitQuery {
     #[serde(default)]
-    pub rev: Option<String>,
-    /// Exact commit learned from an earlier response in this clone operation.
-    /// Unlike `rev`, this is metadata-only and never contacts the upstream or
-    /// schedules work.
-    #[serde(default)]
-    pub pinned: Option<String>,
-    /// Opt in to a one-commit Full-clone top-up plan on a pending pinned lookup.
-    /// Ignored on initial selector, rev-targeted, and non-Full requests.
-    #[serde(default)]
-    pub top_up: bool,
-}
-
-#[derive(Serialize)]
-pub struct BuildResponse {
-    pub status: String,
-    pub queue_depth: usize,
-    pub commit: String,
-    pub branch: String,
-}
-
-#[derive(Serialize)]
-pub struct ArtifactPendingResponse {
-    pub code: &'static str,
-    pub commit: String,
-    pub branch: String,
-    pub status: &'static str,
-    pub queue_depth: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_up_supported: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_up_base: Option<RefResponse>,
-}
-
-#[derive(Serialize)]
-pub struct ExactRevisionUnavailableResponse {
-    pub error: String,
-    pub commit: String,
-    pub branch: String,
+    kind: Option<ExactResultKind>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -253,22 +215,6 @@ impl From<&SyncPhases> for SyncPhaseMetrics {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SyncResponse {
-    #[serde(flatten)]
-    pub ref_info: RefResponse,
-    pub status: String,
-    pub phases: SyncPhases,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unique_bytes: Option<u64>,
-}
-
-fn default_branch_value() -> String {
-    "HEAD".to_string()
-}
-
 /// Resolve a `{*rest}` path segment from `/v1/repos/{*rest}/...` into a
 /// `(RepoId, ProviderInstance)` pair.
 ///
@@ -296,78 +242,77 @@ fn resolve_repo_id<'a>(
     ))
 }
 
-fn unknown_provider_response() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "unknown provider".to_string(),
-        }),
-    )
-        .into_response()
+/// An API error: `{error, code}` with a stable code clients can match.
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    error: String,
 }
 
-fn repo_not_added_response() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "error": "repo not added; run `ripclone add <repo>`",
-            "code": "repo_not_added",
-        })),
-    )
-        .into_response()
+impl ApiError {
+    fn new(status: StatusCode, code: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            error: error.into(),
+        }
+    }
+
+    fn invalid_request(error: impl std::fmt::Display) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            error.to_string(),
+        )
+    }
+
+    /// The control store could not be read or written.
+    fn control(error: impl std::fmt::Display) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control_unavailable",
+            format!("control store unavailable: {error:#}"),
+        )
+    }
 }
 
-fn ref_not_found_response(name: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "error": format!("upstream ref not found: {name}"),
-            "code": "ref_not_found",
-        })),
-    )
-        .into_response()
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({"error": self.error, "code": self.code})),
+        )
+            .into_response()
+    }
 }
 
-async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, Response> {
+fn unknown_provider() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "unknown_provider",
+        "unknown provider",
+    )
+}
+
+fn repo_not_added() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "repo_not_added",
+        "repo not added; run `ripclone add <repo>`",
+    )
+}
+
+async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, ApiError> {
     state
         .control
         .get_repo(repo_id)
         .await
         .map(|repo| repo.is_some())
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("added repo lookup failed: {e}"),
-                }),
-            )
-                .into_response()
+            state.metrics.record_error();
+            ApiError::control(e)
         })
-}
-
-/// Validate an `owner` or `repo` path segment. GitHub identifiers are limited
-/// to ASCII alphanumeric plus `.`, `-`, and `_`, must not be empty, and must
-/// not contain path separators.
-fn validate_repo_id(id: &str) -> Result<()> {
-    if id.is_empty() {
-        anyhow::bail!("repo identifier must not be empty");
-    }
-    if id.len() > 128 {
-        anyhow::bail!("repo identifier too long: {}", id.len());
-    }
-    if id.contains('/') || id.contains('\\') || id.contains('\0') {
-        anyhow::bail!("repo identifier contains path separator: {}", id);
-    }
-    if id == "." || id == ".." {
-        anyhow::bail!("repo identifier cannot be '.' or '..'");
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-    {
-        anyhow::bail!("repo identifier contains invalid characters: {}", id);
-    }
-    Ok(())
 }
 
 async fn repo_lock(
@@ -381,21 +326,6 @@ async fn repo_lock(
         .clone()
 }
 
-fn reject_invalid_repo_ids(owner: &str, repo: &str) -> Option<Response> {
-    if let Err(e) = validate_repo_id(owner).and_then(|_| validate_repo_id(repo)) {
-        return Some(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response(),
-        );
-    }
-    None
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RefResponse {
     pub owner: String,
@@ -406,7 +336,6 @@ pub struct RefResponse {
     pub host: String,
     /// Canonical HTTPS origin URL for the repo.
     pub origin_url: String,
-    pub branch: String,
     pub commit: String,
     pub parent_commit: Option<String>,
     pub clonepack_manifest: String,
@@ -438,7 +367,7 @@ pub struct RefResponse {
     /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idx_bundle_url: Option<String>,
-    pub result: ExactResultKind,
+    pub kind: ExactResultKind,
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -488,10 +417,9 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/v1/repos/{*path}", post(dispatch_repos_post))
         .route("/v1/repos/{*path}", delete(dispatch_repos_delete))
         .route("/v1/artifacts/{hash}", get(get_artifact))
-        // Repository build settings. Legacy `?branch=` queries are parsed only
-        // to return a clear fail-closed error.
+        // Repository build settings, addressed like `/v1/repos`.
         .route(
-            "/v1/admin/config/{owner}/{repo}",
+            "/v1/admin/config/{*path}",
             get(admin_get_config).post(admin_put_config),
         )
         // Clone metrics sink. The cloud consumes these for analytics; the OSS
@@ -798,44 +726,59 @@ async fn metrics_handler(State(state): State<ServerState>) -> impl IntoResponse 
     )
 }
 
+/// Resolve and validate the repository part of a `/v1/repos/...` path.
+fn repo_from_path<'a>(
+    state: &'a ServerState,
+    repo_path: &str,
+) -> Result<(RepoId, &'a ProviderInstance), ApiError> {
+    let (repo_id, provider) =
+        resolve_repo_id(&state.provider_registry, repo_path).ok_or_else(unknown_provider)?;
+    validation::validate_repo_path(provider, &repo_id).map_err(ApiError::invalid_request)?;
+    Ok((repo_id, provider))
+}
+
+fn not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
 async fn dispatch_repos_get(
     Path(path): Path<String>,
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
-) -> impl IntoResponse {
-    if let Some((repo_path, branch)) = path.rsplit_once("/refs/") {
-        let params = match Query::<RefQuery>::try_from_uri(&uri) {
-            Ok(query) => query.0,
-            Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: error.to_string(),
-                    }),
-                )
-                    .into_response();
+) -> Response {
+    if let Some((repo_path, commit)) = path.rsplit_once("/commits/") {
+        let mut response = match repo_from_path(&state, repo_path) {
+            Ok((repo_id, provider)) => {
+                let provider = provider.clone();
+                match Query::<CommitQuery>::try_from_uri(&uri) {
+                    Ok(Query(query)) => get_commit(&state, &repo_id, &provider, commit, query.kind)
+                        .await
+                        .unwrap_or_else(IntoResponse::into_response),
+                    Err(error) => ApiError::invalid_request(error).into_response(),
+                }
             }
+            Err(error) => error.into_response(),
         };
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
-        };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        return get_ref_inner(repo_id, provider.clone(), branch.to_string(), params, state).await;
+        // Every answer is a snapshot of a build that may change on the next
+        // read, and ready bodies carry signed URLs.
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        return response;
     }
 
     if let Some(repo_path) = path.strip_suffix("/status") {
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
+        let repo_id = match repo_from_path(&state, repo_path) {
+            Ok((repo_id, _)) => repo_id,
+            Err(error) => return error.into_response(),
         };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
         let query = match Query::<RepoStatusQuery>::try_from_uri(&uri) {
             Ok(q) => q.0,
             Err(e) => {
@@ -851,63 +794,42 @@ async fn dispatch_repos_get(
         return repo_status_inner(repo_id, query, state).await;
     }
 
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "not found".to_string(),
-        }),
-    )
-        .into_response()
+    not_found_response()
 }
 
 async fn dispatch_repos_post(
     Path(path): Path<String>,
     State(state): State<ServerState>,
-    OriginalUri(uri): OriginalUri,
-) -> impl IntoResponse {
+    body: Bytes,
+) -> Response {
     if let Some(repo_path) = path.strip_suffix("/add") {
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
+        let (repo_id, provider) = match repo_from_path(&state, repo_path) {
+            Ok((repo_id, provider)) => (repo_id, provider.clone()),
+            Err(error) => return error.into_response(),
         };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        return add_repo_inner(repo_id, provider.clone(), state).await;
+        return add_repo(&state, &repo_id, &provider)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
     }
 
-    if let Some(repo_path) = path.strip_suffix("/sync") {
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
+    if let Some(repo_path) = path.strip_suffix("/builds") {
+        let (repo_id, provider) = match repo_from_path(&state, repo_path) {
+            Ok((repo_id, provider)) => (repo_id, provider.clone()),
+            Err(error) => return error.into_response(),
         };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        let query = match Query::<SyncRequest>::try_from_uri(&uri) {
-            Ok(q) => q.0,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("invalid sync request: {}", e),
-                    }),
-                )
+        let request: BuildRequest = match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                return ApiError::invalid_request(format!("invalid build request: {error}"))
                     .into_response();
             }
         };
-        return sync_repo_inner(repo_id, provider.clone(), query, state).await;
+        return post_build(&state, &repo_id, &provider, request)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
     }
 
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "not found".to_string(),
-        }),
-    )
-        .into_response()
+    not_found_response()
 }
 
 async fn dispatch_repos_delete(
@@ -915,15 +837,10 @@ async fn dispatch_repos_delete(
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
     if let Some(repo_path) = path.strip_suffix("/add") {
-        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
-            return unknown_provider_response();
+        return match repo_from_path(&state, repo_path) {
+            Ok((repo_id, _)) => remove_added_repo_inner(repo_id, state).await,
+            Err(error) => error.into_response(),
         };
-        if let Some(resp) =
-            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
-        {
-            return resp;
-        }
-        return remove_added_repo_inner(repo_id, state).await;
     }
 
     (
@@ -955,39 +872,6 @@ async fn list_added_repos(State(state): State<ServerState>) -> Response {
                 .into_response()
         }
     }
-}
-
-async fn ensure_mirror(
-    mirror_dir: &std::path::Path,
-    provider: &ProviderInstance,
-    repo_id: &RepoId,
-    branch: &str,
-    rev: Option<&str>,
-    credential: Option<&secrecy::SecretString>,
-) -> Result<()> {
-    let mirror_dir = mirror_dir.to_path_buf();
-    let provider = provider.clone();
-    let repo_id = repo_id.clone();
-    let branch = branch.to_string();
-    let rev = rev.map(str::to_string);
-    let credential = credential.cloned();
-    // Same process-global fetch cap as the build path.
-    let _fetch_permit = fetch_semaphore()
-        .acquire()
-        .await
-        .expect("fetch semaphore never closed");
-    tokio::task::spawn_blocking(move || {
-        git::sync_bare_mirror(
-            &mirror_dir,
-            &provider,
-            &repo_id,
-            &branch,
-            rev.as_deref(),
-            credential.as_ref(),
-        )
-    })
-    .await
-    .context("ensure mirror task")?
 }
 
 fn exact_result_clonepack(
@@ -1033,360 +917,303 @@ fn kind_state(row: &BuildRow, kind: ExactResultKind) -> Out<()> {
     }
 }
 
-fn row_complete(row: &BuildRow) -> bool {
-    row.head.ready().is_some() && row.full.ready().is_some() && row.files.ready().is_some()
+/// What a selector resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resolved {
+    commit: String,
+    /// The branch a clone checks out. `None` gives a detached checkout: a
+    /// commit SHA, a tag, or an upstream without a symbolic HEAD.
+    checkout_name: Option<String>,
+    /// The upstream ref the commit was read from, recorded on admission.
+    ref_name: Option<String>,
 }
 
-/// The full ref an admission came from, if the selector named a branch tip.
-fn branch_ref_name(branch: &str) -> Option<String> {
-    if branch.is_empty() || branch == "HEAD" {
-        None
-    } else if branch.starts_with("refs/") {
-        Some(branch.to_string())
-    } else {
-        Some(format!("refs/heads/{branch}"))
-    }
-}
-
-async fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
-    artifact_pending_response_with_top_up(commit, branch, queue_depth, None, None).await
-}
-
-async fn artifact_pending_response_with_top_up(
-    commit: &str,
-    branch: &str,
-    queue_depth: usize,
-    top_up_supported: Option<bool>,
-    top_up_base: Option<RefResponse>,
-) -> Response {
-    let mut response = (
-        StatusCode::ACCEPTED,
-        Json(ArtifactPendingResponse {
-            code: "artifact_pending",
-            commit: commit.to_string(),
-            branch: branch.to_string(),
-            status: "building",
-            queue_depth,
-            top_up_supported,
-            top_up_base,
-        }),
-    )
-        .into_response();
-    if let Ok(value) = urlencoding::encode(branch).parse() {
-        response
-            .headers_mut()
-            .insert(axum::http::header::CONTENT_LOCATION, value);
-    }
-    response
-}
-
-/// The Full result of B's parent, as the base of a one-commit top-up while
-/// Full(B) builds. Read from the control store only; the client checks that
-/// the base is B's parent.
-async fn top_up_base_response(
+/// Turn a selector into one commit. A full SHA is trusted as given; `HEAD`
+/// and names cost one `ls-remote` under the fetch cap. Nothing is fetched.
+async fn resolve(
     state: &ServerState,
     repo_id: &RepoId,
     provider: &ProviderInstance,
-    branch: &str,
-    row: &BuildRow,
-) -> Option<RefResponse> {
-    let parent = row.parent.as_deref()?;
-    let parent_row = state.control.status(repo_id, parent).await.ok()??;
-    parent_row.full.ready()?;
-    Some(ref_response(
-        repo_id,
-        provider,
-        branch.to_string(),
-        &row_info(&parent_row),
-        &state.storage,
-        ExactResultKind::Full,
-    ))
-}
-
-async fn get_ref_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    requested_checkout: String,
-    params: RefQuery,
-    state: ServerState,
-) -> Response {
-    if let Some(response) = validation::reject_if_invalid(|| {
-        if requested_checkout == "HEAD" {
-            Ok(())
-        } else {
-            validation::validate_checkout_name(&requested_checkout)
+    selector: &Selector,
+) -> Result<Resolved, ApiError> {
+    let name = match selector {
+        Selector::Commit(commit) => {
+            return Ok(Resolved {
+                commit: commit.clone(),
+                checkout_name: None,
+                ref_name: None,
+            });
         }
-    }) {
-        return response;
-    }
-    if let Some(rev) = params.rev.as_deref()
-        && let Some(response) = validation::reject_if_invalid(|| validation::validate_git_rev(rev))
-    {
-        return response;
-    }
-    if let Some(pinned) = params.pinned.as_deref()
-        && let Some(response) =
-            validation::reject_if_invalid(|| validation::validate_object_id(pinned))
-    {
-        return response;
-    }
-    match repo_is_added(&state, &repo_id).await {
-        Ok(true) => {}
-        Ok(false) => return repo_not_added_response(),
-        Err(response) => return response,
-    }
-
-    let credential = match state.broker.fetch_credential(&repo_id) {
-        Ok(credential) => credential,
-        Err(error) => return credential_error_response(error),
+        Selector::Head => "HEAD",
+        Selector::Name(name) => name.as_str(),
     };
-
-    state.metrics.record_ref_lookup();
-    let (commit, checkout_name, already_pinned) = if let Some(pinned) = params.pinned.as_deref() {
-        let checkout_name = if requested_checkout == "HEAD"
-            && params.rev.as_deref() == Some(pinned)
-            && validation::validate_object_id(pinned).is_ok()
-        {
-            String::new()
-        } else {
-            requested_checkout.clone()
-        };
-        (pinned.to_string(), checkout_name, true)
-    } else if let Some(rev) = params.rev.as_deref() {
-        if validation::validate_object_id(rev).is_ok() {
-            let checkout_name = if requested_checkout == "HEAD" {
-                String::new()
-            } else {
-                requested_checkout.clone()
-            };
-            (rev.to_string(), checkout_name, false)
-        } else {
-            let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-            let lock = repo_lock(&state.sync_locks, &repo_id).await;
-            let _guard = lock.lock().await;
-            if let Err(error) = ensure_mirror(
-                &mirror_dir,
-                &provider,
-                &repo_id,
-                &requested_checkout,
-                Some(rev),
-                credential.as_ref(),
-            )
+    let credential = state
+        .broker
+        .fetch_credential(repo_id)
+        .map_err(credential_error)?;
+    let tip = {
+        let _permit = fetch_semaphore()
+            .acquire()
             .await
-            {
-                warn!(
-                    revision = %rev,
-                    error = %error,
-                    "failed to resolve requested revision"
-                );
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(ErrorResponse {
-                        error: format!(
-                            "cannot resolve requested revision `{rev}`; check the revision and upstream access"
-                        ),
-                    }),
-                )
-                    .into_response();
-            }
-            let checkout_name = if requested_checkout == "HEAD" {
-                match git::default_branch(&mirror_dir)
-                    .ok()
-                    .filter(|name| !name.is_empty() && name != "HEAD")
-                {
-                    Some(name) => name,
-                    None => {
-                        return (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            Json(ErrorResponse {
-                                error: "cannot determine checkout name for HEAD".to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-            } else {
-                requested_checkout.clone()
-            };
-            let commit = match git::resolve_commit(&mirror_dir, rev) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    warn!(
-                        revision = %rev,
-                        error = %error,
-                        "failed to resolve requested revision"
-                    );
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(ErrorResponse {
-                            error: format!(
-                                "cannot resolve requested revision `{rev}`; check the revision and upstream access"
-                            ),
-                        }),
-                    )
-                        .into_response();
-                }
-            };
-            (commit, checkout_name, false)
-        }
-    } else {
-        let tip = {
-            let _permit = fetch_semaphore()
-                .acquire()
-                .await
-                .expect("fetch semaphore never closed");
-            git::ls_remote_tip_async(
-                &provider,
-                &repo_id,
-                &requested_checkout,
-                credential.as_ref(),
-            )
-            .await
-        };
-        match tip {
-            Ok(Some(tip)) => {
-                let checkout_name = if requested_checkout == "HEAD" {
-                    match tip.default_branch.filter(|name| !name.is_empty()) {
-                        Some(name) => name,
-                        None => {
-                            return (
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                Json(ErrorResponse {
-                                    error: "upstream HEAD did not advertise a checkout name"
-                                        .to_string(),
-                                }),
-                            )
-                                .into_response();
-                        }
-                    }
-                } else {
-                    requested_checkout.clone()
-                };
-                (tip.commit, checkout_name, false)
-            }
-            Ok(None) => return ref_not_found_response(&requested_checkout),
-            Err(error) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse {
-                        error: format!("upstream tip probe failed: {error:#}"),
-                    }),
-                )
-                    .into_response();
-            }
-        }
+            .expect("fetch semaphore never closed");
+        git::ls_remote_tip_async(provider, repo_id, name, credential.as_ref()).await
     };
-
-    let existing = match state.control.status(&repo_id, &commit).await {
-        Ok(row) => row,
+    let tip = match tip {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "ref_not_found",
+                format!("upstream ref not found: {name}"),
+            ));
+        }
         Err(error) => {
             state.metrics.record_error();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("exact result lookup failed: {error:#}"),
-                }),
-            )
-                .into_response();
+            // A missing repository, or one the server credential cannot see,
+            // fails the same way every time.
+            let permanent = error
+                .downcast_ref::<git::UpstreamGitError>()
+                .is_some_and(|error| !error.is_retryable());
+            return Err(if permanent {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "repo_not_found",
+                    format!("upstream repository not found or not accessible: {error:#}"),
+                )
+            } else {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_unavailable",
+                    format!("upstream unavailable: {error:#}"),
+                )
+            });
         }
     };
-    let ready_response = |row: &BuildRow, checkout_name: String| {
-        (
-            StatusCode::OK,
-            Json(ref_response(
-                &repo_id,
-                &provider,
-                checkout_name,
-                &row_info(row),
-                &state.storage,
-                params.result,
-            )),
-        )
-            .into_response()
-    };
-    if let Some(row) = existing.as_ref()
-        && exact_result_ready(&row_info(row), params.result, &commit)
-    {
-        return ready_response(row, checkout_name);
-    }
-    if already_pinned {
-        let Some(row) = existing else {
-            return (
-                StatusCode::CONFLICT,
-                Json(ExactRevisionUnavailableResponse {
-                    error: format!(
-                        "{} result is missing for exact commit and no build exists",
-                        params.result
-                    ),
-                    commit,
-                    branch: checkout_name,
-                }),
-            )
-                .into_response();
-        };
-        if let Out::Failed(error) = kind_state(&row, params.result) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ExactRevisionUnavailableResponse {
-                    error: format!("{} result failed: {error}", params.result),
-                    commit,
-                    branch: checkout_name,
-                }),
-            )
-                .into_response();
+    let (checkout_name, ref_name) = match selector {
+        Selector::Head => {
+            let branch = tip
+                .default_branch
+                .filter(|branch| validation::validate_checkout_name(branch).is_ok());
+            let ref_name = branch.as_ref().map(|branch| format!("refs/heads/{branch}"));
+            (branch, ref_name)
         }
-        if params.top_up && params.result == ExactResultKind::Full {
-            let base =
-                top_up_base_response(&state, &repo_id, &provider, &checkout_name, &row).await;
-            return artifact_pending_response_with_top_up(
-                &commit,
-                &checkout_name,
-                0,
-                Some(true),
-                base,
-            )
-            .await;
-        }
-        return artifact_pending_response(&commit, &checkout_name, 0).await;
-    }
-
-    // A rev names a commit, not a branch tip, so it records no ref.
-    let ref_name = if params.rev.is_some() {
-        None
-    } else {
-        branch_ref_name(&checkout_name)
-    };
-    match admit_build(&state, &repo_id, &commit, ref_name.as_deref(), true).await {
-        Ok((row, _)) if exact_result_ready(&row_info(&row), params.result, &commit) => {
-            ready_response(&row, checkout_name)
-        }
-        Ok(_) => artifact_pending_response(&commit, &checkout_name, 0).await,
-        Err(error) => exact_unavailable_response(
-            &state,
-            format!("durable admission failed: {error:#}"),
-            commit,
-            checkout_name,
+        _ => (
+            tip.ref_name.strip_prefix("refs/heads/").map(str::to_string),
+            Some(tip.ref_name),
         ),
+    };
+    Ok(Resolved {
+        commit: tip.commit,
+        checkout_name,
+        ref_name,
+    })
+}
+
+/// `POST .../builds`: resolve the selector, admit its commit, and answer with
+/// the state of each output. Never waits for a build.
+async fn post_build(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    request: BuildRequest,
+) -> Result<Response, ApiError> {
+    let start = Instant::now();
+    let selector = Selector::parse(&request.selector).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_selector",
+            error.to_string(),
+        )
+    })?;
+    if !repo_is_added(state, repo_id).await? {
+        return Err(repo_not_added());
+    }
+    let resolved = resolve(state, repo_id, provider, &selector).await?;
+    admit_resolved(state, repo_id, resolved, request.retry, start).await
+}
+
+/// `POST .../add`: resolve HEAD first, so a repository the upstream does not
+/// have is never added, then add it and admit HEAD.
+async fn add_repo(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+) -> Result<Response, ApiError> {
+    let start = Instant::now();
+    let resolved = resolve(state, repo_id, provider, &Selector::Head).await?;
+    state.control.add_repo(repo_id).await.map_err(|error| {
+        state.metrics.record_error();
+        ApiError::control(error)
+    })?;
+    admit_resolved(state, repo_id, resolved, true, start).await
+}
+
+async fn admit_resolved(
+    state: &ServerState,
+    repo_id: &RepoId,
+    resolved: Resolved,
+    retry: bool,
+    start: Instant,
+) -> Result<Response, ApiError> {
+    let (row, _) = admit_build(
+        state,
+        repo_id,
+        &resolved.commit,
+        resolved.ref_name.as_deref(),
+        retry,
+    )
+    .await
+    .map_err(|error| {
+        state.metrics.record_error();
+        ApiError::control(error)
+    })?;
+    state.metrics.record_sync(start.elapsed());
+    let mut body = build_summary_body(&row);
+    body["checkout_name"] = serde_json::json!(resolved.checkout_name);
+    Ok(Json(body).into_response())
+}
+
+fn output_state(out: Out<()>) -> serde_json::Value {
+    match out {
+        Out::Pending { error: None } => serde_json::json!({"state": "pending"}),
+        Out::Pending { error: Some(error) } => {
+            serde_json::json!({"state": "pending", "error": error})
+        }
+        Out::Ready(()) => serde_json::json!({"state": "ready"}),
+        Out::Failed(error) => serde_json::json!({"state": "failed", "error": error}),
     }
 }
 
-/// Admission failure for an exact-revision request: the control store is unavailable.
-fn exact_unavailable_response(
+/// `{commit, head, files, full}`, each output as `{state, error?}`.
+fn build_summary_body(row: &BuildRow) -> serde_json::Value {
+    serde_json::json!({
+        "commit": row.commit,
+        "head": output_state(kind_state(row, ExactResultKind::Head)),
+        "files": output_state(kind_state(row, ExactResultKind::Files)),
+        "full": output_state(kind_state(row, ExactResultKind::Full)),
+    })
+}
+
+#[derive(Serialize)]
+struct ReadyBody {
+    state: &'static str,
+    #[serde(flatten)]
+    result: RefResponse,
+}
+
+fn ready_body(
     state: &ServerState,
-    error: String,
-    commit: String,
-    branch: String,
-) -> Response {
-    state.metrics.record_error();
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ExactRevisionUnavailableResponse {
-            error,
-            commit,
-            branch,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    row: &BuildRow,
+    kind: ExactResultKind,
+) -> serde_json::Value {
+    serde_json::json!(ReadyBody {
+        state: "ready",
+        result: ref_response(repo_id, provider, row, &state.storage, kind),
+    })
+}
+
+/// `GET .../commits/{sha}[?kind=]`: a pure read of one build. With a kind,
+/// one body per state of that output; without, the summary.
+async fn get_commit(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    commit: &str,
+    kind: Option<ExactResultKind>,
+) -> Result<Response, ApiError> {
+    validation::validate_object_id(commit).map_err(|error| {
+        ApiError::new(StatusCode::BAD_REQUEST, "invalid_commit", error.to_string())
+    })?;
+    let row = state
+        .control
+        .status(repo_id, commit)
+        .await
+        .map_err(|error| {
+            state.metrics.record_error();
+            ApiError::control(error)
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "build_not_found",
+                format!("no build for commit {commit}"),
+            )
+        })?;
+    state.metrics.record_ref_lookup();
+    let Some(kind) = kind else {
+        return Ok(Json(build_summary_body(&row)).into_response());
+    };
+    let body = match kind_state(&row, kind) {
+        Out::Ready(()) => ready_body(state, repo_id, provider, &row, kind),
+        Out::Failed(error) => serde_json::json!({
+            "state": "failed",
+            "commit": row.commit,
+            "kind": kind,
+            "error": error,
         }),
-    )
-        .into_response()
+        Out::Pending { error } => {
+            let mut body = serde_json::json!({
+                "state": "pending",
+                "commit": row.commit,
+                "kind": kind,
+                "attempts": row.attempts,
+            });
+            if let Some(error) = error {
+                body["error"] = serde_json::json!(error);
+            }
+            if kind == ExactResultKind::Full
+                && let Some(top_up) = top_up_plan(state, repo_id, provider, &row).await?
+            {
+                body["top_up"] = top_up;
+            }
+            body
+        }
+    };
+    Ok(Json(body).into_response())
+}
+
+/// While Full(B) is pending, a full clone can install a ready Full of an
+/// older commit and fetch the rest from the upstream. The base is the newest
+/// ready Full admitted from B's ref, else B's parent's Full. Head(B) need not
+/// be ready: a full clone never waits on the server.
+async fn top_up_plan(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    row: &BuildRow,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let control = |error: anyhow::Error| {
+        state.metrics.record_error();
+        ApiError::control(error)
+    };
+    let mut base_commit = None;
+    if let Some(ref_name) = row.ref_name.as_deref() {
+        base_commit = state
+            .control
+            .latest_ready_full(repo_id, ref_name)
+            .await
+            .map_err(control)?
+            .map(|(commit, _)| commit);
+    }
+    let Some(base_commit) = base_commit.or_else(|| row.parent.clone()) else {
+        return Ok(None);
+    };
+    let Some(base) = state
+        .control
+        .status(repo_id, &base_commit)
+        .await
+        .map_err(control)?
+        .filter(|base| base.full.ready().is_some())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::json!({
+        "base_commit": base_commit,
+        "upstream_url": git::upstream_url(provider, repo_id),
+        "base": ready_body(state, repo_id, provider, &base, ExactResultKind::Full),
+    })))
 }
 
 const REF_SIGNED_URL_TTL_SECS: u64 = 1200;
@@ -1405,37 +1232,37 @@ fn ref_signed_url_ttl() -> Duration {
     ))
 }
 
-/// Artifact hashes needed to build one [`RefResponse`], independent of
-/// whether they came from a loaded `RefInfo` or from decoded manifest bytes
-/// (the top-up path).
-struct ResponseArtifacts {
-    commit: String,
-    parent_commit: Option<String>,
-    manifest: String,
-    metadata_chunk: String,
-    archive_chunks: Vec<String>,
-    head_blobs_chunks: Vec<String>,
-    head_blobs_idx: Option<String>,
-    packs: Vec<String>,
-    midx: String,
-    idx_bundle: String,
-}
-
-/// Sign and order the URLs for one ref response. Shared by every builder:
-/// each caller extracts a [`ResponseArtifacts`] from its own source (a
-/// `RefInfo`, or a decoded manifest) and hands it here.
-fn build_ref_response(
+/// The ready `kind` output of `row`, with a signed URL for every artifact the
+/// backend can sign. `None` entries fall back to the gateway's
+/// `/v1/artifacts/{hash}`.
+fn ref_response(
     repo_id: &RepoId,
     provider: &ProviderInstance,
-    branch: String,
-    artifacts: &ResponseArtifacts,
+    row: &BuildRow,
     storage: &crate::storage::StorageRef,
-    result: ExactResultKind,
+    kind: ExactResultKind,
 ) -> RefResponse {
+    let info = row_info(row);
+    let artifacts = exact_result_clonepack(&info, kind)
+        .expect("requested exact result is ready before response construction");
+    let archive_chunks: Vec<String> = info
+        .files
+        .as_ref()
+        .filter(|_| kind == ExactResultKind::Files)
+        .map(|files| files.archive_chunks.clone())
+        .unwrap_or_default();
+    let packs: Vec<String> = match kind {
+        ExactResultKind::Head => info.head.as_ref().map(|head| head.packs.as_slice()),
+        ExactResultKind::Full => info.full.as_ref().map(|full| full.packs.as_slice()),
+        ExactResultKind::Files => None,
+    }
+    .unwrap_or_default()
+    .iter()
+    .map(|p| p.pack.clone())
+    .collect();
     let ttl = ref_signed_url_ttl();
     let signed = |hash: &str| signed_url(storage, ttl, hash);
-    // `None` entries (e.g. local backend) fall back to the gateway. Ordered
-    // to match the manifest's own chunk/pack lists.
+    // Ordered to match the manifest's own chunk and pack lists.
     let signed_list = |hashes: &[String]| -> Option<Vec<Option<String>>> {
         if hashes.is_empty() {
             return None;
@@ -1453,94 +1280,21 @@ fn build_ref_response(
         provider: provider.id.as_str().to_string(),
         host: provider.host.clone(),
         origin_url: provider.clone_url(&repo_id.path),
-        branch,
         commit: artifacts.commit.clone(),
-        parent_commit: artifacts.parent_commit.clone(),
+        parent_commit: row.parent.clone(),
         clonepack_manifest: artifacts.manifest.clone(),
         clonepack_manifest_url: signed(&artifacts.manifest),
         metadata_chunk: artifacts.metadata_chunk.clone(),
         metadata_chunk_url: signed(&artifacts.metadata_chunk),
-        archive_chunk_urls: signed_list(&artifacts.archive_chunks),
-        head_blobs_chunk_urls: signed_list(&artifacts.head_blobs_chunks),
-        head_blobs_idx_url: artifacts.head_blobs_idx.as_deref().and_then(signed),
-        pack_chunk_urls: signed_list(&artifacts.packs),
-        // Sign the pre-built MIDX for the selected variant so the client
-        // installs it directly instead of running `git multi-pack-index
-        // write`, and the idx bundle so the client fetches all idx in one GET.
+        archive_chunk_urls: signed_list(&archive_chunks),
+        head_blobs_chunk_urls: None,
+        head_blobs_idx_url: None,
+        pack_chunk_urls: signed_list(&packs),
+        // The pre-built MIDX lets the client skip `git multi-pack-index
+        // write`; the idx bundle fetches every idx in one GET.
         midx_url: signed(&artifacts.midx),
         idx_bundle_url: signed(&artifacts.idx_bundle),
-        result,
-    }
-}
-
-fn ref_response(
-    repo_id: &RepoId,
-    provider: &ProviderInstance,
-    branch: String,
-    info: &RefInfo,
-    storage: &crate::storage::StorageRef,
-    result: ExactResultKind,
-) -> RefResponse {
-    let artifacts = exact_result_clonepack(info, result)
-        .expect("requested exact result is ready before response construction");
-    let archive_chunks = info
-        .files
-        .as_ref()
-        .filter(|_| result == ExactResultKind::Files)
-        .map(|files| files.archive_chunks.clone())
-        .unwrap_or_default();
-    let packs = match result {
-        ExactResultKind::Head => info.head.as_ref().map(|head| head.packs.as_slice()),
-        ExactResultKind::Full => info.full.as_ref().map(|full| full.packs.as_slice()),
-        ExactResultKind::Files => None,
-    }
-    .unwrap_or_default()
-    .iter()
-    .map(|p| p.pack.clone())
-    .collect();
-    let response_artifacts = ResponseArtifacts {
-        commit: artifacts.commit.clone(),
-        parent_commit: info
-            .head
-            .as_ref()
-            .and_then(|head| head.parent_commit.clone()),
-        manifest: artifacts.manifest.clone(),
-        metadata_chunk: artifacts.metadata_chunk.clone(),
-        archive_chunks,
-        head_blobs_chunks: Vec::new(),
-        head_blobs_idx: None,
-        packs,
-        midx: artifacts.midx.clone(),
-        idx_bundle: artifacts.idx_bundle.clone(),
-    };
-    build_ref_response(
-        repo_id,
-        provider,
-        branch,
-        &response_artifacts,
-        storage,
-        result,
-    )
-}
-
-/// Ready admission response. Signing already-known object URLs does not read
-/// artifact bytes; keeping the byte totals absent preserves the no-op proof's
-/// zero artifact-read boundary.
-fn sync_response_without_storage_read(
-    repo_id: &RepoId,
-    provider: &ProviderInstance,
-    branch: String,
-    info: &RefInfo,
-    storage: &crate::storage::StorageRef,
-    result: ExactResultKind,
-    status: impl Into<String>,
-) -> SyncResponse {
-    SyncResponse {
-        ref_info: ref_response(repo_id, provider, branch, info, storage, result),
-        status: status.into(),
-        phases: SyncPhases::default(),
-        bytes: None,
-        unique_bytes: None,
+        kind,
     }
 }
 
@@ -1551,14 +1305,12 @@ fn signed_url(storage: &crate::storage::StorageRef, ttl: Duration, hash: &str) -
     storage.signed_url(hash, ttl)
 }
 
-fn credential_error_response(e: anyhow::Error) -> Response {
-    (
+fn credential_error(e: anyhow::Error) -> ApiError {
+    ApiError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: format!("credential fetch failed: {e}"),
-        }),
+        "credential_unavailable",
+        format!("credential fetch failed: {e}"),
     )
-        .into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -1713,307 +1465,13 @@ fn build_summary(row: &BuildRow) -> (String, Option<String>) {
     }
 }
 
-/// Ordinary branch-tip sync: resolve one exact upstream commit, then perform a
-/// read-only ready check or admit that immutable target. The response never
-/// waits for the builder.
-async fn sync_repo_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    params: SyncRequest,
-    state: ServerState,
-) -> Response {
-    if let Some(resp) = validation::reject_if_invalid(|| {
-        if params.branch == "HEAD" {
-            Ok(())
-        } else {
-            validation::validate_checkout_name(&params.branch)
-        }
-    }) {
-        return resp;
-    }
-    if params.rev.is_some() {
-        return sync_repo_at_revision(repo_id, provider, params, state).await;
-    }
-    match repo_is_added(&state, &repo_id).await {
-        Ok(true) => {}
-        Ok(false) => return repo_not_added_response(),
-        Err(resp) => return resp,
-    }
-
-    let credential = match state.broker.fetch_credential(&repo_id) {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-
-    let start = Instant::now();
-    let requested_branch = params.branch;
-    let tip = {
-        let _permit = fetch_semaphore()
-            .acquire()
-            .await
-            .expect("fetch semaphore never closed");
-        git::ls_remote_tip_async(&provider, &repo_id, &requested_branch, credential.as_ref()).await
-    };
-    let tip = match tip {
-        Ok(Some(tip)) => tip,
-        Ok(None) => return ref_not_found_response(&requested_branch),
-        Err(e) => {
-            state.metrics.record_error();
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("upstream tip probe failed: {e:#}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-    // The single bounded advertisement asks for symbolic HEAD alongside a
-    // concrete requested branch. Preserve that identity for every exact-only
-    // mirror, not only requests whose selector was HEAD, so later historical
-    // HEAD~N resolution never falls back to Git's platform init default.
-    let commit = tip.commit;
-    let effective_branch = if requested_branch == "HEAD" {
-        tip.default_branch
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or_else(|| requested_branch.clone())
-    } else {
-        requested_branch.clone()
-    };
-
-    // Explicit sync owns every missing result. It is a no-op only when Head,
-    // Full, and Files are all already present; failed outputs are retried.
-    match admit_build(
-        &state,
-        &repo_id,
-        &commit,
-        branch_ref_name(&effective_branch).as_deref(),
-        true,
-    )
-    .await
-    {
-        Ok((row, _)) if row_complete(&row) => {
-            state.metrics.record_sync(start.elapsed());
-            let resp = sync_response_without_storage_read(
-                &repo_id,
-                &provider,
-                effective_branch,
-                &row_info(&row),
-                &state.storage,
-                ExactResultKind::Full,
-                "no-op",
-            );
-            (StatusCode::OK, Json(resp)).into_response()
-        }
-        Ok((_, inserted)) => (
-            StatusCode::ACCEPTED,
-            Json(BuildResponse {
-                status: if inserted { "queued" } else { "coalesced" }.to_string(),
-                // The wire keeps the field; the server no longer tracks a
-                // queue depth.
-                queue_depth: 0,
-                commit,
-                branch: effective_branch,
-            }),
-        )
-            .into_response(),
-        Err(error) => {
-            state.metrics.record_error();
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: format!("durable admission failed: {error:#}"),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// First-class exact-revision sync used by `sync --at REV`.
-async fn sync_repo_at_revision(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    params: SyncRequest,
-    state: ServerState,
-) -> Response {
-    if let Some(resp) = validation::reject_if_invalid(|| {
-        if params.branch == "HEAD" {
-            Ok(())
-        } else {
-            validation::validate_checkout_name(&params.branch)
-        }
-    }) {
-        return resp;
-    }
-    let Some(at_rev) = params.rev else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "exact revision is required".to_string(),
-            }),
-        )
-            .into_response();
-    };
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&at_rev)) {
-        return resp;
-    }
-    match repo_is_added(&state, &repo_id).await {
-        Ok(true) => {}
-        Ok(false) => return repo_not_added_response(),
-        Err(resp) => return resp,
-    }
-    let start = Instant::now();
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let mut branch = params.branch;
-
-    let credential = match state.broker.fetch_credential(&repo_id) {
-        Ok(c) => c,
-        Err(e) => return credential_error_response(e),
-    };
-
-    // Resolve a symbolic historical selector exactly once. Subsequent work and
-    // polls use only the selected object id. A concrete object id never needs
-    // upstream resolution: an explicit branch remains the checkout name, while
-    // the default HEAD selector is represented by an empty detached marker.
-    let selector_is_exact = crate::validation::validate_object_id(&at_rev).is_ok();
-    let needs_resolution_fetch = !selector_is_exact;
-    let selected_commit = if needs_resolution_fetch {
-        let lock = repo_lock(&state.sync_locks, &repo_id).await;
-        let _guard = lock.lock().await;
-        let mirror = mirror_dir.clone();
-        let provider = provider.clone();
-        let repo = repo_id.clone();
-        let fetch_branch = branch.clone();
-        let selector = at_rev.clone();
-        let fetch_credential = credential.clone();
-        let resolved = tokio::task::spawn_blocking(move || {
-            git::sync_bare_mirror(
-                &mirror,
-                &provider,
-                &repo,
-                &fetch_branch,
-                Some(&selector),
-                fetch_credential.as_ref(),
-            )?;
-            let commit = git::resolve_commit(&mirror, &selector)?;
-            let default_branch = git::default_branch(&mirror)
-                .ok()
-                .filter(|candidate| !candidate.is_empty() && candidate != "HEAD");
-            Ok::<_, anyhow::Error>((commit, default_branch))
-        })
-        .await;
-        match resolved {
-            Ok(Ok((commit, default_branch))) => {
-                if branch == "HEAD" {
-                    branch = default_branch.unwrap_or_else(|| branch.clone());
-                }
-                commit
-            }
-            Ok(Err(error)) => {
-                state.metrics.record_error();
-                warn!(
-                    revision = %at_rev,
-                    error = %error,
-                    "failed to resolve requested revision"
-                );
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(ErrorResponse {
-                        error: format!(
-                            "cannot resolve requested revision `{at_rev}`; check the revision and upstream access"
-                        ),
-                    }),
-                )
-                    .into_response();
-            }
-            Err(error) => {
-                state.metrics.record_error();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("exact revision resolution task failed: {error}"),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        if branch == "HEAD" {
-            branch.clear();
-        }
-        at_rev.clone()
-    };
-    let at_rev = selected_commit;
-
-    // Exact revisions use the same immutable `(repository, commit)` row as
-    // ordinary requests; checkout names are never build identity. An explicit
-    // sync is a no-op only when every output is ready.
-    match admit_build(&state, &repo_id, &at_rev, None, true).await {
-        Ok((row, _)) if row_complete(&row) => {
-            state.metrics.record_sync(start.elapsed());
-            let response = sync_response_without_storage_read(
-                &repo_id,
-                &provider,
-                branch,
-                &row_info(&row),
-                &state.storage,
-                ExactResultKind::Full,
-                "no-op",
-            );
-            (StatusCode::OK, Json(response)).into_response()
-        }
-        Ok(_) => artifact_pending_response(&at_rev, &branch, 0).await,
-        Err(error) => exact_unavailable_response(
-            &state,
-            format!("durable admission failed: {error:#}"),
-            at_rev,
-            branch,
-        ),
-    }
-}
-
-async fn add_repo_inner(
-    repo_id: RepoId,
-    provider: ProviderInstance,
-    state: ServerState,
-) -> Response {
-    if let Err(e) = state.control.add_repo(&repo_id).await {
-        state.metrics.record_error();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("add failed: {e:#}"),
-            }),
-        )
-            .into_response();
-    }
-
-    sync_repo_inner(
-        repo_id,
-        provider,
-        SyncRequest {
-            branch: "HEAD".to_string(),
-            rev: None,
-        },
-        state,
-    )
-    .await
-}
-
 async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Response {
     match state.control.remove_repo(&repo_id).await {
         Ok(true) => (StatusCode::NO_CONTENT, Body::empty()).into_response(),
-        Ok(false) => repo_not_added_response(),
+        Ok(false) => repo_not_added().into_response(),
         Err(e) => {
             state.metrics.record_error();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("remove added repo failed: {e:#}"),
-                }),
-            )
-                .into_response()
+            ApiError::control(e).into_response()
         }
     }
 }
@@ -2056,98 +1514,48 @@ async fn admit_build(
     Ok((row, inserted))
 }
 
-/// Legacy branch selectors are parsed only so they can fail closed without
-/// changing repository configuration or admitting work.
-#[derive(Deserialize)]
-struct AdminConfigQuery {
-    #[serde(default)]
-    branch: Option<String>,
-}
-
-/// `GET /v1/admin/config/{owner}/{repo}` — return the stored repository config
-/// (404 if none is stored).
-async fn admin_get_config(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<AdminConfigQuery>,
-    State(state): State<ServerState>,
-) -> Response {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    if query.branch.is_some() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "branch-level repository configuration is no longer supported".to_string(),
-            }),
-        )
-            .into_response();
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+/// `GET /v1/admin/config/{provider}/{path}`: the stored repository config,
+/// or 404 `config_not_found`.
+async fn admin_get_config(Path(path): Path<String>, State(state): State<ServerState>) -> Response {
+    let repo_id = match repo_from_path(&state, &path) {
+        Ok((repo_id, _)) => repo_id,
+        Err(error) => return error.into_response(),
+    };
     match state.control.get_config(&repo_id).await {
         Ok(Some(config)) => (StatusCode::OK, Json(config)).into_response(),
-        Ok(None) => (
+        Ok(None) => ApiError::new(
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "no config stored for this repository".to_string(),
-            }),
+            "config_not_found",
+            "no config stored for this repository",
         )
-            .into_response(),
+        .into_response(),
         Err(e) => {
             state.metrics.record_error();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("load config: {e:#}"),
-                }),
-            )
-                .into_response()
+            ApiError::control(e).into_response()
         }
     }
 }
 
-/// `POST /v1/admin/config/{owner}/{repo}` — store the repository config. The
-/// body is validated before the control database is written; builds read it
-/// when they start.
+/// `POST /v1/admin/config/{provider}/{path}`: store the repository config.
+/// The body is validated before the control database is written; builds read
+/// it when they start.
 async fn admin_put_config(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<AdminConfigQuery>,
+    Path(path): Path<String>,
     State(state): State<ServerState>,
     Json(config): Json<crate::repo_config::RepoConfig>,
 ) -> Response {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    if query.branch.is_some() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "branch-level repository configuration is no longer supported".to_string(),
-            }),
-        )
-            .into_response();
-    }
+    let repo_id = match repo_from_path(&state, &path) {
+        Ok((repo_id, _)) => repo_id,
+        Err(error) => return error.into_response(),
+    };
     if let Err(e) = config.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid config: {e:#}"),
-            }),
-        )
-            .into_response();
+        return ApiError::invalid_request(format!("invalid config: {e:#}")).into_response();
     }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     match state.control.set_config(&repo_id, &config).await {
         Ok(()) => (StatusCode::OK, Json(config)).into_response(),
         Err(e) => {
             state.metrics.record_error();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("store config: {e:#}"),
-                }),
-            )
-                .into_response()
+            ApiError::control(e).into_response()
         }
     }
 }
@@ -2191,7 +1599,7 @@ async fn handle_webhook(
 ) -> Response {
     // Resolve the configured provider instance from the path.
     let Some(provider) = state.provider_registry.get(&provider_id).cloned() else {
-        return unknown_provider_response();
+        return unknown_provider().into_response();
     };
     // Phase 1: only GitHub has a webhook adapter; other kinds are follow-ups.
     let Some(adapter) = crate::webhook::provider_for(provider.kind) else {
@@ -2290,7 +1698,7 @@ async fn webhook_dispatch_push(
     match repo_is_added(state, &repo_id).await {
         Ok(true) => {}
         Ok(false) => return webhook_ignored("repo not added"),
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     }
     // Only branch pushes can identify the admitted default-branch commit; tags
     // and other refs are ignored.
@@ -3651,39 +3059,32 @@ pub async fn poll_once(state: &ServerState) -> usize {
         else {
             continue; // unknown provider; skip
         };
-        // Cheap tip probe, under the same fetch cap as a real fetch so a sweep
-        // can't become uncapped upstream chatter. Best-effort.
-        let credential = match state.broker.fetch_credential(&repo_id) {
-            Ok(c) => c,
-            Err(e) => {
+        let resolved = match resolve(state, &repo_id, &provider, &Selector::Head).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
                 warn!(
-                    "poll: credential fetch for {} failed: {e:#}",
-                    repo_id.storage_key()
+                    "poll: resolve HEAD of {} failed: {}",
+                    repo_id.storage_key(),
+                    error.error
                 );
                 continue;
             }
         };
-        let tip = {
-            let _permit = fetch_semaphore()
-                .acquire()
-                .await
-                .expect("fetch semaphore never closed");
-            git::ls_remote_tip_async(&provider, &repo_id, "HEAD", credential.as_ref()).await
-        };
-        let Ok(Some(tip)) = tip else {
-            continue; // unknown HEAD / probe failed
-        };
-        let ref_name = tip
-            .default_branch
-            .as_deref()
-            .map(|branch| format!("refs/heads/{branch}"));
-        match admit_build(state, &repo_id, &tip.commit, ref_name.as_deref(), false).await {
+        match admit_build(
+            state,
+            &repo_id,
+            &resolved.commit,
+            resolved.ref_name.as_deref(),
+            false,
+        )
+        .await
+        {
             Ok((_, true)) => {
                 triggered += 1;
                 info!(
                     "poll: admitted HEAD build for {} at {}",
                     repo_id.storage_key(),
-                    &tip.commit[..7.min(tip.commit.len())]
+                    &resolved.commit[..7.min(resolved.commit.len())]
                 );
             }
             Ok((_, false)) => {}
@@ -3913,28 +3314,339 @@ mod tests {
             &"b".repeat(40)
         ));
     }
-    #[tokio::test]
-    async fn pending_body_includes_the_selected_branch() {
-        let response = artifact_pending_response(&"a".repeat(40), "rélease/東京", 3).await;
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::CONTENT_LOCATION)
-                .and_then(|value| value.to_str().ok()),
-            Some("r%C3%A9lease%2F%E6%9D%B1%E4%BA%AC")
+    /// A row whose ready outputs are those of `info`; the rest are pending.
+    fn row_of(info: RefInfo, parent: Option<String>) -> BuildRow {
+        fn out<T>(result: Option<T>) -> Out<T> {
+            result.map_or(Out::Pending { error: None }, Out::Ready)
+        }
+        BuildRow {
+            commit: info.commit,
+            ref_name: None,
+            parent,
+            created_at: 0,
+            head: out(info.head),
+            files: out(info.files),
+            full: out(info.full),
+            attempts: 0,
+            lease_until: None,
+        }
+    }
+
+    /// Admit `commit`, publish its Head (with `parent`) and Full, and fail
+    /// its Files for good.
+    async fn publish_head_and_full(
+        state: &ServerState,
+        repo_id: &RepoId,
+        commit: &str,
+        ref_name: Option<&str>,
+        parent: Option<&str>,
+    ) {
+        let metadata = state
+            .cas
+            .put(format!("metadata {commit}").as_bytes())
+            .unwrap();
+        let manifest =
+            make_manifest(commit, &None, &[], &metadata, 15, Vec::new(), None, None).unwrap();
+        let manifest = state.cas.put(&manifest.encode_to_vec()).unwrap();
+        let artifacts = |label: &str| crate::ClonepackArtifacts {
+            manifest: manifest.clone(),
+            metadata_chunk: metadata.clone(),
+            ..ready_artifacts(commit, label)
+        };
+        let lease = Duration::from_secs(60);
+        state
+            .control
+            .admit(repo_id, commit, ref_name)
+            .await
+            .unwrap();
+        let head = state
+            .control
+            .claim("test-head", crate::control::Pool::Head, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.build.commit, commit);
+        let output = crate::control::Output::Head {
+            result: crate::HeadResult {
+                clonepack: artifacts("head"),
+                ..Default::default()
+            },
+            parent: parent.map(str::to_string),
+        };
+        assert!(state.control.publish(&head, output).await.unwrap().applied);
+        state.control.release(&head).await.unwrap();
+        let background = state
+            .control
+            .claim("test-background", crate::control::Pool::Background, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        let output = crate::control::Output::Full(crate::FullResult {
+            clonepack: artifacts("full"),
+            ..Default::default()
+        });
+        assert!(
+            state
+                .control
+                .publish(&background, output)
+                .await
+                .unwrap()
+                .applied
         );
+        state
+            .control
+            .fail(&background, ExactResultKind::Files, "archive broke", None)
+            .await
+            .unwrap();
+        state.control.release(&background).await.unwrap();
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let mut request = test_request(method, uri);
+        if let Some(body) = body {
+            *request.body_mut() = Body::from(body.to_string());
+            request.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+        }
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("read pending body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("pending JSON");
-        let keys = body.as_object().expect("pending object");
-        assert_eq!(keys.len(), 5);
-        assert_eq!(body["code"], "artifact_pending");
-        assert_eq!(body["commit"], "a".repeat(40));
-        assert_eq!(body["branch"], "rélease/東京");
-        assert_eq!(body["status"], "building");
-        assert_eq!(body["queue_depth"], 3);
+            .unwrap();
+        let body = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
+        (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn commits_answer_each_output_state_without_caching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let repo_id = RepoId::github("acme/api");
+        mark_added(&state, repo_id.clone()).await;
+        let base = "b".repeat(40);
+        let tip = "c".repeat(40);
+        publish_head_and_full(&state, &repo_id, &base, Some("refs/heads/main"), None).await;
+        state
+            .control
+            .admit(&repo_id, &tip, Some("refs/heads/main"))
+            .await
+            .unwrap();
+        let control = Arc::clone(&state.control);
+        let app = build_app(state);
+        let commits = "/v1/repos/github/acme/api/commits";
+
+        let (status, headers, ready) =
+            call(&app, "GET", &format!("{commits}/{base}?kind=full"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(ready["state"], "ready");
+        assert_eq!(ready["kind"], "full");
+        assert_eq!(ready["commit"], base);
+        assert!(ready.get("branch").is_none());
+        assert!(ready["clonepack_manifest"].is_string());
+
+        let (_, _, failed) = call(&app, "GET", &format!("{commits}/{base}?kind=files"), None).await;
+        assert_eq!(
+            failed,
+            serde_json::json!({"state": "failed", "commit": base, "kind": "files", "error": "archive broke"})
+        );
+
+        // Full(tip) pending: the newest ready Full of the same ref is the
+        // top-up base, although Head(tip) is not built.
+        let (status, headers, pending) =
+            call(&app, "GET", &format!("{commits}/{tip}?kind=full"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["attempts"], 0);
+        assert_eq!(pending["top_up"]["base_commit"], base);
+        assert_eq!(pending["top_up"]["base"], ready);
+        assert!(
+            pending["top_up"]["upstream_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/acme/api.git")
+        );
+        let (_, _, head) = call(&app, "GET", &format!("{commits}/{tip}?kind=head"), None).await;
+        assert_eq!(
+            head,
+            serde_json::json!({"state": "pending", "commit": tip, "kind": "head", "attempts": 0})
+        );
+
+        let (_, _, summary) = call(&app, "GET", &format!("{commits}/{base}"), None).await;
+        assert_eq!(
+            summary,
+            serde_json::json!({
+                "commit": base,
+                "head": {"state": "ready"},
+                "files": {"state": "failed", "error": "archive broke"},
+                "full": {"state": "ready"},
+            })
+        );
+
+        let unknown = "d".repeat(40);
+        let (status, headers, missing) =
+            call(&app, "GET", &format!("{commits}/{unknown}?kind=full"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(missing["code"], "build_not_found");
+        assert!(control.status(&repo_id, &unknown).await.unwrap().is_none());
+
+        let (status, _, invalid) =
+            call(&app, "GET", &format!("{commits}/main?kind=full"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid["code"], "invalid_commit");
+    }
+
+    #[tokio::test]
+    async fn top_up_falls_back_to_the_parent_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let repo_id = RepoId::github("acme/api");
+        let parent = "b".repeat(40);
+        let child = "c".repeat(40);
+        publish_head_and_full(&state, &repo_id, &parent, None, None).await;
+        // The child's Head names the parent; its Full is still pending.
+        state.control.admit(&repo_id, &child, None).await.unwrap();
+        let head = state
+            .control
+            .claim(
+                "test-head",
+                crate::control::Pool::Head,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut artifacts = state
+            .control
+            .status(&repo_id, &parent)
+            .await
+            .unwrap()
+            .unwrap();
+        let Out::Ready(mut result) =
+            std::mem::replace(&mut artifacts.head, Out::Failed(String::new()))
+        else {
+            panic!("parent Head is ready");
+        };
+        result.clonepack.commit = child.clone();
+        let output = crate::control::Output::Head {
+            result,
+            parent: Some(parent.clone()),
+        };
+        assert!(state.control.publish(&head, output).await.unwrap().applied);
+        let app = build_app(state);
+
+        let (_, _, pending) = call(
+            &app,
+            "GET",
+            &format!("/v1/repos/github/acme/api/commits/{child}?kind=full"),
+            None,
+        )
+        .await;
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["top_up"]["base_commit"], parent);
+        assert_eq!(
+            pending["top_up"]["base"]["parent_commit"],
+            serde_json::Value::Null
+        );
+        let (_, _, head) = call(
+            &app,
+            "GET",
+            &format!("/v1/repos/github/acme/api/commits/{child}?kind=head"),
+            None,
+        )
+        .await;
+        assert_eq!(head["state"], "ready");
+        assert_eq!(head["parent_commit"], parent);
+    }
+
+    #[tokio::test]
+    async fn builds_admit_a_sha_without_the_upstream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let repo_id = RepoId::github("acme/api");
+        let builds = "/v1/repos/github/acme/api/builds";
+        let commit = "e".repeat(40);
+        let control = Arc::clone(&state.control);
+        let app = build_app(state);
+
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            builds,
+            Some(serde_json::json!({"selector": commit})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "repo_not_added");
+        control.add_repo(&repo_id).await.unwrap();
+
+        // A short SHA is a valid branch name, so it is not tested here: it
+        // would ask the upstream.
+        for selector in ["HEAD~1", "main^", "main@{1}", ""] {
+            let (status, _, body) = call(
+                &app,
+                "POST",
+                builds,
+                Some(serde_json::json!({"selector": selector})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{selector:?}");
+            assert_eq!(body["code"], "invalid_selector");
+        }
+        for request in [
+            serde_json::json!({}),
+            serde_json::json!({"selector": "HEAD", "branch": "main"}),
+        ] {
+            let (status, _, body) = call(&app, "POST", builds, Some(request)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "invalid_request");
+        }
+        assert!(control.list_builds(&repo_id).await.unwrap().is_empty());
+
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            builds,
+            Some(serde_json::json!({"selector": commit, "retry": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "commit": commit,
+                "checkout_name": null,
+                "head": {"state": "pending"},
+                "files": {"state": "pending"},
+                "full": {"state": "pending"},
+            })
+        );
+        let row = control.status(&repo_id, &commit).await.unwrap().unwrap();
+        assert_eq!(row.ref_name, None);
+
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            "/v1/repos/nowhere/acme/api/builds",
+            Some(serde_json::json!({"selector": commit})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "unknown_provider");
     }
 
     /// A `ServerState` on a real control store in `tmp`, with no workers.
@@ -4146,23 +3858,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_repo_id_accepts_names_and_rejects_paths() {
-        for (id, ok) in [
-            ("ripclone", true),
-            ("ripclone-rs", true),
-            ("ripclone.rs", true),
-            ("rip_clone", true),
-            ("..", false),
-            ("foo/bar", false),
-            ("foo\\bar", false),
-            ("foo\0bar", false),
-            ("", false),
-        ] {
-            assert_eq!(validate_repo_id(id).is_ok(), ok, "{id:?}");
-        }
-    }
-
-    #[test]
     fn server_auth_token_hash_prefers_the_hash_and_requires_a_token() {
         let s = |v: &str| Some(v.to_string());
         let secret = Some(hex::encode(Sha256::digest("secret")));
@@ -4302,8 +3997,7 @@ mod tests {
         let resp = ref_response(
             &repo_id,
             &provider,
-            "main".to_string(),
-            &info,
+            &row_of(info, None),
             &storage,
             ExactResultKind::Full,
         );
@@ -4359,7 +4053,6 @@ mod tests {
             commit: commit.clone(),
             head: Some(crate::HeadResult {
                 clonepack: ready_artifacts(&commit, "head"),
-                parent_commit: Some(parent.clone()),
                 packs: vec![pack("h1")],
                 ..Default::default()
             }),
@@ -4380,15 +4073,10 @@ mod tests {
         let provider = ProviderRegistry::new().get("github").unwrap().clone();
         let repo_id = RepoId::github("o/r");
         let signed = |ttl: u64, hash: &str| Some(format!("signed:{ttl}:{hash}"));
+        // `parent_commit` comes from the row, not from the Head result.
+        let row = row_of(info.clone(), Some(parent.clone()));
 
-        let full = ref_response(
-            &repo_id,
-            &provider,
-            "main".to_string(),
-            &info,
-            &storage,
-            ExactResultKind::Full,
-        );
+        let full = ref_response(&repo_id, &provider, &row, &storage, ExactResultKind::Full);
         let full_artifacts = info.full.as_ref().unwrap();
         assert_eq!(full.commit, commit);
         assert_eq!(full.parent_commit.as_deref(), Some(parent.as_str()));
@@ -4418,14 +4106,7 @@ mod tests {
         assert!(full.head_blobs_chunk_urls.is_none());
         assert!(full.head_blobs_idx_url.is_none());
 
-        let files = ref_response(
-            &repo_id,
-            &provider,
-            "main".to_string(),
-            &info,
-            &storage,
-            ExactResultKind::Files,
-        );
+        let files = ref_response(&repo_id, &provider, &row, &storage, ExactResultKind::Files);
         assert_eq!(
             files.archive_chunk_urls,
             Some(vec![signed(1200, "a1"), signed(1200, "a2")])
@@ -4439,14 +4120,7 @@ mod tests {
         assert!(files.midx_url.is_none());
         assert_eq!(files.parent_commit.as_deref(), Some(parent.as_str()));
 
-        let head = ref_response(
-            &repo_id,
-            &provider,
-            "main".to_string(),
-            &info,
-            &storage,
-            ExactResultKind::Head,
-        );
+        let head = ref_response(&repo_id, &provider, &row, &storage, ExactResultKind::Head);
         assert_eq!(head.pack_chunk_urls, Some(vec![signed(1200, "h1-pack")]));
     }
 
@@ -5182,17 +4856,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_rejects_invalid_branch_name() {
+    async fn admin_config_is_addressed_by_provider_and_path() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp).await;
+        let control = Arc::clone(&state.control);
         let app = build_app(state);
-        let response = app
-            .oneshot(test_request(
-                "POST",
-                "/v1/repos/github/acme/secret/sync?branch=../evil",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let uri = "/v1/admin/config/github/acme/configured";
+
+        let (status, _, body) = call(&app, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "config_not_found");
+        let (status, _, _) = call(&app, "POST", uri, Some(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            control
+                .get_config(&RepoId::github("acme/configured"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let (status, _, _) = call(&app, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, body) = call(&app, "GET", "/v1/admin/config/nowhere/acme/x", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "unknown_provider");
     }
 }

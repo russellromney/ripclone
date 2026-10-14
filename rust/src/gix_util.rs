@@ -131,18 +131,6 @@ pub fn is_empty_repo<P: AsRef<Path>>(repo_path: P) -> Result<bool> {
     Ok(iter.next().is_none())
 }
 
-/// Return the name of the current branch (e.g. `main`).
-pub fn default_branch<P: AsRef<Path>>(repo_path: P) -> Result<String> {
-    let repo = open_repo(repo_path)?;
-    let head = repo.head().context("reading HEAD")?;
-    let name = head
-        .referent_name()
-        .context("detached HEAD has no branch name")?
-        .shorten()
-        .to_string();
-    Ok(name)
-}
-
 /// Return the immediate parent of `commit` only when it has exactly one.
 ///
 /// Roots and merges deliberately return `None`: callers use this value as an

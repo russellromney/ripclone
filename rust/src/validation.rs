@@ -2,7 +2,6 @@
 
 use crate::provider::{ProviderInstance, ProviderKind, RepoId};
 use anyhow::{Context, Result};
-use axum::response::IntoResponse;
 
 const MAX_REF_LEN: usize = 256;
 
@@ -135,24 +134,32 @@ pub fn validate_object_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run a validation closure and convert the error into an axum `BAD_REQUEST`
-/// response. Returns `Some(Response)` on failure so handlers can early-return.
-pub fn reject_if_invalid<F>(f: F) -> Option<axum::response::Response>
-where
-    F: FnOnce() -> Result<()>,
-{
-    if let Err(e) = f() {
-        return Some(
-            (
-                axum::http::StatusCode::BAD_REQUEST,
-                axum::Json(crate::server::ErrorResponse {
-                    error: e.to_string(),
-                }),
+/// What a build request names. The server and the CLI parse it with the same
+/// rule: rev expressions such as `HEAD~1` and short SHAs are not selectors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selector {
+    /// The upstream default branch.
+    Head,
+    /// A full commit SHA, trusted without asking the upstream.
+    Commit(String),
+    /// A branch name, or failing that a tag name.
+    Name(String),
+}
+
+impl Selector {
+    pub fn parse(selector: &str) -> Result<Self> {
+        if selector == "HEAD" {
+            Ok(Self::Head)
+        } else if validate_object_id(selector).is_ok() {
+            Ok(Self::Commit(selector.to_string()))
+        } else if validate_checkout_name(selector).is_ok() {
+            Ok(Self::Name(selector.to_string()))
+        } else {
+            anyhow::bail!(
+                "invalid selector `{selector}`: use HEAD, a full commit SHA, or a branch or tag name"
             )
-                .into_response(),
-        );
+        }
     }
-    None
 }
 
 #[cfg(test)]
@@ -196,6 +203,23 @@ mod tests {
         }
         assert!(validate_checkout_name("main").is_ok());
         assert!(validate_checkout_name("feature/exact-results").is_ok());
+    }
+
+    #[test]
+    fn selector_is_head_a_full_sha_or_a_name() {
+        let sha = "a".repeat(40);
+        assert_eq!(Selector::parse("HEAD").unwrap(), Selector::Head);
+        assert_eq!(
+            Selector::parse(&sha).unwrap(),
+            Selector::Commit(sha.clone())
+        );
+        assert_eq!(
+            Selector::parse("v1.2").unwrap(),
+            Selector::Name("v1.2".into())
+        );
+        for invalid in ["HEAD~1", "main^", "main@{1}", "", "-x", "a..b"] {
+            assert!(Selector::parse(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     fn provider(kind: ProviderKind, id: &str) -> ProviderInstance {
