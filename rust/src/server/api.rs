@@ -167,12 +167,6 @@ pub struct RefResponse {
     /// gateway's `/v1/artifacts/{hash}` endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_chunk_urls: Option<Vec<Option<String>>>,
-    /// Signed URL for each chunk of the head-blobs pack, in order.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub head_blobs_chunk_urls: Option<Vec<Option<String>>>,
-    /// Signed URL for the optional head-blobs idx.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub head_blobs_idx_url: Option<String>,
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pack_chunk_urls: Option<Vec<Option<String>>>,
@@ -768,8 +762,6 @@ fn ref_response(
         metadata_chunk: artifacts.metadata_chunk.clone(),
         metadata_chunk_url: signed(&artifacts.metadata_chunk),
         archive_chunk_urls: signed_list(&archive_chunks),
-        head_blobs_chunk_urls: None,
-        head_blobs_idx_url: None,
         pack_chunk_urls: signed_list(&packs),
         // The pre-built MIDX lets the client skip `git multi-pack-index
         // write`; the idx bundle fetches every idx in one GET.
@@ -959,8 +951,8 @@ async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Respons
 
 /// Admit `commit` and wake the pool that has work for it. Returns the row and
 /// whether this call created it. With `retry`, failed outputs go back to
-/// pending: an explicit request (`/sync`, `/add`, a clone lookup) asks for
-/// them again. Webhook and poller admissions leave failures alone.
+/// pending: an explicit request (`POST .../builds` with `retry`, `/add`) asks
+/// for them again. Webhook and poller admissions leave failures alone.
 pub(super) async fn admit_build(
     state: &ServerState,
     repo_id: &RepoId,
@@ -1674,8 +1666,6 @@ mod tests {
             signed(1200, &full_artifacts.clonepack.idx_bundle)
         );
         assert!(full.archive_chunk_urls.is_none());
-        assert!(full.head_blobs_chunk_urls.is_none());
-        assert!(full.head_blobs_idx_url.is_none());
 
         let files = ref_response(&repo_id, &provider, &row, &storage, ExactResultKind::Files);
         assert_eq!(

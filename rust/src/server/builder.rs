@@ -254,7 +254,7 @@ fn assemble_variant(
     ))
 }
 
-/// Build a multi-pack-index over `packs` from local CAS. Free-function form.
+/// Build a multi-pack-index over `packs` from local CAS.
 ///
 /// Reads each pack's bytes from the *local* CAS (no object-storage fallback), so
 /// only call this when every pack was built this sync and is still local — e.g.

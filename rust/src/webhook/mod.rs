@@ -4,11 +4,10 @@
 //! control store, the build workers, storage. The receiver does three things:
 //! **verify → normalize → admit**. This module owns the normalize step
 //! (per-provider parsing) and the config (per-provider secret + optional
-//! allowlist); `server.rs` wires it into the router and the admission path.
+//! allowlist); `server/webhooks.rs` wires it into the router and the admission path.
 //!
-//! Phase 1 ships GitHub only. GitLab and Gitea are later `WebhookProvider`
-//! impls behind the same trait — adding a provider is implementing this one
-//! trait, nothing else.
+//! GitHub, GitLab and Gitea have `WebhookProvider` impls behind the same
+//! trait — adding a provider is implementing this one trait, nothing else.
 
 use crate::provider::{ProviderKind, ProviderRegistry};
 use axum::http::HeaderMap;

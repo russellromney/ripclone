@@ -50,7 +50,7 @@ pub(super) async fn webhook_handler(
 
 /// verify (HMAC over the RAW body) → normalize → admit a build via the shared
 /// `admit_build` path (so the build runs ahead of any clone, coalescing with
-/// `/sync`). Responds 2xx fast. Fail-closed: no configured secret ⇒ 503; bad
+/// `POST .../builds`). Responds 2xx fast. Fail-closed: no configured secret ⇒ 503; bad
 /// signature ⇒ 401. The payload is trusted only for routing (which repo / ref),
 /// never to choose a credential or escalate.
 async fn handle_webhook(
@@ -63,7 +63,7 @@ async fn handle_webhook(
     let Some(provider) = state.provider_registry.get(&provider_id).cloned() else {
         return unknown_provider().into_response();
     };
-    // Phase 1: only GitHub has a webhook adapter; other kinds are follow-ups.
+    // Config-only generic hosts have no webhook adapter.
     let Some(adapter) = crate::webhook::provider_for(provider.kind) else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -274,8 +274,7 @@ mod tests {
         .into_bytes()
     }
 
-    /// A push payload that omits `repository.default_branch`, to exercise the
-    /// mirror fallback.
+    /// A push payload that omits `repository.default_branch`.
     fn gh_push_body_no_default(owner: &str, repo: &str, ref_: &str, after: &str) -> Vec<u8> {
         serde_json::json!({
             "ref": ref_,

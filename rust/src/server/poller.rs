@@ -10,7 +10,7 @@ use tracing::{info, warn};
 /// (`ls-remote`, under the fetch cap) and admit a build for that commit if it
 /// is new. Catches pushes that arrived without a webhook/Actions trigger,
 /// so build-before-clone still holds. Best-effort: per-repo errors are logged and
-/// skipped. Returns the number of builds admitted. Exposed for tests.
+/// skipped. Returns the number of builds admitted.
 pub async fn poll_once(state: &ServerState) -> usize {
     let repos = match state.control.list_repos().await {
         Ok(r) => r,
