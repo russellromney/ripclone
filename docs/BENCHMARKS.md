@@ -2,131 +2,133 @@
 
 Full results behind the summary table in the [README](../README.md#performance).
 
-For representative comparisons, use a real SSD/NVMe filesystem. Memory-backed
-temporary directories can hide filesystem, fsync, and worktree materialization
-bottlenecks.
+Measured on Hetzner Cloud on 2026-10-14 with the current release code. To
+reproduce, see [`benchmark/README.md`](../benchmark/README.md).
 
-## How to read these numbers
+## Setup
 
-ripclone pre-builds git artifacts so clones are faster than `git clone` across
-the 250 Mbps to 1 Gbps shaped links we tested. We also have a high-bandwidth
-Linux run for `torvalds/linux` at 1/2/5 Gbps. On fast links the wins are largest;
-as bandwidth drops the download itself dominates and the gap narrows.
+- **Client:** ccx33 (8 dedicated vCPU, 32 GB). **Server:** cpx62 (16 shared
+  vCPU, 32 GB). Both in Nuremberg, Ubuntu 24.04, ext4 on local NVMe.
+- **Server storage:** local disk, unless the row says S3.
+- **Upstream:** the server built from local bare mirrors of the GitHub
+  repositories, so build times below exclude GitHub's network except where they
+  say "mirror fetch".
+- **Pins:**
+  - `oven-sh/bun` @ `b2aa0d5d`;
+  - `pandas-dev/pandas` @ `d9cdd2ee` (v2.2.2);
+  - `torvalds/linux` @ `ab9de95c`.
+- **Link:** shaped on the client with an `nftables` policer. iperf3 measured
+  1.12 Gbit/s at the 1000 Mbps setting, 277 Mbit/s at 250, and 9.1 Gbit/s
+  unshaped.
+- **Runs:** each cell is the median of 3 runs with the client cache off
+  (`RIPCLONE_NO_CACHE=1`). Every run checked the exact commit, a clean status
+  and the shallow flag; the first run of each cell also compared a full tree
+  digest and ran `git fsck --connectivity-only`.
+- **git baselines:** `git clone` and `git clone --depth 1` from GitHub, from the
+  same client, at 1000 Mbps.
 
-Every speedup below compares like with like: a full clone against `git clone`, and depth-1 and `files` against `git clone --depth 1` (the closest git equivalent — both fetch only the tip). Comparing `files` against a full `git clone` would inflate the number several-fold, so we don't.
+Mode labels: `full` is an editable clone with full history, `depth1` an editable
+clone with `--depth 1`, `files` the `--mode files` worktree without history.
+Full clones are compared with `git clone`; `depth1` and `files` with
+`git clone --depth 1`, the closest git equivalent.
 
-At 1 Gbps, measured speedups are:
+## Clone time
 
-- **`oven-sh/bun`**: full clone **11.7×**, depth-1 **3.3×**, files **5.4×**.
-- **`pandas-dev/pandas`**: full clone **7.6×**, depth-1 **6.0×**, files **7.4×**.
-- **`torvalds/linux`** (high-bandwidth EC2 run): full clone up to **~10×**, depth-1 **~6×**, files **~8×**.
+At 1000 Mbps:
 
-The full-clone win is smaller on pandas than on bun because pandas's full pack is large enough that transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay ahead.
+| repo | ripclone full | ripclone depth1 | ripclone files | git clone | git clone --depth 1 |
+|---|---|---|---|---|---|
+| `oven-sh/bun` | 2.37 s · **30×** | 0.46 s · **15×** | 0.42 s · **17×** | 71.6 s | 7.03 s |
+| `pandas-dev/pandas` | 2.05 s · **13×** | 0.14 s · **18×** | 0.12 s · **21×** | 25.9 s | 2.51 s |
+| `torvalds/linux` | 58.8 s · **6.5×** | 2.30 s · **8.3×** | 1.78 s · **11×** | 384 s | 19.2 s |
 
-*Mode labels:* `ripclone full` and `ripclone depth=1` are the `editable` CLI mode with `--depth 0` and `--depth 1`, respectively. `ripclone files` is the `files` CLI mode (HEAD worktree only).
+The git times depend on GitHub, which we don't control. They moved a lot
+between runs: Linux `--depth 1` took 47 s in an earlier run the same day, and bun
+`git clone` took 40 s from a US region in June. Read the speedups as one sample.
 
-## Shaped bandwidth sweep
+By bandwidth (ripclone only, seconds, full / depth1 / files):
 
-We ran `ripclone` against native `git clone` on separate 8-vCPU cloud client
-and server VMs, with the client↔server link shaped to the listed bandwidth.
-Each cell is the median of 3 runs with a cold client cache
-(`RIPCLONE_NO_CACHE=1`). `oven-sh/bun` is pinned to commit
-`b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037`; `pandas-dev/pandas` is pinned to
-tag `v2.2.2` (`d9cdd2ee5a58015ef6f4d15c7226110c9aab8140`).
+| Mbps | bun | pandas | linux |
+|---|---|---|---|
+| unshaped | | | 15.8 / 2.26 / 1.77 |
+| 1000 | 2.37 / 0.46 / 0.42 | 2.05 / 0.14 / 0.12 | 58.8 / 2.30 / 1.78 |
+| 500 | 5.58 / 0.45 / 0.43 | 4.98 / 0.15 / 0.12 | |
+| 250 | 12.11 / 1.52 / 1.11 | 10.86 / 0.34 / 0.12 | |
 
-The sweep covers **250/500 Mbps and 1 Gbps**. The old 50 Mbps and 100 Mbps rows
-and warm-cache baselines have been dropped because they are not representative
-for real clones. For higher-bandwidth numbers, see the Linux rows below.
+Full clones are bound by the link: Linux's Full is about 6 GiB, so 1 Gbit/s
+takes most of a minute. Depth-1 and files clones download much less and are
+bound by writing the worktree; Linux's is about 95,000 files and 1.8 GB. At 250
+Mbps, pandas depth1 and files are bimodal (about 0.15 s or 0.35 s) because
+policer drops cost one TCP retransmit timeout.
 
-**`oven-sh/bun`**
+The previous release (`ddae2ab`) measured within noise of these numbers in
+every cell; the largest gap was 30 ms, on pandas files.
 
-| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
-|------|---------------|------------------|----------------|----------------|---------------------|
-| 1000 | 3.443 s | 1.023 s | 0.625 s | 40.26 s | 3.37 s |
-| 500 | 6.136 s | 0.785 s | 0.588 s | 39.72 s | 3.60 s |
-| 250 | 12.580 s | 2.006 s | 1.542 s | 41.07 s | 3.33 s |
+## S3 storage
 
-**`pandas-dev/pandas`**
+The same server with Tigris as storage; clients download signed URLs directly
+from Tigris. 1000 Mbps, median of 3:
 
-| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
-|------|---------------|------------------|----------------|----------------|---------------------|
-| 1000 | 2.996 s | 0.316 s | 0.256 s | 22.75 s | 1.90 s |
-| 500 | 5.719 s | 0.346 s | 0.250 s | 22.81 s | 1.90 s |
-| 250 | 11.966 s | 0.315 s | 0.232 s | 26.20 s | 1.87 s |
+| repo | full | depth1 | files |
+|---|---|---|---|
+| `oven-sh/bun` | 2.70 s | 0.60 s | 0.51 s |
+| `pandas-dev/pandas` | 3.65 s | 0.26 s | 0.22 s |
 
-Key takeaways:
-
-- **ripclone wins at every measured bandwidth** for full-history and files-mode clones, with the biggest margins at 1 Gbps (up to **11.7×** for `oven-sh/bun` full clone).
-- **The gap narrows as bandwidth drops.** At 250 Mbps the full-clone win is still **3.3×** for bun and **2.2×** for pandas, while depth-1 remains faster than `git clone --depth 1`.
-- **Above 1 Gbps, use a real high-bandwidth client.** The Linux run below is the
-  current high-bandwidth proof at 1/2/5 Gbps.
-
-The ratio graph shows **ripclone time / git time**; anything below the dashed `1.0` line means ripclone was faster.
-
-![shaped benchmark ratios](../benchmark/shaped_ratios.png)
-
-## High-bandwidth Linux on EC2
-
-`torvalds/linux` was measured from a 32-vCPU high-bandwidth Linux client talking
-to the same test server. The client↔server link was shaped with `nftables`;
-ripclone modes got 3 runs and Git baselines got 1 run.
-
-Pinned to `torvalds/linux` @ `ab9de95c9cf952332ab79453b4b5d1bfca8e514f`:
-
-| Mbps | ripclone full | ripclone depth-1 | ripclone files | git clone full | git clone --depth 1 |
-|------|---------------|------------------|----------------|----------------|---------------------|
-| 1000 | 83.2 s | 3.57 s | 2.33 s | 280.2 s | 18.2 s |
-| 2000 | 44.3 s | 2.97 s | 2.42 s | 279.1 s | 18.3 s |
-| 5000 | 28.4 s | 3.04 s | 2.75 s | 280.5 s | 18.2 s |
-
-That's **~10× faster than `git clone`** for the full history at 5 Gbps, and **~6× faster** for depth-1. The unshaped/raw-pipe ceiling was similar for full (30.0 s) but noticeably lower for the small fast paths — depth-1 hit 2.84 s and files hit 2.23 s — confirming that `nftables` shaping adds a little overhead once the transfer itself is no longer the bottleneck.
-
-## Files-only archive benchmark
-
-GitHub's source archive endpoint (`codeload.github.com/.../tar.gz/...`) is the
-closest built-in comparison for `ripclone --mode=files`: both produce a
-worktree without Git history. Both wrote extracted files to the same NVMe
-volume.
-
-| Repo | ripclone files | GitHub tar.gz | Result |
-|------|----------------|---------------|--------|
-| `oven-sh/bun` | 0.640 s | 1.800 s | ripclone **2.8× faster** |
-| `pandas-dev/pandas` | 0.328 s | 0.210 s | GitHub tar.gz faster on this small, warm archive |
-| `torvalds/linux` | 4.053 s | 37.427 s | ripclone **9.2× faster** |
-
-The Linux run is the important stress case for files mode: 94,655 files and a 1.8 GB materialized worktree. `ripclone files` resolved to `ab9de95c9cf952332ab79453b4b5d1bfca8e514f` and used the existing archive artifacts in object storage; no re-sync was required.
-
-## Running the sweep yourself
-
-See [`benchmark/README.md`](../benchmark/README.md).
+The first run of each mode was 2–5× slower (bun full 7.8 s, pandas full 7.0 s)
+because the objects were not yet in Tigris's cache near the client. The later
+runs were 10–80% slower than local disk. pandas full is the slowest case: its
+history is one 326 MiB pack, so one stream from Tigris limits it.
 
 ## Build time
 
-How long the server takes to build a commit's artifacts after a push, on the same hardware as the clone numbers. git has no equivalent; it builds nothing ahead of time.
+How long the server takes to make a commit clonable. git has no equivalent; it
+builds nothing ahead of time. Times are from the build request to each output
+being ready. A `--depth 1` clone waits for Head, a files clone for Files, and a
+full clone for Full.
 
-| repo | Head ready | Full and Files background work |
-|---|---|---|
-| `facebook/react` | 5.4 s | +32 s |
-| `oven-sh/bun` | ~8 s | +13 s |
-| `torvalds/linux` | ~40 s | very large |
+Cold, the first build of a repository, in seconds:
 
-Head is what a `--depth 1` clone waits for. Full and Files run concurrently in
-the background and gate only their matching clone modes. React's measurement
-is a cold first build; Bun's is much shorter because the incremental re-sync
-reuses unchanged history levels and archive frames. Linux's Head build is
-dominated by its ~95k-file tree, and its full history is large enough that we
-don't pre-build it on the dev box.
+| repo | Head | Files | Full | of which mirror fetch |
+|---|---|---|---|---|
+| `pandas-dev/pandas` | 14.2 | 15.4 | 19.9 | 13.3 |
+| `oven-sh/bun` | 15.5 | 16.7 | 20.0 | 13.4 |
+| `torvalds/linux` | 567 | 576 | 881 | 547 |
 
-> In production the server syncs on push, so this happens once per commit, ahead of any clone — by the time a CI runner or agent asks for the repo, the artifacts are already built.
+A cold build is mostly the first fetch of the repository's history. Here that
+came from a local mirror; from GitHub it takes as long as a full `git clone`.
+
+Incremental, Linux, in seconds. Push C2 was 51 commits after the cold commit,
+and push C3 48 commits after C2, arriving 9 s after C2:
+
+| | Head | Files | Full |
+|---|---|---|---|
+| C2 | 6.1 | 16.2 | 240 |
+| C3 | 4.6 | 16.2 | 316 |
+
+Head and Files for a new push don't wait for an earlier push's Full. Full runs
+one build at a time by default (`RIPCLONE_FULL_SLOTS`) and in commit order, so
+C3's Full starts when C2's finishes and takes 85 s on top of it. While a
+commit's Full is pending, a full clone of it uses the latest ready Full and
+fetches the remaining commits from upstream with the user's own git, so the
+clone doesn't wait.
 
 ## Why ripclone is faster
 
-`git clone` makes the upstream host compute and stream a pack on demand (delta negotiation + server-side compression), then the client runs `index-pack`. ripclone serves pre-built, content-addressed packs from object storage, downloaded in parallel; the worktree is materialized from pre-built packs and history is installed without negotiation or on-the-fly delta compression. The expensive work happens once at sync time, not per clone.
+`git clone` makes the upstream host compute and stream a pack on demand
+(negotiation and compression), and then the client runs `index-pack`. ripclone
+serves packs and worktree archives that were built once per commit, downloads
+them in parallel, and writes the worktree from them without negotiation or
+indexing on the client.
 
-## Honest caveats
+## Caveats
 
-- **Sync pays the cost.** The fast clone is amortized against a full build per sync (bun: ~1m40 first full build; incremental re-syncs are cheaper). First sync of a big repo is still the price.
-- **Edge cache.** These runs had objects warm in the in-region object-storage edge. A first clone from a cold region pays an edge-cache miss. This is inherent to using object storage as the CDN.
-- **Same-datacenter network.** The test client and object storage had a fast
-  path. A laptop on home Wi-Fi is bounded by its own download speed, but still
-  skips Git's server-side pack computation.
+- **The server pays first.** A new repository's first build costs about one
+  full `git clone` of it, and every push costs a build. In production the
+  server builds on push, ahead of any clone.
+- **Same datacenter.** The client and server were in one region with a fast
+  path. A laptop on home Wi-Fi is bounded by its own download speed, but it
+  still skips git's server-side pack work.
+- **Object storage cache.** With S3, the first download of a new object from a
+  new region misses the provider's cache (see the S3 table).
+- **Write path.** An io_uring worktree writer made no measurable difference in
+  an interleaved A/B on this hardware, so the client uses plain POSIX writes.

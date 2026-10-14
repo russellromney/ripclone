@@ -4,8 +4,8 @@
 
 # ripclone
 
-ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup;
-small repos are also a bit faster.
+ripclone is the fastest way to clone git repos. In our benchmarks, clones were
+6x-30x faster than `git clone` from GitHub.
 
 ripclone pre-builds git artifacts for every pushed commit so that agents, CI
 systems, and humans can clone a repo and start working in seconds instead of
@@ -50,16 +50,18 @@ See **[Design](docs/DESIGN.md)** for how the artifacts are built.
 
 ## Performance
 
-At 1 Gbps, separate 8-vCPU cloud client and server, median of 3 runs, cold client cache:
+At 1 Gbps, client and server in one Hetzner region, median of 3 runs, cold
+client cache. git cloned from GitHub:
 
 | Repo | ripclone full | ripclone depth=1 | ripclone files | `git clone` | `git clone --depth 1` |
 |---|---|---|---|---|---|
-| `oven-sh/bun` | 3.4 s · **11.7×** | 1.0 s · **3.3×** | 0.63 s · **5.4×** | 40.3 s | 3.37 s |
-| `pandas-dev/pandas` | 3.0 s · **7.6×** | 0.32 s · **6.0×** | 0.26 s · **7.4×** | 22.8 s | 1.90 s |
+| `oven-sh/bun` | 2.37 s · **30×** | 0.46 s · **15×** | 0.42 s · **17×** | 71.6 s | 7.03 s |
+| `pandas-dev/pandas` | 2.05 s · **13×** | 0.14 s · **18×** | 0.12 s · **21×** | 25.9 s | 2.51 s |
+| `torvalds/linux` | 58.8 s · **6.5×** | 2.30 s · **8.3×** | 1.78 s · **11×** | 384 s | 19.2 s |
 
 Full clones are compared with `git clone`; depth-1 and files with
-`git clone --depth 1`. `torvalds/linux` on EC2 reaches about 10× for full
-history at 5 Gbps and about 6× for depth 1. Details and caveats:
+`git clone --depth 1`. GitHub's speed varies from run to run, so treat the
+ratios as one sample. Build times, S3 numbers and caveats:
 **[Benchmarks](docs/BENCHMARKS.md)**.
 
 ## Build

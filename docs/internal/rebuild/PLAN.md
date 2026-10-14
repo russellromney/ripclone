@@ -253,7 +253,10 @@ Each step is a separate PR with green CI. No step mixes a cut with a redo.
    **Done:** #206 (`server.rs` split), #208 (contract gaps), #209 (follow-ups),
    and the `docs/rebuild` branch (docs pass, unread `RepoConfig` keys removed).
 6. **Release work.** Benchmarks rerun on the final binaries, then the OSS gate.
-   **In progress:** benchmarks.
+   **Benchmarks done:** Hetzner runs on 2026-10-14 against `ddae2ab`. Clone
+   times matched. The runs found three server regressions, fixed in #211
+   (scratch under the cache), #212 (`posix_spawn`) and #213 (separate Files
+   and Full pools). `BENCHMARKS.md` has the results. **Next:** the OSS gate.
 
 Rough effect: `server.rs` from ~11k lines to ~4-5k across modules; production
 Rust from ~47k to somewhere near 35-38k; integration tests from 219 to ~50.
