@@ -201,6 +201,39 @@ fn validate_manifest_commit(manifest: &ClonepackManifest, pinned: &str) -> Resul
     Ok(())
 }
 
+/// A failed exchange with the ripclone server or an artifact URL: an HTTP
+/// error status, or no answer at all. The CLI maps `status` to its exit code.
+#[derive(Debug)]
+pub struct HttpFailure {
+    /// The HTTP status, or `None` when the server could not be reached.
+    pub status: Option<u16>,
+    message: String,
+}
+
+impl HttpFailure {
+    fn status(status: u16, message: String) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            status: Some(status),
+            message,
+        })
+    }
+
+    fn unreachable(message: String) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            status: None,
+            message,
+        })
+    }
+}
+
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpFailure {}
+
 /// The innermost cause of a reqwest transport error — e.g. "Connection refused
 /// (os error 61)" — without the noisy "error sending request for url (...)"
 /// wrapper that hides the real reason a first-run user can't reach the server.
@@ -242,7 +275,7 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
     if let Some(u) = upgrade {
         eprintln!("ripclone: {u}");
     }
-    anyhow::anyhow!("{context}: {msg}{hint}")
+    HttpFailure::status(status.as_u16(), format!("{context}: {msg}{hint}"))
 }
 
 /// Next-step hint for a failed server response, keyed on HTTP status, the
@@ -639,7 +672,10 @@ fn classify_fetch_status(
     if status.is_success() {
         return None;
     }
-    let err = anyhow::anyhow!("artifact {hash} fetch failed: {status}");
+    let err = HttpFailure::status(
+        status.as_u16(),
+        format!("artifact {hash} fetch failed: {status}"),
+    );
     Some(
         if status.is_server_error()
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -1464,11 +1500,47 @@ fn spawn_attempt_reaper(
     cleanup: AttemptCleanup,
     staging: SharedAttemptStaging,
 ) -> tokio::task::JoinHandle<()> {
+    let running = RunningReaper::start();
     tokio::spawn(async move {
         cleanup.drain_closed().await;
         let staging = staging.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(staging);
+        drop(running);
     })
+}
+
+/// Reapers whose staging is not yet removed. A cancelled clone's reaper keeps
+/// running after the clone future is dropped; see [`wait_for_cancelled_cleanup`].
+static RUNNING_REAPERS: AtomicUsize = AtomicUsize::new(0);
+
+struct RunningReaper;
+
+impl RunningReaper {
+    fn start() -> Self {
+        RUNNING_REAPERS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for RunningReaper {
+    fn drop(&mut self) {
+        RUNNING_REAPERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// After dropping an install future (for example on Ctrl-C), wait up to
+/// `limit` for its workers to stop and its staging to be removed. Returns
+/// false if cleanup was still running at the limit; the next clone into the
+/// same parent removes what is left.
+pub async fn wait_for_cancelled_cleanup(limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while RUNNING_REAPERS.load(Ordering::SeqCst) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
 }
 
 impl AttemptCleanup {
@@ -1782,11 +1854,11 @@ impl Client {
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         req.send().await.map_err(|e| {
             if e.is_connect() || e.is_timeout() {
-                anyhow::anyhow!(
+                HttpFailure::unreachable(format!(
                     "could not reach ripclone server at {}: {}\n  → is the server running? check --server / RIPCLONE_SERVER",
                     self.server,
                     transport_cause(&e),
-                )
+                ))
             } else {
                 anyhow::Error::new(e).context("request to ripclone server failed")
             }
@@ -2065,10 +2137,28 @@ impl Client {
                             *resolved_branch = Some(unavailable.branch.clone());
                             Some(unavailable)
                         }
-                        Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!("invalid unavailable response for {repo_path}")
-                            });
+                        Err(_) => {
+                            // Not an exact-revision answer: the server itself
+                            // is unavailable (a proxy, a restart, overload).
+                            let text = String::from_utf8_lossy(&body);
+                            let detail = serde_json::from_slice::<ServerError>(&body)
+                                .ok()
+                                .and_then(|parsed| parsed.error)
+                                .filter(|error| !error.is_empty())
+                                .unwrap_or_else(|| {
+                                    if text.trim().is_empty() {
+                                        status.to_string()
+                                    } else {
+                                        text.trim().to_string()
+                                    }
+                                });
+                            return Err(HttpFailure::status(
+                                status.as_u16(),
+                                format!(
+                                    "ref lookup failed: {detail}{}",
+                                    error_hint(status.as_u16(), None, false)
+                                ),
+                            ));
                         }
                     };
                 if request_was_pinned && let Some(unavailable) = unavailable.as_ref() {

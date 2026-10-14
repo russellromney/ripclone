@@ -900,8 +900,65 @@ async fn run_provider_rm(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Exit codes, so scripts and agents can route a failure without parsing text.
+/// Documented in docs/CLI.md.
+mod exit {
+    pub const FAILURE: u8 = 1;
+    // 2 is clap's usage error.
+    pub const UNAUTHENTICATED: u8 = 3;
+    pub const FORBIDDEN: u8 = 4;
+    pub const NOT_FOUND: u8 = 5;
+    pub const UNAVAILABLE: u8 = 6;
+    pub const INTERRUPTED: u8 = 130;
+}
+
+/// The exit code for a failed command: from the first HTTP failure in the
+/// error chain, else the generic failure code.
+fn exit_code(error: &anyhow::Error) -> u8 {
+    let failure = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ripclone::client::HttpFailure>());
+    match failure.map(|f| f.status) {
+        Some(Some(401)) => exit::UNAUTHENTICATED,
+        Some(Some(403)) => exit::FORBIDDEN,
+        Some(Some(404)) => exit::NOT_FOUND,
+        Some(None | Some(408 | 429 | 500..=599)) => exit::UNAVAILABLE,
+        _ => exit::FAILURE,
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    // Ctrl-C cancels the command instead of killing the process, so a clone's
+    // cleanup can remove its staging directory before exit.
+    let mut command = Box::pin(run());
+    let finished = tokio::select! {
+        result = &mut command => Some(result),
+        _ = tokio::signal::ctrl_c() => None,
+    };
+    let Some(result) = finished else {
+        // Dropping the command cancels it; its cleanup runs in the background.
+        // A second Ctrl-C exits without waiting for it.
+        drop(command);
+        eprintln!("ripclone: interrupted; cleaning up");
+        tokio::select! {
+            _ = ripclone::client::wait_for_cancelled_cleanup(
+                std::time::Duration::from_secs(30),
+            ) => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        return exit::INTERRUPTED.into();
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            exit_code(&error).into()
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

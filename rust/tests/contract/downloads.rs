@@ -200,10 +200,10 @@ fn f6_ignored_range_restarts_only_that_artifact() {
     assert_eq!(listing(&target), origin.tree(&tip));
 }
 
-/// F8: Ctrl-C during the download leaves no target; the next clone into the
-/// same path succeeds and removes the interrupted clone's staging.
+/// F8: Ctrl-C during the download removes the staging directory and exits
+/// 130; the next clone into the same path succeeds.
 #[test]
-fn f8_interrupted_clone_leaves_no_target_and_next_clone_succeeds() {
+fn f8_interrupted_clone_cleans_up() {
     let world = World::new();
     let (origin, _server, proxy, tip) = big_history(&world, "f8");
     proxy.fault_artifacts(Fault::Hold, BIG, usize::MAX);
@@ -211,13 +211,20 @@ fn f8_interrupted_clone_leaves_no_target_and_next_clone_succeeds() {
     let target = world.target("f8");
     let clone = world.cli_spawn(&proxy, &["clone", "acme/f8", target.to_str().unwrap()]);
     proxy.wait_held(1);
+    assert!(
+        !world.staging_leftovers().is_empty(),
+        "the clone should be staging while its download is held"
+    );
     clone.interrupt();
-    clone.wait().err();
+    let out = clone.wait();
+    out.err();
+    assert_eq!(out.code(), Some(130), "{}", out.stderr());
     assert!(
         !target.exists(),
         "interrupted clone left {}",
         target.display()
     );
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
 
     proxy.release();
     world
@@ -225,5 +232,4 @@ fn f8_interrupted_clone_leaves_no_target_and_next_clone_succeeds() {
         .ok();
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
     assert_eq!(listing(&target), origin.tree(&tip));
-    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
 }
