@@ -2155,18 +2155,19 @@ mod tests {
         assert!(resolve_commit(&mirror, "main").is_err());
     }
 
-    /// Is a read-only build safe while another build fetches and rewrites the
-    /// commit-graph/bitmap on the same mirror, with auto-gc off? One writer thread
-    /// does fetch + commit-graph + bitmap; several readers walk every object. With
-    /// gc off, the writer only appends packs and atomically replaces the
-    /// accelerators, so readers should never see a torn or missing object.
-    /// Run: `cargo test --lib concurrent_prep_and_reads_stay_safe -- --ignored --nocapture`.
+    /// Reads and fetches of one mirror stay correct while the multi-pack-index
+    /// bitmap is rewritten beside them, with auto-gc off. One thread runs the
+    /// locked prep (fetch, then `commit-graph write --split`) for a fixed number
+    /// of new commits. Another rewrites the bitmap in a loop, outside that
+    /// lock, as the Full build does. Readers walk every object, with and
+    /// without the bitmap. With gc off, writers only add packs and atomically
+    /// replace the accelerators, so no reader or fetch may fail.
     #[test]
-    #[ignore]
     fn concurrent_prep_and_reads_stay_safe() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::time::{Duration, Instant};
+
+        const ROUNDS: u64 = 8;
 
         let base = tempfile::tempdir().unwrap();
         let origin = base.path().join("origin.git");
@@ -2192,9 +2193,9 @@ mod tests {
             origin.to_str().unwrap(),
             pusher.to_str().unwrap(),
         ]);
-        let p = pusher.to_str().unwrap();
-        git(&["-C", p, "config", "user.email", "t@t"]);
-        git(&["-C", p, "config", "user.name", "t"]);
+        let p = pusher.to_str().unwrap().to_string();
+        git(&["-C", &p, "config", "user.email", "t@t"]);
+        git(&["-C", &p, "config", "user.name", "t"]);
 
         // The mirror under test, cloned with gc off (the production path).
         let mirror = base.path().join("mirror.git");
@@ -2208,142 +2209,135 @@ mod tests {
         ]);
         let m = mirror.to_string_lossy().to_string();
         // Keep fetched objects as packfiles (production fetches from GitHub arrive
-        // as packs), so multi-pack-index/bitmap has packs to index — a local
+        // as packs), so multi-pack-index/bitmap has packs to index; a local
         // file:// fetch would otherwise unpack to loose objects.
         git(&["-C", &m, "config", "transfer.unpackLimit", "1"]);
         git(&["-C", &m, "config", "fetch.unpackLimit", "1"]);
+        // A local clone hardlinks loose objects; a production mirror starts
+        // from a pack.
+        git(&["-C", &m, "repack", "-a", "-d", "-q"]);
 
-        let stop = Arc::new(AtomicBool::new(false));
+        /// Run git; true on success, else print why.
+        fn run(label: &str, args: &[&str]) -> bool {
+            let out = Command::new("git").args(args).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            let ok = out.status.success() && !text.contains("missing");
+            if !ok {
+                eprintln!(
+                    "{label} FAILED: git {args:?}: {:?} {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            ok
+        }
+
+        let prep_done = Arc::new(AtomicBool::new(false));
+        let prep_err = Arc::new(AtomicU64::new(0));
+        let bitmap_ok = Arc::new(AtomicU64::new(0));
         let read_ok = Arc::new(AtomicU64::new(0));
         let read_err = Arc::new(AtomicU64::new(0));
-        let prep_rounds = Arc::new(AtomicU64::new(0));
 
-        let prep_err = Arc::new(AtomicU64::new(0));
-        // Writer: advance origin, then run the exclusive-prep trio on the mirror.
-        let writer = {
-            let (m, p, stop, prep_rounds, prep_err) = (
-                m.clone(),
-                p.to_string(),
-                stop.clone(),
-                prep_rounds.clone(),
-                prep_err.clone(),
-            );
+        let bitmap = {
+            let (m, prep_done, bitmap_ok) = (m.clone(), prep_done.clone(), bitmap_ok.clone());
             std::thread::spawn(move || {
-                let run = |args: &[&str], err: &AtomicU64| {
-                    let out = Command::new("git").args(args).output().unwrap();
-                    if !out.status.success() {
-                        err.fetch_add(1, Ordering::Relaxed);
-                        eprintln!(
-                            "PREP FAIL git {:?}: {}",
-                            args,
-                            String::from_utf8_lossy(&out.stderr)
-                        );
+                while !prep_done.load(Ordering::Relaxed) {
+                    // Best-effort in production: a failed write only loses the
+                    // speedup, so failures are printed, not counted.
+                    let args = ["-C", &m, "multi-pack-index", "write", "--bitmap"];
+                    if run("bitmap", &[&args[..], &["--no-progress"]].concat()) {
+                        bitmap_ok.fetch_add(1, Ordering::Relaxed);
                     }
-                };
-                let mut i = 0u64;
-                while !stop.load(Ordering::Relaxed) {
-                    i += 1;
-                    let file = pusher_path_write(&p, i);
-                    run(&["-C", &p, "add", &file], &prep_err);
-                    run(
-                        &["-C", &p, "commit", "-q", "-m", &format!("c{i}")],
-                        &prep_err,
-                    );
-                    run(&["-C", &p, "push", "-q", "origin"], &prep_err);
-                    // Exclusive prep, serialized (as the per-repo lock would do it).
-                    run(&["-C", &m, "fetch", "-q", "origin"], &prep_err);
-                    run(
-                        &[
-                            "-C",
-                            &m,
-                            "commit-graph",
-                            "write",
-                            "--reachable",
-                            "--split",
-                            "--no-progress",
-                        ],
-                        &prep_err,
-                    );
-                    // Bitmap is best-effort in production (write_bitmap ignores
-                    // errors); still run it to stress its atomic-replace vs reads,
-                    // but don't count its content prerequisites as a prep failure.
-                    let _ = Command::new("git")
-                        .args([
-                            "-C",
-                            &m,
-                            "multi-pack-index",
-                            "write",
-                            "--bitmap",
-                            "--no-progress",
-                        ])
-                        .output();
-                    prep_rounds.fetch_add(1, Ordering::Relaxed);
                 }
             })
         };
 
-        // Readers: walk every object — would surface a torn/missing pack.
         let readers: Vec<_> = (0..4)
             .map(|_| {
-                let (m, stop, read_ok, read_err) =
-                    (m.clone(), stop.clone(), read_ok.clone(), read_err.clone());
+                let (m, prep_done, read_ok, read_err) = (
+                    m.clone(),
+                    prep_done.clone(),
+                    read_ok.clone(),
+                    read_err.clone(),
+                );
                 std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let out = Command::new("git")
-                            .args(["-C", &m, "cat-file", "--batch-check", "--batch-all-objects"])
-                            .output()
-                            .unwrap();
-                        let text = String::from_utf8_lossy(&out.stdout);
-                        if out.status.success() && !text.contains("missing") {
-                            read_ok.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            read_err.fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "READ FAILURE: status={:?} stderr={}",
-                                out.status,
-                                String::from_utf8_lossy(&out.stderr)
-                            );
+                    loop {
+                        let done = prep_done.load(Ordering::Relaxed);
+                        for args in [
+                            &["-C", &m, "cat-file", "--batch-check", "--batch-all-objects"][..],
+                            &[
+                                "-C",
+                                &m,
+                                "rev-list",
+                                "--objects",
+                                "--all",
+                                "--use-bitmap-index",
+                            ],
+                        ] {
+                            let counter = if run("read", args) {
+                                &read_ok
+                            } else {
+                                &read_err
+                            };
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if done {
+                            break;
                         }
                     }
                 })
             })
             .collect();
 
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(4) {
-            std::thread::sleep(Duration::from_millis(50));
+        // The locked prep: advance the origin, fetch, rewrite the commit-graph.
+        for i in 1..=ROUNDS {
+            let file = pusher_path_write(&p, i);
+            git(&["-C", &p, "add", &file]);
+            git(&["-C", &p, "commit", "-q", "-m", &format!("c{i}")]);
+            git(&["-C", &p, "push", "-q", "origin"]);
+            for args in [
+                &["-C", &m, "fetch", "-q", "origin"][..],
+                &[
+                    "-C",
+                    &m,
+                    "commit-graph",
+                    "write",
+                    "--reachable",
+                    "--split",
+                    "--no-progress",
+                ],
+            ] {
+                if !run("prep", args) {
+                    prep_err.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
-        stop.store(true, Ordering::Relaxed);
-        writer.join().unwrap();
-        for r in readers {
-            r.join().unwrap();
+        prep_done.store(true, Ordering::Relaxed);
+        bitmap.join().unwrap();
+        for reader in readers {
+            reader.join().unwrap();
         }
 
-        eprintln!(
-            "spike: prep_rounds={} prep_err={} read_ok={} read_err={}",
-            prep_rounds.load(Ordering::Relaxed),
+        let (prep_err, bitmap_ok, read_ok, read_err) = (
             prep_err.load(Ordering::Relaxed),
+            bitmap_ok.load(Ordering::Relaxed),
             read_ok.load(Ordering::Relaxed),
             read_err.load(Ordering::Relaxed),
         );
-        assert!(
-            prep_rounds.load(Ordering::Relaxed) > 3,
-            "writer should complete several prep rounds"
+        eprintln!(
+            "prep_err={prep_err} bitmap_ok={bitmap_ok} read_ok={read_ok} read_err={read_err}"
         );
         assert_eq!(
-            prep_err.load(Ordering::Relaxed),
-            0,
-            "an exclusive-prep op failed"
-        );
-        assert!(
-            read_ok.load(Ordering::Relaxed) > 10,
-            "readers should complete many walks"
+            prep_err, 0,
+            "a fetch or commit-graph write failed beside the bitmap"
         );
         assert_eq!(
-            read_err.load(Ordering::Relaxed),
-            0,
-            "a read failed concurrent with fetch+graph+bitmap — lock-shrink is NOT safe as-is"
+            read_err, 0,
+            "a read failed beside fetch, commit-graph and bitmap"
         );
+        assert!(bitmap_ok > 0, "no bitmap write succeeded during the run");
+        // Every object the readers saw is still there and connected at the end.
+        git(&["-C", &m, "fsck", "--connectivity-only", "--no-progress"]);
     }
 
     /// Write a unique file into the pusher worktree (for the test above).
