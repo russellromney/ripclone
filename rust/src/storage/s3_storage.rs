@@ -127,16 +127,10 @@ impl S3Storage {
         })
     }
 
-    /// Construct an S3 client from environment variables:
-    ///   RIPCLONE_S3_ENDPOINT, RIPCLONE_S3_REGION, RIPCLONE_S3_BUCKET,
-    ///   RIPCLONE_S3_PREFIX, plus AWS_* credentials.
-    pub fn from_env() -> Result<Option<Self>> {
-        Self::from_env_or_config(&crate::config::StorageConfig::default())
-    }
-
-    /// Like [`from_env`](Self::from_env), but falls back to the `[storage]`
-    /// section of `config.toml` for the non-secret settings (endpoint, region,
-    /// bucket, prefix). The env vars always win. Credentials
+    /// Construct an S3 client from `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`,
+    /// `RIPCLONE_S3_BUCKET`, and `RIPCLONE_S3_PREFIX`, falling back to the
+    /// `[storage]` section of `config.toml` for those non-secret settings. The
+    /// env vars always win. Credentials
     /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) are read from the
     /// environment only — never from config. `backend = "local"` forces local
     /// storage (returns `None`) even if S3 settings are present.
@@ -685,7 +679,7 @@ mod tests {
             eprintln!("SKIP: RIPCLONE_S3_ENDPOINT is required");
             return;
         }
-        let storage = S3Storage::from_env()
+        let storage = S3Storage::from_env_or_config(&crate::config::StorageConfig::default())
             .expect("construct S3 storage")
             .expect("RIPCLONE_S3_ENDPOINT must enable S3 storage");
         let mut source = tempfile::NamedTempFile::new().expect("create multipart fixture");

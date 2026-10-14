@@ -13,7 +13,7 @@ pub mod libsql_db;
 pub mod sql;
 
 pub use libsql_db::LibsqlDb;
-pub use sql::{ClaimedJob, SqlJobQueue};
+pub use sql::SqlJobQueue;
 
 /// A request to build one repository at one admitted commit.
 #[derive(Clone)]

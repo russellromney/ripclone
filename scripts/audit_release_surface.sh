@@ -8,21 +8,11 @@ actual="$({
   cd "$ROOT/rust"
   cargo metadata --locked --no-deps --format-version 1
 } | jq -r '.packages[] | select(.name == "ripclone") | .targets[]
-  | select(.kind == ["bin"] and (.["required-features"] | length) == 0) | .name' | sort)"
+  | select(.kind == ["bin"]) | .name' | sort)"
 
 if [ "$actual" != "$EXPECTED" ]; then
   echo "error: default Cargo-installed programs do not match the release allowlist" >&2
   diff -u <(printf '%s\n' "$EXPECTED") <(printf '%s\n' "$actual") >&2 || true
-  exit 1
-fi
-
-tools="$({
-  cd "$ROOT/rust"
-  cargo metadata --locked --no-deps --format-version 1
-} | jq -r '.packages[] | select(.name == "ripclone") | .targets[]
-  | select(.kind == ["bin"] and (.["required-features"] | index("dev-tools"))) | .name' | sort)"
-if [ "$tools" != $'ripclone-proxy\nwriter_bench' ]; then
-  echo "error: developer-only program allowlist changed" >&2
   exit 1
 fi
 

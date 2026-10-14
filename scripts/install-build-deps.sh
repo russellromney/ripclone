@@ -16,8 +16,6 @@ $SUDO apt-get install -y --no-install-recommends \
   cmake \
   build-essential \
   pkg-config \
-  libssl-dev \
-  libgit2-dev \
   git \
   ripgrep \
   curl \

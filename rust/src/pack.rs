@@ -4,26 +4,9 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-// `git pack-objects --max-pack-size` cannot retain deltas whose bases land in
-// another output pack. Even a 4 GiB split made Linux re-deltify for minutes;
-// 64 MiB more than doubled Bun's cold-history bytes and made the otherwise
-// bitmap-backed build 30x slower. Preserve the source pack's delta graph here.
-// Remote storage handles large files with multipart upload instead of imposing
-// its transport boundary on Git's object representation.
-const HISTORY_REUSE_MAX_PACK_BYTES: Option<u64> = None;
-
 pub struct PackBuilder<'a> {
     repo: PathBuf,
     cas: &'a Cas,
-}
-
-/// Result of an LSM incremental build. Each pack is `(pack_hash, pack_len,
-/// idx_hash, idx_len)`.
-pub struct IncrementalPacks {
-    /// Undeltified HEAD-closure packs (the worktree source).
-    pub head_packs: Vec<(String, u64, String, u64)>,
-    /// Deltified packs for the new commit range since the last sealed level.
-    pub tail_packs: Vec<(String, u64, String, u64)>,
 }
 
 /// Result of compacting LSM levels: the new (bounded) level set, plus the pack
@@ -40,13 +23,6 @@ impl<'a> PackBuilder<'a> {
             repo: repo.as_ref().to_path_buf(),
             cas,
         }
-    }
-
-    /// Build a packfile + idx containing commit + all reachable trees + symlink blobs.
-    /// Symlink blobs are small and let `git status` verify symlinks without
-    /// fetching them lazily.
-    pub fn build_skeleton_pack(&self, commit: &str) -> Result<(String, String)> {
-        self.build_skeleton_pack_with_depth(commit, None)
     }
 
     /// Build a skeleton pack limited to `max_depth` commits. `max_depth = None`
@@ -77,33 +53,6 @@ impl<'a> PackBuilder<'a> {
     /// Build a depth=1 skeleton pack (single commit + HEAD trees + symlinks).
     pub fn build_shallow_skeleton_pack(&self, commit: &str) -> Result<(String, String)> {
         self.build_skeleton_pack_with_depth(commit, Some(1))
-    }
-
-    /// Build a delta skeleton pack: objects not present in parent commit's skeleton.
-    pub fn build_delta_skeleton_pack(
-        &self,
-        commit: &str,
-        parent_commit: &str,
-    ) -> Result<(String, String)> {
-        let commit_shas = git::list_object_shas(&self.repo, commit)?;
-        let parent_shas: HashSet<String> = git::list_object_shas(&self.repo, parent_commit)?
-            .into_iter()
-            .collect();
-
-        let types = git::classify_objects(&self.repo, &commit_shas.iter().cloned().collect())?;
-
-        let delta_shas: Vec<String> = commit_shas
-            .into_iter()
-            .filter(|sha| {
-                !parent_shas.contains(sha)
-                    && matches!(
-                        types.get(sha).map(|s| s.as_str()),
-                        Some("commit") | Some("tree")
-                    )
-            })
-            .collect();
-
-        self.pack_and_index(&delta_shas)
     }
 
     /// Build a ready-to-use `.git/index` from the skeleton pack.
@@ -140,116 +89,6 @@ impl<'a> PackBuilder<'a> {
 
         let index_bytes = std::fs::read(git_dir.join("index")).context("read prebuilt index")?;
         self.cas.put(&index_bytes)
-    }
-
-    /// Ensure all blobs reachable from a commit are stored in the CAS.
-    pub fn store_blobs(&self, commit: &str) -> Result<usize> {
-        let shas = git::list_object_shas(&self.repo, commit)?;
-        let types = git::classify_objects(&self.repo, &shas.iter().cloned().collect())?;
-        let mut count = 0;
-        for sha in shas {
-            if matches!(types.get(&sha).map(|s| s.as_str()), Some("blob")) {
-                let content = git::cat_file(&self.repo, &sha)?;
-                self.cas.put_with_hash(&sha, &content)?;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    /// Build a complete object pack for `commit` limited to the last `depth`
-    /// commits (`None` = full history). The pack contains commits, trees, and
-    /// every blob reachable from those commits — i.e. everything needed to
-    /// materialize the working tree at HEAD and inspect the included history.
-    ///
-    /// Objects are stored undeltified (`git pack-objects --window=0`) so the
-    /// client can extract files without resolving deltas.
-    pub fn build_depth_pack(&self, commit: &str, depth: Option<usize>) -> Result<(String, String)> {
-        let object_shas = git::list_object_shas_with_depth(&self.repo, commit, depth)?;
-        let (ph, _, ih, _) = self.pack_and_index_inner(&object_shas, true)?;
-        Ok((ph, ih))
-    }
-
-    /// Build the depth content as many small, self-contained git packs, each
-    /// targeting roughly `target_raw_bytes` of uncompressed object content.
-    /// Objects are partitioned greedily by raw size so packs are evenly sized
-    /// (~1-2 MB compressed for a few-MB raw target); each pack is independently
-    /// valid (non-thin), so the client can install and extract them in parallel
-    /// as they download.
-    ///
-    /// Returns `(pack_hash, pack_len, idx_hash, idx_len)` for each pack.
-    pub fn build_depth_packs(
-        &self,
-        commit: &str,
-        depth: Option<usize>,
-        target_raw_bytes: u64,
-    ) -> Result<Vec<(String, u64, String, u64)>> {
-        let oids = git::list_object_shas_with_depth(&self.repo, commit, depth)?;
-        if oids.is_empty() {
-            bail!("no objects to pack for {}", commit);
-        }
-        Ok(self.build_packs_from_oids(&oids, target_raw_bytes, true)?.0)
-    }
-
-    /// Build the depth content as two layers of mini-packs:
-    ///   - `head`: the HEAD-tree closure (commit + trees + every *current* blob).
-    ///     Needed by every clone depth; this is the working tree.
-    ///   - `history`: every other reachable object (old blob versions, ancestor
-    ///     commits/trees) — i.e. full history minus the HEAD closure. Needed only
-    ///     for deeper clones.
-    ///
-    /// A depth=1 clonepack lists only `head`; a full (depth=0) clonepack lists
-    /// `head` + `history`. The packs are content-addressed, so the depth=1 set is
-    /// literally a subset of the full set — no separate HEAD pack is built.
-    ///
-    /// `history` is empty for a single-commit repo. Note: `history` is only as
-    /// complete as the mirror's available history (deepen/unshallow the mirror
-    /// for a true full clone).
-    /// Build the two pack buckets for `commit`:
-    /// - HEAD closure: undeltified, partitioned at `head_target_raw_bytes` into
-    ///   many small packs the client downloads in parallel and hand-parses.
-    /// - History (everything else): deltified, partitioned at the much larger
-    ///   `history_target_raw_bytes` into a *handful* of packs. The client only
-    ///   installs these (git reads them), so they must be few and large — using
-    ///   the small HEAD target here would explode a big repo into ~1k packs and
-    ///   ~1k `git pack-objects` spawns (observed: bun = 6.2 GiB raw → 1058 packs,
-    ///   26-minute build).
-    pub fn build_layered_packs(
-        &self,
-        commit: &str,
-        head_target_raw_bytes: u64,
-        history_target_raw_bytes: u64,
-    ) -> Result<(
-        Vec<(String, u64, String, u64)>,
-        Vec<(String, u64, String, u64)>,
-    )> {
-        use std::collections::HashSet;
-        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
-        if head_oids.is_empty() {
-            bail!("no objects to pack for {}", commit);
-        }
-        let head_set: HashSet<&str> = head_oids.iter().map(String::as_str).collect();
-        let all_oids = git::list_object_shas_with_depth(&self.repo, commit, None)?;
-        let history_oids: Vec<String> = all_oids
-            .into_iter()
-            .filter(|o| !head_set.contains(o.as_str()))
-            .collect();
-
-        // HEAD closure: undeltified so the client can hand-parse blobs straight
-        // from the downloaded bytes for the working tree.
-        let (head_packs, _) =
-            self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
-        // History: deltified (undeltified history is multi-GB). The client never
-        // hand-parses these — they're only installed for the object DB and git
-        // reads them, resolving deltas itself. Few large packs, not many small
-        // ones.
-        let history_packs = if history_oids.is_empty() {
-            Vec::new()
-        } else {
-            self.build_packs_from_oids(&history_oids, history_target_raw_bytes, false)?
-                .0
-        };
-        Ok((head_packs, history_packs))
     }
 
     /// Build just the HEAD closure (undeltified small packs) — the depth=1
@@ -319,83 +158,21 @@ impl<'a> PackBuilder<'a> {
             .0)
     }
 
-    /// LSM incremental build. Packs the HEAD closure (undeltified, for the
-    /// worktree) and the *tail* — the objects introduced in `(sealed_tip, commit]`
-    /// (deltified, for the object DB). When `sealed_tip` is `None` the tail is the
-    /// whole history.
-    ///
-    /// Unlike [`build_layered_packs`], the tail is NOT reduced by the HEAD closure:
-    /// a sealed level must hold the full range so it stays correct as an immutable
-    /// artifact even after the HEAD closure changes in later syncs. Current blobs
-    /// therefore appear in both the (undeltified) HEAD packs and the (deltified)
-    /// history packs; git dedups by OID on read.
-    pub fn build_incremental_packs(
-        &self,
-        commit: &str,
-        sealed_tip: Option<&str>,
-        head_target_raw_bytes: u64,
-        history_target_raw_bytes: u64,
-    ) -> Result<IncrementalPacks> {
-        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
-        if head_oids.is_empty() {
-            bail!("no objects to pack for {}", commit);
-        }
-        let tail_oids = git::list_object_shas_in_range(&self.repo, sealed_tip, commit)?;
-
-        let (head_packs, _) =
-            self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
-        let tail_packs = if tail_oids.is_empty() {
-            Vec::new()
-        } else {
-            self.build_packs_from_oids(&tail_oids, history_target_raw_bytes, false)?
-                .0
-        };
-        Ok(IncrementalPacks {
-            head_packs,
-            tail_packs,
-        })
-    }
-
     /// Build only the deltified *tail* — objects introduced in `(sealed_tip,
-    /// commit]` (the whole history when `sealed_tip` is `None`). This is the
-    /// history half of [`build_incremental_packs`], for callers that already
-    /// published the HEAD closure. Returns the tail packs.
+    /// commit]` (the whole history when `sealed_tip` is `None`). The HEAD
+    /// closure is built separately by [`Self::build_head_packs`]. Returns the
+    /// tail packs.
+    ///
+    /// The tail is NOT reduced by the HEAD closure: a sealed level must hold the
+    /// full range so it stays correct as an immutable artifact even after the
+    /// HEAD closure changes in later syncs. Current blobs therefore appear in
+    /// both the (undeltified) HEAD packs and the (deltified) history packs; git
+    /// dedups by OID on read.
     pub fn build_history_tail(
         &self,
         commit: &str,
         sealed_tip: Option<&str>,
         history_target_raw_bytes: u64,
-    ) -> Result<Vec<(String, u64, String, u64)>> {
-        self.build_history_tail_inner(
-            commit,
-            sealed_tip,
-            history_target_raw_bytes,
-            HISTORY_REUSE_MAX_PACK_BYTES,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn build_history_tail_with_reuse_max_pack_bytes_for_tests(
-        &self,
-        commit: &str,
-        sealed_tip: Option<&str>,
-        history_target_raw_bytes: u64,
-        reuse_max_pack_bytes: u64,
-    ) -> Result<Vec<(String, u64, String, u64)>> {
-        self.build_history_tail_inner(
-            commit,
-            sealed_tip,
-            history_target_raw_bytes,
-            Some(reuse_max_pack_bytes),
-        )
-    }
-
-    fn build_history_tail_inner(
-        &self,
-        commit: &str,
-        sealed_tip: Option<&str>,
-        history_target_raw_bytes: u64,
-        reuse_max_pack_bytes: Option<u64>,
     ) -> Result<Vec<(String, u64, String, u64)>> {
         // Cold base build (no sealed level yet): reuse the deltas git already has
         // via the mirror's reachability bitmap instead of enumerating ~all
@@ -407,7 +184,7 @@ impl<'a> PackBuilder<'a> {
             // proven enumerate-and-pack path so a cold build never hard-fails on a
             // missing bitmap, an old git, or a pack-objects hiccup. Reuse is an
             // optimization, never the only path to a complete base.
-            return match self.build_history_pack_reuse(commit, reuse_max_pack_bytes) {
+            return match self.build_history_pack_reuse(commit) {
                 Ok(packs) => Ok(packs),
                 Err(e) => {
                     tracing::warn!(
@@ -433,25 +210,20 @@ impl<'a> PackBuilder<'a> {
     }
 
     /// Build the cold full-history packs by reusing existing pack deltas via the
-    /// mirror's bitmap (see `git::pack_objects_reachable_to_prefix`). Production
-    /// preserves one compact delta graph; the test-only limit can still exercise
-    /// multi-pack collection. The reachable closure includes HEAD's objects (a
-    /// small duplicate with the depth pack) — a deliberate space-for-time trade
-    /// to avoid an exclusion enumeration.
-    fn build_history_pack_reuse(
-        &self,
-        commit: &str,
-        max_pack_bytes: Option<u64>,
-    ) -> Result<Vec<(String, u64, String, u64)>> {
+    /// mirror's bitmap (see `git::pack_objects_reachable_to_prefix`), which
+    /// preserves one compact delta graph. The reachable closure includes HEAD's
+    /// objects (a small duplicate with the depth pack) — a deliberate
+    /// space-for-time trade to avoid an exclusion enumeration.
+    fn build_history_pack_reuse(&self, commit: &str) -> Result<Vec<(String, u64, String, u64)>> {
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
-        git::pack_objects_reachable_to_prefix(&self.repo, commit, &prefix, max_pack_bytes)?;
+        git::pack_objects_reachable_to_prefix(&self.repo, commit, &prefix)?;
         self.store_packs_from_dir(tmp.path())
     }
 
     /// Read every `pack-<sha>.{pack,idx}` pair written under `dir`, store both
     /// halves in the CAS, and return `(pack_hash, pack_len, idx_hash, idx_len)`
-    /// for each (one pack run can emit many under `--max-pack-size`).
+    /// for each.
     fn store_packs_from_dir(&self, dir: &Path) -> Result<Vec<(String, u64, String, u64)>> {
         use std::collections::HashMap;
         let mut packs: HashMap<String, PathBuf> = HashMap::new();
@@ -673,8 +445,6 @@ impl<'a> PackBuilder<'a> {
 
 #[cfg(test)]
 mod lsm_incremental_tests;
-#[cfg(test)]
-mod multipack_tests;
 
 #[cfg(test)]
 mod tests {

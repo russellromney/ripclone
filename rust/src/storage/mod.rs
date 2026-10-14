@@ -114,10 +114,6 @@ impl LocalStorage {
             cas: Cas::new(root)?,
         })
     }
-
-    pub fn cas(&self) -> &Cas {
-        &self.cas
-    }
 }
 
 #[async_trait]
@@ -243,7 +239,7 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert!(
-            !s.cas().path(&expected).exists(),
+            !s.cas.path(&expected).exists(),
             "mismatched file upload must not publish a final object"
         );
     }
@@ -255,7 +251,7 @@ mod tests {
         let source = tmp.path().join("source.bin");
         std::fs::write(&source, b"correct bytes").unwrap();
         let expected = crate::cas::hash(b"correct bytes");
-        let object_path = s.cas().path(&expected);
+        let object_path = s.cas.path(&expected);
         std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
         std::fs::write(&object_path, b"corrupt bytes").unwrap();
 

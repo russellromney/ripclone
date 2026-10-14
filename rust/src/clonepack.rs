@@ -10,11 +10,6 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 
 impl FileEntry {
-    /// Total uncompressed size of the file across all fragments.
-    pub fn total_len(&self) -> u64 {
-        self.fragments.iter().map(|f| f.raw_len as u64).sum()
-    }
-
     /// Total uncompressed size, rejecting malformed fragment tables that would
     /// overflow the accounting type.
     pub fn checked_total_len(&self) -> Result<u64> {

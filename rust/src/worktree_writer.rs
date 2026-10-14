@@ -20,7 +20,7 @@ pub(crate) fn linux_fd_safe_writer_concurrency(requested: usize) -> usize {
 }
 
 // Process-wide write-phase timing counters. These let a caller (notably the
-// `writer_bench` binary) split the worktree-write cost into three buckets that
+// `writer_bench` example) split the worktree-write cost into three buckets that
 // the per-clone benchmark conflates inside `write_ms`:
 //
 //   * prep  — path validation, parent-dir creation, symlink/exists probes, and
@@ -290,14 +290,6 @@ impl WorktreeWriter {
         }
     }
 
-    pub fn is_io_uring(&self) -> bool {
-        match &self.backend {
-            WriterBackend::Posix => false,
-            #[cfg(target_os = "linux")]
-            WriterBackend::IoUring(_) => true,
-        }
-    }
-
     fn auto() -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -331,94 +323,6 @@ impl WorktreeWriter {
         {
             anyhow::bail!("RIPCLONE_IO_URING requested, but io_uring is Linux-only");
         }
-    }
-
-    pub fn write_entry(&self, target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<()> {
-        self.write_entry_inner(target_dir, entry, RegularContent::Borrowed(content))
-    }
-
-    pub fn write_owned_entry(
-        &self,
-        target_dir: &Path,
-        entry: &FileEntry,
-        content: Vec<u8>,
-    ) -> Result<()> {
-        self.write_entry_inner(target_dir, entry, RegularContent::Owned(content))
-    }
-
-    pub fn write_owned_entries(
-        &self,
-        target_dir: &Path,
-        writes: Vec<OwnedFileWrite>,
-    ) -> Result<usize> {
-        self.write_owned_entries_with_options(target_dir, writes, WriteOptions::default())
-            .map(|outcome| outcome.written)
-    }
-
-    pub fn write_owned_entries_in_prepared_dirs(
-        &self,
-        target_dir: &Path,
-        writes: Vec<OwnedFileWrite>,
-    ) -> Result<usize> {
-        self.write_owned_entries_with_options(
-            target_dir,
-            writes,
-            WriteOptions {
-                parents_prepared: true,
-                ..WriteOptions::default()
-            },
-        )
-        .map(|outcome| outcome.written)
-    }
-
-    pub fn write_owned_entries_for_archive(
-        &self,
-        target_dir: &Path,
-        writes: Vec<OwnedFileWrite>,
-    ) -> Result<usize> {
-        self.write_owned_entries_with_options(
-            target_dir,
-            writes,
-            WriteOptions {
-                parents_prepared: true,
-                stamp_mtime: false,
-                fresh_target: true,
-            },
-        )
-        .map(|outcome| outcome.written)
-    }
-
-    pub fn write_owned_entries_for_fresh_checkout(
-        &self,
-        target_dir: &Path,
-        writes: Vec<OwnedFileWrite>,
-    ) -> Result<usize> {
-        self.write_owned_entries_with_options(
-            target_dir,
-            writes,
-            WriteOptions {
-                parents_prepared: true,
-                fresh_target: true,
-                ..WriteOptions::default()
-            },
-        )
-        .map(|outcome| outcome.written)
-    }
-
-    pub fn write_owned_entries_for_fresh_indexed_checkout(
-        &self,
-        target_dir: &Path,
-        writes: Vec<OwnedFileWrite>,
-    ) -> Result<WriteOutcome> {
-        self.write_owned_entries_with_options(
-            target_dir,
-            writes,
-            WriteOptions {
-                parents_prepared: true,
-                stamp_mtime: false,
-                fresh_target: true,
-            },
-        )
     }
 
     pub fn write_owned_entries_for_fresh_indexed_checkout_deferred(
@@ -474,68 +378,6 @@ impl WorktreeWriter {
         record_prep(prep_start.elapsed());
         let stats = self.write_regular_batch(regulars, options)?;
         Ok(WriteOutcome { written, stats })
-    }
-
-    fn write_entry_inner(
-        &self,
-        target_dir: &Path,
-        entry: &FileEntry,
-        content: RegularContent<'_>,
-    ) -> Result<()> {
-        let path = path_from_bytes(&entry.path);
-        validate_relative_path(path)
-            .with_context(|| format!("refusing to extract unsafe path: {}", path.display()))?;
-
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            safe_create_dir_all(target_dir, parent).with_context(|| {
-                format!(
-                    "create parent dir for {}",
-                    String::from_utf8_lossy(&entry.path)
-                )
-            })?;
-        }
-
-        let target = target_dir.join(path);
-
-        // Refuse to operate through an existing symlink at the final component.
-        // POSIX open would otherwise follow it and write outside the target dir.
-        if target.is_symlink() {
-            std::fs::remove_file(&target)
-                .with_context(|| format!("remove existing symlink {}", target.display()))?;
-        }
-
-        match entry.mode {
-            0o120000 => write_symlink_entry(&target, content.as_slice()),
-            0o100755 | 0o100644 => {
-                let mode = if entry.mode == 0o100755 { 0o755 } else { 0o644 };
-                self.write_regular(&target, mode, content)?;
-                set_file_mtime(&target, INDEX_MTIME)
-                    .with_context(|| format!("set mtime {}", target.display()))?;
-                Ok(())
-            }
-            _ => {
-                anyhow::bail!(
-                    "refusing to extract file {} with illegal mode 0o{:o}",
-                    String::from_utf8_lossy(&entry.path),
-                    entry.mode
-                );
-            }
-        }
-    }
-
-    fn write_regular(&self, target: &Path, mode: u32, content: RegularContent<'_>) -> Result<()> {
-        match &self.backend {
-            WriterBackend::Posix => {
-                write_regular_posix(target, mode, content.as_slice()).map(|_| ())
-            }
-            #[cfg(target_os = "linux")]
-            WriterBackend::IoUring(writer) => match content {
-                RegularContent::Borrowed(content) => writer.write_regular(target, mode, content),
-                RegularContent::Owned(content) => writer.write_regular_owned(target, mode, content),
-            },
-        }
     }
 
     fn write_regular_batch(
@@ -701,20 +543,6 @@ fn prepare_owned_entries(
     Ok((written, regulars))
 }
 
-enum RegularContent<'a> {
-    Borrowed(&'a [u8]),
-    Owned(Vec<u8>),
-}
-
-impl<'a> RegularContent<'a> {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            RegularContent::Borrowed(content) => content,
-            RegularContent::Owned(content) => content.as_slice(),
-        }
-    }
-}
-
 fn write_regular_batch_posix(
     writes: &[PreparedRegularWrite],
     collect_stats: bool,
@@ -795,37 +623,6 @@ fn write_symlink_entry(target: &Path, content: &[u8]) -> Result<()> {
             .with_context(|| format!("set mtime {}", target.display()))?;
     }
     Ok(())
-}
-
-fn write_regular_posix(target: &Path, mode: u32, content: &[u8]) -> Result<std::fs::Metadata> {
-    if target.exists() {
-        std::fs::remove_file(target).ok();
-    }
-
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW);
-        let mut file = opts
-            .open(target)
-            .with_context(|| format!("open {}", target.display()))?;
-        file.write_all(content)
-            .with_context(|| format!("write {}", target.display()))?;
-        file.metadata()
-            .with_context(|| format!("stat {}", target.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(target, content).with_context(|| format!("write {}", target.display()))?;
-        std::fs::metadata(target).with_context(|| format!("stat {}", target.display()))
-    }
 }
 
 /// Durability barrier for an opt-in (`RIPCLONE_FSYNC`) clone. fsyncs every file
@@ -1076,7 +873,7 @@ mod linux_uring {
                 std::fs::remove_file(target).ok();
             }
             if self.ensure_ready().is_err() {
-                return write_regular_posix(target, mode, &content)
+                return write_regular_posix_content(target, mode, &content.into())
                     .map(|_| ())
                     .with_context(|| format!("write {}", target.display()));
             }
@@ -2328,6 +2125,21 @@ mod linux_uring {
 mod tests {
     use super::*;
 
+    fn write_one(
+        writer: &WorktreeWriter,
+        root: &Path,
+        entry: FileEntry,
+        content: &[u8],
+    ) -> Result<()> {
+        let write = OwnedFileWrite {
+            entry,
+            content: content.to_vec().into(),
+        };
+        writer
+            .write_owned_entries_with_options(root, vec![write], WriteOptions::default())
+            .map(|_| ())
+    }
+
     #[test]
     fn posix_writer_writes_regular_file_modes_and_content() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2339,9 +2151,7 @@ mod tests {
             fragments: Vec::new(),
         };
 
-        writer
-            .write_entry(dir.path(), &entry, b"#!/bin/sh\n")
-            .unwrap();
+        write_one(&writer, dir.path(), entry, b"#!/bin/sh\n").unwrap();
 
         let path = dir.path().join("bin/tool");
         assert_eq!(std::fs::read(&path).unwrap(), b"#!/bin/sh\n");
@@ -2412,7 +2222,7 @@ mod tests {
             fragments: Vec::new(),
         };
 
-        assert!(writer.write_entry(dir.path(), &entry, b"nope").is_err());
+        assert!(write_one(&writer, dir.path(), entry, b"nope").is_err());
     }
 
     // A mid-run io_uring ring-allocation failure (e.g. ENOMEM / the locked-memory
@@ -2450,8 +2260,12 @@ mod tests {
         // Run on a fresh thread that has no ring yet, so ring creation is what's
         // attempted (and refused) — exercising the POSIX fallback rather than
         // reusing the ring this test thread created during the probe above.
-        let result =
-            std::thread::spawn(move || writer.write_owned_entries(&dir_path, writes)).join();
+        let result = std::thread::spawn(move || {
+            writer
+                .write_owned_entries_with_options(&dir_path, writes, WriteOptions::default())
+                .map(|outcome| outcome.written)
+        })
+        .join();
         // Restore before asserting so a failure can't leak the flag to other tests.
         linux_uring::set_runtime_disabled_for_test(false);
         let written = result
@@ -2519,15 +2333,22 @@ mod tests {
             }
         };
         let dir = tempfile::TempDir::new().unwrap();
-        let entry = FileEntry {
-            path: b"docs/readme.txt".to_vec(),
-            mode: 0o100644,
-            blob_sha1: Vec::new(),
-            fragments: Vec::new(),
-        };
+        // At least IO_URING_MIN_BATCH_FILES so the io_uring batch path is taken.
+        let writes = ["docs/readme.txt", "docs/other.txt"]
+            .into_iter()
+            .map(|path| OwnedFileWrite {
+                entry: FileEntry {
+                    path: path.as_bytes().to_vec(),
+                    mode: 0o100644,
+                    blob_sha1: Vec::new(),
+                    fragments: Vec::new(),
+                },
+                content: b"hello from io_uring\n".to_vec().into(),
+            })
+            .collect();
 
         writer
-            .write_entry(dir.path(), &entry, b"hello from io_uring\n")
+            .write_owned_entries_with_options(dir.path(), writes, WriteOptions::default())
             .unwrap();
 
         let path = dir.path().join("docs/readme.txt");
@@ -2558,19 +2379,20 @@ mod tests {
                 let writer = std::sync::Arc::clone(&writer);
                 let root = dir.path().to_path_buf();
                 scope.spawn(move || {
-                    for i in 0..32 {
-                        let rel = format!("shard-{worker}/file-{i}.txt");
-                        let content = format!("worker={worker} file={i}\n");
-                        let entry = FileEntry {
-                            path: rel.as_bytes().to_vec(),
-                            mode: 0o100644,
-                            blob_sha1: Vec::new(),
-                            fragments: Vec::new(),
-                        };
-                        writer
-                            .write_entry(&root, &entry, content.as_bytes())
-                            .unwrap();
-                    }
+                    let writes = (0..32)
+                        .map(|i| OwnedFileWrite {
+                            entry: FileEntry {
+                                path: format!("shard-{worker}/file-{i}.txt").into_bytes(),
+                                mode: 0o100644,
+                                blob_sha1: Vec::new(),
+                                fragments: Vec::new(),
+                            },
+                            content: format!("worker={worker} file={i}\n").into_bytes().into(),
+                        })
+                        .collect();
+                    writer
+                        .write_owned_entries_with_options(&root, writes, WriteOptions::default())
+                        .unwrap();
                 });
             }
         });
@@ -2649,7 +2471,10 @@ mod tests {
         // otherwise auto() legitimately falls back to POSIX.
         if WorktreeWriter::io_uring().is_ok() {
             assert!(
-                WorktreeWriter::new().unwrap().is_io_uring(),
+                matches!(
+                    WorktreeWriter::new().unwrap().backend,
+                    WriterBackend::IoUring(_)
+                ),
                 "new() must default to io_uring on Linux when available"
             );
         }

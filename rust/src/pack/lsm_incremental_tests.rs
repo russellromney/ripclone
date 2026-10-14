@@ -94,28 +94,22 @@ fn lsm_incremental_full_clone_is_complete() {
     let hist_target = 512 * 1024 * 1024;
 
     // Sync 1 @ C: seal the whole history up to C as level 0.
-    let s1 = builder
-        .build_incremental_packs(&c, None, head_target, hist_target)
-        .unwrap();
-    assert!(!s1.tail_packs.is_empty(), "level 0 should have packs");
+    let level0 = builder.build_history_tail(&c, None, hist_target).unwrap();
+    assert!(!level0.is_empty(), "level 0 should have packs");
 
-    // Sync 2 @ E: only the tail (C, E] is rebuilt.
-    let s2 = builder
-        .build_incremental_packs(&e, Some(&c), head_target, hist_target)
+    // Sync 2 @ E: only the tail (C, E] is rebuilt, plus E's HEAD closure.
+    let tail = builder
+        .build_history_tail(&e, Some(&c), hist_target)
         .unwrap();
-    assert!(!s2.tail_packs.is_empty(), "tail (C,E] should have packs");
+    assert!(!tail.is_empty(), "tail (C,E] should have packs");
+    let head = builder.build_head_packs(&e, head_target).unwrap();
 
     // A full clone at E installs: level 0 (sync-1 tail) + sync-2 tail + sync-2 head.
     let tgt = tmp.path().join("tgt");
     std::fs::create_dir_all(&tgt).unwrap();
     git(&tgt, &["init", "-q", "-b", "main"]);
     let pack_dir = tgt.join(".git/objects/pack");
-    for (ph, _, ih, _) in s1
-        .tail_packs
-        .iter()
-        .chain(s2.tail_packs.iter())
-        .chain(s2.head_packs.iter())
-    {
+    for (ph, _, ih, _) in level0.iter().chain(tail.iter()).chain(head.iter()) {
         install_pack(&cas, &pack_dir, ph, ih);
     }
 
@@ -165,18 +159,15 @@ fn lsm_no_new_commits_yields_empty_tail() {
     let builder = PackBuilder::new(&src, &cas);
 
     // Seal everything up to HEAD, then "sync" again at the same commit.
-    let _ = builder
-        .build_incremental_packs(&head, None, 6 * 1024 * 1024, 512 * 1024 * 1024)
+    let sealed = builder
+        .build_history_tail(&head, None, 512 * 1024 * 1024)
         .unwrap();
+    assert!(!sealed.is_empty(), "level 0 should have packs");
     let again = builder
-        .build_incremental_packs(&head, Some(&head), 6 * 1024 * 1024, 512 * 1024 * 1024)
+        .build_history_tail(&head, Some(&head), 512 * 1024 * 1024)
         .unwrap();
     assert!(
-        again.tail_packs.is_empty(),
+        again.is_empty(),
         "no new commits since the sealed tip -> empty tail"
-    );
-    assert!(
-        !again.head_packs.is_empty(),
-        "HEAD closure is always rebuilt"
     );
 }

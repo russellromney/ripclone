@@ -4,7 +4,7 @@
 //! (`write_ms`) buries underneath archive download, zstd decompression, SHA-1
 //! verification and the local blob-pack build. Here there is no network, no
 //! decompression and no hashing: file contents are prepared in memory up front,
-//! then handed to the real `WorktreeWriter::write_owned_entries` path — exactly
+//! then handed to the real `WorktreeWriter::write_owned_entries_with_options` path — exactly
 //! what the extractor calls per frame.
 //!
 //! It runs the POSIX backend and (on Linux, when available) the io_uring
@@ -13,7 +13,7 @@
 //! `worktree_writer::take_write_timing`.
 //!
 //! Example:
-//!   cargo run --release --bin writer_bench -- \
+//!   cargo run --release --example writer_bench -- \
 //!     --small 20000 --small-size 2048 --large 64 --large-size 1048576 \
 //!     --threads 7 --batch 256 --backend both
 //!

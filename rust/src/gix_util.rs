@@ -143,26 +143,6 @@ pub fn default_branch<P: AsRef<Path>>(repo_path: P) -> Result<String> {
     Ok(name)
 }
 
-/// Return the `count` most recent commits on `branch`, first-parent only.
-pub fn last_commits<P: AsRef<Path>>(
-    repo_path: P,
-    branch: &str,
-    count: usize,
-) -> Result<Vec<String>> {
-    let repo = open_repo(repo_path)?;
-    let id = repo
-        .rev_parse_single(branch)
-        .with_context(|| format!("resolving branch '{}'", branch))?;
-    repo.rev_walk([id])
-        .first_parent_only()
-        .all()
-        .context("rev-walk")?
-        .take(count)
-        .map(|info| info.map(|i| i.id.to_string()))
-        .collect::<Result<Vec<_>, _>>()
-        .context("iterate rev-walk")
-}
-
 /// Return the immediate parent of `commit` only when it has exactly one.
 ///
 /// Roots and merges deliberately return `None`: callers use this value as an
@@ -376,46 +356,6 @@ pub fn classify_objects<P: AsRef<Path>>(
     Ok(pairs.into_iter().collect())
 }
 
-/// Return the type of an object.
-pub fn object_type<P: AsRef<Path>>(repo_path: P, sha: &str) -> Result<String> {
-    let repo = open_repo(repo_path)?;
-    let id = parse_oid(sha)?;
-    let header = repo
-        .find_header(id)
-        .with_context(|| format!("find header {}", sha))?;
-    Ok(kind_to_str(header.kind()).to_string())
-}
-
-/// Read the content bytes of an object (what `git cat-file -p` prints).
-pub fn cat_file<P: AsRef<Path>>(repo_path: P, sha: &str) -> Result<Vec<u8>> {
-    let repo = open_repo(repo_path)?;
-    let id = parse_oid(sha)?;
-    Ok(repo
-        .find_object(id)
-        .with_context(|| format!("read object {}", sha))?
-        .data
-        .clone())
-}
-
-/// Read the content bytes of many objects.
-pub fn cat_file_batch<P: AsRef<Path>>(
-    repo_path: P,
-    shas: &[String],
-) -> Result<HashMap<String, Vec<u8>>> {
-    let repo = open_repo(repo_path)?;
-    let mut map = HashMap::with_capacity(shas.len());
-    for sha in shas {
-        let id = parse_oid(sha)?;
-        let data = repo
-            .find_object(id)
-            .with_context(|| format!("read object {}", sha))?
-            .data
-            .clone();
-        map.insert(sha.clone(), data);
-    }
-    Ok(map)
-}
-
 /// Return a map from path to blob size for every blob in the commit tree.
 pub fn ls_tree_sizes<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<HashMap<String, u64>> {
     let repo = open_repo(repo_path)?;
@@ -450,29 +390,6 @@ pub fn ls_tree_sizes<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<HashM
         map.insert(String::from_utf8_lossy(&entry.filepath).to_string(), size);
     }
     Ok(map)
-}
-
-/// Look up a single tree entry by path.
-pub fn ls_tree_entry<P: AsRef<Path>>(
-    repo_path: P,
-    commit: &str,
-    path: &str,
-) -> Result<Option<(String, String)>> {
-    let repo = open_repo(repo_path)?;
-    let id = repo
-        .rev_parse_single(commit)
-        .with_context(|| format!("resolving commit '{}'", commit))?;
-    let tree_id = repo
-        .find_commit(id)
-        .context("find commit")?
-        .tree_id()
-        .context("read tree id")?;
-    let tree = repo.find_tree(tree_id).context("find tree")?;
-    let entry = tree.lookup_entry_by_path(path).context("lookup entry")?;
-    Ok(entry.map(|e| {
-        let mode = format!("{:o}", e.mode());
-        (mode, e.object_id().to_string())
-    }))
 }
 
 // ---------------------------------------------------------------------------

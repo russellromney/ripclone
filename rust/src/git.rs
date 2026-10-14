@@ -134,82 +134,6 @@ pub fn set_skip_worktree_all<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
     update_index_skip_worktree(repo_dir, &paths, true)
 }
 
-/// Set skip-worktree on every tracked path only if at least one entry is
-/// missing the bit. Use this on a client that receives a prebuilt index from
-/// the server: it is a fast no-op when the server already set the bit.
-pub fn ensure_skip_worktree_all<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let repo_dir = repo_dir.as_ref();
-    let index_path = repo_dir.join(".git").join("index");
-    let index = open_index_file(&index_path)?;
-    let paths: Vec<String> = index
-        .entries()
-        .iter()
-        .filter(|entry| !entry.flags.contains(SKIP_WORKTREE_FLAG))
-        .map(|entry| String::from_utf8_lossy(entry.path_in(index.path_backing())).to_string())
-        .collect();
-    update_index_skip_worktree(repo_dir, &paths, true)
-}
-
-/// Clear the skip-worktree bit for every entry in the index.
-/// Returns the number of entries that were cleared.
-pub fn clear_skip_worktree_all<P: AsRef<Path>>(repo_dir: P) -> Result<usize> {
-    let repo_dir = repo_dir.as_ref();
-    let index_path = repo_dir.join(".git").join("index");
-    let index = open_index_file(&index_path)?;
-    let paths: Vec<String> = index
-        .entries()
-        .iter()
-        .filter(|entry| entry.flags.contains(SKIP_WORKTREE_FLAG))
-        .map(|entry| String::from_utf8_lossy(entry.path_in(index.path_backing())).to_string())
-        .collect();
-    let cleared = paths.len();
-    update_index_skip_worktree(repo_dir, &paths, false)?;
-    Ok(cleared)
-}
-
-/// Clear the skip-worktree bit for a set of paths directly via `git2`.
-/// `repo_dir` is the working tree (containing `.git`).
-/// This avoids spawning a `git update-index` subprocess for every extraction.
-pub fn clear_skip_worktree_index<P: AsRef<Path>>(repo_dir: P, paths: &[String]) -> Result<()> {
-    update_index_skip_worktree(repo_dir, paths, false)
-}
-
-/// Clear skip-worktree and refresh cached stat data for materialized paths.
-///
-/// This lets fresh checkout/materialization paths skip the per-file mtime stamp:
-/// the index is updated to match the actual files on disk instead.
-pub fn clear_skip_worktree_index_and_refresh_stats<P: AsRef<Path>>(
-    repo_dir: P,
-    paths: &[String],
-) -> Result<()> {
-    clear_skip_worktree_index_with_stats(repo_dir, paths, &[])
-}
-
-pub fn clear_skip_worktree_index_with_stats<P: AsRef<Path>>(
-    repo_dir: P,
-    paths: &[String],
-    stats: &[MaterializedPathStat],
-) -> Result<()> {
-    let byte_paths: Vec<&[u8]> = paths.iter().map(|p| p.as_bytes()).collect();
-    clear_skip_worktree_index_with_stats_bytes(repo_dir, &byte_paths, stats)
-}
-
-pub fn clear_skip_worktree_index_with_stats_raw<P: AsRef<Path>>(
-    repo_dir: P,
-    paths: &[Vec<u8>],
-    stats: &[MaterializedPathStat],
-) -> Result<()> {
-    clear_skip_worktree_index_with_stats_byte_iter(repo_dir, paths.iter().map(Vec::as_slice), stats)
-}
-
-pub fn clear_skip_worktree_index_with_stats_bytes<P: AsRef<Path>>(
-    repo_dir: P,
-    paths: &[&[u8]],
-    stats: &[MaterializedPathStat],
-) -> Result<()> {
-    clear_skip_worktree_index_with_stats_byte_iter(repo_dir, paths.iter().copied(), stats)
-}
-
 pub fn clear_skip_worktree_index_with_stats_byte_iter<'a, P, I>(
     repo_dir: P,
     paths: I,
@@ -375,27 +299,6 @@ fn clamp_u64_to_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-/// Materialize the entire index into the working tree using `git checkout-index`.
-/// This is typically much faster than writing files one-by-one from an archive
-/// because git batches reads through the pack index and uses fewer syscalls.
-pub fn checkout_index<P: AsRef<Path>>(repo: P) -> Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo.as_ref().as_os_str())
-        .args(["checkout-index", "-a", "-f"])
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to run git checkout-index in {}",
-                repo.as_ref().display()
-            )
-        })?;
-    if !status.success() {
-        bail!("git checkout-index failed");
-    }
-    Ok(())
-}
-
 /// Run a git command in a repo and return stdout as String.
 pub fn run_git<P: AsRef<Path>>(repo: P, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
@@ -471,42 +374,6 @@ pub fn default_branch<P: AsRef<Path>>(repo: P) -> Result<String> {
 /// True when the mirror holds no references — an empty upstream with no commits.
 pub fn is_empty_repo<P: AsRef<Path>>(repo: P) -> Result<bool> {
     crate::gix_util::is_empty_repo(repo)
-}
-
-/// The commit's depth in history — the number of commits reachable from it
-/// (`git rev-list --count`). It's monotonic along ancestry (a descendant always
-/// reaches strictly more commits than its ancestors), so it orders branch
-/// updates by their place in git history rather than by the builder's clock.
-/// The commit-graph written during sync makes this cheap.
-pub fn commit_depth<P: AsRef<Path>>(repo: P, commit: &str) -> Result<u64> {
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {}", commit))?;
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo.as_ref())
-        .args(["rev-list", "--count", commit])
-        .output()
-        .context("run git rev-list --count")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git rev-list --count {commit} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.trim()
-        .parse::<u64>()
-        .with_context(|| format!("parse commit depth {:?}", s.trim()))
-}
-
-pub fn last_commits<P: AsRef<Path>>(repo: P, branch: &str, count: usize) -> Result<Vec<String>> {
-    crate::validation::validate_git_rev(branch)
-        .with_context(|| format!("invalid branch: {}", branch))?;
-    crate::gix_util::last_commits(repo, branch, count)
-}
-
-pub fn list_object_shas<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Vec<String>> {
-    crate::gix_util::list_object_shas_with_depth(repo, commit, None)
 }
 
 /// List objects reachable from `to` but not from `from` — i.e. the objects
@@ -738,53 +605,6 @@ pub fn classify_objects<P: AsRef<Path>>(
     crate::gix_util::classify_objects(repo, shas)
 }
 
-/// Build a packfile containing the given object SHAs.
-pub fn pack_objects<P: AsRef<Path>, Q: AsRef<Path>>(
-    repo: P,
-    object_shas: &[String],
-    output_path: Q,
-) -> Result<()> {
-    if object_shas.is_empty() {
-        bail!("no objects to pack");
-    }
-
-    let output = std::fs::File::create(output_path.as_ref())
-        .with_context(|| format!("create pack output {}", output_path.as_ref().display()))?;
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo.as_ref())
-        .args(["pack-objects", "--stdout"])
-        .stdin(Stdio::piped())
-        .stdout(output)
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn git pack-objects --stdout")?;
-
-    {
-        let mut stdin = child.stdin.take().context("open pack-objects stdin")?;
-        for sha in object_shas {
-            stdin
-                .write_all(sha.as_bytes())
-                .context("write object id to pack-objects stdin")?;
-            stdin
-                .write_all(b"\n")
-                .context("write newline to pack-objects stdin")?;
-        }
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("wait for git pack-objects")?;
-    if !output.status.success() {
-        bail!(
-            "pack-objects failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    Ok(())
-}
-
 /// Build a packfile + index containing the given object SHAs, writing them to
 /// files starting with `prefix`. Git emits `<prefix>-<packhash>.pack` and
 /// `<prefix>-<packhash>.idx`.
@@ -820,15 +640,17 @@ pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
 /// reachable closure itself; `--use-bitmap-index` answers that from the mirror's
 /// multi-pack-index bitmap (no graph walk) and lets pack-objects copy existing
 /// pack deltas (`--reuse-delta` is on by default) rather than re-deltifying.
-/// An optional `--max-pack-size` exists for focused compatibility tests. The
-/// production cold-history path leaves it unset: split packs cannot retain
-/// deltas whose bases land in another output pack, turning this I/O-oriented
-/// reuse path back into expensive re-deltification.
+/// No `--max-pack-size`: split packs cannot retain deltas whose bases land in
+/// another output pack, turning this I/O-oriented reuse path back into
+/// expensive re-deltification. Even a 4 GiB split made Linux re-deltify for
+/// minutes; 64 MiB more than doubled Bun's cold-history bytes and made the
+/// otherwise bitmap-backed build 30x slower. Remote storage handles large files
+/// with multipart upload instead of imposing its transport boundary on Git's
+/// object representation.
 pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     repo: P,
     commit: &str,
     prefix: Q,
-    max_pack_bytes: Option<u64>,
 ) -> Result<()> {
     // `commit` is fed to `pack-objects --revs` via stdin, where each line is a
     // rev-list arg — a `-`-leading or range value would change the packed set.
@@ -844,17 +666,12 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     // Capture rather than inherit: pack-objects prints each output pack's hash to
     // stdout (noise in the server log), and stderr carries the real diagnostic when
     // it fails. We write the packs by base-name, so stdout is not needed.
-    let mut command = Command::new("git");
-    command
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(repo.as_ref())
         .arg("pack-objects")
         .arg("--revs")
-        .arg("--use-bitmap-index");
-    if let Some(max_pack_bytes) = max_pack_bytes {
-        command.arg(format!("--max-pack-size={}", max_pack_bytes.max(1)));
-    }
-    let mut child = command
+        .arg("--use-bitmap-index")
         .arg(prefix.as_ref())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1161,42 +978,6 @@ pub fn ls_tree_sizes<P: AsRef<Path>>(repo: P, commit: &str) -> Result<HashMap<St
     crate::gix_util::ls_tree_sizes(repo, commit)
 }
 
-pub fn ls_tree_entry<P: AsRef<Path>>(
-    repo: P,
-    commit: &str,
-    path: &str,
-) -> Result<Option<(String, String)>> {
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {}", commit))?;
-    if path.contains('\0') {
-        anyhow::bail!("path contains NUL byte");
-    }
-    crate::gix_util::ls_tree_entry(repo, commit, path)
-}
-
-pub fn cat_file<P: AsRef<Path>>(repo: P, sha: &str) -> Result<Vec<u8>> {
-    crate::validation::validate_object_id(sha)
-        .with_context(|| format!("invalid object id: {}", sha))?;
-    crate::gix_util::cat_file(repo, sha)
-}
-
-/// Fetch the contents of many blob SHAs in a single `git cat-file --batch` call.
-///
-/// Streams one SHA at a time so the pipe never backs up, which avoids the
-/// deadlock risk of buffering the entire output in memory before reading.
-pub fn cat_file_batch<P: AsRef<Path>>(
-    repo: P,
-    shas: &[String],
-) -> Result<std::collections::HashMap<String, Vec<u8>>> {
-    crate::gix_util::cat_file_batch(repo, shas)
-}
-
-pub fn object_type<P: AsRef<Path>>(repo: P, sha: &str) -> Result<String> {
-    crate::validation::validate_object_id(sha)
-        .with_context(|| format!("invalid object id: {}", sha))?;
-    crate::gix_util::object_type(repo, sha)
-}
-
 /// Disable git's automatic gc on a bare mirror, persisted into the mirror's own
 /// config so it covers every later command, not just one fetch.
 ///
@@ -1218,82 +999,6 @@ pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
         if !status.success() {
             bail!("failed to disable auto-gc ({key}) on mirror");
         }
-    }
-    Ok(())
-}
-
-/// Initialize an empty bare mirror that can be seeded with packfiles before the
-/// normal `git fetch origin` delta step runs.
-///
-/// This mirrors the durable config shape of `git clone --mirror`: all upstream
-/// refs are fetched directly into the bare repo (`+refs/*:refs/*`), and auto-gc
-/// is disabled before any later fetch mutates the object database.
-pub fn init_bare_mirror_origin<P: AsRef<Path>>(
-    mirror_dir: P,
-    provider: &ProviderInstance,
-    repo_id: &RepoId,
-    credential: Option<&secrecy::SecretString>,
-) -> Result<()> {
-    crate::validation::validate_repo_path(provider, repo_id)
-        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
-
-    let (url, _git_args) = upstream_url_and_auth(provider, repo_id, credential);
-    std::fs::create_dir_all(mirror_dir.as_ref().parent().unwrap_or(Path::new("")))?;
-
-    let output = Command::new("git")
-        .args(["init", "--bare"])
-        .arg(mirror_dir.as_ref().as_os_str())
-        .output()
-        .context("git init bare mirror")?;
-    if !output.status.success() {
-        bail!(
-            "init bare mirror failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    disable_auto_gc(mirror_dir.as_ref())?;
-
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(mirror_dir.as_ref().as_os_str())
-        .args(["remote", "add", "origin", &url])
-        .status()
-        .context("git remote add origin")?;
-    if !status.success() {
-        bail!("remote add origin failed");
-    }
-
-    for (key, value) in [
-        ("remote.origin.fetch", "+refs/*:refs/*"),
-        ("remote.origin.mirror", "true"),
-    ] {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(mirror_dir.as_ref().as_os_str())
-            .args(["config", key, value])
-            .status()
-            .with_context(|| format!("git config {key}"))?;
-        if !status.success() {
-            bail!("config {key} failed");
-        }
-    }
-
-    Ok(())
-}
-
-pub fn fsck_connectivity<P: AsRef<Path>>(repo: P) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo.as_ref().as_os_str())
-        .args(["fsck", "--connectivity-only"])
-        .output()
-        .context("git fsck connectivity")?;
-    if !output.status.success() {
-        bail!(
-            "git fsck connectivity failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
     Ok(())
 }
@@ -1465,20 +1170,6 @@ fn upstream_failure_is_retryable(stderr: &[u8]) -> bool {
     // an HTTP response as retryable. Preserve that conservative behavior from
     // the one Git result: bounded queue attempts still cap an unknown failure.
     true
-}
-
-/// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
-/// reference-advertisement round-trip with **no object transfer**. Returns the
-/// hex commit SHA, or `None` if the ref is absent upstream. Individual callers
-/// decide whether an upstream error is best-effort (historical-revision work) or
-/// fail-closed (ordinary immutable admission).
-pub fn ls_remote_commit(
-    provider: &ProviderInstance,
-    repo_id: &RepoId,
-    ref_name: &str,
-    credential: Option<&secrecy::SecretString>,
-) -> Result<Option<String>> {
-    Ok(ls_remote_tip(provider, repo_id, ref_name, credential)?.map(|tip| tip.commit))
 }
 
 /// Cancellation-owned async form of [`ls_remote_commit`].
@@ -1952,19 +1643,6 @@ impl MirrorLock {
     }
 }
 
-/// Run `f` while holding the same cross-process mirror lock used by
-/// [`sync_bare_mirror`]. Callers that mutate or create a mirror outside
-/// `sync_bare_mirror` must use this so multi-process workers cannot race the
-/// initial clone/seed step.
-pub fn with_mirror_lock<P, F, T>(mirror_dir: P, f: F) -> Result<T>
-where
-    P: AsRef<Path>,
-    F: FnOnce() -> Result<T>,
-{
-    let _mirror_lock = MirrorLock::acquire(mirror_dir.as_ref())?;
-    f()
-}
-
 /// Sync a bare mirror of a repo. Creates if missing, fetches if exists.
 ///
 /// Phase 1: credentials are passed via git's `http.extraHeader` config, never
@@ -2250,70 +1928,6 @@ pub fn parent_commit<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Option<Str
     crate::gix_util::parent_commit(repo, commit)
 }
 
-/// Find a commit object in a git dir's object store.
-pub fn find_commit_in_git_dir<P: AsRef<Path>>(git_dir: P) -> Result<String> {
-    let objects_dir = git_dir.as_ref().join("objects");
-    for entry in walkdir::WalkDir::new(&objects_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.is_file() {
-            let rel = path.strip_prefix(&objects_dir)?;
-            let sha = rel
-                .to_string_lossy()
-                .replace(&std::path::MAIN_SEPARATOR.to_string(), "");
-            if sha.len() == 40
-                && let Ok(t) = object_type(&git_dir, &sha)
-                && t == "commit"
-            {
-                return Ok(sha);
-            }
-        }
-    }
-    bail!("no commit object found")
-}
-
-/// Materialize a file in a git dir by fetching its blob from a source repo.
-pub fn materialize_file<P: AsRef<Path>, Q: AsRef<Path>>(
-    source_repo: P,
-    git_dir: Q,
-    commit: &str,
-    path: &str,
-    target_root: Option<P>,
-) -> Result<usize> {
-    let entry = ls_tree_entry(&source_repo, commit, path)?;
-    let (mode, sha) = match entry {
-        Some(e) => e,
-        None => bail!("path not found in tree: {}", path),
-    };
-
-    let content = cat_file(&source_repo, &sha)?;
-    let target = match target_root {
-        Some(root) => root.as_ref().join(path),
-        None => git_dir
-            .as_ref()
-            .parent()
-            .unwrap_or(Path::new(""))
-            .join(path),
-    };
-
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&target, &content)?;
-
-    #[cfg(unix)]
-    if mode == "100755" {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&target)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&target, perms)?;
-    }
-
-    Ok(content.len())
-}
-
 /// Serializes tests that mutate the process-global `RIPCLONE_ORIGIN_BASE`, so
 /// parallel test threads don't clobber each other's origin redirection.
 #[cfg(test)]
@@ -2532,17 +2146,20 @@ mod tests {
         let sha = crate::test_fixture::commit(&repo, &[("README.md", b"hello")]);
 
         let registry = ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/widget");
 
         // Redirect the github default origin to the local bare repo, serialized
         // against other RIPCLONE_ORIGIN_BASE tests.
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        let head = ls_remote_commit(provider, &repo_id, "HEAD", None);
-        let missing = ls_remote_commit(provider, &repo_id, "no-such-branch", None);
+        let tip = |ref_name| {
+            ls_remote_tip(provider, &repo_id, ref_name, None).map(|tip| tip.map(|t| t.commit))
+        };
+        let head = tip("HEAD");
+        let missing = tip("no-such-branch");
         // A glob in the ref name must not turn the query into a pattern match.
-        let globbed = ls_remote_commit(provider, &repo_id, "wid*", None);
+        let globbed = tip("wid*");
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(
@@ -2579,7 +2196,7 @@ mod tests {
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", format!("http://{addr}")) };
         let registry = crate::provider::ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let result = ls_remote_tip_with_timeout(
             provider,
             &crate::provider::RepoId::github("acme/timeout"),
@@ -2655,7 +2272,7 @@ mod tests {
         crate::test_fixture::commit(&src, &[("README.md", b"hi")]);
 
         let registry = ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/widget");
         let mirror = base.path().join("mirror.git");
 
@@ -2697,7 +2314,7 @@ mod tests {
         );
 
         let registry = ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/widget");
         let mirror = base.path().join("mirror-rev.git");
 
@@ -2734,7 +2351,7 @@ mod tests {
         );
 
         let registry = ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/head-rev");
         let mirror = base.path().join("mirror-head-rev.git");
 
@@ -2778,7 +2395,7 @@ mod tests {
         );
 
         let registry = ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/named-tip");
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
@@ -2802,7 +2419,7 @@ mod tests {
         let commit_c = crate::test_fixture::commit(&src, &[("README.md", b"C")]);
         let mirror = base.path().join("mirror-admitted.git");
         let registry = ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/widget");
 
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2857,7 +2474,7 @@ mod tests {
 
         let mirror = base.path().join("mirror-deleted.git");
         let registry = ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/deleted");
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
@@ -2888,7 +2505,7 @@ mod tests {
         );
 
         let registry = ProviderRegistry::new();
-        let provider = registry.default_provider();
+        let provider = registry.get("github").unwrap();
         let repo_id = RepoId::github("acme/widget");
         let mirror = base.path().join("mirror-non-sha-rev.git");
 
@@ -3103,64 +2720,6 @@ mod tests {
         name
     }
 
-    #[test]
-    #[ignore]
-    fn debug_list_objects() {
-        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
-        let start = std::time::Instant::now();
-        let shas = list_object_shas(repo, "HEAD").unwrap();
-        println!("list_object_shas: {} in {:?}", shas.len(), start.elapsed());
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_classify() {
-        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
-        let shas = list_object_shas(repo, "HEAD").unwrap();
-        let set: HashSet<String> = shas.into_iter().collect();
-        let start = std::time::Instant::now();
-        let types = classify_objects(repo, &set).unwrap();
-        println!("classify_objects: {} in {:?}", types.len(), start.elapsed());
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_pack() {
-        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
-        let shas = list_object_shas(repo, "HEAD").unwrap();
-        let set: HashSet<String> = shas.into_iter().collect();
-        let types = classify_objects(repo, &set).unwrap();
-        let skel: Vec<String> = set
-            .into_iter()
-            .filter(|sha| {
-                matches!(
-                    types.get(sha).map(|s| s.as_str()),
-                    Some("commit") | Some("tree")
-                )
-            })
-            .collect();
-        let out = std::path::Path::new("/tmp/test-skel.pack");
-        let start = std::time::Instant::now();
-        pack_objects(repo, &skel, out).unwrap();
-        println!(
-            "pack_objects: {} bytes in {:?}",
-            std::fs::metadata(out).unwrap().len(),
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn test_cat_file_batch() {
-        let repo = Path::new("/tmp/bun-inspect.git");
-        if !repo.exists() {
-            return;
-        }
-        let shas = vec!["5ff4e6424be88db31ae443f926f289aa726a88b1".to_string()];
-        let map = cat_file_batch(repo, &shas).unwrap();
-        assert_eq!(map.len(), 1);
-        assert!(map.contains_key(&shas[0]));
-    }
-
     /// Phase 1 parity harness: gix-based enumeration/metadata must match git(1).
     #[test]
     fn gix_enumeration_parity_with_git() {
@@ -3210,7 +2769,7 @@ mod tests {
         git(repo, &["add", "c.txt"]);
         git(repo, &["commit", "-q", "-m", "c2"]);
 
-        // resolve / default branch / parent / last_commits
+        // resolve / default branch / parent
         assert_eq!(
             resolve_commit(repo, "HEAD").unwrap(),
             git(repo, &["rev-parse", "HEAD"])
@@ -3220,14 +2779,6 @@ mod tests {
             parent_commit(repo, "HEAD").unwrap(),
             Some(git(repo, &["rev-parse", "HEAD^"]))
         );
-        assert_eq!(
-            last_commits(repo, "HEAD", 2).unwrap(),
-            git(repo, &["log", "--format=%H", "--first-parent", "-n", "2"])
-                .lines()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-        );
-
         // Object sets must include commit + tree/blob closure.
         let expect_full: HashSet<String> = git(
             repo,
@@ -3236,7 +2787,7 @@ mod tests {
         .lines()
         .map(|s| s.to_string())
         .collect();
-        let got_full: HashSet<String> = list_object_shas(repo, "HEAD")
+        let got_full: HashSet<String> = list_object_shas_with_depth(repo, "HEAD", None)
             .unwrap()
             .into_iter()
             .collect();
@@ -3313,20 +2864,10 @@ mod tests {
         };
         assert_eq!(ls_tree_sizes(repo, "HEAD").unwrap(), expect_sizes);
 
-        // Single entry lookup.
-        assert_eq!(
-            ls_tree_entry(repo, "HEAD", "dir/b.txt").unwrap(),
-            Some((
-                "100644".to_string(),
-                git(repo, &["rev-parse", "HEAD:dir/b.txt"])
-            ))
-        );
-
         // Type/size/classify.
         let types = classify_objects(repo, &expect_full).unwrap();
         for sha in &expect_full {
             let want_type = git(repo, &["cat-file", "-t", sha]);
-            assert_eq!(object_type(repo, sha).unwrap(), want_type);
             assert_eq!(types.get(sha).unwrap(), &want_type);
         }
         let sizes = object_sizes(repo, &expect_full.iter().cloned().collect::<Vec<_>>()).unwrap();
@@ -3337,12 +2878,6 @@ mod tests {
                 .unwrap();
             assert_eq!(sizes.get(sha).copied().unwrap(), want_size);
         }
-
-        // Blob content.
-        let blob_sha = git(repo, &["rev-parse", "HEAD:dir/b.txt"]);
-        assert_eq!(cat_file(repo, &blob_sha).unwrap(), b"b\n"[..]);
-        let batch = cat_file_batch(repo, std::slice::from_ref(&blob_sha)).unwrap();
-        assert_eq!(batch.get(&blob_sha).unwrap(), &b"b\n"[..]);
     }
 
     /// Submodule entries (mode 160000) must not appear in the worktree file list.
@@ -3368,18 +2903,6 @@ mod tests {
         assert_eq!(entries.len(), 1, "submodule entry must be skipped");
         assert_eq!(entries[0].0, "file.txt");
         assert_eq!(entries[0].1, "100644");
-    }
-
-    /// Negative case: asking for a non-existent object must fail cleanly.
-    #[test]
-    fn gix_cat_file_rejects_missing_object() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let _ = Command::new("git").arg("init").arg(repo).output().unwrap();
-        assert!(
-            cat_file(repo, "0000000000000000000000000000000000000000").is_err(),
-            "missing object should error"
-        );
     }
 
     /// gix pack encode produces a deterministic, valid pack+idx pair.
@@ -3682,8 +3205,8 @@ mod tests {
         assert_skip_worktree_flag(repo, "a.txt", true);
         assert_skip_worktree_flag(repo, "b.txt", true);
 
-        let cleared = clear_skip_worktree_all(repo).unwrap();
-        assert_eq!(cleared, 2);
+        update_index_skip_worktree(repo, &["a.txt".to_string(), "b.txt".to_string()], false)
+            .unwrap();
         assert_skip_worktree_flag(repo, "a.txt", false);
         assert_skip_worktree_flag(repo, "b.txt", false);
     }
@@ -3731,7 +3254,8 @@ mod tests {
             b"a.txt".to_vec(),
             &std::fs::symlink_metadata(repo.join("a.txt")).unwrap(),
         )];
-        clear_skip_worktree_index_with_stats(repo, &["a.txt".to_string()], &stats).unwrap();
+        clear_skip_worktree_index_with_stats_byte_iter(repo, [b"a.txt".as_slice()], &stats)
+            .unwrap();
 
         assert_skip_worktree_flag(repo, "a.txt", false);
 
@@ -3824,27 +3348,10 @@ mod tests {
 
         assert_eq!(parent_commit(repo, &commit).unwrap(), None);
 
-        let commits = last_commits(repo, "main", 1).unwrap();
-        assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0], commit);
-
-        let empty = last_commits(repo, "main", 0).unwrap();
-        assert!(empty.is_empty());
-
-        // ls-tree entry and symlink detection.
-        let entry = ls_tree_entry(repo, "HEAD", "a.txt").unwrap();
-        assert!(entry.is_some(), "ls_tree_entry should find a.txt");
-        let (mode, sha) = entry.unwrap();
-        assert_eq!(mode, "100644");
-        assert!(!sha.is_empty());
-
-        let missing = ls_tree_entry(repo, "HEAD", "does-not-exist.txt").unwrap();
-        assert!(missing.is_none());
-
         let symlinks = symlink_blob_shas(repo, "HEAD").unwrap();
         assert!(symlinks.is_empty());
 
-        let oids = list_object_shas(repo, &commit).unwrap();
+        let oids = list_object_shas_with_depth(repo, &commit, None).unwrap();
         assert!(!oids.is_empty());
     }
 
@@ -3897,14 +3404,12 @@ mod tests {
 
         assert!(resolve_commit(repo, "not-a-real-ref").is_err());
         assert!(resolve_commit(repo, "HEAD").is_err()); // no commits yet
-        assert!(last_commits(repo, "main", 1).is_err());
-        assert!(ls_tree_entry(repo, "HEAD", "x").is_err());
 
         let not_repo = tempfile::tempdir().unwrap();
         assert!(crate::gix_util::open_repo(not_repo.path()).is_err());
     }
 
-    /// A commit chain: parent_commit and last_commits order (Phase 1).
+    /// A commit chain: parent_commit and range listing (Phase 1).
     #[test]
     fn gix_commit_chain_metadata() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3954,9 +3459,6 @@ mod tests {
             Some(shas[1].as_str())
         );
         assert_eq!(parent_commit(repo, &shas[0]).unwrap(), None);
-
-        let last = last_commits(repo, "main", 2).unwrap();
-        assert_eq!(last, vec![shas[2].clone(), shas[1].clone()]);
 
         let range = list_object_shas_in_range(repo, Some(shas[1].as_str()), &shas[2]).unwrap();
         assert!(!range.is_empty());

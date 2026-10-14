@@ -19,8 +19,6 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-pub use crate::provider_config::load_registry;
-
 /// Built-in default instance id used for unqualified CLI input.
 const DEFAULT_PROVIDER_ID: &str = "github";
 
@@ -364,13 +362,6 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// The default `github` instance. Always present.
-    pub fn default_provider(&self) -> &ProviderInstance {
-        self.providers
-            .get(DEFAULT_PROVIDER_ID)
-            .expect("github default instance is always present")
-    }
-
     /// Look up an instance by id.
     pub fn get(&self, id: &str) -> Option<&ProviderInstance> {
         self.providers.get(id)
@@ -484,61 +475,6 @@ fn escape_path(path: &str) -> String {
     path.replace('%', "%25")
         .replace('/', "%2F")
         .replace('\\', "%5C")
-}
-
-/// Reverse of [`escape_path`].
-fn unescape_path(escaped: &str) -> String {
-    let mut out = String::with_capacity(escaped.len());
-    let mut chars = escaped.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            out.push(ch);
-            continue;
-        }
-        let Some(a) = chars.next() else {
-            out.push(ch);
-            break;
-        };
-        let Some(b) = chars.next() else {
-            out.push(ch);
-            out.push(a);
-            break;
-        };
-        if let Some(byte) = decode_hex_byte(a, b) {
-            out.push(byte as char);
-        } else {
-            out.push(ch);
-            out.push(a);
-            out.push(b);
-        }
-    }
-    out
-}
-
-fn decode_hex_byte(a: char, b: char) -> Option<u8> {
-    fn nibble(c: char) -> Option<u8> {
-        match c {
-            '0'..='9' => Some(c as u8 - b'0'),
-            'a'..='f' => Some(c as u8 - b'a' + 10),
-            'A'..='F' => Some(c as u8 - b'A' + 10),
-            _ => None,
-        }
-    }
-    Some(nibble(a)? << 4 | nibble(b)?)
-}
-
-/// Parse a storage key back into a `RepoId`.
-///
-/// Used by tools that list the ref store; not required by the hot path.
-pub fn parse_storage_key(key: &str) -> Option<RepoId> {
-    let (provider, rest) = key.split_once('/')?;
-    if provider.is_empty() || rest.is_empty() {
-        return None;
-    }
-    Some(RepoId {
-        provider: ProviderInstanceId::new(provider),
-        path: unescape_path(rest),
-    })
 }
 
 #[cfg(test)]
@@ -739,40 +675,11 @@ mod tests {
     }
 
     #[test]
-    fn storage_key_round_trips() {
-        let cases = vec![
-            RepoId::github("owner/repo"),
-            RepoId {
-                provider: ProviderInstanceId::new("gitlab"),
-                path: "g/sub/proj".to_string(),
-            },
-            RepoId {
-                provider: ProviderInstanceId::new("sourcehut"),
-                path: "~user/repo".to_string(),
-            },
-            RepoId {
-                provider: ProviderInstanceId::new("gitea"),
-                path: "a%2Fb".to_string(),
-            },
-        ];
-        for repo in cases {
-            let key = repo.storage_key();
-            let parsed = parse_storage_key(&key).expect("round-trippable key");
-            assert_eq!(parsed, repo, "round-trip failed for {key}");
-        }
-        assert_eq!(
-            parse_storage_key("owner/repo").unwrap(),
-            RepoId {
-                provider: ProviderInstanceId::new("owner"),
-                path: "repo".to_string(),
-            }
-        );
-        assert!(parse_storage_key("bare-key").is_none());
-    }
-
-    #[test]
     fn github_auth_header_is_basic_x_access_token() {
-        let github = ProviderRegistry::new().default_provider().clone();
+        let github = ProviderRegistry::new()
+            .get(DEFAULT_PROVIDER_ID)
+            .unwrap()
+            .clone();
         let (name, value) = github.auth_header("pat123").unwrap();
         assert_eq!(name, "Authorization");
         let expected = format!(
@@ -877,7 +784,10 @@ mod tests {
 
     #[test]
     fn github_clone_url_is_clean() {
-        let github = ProviderRegistry::new().default_provider().clone();
+        let github = ProviderRegistry::new()
+            .get(DEFAULT_PROVIDER_ID)
+            .unwrap()
+            .clone();
         assert_eq!(
             github.clone_url("owner/repo"),
             "https://github.com/owner/repo.git"
@@ -902,7 +812,7 @@ mod tests {
     #[test]
     fn registry_default_has_github_provider() {
         let registry = ProviderRegistry::new();
-        let github = registry.default_provider();
+        let github = registry.get(DEFAULT_PROVIDER_ID).unwrap();
         assert_eq!(github.id.as_str(), "github");
         assert_eq!(github.kind, ProviderKind::GitHub);
         assert_eq!(github.host, "github.com");

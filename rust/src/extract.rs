@@ -60,12 +60,6 @@ pub struct Chunk {
     pub byte_end: u64,
 }
 
-impl Chunk {
-    pub fn compressed_len(&self) -> u64 {
-        self.byte_end - self.byte_start
-    }
-}
-
 /// Group consecutive frames into chunks whose total compressed size is at most
 /// `chunk_size`. A frame larger than `chunk_size` gets its own chunk.
 fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Result<Vec<Chunk>> {
@@ -979,7 +973,8 @@ mod proptests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Fragment, FrameInfo, MetadataChunk};
+    use crate::clonepack::Fragment;
+    use crate::manifest::{FrameInfo, MetadataChunk};
     use sha1::{Digest, Sha1};
     use tempfile::TempDir;
 

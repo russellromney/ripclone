@@ -18,7 +18,7 @@ lint() {
   bash "$ROOT/scripts/audit_release_surface.sh"
   ( cd "$ROOT/rust"
     cargo fmt --all --check
-    cargo clippy --all-targets --features dev-tools --locked -- -D warnings )
+    cargo clippy --all-targets --locked -- -D warnings )
 }
 
 # Unit tests run one at a time: some still mutate process env, and io_uring

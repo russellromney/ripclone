@@ -80,12 +80,6 @@ impl FileBackedTokenStore {
             FileTokenStore::new(FileTokenStore::default_path().context("no HOME for token file")?);
         Ok(Self { file })
     }
-
-    pub fn with_path(path: impl Into<PathBuf>) -> Self {
-        Self {
-            file: FileTokenStore::new(path),
-        }
-    }
 }
 
 impl TokenStore for FileBackedTokenStore {

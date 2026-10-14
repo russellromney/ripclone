@@ -100,33 +100,6 @@ pub struct WebhookConfig {
 }
 
 impl WebhookConfig {
-    /// An empty config: no secrets, allow-all. Used by the worker (which never
-    /// serves webhooks) and as the test default.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Build a config with a single provider secret and allow-all. Handy for
-    /// tests and programmatic setup.
-    pub fn with_secret(provider_id: &str, secret: &str) -> Self {
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            provider_id.to_string(),
-            SecretString::new(secret.to_string().into()),
-        );
-        Self {
-            secrets,
-            allowlist: None,
-        }
-    }
-
-    /// Set the repo allowlist (chainable). Entries use the operator-facing
-    /// natural key (`owner/repo` for github, `provider/path` otherwise).
-    pub fn with_allowlist(mut self, repos: impl IntoIterator<Item = String>) -> Self {
-        self.allowlist = Some(repos.into_iter().collect());
-        self
-    }
-
     /// Build from the environment.
     ///
     /// Secret per provider instance: `RIPCLONE_WEBHOOK_SECRET_<ID>`, where
@@ -189,13 +162,28 @@ impl WebhookConfig {
             None => true,
         }
     }
+}
 
-    /// The configured allowlist entries as operator-facing natural repo keys.
-    pub fn allowlist_repos(&self) -> Vec<String> {
-        self.allowlist
-            .as_ref()
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+#[cfg(test)]
+impl WebhookConfig {
+    /// A config with a single provider secret and allow-all.
+    pub(crate) fn with_secret(provider_id: &str, secret: &str) -> Self {
+        let mut secrets = HashMap::new();
+        secrets.insert(
+            provider_id.to_string(),
+            SecretString::new(secret.to_string().into()),
+        );
+        Self {
+            secrets,
+            allowlist: None,
+        }
+    }
+
+    /// Set the repo allowlist (chainable). Entries use the operator-facing
+    /// natural key (`owner/repo` for github, `provider/path` otherwise).
+    pub(crate) fn with_allowlist(mut self, repos: impl IntoIterator<Item = String>) -> Self {
+        self.allowlist = Some(repos.into_iter().collect());
+        self
     }
 }
 
@@ -251,7 +239,7 @@ mod tests {
 
     #[test]
     fn allowlist_none_allows_all() {
-        let cfg = WebhookConfig::empty();
+        let cfg = WebhookConfig::default();
         assert!(cfg.allows("anyone/anything"));
     }
 
@@ -267,7 +255,7 @@ mod tests {
 
     #[test]
     fn no_secret_for_provider_is_none() {
-        let cfg = WebhookConfig::empty();
+        let cfg = WebhookConfig::default();
         assert!(cfg.secret("github").is_none());
     }
 
