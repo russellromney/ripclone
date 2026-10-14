@@ -186,6 +186,7 @@ mod tests {
     #[test]
     fn validate_checkout_name_rejects_paths_and_invalid_git_branches() {
         for invalid in [
+            "",
             "/tmp/victim",
             "HEAD",
             "../victim",

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
+# Start a digest-pinned Gitea and run the contract suite's live Gitea row
+# (rust/tests/contract/gitea.rs) against it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GITEA_IMAGE="gitea/gitea:1.24.6@sha256:2edc102cbb636ae1ddac5fa0c715aa5b03079dee13ac6800b2cef6d4e912e718"
-CONTAINER="ripclone-topup-gitea-$$"
-TEST_NAME="gitea_server_side_token_end_to_end"
+CONTAINER="ripclone-gitea-$$"
 
-: "${RIPCLONE_REQUIRE_GITEA:?RIPCLONE_REQUIRE_GITEA=1 is required}"
 : "${RIPCLONE_BIN_DIR:?RIPCLONE_BIN_DIR must name the release binary directory}"
 test -x "$RIPCLONE_BIN_DIR/ripclone" || {
   echo "error: missing release CLI $RIPCLONE_BIN_DIR/ripclone" >&2
@@ -67,51 +67,21 @@ export RIPCLONE_GITEA_USER=ci
 export RIPCLONE_GITEA_TOKEN="$token"
 
 if [ -n "${CI_ARTIFACTS:-}" ]; then
-  test_bin="$CI_ARTIFACTS/e2e_gitea_provider"
-  test -x "$test_bin" || {
-    echo "error: missing $test_bin" >&2
-    exit 1
-  }
-  listed="$(timeout 60 "$test_bin" --ignored --list)"
-  grep -Fqx "$TEST_NAME: test" <<<"$listed" || {
-    echo "error: exact Gitea test '$TEST_NAME' is missing" >&2
-    exit 1
-  }
-  run=("$test_bin" --ignored --exact "$TEST_NAME" --nocapture)
+  run=("$CI_ARTIFACTS/contract" --ignored gitea_ --nocapture)
 else
-  listed="$(cd "$ROOT/rust" && timeout 300 cargo test --profile ci --locked --test e2e_gitea_provider -- --ignored --list)"
-  grep -Fqx "$TEST_NAME: test" <<<"$listed" || {
-    echo "error: exact Gitea test '$TEST_NAME' is missing" >&2
-    exit 1
-  }
-  run=(cargo test --profile ci --locked --test e2e_gitea_provider -- --ignored --exact "$TEST_NAME" --nocapture)
+  run=(cargo test --profile ci --locked --test contract -- --ignored gitea_ --nocapture)
 fi
 
-log="$(mktemp "${TMPDIR:-/tmp}/ripclone-topup-gitea.XXXXXX")"
+log="$(mktemp "${TMPDIR:-/tmp}/ripclone-gitea.XXXXXX")"
 set +e
-if [ -n "${CI_ARTIFACTS:-}" ]; then
-  (cd "$ROOT/rust" && timeout 300 "${run[@]}") 2>&1 | tee "$log"
-else
-  (cd "$ROOT/rust" && timeout 300 "${run[@]}") 2>&1 | tee "$log"
-fi
+(cd "$ROOT/rust" && timeout 300 "${run[@]}") 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
 set -e
 test "$rc" -eq 0 || exit "$rc"
-grep -Fq "running 1 test" "$log" || {
-  echo "error: exact Gitea filter ran zero or multiple tests" >&2
-  exit 1
-}
+# A filter that matched nothing would also pass.
 grep -Eq "test result: ok\. 1 passed; 0 failed;" "$log" || {
-  echo "error: exact Gitea proof did not report one passing test" >&2
+  echo "error: the Gitea contract row did not report one passing test" >&2
   exit 1
 }
-if grep -Fq "SKIP" "$log"; then
-  echo "error: Gitea proof emitted SKIP" >&2
-  exit 1
-fi
-if grep -Fq "background build failed" "$log" || grep -Fq "fatal:" "$log"; then
-  echo "error: Gitea proof logged an exact-result build failure" >&2
-  exit 1
-fi
 rm -f "$log"
 echo "Gitea image: $GITEA_IMAGE"

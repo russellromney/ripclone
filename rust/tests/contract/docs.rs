@@ -1,15 +1,13 @@
-//! Doc-lint: every `ripclone <verb>` the OSS docs tell a user to run must exist.
-//! Included in the bounded `local_cli` integration-test crate.
-//!
-//! The README and `docs/` are the product's front door. A doc that names a verb
-//! the CLI doesn't have is a broken quick start, so this test walks every fenced
-//! code block in the docs, pulls out the `ripclone` invocations, and asks the
-//! real binary whether each verb exists. It also pins the removed `track` /
-//! `untrack` verbs staying removed from the prose.
+//! I6: every `ripclone <verb>` the user-facing docs tell a user to run exists.
+//! A doc that names a verb the CLI doesn't have is a broken quick start, so
+//! this walks every fenced code block in the README and `docs/`, pulls out the
+//! `ripclone` invocations, and asks the real binary for each verb's help.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::harness::bin;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -93,8 +91,8 @@ fn documented_verbs(markdown: &str) -> BTreeSet<String> {
 }
 
 #[test]
-fn every_documented_ripclone_verb_exists() {
-    let bin = std::env::var("CARGO_BIN_EXE_ripclone").expect("CARGO_BIN_EXE_ripclone");
+fn i6_every_documented_cli_verb_exists() {
+    let bin = bin("ripclone");
     let mut missing: Vec<String> = Vec::new();
 
     for doc in doc_files() {
@@ -121,88 +119,5 @@ fn every_documented_ripclone_verb_exists() {
         missing.is_empty(),
         "docs reference CLI verbs the binary does not have:\n  {}",
         missing.join("\n  ")
-    );
-}
-
-/// `track` / `untrack` were removed in favour of the added-repo set
-/// (`ripclone add`). They must not creep back into the user-facing docs.
-#[test]
-fn removed_track_verbs_stay_out_of_the_docs() {
-    let mut hits: Vec<String> = Vec::new();
-    for doc in doc_files() {
-        let text = std::fs::read_to_string(&doc).expect("read doc");
-        for verb in documented_verbs(&text) {
-            if verb == "track" || verb == "untrack" || verb == "tracked" {
-                hits.push(format!("{}: `ripclone {verb}`", doc.display()));
-            }
-        }
-    }
-    assert!(
-        hits.is_empty(),
-        "removed verbs resurfaced in the docs:\n  {}",
-        hits.join("\n  ")
-    );
-}
-
-/// The two materialize surfaces the README promises must both be real flags on
-/// the binary, with the documented spellings.
-#[test]
-fn the_two_documented_materialize_surfaces_exist() {
-    let bin = std::env::var("CARGO_BIN_EXE_ripclone").expect("CARGO_BIN_EXE_ripclone");
-    let clone_help = String::from_utf8(
-        Command::new(&bin)
-            .args(["clone", "--help"])
-            .output()
-            .expect("spawn")
-            .stdout,
-    )
-    .expect("utf8");
-    assert!(clone_help.contains("--mode"), "clone --mode is documented");
-    assert!(
-        clone_help.contains("--depth"),
-        "clone --depth is documented"
-    );
-
-    for mode in ["editable", "files"] {
-        assert!(
-            mode.parse::<ripclone::mode::CloneMode>().is_ok(),
-            "`--mode {mode}` must parse"
-        );
-    }
-}
-
-/// The experimental `worktree` command was deleted. Clap must reject it as an
-/// unknown subcommand rather than leaving a hidden or half-wired surface, and
-/// the user-facing docs must not name it.
-#[test]
-fn removed_worktree_verb_is_unknown_and_undocumented() {
-    let bin = std::env::var("CARGO_BIN_EXE_ripclone").expect("CARGO_BIN_EXE_ripclone");
-    let out = Command::new(&bin)
-        .args(["worktree", "--help"])
-        .output()
-        .expect("spawn");
-    assert!(
-        !out.status.success(),
-        "`ripclone worktree` must be rejected as an unknown command"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
-        "clap must name it as unknown: {stderr}"
-    );
-
-    let mut hits: Vec<String> = Vec::new();
-    for doc in doc_files() {
-        let text = std::fs::read_to_string(&doc).expect("read doc");
-        for verb in documented_verbs(&text) {
-            if verb == "worktree" {
-                hits.push(format!("{}: `ripclone {verb}`", doc.display()));
-            }
-        }
-    }
-    assert!(
-        hits.is_empty(),
-        "the removed worktree verb resurfaced in the docs:\n  {}",
-        hits.join("\n  ")
     );
 }

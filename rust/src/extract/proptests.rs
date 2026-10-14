@@ -1,5 +1,4 @@
 //! Property and fuzz tests for the manifest → working-tree extraction path.
-//! Included in the bounded `local_cli` integration-test crate.
 //!
 //! The core invariant: given any `MetadataChunk` manifest and archive bytes, the
 //! extractor must either return `Err` or produce a working tree whose file set
@@ -10,11 +9,11 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use crate::clonepack::ClonepackManifest;
+use crate::extract::{ExtractStats, extract_archive_with_chunk_fetcher};
+use crate::manifest::{FileEntry, Fragment, FrameInfo, MetadataChunk};
 use proptest::prelude::*;
 use prost::Message;
-use ripclone::clonepack::ClonepackManifest;
-use ripclone::extract::{ExtractStats, extract_archive_with_chunk_fetcher};
-use ripclone::manifest::{FileEntry, Fragment, FrameInfo, MetadataChunk};
 use sha1::{Digest, Sha1};
 
 const MODE_REGULAR: u32 = 0o100644;

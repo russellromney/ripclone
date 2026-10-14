@@ -205,11 +205,34 @@ replaces `full-topup-s3`. Deleted as covered: the S3 refresh test in
 webhook build-before-clone tests, the missed-push poller test (I5), and three
 `--verify-upstream` cases.
 
+The fifth PR deleted every other integration test: the `local_cli`,
+`local_default`, `local_lsm` and `local_server` suites, `suites/contracts`,
+`control_startup`, `e2e_clone_pinning`, `e2e_full_topup`,
+`e2e_sync_admission`, `e2e_token_only_worker`, `e2e_gitea_provider` and
+`tests/common`, about 21,000 lines. They ran with LSM off and the trust
+gateway on, used probes, barriers and `RIPCLONE_TEST_*` hooks, or tested cut
+features. Three library-level tests moved into unit tests (the manifest
+proptest, multipack reuse, LSM incremental). The live Gitea test became an
+ignored contract row that the `gitea` job runs with `--ignored gitea_`, and
+`docs_cli_surface` became I6. I7 was split into three tests so each finishes
+well under 15 s. CI now runs unit tests and the contract suite once each;
+`ci-build` no longer builds an unused unit-test binary, and the Turso worker
+job is gone.
+
 ## Open points
 
 - C1, C2, D4 and E1 depend on `background_slots`, which arrives in step 3. Until
   then, the "now" tests run against today's main.
-- Every "now" row has a contract test except H4, which waits on #181, and
-  I6, which the existing `docs_cli_surface` test covers.
+- Every "now" row has a contract test except H4, which waits on #181.
+- Behavior the deleted suites checked that no row covers yet, to add with the
+  matching step: F1's "no cache object" clause (the harness never sets
+  `RIPCLONE_CACHE_DIR`); the artifact-by-hash route needs the token (I1);
+  retention keeps durable artifacts (H1); A6 cases (not-added sync, origin
+  deleted after add, upstream hang); I7 in Files mode; a persistent 503 (F4);
+  incremental Files rebuild, depth-1 re-add of an identical blob, empty tree,
+  and concurrent builds of different branches (G); repo config survives
+  restart; config file discovery. The ControlStore conformance suite takes the
+  queue rules from `queue/sql.rs`, the stale-owner and ready-is-immutable
+  rules from `control.rs`, and lease reclaim from `e2e_sync_admission`.
 - Next: the step-3 rows (A5, C1, C2, D4, E1, I2) once `background_slots` and
   the `--at` rule land, then the deletions listed above.

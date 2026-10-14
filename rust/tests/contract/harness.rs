@@ -27,7 +27,7 @@ pub const SLOW_POLL: &[(&str, &str)] = &[("RIPCLONE_POLL_MS", "200")];
 
 /// A built binary. `RIPCLONE_BIN_DIR` points at prebuilt binaries (CI fan-out
 /// jobs); otherwise Cargo's own build of this package is used.
-fn bin(name: &str) -> PathBuf {
+pub fn bin(name: &str) -> PathBuf {
     if let Some(dir) = std::env::var_os("RIPCLONE_BIN_DIR") {
         return PathBuf::from(dir).join(name);
     }
@@ -273,6 +273,33 @@ impl Default for Closed {
 }
 
 impl Endpoint for Closed {
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+}
+
+/// A local address that accepts every connection and closes it at once, for
+/// "upstream broken". Fails fast on every OS, where a [`Closed`] port can take
+/// seconds to refuse on macOS.
+pub struct Hangup {
+    url: String,
+}
+
+impl Hangup {
+    pub fn new() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // The thread holds the port until the test process exits.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        Self { url }
+    }
+}
+
+impl Endpoint for Hangup {
     fn url(&self) -> String {
         self.url.clone()
     }
