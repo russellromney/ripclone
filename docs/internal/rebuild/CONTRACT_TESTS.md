@@ -166,7 +166,7 @@ step 2, after the contract suite is green.
 
 - `test`: unit tests plus the contract suite, parallel. Target under 5 minutes
   after compile.
-- `s3`: F7 and H2 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
+- `s3`: F7 and H2 against the S3 emulator (`scripts/s3_emulator.sh`: MinIO's last community release, built from source).
 - `gitea`: the live Gitea provider job, unchanged.
 - `lint`, `musl`, `docker`, `cargo-deny`: unchanged.
 - Nightly: stress tests, benchmarks.
