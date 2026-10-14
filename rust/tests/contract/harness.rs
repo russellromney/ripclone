@@ -246,6 +246,28 @@ pub trait Endpoint {
     fn url(&self) -> String;
 }
 
+/// A local address with nothing listening, for "server unreachable".
+pub struct Closed(String);
+
+impl Closed {
+    pub fn new() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Self(format!("http://{}", listener.local_addr().unwrap()))
+    }
+}
+
+impl Default for Closed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Endpoint for Closed {
+    fn url(&self) -> String {
+        self.0.clone()
+    }
+}
+
 /// A CLI process started with [`World::cli_spawn`].
 pub struct RunningCli {
     args: Vec<String>,
@@ -302,6 +324,11 @@ pub struct CliOutput {
 impl CliOutput {
     pub fn success(&self) -> bool {
         self.output.status.success()
+    }
+
+    /// The exit code; `None` if a signal killed the process.
+    pub fn code(&self) -> Option<i32> {
+        self.output.status.code()
     }
 
     pub fn stdout(&self) -> String {

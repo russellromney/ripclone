@@ -48,15 +48,19 @@ fn d2_changed_commit_in_later_poll_fails() {
     let proxy = FaultProxy::start(&server);
     proxy.rewrite("pinned=", &b, &a);
     let target = world.target("d2");
-    let err = world
-        .cli_env(
-            &proxy,
-            &["clone", "acme/d2", target.to_str().unwrap(), "--depth", "1"],
-            SLOW_POLL,
-        )
-        .err();
+    let out = world.cli_env(
+        &proxy,
+        &["clone", "acme/d2", target.to_str().unwrap(), "--depth", "1"],
+        SLOW_POLL,
+    );
+    let err = out.err();
 
     assert!(err.contains("integrity"), "{err}");
+    assert_eq!(
+        out.code(),
+        Some(1),
+        "an integrity failure is a plain failure"
+    );
     assert!(!target.exists(), "failed clone left {}", target.display());
 }
 
@@ -93,4 +97,39 @@ fn d3_removed_pinned_commit_fails_without_fallback() {
         .err();
     assert!(err.contains(&x[..12]), "error should name X:\n{err}");
     assert!(!target.exists(), "failed clone left {}", target.display());
+}
+
+/// D5: 401, 403, 404, a 5xx, and an unreachable server each give their own
+/// message and exit code, and install nothing.
+#[test]
+fn d5_server_failures_have_distinct_exit_codes() {
+    let world = World::new();
+    let origin = world.origin("acme", "d5");
+    origin.commit(&[("f.txt", "a\n")], "A");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/d5", "--wait"]).ok();
+    let proxy = FaultProxy::start(&server);
+
+    let mut messages = Vec::new();
+    for (status, code) in [(401, 3), (403, 4), (404, 5), (503, 6)] {
+        proxy.fault_requests("/v1/repos/", Fault::Status(status), 1);
+        let target = world.target(&format!("d5-{status}"));
+        let out = world.cli(&proxy, &["clone", "acme/d5", target.to_str().unwrap()]);
+        let err = out.err();
+        assert_eq!(out.code(), Some(code), "{status}:\n{err}");
+        assert!(!target.exists(), "failed clone left {}", target.display());
+        messages.push(err);
+    }
+
+    let unreachable = world.cli(&Closed::new(), &["list"]);
+    let err = unreachable.err();
+    assert_eq!(unreachable.code(), Some(6), "{err}");
+    messages.push(err);
+
+    for (i, a) in messages.iter().enumerate() {
+        for b in &messages[i + 1..] {
+            assert_ne!(a, b, "two different failures gave the same error");
+        }
+    }
 }

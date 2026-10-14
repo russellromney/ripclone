@@ -86,7 +86,7 @@ against the CLI) or the plan step that introduces the behavior.
 | D2 | Proxy rewrites a later poll to name a different commit: integrity error, no target directory. | now |
 | D3 | Pinned commit removed upstream before it is built: clone fails and does not fall back to the branch. | now |
 | D4 | `--wait` with Full(B) pending and `background_slots = 0`: the CLI waits, reports pending, and exits at its timeout without installing anything else. | step 4 |
-| D5 | 401, 403, 404 and 5xx from the server give distinct CLI errors and exit codes. | later (the CLI exits 1 for every error today) |
+| D5 | 401, 403, 404, 5xx, and an unreachable server give distinct CLI errors and exit codes (3, 4, 5, 6, 6; see the README). | now |
 
 ### E. Top-up (4)
 
@@ -112,7 +112,7 @@ Ripclone token reaches the origin.
 | F5 | Connection cut after N bytes: resumes with Range from the saved offset (proxy counts Range requests). | now |
 | F6 | Proxy without Range support: restarts only that artifact. | now |
 | F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes. | now |
-| F8 | SIGINT during the download: no target directory; the next clone into the same path succeeds and leaves no staging directory or marker. | now |
+| F8 | SIGINT during the download: exit 130, no target, staging directory, or marker left; the next clone succeeds. | now |
 
 ### G. Clone shapes produce correct trees (5)
 
@@ -190,12 +190,12 @@ exposed a server race: a pinned ref lookup could read "result missing" just
 before the build published it and "no job active" just after, and answer 409.
 The lookup now rereads the result before failing.
 
-The CLI has no SIGINT handler, so an interrupted clone leaves its staging
-directory; the next clone into the same parent removes it. F8 checks that.
+The third PR fixed the CLI: exit codes by failure kind (D5), and Ctrl-C
+cancels the command and waits for the clone's cleanup to remove staging
+before exiting 130 (F8).
 
 ## Open points
 
 - C1, C2, D4 and E1 depend on `background_slots`, which arrives in step 3. Until
   then, the "now" tests run against today's main.
-- D5 needs the CLI to map server statuses to distinct exit codes.
 - Next: integrations (I3, I4, I7) and the S3 rows (F7, H2).

@@ -138,8 +138,19 @@ The server URL comes from `--server` (a global flag, before the subcommand) or
 
 **Agents and CI.** `RIPCLONE_AGENT=1` makes depth 1 the default and disables
 interactive prompts. Explicit `--depth` still wins. Use `--mode files` when the
-agent never runs git. Errors are JSON `{ "error", "code" }`: treat `429` and
-`502`/`503` as retryable, `401`/`403`/`404` as needing action.
+agent never runs git. Server errors are JSON `{ "error", "code" }`. The CLI's
+exit code says what kind of failure it was:
+
+| Exit | Meaning | Action |
+|---|---|---|
+| 0 | Success | |
+| 1 | Any other failure (integrity, git, local I/O) | Read the message |
+| 2 | Bad arguments | Fix the command |
+| 3 | Not authenticated (401) | Log in or set the token |
+| 4 | Forbidden (403) | Get access |
+| 5 | Not found (404): repo not added, unknown ref, missing artifact | Add the repo or fix the ref |
+| 6 | Server unreachable, rate limited, or unavailable (429, 5xx) | Retry |
+| 130 | Interrupted (Ctrl-C); staging is removed before exit | |
 
 **Private repos.** The server needs read access to the upstream: a token on the
 provider instance ([Providers](docs/PROVIDERS.md)) or a GitHub App

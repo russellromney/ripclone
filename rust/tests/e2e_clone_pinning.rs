@@ -499,7 +499,15 @@ async fn unidentified_503_fails_instead_of_repinning_after_branch_moves() {
         .await
         .expect_err("unidentified 503 cannot establish an operation pin");
     abort_server_task(task).await;
-    assert!(format!("{error:#}").contains("invalid unavailable response"));
+    assert!(
+        format!("{error:#}").contains("proxy unavailable"),
+        "{error:#}"
+    );
+    let failure = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ripclone::client::HttpFailure>())
+        .expect("a generic 503 is an HTTP failure");
+    assert_eq!(failure.status, Some(503));
     assert_eq!(
         requests.lock().unwrap_or_else(|e| e.into_inner()).len(),
         1,
