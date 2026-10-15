@@ -450,6 +450,24 @@ pub fn is_ancestor<P: AsRef<Path>>(repo: P, ancestor: &str, commit: &str) -> Res
     }
 }
 
+/// The commits of `commits` that no other commit of the list reaches: the
+/// newest ones.
+pub fn independent_commits<P: AsRef<Path>>(
+    repo: P,
+    commits: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    for commit in commits {
+        crate::validation::validate_git_rev(commit)
+            .with_context(|| format!("invalid commit: {commit}"))?;
+    }
+    let mut args = vec!["merge-base", "--independent", "--end-of-options"];
+    args.extend(commits.iter().map(String::as_str));
+    Ok(run_git(repo, &args)?
+        .lines()
+        .map(|line| line.trim().to_string())
+        .collect())
+}
+
 /// Number of commits reachable from `commit` but not from `base`.
 pub fn count_commits_since<P: AsRef<Path>>(repo: P, base: &str, commit: &str) -> Result<u64> {
     crate::validation::validate_git_rev(base).with_context(|| format!("invalid commit: {base}"))?;

@@ -646,10 +646,11 @@ const BASE_CANDIDATES: usize = 32;
 
 /// The row whose `kind` output a build of the claimed commit reuses: the
 /// newest row of the repo with `kind` ready whose commit is an ancestor of
-/// the claimed commit in the mirror, rows of the claimed ref first. A
-/// commit that is not an ancestor (after a force push) or not in the mirror
-/// is never a base, so a build never carries objects the commit cannot
-/// reach. `None` builds `kind` cold.
+/// the claimed commit in the mirror. "Newest" is by history: among the
+/// ancestors found, one no other of them descends from, rows of the claimed
+/// ref and later admissions first. A commit that is not an ancestor (after
+/// a force push) or not in the mirror is never a base, so a build never
+/// carries objects the commit cannot reach. `None` builds `kind` cold.
 async fn ancestor_base(
     state: &ServerState,
     claim: &Claim,
@@ -671,22 +672,36 @@ async fn ancestor_base(
     let target = format!("{}@{}", repo_id.storage_key(), short(commit));
     let (dir, tip, log_target) = (mirror_dir.to_path_buf(), commit.to_string(), target.clone());
     let found = tokio::task::spawn_blocking(move || {
-        candidates.into_iter().find_map(|candidate| {
-            match git::is_ancestor(&dir, &candidate, &tip) {
-                Ok(true) => {
-                    let distance = git::count_commits_since(&dir, &candidate, &tip).ok();
-                    Some((candidate, distance))
-                }
-                Ok(false) => None,
+        let ancestors: Vec<String> = candidates
+            .into_iter()
+            .filter(|candidate| match git::is_ancestor(&dir, candidate, &tip) {
+                Ok(is_ancestor) => is_ancestor,
                 Err(error) => {
                     info!(
                         "{kind} base candidate {} for {log_target} is not usable: {error:#}",
-                        short(&candidate)
+                        short(candidate)
                     );
-                    None
+                    false
                 }
-            }
-        })
+            })
+            .collect();
+        // Admission times are in seconds, so admission order alone can rank
+        // an older ancestor first.
+        let newest = match ancestors.len() {
+            0 | 1 => None,
+            _ => git::independent_commits(&dir, &ancestors).ok(),
+        };
+        let base = ancestors
+            .iter()
+            .find(|ancestor| {
+                newest
+                    .as_ref()
+                    .is_none_or(|newest| newest.contains(*ancestor))
+            })
+            .or(ancestors.first())?
+            .clone();
+        let distance = git::count_commits_since(&dir, &base, &tip).ok();
+        Some((base, distance))
     })
     .await
     .context("base lookup task")?;
