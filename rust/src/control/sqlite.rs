@@ -1,10 +1,12 @@
 //! [`ControlStore`] over one local SQLite file.
 //!
 //! SQL stays in the portable subset: `INSERT ... ON CONFLICT DO NOTHING`,
-//! `UPDATE ... RETURNING`, integer epoch seconds, outputs as JSON text. Only
-//! `open` (schema inspection, WAL) and `BEGIN IMMEDIATE` are SQLite-specific.
-//! Claims rely on SQLite's single writer; another backend would add
-//! `FOR UPDATE SKIP LOCKED` to the claim subquery.
+//! `UPDATE ... RETURNING`, integer epoch seconds, outputs as JSON text,
+//! partial indexes. Only `open` (schema inspection, WAL) and `BEGIN
+//! IMMEDIATE` are SQLite-specific. Claims and admits rely on SQLite's single
+//! writer: the admission sequence is `MAX(seq) + 1` inside the admit
+//! transaction. Another backend would use an identity column for `seq` and
+//! add `FOR UPDATE SKIP LOCKED` to the claim subquery.
 
 use super::{
     AddedRepo, BuildRow, Claim, Clock, ControlPathLock, ControlStore, Out, Output, Pool, Published,
@@ -21,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema/sqlite.sql");
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, \
     head_state, head_output, head_error, files_state, files_output, files_error, \
@@ -249,7 +251,8 @@ impl ControlStore for SqliteControlStore {
             .await
             .context("begin admit")?;
         let inserted = sqlx::query(
-            "INSERT INTO builds (repo, commit_id, ref_name, created_at) VALUES ($1, $2, $3, $4)
+            "INSERT INTO builds (repo, commit_id, ref_name, created_at, seq)
+             VALUES ($1, $2, $3, $4, (SELECT COALESCE(MAX(seq), 0) + 1 FROM builds))
              ON CONFLICT (repo, commit_id) DO NOTHING",
         )
         .bind(&key)
@@ -315,77 +318,102 @@ impl ControlStore for SqliteControlStore {
         let now = self.clock.now();
         // A Full waits for every older Full of its repo, so Fulls publish in
         // admission order and each can build on the history before it.
-        let predicate = match pool {
-            Pool::Head => "head_state = 'pending'",
-            Pool::Files => "head_state = 'ready' AND files_state = 'pending'",
-            Pool::Full => {
+        let (kind, predicate) = match pool {
+            Pool::Head => ("head", "head_state = 'pending'"),
+            Pool::Files => ("files", "head_state = 'ready' AND files_state = 'pending'"),
+            Pool::Full => (
+                "full",
                 "head_state = 'ready' AND full_state = 'pending' AND files_state <> 'pending'
                  AND NOT EXISTS (
                    SELECT 1 FROM builds AS older
                    WHERE older.repo = b.repo AND older.full_state = 'pending'
-                     AND (older.created_at < b.created_at
-                       OR (older.created_at = b.created_at AND older.commit_id < b.commit_id)))"
-            }
+                     AND older.seq < b.seq)",
+            ),
         };
+        // The oldest claimable row. A repo that already holds a live lease
+        // of this kind is skipped, so one repo cannot take every slot of a
+        // pool. `$1` is now, `$2` the attempt limit.
+        let candidate = format!(
+            "SELECT repo, commit_id FROM builds AS b
+             WHERE {predicate}
+               AND (lease_until IS NULL OR lease_until <= $1)
+               AND retry_after <= $1
+               AND attempts < $2
+               AND NOT EXISTS (
+                 SELECT 1 FROM builds AS busy
+                 WHERE busy.repo = b.repo AND busy.lease_kind = '{kind}'
+                   AND busy.lease_until > $1)
+             ORDER BY seq
+             LIMIT 1"
+        );
+        // Rows whose last allowed attempt ended without a result.
+        const EXHAUSTED: &str = "attempts >= $2
+            AND (lease_until IS NULL OR lease_until <= $1)
+            AND (head_state = 'pending' OR files_state = 'pending' OR full_state = 'pending')";
+        // Idle polls stop here, on a read, without taking the write lock.
+        let work: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM builds WHERE {EXHAUSTED}) OR EXISTS ({candidate})"
+        ))
+        .bind(now)
+        .bind(self.max_attempts)
+        .fetch_one(&self.pool)
+        .await
+        .context("look for claimable builds")?;
+        if !work {
+            return Ok(None);
+        }
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
             .context("begin claim")?;
-        // Give up on rows whose last allowed attempt ended without a result.
-        // The current phase's output fails: a pending Head takes Files and
-        // Full with it; a pending Files fails alone and the Full phase starts
-        // with fresh attempts. The lease is cleared so a late publish cannot
-        // land. (SET expressions read the row as it was before the update.)
-        sqlx::query(
+        // Give up on exhausted rows. The current phase's output fails: a
+        // pending Head takes Files and Full with it; a pending Files fails
+        // alone and the Full phase starts with fresh attempts. The lease is
+        // cleared so a late publish cannot land. (SET expressions read the
+        // row as it was before the update.)
+        sqlx::query(&format!(
             "UPDATE builds SET
                head_state = CASE WHEN head_state = 'pending' THEN 'failed' ELSE head_state END,
                head_error = CASE WHEN head_state = 'pending'
-                 THEN $1 || COALESCE(': ' || head_error, '') ELSE head_error END,
+                 THEN $3 || COALESCE(': ' || head_error, '') ELSE head_error END,
                files_state = CASE WHEN files_state = 'pending' THEN 'failed' ELSE files_state END,
                files_error = CASE
                  WHEN files_state <> 'pending' THEN files_error
-                 WHEN head_state = 'pending' THEN 'head failed: ' || $1 || COALESCE(': ' || head_error, '')
-                 ELSE $1 || COALESCE(': ' || files_error, '') END,
+                 WHEN head_state = 'pending' THEN 'head failed: ' || $3 || COALESCE(': ' || head_error, '')
+                 ELSE $3 || COALESCE(': ' || files_error, '') END,
                full_state = CASE
                  WHEN full_state <> 'pending' THEN full_state
                  WHEN head_state = 'ready' AND files_state = 'pending' THEN full_state
                  ELSE 'failed' END,
                full_error = CASE
                  WHEN full_state <> 'pending' THEN full_error
-                 WHEN head_state = 'pending' THEN 'head failed: ' || $1 || COALESCE(': ' || head_error, '')
+                 WHEN head_state = 'pending' THEN 'head failed: ' || $3 || COALESCE(': ' || head_error, '')
                  WHEN files_state = 'pending' THEN full_error
-                 ELSE $1 || COALESCE(': ' || full_error, '') END,
+                 ELSE $3 || COALESCE(': ' || full_error, '') END,
                attempts = CASE WHEN head_state = 'ready' AND files_state = 'pending'
                  THEN 0 ELSE attempts END,
                lease_owner = NULL,
-               lease_until = NULL
-             WHERE attempts >= $2
-               AND (lease_until IS NULL OR lease_until <= $3)
-               AND (head_state = 'pending' OR files_state = 'pending' OR full_state = 'pending')",
-        )
-        .bind(format!("gave up after {} attempts", self.max_attempts))
-        .bind(self.max_attempts)
+               lease_until = NULL,
+               lease_kind = NULL
+             WHERE {EXHAUSTED}"
+        ))
         .bind(now)
+        .bind(self.max_attempts)
+        .bind(format!("gave up after {} attempts", self.max_attempts))
         .execute(&mut *tx)
         .await
         .context("give up exhausted builds")?;
         let row = sqlx::query(&format!(
-            "UPDATE builds SET lease_owner = $1, lease_until = $2, attempts = attempts + 1
-             WHERE (repo, commit_id) = (
-               SELECT repo, commit_id FROM builds AS b
-               WHERE {predicate}
-                 AND (lease_until IS NULL OR lease_until <= $3)
-                 AND retry_after <= $3
-                 AND attempts < $4
-               ORDER BY created_at, repo, commit_id
-               LIMIT 1)
+            "UPDATE builds SET lease_owner = $3, lease_until = $4, lease_kind = '{kind}',
+               attempts = attempts + 1
+             WHERE (repo, commit_id) = ({candidate})
              RETURNING {COLUMNS}"
         ))
-        .bind(owner)
-        .bind(now.saturating_add(duration_secs(lease)))
         .bind(now)
         .bind(self.max_attempts)
+        .bind(owner)
+        .bind(now.saturating_add(duration_secs(lease)))
         .fetch_optional(&mut *tx)
         .await
         .context("claim build")?;
@@ -403,12 +431,13 @@ impl ControlStore for SqliteControlStore {
     async fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool> {
         let renewed = sqlx::query(
             "UPDATE builds SET lease_until = $1
-             WHERE repo = $2 AND commit_id = $3 AND lease_owner = $4",
+             WHERE repo = $2 AND commit_id = $3 AND lease_owner = $4 AND lease_until > $5",
         )
         .bind(self.clock.now().saturating_add(duration_secs(lease)))
         .bind(claim.repo.storage_key())
         .bind(&claim.build.commit)
         .bind(&claim.owner)
+        .bind(self.clock.now())
         .execute(&self.pool)
         .await
         .context("renew build lease")?
@@ -445,9 +474,10 @@ impl ControlStore for SqliteControlStore {
         let data = data.with_context(|| format!("encode {kind} output"))?;
         let prefix = column_prefix(kind);
         // Head and Files end their phase; the next phase starts its own
-        // attempts.
+        // attempts. An expired lease publishes nothing, even before another
+        // worker claims the row.
         let next_phase = match kind {
-            ExactResultKind::Head => ", parent = $5, attempts = 0",
+            ExactResultKind::Head => ", parent = $6, attempts = 0",
             ExactResultKind::Files => ", attempts = 0",
             ExactResultKind::Full => "",
         };
@@ -455,14 +485,15 @@ impl ControlStore for SqliteControlStore {
             "UPDATE builds SET {prefix}_state = 'ready', {prefix}_output = $1,
                {prefix}_error = NULL{next_phase}
              WHERE repo = $2 AND commit_id = $3 AND lease_owner = $4
-               AND {prefix}_state <> 'ready'
+               AND lease_until > $5 AND {prefix}_state <> 'ready'
              RETURNING head_state, files_state, full_state"
         );
         let mut query = sqlx::query_as::<_, (String, String, String)>(&sql)
             .bind(data)
             .bind(claim.repo.storage_key())
             .bind(commit)
-            .bind(&claim.owner);
+            .bind(&claim.owner)
+            .bind(self.clock.now());
         if kind == ExactResultKind::Head {
             query = query.bind(parent);
         }
@@ -500,11 +531,11 @@ impl ControlStore for SqliteControlStore {
                 ", files_state = CASE WHEN {gives_up} AND files_state = 'pending'
                      THEN 'failed' ELSE files_state END,
                    files_error = CASE WHEN {gives_up} AND files_state = 'pending'
-                     THEN $7 ELSE files_error END,
+                     THEN $8 ELSE files_error END,
                    full_state = CASE WHEN {gives_up} AND full_state = 'pending'
                      THEN 'failed' ELSE full_state END,
                    full_error = CASE WHEN {gives_up} AND full_state = 'pending'
-                     THEN $7 ELSE full_error END"
+                     THEN $8 ELSE full_error END"
             ),
             ExactResultKind::Files => {
                 format!(", attempts = CASE WHEN {gives_up} THEN 0 ELSE attempts END")
@@ -517,7 +548,7 @@ impl ControlStore for SqliteControlStore {
                {prefix}_error = $1,
                retry_after = CASE WHEN {gives_up} THEN retry_after ELSE $4 END{cascade}
              WHERE repo = $2 AND commit_id = $3 AND lease_owner = $6
-               AND {prefix}_state = 'pending'"
+               AND lease_until > $7 AND {prefix}_state = 'pending'"
         );
         let mut query = sqlx::query(&sql)
             .bind(error)
@@ -525,7 +556,8 @@ impl ControlStore for SqliteControlStore {
             .bind(&claim.build.commit)
             .bind(retry_after.map(|delay| self.clock.now().saturating_add(duration_secs(delay))))
             .bind(self.max_attempts)
-            .bind(&claim.owner);
+            .bind(&claim.owner)
+            .bind(self.clock.now());
         if kind == ExactResultKind::Head {
             query = query.bind(format!("head failed: {error}"));
         }
@@ -538,7 +570,7 @@ impl ControlStore for SqliteControlStore {
 
     async fn release(&self, claim: &Claim) -> Result<()> {
         sqlx::query(
-            "UPDATE builds SET lease_owner = NULL, lease_until = NULL
+            "UPDATE builds SET lease_owner = NULL, lease_until = NULL, lease_kind = NULL
              WHERE repo = $1 AND commit_id = $2 AND lease_owner = $3",
         )
         .bind(claim.repo.storage_key())
@@ -552,7 +584,7 @@ impl ControlStore for SqliteControlStore {
 
     async fn reset_leases(&self) -> Result<u64> {
         Ok(sqlx::query(
-            "UPDATE builds SET lease_owner = NULL, lease_until = NULL
+            "UPDATE builds SET lease_owner = NULL, lease_until = NULL, lease_kind = NULL
              WHERE lease_owner IS NOT NULL",
         )
         .execute(&self.pool)
@@ -567,7 +599,7 @@ impl ControlStore for SqliteControlStore {
 
     async fn list_builds(&self, repo: &RepoId) -> Result<Vec<BuildRow>> {
         sqlx::query(&format!(
-            "SELECT {COLUMNS} FROM builds WHERE repo = $1 ORDER BY created_at, commit_id"
+            "SELECT {COLUMNS} FROM builds WHERE repo = $1 ORDER BY seq"
         ))
         .bind(repo.storage_key())
         .fetch_all(&self.pool)
@@ -586,7 +618,7 @@ impl ControlStore for SqliteControlStore {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT commit_id, full_output FROM builds
              WHERE repo = $1 AND ref_name = $2 AND full_state = 'ready'
-             ORDER BY created_at DESC, commit_id DESC
+             ORDER BY seq DESC
              LIMIT 1",
         )
         .bind(repo.storage_key())
@@ -614,7 +646,7 @@ impl ControlStore for SqliteControlStore {
             "SELECT commit_id FROM builds
              WHERE repo = $1 AND {prefix}_state = 'ready' AND commit_id <> $2
              ORDER BY CASE WHEN ref_name = $3 THEN 0 ELSE 1 END,
-               created_at DESC, commit_id DESC
+               seq DESC
              LIMIT $4"
         ))
         .bind(repo.storage_key())

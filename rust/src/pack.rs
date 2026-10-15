@@ -187,6 +187,8 @@ impl<'a> PackBuilder<'a> {
             return match self.build_history_pack_reuse(commit) {
                 Ok(packs) => Ok(packs),
                 Err(e) => {
+                    // A cancelled build stops; it does not fall back.
+                    crate::cancel::Cancel::check_current()?;
                     tracing::warn!(
                         "cold history pack-reuse failed ({e:#}); falling back to enumerate+pack"
                     );
@@ -375,9 +377,11 @@ impl<'a> PackBuilder<'a> {
         // threaded, so we keep those serial to avoid CPU oversubscription.
         let packs: Vec<(String, u64, String, u64)> = if undeltified && batches.len() > 1 {
             use rayon::prelude::*;
+            // Rayon threads do not inherit the build's cancel token.
+            let cancel = crate::cancel::Cancel::current().unwrap_or_default();
             batches
                 .par_iter()
-                .map(|batch| self.pack_and_index_inner(batch, undeltified))
+                .map(|batch| cancel.enter(|| self.pack_and_index_inner(batch, undeltified)))
                 .collect::<Result<Vec<_>>>()?
         } else {
             batches
@@ -404,6 +408,7 @@ impl<'a> PackBuilder<'a> {
         if object_shas.is_empty() {
             bail!("no objects to pack");
         }
+        crate::cancel::Cancel::check_current()?;
 
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");

@@ -60,17 +60,21 @@ replaced, so several half-models now run at once:
    - Webhook, poller, and `sync` all call the same `admit(repo, commit)`.
 4. **One row per (repo, commit) is both the job and the result.**
    ```
-   builds(repo, commit, parent, ref_name, created_at,   -- ref_name: the ref that admitted it, for top-up
+   builds(repo, commit, seq, parent, ref_name, created_at,   -- ref_name: the ref that admitted it, for top-up
           head_state, head_manifest, files_state, files_manifest,
           full_state, full_manifest,          -- state: pending | ready | failed
-          attempts, error, lease_owner, lease_until, retry_after)
+          attempts, error, lease_owner, lease_until, lease_kind, retry_after)
    ```
-   - admit: `INSERT OR IGNORE`; an explicit retry resets failed outputs to pending.
-   - claim: one `UPDATE ... RETURNING` on a row with pending outputs whose lease
-     is empty or expired and whose `retry_after` has passed.
-   - renew: extend `lease_until` (short lease, for example 60 s).
-   - publish(kind): set that output's state and manifest `WHERE lease_owner = me`.
-     A ready output is never overwritten.
+   - admit: `INSERT OR IGNORE` with `seq`, a strictly increasing admission
+     number; an explicit retry resets failed outputs to pending.
+   - claim: one `UPDATE ... RETURNING` on the lowest-`seq` row with pending
+     outputs whose lease is empty or expired and whose `retry_after` has
+     passed, skipping repos that already hold a live lease of that kind.
+   - renew: extend `lease_until` (short lease, for example 60 s). An expired
+     lease is lost: renew, publish and fail refuse it, and the worker cancels
+     the build.
+   - publish(kind): set that output's state and manifest `WHERE lease_owner = me`
+     and the lease is live. A ready output is never overwritten.
    - fail(kind): mark it failed, increment attempts, set `retry_after`. No sleep
      while holding the lease.
    - status: read the row. One place.
@@ -79,14 +83,16 @@ replaced, so several half-models now run at once:
 5. **Bounded sequencing.** Each commit's build runs Head, then Files, then
    Full. Three process-wide caps: Head, Files and Full slots, one pool each, so
    a long Full never holds back another commit's Files. Each pool claims in
-   admission order.
+   admission order, and a repo holds at most one lease per pool.
 6. **Published outputs are immutable.** Head compaction, if kept, applies to the
    next commit's Head, never by republishing this one.
 7. **Credentials come from the server's broker at build time** (GitHub App,
    configured token). They are never copied into the database or sent to
    workers in job payloads.
 8. **One mirror shape, one fetch function, all mirror writes under the mirror
-   lock** (including bitmap and commit-graph writes).
+   lock** (fetch, commit-graph, bitmap, compaction). Builds read the mirror
+   under a shared lock and fetch only a commit it lacks; compaction deletes
+   packs, so it runs only while no build reads.
 
 ## Keep (reuse with little change)
 

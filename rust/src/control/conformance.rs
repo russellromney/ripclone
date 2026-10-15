@@ -54,9 +54,11 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
         ref_name_is_filled_never_replaced,
         pools_offer_head_then_files_then_full,
         claims_take_the_oldest_row,
+        a_repo_holds_one_lease_per_pool,
         files_does_not_wait_for_another_rows_full,
         full_claims_follow_admission_order,
         expired_lease_is_reclaimed_from_its_old_owner,
+        expired_lease_cannot_publish_fail_or_renew,
         renew_extends_the_lease,
         retry_after_gates_claims,
         failed_head_fails_every_output,
@@ -389,7 +391,7 @@ async fn publish_files(store: &dyn ControlStore, commit: &str) {
 
 /// A new push's Files is claimable while an older row's Full is building.
 async fn files_does_not_wait_for_another_rows_full(backend: &dyn Backend) {
-    let (clock, store) = open(backend).await;
+    let (_, store) = open(backend).await;
     let (b, c) = (sha(1), sha(2));
     store.admit(&repo(), &b, Some(MAIN)).await.unwrap();
     publish_head(store.as_ref(), &b).await;
@@ -397,7 +399,6 @@ async fn files_does_not_wait_for_another_rows_full(backend: &dyn Backend) {
     let full_b = store.claim("u", Pool::Full, LEASE).await.unwrap().unwrap();
     assert_eq!(full_b.build.commit, b);
 
-    clock.advance(1);
     store.admit(&repo(), &c, Some(MAIN)).await.unwrap();
     publish_head(store.as_ref(), &c).await;
     let files_c = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
@@ -416,12 +417,13 @@ async fn files_does_not_wait_for_another_rows_full(backend: &dyn Backend) {
 }
 
 /// Full claims go oldest admission first, so with one Full slot Full(C)
-/// builds after Full(B) and on its history levels.
+/// builds after Full(B) and on its history levels. B and C are admitted in
+/// the same second and C sorts first by commit id: only admission order
+/// decides.
 async fn full_claims_follow_admission_order(backend: &dyn Backend) {
-    let (clock, store) = open(backend).await;
+    let (_, store) = open(backend).await;
     let (b, c) = (sha(2), sha(1));
     store.admit(&repo(), &b, Some(MAIN)).await.unwrap();
-    clock.advance(1);
     store.admit(&repo(), &c, Some(MAIN)).await.unwrap();
     for commit in [&b, &c] {
         publish_head(store.as_ref(), commit).await;
@@ -437,16 +439,78 @@ async fn full_claims_follow_admission_order(backend: &dyn Backend) {
     }
 }
 
+/// Claims follow admission order, not the clock or commit ids: all rows
+/// here are admitted in the same second, in an order their ids do not sort
+/// in.
 async fn claims_take_the_oldest_row(backend: &dyn Backend) {
-    let (clock, store) = open(backend).await;
-    store.admit(&repo(), &sha(2), None).await.unwrap();
-    clock.advance(1);
+    let (_, store) = open(backend).await;
+    let other_repo = RepoId::github("acme/other");
+    store.admit(&repo(), &sha(3), None).await.unwrap();
+    store.admit(&other_repo, &sha(2), None).await.unwrap();
     store.admit(&repo(), &sha(1), None).await.unwrap();
-    for expected in [sha(2), sha(1)] {
-        let claim = store.claim("h", Pool::Head, LEASE).await.unwrap().unwrap();
-        assert_eq!(claim.build.commit, expected);
+    for expected in [sha(3), sha(2), sha(1)] {
+        publish_head(store.as_ref(), &expected).await;
     }
     assert!(store.claim("h", Pool::Head, LEASE).await.unwrap().is_none());
+}
+
+/// A repo with a live lease in a pool is skipped by that pool's claims, so
+/// one busy repo cannot hold every slot. Other pools still claim its rows.
+async fn a_repo_holds_one_lease_per_pool(backend: &dyn Backend) {
+    let (clock, store) = open(backend).await;
+    let other_repo = RepoId::github("acme/other");
+    for n in 1..=3 {
+        store.admit(&repo(), &sha(n), None).await.unwrap();
+    }
+    store.admit(&other_repo, &sha(9), None).await.unwrap();
+
+    let head_1 = store.claim("a", Pool::Head, LEASE).await.unwrap().unwrap();
+    assert_eq!(head_1.build.commit, sha(1));
+    let other = store.claim("b", Pool::Head, LEASE).await.unwrap().unwrap();
+    assert_eq!(other.repo, other_repo, "the busy repo's sha(2) is skipped");
+    assert!(store.claim("c", Pool::Head, LEASE).await.unwrap().is_none());
+
+    // Files of one row and Head of the next run together in one repo.
+    assert!(
+        store
+            .publish(&head_1, head(&sha(1), "head"))
+            .await
+            .unwrap()
+            .applied
+    );
+    store.release(&head_1).await.unwrap();
+    let files_1 = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
+    assert_eq!(files_1.build.commit, sha(1));
+    let head_2 = store.claim("a", Pool::Head, LEASE).await.unwrap().unwrap();
+    assert_eq!(head_2.build.commit, sha(2));
+    assert!(store.claim("a", Pool::Head, LEASE).await.unwrap().is_none());
+
+    // Releasing or expiring the lease frees the repo.
+    assert!(
+        store
+            .publish(&head_2, head(&sha(2), "head"))
+            .await
+            .unwrap()
+            .applied
+    );
+    store.release(&head_2).await.unwrap();
+    assert!(
+        store
+            .claim("f", Pool::Files, LEASE)
+            .await
+            .unwrap()
+            .is_none(),
+        "Files(sha 1) still holds the repo's Files lease"
+    );
+    let head_3 = store.claim("a", Pool::Head, LEASE).await.unwrap().unwrap();
+    assert_eq!(head_3.build.commit, sha(3));
+    clock.advance(60);
+    let files_2 = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
+    assert_eq!(
+        files_2.build.commit,
+        sha(1),
+        "the expired Files lease is retaken"
+    );
 }
 
 async fn expired_lease_is_reclaimed_from_its_old_owner(backend: &dyn Backend) {
@@ -505,6 +569,32 @@ async fn expired_lease_is_reclaimed_from_its_old_owner(backend: &dyn Backend) {
             .unwrap()
             .applied
     );
+}
+
+/// A lease past its expiry is lost even before anyone claims the row: the
+/// late owner cannot publish, record a failure, or revive it by renewing.
+async fn expired_lease_cannot_publish_fail_or_renew(backend: &dyn Backend) {
+    let (clock, store) = open(backend).await;
+    let commit = sha(1);
+    store.admit(&repo(), &commit, None).await.unwrap();
+    let claim = store.claim("a", Pool::Head, LEASE).await.unwrap().unwrap();
+    clock.advance(60);
+    assert!(!store.renew(&claim, LEASE).await.unwrap());
+    assert!(
+        !store
+            .publish(&claim, head(&commit, "late"))
+            .await
+            .unwrap()
+            .applied
+    );
+    store
+        .fail(&claim, ExactResultKind::Head, "late failure", None)
+        .await
+        .unwrap();
+    let row = store.status(&repo(), &commit).await.unwrap().unwrap();
+    assert_out!(row.head, pending(None));
+    let claim = store.claim("b", Pool::Head, LEASE).await.unwrap().unwrap();
+    assert_eq!(claim.build.attempts, 2);
 }
 
 async fn renew_extends_the_lease(backend: &dyn Backend) {
@@ -870,7 +960,10 @@ async fn stale_claim_cannot_overwrite_any_ready_result(backend: &dyn Backend) {
 async fn reset_leases_frees_every_row(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     store.admit(&repo(), &sha(1), None).await.unwrap();
-    store.admit(&repo(), &sha(2), None).await.unwrap();
+    store
+        .admit(&RepoId::github("acme/other"), &sha(2), None)
+        .await
+        .unwrap();
     store.claim("a", Pool::Head, LEASE).await.unwrap().unwrap();
     store.claim("a", Pool::Head, LEASE).await.unwrap().unwrap();
     assert!(store.claim("b", Pool::Head, LEASE).await.unwrap().is_none());
@@ -882,8 +975,9 @@ async fn reset_leases_frees_every_row(backend: &dyn Backend) {
     }
 }
 
+/// Newest by admission order; every row here is admitted in one second.
 async fn latest_ready_full_is_newest_ready_on_the_ref(backend: &dyn Backend) {
-    let (clock, store) = open(backend).await;
+    let (_, store) = open(backend).await;
     let other_repo = RepoId::github("acme/other");
     assert!(
         store
@@ -892,14 +986,11 @@ async fn latest_ready_full_is_newest_ready_on_the_ref(backend: &dyn Backend) {
             .unwrap()
             .is_none()
     );
-    complete(store.as_ref(), &repo(), &sha(1), Some(MAIN)).await;
-    clock.advance(100);
     complete(store.as_ref(), &repo(), &sha(2), Some(MAIN)).await;
-    clock.advance(100);
+    complete(store.as_ref(), &repo(), &sha(1), Some(MAIN)).await;
     complete(store.as_ref(), &repo(), &sha(3), Some("refs/heads/dev")).await;
     complete(store.as_ref(), &other_repo, &sha(4), Some(MAIN)).await;
     complete(store.as_ref(), &repo(), &sha(5), None).await;
-    clock.advance(100);
     store.admit(&repo(), &sha(6), Some(MAIN)).await.unwrap();
 
     let (commit, result) = store
@@ -907,8 +998,8 @@ async fn latest_ready_full_is_newest_ready_on_the_ref(backend: &dyn Backend) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(commit, sha(2));
-    assert_eq!(result.clonepack.manifest, manifest(&sha(2), "full"));
+    assert_eq!(commit, sha(1));
+    assert_eq!(result.clonepack.manifest, manifest(&sha(1), "full"));
     assert_eq!(
         store
             .latest_ready_full(&repo(), "refs/heads/dev")
@@ -937,11 +1028,10 @@ async fn latest_ready_full_is_newest_ready_on_the_ref(backend: &dyn Backend) {
 }
 
 async fn list_builds_returns_one_repo_oldest_first(backend: &dyn Backend) {
-    let (clock, store) = open(backend).await;
+    let (_, store) = open(backend).await;
     let other_repo = RepoId::github("acme/other");
     assert!(store.list_builds(&repo()).await.unwrap().is_empty());
     complete(store.as_ref(), &repo(), &sha(2), Some(MAIN)).await;
-    clock.advance(10);
     store.admit(&repo(), &sha(1), None).await.unwrap();
     store.admit(&other_repo, &sha(3), None).await.unwrap();
 
@@ -956,11 +1046,16 @@ async fn list_builds_returns_one_repo_oldest_first(backend: &dyn Backend) {
     assert_eq!(store.list_builds(&other_repo).await.unwrap().len(), 1);
 }
 
+/// One row in each of 16 repos, so the one-lease-per-repo rule does not
+/// limit how many claims succeed.
 async fn concurrent_claims_never_share_a_row(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     let rows = 16;
     for n in 0..rows {
-        store.admit(&repo(), &sha(n), None).await.unwrap();
+        store
+            .admit(&RepoId::github(format!("acme/repo-{n}")), &sha(n), None)
+            .await
+            .unwrap();
     }
     let mut claims = Vec::new();
     for worker in 0..(rows * 2) {

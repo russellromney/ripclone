@@ -1,7 +1,7 @@
 //! The `/v1/repos` and `/v1/admin/config` routes: add and remove
 //! repositories, admit builds, read commits and repository status.
 
-use super::{ErrorResponse, ServerState, fetch_semaphore};
+use super::{ErrorResponse, ServerState, ls_remote_semaphore};
 use crate::clonepack::{
     ClonepackManifest, collect_manifest_hashes, hash_to_hex, manifest_chunk_refs,
 };
@@ -412,7 +412,8 @@ pub(super) struct Resolved {
 }
 
 /// Turn a selector into one commit. A full SHA is trusted as given; `HEAD`
-/// and names cost one `ls-remote` under the fetch cap. Nothing is fetched.
+/// and names cost one `ls-remote` under the ls-remote cap. Nothing is
+/// fetched.
 pub(super) async fn resolve(
     state: &ServerState,
     repo_id: &RepoId,
@@ -431,14 +432,14 @@ pub(super) async fn resolve(
         Selector::Name(name) => name.as_str(),
     };
     let credential = state
-        .broker
         .fetch_credential(repo_id)
+        .await
         .map_err(credential_error)?;
     let tip = {
-        let _permit = fetch_semaphore()
+        let _permit = ls_remote_semaphore()
             .acquire()
             .await
-            .expect("fetch semaphore never closed");
+            .expect("ls-remote semaphore never closed");
         git::ls_remote_tip_async(provider, repo_id, name, credential.as_ref()).await
     };
     let tip = match tip {
@@ -837,6 +838,24 @@ async fn build_repo_status(
     fork_of: Option<&str>,
 ) -> Result<RepoStatusResponse> {
     let rows = state.control.list_builds(repo_id).await?;
+    // Storage reads block (remote storage makes a request each), so they run
+    // off the async workers.
+    let wanted: Vec<String> = rows
+        .iter()
+        .flat_map(|row| collect_manifest_hashes(&row_info(row)))
+        .collect();
+    let storage = state.storage.clone();
+    let manifests: HashMap<String, Vec<u8>> = tokio::task::spawn_blocking(move || {
+        wanted
+            .into_iter()
+            .map(|hash| {
+                let bytes = storage.get(&hash)?;
+                Ok((hash, bytes))
+            })
+            .collect::<Result<_>>()
+    })
+    .await
+    .context("read manifests for status")??;
     let mut refs = Vec::new();
     let mut unique_chunks: HashMap<String, u64> = HashMap::new();
     for row in rows {
@@ -844,7 +863,9 @@ async fn build_repo_status(
         let manifest_hashes = collect_manifest_hashes(&info);
         let mut ref_bytes = 0u64;
         for manifest_hash in manifest_hashes {
-            let manifest_bytes = state.storage.get(&manifest_hash)?;
+            let manifest_bytes = manifests
+                .get(&manifest_hash)
+                .context("manifest read for status is missing")?;
             let manifest_len = manifest_bytes.len() as u64;
             record_chunk(&mut unique_chunks, &manifest_hash, manifest_len);
             ref_bytes += manifest_len;
@@ -1537,6 +1558,27 @@ mod tests {
             state.control.renew(&claimed, lease).await.unwrap(),
             "removal must not take a running build's lease"
         );
+        // A repo holds one Head lease at a time, so the second build waits
+        // for the first to finish.
+        assert!(
+            state
+                .control
+                .claim("worker-2", crate::control::Pool::Head, lease)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        state
+            .control
+            .fail(
+                &claimed,
+                ExactResultKind::Head,
+                "retry later",
+                Some(Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+        state.control.release(&claimed).await.unwrap();
         let next = state
             .control
             .claim("worker-2", crate::control::Pool::Head, lease)

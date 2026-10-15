@@ -155,6 +155,12 @@ fn h4_invalid_config_fails_before_side_effects() {
             "RIPCLONE_LS_REMOTE_TIMEOUT_SECS must be a non-negative integer",
         ),
         (
+            "bad fetch timeout",
+            "",
+            &[("RIPCLONE_FETCH_TIMEOUT_SECS", "1h")],
+            "RIPCLONE_FETCH_TIMEOUT_SECS must be a non-negative integer",
+        ),
+        (
             "bad LSM levels",
             "",
             &[("RIPCLONE_LSM_MAX_LEVELS", "")],

@@ -16,6 +16,7 @@ mod outputs;
 mod pinning;
 mod resolve;
 mod s3;
+mod scheduling;
 mod shapes;
 mod state;
 mod surface;

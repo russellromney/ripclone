@@ -13,7 +13,6 @@ pub struct Metrics {
     syncs: AtomicU64,
     sync_duration_ms_total: AtomicU64,
     sync_mirror_fetch_ms_total: AtomicU64,
-    sync_commit_graph_ms_total: AtomicU64,
     sync_head_packs_ms_total: AtomicU64,
     sync_skeleton_build_ms_total: AtomicU64,
     sync_files_table_ms_total: AtomicU64,
@@ -56,7 +55,6 @@ impl Metrics {
 
     pub fn record_sync_phases(&self, phases: SyncPhaseMetrics) {
         Self::add_optional(&self.sync_mirror_fetch_ms_total, phases.mirror_fetch_ms);
-        Self::add_optional(&self.sync_commit_graph_ms_total, phases.commit_graph_ms);
         Self::add_optional(&self.sync_head_packs_ms_total, phases.head_packs_ms);
         Self::add_optional(&self.sync_skeleton_build_ms_total, phases.skeleton_build_ms);
         Self::add_optional(&self.sync_files_table_ms_total, phases.files_table_ms);
@@ -131,7 +129,7 @@ impl Metrics {
         let s = self.snapshot();
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 23] = [
+        let counters: [(&str, &str, u64); 22] = [
             (
                 "ripclone_ref_lookups_total",
                 "Ref lookups served",
@@ -147,11 +145,6 @@ impl Metrics {
                 "ripclone_sync_mirror_fetch_ms_total",
                 "Total mirror-fetch phase time in milliseconds",
                 s.sync_mirror_fetch_ms_total,
-            ),
-            (
-                "ripclone_sync_commit_graph_ms_total",
-                "Total commit-graph phase time in milliseconds",
-                s.sync_commit_graph_ms_total,
             ),
             (
                 "ripclone_sync_head_packs_ms_total",
@@ -277,7 +270,6 @@ impl Metrics {
             sync_avg_ms: if syncs == 0 { 0 } else { sync_ms / syncs },
             sync_duration_ms_total: sync_ms,
             sync_mirror_fetch_ms_total: self.sync_mirror_fetch_ms_total.load(Ordering::Relaxed),
-            sync_commit_graph_ms_total: self.sync_commit_graph_ms_total.load(Ordering::Relaxed),
             sync_head_packs_ms_total: self.sync_head_packs_ms_total.load(Ordering::Relaxed),
             sync_skeleton_build_ms_total: self.sync_skeleton_build_ms_total.load(Ordering::Relaxed),
             sync_files_table_ms_total: self.sync_files_table_ms_total.load(Ordering::Relaxed),
@@ -318,7 +310,6 @@ fn escape_help(s: &str) -> String {
 #[derive(Default)]
 pub struct SyncPhaseMetrics {
     pub mirror_fetch_ms: Option<u64>,
-    pub commit_graph_ms: Option<u64>,
     pub head_packs_ms: Option<u64>,
     pub skeleton_build_ms: Option<u64>,
     pub files_table_ms: Option<u64>,
@@ -335,7 +326,6 @@ pub struct MetricsSnapshot {
     pub sync_avg_ms: u64,
     pub sync_duration_ms_total: u64,
     pub sync_mirror_fetch_ms_total: u64,
-    pub sync_commit_graph_ms_total: u64,
     pub sync_head_packs_ms_total: u64,
     pub sync_skeleton_build_ms_total: u64,
     pub sync_files_table_ms_total: u64,
