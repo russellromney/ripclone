@@ -65,7 +65,6 @@ async-trait = "0.1.89"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
 gix = "0.85.0"
-gix-pack = "0.72.0"
 rpassword = "7"
 toml = "1.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }

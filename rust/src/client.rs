@@ -411,7 +411,7 @@ impl Client {
             headers.insert("x-ripclone-protocol", pv);
         }
         let http = build_http_client(headers);
-        let cache = cache_dir.and_then(|dir| Cas::new(dir).ok());
+        let cache = cache_dir.and_then(|dir| Cas::cache(dir).ok());
         Self {
             server,
             http,

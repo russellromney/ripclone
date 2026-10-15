@@ -389,36 +389,11 @@ fn extract_archive_from_chunk_receiver_with_chunks(
         })?;
     }
 
-    // Validate every path and create parent directories only when we are
+    // Validate every path and create the directories only when we are
     // materializing the working tree. Lazy callers pass no target dir to build
     // only a local blob pack.
     if let Some(target_dir) = target_dir {
-        for entry in manifest.files.iter() {
-            validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
-                format!(
-                    "invalid manifest path: {}",
-                    String::from_utf8_lossy(&entry.path)
-                )
-            })?;
-        }
-        let dirs: HashSet<PathBuf> = manifest
-            .files
-            .iter()
-            .filter_map(|e| {
-                let p = path_from_bytes(&e.path);
-                let parent = p.parent()?;
-                if parent.as_os_str().is_empty() {
-                    return None;
-                }
-                Some(parent.to_path_buf())
-            })
-            .collect();
-        let mut dirs: Vec<_> = dirs.into_iter().collect();
-        dirs.sort();
-        for dir in dirs {
-            safe_create_dir_all(target_dir, &dir)
-                .with_context(|| format!("create dir {}", dir.display()))?;
-        }
+        prepare_worktree_dirs(target_dir, &manifest)?;
     }
 
     let target_dir = target_dir.map(Path::to_path_buf);
@@ -766,27 +741,30 @@ pub fn build_blob_path_map(files: &[FileEntry]) -> BlobPathMap {
 }
 
 /// Validate every path and pre-create all parent directories single-threaded, so
-/// the parallel per-pack writers never race on `mkdir`.
-pub fn prepare_worktree_dirs(target_dir: &Path, files: &[FileEntry]) -> Result<()> {
-    for entry in files {
-        validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
-            format!(
-                "invalid manifest path: {}",
-                String::from_utf8_lossy(&entry.path)
-            )
-        })?;
+/// the parallel per-pack writers never race on `mkdir`. Each submodule gitlink
+/// becomes an empty directory, as `git clone` leaves an uninitialized one.
+pub fn prepare_worktree_dirs(target_dir: &Path, metadata: &Manifest) -> Result<()> {
+    let files = metadata.files.iter().map(|e| e.path.as_slice());
+    for path in files
+        .clone()
+        .chain(metadata.gitlinks.iter().map(Vec::as_slice))
+    {
+        validate_relative_path(path_from_bytes(path))
+            .with_context(|| format!("invalid manifest path: {}", String::from_utf8_lossy(path)))?;
     }
-    let dirs: HashSet<PathBuf> = files
+    let parents = files.filter_map(|path| {
+        let parent = path_from_bytes(path).parent()?;
+        (!parent.as_os_str().is_empty()).then(|| parent.to_path_buf())
+    });
+    let gitlinks = metadata
+        .gitlinks
         .iter()
-        .filter_map(|e| {
-            let parent = path_from_bytes(&e.path).parent()?;
-            if parent.as_os_str().is_empty() {
-                return None;
-            }
-            Some(parent.to_path_buf())
-        })
+        .map(|path| path_from_bytes(path).to_path_buf());
+    let mut dirs: Vec<PathBuf> = parents
+        .chain(gitlinks)
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect();
-    let mut dirs: Vec<_> = dirs.into_iter().collect();
     dirs.sort();
     for dir in &dirs {
         safe_create_dir_all(target_dir, dir)

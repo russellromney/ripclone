@@ -17,6 +17,19 @@ pub struct CompactResult {
     pub new_packs: Vec<(String, u64, String, u64)>,
 }
 
+/// History packs built for one range, with the time spent in `pack-objects`
+/// and in storing the packs in the CAS.
+#[derive(Default)]
+pub struct HistoryBuild {
+    pub packs: Vec<(String, u64, String, u64)>,
+    pub pack_ms: u64,
+    pub store_ms: u64,
+}
+
+fn elapsed_ms(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 impl<'a> PackBuilder<'a> {
     pub fn new<P: AsRef<Path>>(repo: P, cas: &'a Cas) -> Self {
         Self {
@@ -55,40 +68,17 @@ impl<'a> PackBuilder<'a> {
         self.build_skeleton_pack_with_depth(commit, Some(1))
     }
 
-    /// Build a ready-to-use `.git/index` from the skeleton pack.
+    /// Build a ready-to-use `.git/index` for `commit` and store it in the CAS.
     ///
     /// The index contains every tracked path with `skip-worktree` set and
     /// accurate cached blob sizes. After the client materializes files it must
     /// clear skip-worktree for those paths.
-    pub fn build_prebuilt_index(&self, commit: &str, skeleton_pack_hash: &str) -> Result<String> {
+    pub fn build_prebuilt_index(&self, commit: &str) -> Result<String> {
         let tmp = tempfile::TempDir::new()?;
-        let work = tmp.path();
-        let git_dir = work.join(".git");
-
-        git::init(work)?;
-        let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-
-        let pack_data = self
-            .cas
-            .get(skeleton_pack_hash)
-            .context("fetch skeleton pack for index build")?;
-        let pack_path = pack_dir.join("skeleton.pack");
-        std::fs::write(&pack_path, &pack_data)?;
-        git::index_pack(&git_dir, &pack_path)?;
-
-        git::set_head(&git_dir, commit)?;
-        git::read_tree(&git_dir, commit)?;
-
-        let sizes = git::ls_tree_sizes(&self.repo, commit)?;
-        git::update_index_sizes(&git_dir, &sizes)?;
-
-        // Mark every tracked path as skip-worktree. The client clears this bit
-        // for files it actually materializes from the archive.
-        git::set_skip_worktree_all(work)?;
-
-        let index_bytes = std::fs::read(git_dir.join("index")).context("read prebuilt index")?;
-        self.cas.put(&index_bytes)
+        let index_path = tmp.path().join("index");
+        git::write_prebuilt_index(&self.repo, commit, &index_path)?;
+        let (hash, _) = self.cas.put_file(&index_path)?;
+        Ok(hash)
     }
 
     /// Build just the HEAD closure (undeltified small packs) — the depth=1
@@ -102,9 +92,7 @@ impl<'a> PackBuilder<'a> {
         if head_oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
-        Ok(self
-            .build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?
-            .0)
+        self.build_packs_from_oids(&head_oids, head_target_raw_bytes)
     }
 
     /// Build a HEAD-closure *delta* pack against a base commit: only the depth-1
@@ -153,15 +141,13 @@ impl<'a> PackBuilder<'a> {
         if delta_oids.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(self
-            .build_packs_from_oids(&delta_oids, head_target_raw_bytes, true)?
-            .0)
+        self.build_packs_from_oids(&delta_oids, head_target_raw_bytes)
     }
 
-    /// Build only the deltified *tail* — objects introduced in `(sealed_tip,
+    /// Build only the deltified *tail*: objects introduced in `(sealed_tip,
     /// commit]` (the whole history when `sealed_tip` is `None`). The HEAD
     /// closure is built separately by [`Self::build_head_packs`]. Returns the
-    /// tail packs.
+    /// tail packs, none when the range has no objects.
     ///
     /// The tail is NOT reduced by the HEAD closure: a sealed level must hold the
     /// full range so it stays correct as an immutable artifact even after the
@@ -172,62 +158,54 @@ impl<'a> PackBuilder<'a> {
         &self,
         commit: &str,
         sealed_tip: Option<&str>,
-        history_target_raw_bytes: u64,
-    ) -> Result<Vec<(String, u64, String, u64)>> {
-        // Cold base build (no sealed level yet): reuse the deltas git already has
-        // via the mirror's reachability bitmap instead of enumerating ~all
-        // objects and re-deltifying them in size-partitioned batches (which also
-        // breaks delta reuse at batch boundaries). This is the dominant cost of a
-        // huge repo's first full sync; bitmap pack-reuse makes it ~I/O-bound.
-        if sealed_tip.is_none() {
-            // Try the bitmap/delta-reuse fast path; on any failure fall back to the
-            // proven enumerate-and-pack path so a cold build never hard-fails on a
-            // missing bitmap, an old git, or a pack-objects hiccup. Reuse is an
-            // optimization, never the only path to a complete base.
-            return match self.build_history_pack_reuse(commit) {
-                Ok(packs) => Ok(packs),
-                Err(e) => {
-                    // A cancelled build stops; it does not fall back.
-                    crate::cancel::Cancel::check_current()?;
-                    tracing::warn!(
-                        "cold history pack-reuse failed ({e:#}); falling back to enumerate+pack"
-                    );
-                    let oids = git::list_object_shas_in_range(&self.repo, None, commit)?;
-                    if oids.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    Ok(self
-                        .build_packs_from_oids(&oids, history_target_raw_bytes, false)?
-                        .0)
-                }
-            };
+    ) -> Result<HistoryBuild> {
+        if sealed_tip.is_some() {
+            return self.build_history_range(commit, sealed_tip, false);
         }
-        let tail_oids = git::list_object_shas_in_range(&self.repo, sealed_tip, commit)?;
-        if tail_oids.is_empty() {
-            return Ok(Vec::new());
+        // Cold base build: the mirror's reachability bitmap answers the walk of
+        // the whole history. A bitmap git cannot use fails only this attempt;
+        // the same pack built by walking the graph is the fallback.
+        match self.build_history_range(commit, None, true) {
+            Ok(packs) => Ok(packs),
+            Err(e) => {
+                // A cancelled build stops; it does not fall back.
+                crate::cancel::Cancel::check_current()?;
+                tracing::warn!("cold history with bitmap failed ({e:#}); packing without it");
+                self.build_history_range(commit, None, false)
+            }
         }
-        Ok(self
-            .build_packs_from_oids(&tail_oids, history_target_raw_bytes, false)?
-            .0)
     }
 
-    /// Build the cold full-history packs by reusing existing pack deltas via the
-    /// mirror's bitmap (see `git::pack_objects_reachable_to_prefix`), which
-    /// preserves one compact delta graph. The reachable closure includes HEAD's
-    /// objects (a small duplicate with the depth pack) — a deliberate
-    /// space-for-time trade to avoid an exclusion enumeration.
-    fn build_history_pack_reuse(&self, commit: &str) -> Result<Vec<(String, u64, String, u64)>> {
+    /// Pack the objects of `(exclude, tip]` with git's own walk and delta
+    /// reuse (see `git::pack_objects_range_to_prefix`) and store the pack.
+    fn build_history_range(
+        &self,
+        tip: &str,
+        exclude: Option<&str>,
+        use_bitmap: bool,
+    ) -> Result<HistoryBuild> {
+        crate::cancel::Cancel::check_current()?;
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
-        git::pack_objects_reachable_to_prefix(&self.repo, commit, &prefix)?;
-        self.store_packs_from_dir(tmp.path())
+        let start = std::time::Instant::now();
+        git::pack_objects_range_to_prefix(&self.repo, tip, exclude, &prefix, use_bitmap)?;
+        let pack_ms = elapsed_ms(start);
+        let start = std::time::Instant::now();
+        let packs = self.store_packs_from_dir(tmp.path())?;
+        Ok(HistoryBuild {
+            packs,
+            pack_ms,
+            store_ms: elapsed_ms(start),
+        })
     }
 
     /// Read every `pack-<sha>.{pack,idx}` pair written under `dir`, store both
     /// halves in the CAS, and return `(pack_hash, pack_len, idx_hash, idx_len)`
-    /// for each.
+    /// for each. A pack with no objects is dropped.
     fn store_packs_from_dir(&self, dir: &Path) -> Result<Vec<(String, u64, String, u64)>> {
         use std::collections::HashMap;
+        // A pack is a 12-byte header, its objects, and a 20-byte checksum.
+        const EMPTY_PACK_LEN: u64 = 32;
         let mut packs: HashMap<String, PathBuf> = HashMap::new();
         let mut idxs: HashMap<String, PathBuf> = HashMap::new();
         for entry in std::fs::read_dir(dir)? {
@@ -254,12 +232,12 @@ impl<'a> PackBuilder<'a> {
             let idx_path = idxs
                 .get(&name)
                 .with_context(|| format!("missing idx for {name}"))?;
+            if std::fs::metadata(pack_path)?.len() <= EMPTY_PACK_LEN {
+                continue;
+            }
             let (pack_hash, pack_len) = self.cas.put_file(pack_path)?;
             let (idx_hash, idx_len) = self.cas.put_file(idx_path)?;
             out.push((pack_hash, pack_len, idx_hash, idx_len));
-        }
-        if out.is_empty() {
-            bail!("no packs produced");
         }
         Ok(out)
     }
@@ -275,7 +253,6 @@ impl<'a> PackBuilder<'a> {
         &self,
         mut levels: Vec<crate::HistoryLevel>,
         max_levels: usize,
-        history_target_raw_bytes: u64,
     ) -> Result<CompactResult> {
         let mut new_packs = Vec::new();
         let level_bytes =
@@ -295,13 +272,9 @@ impl<'a> PackBuilder<'a> {
             // before `best` (None when best is the base), tip is level[best+1].
             let start = best.checked_sub(1).map(|i| levels[i].tip_commit.clone());
             let tip = levels[best + 1].tip_commit.clone();
-            let oids = git::list_object_shas_in_range(&self.repo, start.as_deref(), &tip)?;
-            let packs = if oids.is_empty() {
-                Vec::new()
-            } else {
-                self.build_packs_from_oids(&oids, history_target_raw_bytes, false)?
-                    .0
-            };
+            let packs = self
+                .build_history_range(&tip, start.as_deref(), false)?
+                .packs;
             new_packs.extend(packs.iter().cloned());
             let merged = crate::HistoryLevel {
                 tip_commit: tip,
@@ -321,25 +294,19 @@ impl<'a> PackBuilder<'a> {
     }
 
     /// Partition `oids` greedily by raw size into `~target_raw_bytes` batches and
-    /// pack each as a self-contained mini-pack. Returns the per-pack
-    /// `(pack_hash, pack_len, idx_hash, idx_len)` tuples plus the total raw
-    /// (uncompressed) size of all `oids` (so callers can make sealing decisions
-    /// without a second `object_sizes` pass).
+    /// pack each as a self-contained, undeltified mini-pack: each object is
+    /// stored whole so the client can hand-parse blobs from the bytes (HEAD
+    /// closure). Returns the per-pack `(pack_hash, pack_len, idx_hash, idx_len)`
+    /// tuples.
     fn build_packs_from_oids(
         &self,
         oids: &[String],
         target_raw_bytes: u64,
-        undeltified: bool,
-    ) -> Result<(Vec<(String, u64, String, u64)>, u64)> {
+    ) -> Result<Vec<(String, u64, String, u64)>> {
         if oids.is_empty() {
-            return Ok((Vec::new(), 0));
+            return Ok(Vec::new());
         }
         let sizes = git::object_sizes(&self.repo, oids)?;
-        let total_raw = oids.iter().try_fold(0u64, |total, oid| {
-            total
-                .checked_add(sizes.get(oid).copied().unwrap_or(0))
-                .context("raw object size total overflow")
-        })?;
 
         // Greedy size-based partitioning. A single object larger than the target
         // gets its own pack (we can't split one object across packs).
@@ -367,29 +334,15 @@ impl<'a> PackBuilder<'a> {
             batches.push(cur);
         }
 
-        // `undeltified` (`--window=0`): each object stored whole so the client
-        // can hand-parse blobs from the bytes (HEAD closure). Deltified packs are
-        // compact and only installed for the object DB (history); git resolves
-        // their deltas. Each pack is self-contained (non-thin).
-        //
-        // Undeltified packs are single-threaded + CPU-light, so pack the batches
-        // across cores. Deltified `pack-objects` is already git-internally
-        // threaded, so we keep those serial to avoid CPU oversubscription.
-        let packs: Vec<(String, u64, String, u64)> = if undeltified && batches.len() > 1 {
-            use rayon::prelude::*;
-            // Rayon threads do not inherit the build's cancel token.
-            let cancel = crate::cancel::Cancel::current().unwrap_or_default();
-            batches
-                .par_iter()
-                .map(|batch| cancel.enter(|| self.pack_and_index_inner(batch, undeltified)))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            batches
-                .iter()
-                .map(|batch| self.pack_and_index_inner(batch, undeltified))
-                .collect::<Result<Vec<_>>>()?
-        };
-        Ok((packs, total_raw))
+        // Undeltified packs are single-threaded + CPU-light, so pack the
+        // batches across cores. Rayon threads do not inherit the build's
+        // cancel token.
+        use rayon::prelude::*;
+        let cancel = crate::cancel::Cancel::current().unwrap_or_default();
+        batches
+            .par_iter()
+            .map(|batch| cancel.enter(|| self.pack_and_index_inner(batch, true)))
+            .collect()
     }
 
     fn pack_and_index(&self, object_shas: &[String]) -> Result<(String, String)> {
@@ -412,39 +365,14 @@ impl<'a> PackBuilder<'a> {
 
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
-        // The gix encoder is currently undeltified (deterministic, sorted OIDs).
-        // Use it for HEAD-closure packs when requested; keep C-git for deltified
-        // history packs so their size stays compact.
-        let use_gix = false;
-        if use_gix && undeltified {
-            git::pack_objects_to_prefix_gix(&self.repo, object_shas, &prefix)?;
-        } else if undeltified {
+        if undeltified {
             git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
         } else {
             git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;
         }
-
-        let mut pack_path: Option<PathBuf> = None;
-        let mut idx_path: Option<PathBuf> = None;
-        for entry in std::fs::read_dir(tmp.path())? {
-            let entry = entry?;
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                if ext == "pack" {
-                    pack_path = Some(path);
-                } else if ext == "idx" {
-                    idx_path = Some(path);
-                }
-            }
-        }
-
-        let pack_path = pack_path.context("missing generated pack file")?;
-        let idx_path = idx_path.context("missing generated idx file")?;
-
-        let (pack_hash, pack_len) = self.cas.put_file(&pack_path)?;
-        let (idx_hash, idx_len) = self.cas.put_file(&idx_path)?;
-
-        Ok((pack_hash, pack_len, idx_hash, idx_len))
+        let mut packs = self.store_packs_from_dir(tmp.path())?;
+        anyhow::ensure!(packs.len() == 1, "pack-objects wrote {} packs", packs.len());
+        Ok(packs.remove(0))
     }
 }
 

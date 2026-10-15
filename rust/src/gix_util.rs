@@ -185,59 +185,6 @@ pub fn list_object_shas_with_depth<P: AsRef<Path>>(
     Ok(out)
 }
 
-/// List objects reachable from `to` but not from `from`.
-pub fn list_object_shas_in_range<P: AsRef<Path>>(
-    repo_path: P,
-    from: Option<&str>,
-    to: &str,
-) -> Result<Vec<String>> {
-    list_object_shas_in_range_git(repo_path, from, to)
-}
-
-fn list_object_shas_in_range_git<P: AsRef<Path>>(
-    repo_path: P,
-    from: Option<&str>,
-    to: &str,
-) -> Result<Vec<String>> {
-    crate::validation::validate_git_rev(to).with_context(|| format!("invalid commit: {to}"))?;
-    if let Some(from) = from {
-        crate::validation::validate_git_rev(from)
-            .with_context(|| format!("invalid commit: {from}"))?;
-    }
-    let mut command = crate::git::command();
-    command
-        .arg("-C")
-        .arg(repo_path.as_ref())
-        .args([
-            "rev-list",
-            "--objects",
-            "--no-object-names",
-            "--end-of-options",
-        ])
-        .arg(to);
-    if let Some(from) = from {
-        command.arg(format!("^{from}"));
-    }
-    let out = command
-        .output()
-        .context("run git rev-list --objects range")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git rev-list --objects range failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let mut oids: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|oid| !oid.is_empty())
-        .map(str::to_string)
-        .collect();
-    oids.sort();
-    oids.dedup();
-    Ok(oids)
-}
-
 /// List every tree entry reachable from `commit`.
 pub fn list_tree_entries<P: AsRef<Path>>(
     repo_path: P,
@@ -343,42 +290,6 @@ pub fn classify_objects<P: AsRef<Path>>(
     Ok(pairs.into_iter().collect())
 }
 
-/// Return a map from path to blob size for every blob in the commit tree.
-pub fn ls_tree_sizes<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<HashMap<String, u64>> {
-    let repo = open_repo(repo_path)?;
-    let id = repo
-        .rev_parse_single(commit)
-        .with_context(|| format!("resolving commit '{}'", commit))?;
-    let tree_id = repo
-        .find_commit(id)
-        .context("find commit")?
-        .tree_id()
-        .context("read tree id")?
-        .detach();
-
-    let mut recorder = gix::traverse::tree::Recorder::default();
-    gix::traverse::tree::depthfirst(
-        tree_id,
-        gix::traverse::tree::depthfirst::State::default(),
-        &repo.objects,
-        &mut recorder,
-    )
-    .context("tree traversal")?;
-
-    let mut map = HashMap::new();
-    for entry in recorder.records {
-        if !entry.mode.is_blob_or_symlink() {
-            continue;
-        }
-        let size = repo
-            .find_header(entry.oid)
-            .with_context(|| format!("find header for {}", entry.oid))?
-            .size();
-        map.insert(String::from_utf8_lossy(&entry.filepath).to_string(), size);
-    }
-    Ok(map)
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -433,7 +344,11 @@ impl Visit for OidCollector {
     }
 
     fn visit_nontree(&mut self, entry: &gix::objs::tree::EntryRef<'_>) -> Action {
-        self.oids.insert(entry.oid.to_owned());
+        // A gitlink (submodule) names a commit of another repository. It is
+        // not an object of this one, as with `git rev-list --objects`.
+        if !entry.mode.is_commit() {
+            self.oids.insert(entry.oid.to_owned());
+        }
         Action::Continue(true)
     }
 }

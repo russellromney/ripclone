@@ -38,13 +38,54 @@ impl ObjectHasher {
 #[derive(Clone)]
 pub struct Cas {
     root: PathBuf,
+    /// Sync each object's directory entry after the rename that installs it,
+    /// so an object reported stored survives a crash. Off for a cache, whose
+    /// lost entry is only a miss.
+    durable: bool,
 }
 
 impl Cas {
+    /// A store that is the source of truth: each stored object is durable.
     pub fn new<P: AsRef<Path>>(root: P) -> Result<Self> {
+        Self::open(root, true)
+    }
+
+    /// A cache in front of a durable store (remote storage, or the client's
+    /// download cache). A crash can lose its newest entries, which only costs
+    /// a re-read, so it skips the directory syncs.
+    pub fn cache<P: AsRef<Path>>(root: P) -> Result<Self> {
+        Self::open(root, false)
+    }
+
+    fn open<P: AsRef<Path>>(root: P, durable: bool) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self { root, durable })
+    }
+
+    /// Create the fan-out directory that holds `path`. A new directory's own
+    /// entry in the root is synced before any object is renamed into it.
+    fn create_object_dir(&self, path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("CAS object path has no parent: {}", path.display()))?;
+        if parent.is_dir() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create CAS directory {}", parent.display()))?;
+        if self.durable {
+            sync_dir(&self.root)?;
+        }
+        Ok(())
+    }
+
+    /// Make the rename that installed `path` durable.
+    fn sync_installed(&self, path: &Path) -> Result<()> {
+        match path.parent() {
+            Some(parent) if self.durable => sync_dir(parent),
+            _ => Ok(()),
+        }
     }
 
     /// Validate that `hash` is a 64-character lowercase hex SHA-256 artifact id.
@@ -93,9 +134,7 @@ impl Cas {
         if path.exists() && self.verify_object(hash).is_ok() {
             return Ok(());
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.create_object_dir(&path)?;
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("CAS object path has no parent: {}", path.display()))?;
@@ -159,9 +198,7 @@ impl Cas {
         {
             return Ok((hash, existing_len));
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.create_object_dir(&path)?;
         self.install_verified_temp(&hash, tmp_path, &path)?;
         Ok((hash, len))
     }
@@ -216,9 +253,7 @@ impl Cas {
         crate::perf::record_cas_fsync(fsync_start.elapsed());
 
         let tmp_path = tmp.into_temp_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.create_object_dir(&path)?;
         self.install_verified_temp(hash, tmp_path, &path)?;
         Ok(len)
     }
@@ -235,11 +270,9 @@ impl Cas {
         if actual != hash {
             anyhow::bail!("hash mismatch: expected {}, actual {}", hash, actual);
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.create_object_dir(&path)?;
         match std::fs::rename(source, &path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(_first_err) if path.exists() => {
                 if self.verify_object(hash).is_ok() {
                     let _ = std::fs::remove_file(source);
@@ -248,10 +281,11 @@ impl Cas {
                 std::fs::remove_file(&path)
                     .with_context(|| format!("remove corrupt CAS object {}", hash))?;
                 std::fs::rename(source, &path)
-                    .with_context(|| format!("replace corrupt CAS object {}", hash))
+                    .with_context(|| format!("replace corrupt CAS object {}", hash))?;
             }
-            Err(e) => Err(e).with_context(|| format!("rename CAS object {}", hash)),
+            Err(e) => return Err(e).with_context(|| format!("rename CAS object {}", hash)),
         }
+        self.sync_installed(&path)
     }
 
     fn install_verified_temp(
@@ -261,7 +295,7 @@ impl Cas {
         path: &Path,
     ) -> Result<()> {
         match std::fs::rename(&tmp_path, path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(_first_err) if path.exists() => {
                 if self.verify_object(hash).is_ok() {
                     let _ = tmp_path.close();
@@ -270,10 +304,11 @@ impl Cas {
                 std::fs::remove_file(path)
                     .with_context(|| format!("remove corrupt CAS object {}", hash))?;
                 std::fs::rename(&tmp_path, path)
-                    .with_context(|| format!("replace corrupt CAS object {}", hash))
+                    .with_context(|| format!("replace corrupt CAS object {}", hash))?;
             }
-            Err(e) => Err(e).with_context(|| format!("rename CAS object {}", hash)),
+            Err(e) => return Err(e).with_context(|| format!("rename CAS object {}", hash)),
         }
+        self.sync_installed(path)
     }
 
     pub fn get(&self, hash: &str) -> Result<Vec<u8>> {
@@ -424,6 +459,13 @@ impl Cas {
 
 pub fn hash(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
+}
+
+/// Flush a directory's entries (a rename or a new child) to disk.
+fn sync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("fsync CAS directory {}", dir.display()))
 }
 
 fn hash_bytes_for_object_id(hash: &str, data: &[u8]) -> Result<String> {

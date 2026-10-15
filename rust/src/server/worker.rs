@@ -16,7 +16,8 @@
 //! commit Head already fetched never waits on another commit's fetch. Full
 //! keeps the mirror small: it writes the commit-graph, compacts the mirror
 //! when no build reads it, and writes the bitmap right before a cold history
-//! build, the one build that uses it.
+//! build, the one build that uses it. The bitmap write only reads the mirror's
+//! packs, so it holds the shared lock and fetches proceed during it.
 //!
 //! Each output builds incrementally from the same output of its base: the
 //! newest commit of the repo with that output ready that is an ancestor of
@@ -24,8 +25,8 @@
 
 use super::api::row_info;
 use super::builder::{
-    SyncPhases, build_files_result, build_full_result, build_head_result, report_sync_bench,
-    report_sync_phases,
+    BuildPhases, SyncPhases, build_files_result, build_full_result, build_head_result,
+    report_sync_bench, report_sync_phases,
 };
 use super::{RepoLock, ServerState, duration_ms};
 use crate::cancel::{self, Cancel};
@@ -48,9 +49,9 @@ const RETRY_CAP: Duration = Duration::from_secs(300);
 /// Full. They hold the repo's write lock, which a build waits on only when
 /// it must fetch.
 const UPKEEP_TIMEOUT: Duration = Duration::from_secs(120);
-/// Cap on the bitmap written before a cold history build. It also holds the
-/// write lock, but runs once per cold build: a repo's first Full, or one
-/// after a force push.
+/// Cap on the bitmap written before a cold history build: a repo's first
+/// Full, or one after a force push. It does not hold the write lock, so
+/// fetches of new pushes proceed during it.
 const BITMAP_TIMEOUT: Duration = Duration::from_secs(600);
 /// After a failed compaction, a repo's Fulls skip compaction this long.
 const COMPACT_BACKOFF: Duration = Duration::from_secs(3600);
@@ -598,21 +599,29 @@ async fn head_output(
 }
 
 async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
+    let started = Instant::now();
+    let mut phases = BuildPhases::default();
     let built = async {
         let head = ready_head(claim)?;
         let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
         let lock = repo_lock(state, &claim.repo).await;
+        let start = Instant::now();
         let _reading = lock.read.read().await;
+        phases.record("lock_wait", start);
+        let start = Instant::now();
         ensure_commit(state, &claim.repo, &claim.build.commit, &mirror_dir, &lock).await?;
+        phases.record("fetch", start);
         let config = state
             .control
             .get_config(&claim.repo)
             .await?
             .unwrap_or_default();
+        let start = Instant::now();
         let base_row = ancestor_base(state, claim, ExactResultKind::Files, &mirror_dir).await?;
         let base_files = base_row
             .as_ref()
             .and_then(|row| row.files.ready().map(|files| (row.commit.as_str(), files)));
+        phases.record("base", start);
         Cancel::check_current()?;
         build_files_result(
             &state.cas,
@@ -622,30 +631,41 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
             base_files,
             &state.storage,
             config.compression_level(),
+            &mut phases,
         )
         .await
         .map(Output::Files)
     }
     .await;
+    let ready = built.is_ok();
+    phases.report("files", &claim.repo, &claim.build.commit, ready, started);
     settle(state, settings, claim, ExactResultKind::Files, built).await;
 }
 
 async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
+    let started = Instant::now();
+    let mut phases = BuildPhases::default();
     let built = async {
         let head = ready_head(claim)?;
         let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
         let lock = repo_lock(state, &claim.repo).await;
-        upkeep_mirror(&claim.repo, &mirror_dir, &lock).await;
+        upkeep_mirror(&claim.repo, &mirror_dir, &lock, &mut phases).await;
+        let start = Instant::now();
         let _reading = lock.read.read().await;
+        phases.record("lock_wait", start);
+        let start = Instant::now();
         ensure_commit(state, &claim.repo, &claim.build.commit, &mirror_dir, &lock).await?;
+        phases.record("fetch", start);
         // Full builds on the history levels of its base. A repo's Fulls are
         // claimed in admission order, so an earlier push's Full has settled.
+        let start = Instant::now();
         let levels = ancestor_base(state, claim, ExactResultKind::Full, &mirror_dir)
             .await?
             .as_ref()
             .and_then(|row| row.full.ready())
             .map(|full| full.history_levels.clone())
             .unwrap_or_default();
+        phases.record("base", start);
         Cancel::check_current()?;
         build_full_result(
             &state.cas,
@@ -655,12 +675,15 @@ async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim
             &head,
             levels,
             &state.storage,
-            write_bitmap_before_cold(&mirror_dir, &lock),
+            write_bitmap_before_cold(&mirror_dir),
+            &mut phases,
         )
         .await
         .map(Output::Full)
     }
     .await;
+    let ready = built.is_ok();
+    phases.report("full", &claim.repo, &claim.build.commit, ready, started);
     settle(state, settings, claim, ExactResultKind::Full, built).await;
 }
 
@@ -679,7 +702,12 @@ fn ready_head(claim: &Claim) -> Result<crate::HeadResult> {
 /// Both need the write lock and are skipped while another build holds it.
 /// Compaction deletes packs, so it also needs the mirror to itself and is
 /// skipped while any build reads it; a later Full tries again.
-async fn upkeep_mirror(repo_id: &RepoId, mirror_dir: &std::path::Path, lock: &RepoLock) {
+async fn upkeep_mirror(
+    repo_id: &RepoId,
+    mirror_dir: &std::path::Path,
+    lock: &RepoLock,
+    phases: &mut BuildPhases,
+) {
     let target = repo_id.storage_key();
     let Ok(_writing) = lock.write.try_lock() else {
         return;
@@ -688,11 +716,13 @@ async fn upkeep_mirror(repo_id: &RepoId, mirror_dir: &std::path::Path, lock: &Re
         return;
     }
     let dir = mirror_dir.to_path_buf();
+    let start = Instant::now();
     match cancel::spawn_blocking(move || git::write_commit_graph(&dir, UPKEEP_TIMEOUT)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("commit-graph for {target} failed: {error:#}"),
         Err(error) => warn!("commit-graph task for {target} failed: {error}"),
     }
+    phases.record("commit_graph", start);
     let backing_off = lock
         .compact_failed
         .lock()
@@ -705,10 +735,12 @@ async fn upkeep_mirror(repo_id: &RepoId, mirror_dir: &std::path::Path, lock: &Re
         return;
     };
     let dir = mirror_dir.to_path_buf();
+    let start = Instant::now();
     let compacted = cancel::spawn_blocking(move || git::compact_mirror(&dir, UPKEEP_TIMEOUT))
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
+    phases.record("mirror_compact", start);
     match compacted {
         Ok(done) if done != git::MirrorCompaction::default() => {
             info!("compacted mirror of {target}: {done:?}");
@@ -725,10 +757,21 @@ async fn upkeep_mirror(repo_id: &RepoId, mirror_dir: &std::path::Path, lock: &Re
 }
 
 /// Run by a Full right before a cold history build: write the mirror's
-/// reachability bitmap, which the cold build walks history with, under the
-/// write lock. Best-effort: without it the cold build is slower.
-async fn write_bitmap_before_cold(mirror_dir: &std::path::Path, lock: &RepoLock) {
-    let _writing = lock.write.lock().await;
+/// reachability bitmap, which the cold build walks history with.
+/// Best-effort: without it the cold build is slower.
+///
+/// It runs under the Full's shared read lock only, not the write lock, so a
+/// new push's fetch proceeds during it. A fetch only adds a pack, and
+/// `multi-pack-index write` covers the packs it found when it started: a
+/// commit in those packs reaches only objects in them, so the bitmap stays
+/// closed, and a pack added later is outside the bitmap, where git finds its
+/// objects without one. The new index and bitmap are written under git's own
+/// lock file and renamed into place. Compaction, the only step that deletes
+/// packs or also writes the multi-pack-index, needs the read lock
+/// exclusively, so it never runs alongside. A repo's Fulls run one at a time,
+/// so two bitmap writes of one mirror never overlap; if one did, the second
+/// would fail on git's lock file and the cold build would walk without it.
+async fn write_bitmap_before_cold(mirror_dir: &std::path::Path) {
     let dir = mirror_dir.to_path_buf();
     match cancel::spawn_blocking(move || git::write_bitmap(&dir, BITMAP_TIMEOUT)).await {
         Ok(Ok(())) => {}
