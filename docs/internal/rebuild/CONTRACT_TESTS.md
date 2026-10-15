@@ -76,10 +76,10 @@ after the row (`a1_...`, `s3_c2_...`).
 | C1 | `files_slots = 0` and `full_slots = 0`: depth-1 clone of B succeeds while Full and Files stay pending (API status shows it). | #203 |
 | C2 | Head ready, then restart with the storage proxy failing PUTs and background builds on: Full and Files fail, Head stays cloneable, status shows `failed` per output. | #203 (S3 job) |
 | C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | #203 (S3 job) |
-| C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. Then SIGKILL as soon as a push's first artifact is in the store: every stored object hashes to its name, and after a restart the push builds and its full and Files clones are exact. | #202, perf/storage-path |
+| C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. Then SIGKILL as soon as a push's first artifact is in the store: every stored object hashes to its name, and after a restart the push builds and its full and Files clones are exact. | #202, #220 |
 | C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). Over the three builds, every server log line is the server's own: no git output. | #202 |
 | C7 | S3 only: the bucket holds Full(B)'s first write while push C arrives. Head(C) and Files(C) become ready while Full(B) is still pending; after release, Full(B) publishes before Full(C). | Hetzner benchmark |
-| C8 | S3 only: the bucket holds one of Head's writes and refuses the next. Head fails with the storage error and publishes nothing; a depth-1 clone fails and leaves no target. With the fault gone, `sync --at` builds every output and each shape clones exactly. | perf/storage-path (S3 job) |
+| C8 | S3 only: the bucket holds one of Head's writes and refuses the next. Head fails with the storage error and publishes nothing; a depth-1 clone fails and leaves no target. With the fault gone, `sync --at` builds every output and each shape clones exactly. | #220 (S3 job) |
 
 A SIGKILLed server's `git` children run until their command ends, on every
 OS. #209 killed them on Linux with a parent-death signal (row C6), but
@@ -154,7 +154,7 @@ Ripclone token reaches the origin.
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | #208 |
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | #209 |
 | H9 | Build scratch goes under `<cache>/tmp`, which startup empties: with a read-only `TMPDIR`, a stale scratch entry is removed and a full build and clone succeed. | #211 |
-| H10 | S3 emulator: after a one-line push, no object of 1 MiB or more that the bucket already holds is uploaded again (the bucket proxy sees a HEAD and no PUT); only small objects are rewritten. A bucket copy cut short is uploaded again when a second repository with the same files makes it; that repository's clones and B's Files clone are exact. | perf/storage-path (S3 job) |
+| H10 | S3 emulator: after a one-line push, no object of 1 MiB or more that the bucket already holds is uploaded again (the bucket proxy sees a HEAD and no PUT); only small objects are rewritten. A bucket copy cut short is uploaded again when a second repository with the same files makes it; that repository's clones and B's Files clone are exact. | #220 (S3 job) |
 
 ### I. Auth, integrations, CLI (12)
 
