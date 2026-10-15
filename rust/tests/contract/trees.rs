@@ -40,8 +40,15 @@ fn commit_entries(origin: &Origin, entries: &[Entry], msg: &str) -> String {
     origin.head()
 }
 
+/// Wait for all three outputs of `commit`. A build error fails at once with
+/// the server's message, not after the wait runs out.
 fn wait_ready(server: &Server, repo: &str, commit: &str) {
     wait_for(&format!("every output of {commit} ready"), || {
+        let (_, body) = api::read_commit(server, repo, commit, None);
+        for kind in ["head", "files", "full"] {
+            let error = &body[kind]["error"];
+            assert!(error.is_null(), "{kind} of {commit}: {error}");
+        }
         (output_states(server, repo, commit) == ["ready"; 3]).then_some(())
     });
 }
