@@ -3,14 +3,15 @@ use crate::clonepack::{FileEntry, Fragment, FrameInfo};
 use crate::manifest::MetadataChunk;
 use anyhow::{Context, Result};
 use fastcdc::v2020::StreamCDC;
+use rayon::prelude::*;
 use sha1::{Digest, Sha1};
-use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::mpsc;
 
-/// Default compressed size cap for a single archive chunk.
+/// Default compressed size of an archive download bundle.
 pub const DEFAULT_ARCHIVE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Content-defined chunking bounds for the worktree stream (fastcdc v2020).
@@ -33,12 +34,21 @@ const CDC: CdcBounds = CdcBounds {
     max: 16 * 1024 * 1024,
 };
 
-/// How many raw frame bytes to buffer before compressing a batch in parallel.
-/// The worktree is streamed through the chunker one frame at a time, so peak
-/// memory is bounded to roughly this batch plus the largest single blob —
-/// instead of the whole worktree at once — while still handing rayon enough
-/// frames per batch to keep every core busy.
-const STREAM_BATCH_BYTES: usize = 64 * 1024 * 1024;
+/// Raw frame bytes the chunker hands the compressor at once. One batch is
+/// compressed while the next is cut and the reader loads ahead, so peak
+/// memory is a few batches and windows, never the whole worktree.
+const STREAM_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// Raw blob bytes the reader loads per window, several blobs at a time.
+const READ_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+
+/// Changed bytes an incremental build reads into memory at once. Gaps are
+/// read, cut and compressed in batches of about this size; a single larger
+/// gap makes the build stream the whole worktree instead.
+const MAX_GAP_BYTES: usize = 128 * 1024 * 1024;
+
+/// A blob in tree order: raw path, object id, git mode.
+type Blob = (Vec<u8>, gix::hash::ObjectId, u32);
 
 /// Compress one CDC frame with zstd. Empty frames stay empty. Frames are
 /// independent, so this is the unit of both parallel compression and
@@ -53,8 +63,8 @@ fn compress_frame(raw: &[u8], level: i32) -> Result<Vec<u8>> {
 /// Cut `stream` into content-defined frames; returns each frame's `(start, end)`
 /// byte range. An empty stream yields a single empty frame so empty-file
 /// fragments always have a frame to point at. Production code streams the tree
-/// through [`StreamCDC`] instead (see [`ArchiveBuilder::stream_cdc`]); this
-/// slice-based form is kept as the reference the tests check streaming against.
+/// through [`StreamCDC`] instead; this slice-based form is the reference the
+/// tests check streaming against.
 #[cfg(test)]
 fn cdc_frame_bounds(stream: &[u8]) -> Vec<(usize, usize)> {
     if stream.is_empty() {
@@ -126,21 +136,505 @@ pub struct ArchiveStats {
     pub compressed_bytes: u64,
 }
 
-pub struct ArchiveBuildOutput {
-    pub download_bundle_hashes: Vec<String>,
-    pub metadata: MetadataChunk,
-    pub new_reuse_frame_hashes: Vec<String>,
-    pub archive_frames: Vec<crate::ArchiveFrame>,
+/// A ready Files build of an ancestor, which a new build takes unchanged
+/// frames and download bundles from.
+pub struct ArchiveBase<'a> {
+    /// The base's frames, in stream order.
+    pub frames: &'a [crate::ArchiveFrame],
+    /// The base's metadata: its files with fragments, and its frames placed
+    /// in download bundles.
+    pub metadata: &'a MetadataChunk,
+    /// The base's download bundles. They are durable in storage.
+    pub bundles: &'a [String],
 }
 
-/// Per-frame result of the streaming incremental archive build. The compressed
-/// bytes are already in CAS (`chunk_hash`); only this small metadata is retained
-/// across the whole worktree so peak memory stays bounded to one batch.
-struct FrameChunk {
+/// What a build reused and what it made, for the build log.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArchiveReuse {
+    /// Whether the build read only the changed bytes.
+    pub incremental: bool,
+    /// Blob bytes read from the mirror.
+    pub bytes_read: u64,
+    pub frames_built: usize,
+    pub frames_reused: usize,
+    pub bundles_built: usize,
+    pub bundles_reused: usize,
+}
+
+pub struct ArchiveBuildOutput {
+    /// Every download bundle, in frame order.
+    pub download_bundle_hashes: Vec<String>,
+    /// Bundles this build wrote. The others are the base's, already durable.
+    pub new_bundle_hashes: Vec<String>,
+    pub metadata: MetadataChunk,
+    pub archive_frames: Vec<crate::ArchiveFrame>,
+    pub reuse: ArchiveReuse,
+}
+
+/// One frame ready for a bundle: its compressed bytes when this build made
+/// them, or the base frame that holds the same bytes.
+struct BuiltFrame {
     raw_hash: String,
+    raw_len: u64,
     chunk_hash: String,
     compressed_len: u64,
-    is_new: bool,
+    bytes: Option<Vec<u8>>,
+    base_frame: Option<usize>,
+}
+
+/// Hash a raw frame and take the base's compressed frame when one holds the
+/// same bytes; otherwise compress it.
+fn build_frame(raw: &[u8], level: i32, base: Option<&BaseIndex>) -> Result<BuiltFrame> {
+    let raw_hash = crate::cas::hash(raw);
+    if let Some(base) = base
+        && let Some(&k) = base.by_raw.get(raw_hash.as_str())
+    {
+        let frame = &base.frames[k];
+        return Ok(BuiltFrame {
+            raw_hash,
+            raw_len: raw.len() as u64,
+            chunk_hash: frame.chunk_hash.clone(),
+            compressed_len: frame.compressed_len,
+            bytes: None,
+            base_frame: Some(k),
+        });
+    }
+    let bytes = compress_frame(raw, level)?;
+    Ok(BuiltFrame {
+        raw_hash,
+        raw_len: raw.len() as u64,
+        chunk_hash: crate::cas::hash(&bytes),
+        compressed_len: bytes.len() as u64,
+        bytes: Some(bytes),
+        base_frame: None,
+    })
+}
+
+/// A base build, indexed for reuse.
+struct BaseIndex<'a> {
+    frames: &'a [crate::ArchiveFrame],
+    /// Each base frame's start in the base stream; one extra entry holds the
+    /// stream's length.
+    starts: Vec<usize>,
+    /// Each base frame's bundle and offset in it.
+    places: Vec<(&'a str, u64)>,
+    /// Base frame by the hash of its raw bytes.
+    by_raw: HashMap<&'a str, usize>,
+    /// Base bundle by the chunk hashes of its frames, in order.
+    bundles: HashMap<String, &'a str>,
+    /// Base file by path: content SHA-1, start in the base stream, length.
+    files: HashMap<&'a [u8], (&'a [u8], usize, usize)>,
+}
+
+impl<'a> BaseIndex<'a> {
+    fn new(base: &ArchiveBase<'a>) -> Result<Self> {
+        let infos = &base.metadata.frames;
+        anyhow::ensure!(
+            infos.len() == base.frames.len(),
+            "base has {} frames but its metadata places {}",
+            base.frames.len(),
+            infos.len()
+        );
+        let mut starts = Vec::with_capacity(infos.len() + 1);
+        let mut places = Vec::with_capacity(infos.len());
+        let mut by_raw = HashMap::with_capacity(infos.len());
+        let mut bundles: HashMap<String, &'a str> = HashMap::new();
+        let mut key = String::new();
+        let mut pos = 0usize;
+        for (k, (frame, info)) in base.frames.iter().zip(infos).enumerate() {
+            anyhow::ensure!(
+                frame.compressed_len == u64::from(info.compressed_len)
+                    && frame.raw_len == u64::from(info.raw_len),
+                "base frame {k} does not match its metadata"
+            );
+            let bundle = base
+                .bundles
+                .get(info.chunk_index as usize)
+                .with_context(|| format!("base frame {k} names a missing bundle"))?;
+            starts.push(pos);
+            pos = pos
+                .checked_add(usize::try_from(frame.raw_len)?)
+                .context("base stream length overflow")?;
+            places.push((bundle.as_str(), info.chunk_offset));
+            by_raw.insert(frame.raw_hash.as_str(), k);
+            key.push_str(&frame.chunk_hash);
+            let last_in_bundle = infos
+                .get(k + 1)
+                .is_none_or(|next| next.chunk_index != info.chunk_index);
+            if last_in_bundle {
+                bundles.insert(std::mem::take(&mut key), bundle.as_str());
+            }
+        }
+        starts.push(pos);
+        let mut files = HashMap::with_capacity(base.metadata.files.len());
+        let mut file_pos = 0usize;
+        for file in &base.metadata.files {
+            let len = file.fragments.iter().try_fold(0usize, |total, fragment| {
+                total.checked_add(fragment.raw_len as usize)
+            });
+            let len = len.context("base file length overflow")?;
+            files.insert(
+                file.path.as_slice(),
+                (file.blob_sha1.as_slice(), file_pos, len),
+            );
+            file_pos = file_pos
+                .checked_add(len)
+                .context("base file offset overflow")?;
+        }
+        anyhow::ensure!(
+            file_pos == pos,
+            "base files cover {file_pos} bytes but its frames cover {pos}"
+        );
+        Ok(Self {
+            frames: base.frames,
+            starts,
+            places,
+            by_raw,
+            bundles,
+            files,
+        })
+    }
+
+    /// The compressed bytes of base frame `k`, from the local copy of its
+    /// bundle or from storage, checked against the frame's hash.
+    fn read_frame(
+        &self,
+        cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
+        k: usize,
+    ) -> Result<Vec<u8>> {
+        let frame = &self.frames[k];
+        let (bundle, offset) = self.places[k];
+        let matches = |data: &[u8]| {
+            data.len() as u64 == frame.compressed_len && crate::cas::hash(data) == frame.chunk_hash
+        };
+        if let Ok(data) = cas.get_range(bundle, offset, frame.compressed_len)
+            && matches(&data)
+        {
+            return Ok(data);
+        }
+        let Some(storage) = storage else {
+            anyhow::bail!(
+                "archive frame {} is not in the local copy of bundle {bundle}",
+                frame.chunk_hash
+            );
+        };
+        let data = storage
+            .get_range(bundle, offset, frame.compressed_len)
+            .with_context(|| {
+                format!(
+                    "read archive frame {} from bundle {bundle}",
+                    frame.chunk_hash
+                )
+            })?;
+        anyhow::ensure!(
+            matches(&data),
+            "archive frame {} from bundle {bundle}: hash mismatch",
+            frame.chunk_hash
+        );
+        Ok(data)
+    }
+}
+
+/// Groups frames into download bundles, in order. A bundle ends after a
+/// frame whose hash passes a fixed test once the bundle holds half the
+/// target, or at twice the target. The cuts depend on the frames, not on
+/// where the stream starts, so after an edit the bundles away from it come
+/// out the same as the base's and are reused whole: no bytes written, none
+/// uploaded.
+struct Bundler<'a> {
+    cas: &'a Cas,
+    storage: Option<&'a crate::storage::StorageRef>,
+    base: Option<&'a BaseIndex<'a>>,
+    min: u64,
+    max: u64,
+    group: Vec<BuiltFrame>,
+    group_len: u64,
+    bundles: Vec<String>,
+    new_bundles: Vec<String>,
+    infos: Vec<FrameInfo>,
+    frames: Vec<crate::ArchiveFrame>,
+    reuse: ArchiveReuse,
+}
+
+impl<'a> Bundler<'a> {
+    fn new(
+        cas: &'a Cas,
+        storage: Option<&'a crate::storage::StorageRef>,
+        base: Option<&'a BaseIndex<'a>>,
+        target: u64,
+    ) -> Self {
+        let target = target.max(2);
+        Self {
+            cas,
+            storage,
+            base,
+            min: target / 2,
+            max: target.saturating_mul(2),
+            group: Vec::new(),
+            group_len: 0,
+            bundles: Vec::new(),
+            new_bundles: Vec::new(),
+            infos: Vec::new(),
+            frames: Vec::new(),
+            reuse: ArchiveReuse::default(),
+        }
+    }
+
+    fn push(&mut self, frame: BuiltFrame) -> Result<()> {
+        if !self.group.is_empty() && self.group_len + frame.compressed_len > self.max {
+            self.close()?;
+        }
+        self.group_len += frame.compressed_len;
+        let cut = self.group_len >= self.max
+            || (self.group_len >= self.min && cuts_after(&frame.chunk_hash));
+        self.group.push(frame);
+        if cut {
+            self.close()?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if self.group.is_empty() {
+            return Ok(());
+        }
+        let index = u32::try_from(self.bundles.len()).context("too many archive bundles")?;
+        let key: String = self.group.iter().map(|f| f.chunk_hash.as_str()).collect();
+        let hash = match self.base.and_then(|base| base.bundles.get(&key)) {
+            Some(hash) => {
+                self.reuse.bundles_reused += 1;
+                hash.to_string()
+            }
+            None => {
+                let hash = self.write_group()?;
+                self.reuse.bundles_built += 1;
+                self.new_bundles.push(hash.clone());
+                hash
+            }
+        };
+        let mut offset = 0u64;
+        for frame in self.group.drain(..) {
+            if frame.bytes.is_some() {
+                self.reuse.frames_built += 1;
+            } else {
+                self.reuse.frames_reused += 1;
+            }
+            self.infos.push(FrameInfo {
+                chunk_index: index,
+                chunk_offset: offset,
+                compressed_len: u32::try_from(frame.compressed_len)
+                    .context("compressed archive frame exceeds manifest limit")?,
+                raw_len: u32::try_from(frame.raw_len)
+                    .context("raw archive frame exceeds manifest limit")?,
+            });
+            offset += frame.compressed_len;
+            self.frames.push(crate::ArchiveFrame {
+                raw_hash: frame.raw_hash,
+                chunk_hash: frame.chunk_hash,
+                compressed_len: frame.compressed_len,
+                raw_len: frame.raw_len,
+            });
+        }
+        self.bundles.push(hash);
+        self.group_len = 0;
+        Ok(())
+    }
+
+    /// Write the open group as a new bundle. Frames this build did not make
+    /// are read from the base's bundles, several at once.
+    fn write_group(&self) -> Result<String> {
+        let (cas, storage, base) = (self.cas, self.storage, self.base);
+        let fetched = self
+            .group
+            .par_iter()
+            .map(|frame| match (&frame.bytes, frame.base_frame, base) {
+                (Some(_), _, _) => Ok(None),
+                (None, Some(k), Some(base)) => base.read_frame(cas, storage, k).map(Some),
+                _ => anyhow::bail!("archive frame {} has no bytes", frame.chunk_hash),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut writer = self.cas.writer().context("create archive bundle")?;
+        for (frame, fetched) in self.group.iter().zip(&fetched) {
+            let bytes = frame
+                .bytes
+                .as_deref()
+                .or(fetched.as_deref())
+                .unwrap_or_default();
+            writer.write_all(bytes).context("write archive bundle")?;
+        }
+        let (hash, len) = writer.finish().context("install archive bundle")?;
+        anyhow::ensure!(
+            len == self.group_len,
+            "archive bundle length {len} != frames {}",
+            self.group_len
+        );
+        Ok(hash)
+    }
+
+    fn finish(
+        mut self,
+    ) -> Result<(
+        Vec<String>,
+        Vec<String>,
+        Vec<FrameInfo>,
+        Vec<crate::ArchiveFrame>,
+        ArchiveReuse,
+    )> {
+        self.close()?;
+        Ok((
+            self.bundles,
+            self.new_bundles,
+            self.infos,
+            self.frames,
+            self.reuse,
+        ))
+    }
+}
+
+/// Whether a bundle may end after the frame with this hash: about half do.
+fn cuts_after(chunk_hash: &str) -> bool {
+    chunk_hash.as_bytes().last().is_some_and(|b| b % 2 == 0)
+}
+
+/// The bytes of one blob to read: the whole blob, or a range of it.
+struct Piece {
+    oid: gix::hash::ObjectId,
+    size: usize,
+    lo: usize,
+    hi: usize,
+    sha1: bool,
+}
+
+/// Read pieces of blobs on several threads. Each blob must have the size the
+/// caller planned with. With `sha1`, a piece also returns its whole blob's
+/// SHA-1. Results keep the input order.
+#[allow(clippy::type_complexity)]
+fn read_pieces(mirror: &Path, pieces: Vec<Piece>) -> Result<Vec<(Vec<u8>, Option<[u8; 20]>)>> {
+    let workers = crate::gix_util::default_worker_threads();
+    crate::gix_util::parallel_map_repo(mirror, pieces, workers, |repo, piece| {
+        let mut blob = repo
+            .find_blob(piece.oid)
+            .with_context(|| format!("read blob {}", piece.oid))?;
+        anyhow::ensure!(
+            blob.data.len() == piece.size,
+            "blob {} has {} bytes, expected {}",
+            piece.oid,
+            blob.data.len(),
+            piece.size
+        );
+        let sha1 = piece.sha1.then(|| sha1_bytes(&blob.data));
+        let data = if piece.lo == 0 && piece.hi == blob.data.len() {
+            std::mem::take(&mut blob.data)
+        } else {
+            blob.data[piece.lo..piece.hi].to_vec()
+        };
+        Ok((data, sha1))
+    })
+}
+
+/// Sizes of blobs from their object headers, on several threads.
+fn blob_sizes(mirror: &Path, oids: Vec<gix::hash::ObjectId>) -> Result<Vec<usize>> {
+    let workers = crate::gix_util::default_worker_threads();
+    crate::gix_util::parallel_map_repo(mirror, oids, workers, |repo, oid| {
+        let size = repo
+            .find_header(*oid)
+            .with_context(|| format!("find header {oid}"))?
+            .size();
+        usize::try_from(size).context("blob size exceeds usize")
+    })
+}
+
+/// A [`Read`] over windows of blob bytes that a reader thread sends in order.
+struct WindowReader {
+    rx: mpsc::Receiver<Vec<Vec<u8>>>,
+    parts: VecDeque<Vec<u8>>,
+    pos: usize,
+}
+
+impl Read for WindowReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(part) = self.parts.front() {
+                if self.pos < part.len() {
+                    let n = (part.len() - self.pos).min(buf.len());
+                    buf[..n].copy_from_slice(&part[self.pos..self.pos + n]);
+                    self.pos += n;
+                    return Ok(n);
+                }
+                self.parts.pop_front();
+                self.pos = 0;
+                continue;
+            }
+            match self.rx.recv() {
+                Ok(window) => self.parts = window.into(),
+                Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
+/// The worktree's files in tree order, with their sizes and stream offsets.
+struct Layout {
+    blobs: Vec<Blob>,
+    gitlinks: Vec<Vec<u8>>,
+    sizes: Vec<usize>,
+    starts: Vec<usize>,
+    total: usize,
+}
+
+impl Layout {
+    fn new(blobs: Vec<Blob>, gitlinks: Vec<Vec<u8>>, sizes: Vec<usize>) -> Result<Self> {
+        let mut starts = Vec::with_capacity(sizes.len());
+        let mut total = 0usize;
+        for size in &sizes {
+            starts.push(total);
+            total = total
+                .checked_add(*size)
+                .context("archive stream length overflow")?;
+        }
+        Ok(Self {
+            blobs,
+            gitlinks,
+            sizes,
+            starts,
+            total,
+        })
+    }
+
+    /// The metadata's files table: each file's fragments over `bounds`.
+    fn files_table(&self, sha1s: &[&[u8]], bounds: &[(usize, usize)]) -> Result<MetadataChunk> {
+        let mut manifest = MetadataChunk::new();
+        manifest.gitlinks = self.gitlinks.clone();
+        let mut hint = 0usize;
+        for (idx, (path, _, mode)) in self.blobs.iter().enumerate() {
+            let (fragments, next) = fragments_for(bounds, self.starts[idx], self.sizes[idx], hint)?;
+            hint = next;
+            manifest.files.push(FileEntry {
+                path: path.clone(),
+                mode: *mode,
+                blob_sha1: sha1s[idx].to_vec(),
+                fragments,
+            });
+        }
+        Ok(manifest)
+    }
+}
+
+/// Head's files table, when it lists exactly this tree's files in order.
+fn head_hashes<'h>(head: &'h MetadataChunk, blobs: &[Blob]) -> Option<Vec<&'h [u8]>> {
+    let aligned = head.files.len() == blobs.len()
+        && head.files.iter().zip(blobs).all(|(f, (path, _, mode))| {
+            f.path == *path && f.mode == *mode && f.blob_sha1.len() == 20
+        });
+    aligned.then(|| head.files.iter().map(|f| f.blob_sha1.as_slice()).collect())
+}
+
+/// An incremental build's plan: base frames to keep, as `(new_start,
+/// new_end, base frame)`, and the byte ranges between them to read again.
+struct Plan {
+    reused: Vec<(usize, usize, usize)>,
+    gaps: Vec<(usize, usize)>,
 }
 
 pub struct ArchiveBuilder {
@@ -161,6 +655,34 @@ impl ArchiveBuilder {
     #[cfg(test)]
     fn with_cdc(self, cdc: CdcBounds) -> Self {
         Self { cdc, ..self }
+    }
+
+    fn open_tree(&self, commit: &str) -> Result<(gix::Repository, gix::hash::ObjectId)> {
+        if !self.mirror.exists() {
+            anyhow::bail!("mirror not found: {}", self.mirror.display());
+        }
+        let repo = crate::gix_util::open_repo(&self.mirror)
+            .with_context(|| format!("open repo {}", self.mirror.display()))?;
+        let id = repo
+            .rev_parse_single(commit)
+            .with_context(|| format!("resolve commit {}", commit))?;
+        let tree_id = repo
+            .find_commit(id)
+            .with_context(|| format!("find commit {}", id))?
+            .tree_id()
+            .with_context(|| format!("read tree for commit {}", id))?
+            .detach();
+        Ok((repo, tree_id))
+    }
+
+    /// Walk the tree and size every blob from its header.
+    fn layout(&self, commit: &str) -> Result<Layout> {
+        let (repo, tree_id) = self.open_tree(commit)?;
+        let mut blobs = Vec::new();
+        let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
+            .context("walk git tree for archive")?;
+        let sizes = blob_sizes(&self.mirror, blobs.iter().map(|b| b.1).collect())?;
+        Layout::new(blobs, gitlinks, sizes)
     }
 
     /// Build a working-tree archive and its manifest for `commit`.
@@ -195,7 +717,7 @@ impl ArchiveBuilder {
         Ok(stats)
     }
 
-    /// Build the working tree into content-addressed archive chunks.
+    /// Build the working tree into archive chunks held in memory.
     ///
     /// Returns the metadata chunk (containing the frame and file tables) and a
     /// vector of raw archive chunk byte vectors. `target_chunk_size` caps the
@@ -208,34 +730,19 @@ impl ArchiveBuilder {
         target_chunk_size: u64,
     ) -> Result<(MetadataChunk, Vec<Vec<u8>>, ArchiveStats)> {
         let target_chunk_size = target_chunk_size.max(1);
-        if !self.mirror.exists() {
-            anyhow::bail!("mirror not found: {}", self.mirror.display());
-        }
-
-        let repo = crate::gix_util::open_repo(&self.mirror)
-            .with_context(|| format!("open repo {}", self.mirror.display()))?;
-        let id = repo
-            .rev_parse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?;
-        let tree_id = repo
-            .find_commit(id)
-            .with_context(|| format!("find commit {}", id))?
-            .tree_id()
-            .with_context(|| format!("read tree for commit {}", id))?
-            .detach();
-
-        // Stream the path-ordered worktree through the chunker, compressing each
-        // batch of frames in parallel. The whole worktree is never held in
-        // memory — peak stays ~one batch + the largest blob. Frames are
-        // independent, so compression parallelizes cleanly within a batch.
-        let (mut manifest, bounds, raw_total, compressed_frames) =
-            self.stream_cdc(&repo, tree_id, |batch| {
-                use rayon::prelude::*;
-                batch
-                    .par_iter()
-                    .map(|&(_, raw)| compress_frame(raw, level))
-                    .collect::<Result<Vec<_>>>()
-            })?;
+        let layout = self.layout(commit)?;
+        let mut compressed_frames: Vec<Vec<u8>> = Vec::new();
+        let (bounds, sha1s) = self.stream_frames(&layout, true, level, None, |frame| {
+            compressed_frames.push(frame.bytes.unwrap_or_default());
+            Ok(())
+        })?;
+        let sha1s: Vec<&[u8]> = sha1s.iter().map(|h| h.as_slice()).collect();
+        let mut manifest = if layout.blobs.is_empty() {
+            MetadataChunk::new()
+        } else {
+            layout.files_table(&sha1s, &bounds)?
+        };
+        manifest.gitlinks = layout.gitlinks.clone();
 
         // Assemble compressed frames into chunks of ~target_chunk_size, recording
         // each frame's placement.
@@ -243,41 +750,24 @@ impl ArchiveBuilder {
         let mut current_chunk: Vec<u8> = Vec::new();
         let mut current_frame_count = 0usize;
         for (i, compressed) in compressed_frames.iter().enumerate() {
-            let would_exceed = if current_chunk.is_empty() {
-                false
-            } else {
-                let current_len =
-                    u64::try_from(current_chunk.len()).context("archive chunk is too large")?;
-                let compressed_len =
-                    u64::try_from(compressed.len()).context("compressed frame is too large")?;
-                current_len
-                    .checked_add(compressed_len)
-                    .context("archive chunk length overflow")?
-                    > target_chunk_size
-            };
+            let would_exceed = !current_chunk.is_empty()
+                && (current_chunk.len() as u64).saturating_add(compressed.len() as u64)
+                    > target_chunk_size;
             if would_exceed {
                 chunks.push(std::mem::take(&mut current_chunk));
                 current_frame_count = 0;
             }
             manifest.frames.push(FrameInfo {
                 chunk_index: u32::try_from(chunks.len()).context("archive has too many chunks")?,
-                chunk_offset: u64::try_from(current_chunk.len())
-                    .context("archive chunk is too large")?,
+                chunk_offset: current_chunk.len() as u64,
                 compressed_len: u32::try_from(compressed.len())
                     .context("compressed archive frame is too large")?,
-                raw_len: u32::try_from(
-                    bounds[i]
-                        .1
-                        .checked_sub(bounds[i].0)
-                        .context("archive frame bounds are inverted")?,
-                )
-                .context("raw archive frame is too large")?,
+                raw_len: u32::try_from(bounds[i].1 - bounds[i].0)
+                    .context("raw archive frame is too large")?,
             });
             current_chunk.extend_from_slice(compressed);
             current_frame_count += 1;
-            if u64::try_from(current_chunk.len()).context("archive chunk is too large")?
-                >= target_chunk_size
-            {
+            if current_chunk.len() as u64 >= target_chunk_size {
                 chunks.push(std::mem::take(&mut current_chunk));
                 current_frame_count = 0;
             }
@@ -286,130 +776,154 @@ impl ArchiveBuilder {
             chunks.push(current_chunk);
         }
 
-        let compressed_total = chunks.iter().try_fold(0u64, |total, chunk| {
-            total
-                .checked_add(u64::try_from(chunk.len()).context("archive chunk is too large")?)
-                .context("compressed archive byte total overflow")
-        })?;
+        let compressed_total = chunks.iter().map(|chunk| chunk.len() as u64).sum();
         let files = manifest.files.len();
         let frames = manifest.frames.len();
-
         Ok((
             manifest,
             chunks,
             ArchiveStats {
                 files,
                 frames,
-                raw_bytes: raw_total,
+                raw_bytes: layout.total as u64,
                 compressed_bytes: compressed_total,
             },
         ))
     }
 
-    /// Stream the path-ordered worktree through content-defined chunking without
-    /// ever materializing the whole worktree in memory.
+    /// Stream the whole worktree through content-defined chunking and hand
+    /// each frame, in order, to `consume`.
     ///
-    /// Blobs are served one at a time (peak memory is the largest single blob,
-    /// not the sum of all files) and cut into frames by [`StreamCDC`], which
-    /// produces byte-identical boundaries to the slice-based chunker for the same
-    /// content. Frames are handed to `process_batch` in batches bounded by
-    /// [`STREAM_BATCH_BYTES`], so the per-frame work (compression, hashing) can
-    /// run in parallel while peak memory stays ~one batch + one blob.
+    /// Three stages overlap: a reader thread loads windows of blobs, several
+    /// blobs at once; this thread cuts frames; a compressor thread compresses
+    /// each batch of frames on all cores and passes them to `consume`. Memory
+    /// stays a few windows and batches, never the whole worktree. With
+    /// `sha1`, the reader also hashes each blob for the files table.
     ///
-    /// Returns `(manifest_with_files, bounds, raw_total, outputs)` where
-    /// `bounds[i] = (start, end)` is frame i's byte range, the manifest has its
-    /// `files` (with fragments) populated but `frames` empty, and `outputs[i]` is
-    /// `process_batch`'s result for frame i (one per frame, in order).
+    /// Returns each frame's `(start, end)` and, with `sha1`, each blob's
+    /// SHA-1. A worktree of only empty files gets one empty frame.
     #[allow(clippy::type_complexity)]
-    fn stream_cdc<T, P>(
+    fn stream_frames<C>(
         &self,
-        repo: &gix::Repository,
-        tree_id: gix::hash::ObjectId,
-        mut process_batch: P,
-    ) -> Result<(MetadataChunk, Vec<(usize, usize)>, u64, Vec<T>)>
+        layout: &Layout,
+        sha1: bool,
+        level: i32,
+        base: Option<&BaseIndex>,
+        mut consume: C,
+    ) -> Result<(Vec<(usize, usize)>, Vec<[u8; 20]>)>
     where
-        P: FnMut(&[(usize, &[u8])]) -> Result<Vec<T>>,
+        C: FnMut(BuiltFrame) -> Result<()> + Send,
     {
-        // Enumerate blobs (raw paths, oids, modes) up front — cheap metadata, no
-        // content. Raw byte paths keep the file table byte-exact for non-UTF8
-        // names (matching the worktree the client extracts).
-        let mut blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
-        let gitlinks = collect_blobs_raw_gix(repo, tree_id, &mut blobs)
-            .context("walk git tree for archive")?;
+        let mirror = self.mirror.as_path();
+        let (bounds, sha1s) = std::thread::scope(|scope| -> Result<_> {
+            let (window_tx, window_rx) = mpsc::sync_channel::<Vec<Vec<u8>>>(2);
+            let reader = scope.spawn(move || -> Result<Vec<[u8; 20]>> {
+                let mut sha1s = Vec::new();
+                let mut i = 0usize;
+                while i < layout.blobs.len() {
+                    let mut j = i;
+                    let mut bytes = 0usize;
+                    while j < layout.blobs.len()
+                        && (j == i || bytes + layout.sizes[j] <= READ_WINDOW_BYTES)
+                    {
+                        bytes += layout.sizes[j];
+                        j += 1;
+                    }
+                    let pieces = (i..j)
+                        .map(|k| Piece {
+                            oid: layout.blobs[k].1,
+                            size: layout.sizes[k],
+                            lo: 0,
+                            hi: layout.sizes[k],
+                            sha1,
+                        })
+                        .collect();
+                    let mut window = Vec::with_capacity(j - i);
+                    for (data, hash) in read_pieces(mirror, pieces)? {
+                        window.push(data);
+                        sha1s.extend(hash);
+                    }
+                    if window_tx.send(window).is_err() {
+                        break;
+                    }
+                    i = j;
+                }
+                Ok(sha1s)
+            });
 
-        // The reader records each file's (path, mode, sha1) + byte range as it
-        // serves blob bytes; we recover that table after the stream is drained.
-        let rec: FileRec = Rc::new(RefCell::new(FileTable::default()));
-        let reader = TreeBlobReader::new(repo, blobs, rec.clone());
+            let (batch_tx, batch_rx) = mpsc::sync_channel::<Vec<Vec<u8>>>(1);
+            let consume = &mut consume;
+            let compressor = scope.spawn(move || -> Result<()> {
+                for batch in batch_rx {
+                    let built = batch
+                        .par_iter()
+                        .map(|raw| build_frame(raw, level, base))
+                        .collect::<Result<Vec<_>>>()?;
+                    for frame in built {
+                        consume(frame)?;
+                    }
+                }
+                Ok(())
+            });
 
-        let mut bounds: Vec<(usize, usize)> = Vec::new();
-        let mut outputs: Vec<T> = Vec::new();
-        let mut batch: Vec<(usize, Vec<u8>)> = Vec::new();
-        let mut batch_bytes = 0usize;
-
-        for chunk in StreamCDC::new(reader, self.cdc.min, self.cdc.avg, self.cdc.max) {
-            let chunk = chunk.map_err(|e| anyhow::anyhow!("content-defined chunking: {e}"))?;
-            let start = usize::try_from(chunk.offset)
-                .context("content-defined frame offset does not fit in usize")?;
-            let end = start
-                .checked_add(chunk.length)
-                .context("content-defined frame bounds overflow")?;
-            bounds.push((start, end));
-            batch_bytes = batch_bytes
-                .checked_add(chunk.data.len())
-                .context("archive compression batch size overflow")?;
-            batch.push((bounds.len() - 1, chunk.data));
-            if batch_bytes >= STREAM_BATCH_BYTES {
-                flush_batch(&mut batch, &mut outputs, &mut process_batch)?;
-                batch_bytes = 0;
+            let input = WindowReader {
+                rx: window_rx,
+                parts: VecDeque::new(),
+                pos: 0,
+            };
+            let mut bounds = Vec::new();
+            let mut batch = Vec::new();
+            let mut batch_bytes = 0usize;
+            let mut cut_error = None;
+            for chunk in StreamCDC::new(input, self.cdc.min, self.cdc.avg, self.cdc.max) {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        cut_error = Some(anyhow::anyhow!("content-defined chunking: {e}"));
+                        break;
+                    }
+                };
+                let start = usize::try_from(chunk.offset)?;
+                bounds.push((start, start + chunk.length));
+                batch_bytes += chunk.length;
+                batch.push(chunk.data);
+                if batch_bytes >= STREAM_BATCH_BYTES {
+                    if batch_tx.send(std::mem::take(&mut batch)).is_err() {
+                        break;
+                    }
+                    batch_bytes = 0;
+                }
             }
-        }
-        flush_batch(&mut batch, &mut outputs, &mut process_batch)?;
+            if cut_error.is_none() && !batch.is_empty() {
+                let _ = batch_tx.send(batch);
+            }
+            drop(batch_tx);
+            let compressed = compressor
+                .join()
+                .map_err(|_| anyhow::anyhow!("archive compressor panicked"))?;
+            let read = reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("archive reader panicked"))?;
+            compressed.context("compress archive frames")?;
+            let sha1s = read.context("read worktree blobs")?;
+            if let Some(e) = cut_error {
+                return Err(e);
+            }
+            Ok((bounds, sha1s))
+        })?;
 
-        // Propagate any blob-read error the reader hit (surfaced as io::Other).
-        let table = Rc::try_unwrap(rec)
-            .map_err(|_| anyhow::anyhow!("file table still referenced after stream"))?
-            .into_inner();
-        if let Some(err) = table.err {
-            return Err(err).context("build archive from tree");
-        }
-        let (mut files, ranges) = (table.files, table.ranges);
-        let raw_total = match ranges.last() {
-            Some(&(start, len)) => u64::try_from(
-                start
-                    .checked_add(len)
-                    .context("archive raw byte range overflow")?,
-            )
-            .context("archive raw byte total does not fit in u64")?,
-            None => 0,
-        };
-
-        // Empty worktree: synthesize one empty frame so empty-file fragments
-        // always have a frame to point at (matches the slice-based chunker).
-        if bounds.is_empty() && !files.is_empty() {
+        let streamed = bounds.last().map_or(0, |b| b.1);
+        anyhow::ensure!(
+            streamed == layout.total,
+            "archive stream has {streamed} bytes, expected {}",
+            layout.total
+        );
+        let mut bounds = bounds;
+        if bounds.is_empty() && !layout.blobs.is_empty() {
             bounds.push((0, 0));
-            let res = process_batch(&[(0, &[][..])])?;
-            anyhow::ensure!(
-                res.len() == 1,
-                "process_batch returned {} outputs for the empty frame",
-                res.len()
-            );
-            outputs.extend(res);
+            consume(build_frame(&[], level, base)?)?;
         }
-
-        // Map each file's byte range to fragments (two-pointer; files and frames
-        // are both in increasing stream order).
-        let mut hint = 0usize;
-        for (i, &(start, len)) in ranges.iter().enumerate() {
-            let (frags, new_hint) = fragments_for(&bounds, start, len, hint)?;
-            hint = new_hint;
-            files[i].fragments = frags;
-        }
-
-        let mut manifest = MetadataChunk::new();
-        manifest.files = files;
-        manifest.gitlinks = gitlinks;
-        Ok((manifest, bounds, raw_total, outputs))
+        Ok((bounds, sha1s))
     }
 
     /// Convenience: build from a repo string "owner/repo" by locating the bare
@@ -431,26 +945,11 @@ impl ArchiveBuilder {
     /// Build only the metadata *files table* (path, mode, blob sha1) — no zstd
     /// frames. Editable clones materialize the worktree from the HEAD-closure
     /// packs, not the archive, so they only need this table; the expensive frame
-    /// compression ([`build_chunks`]) is only needed for files mode. This still
-    /// reads each blob (to hash it) but skips compression, so it is much cheaper
-    /// — letting Head publish without waiting on Files.
-    /// `frames` is left empty.
+    /// compression is only needed for files mode. This still reads each blob (to
+    /// hash it) but skips compression, so it is much cheaper — letting Head
+    /// publish without waiting on Files. `frames` is left empty.
     pub fn build_files_table(&self, commit: &str) -> Result<MetadataChunk> {
-        if !self.mirror.exists() {
-            anyhow::bail!("mirror not found: {}", self.mirror.display());
-        }
-        let repo = crate::gix_util::open_repo(&self.mirror)
-            .with_context(|| format!("open repo {}", self.mirror.display()))?;
-        let id = repo
-            .rev_parse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?;
-        let tree_id = repo
-            .find_commit(id)
-            .with_context(|| format!("find commit {}", id))?
-            .tree_id()
-            .with_context(|| format!("read tree for commit {}", id))?
-            .detach();
-
+        let (repo, tree_id) = self.open_tree(commit)?;
         let mut blobs = Vec::new();
         let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
             .context("collect blobs for files table")?;
@@ -490,31 +989,17 @@ impl ArchiveBuilder {
         prev_files: &[FileEntry],
         changed: &std::collections::HashSet<Vec<u8>>,
     ) -> Result<MetadataChunk> {
-        if !self.mirror.exists() {
-            anyhow::bail!("mirror not found: {}", self.mirror.display());
-        }
         // Prior path -> content hash. Mode is always taken from the current tree
         // walk (so a mode-only change is picked up even if we reuse the hash).
-        let prev: std::collections::HashMap<&[u8], &[u8]> = prev_files
+        let prev: HashMap<&[u8], &[u8]> = prev_files
             .iter()
             .map(|f| (f.path.as_slice(), f.blob_sha1.as_slice()))
             .collect();
-
-        let repo = crate::gix_util::open_repo(&self.mirror)
-            .with_context(|| format!("open repo {}", self.mirror.display()))?;
-        let id = repo
-            .rev_parse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?;
-        let tree_id = repo
-            .find_commit(id)
-            .with_context(|| format!("find commit {}", id))?
-            .tree_id()
-            .with_context(|| format!("read tree for commit {}", id))?
-            .detach();
+        let (repo, tree_id) = self.open_tree(commit)?;
 
         // Paths are built from raw bytes at every level so they match
         // `git diff -z` and the `changed` set exactly.
-        let mut blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
+        let mut blobs: Vec<Blob> = Vec::new();
         let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
             .context("walk git tree for incremental files table")?;
 
@@ -545,829 +1030,342 @@ impl ArchiveBuilder {
         Ok(manifest)
     }
 
-    /// Build the archive with per-frame incremental reuse: one content-addressed
-    /// compressed chunk per CDC frame. A frame whose raw bytes are unchanged
-    /// (found in `prev` by raw-bytes hash) reuses the prior compressed chunk —
-    /// no recompression, no re-upload. Returns `(all_chunk_hashes, metadata,
-    /// new_chunk_hashes, frames)`: every frame's chunk (manifest order), the
-    /// metadata (frames + files), only the freshly built chunks (to upload), and
-    /// the frame index to persist for the next sync.
+    /// Build the archive for `commit` into download bundles in `cas`.
     ///
-    /// `prev` maps a frame's `raw_hash` to its prior `(chunk_hash,
-    /// compressed_len)`. Reused chunks are already durable in storage.
-    pub fn build_into_cas_incremental(
+    /// `head` is Head's metadata for the same commit; its files table gives
+    /// every file's content SHA-1, so no blob is hashed here. `base` is the
+    /// ready Files build of an ancestor. With both, the build reads only the
+    /// changed bytes: a base frame that lies wholly inside a run of files
+    /// unchanged since the base (same path, same SHA-1) is kept, and only the
+    /// ranges between kept frames are read, cut and compressed. Without them,
+    /// or when more than half the bytes changed, or one changed range exceeds
+    /// [`MAX_GAP_BYTES`], the whole worktree is streamed.
+    ///
+    /// Frames go into bundles that are cut by frame content, so bundles away
+    /// from an edit match the base's and are reused whole. Frames that must
+    /// move to a new bundle are read from the local copy of the base bundle,
+    /// or from storage.
+    pub fn build_into_cas(
         &self,
         commit: &str,
         cas: &Cas,
         storage: Option<&crate::storage::StorageRef>,
         level: i32,
-        prev: &std::collections::HashMap<String, (String, u64)>,
+        head: Option<&MetadataChunk>,
+        base: Option<&ArchiveBase>,
         bundle_size: u64,
     ) -> Result<ArchiveBuildOutput> {
-        if !self.mirror.exists() {
-            anyhow::bail!("mirror not found: {}", self.mirror.display());
-        }
-        let repo = crate::gix_util::open_repo(&self.mirror)
-            .with_context(|| format!("open repo {}", self.mirror.display()))?;
-        let id = repo
-            .rev_parse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?;
-        let tree_id = repo
-            .find_commit(id)
-            .with_context(|| format!("find commit {}", id))?
-            .tree_id()
-            .with_context(|| format!("read tree for commit {}", id))?
-            .detach();
-
-        // Stream the worktree through the chunker. For each frame, hash the raw
-        // bytes (the reuse key) and compress only frames not already in `prev`.
-        //
-        // The compressed bytes are written straight into `cas` *inside* the batch,
-        // so a frame's ~MiB compressed buffer is dropped as soon as its batch is
-        // done. Only tiny per-frame metadata (two hashes + a length) is carried
-        // out. On a giant first sync (no reuse) the alternative — returning every
-        // frame's `Vec<u8>` and putting them after the walk — would hold the whole
-        // compressed archive (hundreds of MiB to GiB) resident at once, which is
-        // the archive-build OOM. Peak now stays ~one batch of compressed frames.
-        let (mut manifest, bounds, _raw_total, processed) =
-            self.stream_cdc(&repo, tree_id, |batch| {
-                use rayon::prelude::*;
-                batch
-                    .par_iter()
-                    .map(|&(_, raw)| -> Result<FrameChunk> {
-                        let raw_hash = crate::cas::hash(raw);
-                        match prev.get(&raw_hash) {
-                            Some((chunk_hash, compressed_len)) => Ok(FrameChunk {
-                                raw_hash,
-                                chunk_hash: chunk_hash.clone(),
-                                compressed_len: *compressed_len,
-                                is_new: false,
-                            }),
-                            None => {
-                                let comp = compress_frame(raw, level)?;
-                                let compressed_len = comp.len() as u64;
-                                let chunk_hash = cas.put(&comp)?;
-                                Ok(FrameChunk {
-                                    raw_hash,
-                                    chunk_hash,
-                                    compressed_len,
-                                    is_new: true,
-                                })
-                            }
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?;
-
-        anyhow::ensure!(
-            bounds.len() == processed.len(),
-            "archive frame processing count mismatch: bounds={} processed={}",
-            bounds.len(),
-            processed.len()
-        );
-        let mut new_chunks = Vec::new();
-        let mut frames = Vec::with_capacity(bounds.len());
-        for (i, ((start, end), processed_frame)) in bounds.iter().zip(&processed).enumerate() {
-            let raw_len = u64::try_from(
-                end.checked_sub(*start)
-                    .context("archive frame bounds are reversed")?,
-            )
-            .context("archive frame length exceeds u64")?;
-            let FrameChunk {
-                raw_hash,
-                chunk_hash,
-                compressed_len,
-                is_new,
-            } = processed_frame;
-            if *is_new {
-                new_chunks.push(chunk_hash.clone());
+        let (repo, tree_id) = self.open_tree(commit)?;
+        let mut blobs = Vec::new();
+        let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
+            .context("walk git tree for archive")?;
+        drop(repo);
+        let head_sha1s = head.and_then(|head| head_hashes(head, &blobs));
+        let base_index = match base.map(BaseIndex::new).transpose() {
+            Ok(index) => index,
+            Err(e) => {
+                tracing::warn!("Files base is unusable ({e:#}); building without it");
+                None
             }
-            // One chunk per frame: chunk_index == frame index, offset 0.
-            manifest.frames.push(FrameInfo {
-                chunk_index: u32::try_from(i).context("too many archive frames")?,
-                chunk_offset: 0,
-                compressed_len: u32::try_from(*compressed_len)
-                    .context("compressed archive frame exceeds manifest limit")?,
-                raw_len: u32::try_from(raw_len)
-                    .context("raw archive frame exceeds manifest limit")?,
-            });
-            frames.push(crate::ArchiveFrame {
-                raw_hash: raw_hash.clone(),
-                chunk_hash: chunk_hash.clone(),
-                compressed_len: *compressed_len,
-                raw_len,
-            });
-        }
-        // Bundle per-frame chunks into larger download objects so the client makes
-        // fewer HTTP requests, while keeping per-frame chunks in storage for
-        // incremental reuse on the next sync.
-        let fresh = new_chunks.iter().map(String::as_str).collect();
-        let (bundle_hashes, bundled_frames) = Self::bundle_archive_frames(
-            cas,
-            storage,
-            bundle_size,
-            &frames,
-            &manifest.frames,
-            &fresh,
-        )?;
-        manifest.frames = bundled_frames;
+        };
+        let plan = match (&head_sha1s, &base_index) {
+            (Some(sha1s), Some(index)) => self.plan_incremental(&blobs, sha1s, index)?,
+            _ => None,
+        };
+
+        let incremental = plan.is_some();
+        let mut bundler = Bundler::new(cas, storage, base_index.as_ref(), bundle_size);
+        let (layout, bounds, owned_sha1s, bytes_read) = match plan {
+            Some((plan, sizes)) => {
+                let layout = Layout::new(blobs, gitlinks, sizes)?;
+                let base = base_index
+                    .as_ref()
+                    .context("incremental plan without a base")?;
+                let (bounds, read) = self.build_gaps(&layout, &plan, level, base, &mut bundler)?;
+                (layout, bounds, Vec::new(), read)
+            }
+            None => {
+                let sizes = blob_sizes(&self.mirror, blobs.iter().map(|b| b.1).collect())?;
+                let layout = Layout::new(blobs, gitlinks, sizes)?;
+                let (bounds, sha1s) = self.stream_frames(
+                    &layout,
+                    head_sha1s.is_none(),
+                    level,
+                    base_index.as_ref(),
+                    |frame| bundler.push(frame),
+                )?;
+                let total = layout.total;
+                (layout, bounds, sha1s, total)
+            }
+        };
+        let (bundles, new_bundles, infos, frames, mut reuse) = bundler.finish()?;
+        reuse.incremental = incremental;
+        reuse.bytes_read = bytes_read as u64;
+
+        let owned: Vec<&[u8]> = owned_sha1s.iter().map(|h| h.as_slice()).collect();
+        let sha1s: &[&[u8]] = match &head_sha1s {
+            Some(sha1s) => sha1s,
+            None => &owned,
+        };
+        let mut metadata = if layout.blobs.is_empty() {
+            let mut metadata = MetadataChunk::new();
+            metadata.gitlinks = layout.gitlinks.clone();
+            metadata
+        } else {
+            layout.files_table(sha1s, &bounds)?
+        };
+        metadata.frames = infos;
         Ok(ArchiveBuildOutput {
-            download_bundle_hashes: bundle_hashes,
-            metadata: manifest,
-            new_reuse_frame_hashes: new_chunks,
+            download_bundle_hashes: bundles,
+            new_bundle_hashes: new_bundles,
+            metadata,
             archive_frames: frames,
+            reuse,
         })
     }
 
-    /// Group consecutive archive frames into download bundles of roughly
-    /// `target_size` compressed bytes. The per-frame chunks are kept in storage
-    /// for incremental reuse; this function only creates coarser download objects
-    /// and rewrites `FrameInfo` to point into them. `fresh` names the frame
-    /// chunks this build stored; the others are checked against their hash as
-    /// they are copied.
-    fn bundle_archive_frames(
-        cas: &Cas,
-        storage: Option<&crate::storage::StorageRef>,
-        target_size: u64,
-        frames: &[crate::ArchiveFrame],
-        frame_infos: &[FrameInfo],
-        fresh: &std::collections::HashSet<&str>,
-    ) -> Result<(Vec<String>, Vec<FrameInfo>)> {
-        if frames.len() != frame_infos.len() {
-            anyhow::bail!(
-                "archive frame count mismatch: frames={} frame_infos={}",
-                frames.len(),
-                frame_infos.len()
-            );
-        }
-        let target_size = target_size.max(1);
-        let assembly_start = std::time::Instant::now();
-        let mut assembled_bytes = 0u64;
-        let mut bundle_hashes = Vec::new();
-        let mut current = cas.writer().context("create archive bundle")?;
-        let mut current_frames = 0usize;
-        let mut bundled: Vec<FrameInfo> = Vec::with_capacity(frame_infos.len());
-        for (i, info) in frame_infos.iter().enumerate() {
-            let frame = frames
-                .get(i)
-                .ok_or_else(|| anyhow::anyhow!("missing archive frame {}", i))?;
-            let frame_len = frame.compressed_len;
-            if frame_len != info.compressed_len as u64 {
-                anyhow::bail!(
-                    "archive frame {} compressed length mismatch: frame={} manifest={}",
-                    i,
-                    frame.compressed_len,
-                    info.compressed_len
-                );
-            }
-            if !current.is_empty()
-                && current
-                    .len()
-                    .checked_add(frame_len)
-                    .context("archive bundle length overflow")?
-                    > target_size
-            {
-                let full = std::mem::replace(&mut current, cas.writer()?);
-                bundle_hashes.push(full.finish().context("install archive bundle")?.0);
-                current_frames = 0;
-            }
-            let chunk_index =
-                u32::try_from(bundle_hashes.len()).context("too many archive bundles")?;
-            let chunk_offset = current.len();
-            let written = Self::write_frame_chunk_to_bundle(
-                cas,
-                storage,
-                frame,
-                info,
-                &mut current,
-                fresh.contains(frame.chunk_hash.as_str()),
-            )
-            .with_context(|| format!("write archive frame {} to bundle", i))?;
-            current_frames += 1;
-            assembled_bytes = assembled_bytes
-                .checked_add(written)
-                .context("archive bundle byte count overflow")?;
-            bundled.push(FrameInfo {
-                chunk_index,
-                chunk_offset,
-                compressed_len: info.compressed_len,
-                raw_len: info.raw_len,
-            });
-            if current.len() >= target_size {
-                let full = std::mem::replace(&mut current, cas.writer()?);
-                bundle_hashes.push(full.finish().context("install archive bundle")?.0);
-                current_frames = 0;
-            }
-        }
-        if current_frames > 0 {
-            bundle_hashes.push(current.finish().context("install archive bundle")?.0);
-        }
-        crate::perf::record_archive_bundle_assembly(assembly_start.elapsed(), assembled_bytes);
-
-        Ok((bundle_hashes, bundled))
-    }
-
-    fn write_frame_chunk_to_bundle(
-        cas: &Cas,
-        storage: Option<&crate::storage::StorageRef>,
-        frame: &crate::ArchiveFrame,
-        info: &FrameInfo,
-        out: &mut crate::cas::CasWriter,
-        fresh: bool,
-    ) -> Result<u64> {
-        let expected_len = frame.compressed_len;
-        if expected_len != info.compressed_len as u64 {
-            anyhow::bail!(
-                "archive frame compressed length mismatch: frame={} manifest={}",
-                frame.compressed_len,
-                info.compressed_len
-            );
-        }
-
-        if cas.has(&frame.chunk_hash) {
-            let written = cas.copy_to_writer(&frame.chunk_hash, out, !fresh)?;
-            if written != expected_len {
-                anyhow::bail!(
-                    "archive frame {} compressed length mismatch: data={} expected={}",
-                    frame.chunk_hash,
-                    written,
-                    expected_len
-                );
-            }
-            return Ok(written);
-        }
-
-        let data = Self::read_frame_chunk(cas, storage, &frame.chunk_hash)?;
-        if data.len() as u64 != expected_len {
-            anyhow::bail!(
-                "archive frame {} compressed length mismatch: data={} expected={}",
-                frame.chunk_hash,
-                data.len(),
-                expected_len
-            );
-        }
-        out.write_all(&data).context("write archive bundle temp")?;
-        Ok(data.len() as u64)
-    }
-
-    fn read_frame_chunk(
-        cas: &Cas,
-        storage: Option<&crate::storage::StorageRef>,
-        hash: &str,
-    ) -> Result<Vec<u8>> {
-        match cas.get(hash) {
-            Ok(data) => Ok(data),
-            Err(local_err) => {
-                let Some(storage) = storage else {
-                    return Err(local_err).with_context(|| format!("read archive frame {}", hash));
-                };
-                let data = storage
-                    .get(hash)
-                    .with_context(|| format!("read archive frame {} from storage", hash))?;
-                // `get` checked the bytes against the hash. The frame is
-                // already in storage, so cache it without an upload.
-                cas.detached()
-                    .put_with_hash(hash, &data)
-                    .with_context(|| format!("cache archive frame {} in CAS", hash))?;
-                Ok(data)
-            }
-        }
-    }
-
-    /// Like [`build_into_cas_incremental`], but reads only the changed region of
-    /// the worktree instead of all of it. It compares the new tree against
-    /// `prev_commit`'s tree by `(path, oid)`, reuses the prior frames for the
-    /// unchanged prefix and suffix (content-defined chunking cuts the same bytes
-    /// the same way, so an unchanged region reproduces the same frames), and
-    /// re-chunks only the changed middle. Unchanged files take their content hash
-    /// from `prev_files`. Returns the same tuple as the full build.
-    ///
-    /// Falls back to the full [`build_into_cas_incremental`] whenever the change is
-    /// spread out (little prefix/suffix to reuse), the prior frames don't line up
-    /// with `prev_commit`, or the middle would be too large — so the result is
-    /// always a correct, complete archive.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_into_cas_bounded(
+    /// Plan an incremental build: which base frames to keep and which byte
+    /// ranges to read again. Returns the plan and every blob's size, or `None`
+    /// when the whole worktree should be streamed instead.
+    fn plan_incremental(
         &self,
-        commit: &str,
-        cas: &Cas,
-        storage: Option<&crate::storage::StorageRef>,
-        level: i32,
-        prev_frames: &[crate::ArchiveFrame],
-        prev_files: &[FileEntry],
-        prev_commit: &str,
-        bundle_size: u64,
-    ) -> Result<ArchiveBuildOutput> {
-        let prev_map: std::collections::HashMap<String, (String, u64)> = prev_frames
-            .iter()
-            .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
-            .collect();
-        let full =
-            || self.build_into_cas_incremental(commit, cas, storage, level, &prev_map, bundle_size);
-
-        // Largest changed middle we'll read into memory; above this the full build
-        // is both simpler and not much slower.
-        let max_middle = 256 * 1024 * 1024usize;
-
-        if prev_frames.is_empty() || !self.mirror.exists() {
-            return full();
-        }
-        let repo = crate::gix_util::open_repo(&self.mirror)?;
-        let new_tree = repo
-            .find_commit(
-                repo.rev_parse_single(commit)
-                    .with_context(|| format!("resolve commit {commit}"))?,
-            )
-            .with_context(|| format!("find commit {commit}"))?
-            .tree_id()
-            .context("read new tree id")?
-            .detach();
-        let prev_tree = match repo.rev_parse_single(prev_commit) {
-            Ok(id) => repo
-                .find_commit(id)
-                .ok()
-                .and_then(|c| c.tree_id().ok())
-                .map(|id| id.detach()),
-            Err(_) => None,
-        };
-        let Some(prev_tree) = prev_tree else {
-            return full(); // prev commit pruned — can't bound the read
-        };
-
-        let mut new_blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
-        let gitlinks =
-            collect_blobs_raw_gix(&repo, new_tree, &mut new_blobs).context("walk new tree")?;
-        let mut old_blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
-        collect_blobs_raw_gix(&repo, prev_tree, &mut old_blobs).context("walk prev tree")?;
-
-        let mut oids: Vec<String> = Vec::with_capacity(new_blobs.len() + old_blobs.len());
-        oids.extend(new_blobs.iter().map(|(_, o, _)| o.to_string()));
-        oids.extend(old_blobs.iter().map(|(_, o, _)| o.to_string()));
-        let sizes = crate::git::object_sizes(&self.mirror, &oids)?;
-        let size_of = |oid: &gix::hash::ObjectId| {
-            usize::try_from(sizes.get(&oid.to_string()).copied().unwrap_or(0)).ok()
-        };
-
-        // Byte offset of every file in each path-ordered stream.
-        let mut new_starts = Vec::with_capacity(new_blobs.len());
-        let mut acc = 0usize;
-        for (_, oid, _) in &new_blobs {
-            new_starts.push(acc);
-            let Some(size) = size_of(oid) else {
-                return full();
-            };
-            let Some(total) = acc.checked_add(size) else {
-                return full();
-            };
-            acc = total;
-        }
-        let new_total = acc;
-        let mut old_starts = Vec::with_capacity(old_blobs.len());
-        let mut oacc = 0usize;
-        for (_, oid, _) in &old_blobs {
-            old_starts.push(oacc);
-            let Some(size) = size_of(oid) else {
-                return full();
-            };
-            let Some(total) = oacc.checked_add(size) else {
-                return full();
-            };
-            oacc = total;
-        }
-        let old_total = oacc;
-
-        // Empty trees are cheap; let the full build handle them.
-        if new_total == 0 || old_total == 0 {
-            return full();
-        }
-        // The prior frames must cover exactly the prior stream, or they don't match
-        // prev_commit and we can't trust them.
-        let Some(prior_raw_total) = prev_frames.iter().try_fold(0usize, |total, frame| {
-            total.checked_add(usize::try_from(frame.raw_len).ok()?)
-        }) else {
-            return full();
-        };
-        if prior_raw_total != old_total {
-            return full();
-        }
-
-        // Walk both path-ordered file lists together. Files present in both with the
-        // same oid are unchanged; runs of them form "unchanged segments" with the
-        // old byte range, the new byte range, and the constant offset shift between
-        // them. A modified/added/deleted file is changed and breaks the run.
-        let mut new_changed = vec![false; new_blobs.len()];
-        let mut segs: Vec<(usize, usize, isize)> = Vec::new(); // (old_start, old_end, shift)
-        let mut run: Option<(usize, usize, usize)> = None; // (old_start, new_start, len)
-        let mut i = 0usize;
-        let mut j = 0usize;
-        loop {
-            let ord = match (old_blobs.get(i), new_blobs.get(j)) {
-                (Some(o), Some(n)) => o.0.cmp(&n.0),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => break,
-            };
-            let mut flush = false;
-            match ord {
-                std::cmp::Ordering::Equal => {
-                    if old_blobs[i].1 == new_blobs[j].1 {
-                        let Some(sz) = size_of(&old_blobs[i].1) else {
-                            return full();
-                        };
-                        match &mut run {
-                            Some((_, _, len)) => {
-                                let Some(total) = len.checked_add(sz) else {
-                                    return full();
-                                };
-                                *len = total;
-                            }
-                            None => run = Some((old_starts[i], new_starts[j], sz)),
-                        }
-                    } else {
-                        new_changed[j] = true;
-                        flush = true;
-                    }
-                    i += 1;
-                    j += 1;
+        blobs: &[Blob],
+        sha1s: &[&[u8]],
+        base: &BaseIndex,
+    ) -> Result<Option<(Plan, Vec<usize>)>> {
+        // A file is unchanged when the base has the same path with the same
+        // content; it keeps the base's size and start. Other files are sized
+        // from their headers.
+        let mut sizes = vec![0usize; blobs.len()];
+        let mut old_starts: Vec<Option<usize>> = vec![None; blobs.len()];
+        let mut unknown = Vec::new();
+        for (idx, (path, _, _)) in blobs.iter().enumerate() {
+            match base.files.get(path.as_slice()) {
+                Some(&(sha1, start, len)) if sha1 == sha1s[idx] => {
+                    sizes[idx] = len;
+                    old_starts[idx] = Some(start);
                 }
-                std::cmp::Ordering::Less => {
-                    flush = true;
-                    i += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    new_changed[j] = true;
-                    flush = true;
-                    j += 1;
-                }
-            }
-            if flush
-                && let Some((o0, n0, len)) = run.take()
-                && len > 0
-            {
-                let Some(segment) = shifted_segment(o0, n0, len) else {
-                    return full();
-                };
-                segs.push(segment);
+                _ => unknown.push(idx),
             }
         }
-        if let Some((o0, n0, len)) = run.take()
-            && len > 0
-        {
-            let Some(segment) = shifted_segment(o0, n0, len) else {
-                return full();
-            };
-            segs.push(segment);
+        let headers = blob_sizes(&self.mirror, unknown.iter().map(|&i| blobs[i].1).collect())?;
+        for (&idx, size) in unknown.iter().zip(headers) {
+            sizes[idx] = size;
         }
 
-        // Prior frame boundaries (prior-stream bytes).
-        let mut prior_starts = Vec::with_capacity(prev_frames.len() + 1);
-        let mut s = 0usize;
-        for f in prev_frames {
-            prior_starts.push(s);
-            let Some(total) = usize::try_from(f.raw_len)
-                .ok()
-                .and_then(|raw_len| s.checked_add(raw_len))
-            else {
-                return full();
-            };
-            s = total;
-        }
-        prior_starts.push(s); // == old_total
-
-        // A prior frame is reusable when it sits wholly inside an unchanged segment
-        // and starts far enough into it that content-defined chunking has re-synced
-        // (the segment start, or at least one max-chunk past a change). Its new byte
-        // range is the old range shifted by the segment's offset.
-        let mut reused: Vec<(usize, usize, usize)> = Vec::new(); // (new_start, new_end, frame idx)
-        let mut seg_hint = 0usize;
-        for (k, f) in prev_frames.iter().enumerate() {
-            let fs = prior_starts[k];
-            let fe = prior_starts[k + 1];
-            while seg_hint < segs.len() && segs[seg_hint].1 <= fs {
-                seg_hint += 1;
+        // Runs of unchanged files that are also adjacent in the base stream:
+        // `(old_start, old_end, new_start)`.
+        let mut segments: Vec<(usize, usize, usize)> = Vec::new();
+        let mut new_pos = 0usize;
+        for idx in 0..blobs.len() {
+            if let Some(old) = old_starts[idx] {
+                let extend = segments
+                    .last()
+                    .is_some_and(|&(o0, o1, n0)| o1 == old && n0 + (o1 - o0) == new_pos);
+                if extend {
+                    segments.last_mut().expect("segment").1 += sizes[idx];
+                } else {
+                    segments.push((old, old + sizes[idx], new_pos));
+                }
             }
-            if let Some(&(o0, o1, shift)) = segs.get(seg_hint)
+            new_pos = new_pos
+                .checked_add(sizes[idx])
+                .context("archive stream length overflow")?;
+        }
+        let total = new_pos;
+        if total == 0 {
+            return Ok(None);
+        }
+
+        // Keep each base frame that lies wholly inside one segment, at the
+        // segment's new position.
+        let mut reused = Vec::new();
+        let mut seg = 0usize;
+        let mut by_old: Vec<&(usize, usize, usize)> = segments.iter().collect();
+        by_old.sort_by_key(|s| s.0);
+        for k in 0..base.frames.len() {
+            let (fs, fe) = (base.starts[k], base.starts[k + 1]);
+            if fe == fs {
+                continue;
+            }
+            while seg < by_old.len() && by_old[seg].1 <= fs {
+                seg += 1;
+            }
+            if let Some(&&(o0, o1, n0)) = by_old.get(seg)
                 && o0 <= fs
                 && fe <= o1
-                && (o0 == 0 || fs >= o0.saturating_add(self.cdc.max))
             {
-                let Some(ns) = fs.checked_add_signed(shift) else {
-                    return full();
-                };
-                let Some(ne) = usize::try_from(f.raw_len)
-                    .ok()
-                    .and_then(|raw_len| ns.checked_add(raw_len))
-                else {
-                    return full();
-                };
-                reused.push((ns, ne, k));
+                reused.push((n0 + (fs - o0), n0 + (fe - o0), k));
             }
         }
+        reused.sort_by_key(|r| r.0);
 
-        // No reuse, or the bytes we'd have to re-read are too large to be worth it.
-        let Some(reused_bytes) = reused.iter().try_fold(0usize, |total, &(start, end, _)| {
-            total.checked_add(end.checked_sub(start)?)
-        }) else {
-            return full();
-        };
-        if reused.is_empty()
-            || new_total
-                .checked_sub(reused_bytes)
-                .is_none_or(|changed_bytes| changed_bytes > max_middle)
-        {
-            return full();
-        }
-
-        // Walk the reused frames in new-stream order, re-chunking each gap between
-        // them (the changed regions) from freshly read bytes.
-        let mut all_chunks: Vec<String> = Vec::new();
-        let mut new_chunks: Vec<String> = Vec::new();
-        let mut frames: Vec<crate::ArchiveFrame> = Vec::new();
-        let mut bounds: Vec<(usize, usize)> = Vec::new();
-        let fill_gap = |g0: usize,
-                        g1: usize,
-                        all: &mut Vec<String>,
-                        news: &mut Vec<String>,
-                        frames: &mut Vec<crate::ArchiveFrame>,
-                        bounds: &mut Vec<(usize, usize)>|
-         -> Result<()> {
-            if g1 <= g0 {
-                return Ok(());
-            }
-            let mut buf = Vec::with_capacity(g1 - g0);
-            for (idx, (_, oid, _)) in new_blobs.iter().enumerate() {
-                let bs = new_starts[idx];
-                let be = bs
-                    .checked_add(size_of(oid).context("blob size exceeds usize")?)
-                    .context("blob end offset overflow")?;
-                if be <= g0 || bs >= g1 {
-                    continue;
-                }
-                let blob = repo
-                    .find_blob(*oid)
-                    .with_context(|| format!("read blob {oid}"))?;
-                let lo = g0.max(bs) - bs;
-                let hi = g1.min(be) - bs;
-                buf.extend_from_slice(&blob.data[lo..hi]);
-            }
-            for c in fastcdc::v2020::FastCDC::new(&buf, self.cdc.min, self.cdc.avg, self.cdc.max) {
-                let raw = &buf[c.offset..c.offset + c.length];
-                let raw_hash = crate::cas::hash(raw);
-                let (chunk_hash, compressed_len) = match prev_map.get(&raw_hash) {
-                    Some((ch, cl)) => (ch.clone(), *cl),
-                    None => {
-                        let comp = compress_frame(raw, level)?;
-                        let ch = cas.put(&comp)?;
-                        news.push(ch.clone());
-                        (ch, comp.len() as u64)
-                    }
-                };
-                all.push(chunk_hash.clone());
-                bounds.push((g0 + c.offset, g0 + c.offset + c.length));
-                frames.push(crate::ArchiveFrame {
-                    raw_hash,
-                    chunk_hash,
-                    compressed_len,
-                    raw_len: c.length as u64,
-                });
-            }
-            Ok(())
-        };
-
+        // Drop kept frames that would leave a gap shorter than a minimum
+        // frame, so new frames do not shrink build after build.
+        let mut kept: Vec<(usize, usize, usize)> = Vec::with_capacity(reused.len());
         let mut pos = 0usize;
-        for &(ns, ne, k) in &reused {
-            fill_gap(
-                pos,
-                ns,
-                &mut all_chunks,
-                &mut new_chunks,
-                &mut frames,
-                &mut bounds,
-            )?;
-            let f = &prev_frames[k];
-            all_chunks.push(f.chunk_hash.clone());
-            bounds.push((ns, ne));
-            frames.push(f.clone());
+        for (ns, ne, k) in reused {
+            if ns < pos {
+                return Ok(None);
+            }
+            let gap = ns - pos;
+            if gap > 0 && gap < self.cdc.min {
+                continue;
+            }
+            kept.push((ns, ne, k));
             pos = ne;
         }
-        fill_gap(
-            pos,
-            new_total,
-            &mut all_chunks,
-            &mut new_chunks,
-            &mut frames,
-            &mut bounds,
-        )?;
-
-        // The frames must tile the whole new stream contiguously, or something in
-        // the reuse math is off — rebuild fully rather than ship a wrong archive.
-        let tiled = bounds.first().map(|b| b.0) == Some(0)
-            && bounds.last().map(|b| b.1) == Some(new_total)
-            && bounds.windows(2).all(|w| w[0].1 == w[1].0);
-        if !tiled {
-            return full();
+        while let Some(&(_, ne, _)) = kept.last() {
+            let tail = total - ne;
+            if tail == 0 || tail >= self.cdc.min {
+                break;
+            }
+            kept.pop();
         }
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        let mut gaps = Vec::new();
+        let mut pos = 0usize;
+        for &(ns, ne, _) in &kept {
+            if ns > pos {
+                gaps.push((pos, ns));
+            }
+            pos = ne;
+        }
+        if total > pos {
+            gaps.push((pos, total));
+        }
+        let gap_bytes: usize = gaps.iter().map(|(a, b)| b - a).sum();
+        if gap_bytes > total / 2 || gaps.iter().any(|(a, b)| b - a > MAX_GAP_BYTES) {
+            return Ok(None);
+        }
+        Ok(Some((Plan { reused: kept, gaps }, sizes)))
+    }
 
-        // Files table: unchanged files keep their prior content hash; changed files
-        // are read and hashed. Fragments come from the frame bounds.
-        let prev_sha: std::collections::HashMap<&[u8], &[u8]> = prev_files
-            .iter()
-            .map(|f| (f.path.as_slice(), f.blob_sha1.as_slice()))
-            .collect();
-        let mut manifest = MetadataChunk::new();
-        manifest.gitlinks = gitlinks;
-        let mut hint = 0usize;
-        for (idx, (path, oid, mode)) in new_blobs.iter().enumerate() {
-            let bstart = new_starts[idx];
-            let blen = size_of(oid).context("blob size exceeds usize")?;
-            let blob_sha1 = if !new_changed[idx]
-                && let Some(h) = prev_sha.get(path.as_slice())
-            {
-                h.to_vec()
-            } else {
-                sha1_bytes(&repo.find_blob(*oid)?.data).to_vec()
+    /// Read and cut the plan's gaps, then hand every frame, kept and new, to
+    /// `bundler` in stream order. Gaps go in batches of up to
+    /// [`MAX_GAP_BYTES`]. Returns the frame bounds and the bytes read.
+    fn build_gaps(
+        &self,
+        layout: &Layout,
+        plan: &Plan,
+        level: i32,
+        base: &BaseIndex,
+        bundler: &mut Bundler,
+    ) -> Result<(Vec<(usize, usize)>, usize)> {
+        let mut bounds = Vec::new();
+        let mut bytes_read = 0usize;
+        let mut kept = plan.reused.iter().peekable();
+        let mut emit_kept =
+            |end: usize, bounds: &mut Vec<(usize, usize)>, bundler: &mut Bundler| {
+                while let Some(&&(start, stop, k)) = kept.peek().filter(|r| r.0 < end) {
+                    kept.next();
+                    let frame = &base.frames[k];
+                    bounds.push((start, stop));
+                    bundler.push(BuiltFrame {
+                        raw_hash: frame.raw_hash.clone(),
+                        raw_len: frame.raw_len,
+                        chunk_hash: frame.chunk_hash.clone(),
+                        compressed_len: frame.compressed_len,
+                        bytes: None,
+                        base_frame: Some(k),
+                    })?;
+                }
+                anyhow::Ok(())
             };
-            let (frags, new_hint) = fragments_for(&bounds, bstart, blen, hint)?;
-            hint = new_hint;
-            manifest.files.push(FileEntry {
-                path: path.clone(),
-                mode: *mode,
-                blob_sha1,
-                fragments: frags,
-            });
+        let mut rest = plan.gaps.as_slice();
+        while !rest.is_empty() {
+            let mut n = 0usize;
+            let mut batch_bytes = 0usize;
+            while n < rest.len()
+                && (n == 0 || batch_bytes + (rest[n].1 - rest[n].0) <= MAX_GAP_BYTES)
+            {
+                batch_bytes += rest[n].1 - rest[n].0;
+                n += 1;
+            }
+            let (batch, tail) = rest.split_at(n);
+            rest = tail;
+            for (start, end, frame) in self.cut_gaps(layout, batch, level, base)? {
+                emit_kept(start, &mut bounds, bundler)?;
+                bounds.push((start, end));
+                bundler.push(frame)?;
+            }
+            bytes_read += batch_bytes;
         }
-        for (i, f) in frames.iter().enumerate() {
-            manifest.frames.push(FrameInfo {
-                chunk_index: u32::try_from(i).context("too many archive frames")?,
-                chunk_offset: 0,
-                compressed_len: u32::try_from(f.compressed_len)
-                    .context("compressed archive frame exceeds manifest limit")?,
-                raw_len: u32::try_from(f.raw_len)
-                    .context("raw archive frame exceeds manifest limit")?,
-            });
+        emit_kept(usize::MAX, &mut bounds, bundler)?;
+
+        // The frames must tile the new stream exactly.
+        let tiled = bounds.first().map(|b| b.0) == Some(0)
+            && bounds.last().map(|b| b.1) == Some(layout.total)
+            && bounds.windows(2).all(|w| w[0].1 == w[1].0);
+        anyhow::ensure!(tiled, "incremental archive frames do not tile the worktree");
+        Ok((bounds, bytes_read))
+    }
+
+    /// Read `gaps` of the new stream on several threads, cut each into
+    /// frames, and build the frames on all cores. Returns each frame with its
+    /// `(start, end)` in the stream, in order.
+    fn cut_gaps(
+        &self,
+        layout: &Layout,
+        gaps: &[(usize, usize)],
+        level: i32,
+        base: &BaseIndex,
+    ) -> Result<Vec<(usize, usize, BuiltFrame)>> {
+        let mut pieces = Vec::new();
+        let mut owners = Vec::new();
+        for (g, &(g0, g1)) in gaps.iter().enumerate() {
+            let mut idx = layout
+                .starts
+                .partition_point(|&start| start <= g0)
+                .saturating_sub(1);
+            while idx < layout.blobs.len() && layout.starts[idx] < g1 {
+                let (start, size) = (layout.starts[idx], layout.sizes[idx]);
+                if size > 0 && start + size > g0 {
+                    pieces.push(Piece {
+                        oid: layout.blobs[idx].1,
+                        size,
+                        lo: g0.max(start) - start,
+                        hi: g1.min(start + size) - start,
+                        sha1: false,
+                    });
+                    owners.push(g);
+                }
+                idx += 1;
+            }
         }
-        // Bundle per-frame chunks into larger download objects while keeping the
-        // fine-grained chunks in storage for incremental reuse on the next sync.
-        let fresh = new_chunks.iter().map(String::as_str).collect();
-        let (bundle_hashes, bundled_frames) = Self::bundle_archive_frames(
-            cas,
-            storage,
-            bundle_size,
-            &frames,
-            &manifest.frames,
-            &fresh,
-        )?;
-        manifest.frames = bundled_frames;
-        Ok(ArchiveBuildOutput {
-            download_bundle_hashes: bundle_hashes,
-            metadata: manifest,
-            new_reuse_frame_hashes: new_chunks,
-            archive_frames: frames,
-        })
+        let mut buffers: Vec<Vec<u8>> = gaps
+            .iter()
+            .map(|&(g0, g1)| Vec::with_capacity(g1 - g0))
+            .collect();
+        for ((data, _), g) in read_pieces(&self.mirror, pieces)?.into_iter().zip(owners) {
+            buffers[g].extend_from_slice(&data);
+        }
+        let mut cuts = Vec::new();
+        for (g, (buffer, &(g0, g1))) in buffers.iter().zip(gaps).enumerate() {
+            anyhow::ensure!(
+                buffer.len() == g1 - g0,
+                "archive gap {g0}..{g1} read {} bytes",
+                buffer.len()
+            );
+            for c in fastcdc::v2020::FastCDC::new(buffer, self.cdc.min, self.cdc.avg, self.cdc.max)
+            {
+                cuts.push((g, c.offset, c.length));
+            }
+        }
+        cuts.par_iter()
+            .map(|&(g, offset, len)| {
+                let frame = build_frame(&buffers[g][offset..offset + len], level, Some(base))?;
+                let start = gaps[g].0 + offset;
+                Ok((start, start + len, frame))
+            })
+            .collect()
     }
 }
 
 pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
     Sha1::digest(data).into()
-}
-
-fn shifted_segment(
-    old_start: usize,
-    new_start: usize,
-    len: usize,
-) -> Option<(usize, usize, isize)> {
-    let old_end = old_start.checked_add(len)?;
-    let shift = if new_start >= old_start {
-        isize::try_from(new_start - old_start).ok()?
-    } else {
-        isize::try_from(old_start - new_start).ok()?.checked_neg()?
-    };
-    Some((old_start, old_end, shift))
-}
-
-/// Run `process_batch` over one batch of frames and append the results to
-/// `outputs` in frame order, then clear `batch`. Used by [`ArchiveBuilder::stream_cdc`]
-/// to flush a bounded window of frames (mid-stream and at the end).
-fn flush_batch<T, P>(
-    batch: &mut Vec<(usize, Vec<u8>)>,
-    outputs: &mut Vec<T>,
-    process_batch: &mut P,
-) -> Result<()>
-where
-    P: FnMut(&[(usize, &[u8])]) -> Result<Vec<T>>,
-{
-    if batch.is_empty() {
-        return Ok(());
-    }
-    let view: Vec<(usize, &[u8])> = batch.iter().map(|(i, d)| (*i, d.as_slice())).collect();
-    let res = process_batch(&view)?;
-    anyhow::ensure!(
-        res.len() == view.len(),
-        "process_batch returned {} outputs for {} frames",
-        res.len(),
-        view.len()
-    );
-    outputs.extend(res);
-    batch.clear();
-    Ok(())
-}
-
-/// File table accumulated by [`TreeBlobReader`] while it streams blob bytes: one
-/// [`FileEntry`] per blob (fragments filled in later) and the parallel
-/// `(start, len)` byte range of each file in the stream. `err` holds the first
-/// blob-read failure, since the `Read` trait can only surface an `io::Error`.
-#[derive(Default)]
-struct FileTable {
-    files: Vec<FileEntry>,
-    ranges: Vec<(usize, usize)>,
-    err: Option<anyhow::Error>,
-}
-
-type FileRec = Rc<RefCell<FileTable>>;
-
-/// A [`Read`] over the path-ordered concatenation of a tree's blob contents.
-/// Loads one blob at a time (peak memory is the largest blob, never the whole
-/// worktree) and records each file's entry + byte range into the shared
-/// [`FileTable`] as it serves bytes. A blob-read error is stored in the table
-/// and surfaced as an `io::Error` so the streaming chunker stops.
-struct TreeBlobReader<'r> {
-    repo: &'r gix::Repository,
-    blobs: std::vec::IntoIter<(Vec<u8>, gix::hash::ObjectId, u32)>,
-    cur: Vec<u8>,
-    pos: usize,
-    next_start: usize,
-    rec: FileRec,
-}
-
-impl<'r> TreeBlobReader<'r> {
-    fn new(
-        repo: &'r gix::Repository,
-        blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,
-        rec: FileRec,
-    ) -> Self {
-        Self {
-            repo,
-            blobs: blobs.into_iter(),
-            cur: Vec::new(),
-            pos: 0,
-            next_start: 0,
-            rec,
-        }
-    }
-
-    /// Load the next blob into `cur`, recording its file entry + byte range.
-    /// Returns Ok(true) if a blob was loaded (possibly empty), Ok(false) at EOF.
-    fn load_next(&mut self) -> Result<bool> {
-        let (path, oid, mode) = match self.blobs.next() {
-            Some(b) => b,
-            None => return Ok(false),
-        };
-        let content = self
-            .repo
-            .find_blob(oid)
-            .with_context(|| format!("read blob {} for {:?}", oid, String::from_utf8_lossy(&path)))?
-            .data
-            .clone();
-        let start = self.next_start;
-        let len = content.len();
-        {
-            let mut t = self.rec.borrow_mut();
-            t.files.push(FileEntry {
-                path,
-                mode,
-                blob_sha1: sha1_bytes(&content).to_vec(),
-                fragments: Vec::new(),
-            });
-            t.ranges.push((start, len));
-        }
-        self.next_start = start
-            .checked_add(len)
-            .context("archive file stream offset overflow")?;
-        self.cur = content;
-        self.pos = 0;
-        Ok(true)
-    }
-}
-
-impl Read for TreeBlobReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            if self.pos < self.cur.len() {
-                let n = (self.cur.len() - self.pos).min(buf.len());
-                buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
-                self.pos += n;
-                return Ok(n);
-            }
-            match self.load_next() {
-                Ok(true) => continue,
-                Ok(false) => return Ok(0),
-                Err(e) => {
-                    self.rec.borrow_mut().err = Some(e);
-                    return Err(std::io::Error::other("blob read failed"));
-                }
-            }
-        }
-    }
 }
 
 /// Collect every blob in `tree_id` as `(raw_path_bytes, blob_oid, mode)` in
@@ -1377,7 +1375,7 @@ impl Read for TreeBlobReader<'_> {
 fn collect_blobs_raw_gix(
     repo: &gix::Repository,
     tree_id: gix::hash::ObjectId,
-    out: &mut Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,
+    out: &mut Vec<Blob>,
 ) -> Result<Vec<Vec<u8>>> {
     let mut recorder = gix::traverse::tree::Recorder::default();
     gix::traverse::tree::depthfirst(
@@ -1411,7 +1409,7 @@ fn collect_blobs_raw_gix(
 /// manifest order stays deterministic.
 fn hash_blobs_parallel(
     mirror: &std::path::Path,
-    blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,
+    blobs: Vec<Blob>,
 ) -> anyhow::Result<Vec<(Vec<u8>, u32, Vec<u8>)>> {
     const PARALLEL_HASH_THRESHOLD: usize = 64;
 
@@ -1442,27 +1440,46 @@ fn hash_blobs_parallel(
 mod tests {
     use super::*;
 
-    #[test]
-    fn shifted_segment_checks_offsets_and_lengths() {
-        assert_eq!(shifted_segment(10, 15, 4), Some((10, 14, 5)));
-        assert_eq!(shifted_segment(15, 10, 4), Some((15, 19, -5)));
-        assert_eq!(shifted_segment(usize::MAX, usize::MAX, 1), None);
+    /// The worktree stream for `commit`: every blob in tree order.
+    fn tree_stream(mirror: &Path, commit: &str) -> Vec<u8> {
+        let repo = crate::gix_util::open_repo(mirror).unwrap();
+        let id = repo.rev_parse_single(commit).unwrap();
+        let tree_id = repo.find_commit(id).unwrap().tree_id().unwrap().detach();
+        let mut blobs = Vec::new();
+        collect_blobs_raw_gix(&repo, tree_id, &mut blobs).unwrap();
+        let mut stream = Vec::new();
+        for (_p, oid, _mode) in &blobs {
+            stream.extend_from_slice(&repo.find_blob(*oid).unwrap().data);
+        }
+        stream
     }
 
-    /// Regression: the streaming incremental build must write every frame's
-    /// compressed bytes into CAS *as it walks* (bounded memory) and still produce
-    /// a correct, complete archive. If the build instead accumulated every
-    /// compressed frame in memory before the CAS puts (the pre-fix behavior that
-    /// OOM'd giant repos), it would still pass a plain round-trip — so this test
-    /// pins the observable contract of streaming-to-CAS: each returned frame's
-    /// chunk is already durable in CAS, and decompressing the frames in order
-    /// reproduces the exact path-ordered worktree bytes.
+    /// Decompress a build's frames from its bundles, in order, after checking
+    /// the metadata's geometry. `get` reads a bundle.
+    fn archive_stream(out: &ArchiveBuildOutput, get: impl Fn(&str) -> Vec<u8>) -> Vec<u8> {
+        out.metadata.validate_geometry().unwrap();
+        let lengths = crate::clonepack::archive_chunk_lengths(&out.metadata).unwrap();
+        assert_eq!(lengths.len(), out.download_bundle_hashes.len());
+        let bundles: Vec<Vec<u8>> = out.download_bundle_hashes.iter().map(|h| get(h)).collect();
+        for (bundle, len) in bundles.iter().zip(&lengths) {
+            assert_eq!(bundle.len() as u64, *len, "bundle length");
+        }
+        let mut stream = Vec::new();
+        for info in &out.metadata.frames {
+            let bundle = &bundles[info.chunk_index as usize];
+            let start = info.chunk_offset as usize;
+            let raw = &bundle[start..start + info.compressed_len as usize];
+            if info.raw_len > 0 {
+                stream.extend_from_slice(&zstd::decode_all(raw).unwrap());
+            }
+        }
+        stream
+    }
+
+    /// A build with no Head table and no base streams the whole worktree:
+    /// its bundles are in CAS and decompress, in order, to the worktree.
     #[test]
-    fn incremental_build_streams_frames_to_cas() {
-        use std::collections::HashMap;
-        // High-entropy xorshift so CDC finds real content-defined cut points
-        // (not just max-size cuts) — this is what makes the multi-frame streaming
-        // assertion meaningful.
+    fn archive_bundles_reproduce_the_worktree_stream() {
         let pr = |len: usize, seed: u64| {
             let mut s = seed ^ 0x9E3779B97F4A7C15;
             (0..len)
@@ -1485,125 +1502,220 @@ mod tests {
 
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
-        let builder = ArchiveBuilder::new(tmp.path());
-        let empty: HashMap<String, (String, u64)> = HashMap::new();
-        let out = builder
-            .build_into_cas_incremental(&commit, &cas, None, 6, &empty, DEFAULT_ARCHIVE_CHUNK_SIZE)
+        let out = ArchiveBuilder::new(tmp.path())
+            .build_into_cas(
+                &commit,
+                &cas,
+                None,
+                6,
+                None,
+                None,
+                DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
             .unwrap();
-
         assert!(
             out.archive_frames.len() >= 3,
             "test data should span multiple CDC frames, got {}",
             out.archive_frames.len()
         );
-
-        // Every per-frame chunk must already be durable in CAS: the build streamed
-        // it there instead of holding it in memory. Decompressing the frames in
-        // order must reproduce the path-ordered worktree byte-for-byte.
-        let repo = crate::gix_util::open_repo(tmp.path()).unwrap();
-        let id = repo.rev_parse_single(commit.as_str()).unwrap();
-        let tree_id = repo.find_commit(id).unwrap().tree_id().unwrap().detach();
-        let mut blobs = Vec::new();
-        collect_blobs_raw_gix(&repo, tree_id, &mut blobs).unwrap();
-        let mut expected = Vec::new();
-        for (_p, oid, _mode) in &blobs {
-            expected.extend_from_slice(&repo.find_blob(*oid).unwrap().data);
-        }
-
-        let mut reconstructed = Vec::with_capacity(expected.len());
-        for frame in &out.archive_frames {
-            assert!(
-                cas.has(&frame.chunk_hash),
-                "frame chunk {} must be in CAS after the streaming build",
-                frame.chunk_hash
-            );
-            let comp = cas.get(&frame.chunk_hash).unwrap();
-            assert_eq!(
-                comp.len() as u64,
-                frame.compressed_len,
-                "stored chunk length must match frame metadata"
-            );
-            if frame.raw_len == 0 {
-                continue;
-            }
-            reconstructed.extend_from_slice(&zstd::decode_all(comp.as_slice()).unwrap());
-        }
-        assert_eq!(
-            reconstructed, expected,
-            "frames decompressed in order must reproduce the worktree stream"
-        );
+        assert!(!out.reuse.incremental);
+        assert_eq!(out.new_bundle_hashes, out.download_bundle_hashes);
+        let stream = archive_stream(&out, |h| cas.get(h).unwrap());
+        assert_eq!(stream, tree_stream(tmp.path(), &commit));
     }
 
-    /// Incremental archive: identical commit reuses every frame; a small edit at
-    /// the end of the stream reuses all earlier (unchanged) frames and rebuilds
-    /// only the affected one. Verifies the CDC reuse mechanic.
-    #[test]
-    fn incremental_archive_reuses_unchanged_frames() {
-        use std::collections::HashMap;
-        let pr = |len: usize, seed: u8| {
-            (0..len)
-                .map(|i| (i.wrapping_mul(2654435761) as u8) ^ seed)
-                .collect::<Vec<u8>>()
+    /// Small frames and bundles, so a little data spans many of each.
+    const SMALL_CDC: CdcBounds = CdcBounds {
+        min: CDC.min / 64,
+        avg: CDC.avg / 64,
+        max: CDC.max / 64,
+    };
+    const SMALL_BUNDLE: u64 = 64 * 1024;
+
+    /// The base build of an incremental test, kept with what it was built from.
+    struct Prior<'a> {
+        builder: &'a ArchiveBuilder,
+        cas: &'a Cas,
+        out: &'a ArchiveBuildOutput,
+        bundle_size: u64,
+    }
+
+    /// Build `commit` against `prior` with Head's files table, as the server
+    /// does, and check the result: it decompresses to the worktree, its files
+    /// table matches a full one, and it read and wrote less than everything.
+    fn build_on(
+        prior: &Prior,
+        storage: Option<&crate::storage::StorageRef>,
+        commit: &str,
+    ) -> Result<ArchiveBuildOutput> {
+        let head = prior.builder.build_files_table(commit).unwrap();
+        let base = ArchiveBase {
+            frames: &prior.out.archive_frames,
+            metadata: &prior.out.metadata,
+            bundles: &prior.out.download_bundle_hashes,
         };
+        let out = prior.builder.build_into_cas(
+            commit,
+            prior.cas,
+            storage,
+            3,
+            Some(&head),
+            Some(&base),
+            prior.bundle_size,
+        )?;
+        let fl = |m: &MetadataChunk| {
+            m.files
+                .iter()
+                .map(|f| (f.path.clone(), f.mode, f.blob_sha1.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fl(&out.metadata), fl(&head), "files table");
+        Ok(out)
+    }
+
+    /// An incremental build reads only the changed bytes, keeps the base's
+    /// other frames and bundles, and is exact, across edit positions and
+    /// shapes: a wrong offset or a stale frame would change the stream. An
+    /// identical commit reuses everything. The scenarios run in parallel.
+    #[test]
+    fn incremental_archive_is_exact_and_reuses_the_base() {
+        let mix_blob = |seed| mix_blob(seed, 200_000);
+        let base: Vec<(String, Vec<u8>)> = (0..10)
+            .map(|s| (format!("f{s:02}.bin"), mix_blob(s)))
+            .collect();
+
+        let scenarios: Vec<
+            Box<dyn Fn(&[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> + Send + Sync>,
+        > = vec![
+            // Nothing changes.
+            Box::new(|base| base.to_vec()),
+            Box::new(|base| {
+                // Same-size edit in the middle.
+                let mut middle = base.to_vec();
+                middle[5].1 = mix_blob(900);
+                middle
+            }),
+            Box::new(|base| {
+                // Edit at the head.
+                let mut head = base.to_vec();
+                head[0].1 = mix_blob(901);
+                head
+            }),
+            Box::new(|base| {
+                // Edit at the tail.
+                let mut tail = base.to_vec();
+                tail[9].1 = mix_blob(902);
+                tail
+            }),
+            Box::new(|base| {
+                // A growing edit shifts what follows forward.
+                let mut grow = base.to_vec();
+                grow[5].1 = {
+                    let mut v = mix_blob(903);
+                    v.extend(mix_blob(904));
+                    v
+                };
+                grow
+            }),
+            Box::new(|base| {
+                // A deletion shifts what follows back.
+                let mut del = base.to_vec();
+                del.remove(5);
+                del
+            }),
+            Box::new(|base| {
+                // A new file between unchanged neighbors.
+                let mut add = base.to_vec();
+                add.insert(5, ("f05b.bin".to_string(), mix_blob(905)));
+                add
+            }),
+            Box::new(|base| {
+                // Several edits, with unchanged frames between them.
+                let mut spread = base.to_vec();
+                spread[1].1 = mix_blob(906);
+                spread[5].1 = mix_blob(907);
+                spread[8].1 = mix_blob(908);
+                spread
+            }),
+            Box::new(|base| {
+                // A modify, a delete and an insert at once.
+                let mut mixed = base.to_vec();
+                mixed[2].1 = mix_blob(909);
+                mixed.remove(6);
+                mixed.insert(4, ("f03b.bin".to_string(), mix_blob(910)));
+                mixed
+            }),
+        ];
+
         let tmp = tempfile::tempdir().unwrap();
         let repo = crate::test_fixture::init_bare(tmp.path());
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
-        let builder = ArchiveBuilder::new(tmp.path());
-
-        // ~20 MiB of incompressible data → several CDC frames; small file last.
-        let big = pr(20 * 1024 * 1024, 1);
-        let c1 = commit_onto_bytes(&repo, &[(b"a.bin", &big), (b"z.txt", b"hello")]);
-        let empty: HashMap<String, (String, u64)> = HashMap::new();
-        let out1 = builder
-            .build_into_cas_incremental(&c1, &cas, None, 6, &empty, DEFAULT_ARCHIVE_CHUNK_SIZE)
+        let builder = ArchiveBuilder::new(tmp.path()).with_cdc(SMALL_CDC);
+        let c1 = commit_onto(&repo, &as_refs(&base));
+        let out = builder
+            .build_into_cas(&c1, &cas, None, 3, None, None, SMALL_BUNDLE)
             .unwrap();
-        assert_eq!(
-            out1.new_reuse_frame_hashes.len(),
-            out1.archive_frames.len(),
-            "first build: every frame built"
-        );
         assert!(
-            out1.archive_frames.len() >= 2,
-            "20 MiB should span multiple CDC frames"
+            out.archive_frames.len() > 15 && out.download_bundle_hashes.len() > 3,
+            "need many frames and bundles, got {} and {}",
+            out.archive_frames.len(),
+            out.download_bundle_hashes.len()
         );
-
-        let prev: HashMap<String, (String, u64)> = out1
-            .archive_frames
+        let prior = Prior {
+            builder: &builder,
+            cas: &cas,
+            out: &out,
+            bundle_size: SMALL_BUNDLE,
+        };
+        // Commits update one ref, so they are made in turn.
+        let commits: Vec<String> = scenarios
             .iter()
-            .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
+            .map(|scenario| commit_onto(&repo, &as_refs(&scenario(&base))))
             .collect();
-
-        // Same commit → full reuse.
-        let out1b = builder
-            .build_into_cas_incremental(&c1, &cas, None, 6, &prev, DEFAULT_ARCHIVE_CHUNK_SIZE)
-            .unwrap();
-        assert_eq!(
-            out1b.new_reuse_frame_hashes.len(),
-            0,
-            "identical commit reuses all frames"
-        );
-
-        // Change only the trailing small file → only the last frame changes.
-        let c2 = commit_onto_bytes(&repo, &[(b"a.bin", &big), (b"z.txt", b"changed!")]);
-        let out2 = builder
-            .build_into_cas_incremental(&c2, &cas, None, 6, &prev, DEFAULT_ARCHIVE_CHUNK_SIZE)
-            .unwrap();
-        assert!(
-            out2.new_reuse_frame_hashes.len() < out2.archive_frames.len(),
-            "re-sync reuses unchanged frames (built {} of {})",
-            out2.new_reuse_frame_hashes.len(),
-            out2.archive_frames.len()
-        );
-        assert!(
-            !out2.new_reuse_frame_hashes.is_empty(),
-            "the changed frame is rebuilt"
-        );
+        std::thread::scope(|scope| {
+            let (prior, mirror) = (&prior, tmp.path());
+            let handles: Vec<_> = commits
+                .iter()
+                .enumerate()
+                .map(|(i, c2)| {
+                    scope.spawn(move || {
+                        let out = build_on(prior, None, c2).unwrap();
+                        let stream = archive_stream(&out, |h| prior.cas.get(h).unwrap());
+                        assert!(
+                            stream == tree_stream(mirror, c2),
+                            "scenario {i}: stream differs"
+                        );
+                        let reuse = out.reuse;
+                        assert!(reuse.incremental, "scenario {i}: {reuse:?}");
+                        assert!(reuse.frames_reused > 0, "scenario {i}: {reuse:?}");
+                        assert!(reuse.bundles_reused > 0, "scenario {i}: {reuse:?}");
+                        if i == 0 {
+                            assert_eq!(reuse.bytes_read, 0, "identical commit: {reuse:?}");
+                            assert_eq!(reuse.frames_built + reuse.bundles_built, 0, "{reuse:?}");
+                        } else {
+                            assert!(reuse.bytes_read > 0, "scenario {i}: {reuse:?}");
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("incremental scenario panicked");
+            }
+        });
     }
 
+    /// The base's bundles may be gone from the local cache (evicted after
+    /// upload, or a fresh disk). Frames that move to a new bundle are then
+    /// read from storage and checked: a correct copy builds an exact
+    /// archive; a corrupt copy of the right length fails the build.
     #[test]
-    fn bundled_archive_reuse_can_read_frames_from_storage_when_local_cas_is_cold() {
-        use std::collections::HashMap;
+    fn incremental_archive_reads_base_frames_from_storage() {
+        let base: Vec<(String, Vec<u8>)> = (0..10)
+            .map(|s| (format!("f{s:02}.bin"), mix_blob(s, 200_000)))
+            .collect();
+        let mut edited = base.clone();
+        edited[5].1 = mix_blob(900, 200_000);
 
         let tmp = tempfile::tempdir().unwrap();
         let repo = crate::test_fixture::init_bare(tmp.path());
@@ -1611,173 +1723,53 @@ mod tests {
         let cas = Cas::new(cas_dir.path()).unwrap();
         let storage_dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::local(storage_dir.path()).unwrap();
-        let builder = ArchiveBuilder::new(tmp.path());
-
-        let commit = commit_onto_bytes(
-            &repo,
-            &[
-                (b"a.txt", b"alpha"),
-                (b"b.txt", b"bravo"),
-                (b"c.txt", b"charlie"),
-            ],
-        );
-        let empty: HashMap<String, (String, u64)> = HashMap::new();
-        let first = builder
-            .build_into_cas_incremental(&commit, &cas, None, 3, &empty, 16)
+        let builder = ArchiveBuilder::new(tmp.path()).with_cdc(SMALL_CDC);
+        let c1 = commit_onto(&repo, &as_refs(&base));
+        let c2 = commit_onto(&repo, &as_refs(&edited));
+        // Bundles of several frames, so frames next to the edit move.
+        let bundle_size = 16 * SMALL_BUNDLE;
+        let out = builder
+            .build_into_cas(&c1, &cas, None, 3, None, None, bundle_size)
             .unwrap();
-
-        for frame in &first.archive_frames {
-            let data = cas.get(&frame.chunk_hash).unwrap();
-            storage.put(&frame.chunk_hash, &data).unwrap();
-            cas.remove(&frame.chunk_hash).unwrap();
-            assert!(
-                !cas.has(&frame.chunk_hash),
-                "test setup should remove local frame {}",
-                frame.chunk_hash
-            );
+        for hash in &out.download_bundle_hashes {
+            storage.put(hash, &cas.get(hash).unwrap()).unwrap();
+            cas.remove(hash).unwrap();
         }
+        let prior = Prior {
+            builder: &builder,
+            cas: &cas,
+            out: &out,
+            bundle_size,
+        };
 
-        let prev: HashMap<String, (String, u64)> = first
-            .archive_frames
-            .iter()
-            .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
-            .collect();
-        let second = builder
-            .build_into_cas_incremental(&commit, &cas, Some(&storage), 3, &prev, 16)
-            .unwrap();
-
-        assert_eq!(
-            second.new_reuse_frame_hashes.len(),
-            0,
-            "identical commit should reuse every per-frame chunk"
-        );
-        assert_eq!(second.archive_frames.len(), first.archive_frames.len());
-        assert!(!second.download_bundle_hashes.is_empty());
-        for frame in &second.archive_frames {
-            assert!(
-                cas.has(&frame.chunk_hash),
-                "storage fallback should refill local CAS for {}",
-                frame.chunk_hash
-            );
-        }
-    }
-
-    #[test]
-    fn bundled_archive_rejects_corrupt_storage_frame_with_matching_length() {
-        let cas_dir = tempfile::tempdir().unwrap();
-        let cas = Cas::new(cas_dir.path()).unwrap();
-        let raw = b"correct frame bytes";
-        let compressed = compress_frame(raw, 3).unwrap();
-        let hash = crate::cas::hash(&compressed);
-        let corrupt = vec![compressed[0].wrapping_add(1); compressed.len()];
-        let storage: crate::storage::StorageRef = std::sync::Arc::new(CorruptFrameStorage {
-            hash: hash.clone(),
-            data: corrupt,
-        });
-
-        let frames = vec![crate::ArchiveFrame {
-            raw_hash: crate::cas::hash(raw),
-            chunk_hash: hash.clone(),
-            compressed_len: compressed.len() as u64,
-            raw_len: raw.len() as u64,
-        }];
-        let frame_infos = vec![FrameInfo {
-            chunk_index: 0,
-            chunk_offset: 0,
-            compressed_len: compressed.len() as u32,
-            raw_len: raw.len() as u32,
-        }];
-
-        let err = ArchiveBuilder::bundle_archive_frames(
-            &cas,
-            Some(&storage),
-            DEFAULT_ARCHIVE_CHUNK_SIZE,
-            &frames,
-            &frame_infos,
-            &Default::default(),
-        )
-        .unwrap_err();
+        let corrupt: crate::storage::StorageRef = std::sync::Arc::new(CorruptStorage);
+        let Err(err) = build_on(&prior, Some(&corrupt), &c2) else {
+            panic!("a corrupt base frame must fail the build");
+        };
         assert!(
             format!("{err:#}").contains("hash mismatch"),
             "unexpected error: {err:#}"
         );
+
+        let rebuilt = build_on(&prior, Some(&storage), &c2).unwrap();
+        assert!(rebuilt.reuse.frames_reused > 0, "{:?}", rebuilt.reuse);
+        let stream = archive_stream(&rebuilt, |h| {
+            cas.get(h).or_else(|_| storage.get(h)).unwrap()
+        });
+        assert!(stream == tree_stream(tmp.path(), &c2), "stream differs");
     }
 
-    #[test]
-    fn bundled_archive_frame_table_slices_multiple_download_bundles() {
-        let cas_dir = tempfile::tempdir().unwrap();
-        let cas = Cas::new(cas_dir.path()).unwrap();
-        let raws = [
-            b"alpha alpha alpha".to_vec(),
-            b"bravo bravo bravo".to_vec(),
-            b"charlie charlie charlie".to_vec(),
-            b"delta delta delta".to_vec(),
-        ];
-        let mut frames = Vec::new();
-        let mut frame_infos = Vec::new();
-        for (idx, raw) in raws.iter().enumerate() {
-            let compressed = compress_frame(raw, 3).unwrap();
-            let hash = cas.put(&compressed).unwrap();
-            frames.push(crate::ArchiveFrame {
-                raw_hash: crate::cas::hash(raw),
-                chunk_hash: hash,
-                compressed_len: compressed.len() as u64,
-                raw_len: raw.len() as u64,
-            });
-            frame_infos.push(FrameInfo {
-                chunk_index: idx as u32,
-                chunk_offset: 0,
-                compressed_len: compressed.len() as u32,
-                raw_len: raw.len() as u32,
-            });
-        }
-
-        let target = frames[0].compressed_len + frames[1].compressed_len / 2;
-        let (bundle_hashes, bundled_frames) = ArchiveBuilder::bundle_archive_frames(
-            &cas,
-            None,
-            target,
-            &frames,
-            &frame_infos,
-            &Default::default(),
-        )
-        .unwrap();
-        let mut metadata = MetadataChunk::new();
-        metadata.frames = bundled_frames.clone();
-        let lengths = crate::clonepack::archive_chunk_lengths(&metadata).unwrap();
-
-        assert!(
-            bundle_hashes.len() > 1,
-            "test must exercise multiple download bundles"
-        );
-        assert_eq!(lengths.len(), bundle_hashes.len());
-        for (idx, info) in bundled_frames.iter().enumerate() {
-            let bundle = cas.get(&bundle_hashes[info.chunk_index as usize]).unwrap();
-            let start = info.chunk_offset as usize;
-            let end = start + info.compressed_len as usize;
-            assert!(end <= bundle.len(), "frame {idx} outside bundle bounds");
-            let decoded = zstd::decode_all(&bundle[start..end]).unwrap();
-            assert_eq!(decoded, raws[idx], "frame {idx} decoded from bundle slice");
-        }
-    }
-
-    struct CorruptFrameStorage {
-        hash: String,
-        data: Vec<u8>,
-    }
+    /// Storage that returns wrong bytes of the right length.
+    struct CorruptStorage;
 
     #[async_trait::async_trait]
-    impl crate::storage::StorageBackend for CorruptFrameStorage {
-        fn get(&self, hash: &str) -> Result<Vec<u8>> {
-            if hash == self.hash {
-                Ok(self.data.clone())
-            } else {
-                anyhow::bail!("not found")
-            }
+    impl crate::storage::StorageBackend for CorruptStorage {
+        fn get(&self, _hash: &str) -> Result<Vec<u8>> {
+            anyhow::bail!("not found")
         }
 
-        fn get_range(&self, _hash: &str, _start: u64, _len: u64) -> Result<Vec<u8>> {
-            anyhow::bail!("unsupported")
+        fn get_range(&self, _hash: &str, _start: u64, len: u64) -> Result<Vec<u8>> {
+            Ok(vec![0x5a; len as usize])
         }
 
         fn put(&self, _hash: &str, _data: &[u8]) -> Result<()> {
@@ -1868,211 +1860,6 @@ mod tests {
 
     fn as_refs(fs: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
         fs.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect()
-    }
-
-    /// The prior commit's build, shared by every scenario of
-    /// `bounded_archive_matches_incremental`.
-    struct Prior<'a> {
-        builder: &'a ArchiveBuilder,
-        cas: &'a Cas,
-        commit: &'a str,
-        out: &'a ArchiveBuildOutput,
-    }
-
-    /// Build the bounded archive at commit `c2` (with `prior` as the previous
-    /// build) and assert it is byte-identical to the full incremental build: same
-    /// per-frame chunk hashes, frame table, and files table.
-    fn assert_bounded_matches(prior: &Prior, c2: &str) {
-        use std::collections::HashMap;
-        let prev_map: HashMap<String, (String, u64)> = prior
-            .out
-            .archive_frames
-            .iter()
-            .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
-            .collect();
-        let inc = prior
-            .builder
-            .build_into_cas_incremental(
-                c2,
-                prior.cas,
-                None,
-                3,
-                &prev_map,
-                DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
-            .unwrap();
-        let bnd = prior
-            .builder
-            .build_into_cas_bounded(
-                c2,
-                prior.cas,
-                None,
-                3,
-                &prior.out.archive_frames,
-                &prior.out.metadata.files,
-                prior.commit,
-                DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
-            .unwrap();
-
-        assert_eq!(
-            inc.download_bundle_hashes, bnd.download_bundle_hashes,
-            "download bundle hashes differ"
-        );
-        let fr = |fs: &[crate::ArchiveFrame]| {
-            fs.iter()
-                .map(|f| {
-                    (
-                        f.raw_hash.clone(),
-                        f.chunk_hash.clone(),
-                        f.compressed_len,
-                        f.raw_len,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            fr(&inc.archive_frames),
-            fr(&bnd.archive_frames),
-            "frame tables differ"
-        );
-        let fl = |m: &MetadataChunk| {
-            m.files
-                .iter()
-                .map(|f| {
-                    (
-                        f.path.clone(),
-                        f.mode,
-                        f.blob_sha1.clone(),
-                        f.fragments
-                            .iter()
-                            .map(|x| (x.frame_index, x.frame_offset, x.raw_len))
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(fl(&inc.metadata), fl(&bnd.metadata), "files tables differ");
-    }
-
-    /// The bounded archive (read only the changed middle) must be byte-identical to
-    /// the full incremental build across edit positions and shapes — a wrong
-    /// prefix/suffix reuse or a bad offset shift would diverge here. Frames are
-    /// the production bounds scaled down 64x, so 2 MB spans about 20 of them
-    /// and a change has whole frames more than one max frame away on both
-    /// sides to reuse. The prior commit is built once; the scenarios' builds
-    /// run in parallel.
-    #[test]
-    fn bounded_archive_matches_incremental() {
-        const SCALE: usize = 64;
-        let cdc = CdcBounds {
-            min: CDC.min / SCALE,
-            avg: CDC.avg / SCALE,
-            max: CDC.max / SCALE,
-        };
-        let mix_blob = |seed| mix_blob(seed, 200_000);
-        let base: Vec<(String, Vec<u8>)> = (0..10)
-            .map(|s| (format!("f{s:02}.bin"), mix_blob(s)))
-            .collect();
-
-        let scenarios: Vec<
-            Box<dyn Fn(&[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> + Send + Sync>,
-        > = vec![
-            Box::new(|base| {
-                // Same-size edit in the middle (unchanged prefix + suffix).
-                let mut middle = base.to_vec();
-                middle[5].1 = mix_blob(900);
-                middle
-            }),
-            Box::new(|base| {
-                // Edit at the head (large unchanged suffix to reuse).
-                let mut head = base.to_vec();
-                head[0].1 = mix_blob(901);
-                head
-            }),
-            Box::new(|base| {
-                // Edit at the tail (large unchanged prefix to reuse).
-                let mut tail = base.to_vec();
-                tail[9].1 = mix_blob(902);
-                tail
-            }),
-            Box::new(|base| {
-                // Size-growing edit in the middle (shifts the suffix by a positive delta).
-                let mut grow = base.to_vec();
-                grow[5].1 = {
-                    let mut v = mix_blob(903);
-                    v.extend(mix_blob(904));
-                    v
-                };
-                grow
-            }),
-            Box::new(|base| {
-                // Deletion in the middle (shifts the suffix by a negative delta).
-                let mut del = base.to_vec();
-                del.remove(5);
-                del
-            }),
-            Box::new(|base| {
-                // Addition in the middle (new file between unchanged neighbors).
-                let mut add = base.to_vec();
-                add.insert(5, ("f05b.bin".to_string(), mix_blob(905)));
-                add
-            }),
-            Box::new(|base| {
-                // Spread edits at several positions (multiple dirty regions with
-                // unchanged frames reused between them).
-                let mut spread = base.to_vec();
-                spread[1].1 = mix_blob(906);
-                spread[5].1 = mix_blob(907);
-                spread[8].1 = mix_blob(908);
-                spread
-            }),
-            Box::new(|base| {
-                // A modify + a delete + an insert at once.
-                let mut mixed = base.to_vec();
-                mixed[2].1 = mix_blob(909);
-                mixed.remove(6);
-                mixed.insert(4, ("f03b.bin".to_string(), mix_blob(910)));
-                mixed
-            }),
-        ];
-
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = crate::test_fixture::init_bare(tmp.path());
-        let cas_dir = tempfile::tempdir().unwrap();
-        let cas = Cas::new(cas_dir.path()).unwrap();
-        let builder = ArchiveBuilder::new(tmp.path()).with_cdc(cdc);
-        let c1 = commit_onto(&repo, &as_refs(&base));
-        let empty = std::collections::HashMap::new();
-        let out = builder
-            .build_into_cas_incremental(&c1, &cas, None, 3, &empty, DEFAULT_ARCHIVE_CHUNK_SIZE)
-            .unwrap();
-        assert!(
-            out.archive_frames.len() > 15,
-            "need many frames to exercise reuse, got {}",
-            out.archive_frames.len()
-        );
-        let prior = Prior {
-            builder: &builder,
-            cas: &cas,
-            commit: &c1,
-            out: &out,
-        };
-        // Commits update one ref, so they are made in turn.
-        let commits: Vec<String> = scenarios
-            .iter()
-            .map(|scenario| commit_onto(&repo, &as_refs(&scenario(&base))))
-            .collect();
-        std::thread::scope(|scope| {
-            let prior = &prior;
-            let handles: Vec<_> = commits
-                .iter()
-                .map(|c2| scope.spawn(move || assert_bounded_matches(prior, c2)))
-                .collect();
-            for h in handles {
-                h.join().expect("bounded scenario panicked");
-            }
-        });
     }
 
     /// Commit raw-byte paths (so we can use a non-UTF8 filename).
@@ -2275,12 +2062,13 @@ mod tests {
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let output = builder
-            .build_into_cas_incremental(
+            .build_into_cas(
                 &commit,
                 &cas,
                 None,
                 1,
-                &std::collections::HashMap::new(),
+                None,
+                None,
                 DEFAULT_ARCHIVE_CHUNK_SIZE,
             )
             .unwrap();
@@ -2337,12 +2125,11 @@ mod tests {
         }
     }
 
-    /// The streaming chunker must produce byte-identical frame boundaries to the
-    /// slice-based chunker over the same path-ordered worktree. This is what lets
-    /// us drop the whole-worktree buffer without invalidating already-stored
-    /// archives or per-frame reuse keys.
+    /// The pipelined stream (parallel reads, cutting, compressing) must cut
+    /// the same frames as the slice-based chunker over the same worktree, and
+    /// hash each blob as the files table does.
     #[test]
-    fn stream_cdc_bounds_match_slice_cdc() {
+    fn stream_frames_match_slice_cdc() {
         // High-entropy xorshift bytes so CDC finds real content-defined cut
         // points (not just max-size cuts) — that's what makes the streaming vs.
         // slice boundary equivalence a meaningful check.
@@ -2368,38 +2155,30 @@ mod tests {
         let (tmp, commit) = commit_files(&files_ref);
 
         let builder = ArchiveBuilder::new(tmp.path());
-        let repo = crate::gix_util::open_repo(tmp.path()).unwrap();
-        let id = repo.rev_parse_single(commit.as_str()).unwrap();
-        let tree_id = repo.find_commit(id).unwrap().tree_id().unwrap().detach();
-
-        // Streaming bounds (process closure is a no-op: one unit per frame).
-        let (_m, stream_bounds, raw_total, outputs) = builder
-            .stream_cdc(&repo, tree_id, |batch| Ok(vec![(); batch.len()]))
+        let layout = builder.layout(&commit).unwrap();
+        let mut frames = 0usize;
+        let (stream_bounds, sha1s) = builder
+            .stream_frames(&layout, true, 1, None, |_| {
+                frames += 1;
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(outputs.len(), stream_bounds.len(), "one output per frame");
+        assert_eq!(frames, stream_bounds.len(), "one frame per bound");
 
-        // Reference: concatenate the same blobs in walk order and slice-CDC them.
-        let mut blobs = Vec::new();
-        collect_blobs_raw_gix(&repo, tree_id, &mut blobs).unwrap();
-        let mut full = Vec::new();
-        for (_p, oid, _mode) in &blobs {
-            full.extend_from_slice(&repo.find_blob(*oid).unwrap().data);
-        }
-        let ref_bounds = cdc_frame_bounds(&full);
-
+        let full = tree_stream(tmp.path(), &commit);
         assert_eq!(
-            stream_bounds, ref_bounds,
+            stream_bounds,
+            cdc_frame_bounds(&full),
             "streaming CDC boundaries must match slice CDC"
-        );
-        assert_eq!(
-            raw_total,
-            full.len() as u64,
-            "raw_total must match stream len"
         );
         assert!(
             stream_bounds.len() >= 3,
             "test data should span many frames"
         );
+        let table = builder.build_files_table(&commit).unwrap();
+        let expected: Vec<Vec<u8>> = table.files.iter().map(|f| f.blob_sha1.clone()).collect();
+        let got: Vec<Vec<u8>> = sha1s.iter().map(|h| h.to_vec()).collect();
+        assert_eq!(got, expected, "blob SHA-1s");
     }
 
     /// A non-UTF8 filename must survive into the archive manifest byte-exact (the

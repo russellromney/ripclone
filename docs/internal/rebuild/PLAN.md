@@ -92,9 +92,10 @@ replaced, so several half-models now run at once:
 8. **One mirror shape, one fetch function, mirror writes under the mirror
    lock** (fetch, commit-graph, compaction). Builds read the mirror under a
    shared lock and fetch only a commit it lacks; compaction deletes packs, so
-   it runs only while no build reads. The bitmap a cold Full writes covers
-   only the packs it found, so it runs under the shared lock and fetches
-   continue during it.
+   it runs only while no build reads. No reachability bitmap is written: a
+   cold Full packs history with a plain `pack-objects --revs` walk. The
+   mirror's `attr.tree` names the empty tree, so that walk does not resolve
+   the mirror's missing `HEAD` once per object.
 
 ## Keep (reuse with little change)
 

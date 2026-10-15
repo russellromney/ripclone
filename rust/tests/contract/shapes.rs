@@ -3,7 +3,7 @@
 use crate::harness::*;
 
 /// An origin with history, a nested dir, an executable, and a symlink.
-fn rich_origin(world: &World, name: &str) -> (Origin, String) {
+pub fn rich_origin(world: &World, name: &str) -> (Origin, String) {
     let origin = world.origin("acme", name);
     origin.commit(&[("README.md", "v1\n")], "one");
     origin.commit(&[("src/main.rs", "fn main() {}\n")], "two");
@@ -258,6 +258,9 @@ pub fn stored_bytes(world: &World) -> u64 {
 /// G6: after a small push, the Files build of B reuses A's archive. A Files
 /// clone of B downloads chunks a Files clone of A also downloaded, the
 /// store grows by much less than the repository, and B's tree is exact.
+/// Two more pushes, each Files built on the last: an edit inside a large
+/// file plus a new file beside it; then a delete, a move, an exec bit, a
+/// symlink and 50 small files. Each Files clone is exact.
 #[test]
 fn g6_incremental_files_rebuild_after_small_push() {
     let world = World::new();
@@ -313,6 +316,56 @@ fn g6_incremental_files_rebuild_after_small_push() {
         grown < (12 << 20) / 2,
         "B's builds stored {grown} bytes for a one-line change"
     );
+
+    let write = |path: &str, bytes: &[u8]| {
+        let path = origin.work.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    };
+    let pushes = [
+        "C: edit inside a large file, add one beside it",
+        "D: delete, move, exec bit, symlink, small files",
+    ];
+    for (i, what) in pushes.into_iter().enumerate() {
+        match i {
+            0 => {
+                let path = origin.work.join("data/1.bin");
+                let mut bytes = std::fs::read(&path).unwrap();
+                let middle = bytes.len() / 2;
+                bytes[middle..middle + (64 << 10)]
+                    .copy_from_slice(&crate::downloads::noise(9, 64 << 10));
+                std::fs::write(path, bytes).unwrap();
+                write("data/1a.bin", &crate::downloads::noise(10, 256 << 10));
+            }
+            _ => {
+                std::fs::remove_file(origin.work.join("data/2.bin")).unwrap();
+                std::fs::create_dir_all(origin.work.join("data/x")).unwrap();
+                std::fs::rename(
+                    origin.work.join("data/0.bin"),
+                    origin.work.join("data/x/0.bin"),
+                )
+                .unwrap();
+                write("bin/run.sh", b"#!/bin/sh\necho hi\n");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let script = origin.work.join("bin/run.sh");
+                    std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    std::os::unix::fs::symlink("data/1a.bin", origin.work.join("link.bin"))
+                        .unwrap();
+                }
+                for n in 0..50 {
+                    write(&format!("src/{n:02}.txt"), format!("file {n}\n").as_bytes());
+                }
+            }
+        }
+        let tip = origin.commit(&[], what);
+        origin.publish();
+        world.cli(&server, &["sync", "acme/g6", "--wait"]).ok();
+        let (target, _) = files_clone(&format!("g6-{i}"));
+        assert_eq!(listing(&target), origin.tree(&tip), "{what}");
+    }
 }
 
 /// G7: a push deletes a file and a later push re-adds the same bytes (the

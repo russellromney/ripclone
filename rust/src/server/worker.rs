@@ -14,10 +14,8 @@
 //! Builds read it under a shared lock. A build fetches its commit only when
 //! the mirror lacks it, under the repo's write lock, so a Files or Full whose
 //! commit Head already fetched never waits on another commit's fetch. Full
-//! keeps the mirror small: it writes the commit-graph, compacts the mirror
-//! when no build reads it, and writes the bitmap right before a cold history
-//! build, the one build that uses it. The bitmap write only reads the mirror's
-//! packs, so it holds the shared lock and fetches proceed during it.
+//! keeps the mirror small: it writes the commit-graph and compacts the mirror
+//! when no build reads it.
 //!
 //! Each output builds incrementally from the same output of its base: the
 //! newest commit of the repo with that output ready that is an ancestor of
@@ -49,10 +47,6 @@ const RETRY_CAP: Duration = Duration::from_secs(300);
 /// Full. They hold the repo's write lock, which a build waits on only when
 /// it must fetch.
 const UPKEEP_TIMEOUT: Duration = Duration::from_secs(120);
-/// Cap on the bitmap written before a cold history build: a repo's first
-/// Full, or one after a force push. It does not hold the write lock, so
-/// fetches of new pushes proceed during it.
-const BITMAP_TIMEOUT: Duration = Duration::from_secs(600);
 /// After a failed compaction, a repo's Fulls skip compaction this long.
 const COMPACT_BACKOFF: Duration = Duration::from_secs(3600);
 
@@ -78,17 +72,19 @@ impl WorkerSettings {
 
     /// Slot defaults scale with `cores`. A Head build is mostly
     /// single-threaded git and gix work plus uploads, so a quarter of the
-    /// cores, at least 2. Files compresses with zstd and Full runs
-    /// multi-threaded `pack-objects`, each using several cores, so an eighth,
-    /// at least 1. A repo holds at most one slot of each pool, so more slots
-    /// only help when more repos build at once.
+    /// cores, at least 2. A Files build after the first reads and compresses
+    /// only changed bytes and waits on uploads, so it gets as many slots as
+    /// Head; one slow repo's Files then does not hold back every other
+    /// repo's. Full runs multi-threaded `pack-objects` on all cores, so an
+    /// eighth, at least 1. A repo holds at most one slot of each pool, so more
+    /// slots only help when more repos build at once.
     fn from_lookup(get: impl Fn(&str) -> Option<String>, cores: usize) -> Result<Self> {
         let number = |key: &str, default: usize| -> Result<u64> {
             crate::env::parse_number(key, get(key).as_deref(), default as u64)
         };
         let head_slots = number("RIPCLONE_HEAD_SLOTS", (cores / 4).max(2))?;
         anyhow::ensure!(head_slots >= 1, "RIPCLONE_HEAD_SLOTS must be at least 1");
-        let files_slots = number("RIPCLONE_FILES_SLOTS", (cores / 8).max(1))?;
+        let files_slots = number("RIPCLONE_FILES_SLOTS", (cores / 4).max(2))?;
         let full_slots = number("RIPCLONE_FULL_SLOTS", (cores / 8).max(1))?;
         let retry_base = number("RIPCLONE_BUILD_RETRY_BASE_MS", 2000)?;
         let max_attempts = number("RIPCLONE_BUILD_MAX_ATTEMPTS", 5)?;
@@ -675,7 +671,6 @@ async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim
             &head,
             levels,
             &state.storage,
-            write_bitmap_before_cold(&mirror_dir),
             &mut phases,
         )
         .await
@@ -753,30 +748,6 @@ async fn upkeep_mirror(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         }
-    }
-}
-
-/// Run by a Full right before a cold history build: write the mirror's
-/// reachability bitmap, which the cold build walks history with.
-/// Best-effort: without it the cold build is slower.
-///
-/// It runs under the Full's shared read lock only, not the write lock, so a
-/// new push's fetch proceeds during it. A fetch only adds a pack, and
-/// `multi-pack-index write` covers the packs it found when it started: a
-/// commit in those packs reaches only objects in them, so the bitmap stays
-/// closed, and a pack added later is outside the bitmap, where git finds its
-/// objects without one. The new index and bitmap are written under git's own
-/// lock file and renamed into place. Compaction, the only step that deletes
-/// packs or also writes the multi-pack-index, needs the read lock
-/// exclusively, so it never runs alongside. A repo's Fulls run one at a time,
-/// so two bitmap writes of one mirror never overlap; if one did, the second
-/// would fail on git's lock file and the cold build would walk without it.
-async fn write_bitmap_before_cold(mirror_dir: &std::path::Path) {
-    let dir = mirror_dir.to_path_buf();
-    match cancel::spawn_blocking(move || git::write_bitmap(&dir, BITMAP_TIMEOUT)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!("mirror bitmap failed: {error:#}"),
-        Err(error) => warn!("mirror bitmap task failed: {error}"),
     }
 }
 
@@ -872,17 +843,17 @@ mod tests {
             defaults,
             WorkerSettings {
                 head_slots: 2,
-                files_slots: 1,
+                files_slots: 2,
                 full_slots: 1,
                 retry_base: Duration::from_millis(2000),
                 max_attempts: 5,
             }
         );
-        for (cores, head, background) in [(1, 2, 1), (16, 4, 2), (64, 16, 8)] {
+        for (cores, head, full) in [(1, 2, 1), (16, 4, 2), (64, 16, 8)] {
             let scaled = WorkerSettings::from_lookup(|_| None, cores).unwrap();
             assert_eq!(
                 (scaled.head_slots, scaled.files_slots, scaled.full_slots),
-                (head, background, background),
+                (head, head, full),
                 "{cores} cores"
             );
         }

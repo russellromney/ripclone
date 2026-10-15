@@ -28,13 +28,14 @@ pub fn output_states(server: &Server, repo: &str, commit: &str) -> [String; 3] {
 }
 
 /// C1: with no Files or Full slots, a depth-1 clone succeeds on Head alone
-/// while Full and Files stay pending.
+/// while Full and Files stay pending. A files clone does not wait either: it
+/// writes B's tree, exec bits and symlink included, from Head(B), with no
+/// `.git`. With `--wait` the files clone waits for Files(B), reports it
+/// pending, and installs nothing.
 #[test]
 fn c1_head_clones_while_background_outputs_pend() {
     let world = World::new();
-    let origin = world.origin("acme", "c1");
-    let tip = origin.commit(&[("a.txt", "a\n"), ("b/c.txt", "c\n")], "B");
-    origin.publish();
+    let (origin, tip) = crate::shapes::rich_origin(&world, "c1");
     let server = world.server(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
     world.cli(&server, &["add", "acme/c1"]).ok();
 
@@ -48,6 +49,39 @@ fn c1_head_clones_while_background_outputs_pend() {
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
     assert_eq!(listing(&target), origin.tree(&tip));
 
+    let files = world.target("c1-files");
+    world
+        .cli(
+            &server,
+            &[
+                "clone",
+                "acme/c1",
+                files.to_str().unwrap(),
+                "--mode",
+                "files",
+            ],
+        )
+        .ok();
+    assert_eq!(listing(&files), origin.tree(&tip));
+    assert!(!files.join(".git").exists(), "a files clone has no .git");
+
+    let waited = world.target("c1-files-wait");
+    let out = world.cli_env(
+        &server,
+        &[
+            "clone",
+            "acme/c1",
+            waited.to_str().unwrap(),
+            "--mode",
+            "files",
+            "--wait",
+        ],
+        &[("RIPCLONE_POLL_MS", "50")],
+    );
+    let err = out.err();
+    assert!(err.contains("pending") && err.contains(&tip), "{err}");
+    assert!(!waited.exists(), "failed clone left {}", waited.display());
+
     assert_eq!(
         output_states(&server, "acme/c1", &tip),
         ["ready", "pending", "pending"]
@@ -60,6 +94,57 @@ fn c1_head_clones_while_background_outputs_pend() {
             0,
             "{kind}"
         );
+    }
+}
+
+/// C9: while the origin holds B's fetch, nothing of B is ready, though every
+/// output of A is. A files clone and a depth-1 clone of B each wait, report
+/// B pending, and install nothing: neither falls back to A. After release,
+/// both install B.
+#[test]
+fn c9_files_and_depth_1_clones_never_fall_back_to_another_commit() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let origin = world.origin("acme", "c9");
+    origin.commit(&[("f.txt", "a\n")], "A");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/c9", "--wait"]).ok();
+    let b = origin.commit(&[("f.txt", "b\n"), ("g.txt", "g\n")], "B");
+    origin.publish();
+    http.hold_fetches();
+
+    let proxy = FaultProxy::start(&server);
+    let shapes: [(&str, &[&str]); 2] = [
+        ("files", &["--mode", "files"]),
+        ("depth1", &["--depth", "1"]),
+    ];
+    for (shape, args) in shapes {
+        let target = world.target(&format!("c9-{shape}"));
+        let mut argv = vec!["clone", "acme/c9", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        let out = world.cli_env(&proxy, &argv, &[("RIPCLONE_POLL_MS", "50")]);
+        let err = out.err();
+        assert!(
+            err.contains("pending") && err.contains(&b),
+            "{shape}: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "{shape}: failed clone left {}",
+            target.display()
+        );
+    }
+    assert!(proxy.artifact_gets().is_empty(), "a clone downloaded");
+    assert!(world.staging_leftovers().is_empty());
+
+    http.release_fetches();
+    for (shape, args) in shapes {
+        let target = world.target(&format!("c9-{shape}-after"));
+        let mut argv = vec!["clone", "acme/c9", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&server, &argv).ok();
+        assert_eq!(listing(&target), origin.tree(&b), "{shape}");
     }
 }
 

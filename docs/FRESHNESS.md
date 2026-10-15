@@ -24,9 +24,21 @@ and installs that commit, even if the branch moves during the clone.
 | Clone | Needs | If it is still building |
 |---|---|---|
 | `--depth 1` | Head | waits for it |
-| `--mode files` | Files | waits for it |
+| `--mode files` | Files | writes the same commit's tree from its Head, or waits if Head is pending too |
+| `--mode files` with `--wait` | Files | waits for it |
 | full (default) | Full | tops up from an earlier Full, or waits if there is none |
 | full with `--wait` | Full | waits for it |
+
+A depth-1 clone always waits: Head is the first result built for a commit,
+so nothing else for that commit can be ready before it.
+
+## Files from Head
+
+While Files(B) is pending, a files clone checks whether Head(B) is ready. If
+it is, the clone downloads Head(B)'s packs and writes B's working tree from
+them, the same files with the same modes that Files(B) would give, and no
+`.git`. Head's packs compress each blob on its own, so this can download
+more bytes than Files. It never uses another commit.
 
 ## Top-up
 

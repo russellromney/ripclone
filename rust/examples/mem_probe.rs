@@ -1,4 +1,4 @@
-//! Peak-RSS probe for the phase-2 archive build (`build_into_cas_incremental`).
+//! Peak-RSS probe for the Files archive build (`build_into_cas`).
 //!
 //! Builds a synthetic many-file repo and runs the streaming archive build, then
 //! reports peak resident set size and the total compressed archive bytes. The
@@ -11,7 +11,6 @@
 
 use ripclone::archive::ArchiveBuilder;
 use ripclone::cas::Cas;
-use std::collections::HashMap;
 use std::process::Command;
 
 fn peak_rss_bytes() -> u64 {
@@ -83,11 +82,10 @@ fn main() {
     let cas_dir = tempfile::tempdir().unwrap();
     let cas = Cas::new(cas_dir.path()).unwrap();
     let builder = ArchiveBuilder::new(work.path());
-    let empty: HashMap<String, (String, u64)> = HashMap::new();
 
     let t = std::time::Instant::now();
     let result = builder
-        .build_into_cas_incremental(&commit, &cas, None, 3, &empty, 4 * 1024 * 1024)
+        .build_into_cas(&commit, &cas, None, 3, None, None, 4 * 1024 * 1024)
         .expect("archive build");
     let elapsed = t.elapsed();
 

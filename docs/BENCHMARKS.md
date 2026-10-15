@@ -83,8 +83,8 @@ history is one 326 MiB pack, so one stream from Tigris limits it.
 
 How long the server takes to make a commit clonable. git has no equivalent; it
 builds nothing ahead of time. Times are from the build request to each output
-being ready. A `--depth 1` clone waits for Head, a files clone for Files, and a
-full clone for Full.
+being ready. A `--depth 1` clone waits for Head, a files clone for Files (or
+for Head while Files is pending), and a full clone for Full.
 
 Cold, the first build of a repository, in seconds:
 

@@ -35,7 +35,8 @@ pub struct CloneRequest<'a> {
     pub at: Option<&'a str>,
     /// The output to install: Head (depth 1), Full, or Files.
     pub kind: ExactResultKind,
-    /// `--wait`: install the exact output, waiting for it, never a top-up.
+    /// `--wait`: install the exact output, waiting for it, never a top-up
+    /// and never a files clone from Head.
     pub wait: bool,
 }
 
@@ -51,6 +52,9 @@ struct Pin {
 /// The ready output a clone installs.
 enum Plan {
     Files(RefResponse),
+    /// The working tree of the pinned commit from its ready Head, while its
+    /// Files is pending. Head's packs hold every blob of the tree.
+    FilesFromHead(RefResponse),
     Head(RefResponse),
     Full(RefResponse),
     /// Full of an older commit; the pinned commit is fetched on top from
@@ -73,11 +77,23 @@ impl Plan {
     fn output(&self) -> &RefResponse {
         match self {
             Self::Files(output)
+            | Self::FilesFromHead(output)
             | Self::Head(output)
             | Self::Full(output)
             | Self::TopUp { base: output, .. } => output,
         }
     }
+}
+
+/// What a clone may install while its exact output is pending.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    /// Wait for the exact output.
+    None,
+    /// A full clone: the base Full a pending answer names, then a fetch.
+    TopUp,
+    /// A files clone: the working tree of the same commit's ready Head.
+    Head,
 }
 
 /// One chunk of the files archive on its way to the extractor.
@@ -119,20 +135,28 @@ impl Client {
 
         let pin = self.resolve(request).await?;
         // A full clone never waits on the server: while Full(B) builds, it
-        // installs the newest ready Full and fetches the rest upstream.
-        let allow_top_up = !request.wait && request.kind == ExactResultKind::Full;
-        let (plan, cold) = self
-            .plan(repo_path, &pin, request.kind, allow_top_up)
-            .await?;
+        // installs the newest ready Full and fetches the rest upstream. A
+        // files clone takes B's working tree from Head(B) while Files(B)
+        // builds. A depth-1 clone waits: Head is the first output of a commit.
+        let fallback = if request.wait {
+            Fallback::None
+        } else {
+            match request.kind {
+                ExactResultKind::Full => Fallback::TopUp,
+                ExactResultKind::Files => Fallback::Head,
+                ExactResultKind::Head => Fallback::None,
+            }
+        };
+        let (plan, cold) = self.plan(repo_path, &pin, request.kind, fallback).await?;
         bench.mark_resolve();
         let output = plan.output();
         info!(
             "resolved target {} using {} artifact {}",
             &pin.commit[..7],
-            if matches!(plan, Plan::TopUp { .. }) {
-                "base"
-            } else {
-                "exact"
+            match plan {
+                Plan::TopUp { .. } => "base",
+                Plan::FilesFromHead(_) => "head",
+                _ => "exact",
             },
             &output.commit[..7]
         );
@@ -205,14 +229,15 @@ impl Client {
     }
 
     /// Poll the pinned commit's `kind` output until it is ready or failed.
-    /// With `allow_top_up`, the first pending answer that names a base is
-    /// taken instead. Returns the plan and whether any poll saw it pending.
+    /// While it is pending, `fallback` may take another ready output instead:
+    /// the base a pending answer names, or the same commit's ready Head.
+    /// Returns the plan and whether any poll saw it pending.
     async fn plan(
         &self,
         repo_path: &str,
         pin: &Pin,
         kind: ExactResultKind,
-        allow_top_up: bool,
+        fallback: Fallback,
     ) -> Result<(Plan, bool)> {
         let target = &pin.commit;
         let mut cold = false;
@@ -235,7 +260,14 @@ impl Client {
                         "ref integrity error: expected commit {target} changed to {commit} in a pending response"
                     );
                     cold = true;
-                    if allow_top_up && let Some(plan) = top_up {
+                    if fallback == Fallback::Head
+                        && let Some(head) = self.ready_head(repo_path, target).await?
+                    {
+                        return Ok((Plan::FilesFromHead(head), cold));
+                    }
+                    if fallback == Fallback::TopUp
+                        && let Some(plan) = top_up
+                    {
                         crate::validation::validate_object_id(&plan.base_commit)
                             .context("invalid top-up base")?;
                         validate_output(&plan.base, &plan.base_commit, kind, repo_path)
@@ -266,6 +298,27 @@ impl Client {
         }))
     }
 
+    /// The pinned commit's Head when it is ready, `None` while it is pending.
+    /// A failed Head is not an error here: the clone keeps waiting for Files.
+    async fn ready_head(&self, repo_path: &str, target: &str) -> Result<Option<RefResponse>> {
+        match self
+            .commit_output(repo_path, target, ExactResultKind::Head)
+            .await?
+        {
+            CommitOutput::Ready(output) => {
+                validate_output(&output, target, ExactResultKind::Head, repo_path)?;
+                Ok(Some(*output))
+            }
+            CommitOutput::Pending { commit, .. } | CommitOutput::Failed { commit, .. } => {
+                anyhow::ensure!(
+                    commit == target,
+                    "ref integrity error: expected commit {target} changed to {commit} in a Head response"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Build the clone in a new staging directory next to `target` and
     /// return its path.
     #[allow(clippy::too_many_arguments)]
@@ -281,10 +334,18 @@ impl Client {
     ) -> Result<PathBuf> {
         let output = plan.output();
         let urls = OutputUrls::new(repo_path, output.clone());
-        if let Plan::Files(_) = plan {
-            return self
-                .materialize_files(&urls, target, staging, cleanup, bench)
-                .await;
+        match plan {
+            Plan::Files(_) => {
+                return self
+                    .materialize_files(&urls, target, staging, cleanup, bench)
+                    .await;
+            }
+            Plan::FilesFromHead(_) => {
+                return self
+                    .materialize_tree(&urls, target, staging, cleanup, bench)
+                    .await;
+            }
+            _ => {}
         }
         let root = self
             .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
@@ -415,6 +476,34 @@ impl Client {
         Ok(root)
     }
 
+    /// Files from Head: the working tree only, written from Head's packs as
+    /// they land. No `.git`: no pack, index or multi-pack-index is kept.
+    async fn materialize_tree(
+        &self,
+        urls: &OutputUrls,
+        target: &Path,
+        staging: &Staging,
+        cleanup: &Cleanup,
+        bench: &mut Benchmark,
+    ) -> Result<PathBuf> {
+        let (manifest, metadata) =
+            tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
+                .context("fetch manifest/metadata")?;
+        bench.mark_manifest();
+        bench.add_bytes(metadata_bytes(&metadata), 0);
+
+        let root = stage(target, staging)?;
+        bench.mark_metadata();
+        let bytes = self
+            .install_editable_packs(urls, &manifest, None, &root, &metadata, cleanup)
+            .await
+            .context("write the working tree from Head packs")?;
+        bench.mark_write();
+        info!("extracted {} files from Head packs", metadata.files.len());
+        bench.mark_archive_download(bytes);
+        Ok(root)
+    }
+
     /// Head or Full: `.git` from the metadata chunk, then the packs, whose
     /// blobs are written into the working tree as each pack lands.
     async fn materialize_git(
@@ -441,7 +530,7 @@ impl Client {
             .install_editable_packs(
                 urls,
                 &manifest,
-                &git_dir.join("objects").join("pack"),
+                Some(&git_dir.join("objects").join("pack")),
                 &root,
                 &metadata,
                 cleanup,
@@ -537,13 +626,15 @@ impl Client {
     /// Download the packs in parallel and, as each lands, install it into
     /// `pack_dir` and write its blobs into `work_tree`, so download and
     /// extraction overlap. History packs stream to a file; HEAD packs are
-    /// buffered, since extraction reads their bytes directly. Returns the
-    /// bytes downloaded.
+    /// buffered, since extraction reads their bytes directly. Without a
+    /// `pack_dir` only the working tree is written: history packs are not
+    /// downloaded, and no pack, idx, index or multi-pack-index is kept.
+    /// Returns the bytes downloaded.
     async fn install_editable_packs(
         &self,
         urls: &OutputUrls,
         manifest: &ClonepackManifest,
-        pack_dir: &Path,
+        pack_dir: Option<&Path>,
         work_tree: &Path,
         metadata: &MetadataChunk,
         cleanup: &Cleanup,
@@ -562,20 +653,29 @@ impl Client {
                 cleanup.clone(),
             )
         };
-        let bundle_ref = manifest
-            .idx_bundle
+        let idx_bundle_task = match pack_dir {
+            Some(_) => {
+                let bundle_ref = manifest
+                    .idx_bundle
+                    .as_ref()
+                    .context("clonepack manifest is missing required idx bundle")?;
+                Some(fetch(
+                    Artifact::chunk(bundle_ref, UrlSlot::IdxBundle),
+                    "fetch idx bundle",
+                ))
+            }
+            None => None,
+        };
+        let midx_task = manifest
+            .midx
             .as_ref()
-            .context("clonepack manifest is missing required idx bundle")?;
-        let idx_bundle_task = fetch(
-            Artifact::chunk(bundle_ref, UrlSlot::IdxBundle),
-            "fetch idx bundle",
-        );
-        let midx_task = manifest.midx.as_ref().map(|midx_ref| {
-            fetch(
-                Artifact::chunk(midx_ref, UrlSlot::Midx),
-                "fetch pre-built multi-pack-index",
-            )
-        });
+            .filter(|_| pack_dir.is_some())
+            .map(|midx_ref| {
+                fetch(
+                    Artifact::chunk(midx_ref, UrlSlot::Midx),
+                    "fetch pre-built multi-pack-index",
+                )
+            });
 
         // Validate every blob sha1 length up front so `build_blob_path_map`
         // indexes every file and the files-written guard below is exact (a
@@ -605,12 +705,12 @@ impl Client {
         let parse_conc = tuning.pack_parse_threads;
 
         // Fetch the required bundle once and slice every verified pack idx from it.
-        let idx_bundle = Arc::new(
-            idx_bundle_task
-                .join()
-                .await
-                .context("idx bundle fetch task")??,
-        );
+        let idx_bundle = match idx_bundle_task {
+            Some(task) => Some(Arc::new(
+                task.join().await.context("idx bundle fetch task")??,
+            )),
+            None => None,
+        };
 
         enum PackBody {
             Buffered {
@@ -633,49 +733,51 @@ impl Client {
         }
 
         // Stage 1: download packs (network concurrency `download_conc`).
-        let downloads = stream::iter(manifest.packs.iter().enumerate()).map(
-            |(i, entry): (usize, &PackEntry)| {
-                let idx_bundle = Arc::clone(&idx_bundle);
-                async move {
-                    let pack_ref = entry
-                        .pack
-                        .as_ref()
-                        .with_context(|| format!("pack {i} missing pack ref"))?;
-                    let idx_bytes = manifest_pack_idx_bytes(entry, i, &idx_bundle)?;
-                    let artifact = Artifact::chunk(pack_ref, UrlSlot::PackChunk(i));
-                    let pack_fetch_start = Instant::now();
-                    let pack_body = if entry.history_only {
-                        let Downloaded::TempFile(file, len) = self
-                            .download(urls, &artifact, Sink::TempFile(pack_dir))
-                            .await
-                            .with_context(|| format!("stream history pack {i}"))?
-                        else {
-                            unreachable!("temp file sink");
-                        };
-                        PackBody::TempFile { file, len }
-                    } else {
-                        // Hold a process-wide weighted permit from before the
-                        // body starts buffering until its blocking parser
-                        // exits, so concurrent clones share one byte budget.
-                        let memory_permit =
-                            tuning::acquire_editable_pack_memory(pack_ref.len).await;
-                        let bytes = self
-                            .download_bytes(urls, &artifact)
-                            .await
-                            .with_context(|| format!("fetch head pack {i}"))?;
-                        PackBody::Buffered {
-                            bytes,
-                            _memory_permit: memory_permit,
-                        }
+        // History packs hold no blob of the working tree.
+        let packs = (manifest.packs.iter().enumerate())
+            .filter(|(_, entry)| pack_dir.is_some() || !entry.history_only);
+        let downloads = stream::iter(packs).map(|(i, entry): (usize, &PackEntry)| {
+            let idx_bundle = idx_bundle.clone();
+            async move {
+                let pack_ref = entry
+                    .pack
+                    .as_ref()
+                    .with_context(|| format!("pack {i} missing pack ref"))?;
+                let idx_bytes = idx_bundle
+                    .map(|bundle| manifest_pack_idx_bytes(entry, i, &bundle))
+                    .transpose()?;
+                let artifact = Artifact::chunk(pack_ref, UrlSlot::PackChunk(i));
+                let pack_fetch_start = Instant::now();
+                let pack_body = if let (true, Some(pack_dir)) = (entry.history_only, pack_dir) {
+                    let Downloaded::TempFile(file, len) = self
+                        .download(urls, &artifact, Sink::TempFile(pack_dir))
+                        .await
+                        .with_context(|| format!("stream history pack {i}"))?
+                    else {
+                        unreachable!("temp file sink");
                     };
-                    crate::perf::record_editable_pack_fetch(
-                        pack_fetch_start.elapsed(),
-                        pack_body.len(),
-                    );
-                    anyhow::Ok((i, pack_body, idx_bytes))
-                }
-            },
-        );
+                    PackBody::TempFile { file, len }
+                } else {
+                    // Hold a process-wide weighted permit from before the
+                    // body starts buffering until its blocking parser
+                    // exits, so concurrent clones share one byte budget.
+                    let memory_permit = tuning::acquire_editable_pack_memory(pack_ref.len).await;
+                    let bytes = self
+                        .download_bytes(urls, &artifact)
+                        .await
+                        .with_context(|| format!("fetch head pack {i}"))?;
+                    PackBody::Buffered {
+                        bytes,
+                        _memory_permit: memory_permit,
+                    }
+                };
+                crate::perf::record_editable_pack_fetch(
+                    pack_fetch_start.elapsed(),
+                    pack_body.len(),
+                );
+                anyhow::Ok((i, pack_body, idx_bytes))
+            }
+        });
 
         // Stage 2: install each pack; hand-parse for the worktree only when it's
         // a HEAD-closure (undeltified) pack. History-only packs are deltified —
@@ -683,12 +785,12 @@ impl Client {
         let (total, files_written, stat_cache) = downloads
             .buffer_unordered(download_conc)
             .map(|res| {
-                let pack_dir = pack_dir.to_path_buf();
+                let pack_dir = pack_dir.map(Path::to_path_buf);
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
                 async move {
                     let (i, pack_body, idx_bytes) = res?;
-                    let bytes = pack_body.len() + idx_bytes.len() as u64;
+                    let bytes = pack_body.len() + idx_bytes.as_ref().map_or(0, |b| b.len() as u64);
                     let result = AbortOnDrop::new(
                         tokio::task::spawn_blocking(
                             move || -> Result<crate::extract::PackExtractResult> {
@@ -707,15 +809,20 @@ impl Client {
                                         // pairs to the pack by basename.
                                         let name =
                                             hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-                                        std::fs::write(
-                                            pack_dir.join(format!("pack-{name}.pack")),
-                                            &pack_bytes,
-                                        )
-                                        .with_context(|| format!("write pack {name}"))?;
+                                        if let Some(pack_dir) = &pack_dir {
+                                            std::fs::write(
+                                                pack_dir.join(format!("pack-{name}.pack")),
+                                                &pack_bytes,
+                                            )
+                                            .with_context(|| format!("write pack {name}"))?;
+                                        }
                                         (name, Some(pack_bytes), Some(_memory_permit))
                                     }
                                     PackBody::TempFile { file, len } => {
                                         use std::io::{Read, Seek, SeekFrom};
+                                        let pack_dir = pack_dir
+                                            .as_ref()
+                                            .context("streamed pack without a pack dir")?;
                                         let mut reader = file
                                             .as_file()
                                             .try_clone()
@@ -735,11 +842,13 @@ impl Client {
                                         (name, None, None)
                                     }
                                 };
-                                std::fs::write(
-                                    pack_dir.join(format!("pack-{name}.idx")),
-                                    &idx_bytes,
-                                )
-                                .with_context(|| format!("write idx {name}"))?;
+                                if let (Some(pack_dir), Some(idx_bytes)) = (&pack_dir, &idx_bytes) {
+                                    std::fs::write(
+                                        pack_dir.join(format!("pack-{name}.idx")),
+                                        idx_bytes,
+                                    )
+                                    .with_context(|| format!("write idx {name}"))?;
+                                }
                                 let Some(pack_bytes) = pack_bytes else {
                                     return Ok(crate::extract::PackExtractResult {
                                         files: 0,
@@ -780,6 +889,10 @@ impl Client {
                 metadata.files.len()
             );
         }
+
+        let Some(pack_dir) = pack_dir else {
+            return Ok(total);
+        };
 
         // Files are materialized and each gitlink has its empty directory;
         // clear skip-worktree for every tracked path, as `git clone` leaves it.

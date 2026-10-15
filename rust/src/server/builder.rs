@@ -214,32 +214,30 @@ async fn seal_and_compact(
     Ok((history_packs, new_tuples, levels))
 }
 
-/// Load and decode a prior sync's metadata chunk and return its files table.
-/// Bytes come from local CAS or object storage (the disposable local cache may
-/// have been cleared after a prior upload). Returns `None` on any failure — the
-/// caller then falls back to a full (non-incremental) build, so this is purely
-/// best-effort optimization, never a correctness dependency.
-fn load_metadata_files(
+/// Load and decode a prior build's metadata chunk. Bytes come from local CAS
+/// or object storage (the disposable local cache may have been cleared after
+/// a prior upload). Returns `None` on any failure; callers that only use it
+/// to reuse work then build without it.
+fn load_metadata(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
     metadata_hash: &str,
-) -> Option<Vec<crate::clonepack::FileEntry>> {
+) -> Option<crate::clonepack::MetadataChunk> {
     let bytes = cas
         .get(metadata_hash)
         .or_else(|_| storage.get(metadata_hash))
         .ok()?;
-    let md = crate::clonepack::MetadataChunk::decode_and_validate(bytes.as_slice()).ok()?;
-    Some(md.files)
+    crate::clonepack::MetadataChunk::decode_and_validate(bytes.as_slice()).ok()
 }
 
-/// [`load_metadata_files`] on the blocking pool.
-async fn load_metadata_files_async(
+/// [`load_metadata`] on the blocking pool.
+async fn load_metadata_async(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
     metadata_hash: &str,
-) -> Option<Vec<crate::clonepack::FileEntry>> {
+) -> Option<crate::clonepack::MetadataChunk> {
     let (cas, storage, hash) = (cas.clone(), storage.clone(), metadata_hash.to_string());
-    cancel::spawn_blocking(move || load_metadata_files(&cas, &storage, &hash))
+    cancel::spawn_blocking(move || load_metadata(&cas, &storage, &hash))
         .await
         .ok()
         .flatten()
@@ -376,34 +374,21 @@ fn archive_chunk_refs(
         .collect()
 }
 
-fn archive_publish_upload_hashes(
-    metadata_hash: &str,
-    clonepack_hash: &str,
-    download_bundle_hashes: &[String],
-    new_reuse_frame_hashes: &[String],
-) -> Vec<String> {
-    let mut uploads: Vec<String> = vec![metadata_hash.to_string(), clonepack_hash.to_string()];
-    uploads.extend(download_bundle_hashes.iter().cloned());
-    uploads.extend(new_reuse_frame_hashes.iter().cloned());
-    uploads.retain(|h| !h.is_empty());
-    uploads.sort();
-    uploads.dedup();
-    uploads
-}
-
-/// After upload, a remote backend may drop local pack copies while keeping the
-/// tiny idx files used by later bundle and MIDX builds. Local storage owns the
-/// durable copy and keeps every uploaded artifact.
+/// After upload, a remote backend may drop local copies, keeping `keep`:
+/// the tiny idx files used by later bundle and MIDX builds, and the archive
+/// bundles the next Files build reads unchanged frames from. Local storage
+/// owns the durable copy and keeps every uploaded artifact. The local cache's
+/// retention bounds what is kept.
 async fn settle_storage(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
     uploaded: Vec<String>,
-    keep_idx: std::collections::HashSet<String>,
+    keep: std::collections::HashSet<String>,
 ) {
     if storage.is_remote() {
         let cas = cas.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            for h in uploaded.iter().filter(|h| !keep_idx.contains(*h)) {
+            for h in uploaded.iter().filter(|h| !keep.contains(*h)) {
                 let _ = cas.remove(h);
             }
         })
@@ -554,7 +539,9 @@ pub(super) async fn build_head_result(
     // that commit (O(changed) instead of O(worktree)). Falls back to a full
     // table when there is no previous table.
     let prev_files: Option<Vec<crate::clonepack::FileEntry>> = match previous_head {
-        Some(head) => load_metadata_files_async(cas, storage, &head.clonepack.metadata_chunk).await,
+        Some(head) => load_metadata_async(cas, storage, &head.clonepack.metadata_chunk)
+            .await
+            .map(|metadata| metadata.files),
         None => None,
     };
     let prev_commit_for_diff = previous_head.map(|head| head.clonepack.commit.clone());
@@ -907,9 +894,9 @@ fn manifest_pack_tuples(manifest: &ClonepackManifest) -> Result<Vec<(String, u64
 /// When the Head delta has reached `RIPCLONE_HEAD_REBASE_BYTES`, the Head
 /// packs are first compacted into a fresh base for `commit`. Full uses the
 /// compact packs and records them as `head_base`, so later Heads delta against
-/// it. The published Head result never changes. `before_cold` runs right
-/// before a cold history build, the whole history packed as level 0: on the
-/// first Full, and when the tail from the sealed tip cannot be listed.
+/// it. The published Head result never changes. A cold history build packs
+/// the whole history as level 0: on the first Full, and when the tail from
+/// the sealed tip cannot be listed.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_full_result(
     cas: &Cas,
@@ -919,7 +906,6 @@ pub(super) async fn build_full_result(
     head: &crate::HeadResult,
     mut previous_levels: Vec<crate::HistoryLevel>,
     storage: &crate::storage::StorageRef,
-    before_cold: impl std::future::Future<Output = ()>,
     phases: &mut BuildPhases,
 ) -> Result<crate::FullResult> {
     let uploads = Uploads::new(cas, storage);
@@ -977,9 +963,6 @@ pub(super) async fn build_full_result(
     let built_history = match tail {
         Some(built) => built,
         None => {
-            let start = Instant::now();
-            before_cold.await;
-            phases.record("bitmap", start);
             Cancel::check_current()?;
             build_tail(None).await.context("Full history task")??
         }
@@ -1107,8 +1090,11 @@ pub(super) async fn build_full_result(
     })
 }
 
-/// Build and upload the Files result. `parent_files`, the parent's ready
-/// Files result and commit, lets the archive reuse unchanged frames.
+/// Build and upload the Files result. Head's metadata for the same commit
+/// gives the files table and skeleton. `parent_files`, a ready Files result
+/// of an ancestor and its commit, lets the archive read only changed bytes
+/// and reuse its unchanged frames and bundles.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_files_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
@@ -1122,64 +1108,80 @@ pub(super) async fn build_files_result(
     let uploads = Uploads::new(cas, storage);
     let cas = &uploads.cas();
     let start = Instant::now();
-    let previous_frames = parent_files
-        .map(|(_, files)| files.archive_frames.clone())
-        .unwrap_or_default();
-    let previous_files = match parent_files {
-        Some((_, files)) => {
-            load_metadata_files_async(cas, storage, &files.clonepack.metadata_chunk)
-                .await
-                .unwrap_or_default()
+    let base_metadata = async {
+        match parent_files {
+            Some((_, files)) => {
+                load_metadata_async(cas, storage, &files.clonepack.metadata_chunk).await
+            }
+            None => None,
         }
-        None => Vec::new(),
     };
-    let previous_commit = parent_files
-        .map(|(commit, _)| commit.to_string())
-        .unwrap_or_default();
+    let (head_metadata, base_metadata) = tokio::join!(
+        load_metadata_async(cas, storage, &head.clonepack.metadata_chunk),
+        base_metadata
+    );
+    let mut head_metadata = head_metadata.with_context(|| {
+        format!(
+            "read Head metadata {} for Files",
+            head.clonepack.metadata_chunk
+        )
+    })?;
+    let base = base_metadata.zip(parent_files.map(|(_, files)| files.clone()));
     phases.record("base_files", start);
+
     let start = Instant::now();
-    let archive_mirror = mirror_dir.to_path_buf();
-    let archive_cas = cas.clone();
-    let archive_storage = storage.clone();
-    let archive_commit = commit.to_string();
+    let skeleton = (
+        std::mem::take(&mut head_metadata.skeleton_pack),
+        std::mem::take(&mut head_metadata.skeleton_idx),
+        std::mem::take(&mut head_metadata.prebuilt_index),
+    );
+    let (archive_mirror, archive_cas, archive_storage, archive_commit) = (
+        mirror_dir.to_path_buf(),
+        cas.clone(),
+        storage.clone(),
+        commit.to_string(),
+    );
     let archive_output = cancel::spawn_blocking(move || {
-        ArchiveBuilder::new(&archive_mirror).build_into_cas_bounded(
+        let base = base
+            .as_ref()
+            .map(|(metadata, files)| crate::archive::ArchiveBase {
+                frames: &files.archive_frames,
+                metadata,
+                bundles: &files.archive_chunks,
+            });
+        ArchiveBuilder::new(&archive_mirror).build_into_cas(
             &archive_commit,
             &archive_cas,
             Some(&archive_storage),
             compression_level,
-            &previous_frames,
-            &previous_files,
-            &previous_commit,
+            Some(&head_metadata),
+            base.as_ref(),
             crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
         )
     })
     .await
     .context("Files archive task")??;
     phases.record("archive", start);
+    info!("Files archive {:?}", archive_output.reuse);
 
     Cancel::check_current()?;
     let start = Instant::now();
     let archive_chunk_hashes = archive_output.download_bundle_hashes;
     let mut metadata = archive_output.metadata;
-    let (fc, fs, fcommit, fhead) = (
-        cas.clone(),
-        storage.clone(),
-        commit.to_string(),
-        head.clone(),
-    );
+    let (fc, fcommit, fparent) = (cas.clone(), commit.to_string(), head.parent_commit.clone());
     let fchunks = archive_chunk_hashes.clone();
     let (metadata_hash, manifest_hash) = cancel::spawn_blocking(move || -> Result<_> {
-        let fetch = |hash: &str| fc.get(hash).or_else(|_| fs.get(hash));
-        metadata.skeleton_pack = fetch(&fhead.clonepack.skeleton_pack)?;
-        metadata.skeleton_idx = fetch(&fhead.clonepack.skeleton_idx)?;
-        metadata.prebuilt_index = fetch(&fhead.clonepack.prebuilt_index)?;
+        (
+            metadata.skeleton_pack,
+            metadata.skeleton_idx,
+            metadata.prebuilt_index,
+        ) = skeleton;
         let metadata_bytes = metadata.encode_to_vec();
         let metadata_hash = fc.put(&metadata_bytes)?;
         let archive_chunks = archive_chunk_refs(&fchunks, &metadata)?;
         let manifest = make_manifest(
             &fcommit,
-            &fhead.parent_commit,
+            &fparent,
             &archive_chunks,
             &metadata_hash,
             metadata_bytes.len() as u64,
@@ -1193,16 +1195,15 @@ pub(super) async fn build_files_result(
     .await
     .context("Files manifest task")??;
     phases.record("manifest", start);
-    let publish_uploads = archive_publish_upload_hashes(
-        &metadata_hash,
-        &manifest_hash,
-        &archive_chunk_hashes,
-        &archive_output.new_reuse_frame_hashes,
-    );
+
+    // Reused bundles are the base's, already durable.
+    let mut publish_uploads = vec![metadata_hash.clone(), manifest_hash.clone()];
+    publish_uploads.extend(archive_output.new_bundle_hashes.iter().cloned());
     let start = Instant::now();
     uploads.start_all(&publish_uploads);
     let uploaded = uploads.finish().await?;
-    settle_storage(cas, storage, uploaded, std::collections::HashSet::new()).await;
+    let keep = archive_chunk_hashes.iter().cloned().collect();
+    settle_storage(cas, storage, uploaded, keep).await;
     phases.record("upload", start);
 
     Ok(crate::FilesResult {
@@ -1224,26 +1225,6 @@ pub(super) async fn build_files_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn archive_publish_uploads_download_bundles_and_reuse_frames() {
-        let uploads = archive_publish_upload_hashes(
-            "metadata",
-            "clonepack",
-            &["bundle-b".to_string(), "bundle-a".to_string()],
-            &["frame-a".to_string(), "bundle-a".to_string(), String::new()],
-        );
-        assert_eq!(
-            uploads,
-            vec![
-                "bundle-a".to_string(),
-                "bundle-b".to_string(),
-                "clonepack".to_string(),
-                "frame-a".to_string(),
-                "metadata".to_string(),
-            ]
-        );
-    }
 
     #[test]
     fn archive_chunk_refs_rejects_hash_length_mismatch() {

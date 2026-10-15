@@ -83,7 +83,7 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | `RIPCLONE_RATE_LIMIT_BURST`, `RIPCLONE_RATE_LIMIT_PER_SEC` | Per-IP rate limit: burst size and refill per second, defaults 60 and 10. See [API](API.md#authentication). |
 | `RIPCLONE_TRUST_FORWARDED_FOR` | `1` or `true`: rate-limit by the last `X-Forwarded-For` address. Only behind one trusted proxy. |
 | `RIPCLONE_HEAD_SLOTS` | Builds that run Head at once. Default: a quarter of the CPU cores, at least 2. At least 1. |
-| `RIPCLONE_FILES_SLOTS` | Builds that run Files at once. Default: an eighth of the CPU cores, at least 1. `0` pauses Files; Head and Full still build. |
+| `RIPCLONE_FILES_SLOTS` | Builds that run Files at once. Default: a quarter of the CPU cores, at least 2. `0` pauses Files; Head and Full still build. |
 | `RIPCLONE_FULL_SLOTS` | Builds that run Full at once. Default: an eighth of the CPU cores, at least 1. `0` pauses Full; Head and Files still build. A long Full never holds back another commit's Files. |
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
 | `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Files, then Full) before the output fails, default 5. At least 1. |

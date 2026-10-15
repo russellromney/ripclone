@@ -159,36 +159,17 @@ impl<'a> PackBuilder<'a> {
         commit: &str,
         sealed_tip: Option<&str>,
     ) -> Result<HistoryBuild> {
-        if sealed_tip.is_some() {
-            return self.build_history_range(commit, sealed_tip, false);
-        }
-        // Cold base build: the mirror's reachability bitmap answers the walk of
-        // the whole history. A bitmap git cannot use fails only this attempt;
-        // the same pack built by walking the graph is the fallback.
-        match self.build_history_range(commit, None, true) {
-            Ok(packs) => Ok(packs),
-            Err(e) => {
-                // A cancelled build stops; it does not fall back.
-                crate::cancel::Cancel::check_current()?;
-                tracing::warn!("cold history with bitmap failed ({e:#}); packing without it");
-                self.build_history_range(commit, None, false)
-            }
-        }
+        self.build_history_range(commit, sealed_tip)
     }
 
     /// Pack the objects of `(exclude, tip]` with git's own walk and delta
     /// reuse (see `git::pack_objects_range_to_prefix`) and store the pack.
-    fn build_history_range(
-        &self,
-        tip: &str,
-        exclude: Option<&str>,
-        use_bitmap: bool,
-    ) -> Result<HistoryBuild> {
+    fn build_history_range(&self, tip: &str, exclude: Option<&str>) -> Result<HistoryBuild> {
         crate::cancel::Cancel::check_current()?;
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
         let start = std::time::Instant::now();
-        git::pack_objects_range_to_prefix(&self.repo, tip, exclude, &prefix, use_bitmap)?;
+        git::pack_objects_range_to_prefix(&self.repo, tip, exclude, &prefix)?;
         let pack_ms = elapsed_ms(start);
         let start = std::time::Instant::now();
         let packs = self.store_packs_from_dir(tmp.path())?;
@@ -272,9 +253,7 @@ impl<'a> PackBuilder<'a> {
             // before `best` (None when best is the base), tip is level[best+1].
             let start = best.checked_sub(1).map(|i| levels[i].tip_commit.clone());
             let tip = levels[best + 1].tip_commit.clone();
-            let packs = self
-                .build_history_range(&tip, start.as_deref(), false)?
-                .packs;
+            let packs = self.build_history_range(&tip, start.as_deref())?.packs;
             new_packs.extend(packs.iter().cloned());
             let merged = crate::HistoryLevel {
                 tip_commit: tip,

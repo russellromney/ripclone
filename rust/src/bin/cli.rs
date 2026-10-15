@@ -118,7 +118,8 @@ enum Commands {
         at: Option<String>,
         /// Wait for the server's exact build of the commit. Without it, a
         /// full clone whose build is still pending installs the newest ready
-        /// build and fetches the rest from the upstream with your git.
+        /// build and fetches the rest from the upstream with your git, and a
+        /// files clone writes the same commit's tree from its ready Head.
         #[arg(long)]
         wait: bool,
         /// Print a per-phase benchmark report after the clone.
