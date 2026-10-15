@@ -1,8 +1,15 @@
 //! Build the Head, Full and Files results of a commit from the bare mirror
 //! and upload their artifacts.
+//!
+//! Every disk, CAS and storage step runs on the blocking pool through
+//! [`cancel::spawn_blocking`], so a build never stalls the API's async
+//! workers, and the build's cancellation token follows it there. A build
+//! checks the token between steps and before each fallback, so a build whose
+//! lease was lost stops instead of starting more work.
 
 use super::duration_ms;
 use crate::archive::ArchiveBuilder;
+use crate::cancel::{self, Cancel};
 use crate::cas::Cas;
 use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
 use crate::metrics::SyncPhaseMetrics;
@@ -12,15 +19,13 @@ use anyhow::{Context, Result};
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncPhases {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mirror_fetch_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_graph_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_packs_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,7 +46,6 @@ impl From<&SyncPhases> for SyncPhaseMetrics {
     fn from(phases: &SyncPhases) -> Self {
         Self {
             mirror_fetch_ms: phases.mirror_fetch_ms,
-            commit_graph_ms: phases.commit_graph_ms,
             head_packs_ms: phases.head_packs_ms,
             skeleton_build_ms: phases.skeleton_build_ms,
             files_table_ms: phases.files_table_ms,
@@ -50,37 +54,6 @@ impl From<&SyncPhases> for SyncPhaseMetrics {
             ref_publish_ms: phases.ref_publish_ms,
             publish_head_ms: phases.publish_head_ms,
         }
-    }
-}
-
-/// Remove `.tmp*` entries under `dir` whose mtime is older than `max_age`.
-/// Best-effort cleanup of build temp dirs leaked by a killed sync.
-pub(super) fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(".tmp") {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .map(|age| age > max_age)
-            .unwrap_or(false);
-        if !stale {
-            continue;
-        }
-        let path = entry.path();
-        let _ = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
     }
 }
 
@@ -172,7 +145,7 @@ async fn seal_and_compact(
             max_levels,
             history_target,
         );
-        let res = tokio::task::spawn_blocking(move || {
+        let res = cancel::spawn_blocking(move || {
             PackBuilder::new(&md, &c).compact_levels(levels_in, max, tgt)
         })
         .await
@@ -209,6 +182,19 @@ fn load_metadata_files(
         .ok()?;
     let md = crate::clonepack::MetadataChunk::decode_and_validate(bytes.as_slice()).ok()?;
     Some(md.files)
+}
+
+/// [`load_metadata_files`] on the blocking pool.
+async fn load_metadata_files_async(
+    cas: &Cas,
+    storage: &crate::storage::StorageRef,
+    metadata_hash: &str,
+) -> Option<Vec<crate::clonepack::FileEntry>> {
+    let (cas, storage, hash) = (cas.clone(), storage.clone(), metadata_hash.to_string());
+    cancel::spawn_blocking(move || load_metadata_files(&cas, &storage, &hash))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Build one result's PackEntry list and concatenated idx bundle.
@@ -364,8 +350,9 @@ async fn upload_artifacts(
         let cas = cas.clone();
         let storage = storage.clone();
         async move {
+            Cancel::check_current()?;
             let read_hash = hash.clone();
-            let (path, len) = tokio::task::spawn_blocking(move || {
+            let (path, len) = cancel::spawn_blocking(move || {
                 let len = cas
                     .verify_object(&read_hash)
                     .with_context(|| format!("verify artifact {} before upload", read_hash))?;
@@ -413,9 +400,13 @@ async fn settle_storage(
     keep_idx: std::collections::HashSet<String>,
 ) {
     if storage.is_remote() {
-        for h in uploaded.iter().filter(|h| !keep_idx.contains(*h)) {
-            let _ = cas.remove(h);
-        }
+        let cas = cas.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            for h in uploaded.iter().filter(|h| !keep_idx.contains(*h)) {
+                let _ = cas.remove(h);
+            }
+        })
+        .await;
     }
 }
 
@@ -468,7 +459,7 @@ pub(super) async fn build_head_result(
     let t = Instant::now();
     let sk_start = Instant::now();
     let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-    let shallow_skeleton_handle = tokio::task::spawn_blocking(move || {
+    let shallow_skeleton_handle = cancel::spawn_blocking(move || {
         let s = Instant::now();
         let r = PackBuilder::new(&md1, &c1).build_shallow_skeleton_pack(&cm1);
         info!("Head skeleton {:?}", s.elapsed());
@@ -485,7 +476,7 @@ pub(super) async fn build_head_result(
     let head_target = 4 * 1024 * 1024;
     let base = base.filter(|base| !base.commit.is_empty() && !base.packs.is_empty());
     let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-    let head_handle = tokio::task::spawn_blocking(move || -> Result<HeadBuild> {
+    let head_handle = cancel::spawn_blocking(move || -> Result<HeadBuild> {
         let s = Instant::now();
         let b = PackBuilder::new(&md2, &c2);
         // Delta path: a base exists; pack only what is new since the base. A
@@ -527,6 +518,7 @@ pub(super) async fn build_head_result(
             }
             // Cold path: no base yet → pack the full closure as the base.
             None => {
+                Cancel::check_current()?;
                 let base = b.build_head_packs(&cm2, head_target)?;
                 let base_packs = base.iter().map(tuple_to_sized).collect();
                 let elapsed = s.elapsed();
@@ -551,8 +543,10 @@ pub(super) async fn build_head_result(
     // hashes for unchanged paths and read+hash only the blobs that changed since
     // that commit (O(changed) instead of O(worktree)). Falls back to a full
     // table when there is no previous table.
-    let prev_files: Option<Vec<crate::clonepack::FileEntry>> = previous_head
-        .and_then(|head| load_metadata_files(cas, storage, &head.clonepack.metadata_chunk));
+    let prev_files: Option<Vec<crate::clonepack::FileEntry>> = match previous_head {
+        Some(head) => load_metadata_files_async(cas, storage, &head.clonepack.metadata_chunk).await,
+        None => None,
+    };
     let prev_commit_for_diff = previous_head.map(|head| head.clonepack.commit.clone());
     // Carry the prior files table + commit so the bounded archive can hash only
     // changed files and reuse frames for the unchanged prefix/suffix.
@@ -561,7 +555,7 @@ pub(super) async fn build_head_result(
     let files_table_handle = match (prev_files, prev_commit_for_diff) {
         (Some(pf), Some(from)) if !from.is_empty() => {
             let (md, cm, frm) = (md3.clone(), cm3.clone(), from);
-            tokio::task::spawn_blocking(move || {
+            cancel::spawn_blocking(move || {
                 let s = Instant::now();
                 // If the diff fails (e.g. prev.commit was pruned after a
                 // force-push), fall back to a full rebuild rather than failing
@@ -578,6 +572,7 @@ pub(super) async fn build_head_result(
                         r
                     }
                     Err(e) => {
+                        Cancel::check_current()?;
                         warn!("files-table diff failed ({e:#}); full rebuild");
                         let r = ArchiveBuilder::new(&md).build_files_table(&cm);
                         info!("Head files table (full, diff fallback) {:?}", s.elapsed());
@@ -586,7 +581,7 @@ pub(super) async fn build_head_result(
                 }
             })
         }
-        _ => tokio::task::spawn_blocking(move || {
+        _ => cancel::spawn_blocking(move || {
             let s = Instant::now();
             let r = ArchiveBuilder::new(&md3).build_files_table(&cm3);
             info!("Head files table (full) {:?}", s.elapsed());
@@ -611,47 +606,75 @@ pub(super) async fn build_head_result(
         shallow_skeleton_pack.clone(),
     );
     let idx_start = Instant::now();
-    let shallow_prebuilt_index = tokio::task::spawn_blocking(move || {
+    let shallow_prebuilt_index = cancel::spawn_blocking(move || {
         PackBuilder::new(&md4, &c4).build_prebuilt_index(&cm4, &skp)
     })
     .await
     .context("shallow prebuilt index")??;
     phases.prebuilt_index_ms = Some(duration_ms(idx_start.elapsed()));
 
-    let mut shallow_meta = metadata_base.clone();
-    shallow_meta.skeleton_pack = cas.get(&shallow_skeleton_pack)?;
-    shallow_meta.skeleton_idx = cas.get(&shallow_skeleton_idx)?;
-    shallow_meta.prebuilt_index = cas.get(&shallow_prebuilt_index)?;
-    let shallow_meta_data = shallow_meta.encode_to_vec();
-    let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
+    Cancel::check_current()?;
+    // Assemble the metadata chunk, idx bundle, MIDX and manifest from CAS.
+    let (fc, fs, fcommit, fparent) = (
+        cas.clone(),
+        storage.clone(),
+        commit.to_string(),
+        parent.clone(),
+    );
+    let (fsk_pack, fsk_idx, fprebuilt, fpacks, all_built) = (
+        shallow_skeleton_pack.clone(),
+        shallow_skeleton_idx.clone(),
+        shallow_prebuilt_index.clone(),
+        head_packs.clone(),
+        head_built.all_local,
+    );
+    let (shallow_metadata_hash, shallow_clonepack_hash, head_idx_bundle_hash, head_midx_hash) =
+        cancel::spawn_blocking(move || -> Result<(String, String, String, String)> {
+            let (cas, storage) = (&fc, &fs);
+            let mut shallow_meta = metadata_base;
+            shallow_meta.skeleton_pack = cas.get(&fsk_pack)?;
+            shallow_meta.skeleton_idx = cas.get(&fsk_idx)?;
+            shallow_meta.prebuilt_index = cas.get(&fprebuilt)?;
+            let shallow_meta_data = shallow_meta.encode_to_vec();
+            let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
 
-    // Head has no archive frames. Files publishes its own archive result.
-    let archive_chunks = archive_chunk_refs(&[], &metadata_base)?;
-    let head_tagged: Vec<(&(String, u64, String, u64), bool)> =
-        head_packs.iter().map(|p| (p, false)).collect();
-    let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
-        assemble_variant(cas, storage, &head_tagged)?;
-    // Ship the head MIDX only on a cold full base (all pack bytes still local).
-    // On a delta re-sync the base packs may be absent from local cache, so omit it — the
-    // client builds its own MIDX from the per-pack idxs.
-    let all_built = head_built.all_local;
-    let (head_midx_ref, head_midx_hash) = if all_built {
-        assemble_midx(cas, &head_packs)?
-    } else {
-        (None, String::new())
-    };
+            // Head has no archive frames. Files publishes its own archive result.
+            let archive_chunks = archive_chunk_refs(&[], &shallow_meta)?;
+            let head_tagged: Vec<(&(String, u64, String, u64), bool)> =
+                fpacks.iter().map(|p| (p, false)).collect();
+            let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
+                assemble_variant(cas, storage, &head_tagged)?;
+            Cancel::check_current()?;
+            // Ship the head MIDX only on a cold full base (all pack bytes still
+            // local). On a delta re-sync the base packs may be absent from local
+            // cache, so omit it — the client builds its own MIDX from the
+            // per-pack idxs.
+            let (head_midx_ref, head_midx_hash) = if all_built {
+                assemble_midx(cas, &fpacks)?
+            } else {
+                (None, String::new())
+            };
 
-    let shallow_manifest = make_manifest(
-        commit,
-        &parent,
-        &archive_chunks,
-        &shallow_metadata_hash,
-        shallow_meta_data.len() as u64,
-        head_entries,
-        head_midx_ref,
-        head_idx_bundle_ref,
-    )?;
-    let shallow_clonepack_hash = cas.put(&shallow_manifest.encode_to_vec())?;
+            let shallow_manifest = make_manifest(
+                &fcommit,
+                &fparent,
+                &archive_chunks,
+                &shallow_metadata_hash,
+                shallow_meta_data.len() as u64,
+                head_entries,
+                head_midx_ref,
+                head_idx_bundle_ref,
+            )?;
+            let shallow_clonepack_hash = cas.put(&shallow_manifest.encode_to_vec())?;
+            Ok((
+                shallow_metadata_hash,
+                shallow_clonepack_hash,
+                head_idx_bundle_hash,
+                head_midx_hash,
+            ))
+        })
+        .await
+        .context("Head manifest task")??;
 
     let head = crate::HeadResult {
         clonepack: crate::ClonepackArtifacts {
@@ -689,6 +712,7 @@ pub(super) async fn build_head_result(
     head_uploads.retain(|h| !h.is_empty());
     let head_idx_keep: std::collections::HashSet<String> =
         head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
+    Cancel::check_current()?;
     let upload_start = Instant::now();
     upload_artifacts(cas, storage, head_uploads.clone(), upload_conc).await?;
     settle_storage(cas, storage, head_uploads, head_idx_keep).await;
@@ -880,7 +904,9 @@ fn manifest_pack_tuples(manifest: &ClonepackManifest) -> Result<Vec<(String, u64
 /// When the Head delta has reached `RIPCLONE_HEAD_REBASE_BYTES`, the Head
 /// packs are first compacted into a fresh base for `commit`. Full uses the
 /// compact packs and records them as `head_base`, so later Heads delta against
-/// it. The published Head result never changes.
+/// it. The published Head result never changes. `before_cold` runs right
+/// before a cold history build, the whole history packed as level 0: on the
+/// first Full, and when the tail from the sealed tip cannot be listed.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_full_result(
     cas: &Cas,
@@ -890,11 +916,20 @@ pub(super) async fn build_full_result(
     head: &crate::HeadResult,
     mut previous_levels: Vec<crate::HistoryLevel>,
     storage: &crate::storage::StorageRef,
+    before_cold: impl std::future::Future<Output = ()>,
 ) -> Result<crate::FullResult> {
-    let head_manifest_bytes = storage
-        .get(&head.clonepack.manifest)
-        .or_else(|_| cas.get(&head.clonepack.manifest))
-        .context("read Head manifest for Full")?;
+    // Head was built on this server moments ago, so local CAS usually still
+    // has its manifest.
+    let (mc, ms, mhash) = (
+        cas.clone(),
+        storage.clone(),
+        head.clonepack.manifest.clone(),
+    );
+    let head_manifest_bytes =
+        cancel::spawn_blocking(move || mc.get(&mhash).or_else(|_| ms.get(&mhash)))
+            .await
+            .context("Head manifest read task")?
+            .context("read Head manifest for Full")?;
     let head_manifest = ClonepackManifest::decode(head_manifest_bytes.as_slice())
         .context("decode Head manifest for Full")?;
     anyhow::ensure!(
@@ -907,38 +942,45 @@ pub(super) async fn build_full_result(
 
     let history_target = 512 * 1024 * 1024;
     let mut sealed_tip = previous_levels.last().map(|level| level.tip_commit.clone());
-    let history_mirror = mirror_dir.to_path_buf();
-    let history_cas = cas.clone();
-    let history_commit = commit.to_string();
-    let history_sealed_tip = sealed_tip.clone();
+    let build_tail = |since: Option<String>| {
+        let (mirror, cas, commit) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+        cancel::spawn_blocking(move || {
+            PackBuilder::new(&mirror, &cas).build_history_tail(
+                &commit,
+                since.as_deref(),
+                history_target,
+            )
+        })
+    };
     // A tail the mirror cannot list from the sealed tip builds cold instead:
     // a new level 0 with the whole history.
-    let (built_history, cold) = tokio::task::spawn_blocking(move || {
-        let builder = PackBuilder::new(&history_mirror, &history_cas);
-        let Some(tip) = history_sealed_tip else {
-            return builder
-                .build_history_tail(&history_commit, None, history_target)
-                .map(|packs| (packs, false));
-        };
-        match builder.build_history_tail(&history_commit, Some(&tip), history_target) {
-            Ok(packs) => Ok((packs, false)),
-            Err(e) => {
+    let tail = match sealed_tip.clone() {
+        None => None,
+        Some(tip) => match build_tail(Some(tip.clone()))
+            .await
+            .context("Full history task")?
+        {
+            Ok(packs) => Some(packs),
+            Err(error) => {
+                Cancel::check_current()?;
                 warn!(
-                    "history tail from {} failed ({e:#}); building history cold",
+                    "history tail from {} failed ({error:#}); building history cold",
                     &tip[..7.min(tip.len())]
                 );
-                builder
-                    .build_history_tail(&history_commit, None, history_target)
-                    .map(|packs| (packs, true))
+                previous_levels.clear();
+                sealed_tip = None;
+                None
             }
+        },
+    };
+    let built_history = match tail {
+        Some(packs) => packs,
+        None => {
+            before_cold.await;
+            Cancel::check_current()?;
+            build_tail(None).await.context("Full history task")??
         }
-    })
-    .await
-    .context("Full history task")??;
-    if cold {
-        previous_levels.clear();
-        sealed_tip = None;
-    }
+    };
 
     let (history_packs, new_history, levels) = seal_and_compact(
         mirror_dir,
@@ -959,11 +1001,12 @@ pub(super) async fn build_full_result(
         .map(|(_, pack_len, _, _)| *pack_len)
         .sum();
     let mut head_base = None;
+    Cancel::check_current()?;
     if delta_bytes > 0 && delta_bytes >= rebase_bytes {
         let compact_mirror = mirror_dir.to_path_buf();
         let compact_cas = cas.clone();
         let compact_commit = commit.to_string();
-        let compact_packs = tokio::task::spawn_blocking(move || {
+        let compact_packs = cancel::spawn_blocking(move || {
             PackBuilder::new(&compact_mirror, &compact_cas)
                 .build_head_packs(&compact_commit, 4 * 1024 * 1024)
         })
@@ -994,25 +1037,41 @@ pub(super) async fn build_full_result(
         head_packs = compact_packs;
     }
 
-    let tagged: Vec<(&(String, u64, String, u64), bool)> = head_packs
-        .iter()
-        .map(|pack| (pack, false))
-        .chain(history_packs.iter().map(|pack| (pack, true)))
-        .collect();
-    let (entries, idx_bundle_ref, idx_bundle_hash) = assemble_variant(cas, storage, &tagged)?;
-    let manifest = make_manifest(
-        commit,
-        &parent,
-        &[],
-        &head.clonepack.metadata_chunk,
-        storage
-            .size(&head.clonepack.metadata_chunk)
-            .context("size Head metadata for Full")?,
-        entries,
-        None,
-        idx_bundle_ref,
-    )?;
-    let manifest_hash = cas.put(&manifest.encode_to_vec())?;
+    Cancel::check_current()?;
+    let (vc, vs, vcommit, vparent, vmetadata) = (
+        cas.clone(),
+        storage.clone(),
+        commit.to_string(),
+        parent.clone(),
+        head.clonepack.metadata_chunk.clone(),
+    );
+    let (vhead, vhistory) = (head_packs.clone(), history_packs.clone());
+    let metadata_len = head_manifest.metadata_chunk.as_ref().map(|chunk| chunk.len);
+    let (manifest_hash, idx_bundle_hash) = cancel::spawn_blocking(move || -> Result<_> {
+        let tagged: Vec<(&(String, u64, String, u64), bool)> = vhead
+            .iter()
+            .map(|pack| (pack, false))
+            .chain(vhistory.iter().map(|pack| (pack, true)))
+            .collect();
+        let (entries, idx_bundle_ref, idx_bundle_hash) = assemble_variant(&vc, &vs, &tagged)?;
+        let metadata_len = match metadata_len {
+            Some(len) => len,
+            None => vs.size(&vmetadata).context("size Head metadata for Full")?,
+        };
+        let manifest = make_manifest(
+            &vcommit,
+            &vparent,
+            &[],
+            &vmetadata,
+            metadata_len,
+            entries,
+            None,
+            idx_bundle_ref,
+        )?;
+        Ok((vc.put(&manifest.encode_to_vec())?, idx_bundle_hash))
+    })
+    .await
+    .context("Full manifest task")??;
     let mut uploads = vec![manifest_hash.clone(), idx_bundle_hash.clone()];
     for (pack, _, idx, _) in &new_history {
         uploads.push(pack.clone());
@@ -1061,7 +1120,9 @@ pub(super) async fn build_files_result(
         .unwrap_or_default();
     let previous_files = match parent_files {
         Some((_, files)) => {
-            load_metadata_files(cas, storage, &files.clonepack.metadata_chunk).unwrap_or_default()
+            load_metadata_files_async(cas, storage, &files.clonepack.metadata_chunk)
+                .await
+                .unwrap_or_default()
         }
         None => Vec::new(),
     };
@@ -1072,7 +1133,7 @@ pub(super) async fn build_files_result(
     let archive_cas = cas.clone();
     let archive_storage = storage.clone();
     let archive_commit = commit.to_string();
-    let archive_output = tokio::task::spawn_blocking(move || {
+    let archive_output = cancel::spawn_blocking(move || {
         ArchiveBuilder::new(&archive_mirror).build_into_cas_bounded(
             &archive_commit,
             &archive_cas,
@@ -1087,26 +1148,39 @@ pub(super) async fn build_files_result(
     .await
     .context("Files archive task")??;
 
+    Cancel::check_current()?;
     let archive_chunk_hashes = archive_output.download_bundle_hashes;
     let mut metadata = archive_output.metadata;
-    let fetch = |hash: &str| cas.get(hash).or_else(|_| storage.get(hash));
-    metadata.skeleton_pack = fetch(&head.clonepack.skeleton_pack)?;
-    metadata.skeleton_idx = fetch(&head.clonepack.skeleton_idx)?;
-    metadata.prebuilt_index = fetch(&head.clonepack.prebuilt_index)?;
-    let metadata_bytes = metadata.encode_to_vec();
-    let metadata_hash = cas.put(&metadata_bytes)?;
-    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &metadata)?;
-    let manifest = make_manifest(
-        commit,
-        &head.parent_commit,
-        &archive_chunks,
-        &metadata_hash,
-        metadata_bytes.len() as u64,
-        Vec::new(),
-        None,
-        None,
-    )?;
-    let manifest_hash = cas.put(&manifest.encode_to_vec())?;
+    let (fc, fs, fcommit, fhead) = (
+        cas.clone(),
+        storage.clone(),
+        commit.to_string(),
+        head.clone(),
+    );
+    let fchunks = archive_chunk_hashes.clone();
+    let (metadata_hash, manifest_hash) = cancel::spawn_blocking(move || -> Result<_> {
+        let fetch = |hash: &str| fc.get(hash).or_else(|_| fs.get(hash));
+        metadata.skeleton_pack = fetch(&fhead.clonepack.skeleton_pack)?;
+        metadata.skeleton_idx = fetch(&fhead.clonepack.skeleton_idx)?;
+        metadata.prebuilt_index = fetch(&fhead.clonepack.prebuilt_index)?;
+        let metadata_bytes = metadata.encode_to_vec();
+        let metadata_hash = fc.put(&metadata_bytes)?;
+        let archive_chunks = archive_chunk_refs(&fchunks, &metadata)?;
+        let manifest = make_manifest(
+            &fcommit,
+            &fhead.parent_commit,
+            &archive_chunks,
+            &metadata_hash,
+            metadata_bytes.len() as u64,
+            Vec::new(),
+            None,
+            None,
+        )?;
+        let manifest_hash = fc.put(&manifest.encode_to_vec())?;
+        Ok((metadata_hash, manifest_hash))
+    })
+    .await
+    .context("Files manifest task")??;
     let uploads = archive_publish_upload_hashes(
         &metadata_hash,
         &manifest_hash,

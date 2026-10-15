@@ -147,7 +147,7 @@ Ripclone token reaches the origin.
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | #186 |
 | H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | #191 (S3 job) |
 | H3 | A second server on the same control database is rejected before it binds. | #186 |
-| H4 | Table: invalid storage, control, rate-limit and worker config (file or env, malformed file, removed `[queue]` section) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention age and size, signed-URL TTL, ls-remote timeout, LSM levels, Head rebase size, S3 timeout, attempts and retry delay), with an error naming it. | #208 |
+| H4 | Table: invalid storage, control, rate-limit and worker config (file or env, malformed file, removed `[queue]` section) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention age and size, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size, S3 timeout, attempts and retry delay), with an error naming it. | #208 |
 | H5 | Local disk with retention every second and a 1-day limit: the server reports retention off; month-old artifacts stay and clone. | #208 |
 | H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | #208 (S3 job) |
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | #208 |
@@ -189,7 +189,20 @@ origin, and runs `git fsck` and `rev-list --count` on the editable clones.
 | J4 | The mirror directory is deleted between restarts: a push of two commits on A fetches A again and builds on it. After the origin force-pushes unrelated history and prunes A and C, the mirror is deleted again and the next build is cold. | #217 |
 | J5 | A branch with no history in common with the built main builds cold, and its full clone lacks main's commit. | #217 |
 
-Total: 71 tests. Several are table-driven.
+### K. Scheduling and the mirror (4)
+
+A repository runs at most one build of each kind at a time, and its Fulls
+build in admission order. One repository's slow upstream never holds
+another's builds or the API, and the mirror stays compact.
+
+| # | Test | Added |
+|---|---|---|
+| K1 | The origin holds every fetch of X, and a second push of X is admitted, with two Head slots. X fetches once: its second build waits for the first. Meanwhile Y is added, built and cloned at depth 1, and `/add`, `POST /builds` and `/status` each answer within 2 s. After the release both X commits clone. | #PR |
+| K2 | `RIPCLONE_FETCH_TIMEOUT_SECS=1`. The origin holds the fetch until the build retries, then answers: the build completes and clones. With the origin held throughout, Head fails after its 3 attempts (3 fetches) with a `timed out after` error, and nothing publishes. | #PR |
+| K3 | The tip of a repo is admitted, then three older commits by SHA in one burst, out of history order, with four Full slots. Fulls publish in admission order (server log), and each commit's full clone equals the origin, with `rev-list --count` and `git fsck` checked. | #PR |
+| K4 | While the server is down, its mirror gains 20 packs and 70 loose refs from outside. The next Full compacts it first: the log reports a repack and packed refs, under 16 packs remain, and full clones of the built commit and of a later push are exact. | #PR |
+
+Total: 75 tests. Several are table-driven.
 
 ## What it replaced
 

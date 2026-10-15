@@ -20,10 +20,13 @@ CREATE TABLE repo_config (
 -- One row per (repo, commit). Each output kind is pending | ready | failed;
 -- "building" means lease_until is in the future. A ready output is never
 -- rewritten. attempts counts claims in the current phase (Head, Files, then
--- Full); publishing Head and settling Files reset it.
+-- Full); publishing Head and settling Files reset it. seq is the admission
+-- order: strictly increasing, assigned once at admit, never reused. Claims
+-- and the per-repo Full order use it, so same-second admits keep their order.
 CREATE TABLE builds (
   repo         TEXT NOT NULL,          -- RepoId::storage_key()
   commit_id    TEXT NOT NULL,
+  seq          INTEGER NOT NULL,       -- admission order (MAX(seq) + 1 at admit)
   ref_name     TEXT,                   -- full ref (refs/heads/main); NULL for SHA-only admits
   parent       TEXT,                   -- written by publish(Head)
   created_at   INTEGER NOT NULL,       -- epoch seconds
@@ -39,9 +42,21 @@ CREATE TABLE builds (
   attempts     INTEGER NOT NULL DEFAULT 0,
   lease_owner  TEXT,
   lease_until  INTEGER,
+  lease_kind   TEXT,                   -- head | files | full: the pool that holds the lease
   retry_after  INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (repo, commit_id)
 );
 
-CREATE INDEX builds_claim ON builds (head_state, retry_after, created_at);
-CREATE INDEX builds_by_ref ON builds (repo, ref_name, created_at);
+CREATE UNIQUE INDEX builds_seq ON builds (seq);
+CREATE INDEX builds_by_ref ON builds (repo, ref_name, seq);
+
+-- Claims and the give-up pass read only unfinished rows: every pool's
+-- predicate implies this index's WHERE, so finished rows never enter a
+-- claim's scan however many accumulate.
+CREATE INDEX builds_unfinished ON builds (attempts)
+  WHERE head_state = 'pending' OR files_state = 'pending' OR full_state = 'pending';
+-- A Full's wait for older pending Fulls of its repo.
+CREATE INDEX builds_full_pending ON builds (repo, seq) WHERE full_state = 'pending';
+-- A claim skips a repo that already holds a live lease of the same kind.
+CREATE INDEX builds_leased ON builds (repo, lease_kind, lease_until)
+  WHERE lease_until IS NOT NULL;

@@ -105,9 +105,9 @@ and push C3 48 commits after C2, arriving 9 s after C2:
 | C2 | 6.1 | 16.2 | 240 |
 | C3 | 4.6 | 16.2 | 316 |
 
-Head and Files for a new push don't wait for an earlier push's Full. Full runs
-one build at a time by default (`RIPCLONE_FULL_SLOTS`) and in commit order, so
-C3's Full starts when C2's finishes and takes 85 s on top of it. While a
+Head and Files for a new push don't wait for an earlier push's Full. A
+repository's Fulls run one at a time, in the order its commits were admitted,
+so C3's Full starts when C2's finishes and takes 85 s on top of it. While a
 commit's Full is pending, a full clone of it uses the latest ready Full and
 fetches the remaining commits from upstream with the user's own git, so the
 clone doesn't wait.

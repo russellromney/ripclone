@@ -26,6 +26,63 @@ pub fn command() -> Command {
     Command::new("git")
 }
 
+/// Abort an HTTP transfer that moves under 1000 bytes/s for 60 s. A stalled
+/// upstream then fails the fetch or ls-remote instead of holding it open.
+const LOW_SPEED_ARGS: [&str; 4] = [
+    "-c",
+    "http.lowSpeedLimit=1000",
+    "-c",
+    "http.lowSpeedTime=60",
+];
+
+/// A git child run by [`run_tracked`].
+struct Tracked {
+    ended: crate::cancel::Ended,
+    stderr: Vec<u8>,
+}
+
+/// Run `command` in its own process group with stdin closed, stdout
+/// discarded and stderr captured to a file (so a long diagnostic cannot
+/// block the child). The group is killed when the current build is
+/// cancelled or `timeout` passes.
+fn run_tracked(command: &mut Command, timeout: Option<Duration>) -> std::io::Result<Tracked> {
+    let mut stderr = tempfile::tempfile()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr.try_clone()?));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let ended = crate::cancel::wait_child(&mut child, timeout)?;
+    stderr.rewind()?;
+    let mut bytes = Vec::new();
+    stderr.read_to_end(&mut bytes)?;
+    Ok(Tracked {
+        ended,
+        stderr: bytes,
+    })
+}
+
+/// [`run_tracked`] for local maintenance: an error carries git's stderr, a
+/// timeout or a cancelled build is an error too.
+fn run_quiet_bounded(command: &mut Command, what: &str, timeout: Duration) -> Result<()> {
+    use crate::cancel::Ended;
+    let run = run_tracked(command, Some(timeout)).with_context(|| format!("run git {what}"))?;
+    match run.ended {
+        Ended::Exited(status) if status.success() => Ok(()),
+        Ended::Exited(_) => bail!(
+            "git {what} failed: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ),
+        Ended::TimedOut => bail!("git {what} timed out after {timeout:?}"),
+        Ended::Cancelled => Err(anyhow::Error::new(crate::cancel::Cancelled)),
+    }
+}
+
 /// Fail before starting work that requires the system Git executable.
 pub fn require_system_git() -> Result<()> {
     let status = command()
@@ -518,14 +575,14 @@ pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 
 /// Write a commit-graph over all reachable commits so the many `rev-list` /
 /// graph walks during a build (skeleton + layered packs) don't re-parse commit
-/// objects from the packfile each time. A fresh `--mirror` clone has none. Cheap
-/// to build and best-effort — a failure only loses the speedup.
+/// objects from the packfile each time. A fresh mirror has none. Best-effort:
+/// a failure only loses the speedup.
 ///
-/// Uses `--split`: on a re-sync only the new commits are written into a new
-/// graph layer instead of rewriting the whole graph, so this stays O(new
-/// commits) rather than O(all commits) every sync.
-pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    run_quiet(
+/// Uses `--split`: only the new commits are written into a new graph layer
+/// instead of rewriting the whole graph, so this stays O(new commits). Safe
+/// beside readers (see `tests::concurrent_prep_and_reads_stay_safe`).
+pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P, timeout: Duration) -> Result<()> {
+    run_quiet_bounded(
         command()
             .arg("-C")
             .arg(repo_dir.as_ref().as_os_str())
@@ -537,6 +594,7 @@ pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
                 "--no-progress",
             ]),
         "commit-graph write",
+        timeout,
     )
 }
 
@@ -546,16 +604,90 @@ pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 /// full skeleton/history enumerations fast on a fresh `--mirror` clone (GitHub
 /// ships bitmaps, but our `git fetch` of all refs can leave them stale/absent).
 /// Best-effort — a failure only loses the speedup. Building the bitmap itself
-/// costs one reachability walk, so call it once after fetch, before the heavy
-/// builds, not on the depth=1 fast path.
-pub fn write_bitmap<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    run_quiet(
+/// costs one reachability walk, so it is written only right before a cold
+/// history build, the one build that uses it.
+pub fn write_bitmap<P: AsRef<Path>>(repo_dir: P, timeout: Duration) -> Result<()> {
+    run_quiet_bounded(
         command()
             .arg("-C")
             .arg(repo_dir.as_ref().as_os_str())
             .args(["multi-pack-index", "write", "--bitmap", "--no-progress"]),
         "multi-pack-index write --bitmap",
+        timeout,
     )
+}
+
+/// Packs in a mirror above which [`compact_mirror`] repacks.
+const MIRROR_PACK_LIMIT: usize = 16;
+/// Loose refs under `refs/ripclone/revs` above which [`compact_mirror`]
+/// packs refs.
+const MIRROR_LOOSE_REF_LIMIT: usize = 64;
+
+/// What [`compact_mirror`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorCompaction {
+    pub repacked: bool,
+    pub packed_refs: bool,
+}
+
+/// Keep a mirror's pack and loose ref counts bounded. Every admitted commit
+/// is fetched as one pack and kept under one loose ref, and auto-gc is off,
+/// so both grow with every push. Past [`MIRROR_PACK_LIMIT`] packs, a
+/// geometric repack merges the small packs (the large base pack is rarely
+/// rewritten) and writes a multi-pack-index; past
+/// [`MIRROR_LOOSE_REF_LIMIT`] loose refs, they are packed.
+///
+/// `repack -d` deletes packs a reader may be about to open, so the caller
+/// must hold the mirror exclusively: no build reading it, no fetch. Both
+/// steps share one `timeout`; a step killed by it leaves the mirror valid.
+pub fn compact_mirror(mirror_dir: &Path, timeout: Duration) -> Result<MirrorCompaction> {
+    let deadline = std::time::Instant::now() + timeout;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+    let mut done = MirrorCompaction::default();
+    let packs = count_entries(&mirror_dir.join("objects").join("pack"), |name| {
+        name.ends_with(".pack")
+    });
+    if packs > MIRROR_PACK_LIMIT {
+        run_quiet_bounded(
+            command().arg("-C").arg(mirror_dir.as_os_str()).args([
+                "repack",
+                "--geometric=2",
+                "-d",
+                "--write-midx",
+                "--no-write-bitmap-index",
+                "-q",
+            ]),
+            "repack --geometric",
+            remaining(),
+        )?;
+        done.repacked = true;
+    }
+    let loose_refs = count_entries(
+        &mirror_dir.join("refs").join("ripclone").join("revs"),
+        |_| true,
+    );
+    if loose_refs > MIRROR_LOOSE_REF_LIMIT {
+        run_quiet_bounded(
+            command()
+                .arg("-C")
+                .arg(mirror_dir.as_os_str())
+                .args(["pack-refs", "--all"]),
+            "pack-refs",
+            remaining(),
+        )?;
+        done.packed_refs = true;
+    }
+    Ok(done)
+}
+
+/// Entries of `dir` whose names `keep` accepts; 0 when `dir` is missing.
+fn count_entries(dir: &Path, keep: impl Fn(&str) -> bool) -> usize {
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| entry.file_name().to_str().is_some_and(&keep))
+            .count()
+    })
 }
 
 /// Build a multi-pack-index over the given packs (each a `(pack_bytes,
@@ -696,42 +828,68 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     // Capture rather than inherit: pack-objects prints each output pack's hash to
     // stdout (noise in the server log), and stderr carries the real diagnostic when
     // it fails. We write the packs by base-name, so stdout is not needed.
-    let mut child = command()
+    let mut command = command();
+    command
         .arg("-C")
         .arg(repo.as_ref())
         .arg("pack-objects")
         .arg("--revs")
         .arg("--use-bitmap-index")
-        .arg(prefix.as_ref())
+        .arg(prefix.as_ref());
+    run_pack_objects(command, std::iter::once(commit), "pack-objects (reachable)")
+}
+
+/// Run `pack-objects` with one line per `lines` item on stdin, as a tracked
+/// child: a cancelled build kills it. Stderr goes to a file so a long
+/// diagnostic cannot block the stdin writes.
+fn run_pack_objects<'a>(
+    mut command: Command,
+    lines: impl IntoIterator<Item = &'a str>,
+    what: &str,
+) -> Result<()> {
+    use crate::cancel::Ended;
+    let mut stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn git pack-objects (reachable)")?;
-
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .context("clone pack-objects stderr file")?,
+        ));
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn git {what}"))?;
+    let written = {
         let mut stdin = child
             .stdin
             .take()
-            .context("open reachable pack-objects stdin")?;
-        stdin
-            .write_all(commit.as_bytes())
-            .context("write commit to pack-objects stdin")?;
-        stdin
-            .write_all(b"\n")
-            .context("write newline to pack-objects stdin")?;
+            .with_context(|| format!("open git {what} stdin"))?;
+        lines.into_iter().try_for_each(|line| {
+            stdin.write_all(line.as_bytes())?;
+            stdin.write_all(b"\n")
+        })
+    };
+    let ended = crate::cancel::wait_child(&mut child, None)
+        .with_context(|| format!("wait for git {what}"))?;
+    match ended {
+        Ended::Exited(status) if status.success() => {}
+        Ended::Cancelled => return Err(anyhow::Error::new(crate::cancel::Cancelled)),
+        Ended::Exited(_) | Ended::TimedOut => {
+            let mut text = String::new();
+            stderr.rewind().context("rewind pack-objects stderr")?;
+            stderr
+                .read_to_string(&mut text)
+                .context("read pack-objects stderr")?;
+            bail!("{what} failed: {}", text.trim());
+        }
     }
-
-    let output = child
-        .wait_with_output()
-        .context("wait for git pack-objects (reachable)")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("pack-objects (reachable) failed: {}", stderr.trim());
-    }
-
-    Ok(())
+    written.with_context(|| format!("write to git {what} stdin"))
 }
 
 fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -748,47 +906,20 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
 
-    // Capture rather than inherit: pack-objects prints each pack's hash on
-    // stdout, which we do not need (the packs are written by base name), and
-    // its stderr is the diagnostic. Stderr goes to a file so a long
-    // diagnostic cannot block the stdin writes below.
-    let mut stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
-    let mut child = command()
+    // Pack-objects prints each pack's hash on stdout, which we do not need
+    // (the packs are written by base name).
+    let mut command = command();
+    command
         .arg("-C")
         .arg(repo.as_ref())
         .arg("pack-objects")
         .args(extra_args)
-        .arg(prefix.as_ref())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            stderr
-                .try_clone()
-                .context("clone pack-objects stderr file")?,
-        ))
-        .spawn()
-        .context("spawn git pack-objects")?;
-
-    let written = {
-        let mut stdin = child.stdin.take().context("open git pack-objects stdin")?;
-        object_shas.iter().try_for_each(|sha| {
-            stdin.write_all(sha.as_bytes())?;
-            stdin.write_all(b"\n")
-        })
-    };
-
-    let status = child.wait().context("wait for git pack-objects")?;
-    if !status.success() {
-        let mut text = String::new();
-        stderr.rewind().context("rewind pack-objects stderr")?;
-        stderr
-            .read_to_string(&mut text)
-            .context("read pack-objects stderr")?;
-        bail!("pack-objects failed: {}", text.trim());
-    }
-    written.context("write object ids to pack-objects stdin")?;
-
-    Ok(())
+        .arg(prefix.as_ref());
+    run_pack_objects(
+        command,
+        object_shas.iter().map(String::as_str),
+        "pack-objects",
+    )
 }
 
 /// Read and encode objects as pack base entries using scoped OS threads and
@@ -1009,12 +1140,16 @@ pub fn ls_tree_sizes<P: AsRef<Path>>(repo: P, commit: &str) -> Result<HashMap<St
 ///
 /// Builds read the mirror's packs while a fetch appends to it. Auto-gc, which a
 /// fetch can trigger, repacks or prunes those packs out from under a live reader
-/// and corrupts the read. We gc explicitly instead. Idempotent and cheap.
+/// and corrupts the read. The server compacts the mirror itself, with no reader
+/// ([`compact_mirror`]). `fetch.unpackLimit=1` keeps every fetch a pack, so
+/// small pushes do not pile up loose objects that nothing would pack.
+/// Idempotent and cheap.
 pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
     for (key, value) in [
         ("gc.auto", "0"),
         ("gc.autoPackLimit", "0"),
         ("maintenance.auto", "false"),
+        ("fetch.unpackLimit", "1"),
     ] {
         run_quiet(
             command()
@@ -1095,6 +1230,14 @@ pub fn origin_base() -> Option<String> {
 pub fn ls_remote_timeout() -> Result<Duration> {
     let secs = crate::env::number("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", 30)?;
     Ok(Duration::from_secs(if secs == 0 { 30 } else { secs }))
+}
+
+/// `RIPCLONE_FETCH_TIMEOUT_SECS`, default 3600 s; zero means the default.
+/// The wall-clock cap on one mirror fetch. A stalled transfer fails sooner,
+/// through git's low-speed limit.
+pub fn fetch_timeout() -> Result<Duration> {
+    let secs = crate::env::number("RIPCLONE_FETCH_TIMEOUT_SECS", 3600)?;
+    Ok(Duration::from_secs(if secs == 0 { 3600 } else { secs }))
 }
 
 fn upstream_auth_header(
@@ -1303,6 +1446,7 @@ async fn ls_remote_tip_async_with(
     let mut command = tokio::process::Command::from(command());
     command
         .args(&git_args)
+        .args(LOW_SPEED_ARGS)
         .args(["ls-remote", "--symref", "--", &url])
         .args(&candidates)
         .stdout(Stdio::from(child_stdout))
@@ -1557,10 +1701,11 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
         commit,
         credential,
         origin_base().as_deref(),
+        fetch_timeout()?,
     )
 }
 
-/// [`sync_bare_mirror_admitted`] with the origin base given.
+/// [`sync_bare_mirror_admitted`] with the origin base and timeout given.
 fn sync_bare_mirror_admitted_from(
     mirror_dir: &Path,
     provider: &ProviderInstance,
@@ -1568,6 +1713,7 @@ fn sync_bare_mirror_admitted_from(
     commit: &str,
     credential: Option<&secrecy::SecretString>,
     origin_base: Option<&str>,
+    timeout: Duration,
 ) -> Result<()> {
     crate::validation::validate_repo_path(provider, repo_id)
         .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
@@ -1586,10 +1732,11 @@ fn sync_bare_mirror_admitted_from(
     }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential, origin_base);
     let auth_header = upstream_auth_header(provider, credential);
-    sync_bare_mirror_rev(mirror_dir, &url, &git_args, auth_header, commit)
+    sync_bare_mirror_rev(mirror_dir, &url, &git_args, auth_header, commit, timeout)
 }
 
-fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
+/// True when the mirror already holds `commit`.
+pub fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
     mirror_dir.exists()
         && command()
             .arg("-C")
@@ -1634,33 +1781,48 @@ fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fetch `rev` from upstream, bounded twice: git's low-speed limit fails a
+/// stalled transfer, and `timeout` caps the whole fetch. Either way the
+/// fetch's process group (with its HTTP helper) is killed and the error is
+/// retryable. A cancelled build kills it too.
 fn sync_bare_mirror_rev(
     mirror_dir: &Path,
     url: &str,
     git_args: &[String],
     auth_header: Option<(String, String)>,
     rev: &str,
+    timeout: Duration,
 ) -> Result<()> {
+    use crate::cancel::Ended;
     ensure_bare_origin(mirror_dir, url)?;
 
     let refspec = format!("{rev}:refs/ripclone/revs/{}", rev_internal_ref_name(rev));
 
-    let output = command()
-        .args(git_args)
-        .arg("-C")
-        .arg(mirror_dir.as_os_str())
-        .args(["fetch", "--no-tags", "origin", &refspec])
-        .output()
-        .context("git fetch rev")?;
-    if !output.status.success() {
-        return Err(upstream_git_error(
+    let run = run_tracked(
+        command()
+            .args(git_args)
+            .args(LOW_SPEED_ARGS)
+            .arg("-C")
+            .arg(mirror_dir.as_os_str())
+            .args(["fetch", "--no-tags", "origin", &refspec]),
+        Some(timeout),
+    )
+    .context("git fetch rev")?;
+    match run.ended {
+        Ended::Exited(status) if status.success() => Ok(()),
+        Ended::Exited(_) => Err(upstream_git_error(
             "fetch rev",
             url,
             auth_header,
-            &output.stderr,
-        ));
+            &run.stderr,
+        )),
+        Ended::TimedOut => Err(anyhow::Error::new(UpstreamGitError::with_detail(
+            "fetch rev",
+            true,
+            Some(format!("timed out after {timeout:?}")),
+        ))),
+        Ended::Cancelled => Err(anyhow::Error::new(crate::cancel::Cancelled)),
     }
-    Ok(())
 }
 
 fn rev_internal_ref_name(rev: &str) -> String {
@@ -1698,7 +1860,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = format!(
             "{:#}",
-            write_commit_graph(dir.path().join("missing")).unwrap_err()
+            write_commit_graph(dir.path().join("missing"), Duration::from_secs(30)).unwrap_err()
         );
         assert!(
             err.starts_with("git commit-graph write failed: fatal: cannot change to"),
@@ -1911,6 +2073,7 @@ mod tests {
         assert_eq!(read("gc.auto"), "0");
         assert_eq!(read("gc.autoPackLimit"), "0");
         assert_eq!(read("maintenance.auto"), "false");
+        assert_eq!(read("fetch.unpackLimit"), "1");
 
         // Idempotent: a second call on an already-configured mirror is fine.
         disable_auto_gc(repo).unwrap();
@@ -2175,6 +2338,7 @@ mod tests {
             &commit_b,
             None,
             base.path().to_str(),
+            Duration::from_secs(60),
         )
         .unwrap();
 
@@ -2227,6 +2391,7 @@ mod tests {
             &commit_b,
             None,
             base.path().to_str(),
+            Duration::from_secs(60),
         )
         .unwrap();
 
@@ -2235,12 +2400,13 @@ mod tests {
     }
 
     /// Reads and fetches of one mirror stay correct while the multi-pack-index
-    /// bitmap is rewritten beside them, with auto-gc off. One thread runs the
-    /// locked prep (fetch, then `commit-graph write --split`) for a fixed number
-    /// of new commits. Another rewrites the bitmap in a loop, outside that
-    /// lock, as the Full build does. Readers walk every object, with and
-    /// without the bitmap. With gc off, writers only add packs and atomically
-    /// replace the accelerators, so no reader or fetch may fail.
+    /// bitmap and the commit-graph are rewritten beside them, with auto-gc
+    /// off. One thread fetches and writes `commit-graph --split` for a fixed
+    /// number of new commits. Another rewrites the bitmap in a loop. Readers
+    /// walk every object, with and without the bitmap. With gc off, writers
+    /// only add packs and atomically replace the accelerators, so no reader
+    /// or fetch may fail: builds read while the mirror is written, and only
+    /// `compact_mirror`, which deletes packs, needs the mirror to itself.
     #[test]
     fn concurrent_prep_and_reads_stay_safe() {
         use std::sync::Arc;

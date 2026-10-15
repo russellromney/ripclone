@@ -69,6 +69,8 @@ pub mod auth;
 pub mod backends;
 #[doc(hidden)]
 pub mod bench;
+#[doc(hidden)]
+pub mod cancel;
 pub mod cas;
 pub mod client;
 #[doc(hidden)]

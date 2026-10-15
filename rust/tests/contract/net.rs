@@ -82,6 +82,9 @@ struct GitState {
     accepted: Mutex<Vec<(String, String)>>,
     /// A fetch carrying this header passes a closed gate.
     unheld: Mutex<Option<(String, String)>>,
+    /// Fetches of these repos wait on `repo_gate`.
+    held_repos: Mutex<Vec<String>>,
+    repo_gate: Gate,
 }
 
 /// One request the origin received.
@@ -120,6 +123,8 @@ impl GitHttp {
             requests: Mutex::new(Vec::new()),
             accepted: Mutex::new(Vec::new()),
             unheld: Mutex::new(None),
+            held_repos: Mutex::new(Vec::new()),
+            repo_gate: Gate::new(),
         });
         let router = Router::new()
             .fallback(git_backend)
@@ -148,15 +153,31 @@ impl GitHttp {
         self.hold_fetches();
     }
 
+    /// Park upload-pack fetches of one repo (`owner/name`) only; every other
+    /// repo's fetches pass.
+    pub fn hold_fetches_of(&self, repo: &str) {
+        let path = format!("/{repo}.git/");
+        self.state.held_repos.lock().unwrap().push(path);
+        self.state.repo_gate.open.send_replace(false);
+    }
+
     pub fn release_fetches(&self) {
+        self.state.held_repos.lock().unwrap().clear();
+        self.state.repo_gate.open.send_replace(true);
         self.state.gate.open.send_replace(true);
     }
 
     /// Wait until at least `n` fetches are parked.
     pub fn wait_held(&self, n: usize) {
         crate::harness::wait_for(&format!("{n} held origin fetch(es)"), || {
-            (self.state.gate.waiting.load(Ordering::SeqCst) >= n).then_some(())
+            (self.held() >= n).then_some(())
         });
+    }
+
+    /// Fetches parked now.
+    pub fn held(&self) -> usize {
+        self.state.gate.waiting.load(Ordering::SeqCst)
+            + self.state.repo_gate.waiting.load(Ordering::SeqCst)
     }
 
     /// Upload-pack fetch requests seen so far, held or not.
@@ -212,6 +233,12 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
         accepted.is_empty() || accepted.iter().any(carries)
     };
     let unheld = state.unheld.lock().unwrap().as_ref().is_some_and(carries);
+    let repo_held = state
+        .held_repos
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|repo| path.contains(repo.as_str()));
     state.requests.lock().unwrap().push(request);
     if !allowed {
         return plain(StatusCode::FORBIDDEN, "missing required header".into());
@@ -226,6 +253,9 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
         state.fetches.fetch_add(1, Ordering::SeqCst);
         if !unheld {
             state.gate.pass().await;
+        }
+        if repo_held {
+            state.repo_gate.pass().await;
         }
     }
 

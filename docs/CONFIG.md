@@ -79,17 +79,26 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | `RIPCLONE_WEBHOOK_ALLOWLIST` | Comma-separated repos that webhooks may build. Unset: every added repo. |
 | `RIPCLONE_POLL_INTERVAL_SECS` | How often the server checks added repos for new commits, default 300; `0` turns polling off. |
 | `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` | Timeout for each upstream `ls-remote`, default 30; `0` means the default. |
+| `RIPCLONE_FETCH_TIMEOUT_SECS` | Longest one upstream fetch into the server's mirror may run, default 3600; `0` means the default. A fetch that moves under 1000 bytes per second for 60 seconds stops sooner. A stopped fetch is a retryable build failure. |
 | `RIPCLONE_RATE_LIMIT_BURST`, `RIPCLONE_RATE_LIMIT_PER_SEC` | Per-IP rate limit: burst size and refill per second, defaults 60 and 10. See [API](API.md#authentication). |
 | `RIPCLONE_TRUST_FORWARDED_FOR` | `1` or `true`: rate-limit by the last `X-Forwarded-For` address. Only behind one trusted proxy. |
-| `RIPCLONE_HEAD_SLOTS` | Builds that run Head at once, default 2. At least 1. |
-| `RIPCLONE_FILES_SLOTS` | Builds that run Files at once, default 1. `0` pauses Files; Head and Full still build. |
-| `RIPCLONE_FULL_SLOTS` | Builds that run Full at once, default 1. `0` pauses Full; Head and Files still build. A long Full never holds back another commit's Files. |
+| `RIPCLONE_HEAD_SLOTS` | Builds that run Head at once. Default: a quarter of the CPU cores, at least 2. At least 1. |
+| `RIPCLONE_FILES_SLOTS` | Builds that run Files at once. Default: an eighth of the CPU cores, at least 1. `0` pauses Files; Head and Full still build. |
+| `RIPCLONE_FULL_SLOTS` | Builds that run Full at once. Default: an eighth of the CPU cores, at least 1. `0` pauses Full; Head and Files still build. A long Full never holds back another commit's Files. |
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
 | `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Files, then Full) before the output fails, default 5. At least 1. |
 | `RIPCLONE_LSM_MAX_LEVELS` | Most history levels a Full keeps before merging the smallest neighbors, default 16. |
 | `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head packs past their base reach this size, its Full build compacts them into a new base for later Heads. Default 128 MiB. |
 | `RIPCLONE_ORIGIN_BASE` | Fetch repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. For mirrors and tests. |
 | `RIPCLONE_BENCH` | Log a JSON timing report for each build. |
+
+A repository runs at most one build of each kind at a time, so slots past one
+per kind only help when several repositories build at once. Head is mostly
+single-threaded git work and uploads; Files compresses with zstd and Full runs
+multi-threaded `git pack-objects`, so each of those uses several cores. The
+defaults keep a busy server near its core count: 2, 1 and 1 on 8 cores; 4, 2
+and 2 on 16; 16, 8 and 8 on 64. A repository's Fulls build in the order its
+commits were admitted.
 
 Every numeric server setting is a non-negative integer, except
 `RIPCLONE_RATE_LIMIT_PER_SEC`, which may be a decimal. A value that is set but

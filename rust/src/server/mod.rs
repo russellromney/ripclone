@@ -76,9 +76,9 @@ pub struct ServerState {
     /// allowlist. A provider with no configured secret returns 503. Reads
     /// `RIPCLONE_WEBHOOK_SECRET_<provider>`.
     pub webhook_config: Arc<WebhookConfig>,
-    /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
-    /// the bare mirror directory.
-    pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-repo mirror locks, so concurrent builds of one repo cannot
+    /// corrupt or lose its bare mirror.
+    pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<RepoLock>>>>,
     /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
     /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
     pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
@@ -87,7 +87,36 @@ pub struct ServerState {
     pub signed_url_ttl: Duration,
 }
 
+/// The locks of one repo's bare mirror.
+///
+/// Fetches, the commit-graph and the bitmap only add files or atomically
+/// replace them, so builds read the mirror while they run; `write`
+/// serializes them. Compaction deletes packs, so it also needs `read`
+/// exclusively, which it only tries for: it never waits for a build, and no
+/// build waits long for it. Order: `read`, then `write`.
+#[derive(Default)]
+pub struct RepoLock {
+    pub write: tokio::sync::Mutex<()>,
+    /// Shared by every build while it reads the mirror.
+    pub read: tokio::sync::RwLock<()>,
+    /// When compaction last failed, so a failing one is not retried by every
+    /// Full.
+    pub compact_failed: std::sync::Mutex<Option<Instant>>,
+}
+
 impl ServerState {
+    /// The broker's credential for `repo_id`, read on a blocking thread: a
+    /// broker cache miss makes a blocking HTTP call.
+    pub async fn fetch_credential(
+        &self,
+        repo_id: &crate::provider::RepoId,
+    ) -> Result<Option<secrecy::SecretString>> {
+        let (broker, repo_id) = (self.broker.clone(), repo_id.clone());
+        tokio::task::spawn_blocking(move || broker.fetch_credential(&repo_id))
+            .await
+            .context("credential task")?
+    }
+
     /// The wake-up for `pool`'s idle slots.
     pub fn wake(&self, pool: crate::control::Pool) -> &Arc<tokio::sync::Notify> {
         match pool {
@@ -242,12 +271,14 @@ async fn metrics_handler(State(state): State<ServerState>) -> impl IntoResponse 
     )
 }
 
-/// Process-global cap on concurrent upstream fetches/clones. Separate from the
-/// build slots: a fetch is network/upstream bound, a build is CPU bound, so
-/// they throttle independently.
-fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
+/// Process-global cap on concurrent `ls-remote` resolves (API admissions and
+/// the poller). Each is a short, bounded child; the cap only stops a burst of
+/// requests from starting hundreds at once. Mirror fetches are not counted
+/// here: they run inside build slots, which bound them, so a slow fetch never
+/// delays an `/add` or `POST /builds`.
+fn ls_remote_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SEM.get_or_init(|| tokio::sync::Semaphore::new(4))
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(16))
 }
 
 /// Put every temporary file and directory this process makes under `dir`,
@@ -321,6 +352,7 @@ async fn serve(
     let signed_url_ttl = api::signed_url_ttl_from_env()?;
     // Read where they are used; checked here so a bad value stops startup.
     crate::git::ls_remote_timeout()?;
+    crate::git::fetch_timeout()?;
     builder::check_environment()?;
 
     let metrics = Metrics::new();

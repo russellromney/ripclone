@@ -138,22 +138,29 @@ pub trait ControlStore: Send + Sync {
     /// Return failed outputs to pending with attempts and backoff cleared.
     /// Ready and pending outputs are untouched. `None` if the row is unknown.
     async fn retry(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>>;
-    /// Lease the oldest claimable row of `pool`. A Full row is claimable
-    /// only when no older row of its repo has Full pending, so a repo's
-    /// Fulls publish in admission order. First gives up on rows whose
+    /// Lease the oldest claimable row of `pool`, by admission order (a
+    /// strictly increasing sequence, so same-second admits keep their
+    /// order). A repo that already holds a live lease of `pool` is skipped,
+    /// so one repo cannot fill a pool. A Full row is claimable only when no
+    /// older row of its repo has Full pending, so a repo's Fulls publish in
+    /// admission order. First gives up on rows whose
     /// lease expired after the last allowed attempt: the current phase's
     /// output fails (a pending Head takes Files and Full with it), and a
     /// failed Files hands the row to the Full phase.
     async fn claim(&self, owner: &str, pool: Pool, lease: Duration) -> Result<Option<Claim>>;
-    /// Extend the lease. False when the claim no longer owns the row.
+    /// Extend the lease. False when the claim no longer owns the row or the
+    /// lease already expired: an expired lease is lost even if nobody has
+    /// claimed the row since.
     async fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool>;
     /// Write a ready output. Publishing Head or Files ends that phase and
-    /// clears attempts for the next one.
+    /// clears attempts for the next one. Nothing is written for a claim
+    /// whose lease was lost or expired.
     async fn publish(&self, claim: &Claim, output: Output) -> Result<Published>;
     /// Record a failed build of `kind`. With `retry_after` and attempts left
     /// the output stays pending and the row is not claimable until the delay
     /// passes; otherwise it fails. A failed Head fails Files and Full too; a
-    /// failed Files starts the Full phase.
+    /// failed Files starts the Full phase. Like `publish`, a lost or
+    /// expired lease records nothing.
     async fn fail(
         &self,
         claim: &Claim,
