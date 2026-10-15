@@ -447,16 +447,17 @@ struct HeadBuild {
 }
 
 /// Build and upload the Head result for `commit`. Head packs are a delta
-/// against `base`, an immutable Head pack set of an ancestor; without a base
-/// the full closure is packed and becomes the base. `parent_head`, the
-/// parent's ready Head, lets the files table hash only changed paths.
+/// against `base`, an immutable Head pack set of an ancestor; without a base,
+/// or when the base commit cannot be read, the full closure is packed and
+/// becomes the base. `previous_head`, the ready Head of an ancestor, lets the
+/// files table hash only the paths changed since it.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_head_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     commit: &str,
     parent: Option<String>,
-    parent_head: Option<&crate::HeadResult>,
+    previous_head: Option<&crate::HeadResult>,
     base: Option<crate::HeadBase>,
     storage: &crate::storage::StorageRef,
     phases: &mut SyncPhases,
@@ -487,10 +488,23 @@ pub(super) async fn build_head_result(
     let head_handle = tokio::task::spawn_blocking(move || -> Result<HeadBuild> {
         let s = Instant::now();
         let b = PackBuilder::new(&md2, &c2);
+        // Delta path: a base exists; pack only what is new since the base. A
+        // base the mirror cannot read falls back to the cold path.
+        let base =
+            base.and_then(
+                |base| match b.build_head_delta_pack(&cm2, &base.commit, head_target) {
+                    Ok(delta) => Some((base, delta)),
+                    Err(e) => {
+                        warn!(
+                            "Head delta vs base {} failed ({e:#}); packing a full base",
+                            &base.commit[..7.min(base.commit.len())]
+                        );
+                        None
+                    }
+                },
+            );
         match base {
-            // Delta path: a base exists; pack only what is new since the base.
-            Some(base) => {
-                let delta = b.build_head_delta_pack(&cm2, &base.commit, head_target)?;
+            Some((base, delta)) => {
                 let mut all_packs: Vec<(String, u64, String, u64)> =
                     base.packs.iter().map(sized_to_tuple).collect();
                 all_packs.extend(delta.iter().cloned());
@@ -533,13 +547,13 @@ pub(super) async fn build_head_result(
     // not need the archive. The full zstd archive (for files mode) is built in
     // concurrently afterward, off the time-to-Head critical path.
     //
-    // Files-table by-diff: when the parent's Head is ready, reuse its content
+    // Files-table by-diff: with an ancestor's ready Head, reuse its content
     // hashes for unchanged paths and read+hash only the blobs that changed since
-    // the parent (O(changed) instead of O(worktree)). Falls back to a full table
-    // when there is no parent table.
-    let prev_files: Option<Vec<crate::clonepack::FileEntry>> = parent_head
+    // that commit (O(changed) instead of O(worktree)). Falls back to a full
+    // table when there is no previous table.
+    let prev_files: Option<Vec<crate::clonepack::FileEntry>> = previous_head
         .and_then(|head| load_metadata_files(cas, storage, &head.clonepack.metadata_chunk));
-    let prev_commit_for_diff = parent_head.and(parent.clone());
+    let prev_commit_for_diff = previous_head.map(|head| head.clonepack.commit.clone());
     // Carry the prior files table + commit so the bounded archive can hash only
     // changed files and reuse frames for the unchanged prefix/suffix.
     let (md3, cm3) = (mirror_dir.to_path_buf(), commit.to_string());
@@ -874,7 +888,7 @@ pub(super) async fn build_full_result(
     repo_id: &RepoId,
     commit: &str,
     head: &crate::HeadResult,
-    previous_levels: Vec<crate::HistoryLevel>,
+    mut previous_levels: Vec<crate::HistoryLevel>,
     storage: &crate::storage::StorageRef,
 ) -> Result<crate::FullResult> {
     let head_manifest_bytes = storage
@@ -892,20 +906,39 @@ pub(super) async fn build_full_result(
     let parent = head.parent_commit.clone();
 
     let history_target = 512 * 1024 * 1024;
-    let sealed_tip = previous_levels.last().map(|level| level.tip_commit.clone());
+    let mut sealed_tip = previous_levels.last().map(|level| level.tip_commit.clone());
     let history_mirror = mirror_dir.to_path_buf();
     let history_cas = cas.clone();
     let history_commit = commit.to_string();
     let history_sealed_tip = sealed_tip.clone();
-    let built_history = tokio::task::spawn_blocking(move || {
-        PackBuilder::new(&history_mirror, &history_cas).build_history_tail(
-            &history_commit,
-            history_sealed_tip.as_deref(),
-            history_target,
-        )
+    // A tail the mirror cannot list from the sealed tip builds cold instead:
+    // a new level 0 with the whole history.
+    let (built_history, cold) = tokio::task::spawn_blocking(move || {
+        let builder = PackBuilder::new(&history_mirror, &history_cas);
+        let Some(tip) = history_sealed_tip else {
+            return builder
+                .build_history_tail(&history_commit, None, history_target)
+                .map(|packs| (packs, false));
+        };
+        match builder.build_history_tail(&history_commit, Some(&tip), history_target) {
+            Ok(packs) => Ok((packs, false)),
+            Err(e) => {
+                warn!(
+                    "history tail from {} failed ({e:#}); building history cold",
+                    &tip[..7.min(tip.len())]
+                );
+                builder
+                    .build_history_tail(&history_commit, None, history_target)
+                    .map(|packs| (packs, true))
+            }
+        }
     })
     .await
     .context("Full history task")??;
+    if cold {
+        previous_levels.clear();
+        sealed_tip = None;
+    }
 
     let (history_packs, new_history, levels) = seal_and_compact(
         mirror_dir,

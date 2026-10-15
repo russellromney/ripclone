@@ -313,11 +313,18 @@ impl ControlStore for SqliteControlStore {
 
     async fn claim(&self, owner: &str, pool: Pool, lease: Duration) -> Result<Option<Claim>> {
         let now = self.clock.now();
+        // A Full waits for every older Full of its repo, so Fulls publish in
+        // admission order and each can build on the history before it.
         let predicate = match pool {
             Pool::Head => "head_state = 'pending'",
             Pool::Files => "head_state = 'ready' AND files_state = 'pending'",
             Pool::Full => {
-                "head_state = 'ready' AND full_state = 'pending' AND files_state <> 'pending'"
+                "head_state = 'ready' AND full_state = 'pending' AND files_state <> 'pending'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM builds AS older
+                   WHERE older.repo = b.repo AND older.full_state = 'pending'
+                     AND (older.created_at < b.created_at
+                       OR (older.created_at = b.created_at AND older.commit_id < b.commit_id)))"
             }
         };
         let mut tx = self
@@ -366,7 +373,7 @@ impl ControlStore for SqliteControlStore {
         let row = sqlx::query(&format!(
             "UPDATE builds SET lease_owner = $1, lease_until = $2, attempts = attempts + 1
              WHERE (repo, commit_id) = (
-               SELECT repo, commit_id FROM builds
+               SELECT repo, commit_id FROM builds AS b
                WHERE {predicate}
                  AND (lease_until IS NULL OR lease_until <= $3)
                  AND retry_after <= $3
@@ -592,6 +599,31 @@ impl ControlStore for SqliteControlStore {
             Ok((commit, full))
         })
         .transpose()
+    }
+
+    async fn ready_commits(
+        &self,
+        repo: &RepoId,
+        kind: ExactResultKind,
+        prefer_ref: Option<&str>,
+        except: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let prefix = column_prefix(kind);
+        sqlx::query_scalar(&format!(
+            "SELECT commit_id FROM builds
+             WHERE repo = $1 AND {prefix}_state = 'ready' AND commit_id <> $2
+             ORDER BY CASE WHEN ref_name = $3 THEN 0 ELSE 1 END,
+               created_at DESC, commit_id DESC
+             LIMIT $4"
+        ))
+        .bind(repo.storage_key())
+        .bind(except)
+        .bind(prefer_ref)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("read ready {kind} commits"))
     }
 
     async fn add_repo(&self, repo: &RepoId) -> Result<bool> {

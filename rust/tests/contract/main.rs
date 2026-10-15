@@ -10,6 +10,7 @@ mod coalesce;
 mod docs;
 mod downloads;
 mod gitea;
+mod incremental;
 mod integrations;
 mod outputs;
 mod pinning;

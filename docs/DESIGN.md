@@ -38,7 +38,9 @@ Each exact commit stores three independent results: **Head**, **Full**, and
 **Files**. A build publishes Head first, then the Files archive, then Full
 history, each as soon as it is complete. Head, Files and Full each have their
 own build slots, so a long Full never holds back the next commit's Head or
-Files. A published result never changes, and a later build never rebuilds one.
+Files. A repository's Full results build one at a time, in push order, so each
+can extend the history of the one before. A published result never changes,
+and a later build never rebuilds one.
 
 A depth-1 editable clone needs Head, a full editable clone needs Full, and
 files mode needs Files. Each result is `pending`, `ready`, or `failed`.
@@ -65,5 +67,7 @@ codes: [API](API.md).
 The archive is split by content, not by fixed size: cut points land on the data itself (frames run about 1–16 MB). Each frame is compressed on its own and named by the hash of its bytes.
 
 This makes re-syncs cheap. When a new commit lands, frames that didn't change hash to the same name and are reused as-is — no recompressing, no re-uploading. Only the frames that actually changed get rebuilt, and the builder reads just those changed regions, so the work matches the size of the diff, not the whole repo. The same is true of everything else a sync builds: only the commits and objects new since the last sync get packed, and re-syncing a commit that's already built does no work at all. A re-sync costs about what the diff costs.
+
+Each result builds on the same result of its **base**: the newest commit of the repository with that result ready that is an ancestor of the commit being built, preferring commits pushed to the same branch. So a push of many commits, a merge, or a rewind costs the diff from the last built commit it contains, not just from its parent. A commit with no built ancestor, such as a force push onto unrelated history, builds from scratch. A non-ancestor is never a base, so a result never carries objects its commit cannot reach.
 
 Clone and build timings are in [Benchmarks](BENCHMARKS.md).
