@@ -64,9 +64,12 @@ fn c1_head_clones_while_background_outputs_pend() {
 }
 
 /// C4: SIGKILL while the origin holds the build's fetch; after a restart and
-/// release the build completes once and every output is ready.
+/// release the build completes once and every output is ready. Then SIGKILL
+/// again as soon as a push's first artifact is in the store: every object
+/// there holds the bytes its name hashes to, and after a restart the push
+/// builds and clones exactly.
 #[test]
-fn c4_build_killed_mid_fetch_completes_once_after_restart() {
+fn c4_killed_builds_complete_after_restart() {
     let world = World::new();
     let http = world.serve_origins_over_http();
     let origin = world.origin("acme", "c4");
@@ -108,6 +111,95 @@ fn c4_build_killed_mid_fetch_completes_once_after_restart() {
         .ok();
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
     assert_eq!(listing(&target), origin.tree(&tip));
+
+    // Enough new data that the build is still writing when it is killed.
+    for i in 0..2u64 {
+        let path = origin.work.join(format!("data/{i}.bin"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, crate::downloads::noise(i + 1, 3 << 20)).unwrap();
+    }
+    let b = origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+    let stored = store_objects(&world);
+    world.cli(&server, &["sync", "acme/c4"]).ok();
+    wait_for("B's first artifact", || {
+        (store_objects(&world).len() > stored.len()).then_some(())
+    });
+    server.kill();
+    for (name, bytes) in store_objects(&world)
+        .iter()
+        .map(|n| (n, object_bytes(&world, n)))
+    {
+        assert_eq!(&object_id(name, &bytes), name, "corrupt store object");
+    }
+    server.restart();
+    wait_all_ready(&server, "acme/c4", &b);
+    let target = world.target("c4-b");
+    world
+        .cli(&server, &["clone", "acme/c4", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
+    assert_eq!(listing(&target), origin.tree(&b));
+    assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "2");
+    git(&target, &["fsck", "--full"]);
+    let files = world.target("c4-b-files");
+    world
+        .cli(
+            &server,
+            &[
+                "clone",
+                "acme/c4",
+                files.to_str().unwrap(),
+                "--mode",
+                "files",
+            ],
+        )
+        .ok();
+    assert_eq!(listing(&files), origin.tree(&b));
+}
+
+/// Names of the objects in the local store (`<cache>/xx/<name>`), sorted.
+/// Temporary files, whose names start with a dot, are left out.
+fn store_objects(world: &World) -> Vec<String> {
+    let root = world.path("server").join("cache");
+    let mut out = Vec::new();
+    for dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        let fan = dir.file_name().to_string_lossy().into_owned();
+        if fan.len() != 2 || !dir.path().is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with('.') {
+                assert!(name.starts_with(&fan), "{name} under {fan}");
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn object_bytes(world: &World, name: &str) -> Vec<u8> {
+    std::fs::read(
+        world
+            .path("server")
+            .join("cache")
+            .join(&name[..2])
+            .join(name),
+    )
+    .unwrap()
+}
+
+/// The id of `bytes` in the store: SHA-1 for a 40-character name, SHA-256
+/// otherwise.
+fn object_id(name: &str, bytes: &[u8]) -> String {
+    use sha2::Digest;
+    if name.len() == 40 {
+        hex::encode(sha1::Sha1::digest(bytes))
+    } else {
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
 }
 
 /// A ref response with every URL's query string removed: signatures and

@@ -622,6 +622,10 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
             resp_headers.append(name, value.clone());
         }
     }
+    // A HEAD response has no body; its length is the object's.
+    let head_len = (parts.method == Method::HEAD)
+        .then(|| upstream.headers().get(header::CONTENT_LENGTH).cloned())
+        .flatten();
     let mut data = upstream.bytes().await.unwrap_or_default().to_vec();
 
     let target = format!("{path}?{query}");
@@ -682,7 +686,10 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     for (name, value) in &resp_headers {
         builder = builder.header(name, value);
     }
-    builder = builder.header(header::CONTENT_LENGTH, data.len());
+    builder = match head_len {
+        Some(len) => builder.header(header::CONTENT_LENGTH, len),
+        None => builder.header(header::CONTENT_LENGTH, data.len()),
+    };
     match cut {
         None => builder.body(Body::from(data)).unwrap(),
         Some((n, stall)) => {

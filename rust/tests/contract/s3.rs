@@ -1,4 +1,4 @@
-//! C2, C3, C7, F7, H2 and H6 against S3 storage: a versitygw emulator per test,
+//! C2, C3, C7, C8, F7, H2, H6 and H10 against S3 storage: a versitygw emulator per test,
 //! started by `scripts/s3_emulator.sh`. Ignored by default because the script fetches
 //! the emulator binary; the `s3` CI job runs them with `--ignored`.
 
@@ -331,4 +331,212 @@ fn s3_h6_retention_trims_only_the_local_cache() {
         server.metric("ripclone_local_cache_cleanup_errors_total"),
         0
     );
+}
+
+/// C8: the bucket fails a write while Head is building. One write is held in
+/// flight and the next is refused: Head fails with the storage error and
+/// publishes nothing, so a depth-1 clone fails and leaves no target. With
+/// the fault gone, `sync --at` builds every output and each shape clones
+/// exactly.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_c8_failed_upload_publishes_nothing() {
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let s3_proxy = FaultProxy::start(&s3);
+    s3_proxy.preserve_host();
+    let origin = world.origin("acme", "c8");
+    let tip = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "A");
+    origin.publish();
+    let mut env = s3.server_env(&s3_proxy.url());
+    env.push(("RIPCLONE_FILES_SLOTS".into(), "0".into()));
+    env.push(("RIPCLONE_FULL_SLOTS".into(), "0".into()));
+    let mut server = world.server(&env_refs(&env));
+
+    let bucket = format!("/{}/", s3.bucket);
+    s3_proxy.hold_puts(&bucket, 1);
+    // A 403 is permanent, so Head fails on its first attempt.
+    s3_proxy.fail_puts(&bucket, Fault::Status(403));
+    world.cli(&server, &["add", "acme/c8"]).ok();
+    s3_proxy.wait_held(1);
+    wait_for("Head failed", || {
+        (output_states(&server, "acme/c8", &tip)[0] == "failed").then_some(())
+    });
+    let (_, summary) = api::read_commit(&server, "acme/c8", &tip, None);
+    let error = summary["head"]["error"].as_str().unwrap_or_default();
+    assert!(error.contains("upload"), "{summary}");
+    assert_eq!(
+        server.metric("ripclone_outputs_published_total{kind=\"head\"}"),
+        0
+    );
+    let shallow = world.target("c8-failed");
+    let out = world.cli(
+        &server,
+        &[
+            "clone",
+            "acme/c8",
+            shallow.to_str().unwrap(),
+            "--depth",
+            "1",
+        ],
+    );
+    assert!(!out.success(), "a clone of an unpublished Head succeeded");
+    assert!(!shallow.exists(), "failed clone left {}", shallow.display());
+
+    s3_proxy.release();
+    server.restart_with(&[("RIPCLONE_FILES_SLOTS", "1"), ("RIPCLONE_FULL_SLOTS", "1")]);
+    world.cli(&server, &["sync", "acme/c8", "--at", &tip]).ok();
+    assert_eq!(output_states(&server, "acme/c8", &tip), ["ready"; 3]);
+    clone_every_shape(&world, &server, "acme/c8", &origin, &tip);
+}
+
+/// Clone `repo` at depth 1, in full and as files, and compare each with the
+/// origin at `tip`.
+fn clone_every_shape(world: &World, server: &Server, repo: &str, origin: &Origin, tip: &str) {
+    let shapes: [(&str, &[&str]); 3] = [
+        ("depth1", &["--depth", "1"]),
+        ("full", &[]),
+        ("files", &["--mode", "files"]),
+    ];
+    for (shape, args) in shapes {
+        let target = world.target(&format!("{}-{shape}-{}", repo.replace('/', "-"), &tip[..7]));
+        let mut argv = vec!["clone", repo, target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(server, &argv).ok();
+        assert_eq!(listing(&target), origin.tree(tip), "{shape}");
+        if shape == "full" {
+            assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+            assert_eq!(
+                git(&target, &["rev-list", "--count", "HEAD"]),
+                origin.count(tip)
+            );
+            git(&target, &["fsck", "--full"]);
+        }
+    }
+}
+
+/// An origin whose commit A holds 6 MiB of incompressible files, the same
+/// bytes for every `name`.
+fn noisy_origin(world: &World, name: &str) -> Origin {
+    let origin = world.origin("acme", name);
+    for i in 0..3u64 {
+        let path = origin.work.join(format!("data/{i}.bin"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, crate::downloads::noise(i + 1, 2 << 20)).unwrap();
+    }
+    origin.commit(&[("zz.txt", "a\n")], "A");
+    origin.publish();
+    origin
+}
+
+/// H10: a build does not upload an object of 1 MiB or more that the bucket
+/// already holds at the same length. After a one-line push, B's Files
+/// rebuilds A's unchanged archive frames; the server finds each with a HEAD
+/// and writes only small objects over keys the bucket had. A bucket copy cut
+/// short is uploaded again: a second repository with the same files builds
+/// the same frames, and its HEAD sees the wrong length. Every shape of the
+/// second repository clones exactly, and so does B's Files clone, which
+/// reads the repaired objects.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_h10_existing_objects_are_not_uploaded_again() {
+    const LARGE: u64 = 1 << 20;
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let s3_proxy = FaultProxy::start(&s3);
+    s3_proxy.preserve_host();
+    let origin = noisy_origin(&world, "h10");
+    let env = s3.server_env(&s3_proxy.url());
+    let server = world.server(&env_refs(&env));
+    world.cli(&server, &["add", "acme/h10", "--wait"]).ok();
+
+    let bucket = format!("/{}/", s3.bucket);
+    let size = |key: &str| std::fs::metadata(s3.object_file(key)).unwrap().len();
+    // Run `build` and return each key the bucket held before with its
+    // length, and the bucket requests made meanwhile as (method, key).
+    let observe = |build: &dyn Fn()| {
+        let before: BTreeMap<String, u64> = s3
+            .objects()
+            .into_iter()
+            .map(|key| {
+                let len = size(&key);
+                (key, len)
+            })
+            .collect();
+        let mark = s3_proxy.seen().len();
+        build();
+        let requests: Vec<(String, String)> = s3_proxy.seen()[mark..]
+            .iter()
+            .filter_map(|s| {
+                let key = s.path.strip_prefix(&bucket)?;
+                Some((s.method.clone(), key.to_string()))
+            })
+            .collect();
+        (before, requests)
+    };
+    let put = |requests: &[(String, String)], key: &str| {
+        requests.iter().any(|(m, k)| m == "PUT" && k == key)
+    };
+
+    let b = origin.commit(&[("zz.txt", "b\n")], "B");
+    origin.publish();
+    let (before, requests) = observe(&|| {
+        world.cli(&server, &["sync", "acme/h10", "--wait"]).ok();
+    });
+    for (method, key) in &requests {
+        if method == "PUT"
+            && let Some(len) = before.get(key)
+        {
+            assert!(*len < LARGE, "B uploaded {key} ({len} bytes) again");
+        }
+    }
+    let skipped: Vec<String> = requests
+        .iter()
+        .filter(|(m, k)| m == "HEAD" && before.get(k).is_some_and(|len| *len >= LARGE))
+        .map(|(_, k)| k.clone())
+        .filter(|k| !put(&requests, k))
+        .collect();
+    assert!(
+        !skipped.is_empty(),
+        "B checked no large object it already had: {requests:#?}"
+    );
+
+    // Cut the skipped objects short in the bucket, then build a second
+    // repository with the same files: it makes those objects again, and its
+    // HEAD sees the wrong length.
+    for key in &skipped {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(s3.object_file(key))
+            .unwrap();
+        file.set_len(before[key] / 2).unwrap();
+    }
+    let twin = noisy_origin(&world, "h10-twin");
+    let (_, requests) = observe(&|| {
+        world.cli(&server, &["add", "acme/h10-twin", "--wait"]).ok();
+    });
+    for key in &skipped {
+        assert!(
+            put(&requests, key),
+            "the twin did not repair {key}: {requests:#?}"
+        );
+        assert_eq!(size(key), before[key], "{key}");
+    }
+    let twin_tip = twin.head();
+    clone_every_shape(&world, &server, "acme/h10-twin", &twin, &twin_tip);
+    // B's Files clone reads the repaired frames.
+    let files = world.target("h10-b-files");
+    world
+        .cli(
+            &server,
+            &[
+                "clone",
+                "acme/h10",
+                files.to_str().unwrap(),
+                "--mode",
+                "files",
+            ],
+        )
+        .ok();
+    assert_eq!(listing(&files), origin.tree(&b));
 }

@@ -8,6 +8,7 @@
 //! lease was lost stops instead of starting more work.
 
 use super::duration_ms;
+use super::uploads::Uploads;
 use crate::archive::ArchiveBuilder;
 use crate::cancel::{self, Cancel};
 use crate::cas::Cas;
@@ -16,7 +17,6 @@ use crate::metrics::SyncPhaseMetrics;
 use crate::pack::PackBuilder;
 use crate::provider::RepoId;
 use anyhow::{Context, Result};
-use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -256,16 +256,14 @@ fn assemble_variant(
     }
     use std::io::Write;
 
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".idx-bundle")
-        .tempfile_in(cas.root())
-        .context("create idx bundle temp file")?;
+    let mut bundle = cas.writer().context("create idx bundle")?;
     let mut entries = Vec::with_capacity(tagged.len());
     let mut len = 0u64;
     for &(pack, history_only) in tagged {
         let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
         let offset = len;
-        tmp.write_all(&idx_bytes)
+        bundle
+            .write_all(&idx_bytes)
             .context("write idx bytes to bundle")?;
         len += idx_bytes.len() as u64;
         entries.push(crate::clonepack::PackEntry {
@@ -281,8 +279,7 @@ fn assemble_variant(
             idx_bundle_offset: offset,
         });
     }
-    tmp.flush().context("flush idx bundle temp file")?;
-    let (hash, stored_len) = cas.put_file(tmp.path())?;
+    let (hash, stored_len) = bundle.finish()?;
     anyhow::ensure!(
         stored_len == len,
         "idx bundle length changed while storing: expected {len}, got {stored_len}"
@@ -299,11 +296,12 @@ fn assemble_variant(
 
 /// Build a multi-pack-index over `packs` from local CAS.
 ///
-/// Reads each pack's bytes from the *local* CAS (no object-storage fallback), so
-/// only call this when every pack was built this sync and is still local — e.g.
-/// the head MIDX is shipped only when all head buckets were freshly built. For a
-/// set with reused packs absent from the local cache, omit the MIDX and let the client
-/// build its own.
+/// Git reads the packs where they lie in the *local* CAS (linked into a
+/// scratch repo; no object-storage fallback), so only call this when every
+/// pack was built this sync and is still local — e.g. the head MIDX is
+/// shipped only when all head buckets were freshly built. For a set with
+/// reused packs absent from the local cache, omit the MIDX and let the
+/// client build its own.
 fn assemble_midx(
     cas: &Cas,
     packs: &[(String, u64, String, u64)],
@@ -311,14 +309,13 @@ fn assemble_midx(
     if packs.is_empty() {
         return Ok((None, String::new()));
     }
-    use rayon::prelude::*;
-    let pairs: Vec<(Vec<u8>, Vec<u8>)> = packs
-        .par_iter()
-        .map(|(ph, _, ih, _)| Ok((cas.get(ph)?, cas.get(ih)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let midx = crate::git::build_multi_pack_index_bytes(&pairs)?;
-    let len = midx.len() as u64;
-    let hash = cas.put(&midx)?;
+    let files: Vec<_> = packs
+        .iter()
+        .map(|(ph, _, ih, _)| (cas.path(ph), cas.path(ih)))
+        .collect();
+    let scratch = tempfile::TempDir::new().context("create midx scratch dir")?;
+    let midx = crate::git::write_multi_pack_index_over(&files, scratch.path())?;
+    let (hash, len) = cas.install_file(&midx)?;
     Ok((
         Some(ChunkRef {
             hash: hash_from_hex(&hash)?,
@@ -377,50 +374,6 @@ fn archive_chunk_refs(
             })
         })
         .collect()
-}
-
-/// Concurrency for artifact uploads. Defaults to 2x CPU cores.
-fn upload_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get() * 2)
-        .unwrap_or(8)
-        .max(1)
-}
-
-/// Upload `hashes` from CAS to storage with bounded concurrency.
-async fn upload_artifacts(
-    cas: &Cas,
-    storage: &crate::storage::StorageRef,
-    hashes: Vec<String>,
-    conc: usize,
-) -> Result<()> {
-    futures::stream::iter(hashes.into_iter().map(|hash| {
-        let cas = cas.clone();
-        let storage = storage.clone();
-        async move {
-            Cancel::check_current()?;
-            let read_hash = hash.clone();
-            let (path, len) = cancel::spawn_blocking(move || {
-                let len = cas
-                    .verify_object(&read_hash)
-                    .with_context(|| format!("verify artifact {} before upload", read_hash))?;
-                Ok::<_, anyhow::Error>((cas.path(&read_hash), len))
-            })
-            .await
-            .context("verify artifact task")??;
-            let upload_start = std::time::Instant::now();
-            storage
-                .put_file_async(&hash, &path)
-                .await
-                .with_context(|| format!("upload artifact {}", hash))?;
-            crate::perf::record_storage_upload(upload_start.elapsed(), len);
-            Ok(())
-        }
-    }))
-    .buffer_unordered(conc.max(1))
-    .try_collect::<Vec<()>>()
-    .await
-    .map(|_| ())
 }
 
 fn archive_publish_upload_hashes(
@@ -501,7 +454,8 @@ pub(super) async fn build_head_result(
     storage: &crate::storage::StorageRef,
     phases: &mut SyncPhases,
 ) -> Result<crate::HeadResult> {
-    let upload_conc = upload_concurrency();
+    let uploads = Uploads::new(cas, storage);
+    let cas = &uploads.cas();
 
     // Build the Head closure and shallow skeleton.
     let t = Instant::now();
@@ -679,9 +633,10 @@ pub(super) async fn build_head_result(
         cancel::spawn_blocking(move || -> Result<(String, String, String, String)> {
             let (cas, storage) = (&fc, &fs);
             let mut shallow_meta = metadata_base;
-            shallow_meta.skeleton_pack = cas.get(&fsk_pack)?;
-            shallow_meta.skeleton_idx = cas.get(&fsk_idx)?;
-            shallow_meta.prebuilt_index = cas.get(&fprebuilt)?;
+            // Built moments ago by this build.
+            shallow_meta.skeleton_pack = cas.read_fresh(&fsk_pack)?;
+            shallow_meta.skeleton_idx = cas.read_fresh(&fsk_idx)?;
+            shallow_meta.prebuilt_index = cas.read_fresh(&fprebuilt)?;
             let shallow_meta_data = shallow_meta.encode_to_vec();
             let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
 
@@ -756,13 +711,14 @@ pub(super) async fn build_head_result(
         head_uploads.push(p.clone());
         head_uploads.push(i.clone());
     }
-    head_uploads.retain(|h| !h.is_empty());
     let head_idx_keep: std::collections::HashSet<String> =
         head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
     Cancel::check_current()?;
+    // Each upload started when its artifact was stored; wait for the rest.
     let upload_start = Instant::now();
-    upload_artifacts(cas, storage, head_uploads.clone(), upload_conc).await?;
-    settle_storage(cas, storage, head_uploads, head_idx_keep).await;
+    uploads.start_all(&head_uploads);
+    let uploaded = uploads.finish().await?;
+    settle_storage(cas, storage, uploaded, head_idx_keep).await;
     phases.upload_head_ms = Some(duration_ms(upload_start.elapsed()));
 
     Ok(head)
@@ -966,6 +922,8 @@ pub(super) async fn build_full_result(
     before_cold: impl std::future::Future<Output = ()>,
     phases: &mut BuildPhases,
 ) -> Result<crate::FullResult> {
+    let uploads = Uploads::new(cas, storage);
+    let cas = &uploads.cas();
     // Head was built on this server moments ago, so local CAS usually still
     // has its manifest.
     let (mc, ms, mhash) = (
@@ -1060,17 +1018,9 @@ pub(super) async fn build_full_result(
         })
         .await
         .context("compact Head packs")??;
-        let mut compact_uploads = Vec::new();
         for (pack, _, idx, _) in &compact_packs {
-            compact_uploads.push(pack.clone());
-            compact_uploads.push(idx.clone());
+            uploads.start_all([pack, idx]);
         }
-        let compact_idx_keep = compact_packs
-            .iter()
-            .map(|(_, _, idx, _)| idx.clone())
-            .collect();
-        upload_artifacts(cas, storage, compact_uploads.clone(), upload_concurrency()).await?;
-        settle_storage(cas, storage, compact_uploads, compact_idx_keep).await;
         info!(
             "compacted Head packs for {}@{} ({} MiB delta -> {} packs)",
             repo_id.storage_key(),
@@ -1123,19 +1073,19 @@ pub(super) async fn build_full_result(
     .await
     .context("Full manifest task")??;
     phases.record("idx_bundle", start);
-    let mut uploads = vec![manifest_hash.clone(), idx_bundle_hash.clone()];
+    uploads.start_all([&manifest_hash, &idx_bundle_hash]);
     for (pack, _, idx, _) in &new_history {
-        uploads.push(pack.clone());
-        uploads.push(idx.clone());
+        uploads.start_all([pack, idx]);
     }
-    uploads.retain(|hash| !hash.is_empty());
-    let keep_idx = new_history
+    // Later builds read the idx files of the packs this Full references.
+    let keep_idx = head_packs
         .iter()
+        .chain(&new_history)
         .map(|(_, _, idx, _)| idx.clone())
         .collect();
     let start = Instant::now();
-    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
-    settle_storage(cas, storage, uploads, keep_idx).await;
+    let uploaded = uploads.finish().await?;
+    settle_storage(cas, storage, uploaded, keep_idx).await;
     phases.record("upload", start);
 
     let mut all_packs = head_packs;
@@ -1169,6 +1119,8 @@ pub(super) async fn build_files_result(
     compression_level: i32,
     phases: &mut BuildPhases,
 ) -> Result<crate::FilesResult> {
+    let uploads = Uploads::new(cas, storage);
+    let cas = &uploads.cas();
     let start = Instant::now();
     let previous_frames = parent_files
         .map(|(_, files)| files.archive_frames.clone())
@@ -1241,15 +1193,16 @@ pub(super) async fn build_files_result(
     .await
     .context("Files manifest task")??;
     phases.record("manifest", start);
-    let uploads = archive_publish_upload_hashes(
+    let publish_uploads = archive_publish_upload_hashes(
         &metadata_hash,
         &manifest_hash,
         &archive_chunk_hashes,
         &archive_output.new_reuse_frame_hashes,
     );
     let start = Instant::now();
-    upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
-    settle_storage(cas, storage, uploads, std::collections::HashSet::new()).await;
+    uploads.start_all(&publish_uploads);
+    let uploaded = uploads.finish().await?;
+    settle_storage(cas, storage, uploaded, std::collections::HashSet::new()).await;
     phases.record("upload", start);
 
     Ok(crate::FilesResult {

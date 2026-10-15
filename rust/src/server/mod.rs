@@ -31,6 +31,7 @@ mod artifacts;
 mod auth;
 mod builder;
 mod poller;
+mod uploads;
 mod webhooks;
 mod worker;
 

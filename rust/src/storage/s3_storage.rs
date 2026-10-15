@@ -21,6 +21,10 @@ const MULTIPART_UPLOAD_MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MULTIPART_UPLOAD_MAX_PARTS: u64 = 10_000;
 const MULTIPART_UPLOAD_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 const MULTIPART_UPLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Objects at least this large are checked with a HEAD before upload and
+/// skipped when the bucket has them. A smaller PUT costs about what the HEAD
+/// would.
+const EXISTS_CHECK_BYTES: u64 = 1024 * 1024;
 
 fn multipart_upload_concurrency_for_cores(cores: usize) -> usize {
     cores
@@ -399,6 +403,15 @@ impl S3Storage {
         }
     }
 
+    /// Whether the bucket holds `key` with length `len`. Any failure counts
+    /// as absent, so the caller uploads.
+    async fn has_object(&self, key: &str, len: u64) -> bool {
+        matches!(
+            self.client.objects().head(&self.bucket, key).send().await,
+            Ok(head) if head.content_length == Some(len)
+        )
+    }
+
     fn remote_size(&self, hash: &str) -> Result<u64> {
         let key = self.key(hash)?;
         let client = self.client.clone();
@@ -532,25 +545,18 @@ impl StorageBackend for S3Storage {
         Ok(())
     }
 
+    /// Upload a CAS object. Keys are content hashes, so an object of at
+    /// least [`EXISTS_CHECK_BYTES`] that is already in the bucket with the
+    /// same length is not sent again.
     async fn put_file_async(&self, hash: &str, path: &Path) -> Result<()> {
-        let expected_hash = hash.to_string();
-        let verify_path = path.to_path_buf();
-        let (actual_hash, len) = tokio::task::spawn_blocking(move || {
-            crate::cas::hash_file(&verify_path)
-                .with_context(|| format!("hash {} before S3 upload", verify_path.display()))
-        })
-        .await
-        .context("S3 put_file hash task")??;
-        if actual_hash != expected_hash {
-            anyhow::bail!(
-                "S3 upload source {} hash mismatch: expected {}, actual {}",
-                path.display(),
-                expected_hash,
-                actual_hash
-            );
-        }
-
         let key = self.key(hash)?;
+        let len = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("stat {} for S3 upload", path.display()))?
+            .len();
+        if len >= EXISTS_CHECK_BYTES && self.has_object(&key, len).await {
+            return Ok(());
+        }
         if len >= MULTIPART_UPLOAD_THRESHOLD_BYTES {
             self.multipart_put_file(&key, path, len).await?;
         } else {
