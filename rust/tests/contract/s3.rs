@@ -430,13 +430,14 @@ fn noisy_origin(world: &World, name: &str) -> Origin {
 }
 
 /// H10: a build does not upload an object of 1 MiB or more that the bucket
-/// already holds at the same length. After a one-line push, B's Files
-/// rebuilds A's unchanged archive frames; the server finds each with a HEAD
-/// and writes only small objects over keys the bucket had. A bucket copy cut
-/// short is uploaded again: a second repository with the same files builds
-/// the same frames, and its HEAD sees the wrong length. Every shape of the
-/// second repository clones exactly, and so does B's Files clone, which
-/// reads the repaired objects.
+/// already holds at the same length. After a one-line push, B's Files reuses
+/// A's unchanged archive bundles and uploads none of them again. A second
+/// repository with the same files builds the same bundles; the server finds
+/// each with a HEAD and writes only small objects over keys the bucket had. A
+/// bucket copy cut short is uploaded again: a third repository with the same
+/// files builds them once more, and its HEAD sees the wrong length. Every
+/// shape of the third repository clones exactly, and so do the Files clones
+/// of B and the second repository, which read the repaired objects.
 #[test]
 #[ignore = "needs the S3 emulator; run by the s3 CI job"]
 fn s3_h10_existing_objects_are_not_uploaded_again() {
@@ -477,19 +478,29 @@ fn s3_h10_existing_objects_are_not_uploaded_again() {
     let put = |requests: &[(String, String)], key: &str| {
         requests.iter().any(|(m, k)| m == "PUT" && k == key)
     };
+    let no_large_reupload =
+        |who: &str, before: &BTreeMap<String, u64>, requests: &[(String, String)]| {
+            for (method, key) in requests {
+                if method == "PUT"
+                    && let Some(len) = before.get(key)
+                {
+                    assert!(*len < LARGE, "{who} uploaded {key} ({len} bytes) again");
+                }
+            }
+        };
 
     let b = origin.commit(&[("zz.txt", "b\n")], "B");
     origin.publish();
     let (before, requests) = observe(&|| {
         world.cli(&server, &["sync", "acme/h10", "--wait"]).ok();
     });
-    for (method, key) in &requests {
-        if method == "PUT"
-            && let Some(len) = before.get(key)
-        {
-            assert!(*len < LARGE, "B uploaded {key} ({len} bytes) again");
-        }
-    }
+    no_large_reupload("B", &before, &requests);
+
+    let twin = noisy_origin(&world, "h10-twin");
+    let (before, requests) = observe(&|| {
+        world.cli(&server, &["add", "acme/h10-twin", "--wait"]).ok();
+    });
+    no_large_reupload("the twin", &before, &requests);
     let skipped: Vec<String> = requests
         .iter()
         .filter(|(m, k)| m == "HEAD" && before.get(k).is_some_and(|len| *len >= LARGE))
@@ -498,10 +509,10 @@ fn s3_h10_existing_objects_are_not_uploaded_again() {
         .collect();
     assert!(
         !skipped.is_empty(),
-        "B checked no large object it already had: {requests:#?}"
+        "the twin checked no large object the bucket had: {requests:#?}"
     );
 
-    // Cut the skipped objects short in the bucket, then build a second
+    // Cut the skipped objects short in the bucket, then build a third
     // repository with the same files: it makes those objects again, and its
     // HEAD sees the wrong length.
     for key in &skipped {
@@ -511,32 +522,33 @@ fn s3_h10_existing_objects_are_not_uploaded_again() {
             .unwrap();
         file.set_len(before[key] / 2).unwrap();
     }
-    let twin = noisy_origin(&world, "h10-twin");
+    let third = noisy_origin(&world, "h10-third");
     let (_, requests) = observe(&|| {
-        world.cli(&server, &["add", "acme/h10-twin", "--wait"]).ok();
+        world
+            .cli(&server, &["add", "acme/h10-third", "--wait"])
+            .ok();
     });
     for key in &skipped {
         assert!(
             put(&requests, key),
-            "the twin did not repair {key}: {requests:#?}"
+            "the third repository did not repair {key}: {requests:#?}"
         );
         assert_eq!(size(key), before[key], "{key}");
     }
-    let twin_tip = twin.head();
-    clone_every_shape(&world, &server, "acme/h10-twin", &twin, &twin_tip);
-    // B's Files clone reads the repaired frames.
-    let files = world.target("h10-b-files");
-    world
-        .cli(
-            &server,
-            &[
-                "clone",
-                "acme/h10",
-                files.to_str().unwrap(),
-                "--mode",
-                "files",
-            ],
-        )
-        .ok();
-    assert_eq!(listing(&files), origin.tree(&b));
+    let third_tip = third.head();
+    clone_every_shape(&world, &server, "acme/h10-third", &third, &third_tip);
+    // The Files clones of B and the twin read the repaired bundles.
+    for (repo, origin, tip) in [
+        ("acme/h10", &origin, b),
+        ("acme/h10-twin", &twin, twin.head()),
+    ] {
+        let files = world.target(&format!("{}-files", repo.replace('/', "-")));
+        world
+            .cli(
+                &server,
+                &["clone", repo, files.to_str().unwrap(), "--mode", "files"],
+            )
+            .ok();
+        assert_eq!(listing(&files), origin.tree(&tip), "{repo}");
+    }
 }

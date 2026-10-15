@@ -541,25 +541,6 @@ pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P, timeout: Duration) -> Res
     )
 }
 
-/// Write a multi-pack-index *with a reachability bitmap* over the mirror's packs
-/// so `rev-list`/`pack-objects` can answer reachability by OR-ing precomputed
-/// bitmaps instead of walking the commit+tree graph. This is what makes the
-/// full skeleton/history enumerations fast on a fresh `--mirror` clone (GitHub
-/// ships bitmaps, but our `git fetch` of all refs can leave them stale/absent).
-/// Best-effort — a failure only loses the speedup. Building the bitmap itself
-/// costs one reachability walk, so it is written only right before a cold
-/// history build, the one build that uses it.
-pub fn write_bitmap<P: AsRef<Path>>(repo_dir: P, timeout: Duration) -> Result<()> {
-    run_quiet_bounded(
-        command()
-            .arg("-C")
-            .arg(repo_dir.as_ref().as_os_str())
-            .args(["multi-pack-index", "write", "--bitmap", "--no-progress"]),
-        "multi-pack-index write --bitmap",
-        timeout,
-    )
-}
-
 /// Packs in a mirror above which [`compact_mirror`] repacks.
 const MIRROR_PACK_LIMIT: usize = 16;
 /// Loose refs under `refs/ripclone/revs` above which [`compact_mirror`]
@@ -756,14 +737,13 @@ pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
 /// `--revs` reads the rev-list input from stdin (`tip`, then `^exclude`), so
 /// git walks the range itself, the same walk as `rev-list --objects tip
 /// ^exclude`. The pack is not thin: an object outside the range is never a
-/// delta base. `use_bitmap` answers the walk from the mirror's multi-pack-index
-/// bitmap; git walks the graph for any commit the bitmap does not cover.
+/// delta base.
 ///
 /// No `--max-pack-size`: split packs cannot retain deltas whose bases land in
 /// another output pack, turning this I/O-oriented reuse path back into
 /// expensive re-deltification. Even a 4 GiB split made Linux re-deltify for
 /// minutes; 64 MiB more than doubled Bun's cold-history bytes and made the
-/// otherwise bitmap-backed build 30x slower. Remote storage handles large files
+/// build 30x slower. Remote storage handles large files
 /// with multipart upload instead of imposing its transport boundary on Git's
 /// object representation.
 ///
@@ -773,7 +753,6 @@ pub fn pack_objects_range_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     tip: &str,
     exclude: Option<&str>,
     prefix: Q,
-    use_bitmap: bool,
 ) -> Result<()> {
     // Each stdin line is a rev-list argument: a `-`-leading or range value
     // would change the packed set, so only plain revisions get through.
@@ -796,9 +775,6 @@ pub fn pack_objects_range_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
         "--delta-base-offset",
         "--revs",
     ]);
-    if use_bitmap {
-        command.arg("--use-bitmap-index");
-    }
     command.arg(prefix.as_ref());
     run_pack_objects(
         command,
@@ -891,7 +867,10 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
     )
 }
 
-/// Disable git's automatic gc on a bare mirror, persisted into the mirror's own
+/// The empty tree's object id, which git resolves without storing it.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Configure a bare mirror for the server, persisted into the mirror's own
 /// config so it covers every later command, not just one fetch.
 ///
 /// Builds read the mirror's packs while a fetch appends to it. Auto-gc, which a
@@ -899,20 +878,28 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
 /// and corrupts the read. The server compacts the mirror itself, with no reader
 /// ([`compact_mirror`]). `fetch.unpackLimit=1` keeps every fetch a pack, so
 /// small pushes do not pile up loose objects that nothing would pack.
-/// Idempotent and cheap.
-pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
+///
+/// `attr.tree` names the empty tree. Git 2.43 and later read attributes from
+/// `HEAD` in a bare repository, and `pack-objects --revs` asks for each named
+/// object's `delta` attribute. A mirror's `HEAD` names a branch the mirror
+/// never fetches, and git resolves that missing `HEAD` again for every
+/// object: on git/git this tripled a cold history pack (5 s to 15 s, mostly
+/// system time). No attributes is what git used before. Older git ignores the
+/// key. Idempotent and cheap.
+pub fn configure_mirror(mirror_dir: &Path) -> Result<()> {
     for (key, value) in [
         ("gc.auto", "0"),
         ("gc.autoPackLimit", "0"),
         ("maintenance.auto", "false"),
         ("fetch.unpackLimit", "1"),
+        ("attr.tree", EMPTY_TREE),
     ] {
         run_quiet(
             command()
                 .arg("-C")
                 .arg(mirror_dir.as_os_str())
                 .args(["config", key, value]),
-            &format!("config {key} (disable auto-gc on the mirror)"),
+            &format!("config {key} (mirror)"),
         )?;
     }
     Ok(())
@@ -1515,7 +1502,7 @@ fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
                 .arg(mirror_dir.as_os_str()),
             "init --bare (mirror)",
         )?;
-        disable_auto_gc(mirror_dir)?;
+        configure_mirror(mirror_dir)?;
         run_quiet(
             command()
                 .arg("-C")
@@ -1532,7 +1519,7 @@ fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
             "config remote.origin.fetch",
         )?;
     } else {
-        disable_auto_gc(mirror_dir)?;
+        configure_mirror(mirror_dir)?;
     }
     Ok(())
 }
@@ -1801,9 +1788,10 @@ mod tests {
     }
 
     /// Auto-gc must be persisted off on the mirror, or a fetch could repack
-    /// packs out from under a concurrent read.
+    /// packs out from under a concurrent read. Attributes come from the empty
+    /// tree, not the mirror's unborn `HEAD`.
     #[test]
-    fn disable_auto_gc_persists_keys() {
+    fn configure_mirror_persists_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         assert!(
@@ -1815,7 +1803,7 @@ mod tests {
                 .success()
         );
 
-        disable_auto_gc(repo).unwrap();
+        configure_mirror(repo).unwrap();
 
         let read = |key: &str| -> String {
             let out = Command::new("git")
@@ -1830,9 +1818,10 @@ mod tests {
         assert_eq!(read("gc.autoPackLimit"), "0");
         assert_eq!(read("maintenance.auto"), "false");
         assert_eq!(read("fetch.unpackLimit"), "1");
+        assert_eq!(read("attr.tree"), EMPTY_TREE);
 
         // Idempotent: a second call on an already-configured mirror is fine.
-        disable_auto_gc(repo).unwrap();
+        configure_mirror(repo).unwrap();
         assert_eq!(read("gc.auto"), "0");
     }
 
@@ -2155,14 +2144,13 @@ mod tests {
         assert!(resolve_commit(&mirror, "main").is_err());
     }
 
-    /// Reads and fetches of one mirror stay correct while the multi-pack-index
-    /// bitmap and the commit-graph are rewritten beside them, with auto-gc
-    /// off. One thread fetches and writes `commit-graph --split` for a fixed
-    /// number of new commits. Another rewrites the bitmap in a loop. Readers
-    /// walk every object, with and without the bitmap. With gc off, writers
-    /// only add packs and atomically replace the accelerators, so no reader
-    /// or fetch may fail: builds read while the mirror is written, and only
-    /// `compact_mirror`, which deletes packs, needs the mirror to itself.
+    /// Reads and fetches of one mirror stay correct while the commit-graph is
+    /// rewritten beside them, with auto-gc off. One thread fetches and writes
+    /// `commit-graph --split` for a fixed number of new commits. Readers walk
+    /// every object. With gc off, writers only add packs and atomically
+    /// replace the commit-graph, so no reader or fetch may fail: builds read
+    /// while the mirror is written, and only `compact_mirror`, which deletes
+    /// packs, needs the mirror to itself.
     #[test]
     fn concurrent_prep_and_reads_stay_safe() {
         use std::sync::Arc;
@@ -2210,8 +2198,8 @@ mod tests {
         ]);
         let m = mirror.to_string_lossy().to_string();
         // Keep fetched objects as packfiles (production fetches from GitHub arrive
-        // as packs), so multi-pack-index/bitmap has packs to index; a local
-        // file:// fetch would otherwise unpack to loose objects.
+        // as packs); a local file:// fetch would otherwise unpack to loose
+        // objects.
         git(&["-C", &m, "config", "transfer.unpackLimit", "1"]);
         git(&["-C", &m, "config", "fetch.unpackLimit", "1"]);
         // A local clone hardlinks loose objects; a production mirror starts
@@ -2235,23 +2223,8 @@ mod tests {
 
         let prep_done = Arc::new(AtomicBool::new(false));
         let prep_err = Arc::new(AtomicU64::new(0));
-        let bitmap_ok = Arc::new(AtomicU64::new(0));
         let read_ok = Arc::new(AtomicU64::new(0));
         let read_err = Arc::new(AtomicU64::new(0));
-
-        let bitmap = {
-            let (m, prep_done, bitmap_ok) = (m.clone(), prep_done.clone(), bitmap_ok.clone());
-            std::thread::spawn(move || {
-                while !prep_done.load(Ordering::Relaxed) {
-                    // Best-effort in production: a failed write only loses the
-                    // speedup, so failures are printed, not counted.
-                    let args = ["-C", &m, "multi-pack-index", "write", "--bitmap"];
-                    if run("bitmap", &[&args[..], &["--no-progress"]].concat()) {
-                        bitmap_ok.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            })
-        };
 
         let readers: Vec<_> = (0..4)
             .map(|_| {
@@ -2266,14 +2239,7 @@ mod tests {
                         let done = prep_done.load(Ordering::Relaxed);
                         for args in [
                             &["-C", &m, "cat-file", "--batch-check", "--batch-all-objects"][..],
-                            &[
-                                "-C",
-                                &m,
-                                "rev-list",
-                                "--objects",
-                                "--all",
-                                "--use-bitmap-index",
-                            ],
+                            &["-C", &m, "rev-list", "--objects", "--all"],
                         ] {
                             let counter = if run("read", args) {
                                 &read_ok
@@ -2314,29 +2280,21 @@ mod tests {
             }
         }
         prep_done.store(true, Ordering::Relaxed);
-        bitmap.join().unwrap();
         for reader in readers {
             reader.join().unwrap();
         }
 
-        let (prep_err, bitmap_ok, read_ok, read_err) = (
+        let (prep_err, read_ok, read_err) = (
             prep_err.load(Ordering::Relaxed),
-            bitmap_ok.load(Ordering::Relaxed),
             read_ok.load(Ordering::Relaxed),
             read_err.load(Ordering::Relaxed),
         );
-        eprintln!(
-            "prep_err={prep_err} bitmap_ok={bitmap_ok} read_ok={read_ok} read_err={read_err}"
-        );
+        eprintln!("prep_err={prep_err} read_ok={read_ok} read_err={read_err}");
         assert_eq!(
             prep_err, 0,
-            "a fetch or commit-graph write failed beside the bitmap"
+            "a fetch or commit-graph write failed beside reads"
         );
-        assert_eq!(
-            read_err, 0,
-            "a read failed beside fetch, commit-graph and bitmap"
-        );
-        assert!(bitmap_ok > 0, "no bitmap write succeeded during the run");
+        assert_eq!(read_err, 0, "a read failed beside fetch and commit-graph");
         // Every object the readers saw is still there and connected at the end.
         git(&["-C", &m, "fsck", "--connectivity-only", "--no-progress"]);
     }

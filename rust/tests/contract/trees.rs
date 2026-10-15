@@ -249,7 +249,9 @@ fn doc(version: usize) -> String {
         .collect()
 }
 
-/// L3: after a cold Full, three pushes (one commit; several; a merge) each
+/// L3: a cold Full writes no reachability bitmap into the mirror, and its
+/// full clone equals the origin. With Full paused, a full clone of a push
+/// tops up from it. Then three pushes (one commit; several; a merge) each
 /// build Full from the tail since the last Full: one new history level each
 /// and never a cold rebuild. Every full clone equals the origin. Then, with
 /// Full paused, a full clone of a new push tops up from the last tail-built
@@ -259,10 +261,33 @@ fn l3_full_from_tails_is_exact_and_tops_up() {
     let world = World::new();
     let origin = world.origin("acme", "l3");
     let doc0 = doc(0);
-    origin.commit(&[("doc.txt", doc0.as_str()), ("keep.txt", "k\n")], "A");
+    let a = origin.commit(&[("doc.txt", doc0.as_str()), ("keep.txt", "k\n")], "A");
     origin.publish();
     let mut server = world.server(&[]);
     world.cli(&server, &["add", "acme/l3", "--wait"]).ok();
+    let full_clone = |server: &Server, name: &str, tip: &str| {
+        let target = world.target(name);
+        world
+            .cli(server, &["clone", "acme/l3", target.to_str().unwrap()])
+            .ok();
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "{name}");
+        assert_eq!(listing(&target), origin.tree(tip), "{name}");
+        assert_eq!(
+            git(&target, &["rev-list", "--count", "HEAD"]),
+            origin.count(tip),
+            "{name}"
+        );
+        git(&target, &["fsck", "--full", "--strict"]);
+    };
+    full_clone(&server, "l3-cold", &a);
+    let pack_dir = mirror_dir(&world).join("objects").join("pack");
+    let bitmaps: Vec<_> = std::fs::read_dir(&pack_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".bitmap"))
+        .collect();
+    assert!(bitmaps.is_empty(), "the mirror has bitmaps: {bitmaps:?}");
 
     let mut version = 0;
     let mut edit = |name: &str| {
@@ -271,6 +296,15 @@ fn l3_full_from_tails_is_exact_and_tops_up() {
         let file = format!("{name}.txt");
         origin.commit(&[("doc.txt", body.as_str()), (file.as_str(), "x\n")], name)
     };
+    let paused = [("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")];
+    server.restart_with(&paused);
+    let p0 = edit("p0");
+    origin.publish();
+    full_clone(&server, "l3-topup-cold", &p0);
+    assert_eq!(output_states(&server, "acme/l3", &p0)[1], "pending");
+    server.restart_with(&[("RIPCLONE_FILES_SLOTS", "2"), ("RIPCLONE_FULL_SLOTS", "2")]);
+    wait_ready(&server, "acme/l3", &p0);
+
     for push in 1..=3 {
         let tip = match push {
             1 => edit("p1"),
@@ -294,17 +328,7 @@ fn l3_full_from_tails_is_exact_and_tops_up() {
         origin.publish();
         world.cli(&server, &["sync", "acme/l3", "--wait"]).ok();
         wait_ready(&server, "acme/l3", &tip);
-        let target = world.target(&format!("l3-{push}"));
-        world
-            .cli(&server, &["clone", "acme/l3", target.to_str().unwrap()])
-            .ok();
-        assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
-        assert_eq!(listing(&target), origin.tree(&tip));
-        assert_eq!(
-            git(&target, &["rev-list", "--count", "HEAD"]),
-            origin.count(&tip)
-        );
-        git(&target, &["fsck", "--full", "--strict"]);
+        full_clone(&server, &format!("l3-{push}"), &tip);
     }
     let log = server.log();
     assert!(log.contains("LSM: sealed level 3"), "{log}");
@@ -313,24 +337,14 @@ fn l3_full_from_tails_is_exact_and_tops_up() {
         .lines()
         .filter(|l| l.contains("build-phases kind=full"))
         .collect();
-    assert_eq!(phases.len(), 4, "{log}");
+    assert_eq!(phases.len(), 5, "{log}");
     assert!(phases.iter().all(|l| l.contains(" history_ms=")), "{log}");
 
-    server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
+    server.restart_with(&paused);
     let d = edit("d");
     origin.publish();
-    let target = world.target("l3-topup");
-    world
-        .cli(&server, &["clone", "acme/l3", target.to_str().unwrap()])
-        .ok();
+    full_clone(&server, "l3-topup", &d);
     assert_eq!(output_states(&server, "acme/l3", &d)[1], "pending");
-    assert_eq!(git(&target, &["rev-parse", "HEAD"]), d);
-    assert_eq!(listing(&target), origin.tree(&d));
-    assert_eq!(
-        git(&target, &["rev-list", "--count", "HEAD"]),
-        origin.count(&d)
-    );
-    git(&target, &["fsck", "--full", "--strict"]);
 }
 
 /// The object ids and offsets in a pack's idx.
