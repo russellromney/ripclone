@@ -20,8 +20,9 @@ pub use sqlite::SqliteControlStore;
 
 /// Which claimers a build row is offered to. A row moves through the pools
 /// in order: Head while Head is pending, then Files once Head is ready, then
-/// Full once Files is ready or failed. Files is fast, so a new push's Files
-/// never waits behind another commit's Full, and one row has one lease.
+/// Full once Files is ready or failed and no older row of the repo has Full
+/// pending. Files is fast, so a new push's Files never waits behind another
+/// commit's Full, and one row has one lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pool {
     Head,
@@ -137,7 +138,9 @@ pub trait ControlStore: Send + Sync {
     /// Return failed outputs to pending with attempts and backoff cleared.
     /// Ready and pending outputs are untouched. `None` if the row is unknown.
     async fn retry(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>>;
-    /// Lease the oldest claimable row of `pool`. First gives up on rows whose
+    /// Lease the oldest claimable row of `pool`. A Full row is claimable
+    /// only when no older row of its repo has Full pending, so a repo's
+    /// Fulls publish in admission order. First gives up on rows whose
     /// lease expired after the last allowed attempt: the current phase's
     /// output fails (a pending Head takes Files and Full with it), and a
     /// failed Files hands the row to the Full phase.
@@ -170,6 +173,17 @@ pub trait ControlStore: Send + Sync {
         repo: &RepoId,
         ref_name: &str,
     ) -> Result<Option<(String, FullResult)>>;
+    /// Up to `limit` commits of `repo` other than `except` whose `kind`
+    /// output is ready: rows admitted from `prefer_ref` first, then the
+    /// rest, each newest admission first.
+    async fn ready_commits(
+        &self,
+        repo: &RepoId,
+        kind: ExactResultKind,
+        prefer_ref: Option<&str>,
+        except: &str,
+        limit: usize,
+    ) -> Result<Vec<String>>;
     /// False when the repository was already added.
     async fn add_repo(&self, repo: &RepoId) -> Result<bool>;
     /// False when the repository was not added.

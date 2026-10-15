@@ -201,7 +201,7 @@ const SHAPES: [(&str, &[&str]); 3] = [
 /// Clone `repo` with `args` in every shape and check each install equals
 /// `commit`: the tree everywhere, and for editable clones HEAD, the checked
 /// out branch (`None`: detached), a clean status, and `git fsck`.
-fn clone_each_shape(
+pub fn clone_each_shape(
     world: &World,
     server: &Server,
     origin: &Origin,
@@ -237,7 +237,7 @@ fn clone_each_shape(
 }
 
 /// Total bytes in the server's local artifact store.
-fn stored_bytes(world: &World) -> u64 {
+pub fn stored_bytes(world: &World) -> u64 {
     fn walk(dir: &std::path::Path) -> u64 {
         std::fs::read_dir(dir)
             .map(|entries| {

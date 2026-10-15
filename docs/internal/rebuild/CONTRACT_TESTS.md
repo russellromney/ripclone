@@ -171,7 +171,25 @@ Ripclone token reaches the origin.
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | #208 |
 | I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | #209 |
 
-Total: 66 tests. Several are table-driven.
+### J. Builds start from the newest ready ancestor (5)
+
+Each output of C builds on the same output of its base: the newest built
+commit that is an ancestor of C. Tests read the published Head and Full
+manifests: "built on A" means Head(C) keeps every Head pack of A and adds
+under 64 KiB, and Full(C) keeps A's history packs and adds one small level.
+"Cold" means C shares no Head or history pack with the other commit. Every
+case clones C in depth-1, full and Files shapes, compares each with the
+origin, and runs `git fsck` and `rev-list --count` on the editable clones.
+
+| # | Test | Added |
+|---|---|---|
+| J1 | Origin moves A to C through several commits; only C is admitted (the commits between have no build). C is built on A, and the store grows by under 1 MiB though history holds 2 MiB of noise. | #217 |
+| J2 | Same when C is a merge of a side branch. | #217 |
+| J3 | A force push to a sibling X of the built A builds cold, and X's full clone lacks A. A force push of two commits on A then builds on A, not on the newer X, and lacks X. | #217 |
+| J4 | The mirror directory is deleted between restarts: a push of two commits on A fetches A again and builds on it. After the origin force-pushes unrelated history and prunes A and C, the mirror is deleted again and the next build is cold. | #217 |
+| J5 | A branch with no history in common with the built main builds cold, and its full clone lacks main's commit. | #217 |
+
+Total: 71 tests. Several are table-driven.
 
 ## What it replaced
 

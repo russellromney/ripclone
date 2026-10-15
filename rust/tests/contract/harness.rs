@@ -713,6 +713,21 @@ impl Server {
         self.request(reqwest::Method::GET, path, Some(TOKEN))
     }
 
+    /// An authenticated GET of a binary body, such as an artifact.
+    pub fn get_bytes(&self, path: &str) -> (u16, Vec<u8>) {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(WAIT)
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("{}{path}", self.url))
+            .header("Authorization", format!("Ripclone {}", sha256_hex(TOKEN)))
+            .send()
+            .expect("http request");
+        let status = resp.status().as_u16();
+        (status, resp.bytes().map(|b| b.to_vec()).unwrap_or_default())
+    }
+
     pub fn request(
         &self,
         method: reqwest::Method,

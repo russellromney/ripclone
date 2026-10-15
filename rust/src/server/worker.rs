@@ -7,6 +7,10 @@
 //! waits behind another commit's Full. A slot holds a 60 s lease and renews it
 //! every 20 s; a lost lease aborts the build. Failures record a retry time
 //! instead of sleeping, so no slot waits while holding a lease.
+//!
+//! Each output builds incrementally from the same output of its base: the
+//! newest commit of the repo with that output ready that is an ancestor of
+//! the commit being built (see [`ancestor_base`]). Without one it builds cold.
 
 use super::api::row_info;
 use super::builder::{
@@ -524,18 +528,16 @@ async fn head_output(
     };
 
     // Head packs are a delta against an immutable base: the compacted base
-    // recorded by Full(parent), else the base Head(parent) used, else none.
-    let parent_row = match parent.as_deref() {
-        Some(parent) => state.control.status(repo_id, parent).await?,
-        None => None,
-    };
-    let parent_head = parent_row.as_ref().and_then(|row| row.head.ready());
-    let base = parent_row
+    // recorded by Full of the base commit, else the base its Head used, else
+    // none. The base commit's files table also seeds this one.
+    let base_row = ancestor_base(state, claim, ExactResultKind::Head, &mirror_dir).await?;
+    let base_head = base_row.as_ref().and_then(|row| row.head.ready());
+    let base = base_row
         .as_ref()
         .and_then(|row| row.full.ready())
         .and_then(|full| full.head_base.clone())
         .or_else(|| {
-            parent_head.map(|head| crate::HeadBase {
+            base_head.map(|head| crate::HeadBase {
                 commit: head.base_commit.clone(),
                 packs: head.base_packs.clone(),
             })
@@ -545,7 +547,7 @@ async fn head_output(
         &mirror_dir,
         commit,
         parent.clone(),
-        parent_head,
+        base_head,
         base,
         &state.storage,
         phases,
@@ -556,13 +558,14 @@ async fn head_output(
 
 async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
     let built = async {
-        let (head, parent_row, mirror_dir) = background_prep(state, claim).await?;
+        let (head, mirror_dir) = background_prep(state, claim).await?;
         let config = state
             .control
             .get_config(&claim.repo)
             .await?
             .unwrap_or_default();
-        let parent_files = parent_row
+        let base_row = ancestor_base(state, claim, ExactResultKind::Files, &mirror_dir).await?;
+        let base_files = base_row
             .as_ref()
             .and_then(|row| row.files.ready().map(|files| (row.commit.as_str(), files)));
         build_files_result(
@@ -570,7 +573,7 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
             &mirror_dir,
             &claim.build.commit,
             &head,
-            parent_files,
+            base_files,
             &state.storage,
             config.compression_level(),
         )
@@ -583,10 +586,11 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
 
 async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
     let built = async {
-        let (head, parent_row, mirror_dir) = background_prep(state, claim).await?;
-        // Full builds on the parent's history levels. Full claims go oldest
-        // first, so with one Full slot Full(parent) usually lands first.
-        let levels = parent_row
+        let (head, mirror_dir) = background_prep(state, claim).await?;
+        // Full builds on the history levels of its base. A repo's Fulls are
+        // claimed in admission order, so an earlier push's Full has settled.
+        let levels = ancestor_base(state, claim, ExactResultKind::Full, &mirror_dir)
+            .await?
             .as_ref()
             .and_then(|row| row.full.ready())
             .map(|full| full.history_levels.clone())
@@ -613,12 +617,12 @@ async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim
     settle(state, settings, claim, ExactResultKind::Full, built).await;
 }
 
-/// What Files and Full share: the ready Head, the parent's row as stored
-/// now, and a mirror holding the commit.
+/// What Files and Full share: the ready Head and a mirror holding the
+/// commit.
 async fn background_prep(
     state: &ServerState,
     claim: &Claim,
-) -> Result<(crate::HeadResult, Option<BuildRow>, std::path::PathBuf)> {
+) -> Result<(crate::HeadResult, std::path::PathBuf)> {
     let repo_id = &claim.repo;
     let commit = claim.build.commit.as_str();
     let head = claim
@@ -634,11 +638,88 @@ async fn background_prep(
         // Usually a no-op: the Head build fetched the commit.
         fetch_commit(state, repo_id, commit, &mirror_dir).await?;
     }
-    let parent_row = match head.parent_commit.as_deref() {
-        Some(parent) => state.control.status(repo_id, parent).await?,
-        None => None,
+    Ok((head, mirror_dir))
+}
+
+/// Ready commits checked, newest first, for a build's base.
+const BASE_CANDIDATES: usize = 32;
+
+/// The row whose `kind` output a build of the claimed commit reuses: the
+/// newest row of the repo with `kind` ready whose commit is an ancestor of
+/// the claimed commit in the mirror. "Newest" is by history: among the
+/// ancestors found, one no other of them descends from, rows of the claimed
+/// ref and later admissions first. A commit that is not an ancestor (after
+/// a force push) or not in the mirror is never a base, so a build never
+/// carries objects the commit cannot reach. `None` builds `kind` cold.
+async fn ancestor_base(
+    state: &ServerState,
+    claim: &Claim,
+    kind: ExactResultKind,
+    mirror_dir: &std::path::Path,
+) -> Result<Option<BuildRow>> {
+    let repo_id = &claim.repo;
+    let commit = claim.build.commit.as_str();
+    let candidates = state
+        .control
+        .ready_commits(
+            repo_id,
+            kind,
+            claim.build.ref_name.as_deref(),
+            commit,
+            BASE_CANDIDATES,
+        )
+        .await?;
+    let target = format!("{}@{}", repo_id.storage_key(), short(commit));
+    let (dir, tip, log_target) = (mirror_dir.to_path_buf(), commit.to_string(), target.clone());
+    let found = tokio::task::spawn_blocking(move || {
+        let ancestors: Vec<String> = candidates
+            .into_iter()
+            .filter(|candidate| match git::is_ancestor(&dir, candidate, &tip) {
+                Ok(is_ancestor) => is_ancestor,
+                Err(error) => {
+                    info!(
+                        "{kind} base candidate {} for {log_target} is not usable: {error:#}",
+                        short(candidate)
+                    );
+                    false
+                }
+            })
+            .collect();
+        // Admission times are in seconds, so admission order alone can rank
+        // an older ancestor first.
+        let newest = match ancestors.len() {
+            0 | 1 => None,
+            _ => git::independent_commits(&dir, &ancestors).ok(),
+        };
+        let base = ancestors
+            .iter()
+            .find(|ancestor| {
+                newest
+                    .as_ref()
+                    .is_none_or(|newest| newest.contains(*ancestor))
+            })
+            .or(ancestors.first())?
+            .clone();
+        let distance = git::count_commits_since(&dir, &base, &tip).ok();
+        Some((base, distance))
+    })
+    .await
+    .context("base lookup task")?;
+    let Some((base, distance)) = found else {
+        info!("{kind} base for {target}: none, building cold");
+        return Ok(None);
     };
-    Ok((head, parent_row, mirror_dir))
+    let distance = distance.map_or_else(|| "?".to_string(), |n| n.to_string());
+    info!(
+        "{kind} base for {target}: {} ({distance} commits back)",
+        short(&base)
+    );
+    // A ready output never changes, so the row still has it.
+    state.control.status(repo_id, &base).await
+}
+
+fn short(commit: &str) -> &str {
+    &commit[..7.min(commit.len())]
 }
 
 #[cfg(test)]

@@ -425,6 +425,69 @@ pub fn diff_name_set<P: AsRef<Path>>(
         .collect())
 }
 
+/// Whether `ancestor` is an ancestor of (or equal to) `commit`. An error means
+/// git could not answer, for example because `ancestor` is not in the repo.
+pub fn is_ancestor<P: AsRef<Path>>(repo: P, ancestor: &str, commit: &str) -> Result<bool> {
+    crate::validation::validate_git_rev(ancestor)
+        .with_context(|| format!("invalid commit: {ancestor}"))?;
+    crate::validation::validate_git_rev(commit)
+        .with_context(|| format!("invalid commit: {commit}"))?;
+    let output = command()
+        .arg("-C")
+        .arg(repo.as_ref().as_os_str())
+        .args(["merge-base", "--is-ancestor", "--end-of-options"])
+        .args([ancestor, commit])
+        .stdin(Stdio::null())
+        .output()
+        .context("run git merge-base --is-ancestor")?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git merge-base --is-ancestor {ancestor} {commit} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+/// The commits of `commits` that no other commit of the list reaches: the
+/// newest ones.
+pub fn independent_commits<P: AsRef<Path>>(
+    repo: P,
+    commits: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    for commit in commits {
+        crate::validation::validate_git_rev(commit)
+            .with_context(|| format!("invalid commit: {commit}"))?;
+    }
+    let mut args = vec!["merge-base", "--independent", "--end-of-options"];
+    args.extend(commits.iter().map(String::as_str));
+    Ok(run_git(repo, &args)?
+        .lines()
+        .map(|line| line.trim().to_string())
+        .collect())
+}
+
+/// Number of commits reachable from `commit` but not from `base`.
+pub fn count_commits_since<P: AsRef<Path>>(repo: P, base: &str, commit: &str) -> Result<u64> {
+    crate::validation::validate_git_rev(base).with_context(|| format!("invalid commit: {base}"))?;
+    crate::validation::validate_git_rev(commit)
+        .with_context(|| format!("invalid commit: {commit}"))?;
+    let count = run_git(
+        repo,
+        &[
+            "rev-list",
+            "--count",
+            "--end-of-options",
+            commit,
+            &format!("^{base}"),
+        ],
+    )?;
+    count
+        .parse()
+        .with_context(|| format!("parse rev-list count {count:?}"))
+}
+
 /// List objects reachable from `commit`, optionally limiting the commit history
 /// depth. `max_depth = None` returns the full history. With a depth of `1`, only
 /// the HEAD commit and the trees/blobs reachable from it are returned, which is
