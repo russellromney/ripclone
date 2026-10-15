@@ -183,11 +183,11 @@ origin, and runs `git fsck` and `rev-list --count` on the editable clones.
 
 | # | Test | Added |
 |---|---|---|
-| J1 | Origin moves A to C through several commits; only C is admitted (the commits between have no build). C is built on A, and the store grows by under 1 MiB though history holds 2 MiB of noise. | this PR |
-| J2 | Same when C is a merge of a side branch. | this PR |
-| J3 | A force push to a sibling X of the built A builds cold, and X's full clone lacks A. A force push of two commits on A then builds on A, not on the newer X, and lacks X. | this PR |
-| J4 | The mirror directory is deleted between restarts: a push of two commits on A fetches A again and builds on it. After the origin force-pushes unrelated history and prunes A and C, the mirror is deleted again and the next build is cold. | this PR |
-| J5 | A branch with no history in common with the built main builds cold, and its full clone lacks main's commit. | this PR |
+| J1 | Origin moves A to C through several commits; only C is admitted (the commits between have no build). C is built on A, and the store grows by under 1 MiB though history holds 2 MiB of noise. | #217 |
+| J2 | Same when C is a merge of a side branch. | #217 |
+| J3 | A force push to a sibling X of the built A builds cold, and X's full clone lacks A. A force push of two commits on A then builds on A, not on the newer X, and lacks X. | #217 |
+| J4 | The mirror directory is deleted between restarts: a push of two commits on A fetches A again and builds on it. After the origin force-pushes unrelated history and prunes A and C, the mirror is deleted again and the next build is cold. | #217 |
+| J5 | A branch with no history in common with the built main builds cold, and its full clone lacks main's commit. | #217 |
 
 Total: 71 tests. Several are table-driven.
 
