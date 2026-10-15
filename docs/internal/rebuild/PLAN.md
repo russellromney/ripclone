@@ -89,10 +89,12 @@ replaced, so several half-models now run at once:
 7. **Credentials come from the server's broker at build time** (GitHub App,
    configured token). They are never copied into the database or sent to
    workers in job payloads.
-8. **One mirror shape, one fetch function, all mirror writes under the mirror
-   lock** (fetch, commit-graph, bitmap, compaction). Builds read the mirror
-   under a shared lock and fetch only a commit it lacks; compaction deletes
-   packs, so it runs only while no build reads.
+8. **One mirror shape, one fetch function, mirror writes under the mirror
+   lock** (fetch, commit-graph, compaction). Builds read the mirror under a
+   shared lock and fetch only a commit it lacks; compaction deletes packs, so
+   it runs only while no build reads. The bitmap a cold Full writes covers
+   only the packs it found, so it runs under the shared lock and fetches
+   continue during it.
 
 ## Keep (reuse with little change)
 
