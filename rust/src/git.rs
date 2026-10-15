@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -24,6 +24,10 @@ const SKIP_WORKTREE_FLAG: gix::index::entry::Flags = gix::index::entry::Flags::S
 pub fn command() -> Command {
     Command::new("git")
 }
+
+/// Skip git's own fsyncs. Packs and indexes the server builds are scratch
+/// files until the CAS installs them, and a durable CAS syncs them itself.
+const NO_FSYNC: [&str; 2] = ["-c", "core.fsync=none"];
 
 /// Abort an HTTP transfer that moves under 1000 bytes/s for 60 s. A stalled
 /// upstream then fails the fetch or ls-remote instead of holding it open.
@@ -132,6 +136,7 @@ pub fn write_prebuilt_index(repo: &Path, commit: &str, index_path: &Path) -> Res
         .with_context(|| format!("invalid commit: {commit}"))?;
     let mut read_tree = command();
     read_tree
+        .args(NO_FSYNC)
         .arg("-C")
         .arg(repo)
         .env("GIT_INDEX_FILE", index_path)
@@ -628,45 +633,56 @@ fn count_entries(dir: &Path, keep: impl Fn(&str) -> bool) -> usize {
     })
 }
 
-/// Build a multi-pack-index over the given packs (each a `(pack_bytes,
-/// idx_bytes)` pair) and return the raw `multi-pack-index` file bytes. The packs
-/// are laid out with the same `pack-<trailer>.{pack,idx}` filenames the client
-/// uses, so the MIDX references them by those names and is byte-for-byte usable
-/// on the client once it installs the same packs — no client-side
-/// `git multi-pack-index write` needed.
-pub fn build_multi_pack_index_bytes(packs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>> {
+/// Build a multi-pack-index over `packs` (each a `(pack, idx)` pair of file
+/// paths) in a new bare repo at `dir`, and return the index file's path. The
+/// packs are hard-linked in (copied only where linking fails) with the same
+/// `pack-<trailer>.{pack,idx}` filenames the client uses, so the MIDX
+/// references them by those names and is byte-for-byte usable on the client
+/// once it installs the same packs — no client-side `git multi-pack-index
+/// write` needed. Git reads the idx files, never the whole packs.
+pub fn write_multi_pack_index_over(packs: &[(PathBuf, PathBuf)], dir: &Path) -> Result<PathBuf> {
+    use std::io::SeekFrom;
     if packs.is_empty() {
         anyhow::bail!("no packs to index");
     }
-    let tmp = tempfile::TempDir::new()?;
-    let dir = tmp.path();
     // Minimal bare object store so `git multi-pack-index write` has a repo and
     // an `objects/pack` directory laid out exactly like the client's.
     run_quiet(
         command()
+            .args(NO_FSYNC)
             .args(["init", "--bare", "-q"])
             .arg(dir.as_os_str()),
         "init --bare for midx",
     )?;
     let pack_dir = dir.join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)?;
-    for (pack_bytes, idx_bytes) in packs {
-        if pack_bytes.len() < 20 {
-            anyhow::bail!("pack too short to name by trailer");
+    let link = |from: &Path, to: &Path| -> Result<()> {
+        if std::fs::hard_link(from, to).is_err() {
+            std::fs::copy(from, to).with_context(|| format!("copy {} for midx", from.display()))?;
         }
+        Ok(())
+    };
+    for (pack, idx) in packs {
         // Git names packs by the 20-byte trailer sha; match the client exactly.
-        let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-        std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), pack_bytes)?;
-        std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), idx_bytes)?;
+        let mut file =
+            std::fs::File::open(pack).with_context(|| format!("open {}", pack.display()))?;
+        let mut trailer = [0u8; 20];
+        file.seek(SeekFrom::End(-20))
+            .and_then(|_| file.read_exact(&mut trailer))
+            .context("pack too short to name by trailer")?;
+        let name = hex::encode(trailer);
+        link(pack, &pack_dir.join(format!("pack-{name}.pack")))?;
+        link(idx, &pack_dir.join(format!("pack-{name}.idx")))?;
     }
     run_quiet(
         command()
+            .args(NO_FSYNC)
             .arg("-C")
             .arg(dir.as_os_str())
             .args(["multi-pack-index", "write"]),
         "multi-pack-index write (server pregen)",
     )?;
-    std::fs::read(pack_dir.join("multi-pack-index")).context("read generated multi-pack-index")
+    Ok(pack_dir.join("multi-pack-index"))
 }
 
 /// Return the raw (uncompressed) size of each object via
@@ -775,10 +791,11 @@ pub fn pack_objects_range_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     let mut command = command();
-    command
-        .arg("-C")
-        .arg(repo.as_ref())
-        .args(["pack-objects", "--delta-base-offset", "--revs"]);
+    command.args(NO_FSYNC).arg("-C").arg(repo.as_ref()).args([
+        "pack-objects",
+        "--delta-base-offset",
+        "--revs",
+    ]);
     if use_bitmap {
         command.arg("--use-bitmap-index");
     }
@@ -861,6 +878,7 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
     // (the packs are written by base name).
     let mut command = command();
     command
+        .args(NO_FSYNC)
         .arg("-C")
         .arg(repo.as_ref())
         .args(["pack-objects", "--delta-base-offset"])

@@ -69,16 +69,17 @@ after the row (`a1_...`, `s3_c2_...`).
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | #188 |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | #188 |
 
-### C. Outputs are independent and immutable (6)
+### C. Outputs are independent and immutable (7)
 
 | # | Test | Added |
 |---|---|---|
 | C1 | `files_slots = 0` and `full_slots = 0`: depth-1 clone of B succeeds while Full and Files stay pending (API status shows it). | #203 |
 | C2 | Head ready, then restart with the storage proxy failing PUTs and background builds on: Full and Files fail, Head stays cloneable, status shows `failed` per output. | #203 (S3 job) |
 | C3 | Restart without the fault and retry: only Full and Files rebuild (Head build counter flat). | #203 (S3 job) |
-| C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. | #202 |
+| C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. Then SIGKILL as soon as a push's first artifact is in the store: every stored object hashes to its name, and after a restart the push builds and its full and Files clones are exact. | #202, perf/storage-path |
 | C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). Over the three builds, every server log line is the server's own: no git output. | #202 |
 | C7 | S3 only: the bucket holds Full(B)'s first write while push C arrives. Head(C) and Files(C) become ready while Full(B) is still pending; after release, Full(B) publishes before Full(C). | Hetzner benchmark |
+| C8 | S3 only: the bucket holds one of Head's writes and refuses the next. Head fails with the storage error and publishes nothing; a depth-1 clone fails and leaves no target. With the fault gone, `sync --at` builds every output and each shape clones exactly. | perf/storage-path (S3 job) |
 
 A SIGKILLed server's `git` children run until their command ends, on every
 OS. #209 killed them on Linux with a parent-death signal (row C6), but
@@ -140,7 +141,7 @@ Ripclone token reaches the origin.
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | #208 |
 | G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | #208 |
 
-### H. Storage and server state (9)
+### H. Storage and server state (10)
 
 | # | Test | Added |
 |---|---|---|
@@ -153,6 +154,7 @@ Ripclone token reaches the origin.
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | #208 |
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | #209 |
 | H9 | Build scratch goes under `<cache>/tmp`, which startup empties: with a read-only `TMPDIR`, a stale scratch entry is removed and a full build and clone succeed. | #211 |
+| H10 | S3 emulator: after a one-line push, no object of 1 MiB or more that the bucket already holds is uploaded again (the bucket proxy sees a HEAD and no PUT); only small objects are rewritten. A bucket copy cut short is uploaded again when a second repository with the same files makes it; that repository's clones and B's Files clone are exact. | perf/storage-path (S3 job) |
 
 ### I. Auth, integrations, CLI (12)
 
@@ -217,7 +219,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | After a cold Full, three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 79 tests. Several are table-driven.
+Total: 81 tests. Several are table-driven.
 
 ## What it replaced
 
@@ -232,7 +234,7 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
 - `test`: unit tests plus the contract suite, parallel. Target under 5 minutes
   after compile. The one S3 unit test (multipart upload) runs here against
   `scripts/s3_emulator.sh`, reusing the unit-test binary.
-- `s3`: C2, C3, C7, F7, H2 and H6 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
+- `s3`: C2, C3, C7, C8, F7, H2, H6 and H10 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
 - `gitea`: the live Gitea provider row.
 - `lint`, `musl`, `docker`, `cargo-deny`.
 - `e2e`: `scripts/e2e_local.sh` against prebuilt binaries.
@@ -245,7 +247,7 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
   contract`, in parallel. The tools are in `net.rs` (gated origin, fault
   proxy, silent endpoint) and `harness.rs`; wire details are in one module,
   `harness::api`.
-- The six `s3_` rows start their own versitygw and are `#[ignore]`d; the
+- The eight `s3_` rows start their own versitygw and are `#[ignore]`d; the
   `s3` CI job runs them with `--ignored s3_`. The live Gitea row runs in the
   `gitea` job with `--ignored gitea_`.
 - The CLI polls at most 200 ms apart in every test, so `--wait` lasts about

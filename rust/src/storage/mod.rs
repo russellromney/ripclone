@@ -15,7 +15,7 @@ pub use s3_storage::S3Storage;
 /// return signed URLs so clients read directly from the CDN.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
-    /// Fetch the full object by hash.
+    /// Fetch the full object by hash. The bytes are checked against `hash`.
     fn get(&self, hash: &str) -> Result<Vec<u8>>;
 
     /// Fetch a byte range from the object by hash.
@@ -39,26 +39,12 @@ pub trait StorageBackend: Send + Sync {
         self.put(hash, data)
     }
 
-    /// Store an existing file by hash. Backends that support file or stream
-    /// upload should override this; the default keeps compatibility for small
-    /// metadata-style callers and uncommon test backends.
+    /// Store an existing file by hash. The caller vouches that the file
+    /// holds the bytes of `hash`: it is a CAS object, hashed when it was
+    /// written, and clients check every artifact they download. Backends that
+    /// support file or stream upload should override this; the default reads
+    /// the file into memory.
     async fn put_file_async(&self, hash: &str, path: &Path) -> Result<()> {
-        let expected_hash = hash.to_string();
-        let verify_path = path.to_path_buf();
-        let (actual_hash, _len) = tokio::task::spawn_blocking(move || {
-            crate::cas::hash_file(&verify_path)
-                .with_context(|| format!("hash {} before storage upload", verify_path.display()))
-        })
-        .await
-        .context("storage put_file hash task")??;
-        if actual_hash != expected_hash {
-            anyhow::bail!(
-                "storage upload source {} hash mismatch: expected {}, actual {}",
-                path.display(),
-                expected_hash,
-                actual_hash
-            );
-        }
         let data = tokio::fs::read(path)
             .await
             .with_context(|| format!("read file {} for storage upload", path.display()))?;
@@ -138,6 +124,10 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn put_file_async(&self, hash: &str, path: &Path) -> Result<()> {
+        // A build's CAS is this store's directory: its objects are already here.
+        if path == self.cas.path(hash) {
+            return Ok(());
+        }
         let cas = self.cas.clone();
         let hash = hash.to_string();
         let path = path.to_path_buf();
@@ -191,47 +181,13 @@ pub fn local<P: AsRef<Path>>(root: P) -> Result<StorageRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    #[derive(Default)]
-    struct RecordingStorage {
-        puts: Mutex<Vec<(String, Vec<u8>)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl StorageBackend for RecordingStorage {
-        fn get(&self, _hash: &str) -> Result<Vec<u8>> {
-            anyhow::bail!("unsupported")
-        }
-
-        fn get_range(&self, _hash: &str, _start: u64, _len: u64) -> Result<Vec<u8>> {
-            anyhow::bail!("unsupported")
-        }
-
-        fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
-            self.puts
-                .lock()
-                .unwrap()
-                .push((hash.to_string(), data.to_vec()));
-            Ok(())
-        }
-
-        fn size(&self, _hash: &str) -> Result<u64> {
-            anyhow::bail!("unsupported")
-        }
-
-        fn verify_durable_copy(&self, _hash: &str) -> Result<()> {
-            anyhow::bail!("unsupported")
-        }
-    }
-
-    /// `put_file_async` checks the source against its hash before storing it,
-    /// for the local backend and the trait's default implementation.
+    /// The local backend checks a file from outside its own CAS against its
+    /// hash before storing it.
     #[tokio::test]
     async fn put_file_async_stores_nothing_for_a_mismatched_source() {
         let tmp = tempfile::tempdir().unwrap();
         let local = LocalStorage::new(tmp.path().join("cas")).unwrap();
-        let recording = RecordingStorage::default();
         let wrong = tmp.path().join("wrong.bin");
         std::fs::write(&wrong, b"wrong bytes").unwrap();
         let right = tmp.path().join("right.bin");
@@ -240,11 +196,9 @@ mod tests {
 
         assert!(local.put_file_async(&expected, &wrong).await.is_err());
         assert!(!local.cas.path(&expected).exists());
-        assert!(recording.put_file_async(&expected, &wrong).await.is_err());
-        assert!(recording.puts.lock().unwrap().is_empty());
 
-        // Control: the matching source is accepted by both.
+        // Control: the matching source is accepted.
         local.put_file_async(&expected, &right).await.unwrap();
-        recording.put_file_async(&expected, &right).await.unwrap();
+        assert!(local.cas.path(&expected).exists());
     }
 }

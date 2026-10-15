@@ -1023,6 +1023,11 @@ impl S3 {
         out.sort();
         out
     }
+
+    /// The emulator's file holding the object at `key`.
+    pub fn object_file(&self, key: &str) -> PathBuf {
+        self.store.join(key)
+    }
 }
 
 impl Endpoint for S3 {

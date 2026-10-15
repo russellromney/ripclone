@@ -19,10 +19,25 @@ requests on fast links.
 
 ## Publish
 
-Artifacts are first written to the local CAS. Before upload, the server verifies
-the local CAS object by hash and then streams the verified file to durable
-storage. Local filesystem storage uses the same hash-checked file install path;
-S3-compatible storage uses sized streaming uploads.
+Artifacts are first written to the local CAS. Each artifact is hashed once,
+as it is written or, for a file git wrote, by one read, and then renamed into
+the CAS from scratch space on the same filesystem. The hash names the object;
+the server does not hash it again before upload.
+
+Each artifact's upload starts as soon as it is in the CAS, while the build
+goes on. At most 32 uploads run at once across all builds. A build publishes
+only after every one of its uploads has succeeded; if one fails, the build
+fails and publishes nothing. With local filesystem storage the CAS is the
+store, so there is nothing to upload. S3-compatible storage uses sized
+streaming uploads. Keys are content hashes, so an object of 1 MiB or more is
+first checked with a HEAD request and not sent again when the bucket already
+holds it at the same length.
+
+With local storage the CAS syncs each object to disk before it is renamed into
+place, and its directory after. With S3 storage the local CAS is a cache in
+front of the bucket and skips those syncs. The git commands that write build
+packs skip their own syncs in both modes, since the CAS syncs what it
+installs when it must.
 
 For remote storage, the local CAS is a build cache. After successful upload and
 durable-copy verification, large local artifacts may be removed immediately or

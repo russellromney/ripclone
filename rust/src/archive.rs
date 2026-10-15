@@ -661,8 +661,15 @@ impl ArchiveBuilder {
         // Bundle per-frame chunks into larger download objects so the client makes
         // fewer HTTP requests, while keeping per-frame chunks in storage for
         // incremental reuse on the next sync.
-        let (bundle_hashes, bundled_frames) =
-            Self::bundle_archive_frames(cas, storage, bundle_size, &frames, &manifest.frames)?;
+        let fresh = new_chunks.iter().map(String::as_str).collect();
+        let (bundle_hashes, bundled_frames) = Self::bundle_archive_frames(
+            cas,
+            storage,
+            bundle_size,
+            &frames,
+            &manifest.frames,
+            &fresh,
+        )?;
         manifest.frames = bundled_frames;
         Ok(ArchiveBuildOutput {
             download_bundle_hashes: bundle_hashes,
@@ -675,13 +682,16 @@ impl ArchiveBuilder {
     /// Group consecutive archive frames into download bundles of roughly
     /// `target_size` compressed bytes. The per-frame chunks are kept in storage
     /// for incremental reuse; this function only creates coarser download objects
-    /// and rewrites `FrameInfo` to point into them.
+    /// and rewrites `FrameInfo` to point into them. `fresh` names the frame
+    /// chunks this build stored; the others are checked against their hash as
+    /// they are copied.
     fn bundle_archive_frames(
         cas: &Cas,
         storage: Option<&crate::storage::StorageRef>,
         target_size: u64,
         frames: &[crate::ArchiveFrame],
         frame_infos: &[FrameInfo],
+        fresh: &std::collections::HashSet<&str>,
     ) -> Result<(Vec<String>, Vec<FrameInfo>)> {
         if frames.len() != frame_infos.len() {
             anyhow::bail!(
@@ -694,13 +704,8 @@ impl ArchiveBuilder {
         let assembly_start = std::time::Instant::now();
         let mut assembled_bytes = 0u64;
         let mut bundle_hashes = Vec::new();
-        let mut current = tempfile::Builder::new()
-            .prefix(".archive-bundle.")
-            .tempfile_in(cas.root())
-            .with_context(|| format!("create archive bundle temp in {}", cas.root().display()))?;
-        let mut current_len = 0u64;
-        let mut current_frame_count = 0usize;
-        let mut current_hasher = sha2::Sha256::new();
+        let mut current = cas.writer().context("create archive bundle")?;
+        let mut current_frames = 0usize;
         let mut bundled: Vec<FrameInfo> = Vec::with_capacity(frame_infos.len());
         for (i, info) in frame_infos.iter().enumerate() {
             let frame = frames
@@ -715,39 +720,30 @@ impl ArchiveBuilder {
                     info.compressed_len
                 );
             }
-            if current_len > 0
-                && current_len
+            if !current.is_empty()
+                && current
+                    .len()
                     .checked_add(frame_len)
                     .context("archive bundle length overflow")?
                     > target_size
             {
-                bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
-                current = tempfile::Builder::new()
-                    .prefix(".archive-bundle.")
-                    .tempfile_in(cas.root())
-                    .with_context(|| {
-                        format!("create archive bundle temp in {}", cas.root().display())
-                    })?;
-                current_len = 0;
-                current_frame_count = 0;
-                current_hasher = sha2::Sha256::new();
+                let full = std::mem::replace(&mut current, cas.writer()?);
+                bundle_hashes.push(full.finish().context("install archive bundle")?.0);
+                current_frames = 0;
             }
             let chunk_index =
                 u32::try_from(bundle_hashes.len()).context("too many archive bundles")?;
-            let chunk_offset = current_len;
+            let chunk_offset = current.len();
             let written = Self::write_frame_chunk_to_bundle(
                 cas,
                 storage,
                 frame,
                 info,
-                current.as_file_mut(),
-                &mut current_hasher,
+                &mut current,
+                fresh.contains(frame.chunk_hash.as_str()),
             )
             .with_context(|| format!("write archive frame {} to bundle", i))?;
-            current_len = current_len
-                .checked_add(written)
-                .context("archive bundle length overflow")?;
-            current_frame_count += 1;
+            current_frames += 1;
             assembled_bytes = assembled_bytes
                 .checked_add(written)
                 .context("archive bundle byte count overflow")?;
@@ -757,21 +753,14 @@ impl ArchiveBuilder {
                 compressed_len: info.compressed_len,
                 raw_len: info.raw_len,
             });
-            if current_len >= target_size {
-                bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
-                current = tempfile::Builder::new()
-                    .prefix(".archive-bundle.")
-                    .tempfile_in(cas.root())
-                    .with_context(|| {
-                        format!("create archive bundle temp in {}", cas.root().display())
-                    })?;
-                current_len = 0;
-                current_frame_count = 0;
-                current_hasher = sha2::Sha256::new();
+            if current.len() >= target_size {
+                let full = std::mem::replace(&mut current, cas.writer()?);
+                bundle_hashes.push(full.finish().context("install archive bundle")?.0);
+                current_frames = 0;
             }
         }
-        if current_frame_count > 0 {
-            bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
+        if current_frames > 0 {
+            bundle_hashes.push(current.finish().context("install archive bundle")?.0);
         }
         crate::perf::record_archive_bundle_assembly(assembly_start.elapsed(), assembled_bytes);
 
@@ -783,8 +772,8 @@ impl ArchiveBuilder {
         storage: Option<&crate::storage::StorageRef>,
         frame: &crate::ArchiveFrame,
         info: &FrameInfo,
-        out: &mut File,
-        bundle_hasher: &mut sha2::Sha256,
+        out: &mut crate::cas::CasWriter,
+        fresh: bool,
     ) -> Result<u64> {
         let expected_len = frame.compressed_len;
         if expected_len != info.compressed_len as u64 {
@@ -796,9 +785,7 @@ impl ArchiveBuilder {
         }
 
         if cas.has(&frame.chunk_hash) {
-            let written = cas.copy_to_writer_verified_with(&frame.chunk_hash, out, |chunk| {
-                bundle_hasher.update(chunk);
-            })?;
+            let written = cas.copy_to_writer(&frame.chunk_hash, out, !fresh)?;
             if written != expected_len {
                 anyhow::bail!(
                     "archive frame {} compressed length mismatch: data={} expected={}",
@@ -820,7 +807,6 @@ impl ArchiveBuilder {
             );
         }
         out.write_all(&data).context("write archive bundle temp")?;
-        bundle_hasher.update(&data);
         Ok(data.len() as u64)
     }
 
@@ -838,35 +824,14 @@ impl ArchiveBuilder {
                 let data = storage
                     .get(hash)
                     .with_context(|| format!("read archive frame {} from storage", hash))?;
-                let actual = crate::cas::hash(&data);
-                if actual != hash {
-                    anyhow::bail!(
-                        "archive frame {} from storage has hash mismatch: actual {}",
-                        hash,
-                        actual
-                    );
-                }
-                cas.put_with_hash(hash, &data)
+                // `get` checked the bytes against the hash. The frame is
+                // already in storage, so cache it without an upload.
+                cas.detached()
+                    .put_with_hash(hash, &data)
                     .with_context(|| format!("cache archive frame {} in CAS", hash))?;
                 Ok(data)
             }
         }
-    }
-
-    fn finish_bundle(
-        cas: &Cas,
-        bundle: tempfile::NamedTempFile,
-        hasher: sha2::Sha256,
-    ) -> Result<String> {
-        bundle
-            .as_file()
-            .sync_all()
-            .context("fsync archive bundle temp")?;
-        let hash = hex::encode(hasher.finalize());
-        let path = bundle.into_temp_path();
-        cas.install_hashed_file(&hash, &path)
-            .with_context(|| format!("install archive bundle {}", hash))?;
-        Ok(hash)
     }
 
     /// Like [`build_into_cas_incremental`], but reads only the changed region of
@@ -1243,8 +1208,15 @@ impl ArchiveBuilder {
         }
         // Bundle per-frame chunks into larger download objects while keeping the
         // fine-grained chunks in storage for incremental reuse on the next sync.
-        let (bundle_hashes, bundled_frames) =
-            Self::bundle_archive_frames(cas, storage, bundle_size, &frames, &manifest.frames)?;
+        let fresh = new_chunks.iter().map(String::as_str).collect();
+        let (bundle_hashes, bundled_frames) = Self::bundle_archive_frames(
+            cas,
+            storage,
+            bundle_size,
+            &frames,
+            &manifest.frames,
+            &fresh,
+        )?;
         manifest.frames = bundled_frames;
         Ok(ArchiveBuildOutput {
             download_bundle_hashes: bundle_hashes,
@@ -1722,6 +1694,7 @@ mod tests {
             DEFAULT_ARCHIVE_CHUNK_SIZE,
             &frames,
             &frame_infos,
+            &Default::default(),
         )
         .unwrap_err();
         assert!(
@@ -1760,9 +1733,15 @@ mod tests {
         }
 
         let target = frames[0].compressed_len + frames[1].compressed_len / 2;
-        let (bundle_hashes, bundled_frames) =
-            ArchiveBuilder::bundle_archive_frames(&cas, None, target, &frames, &frame_infos)
-                .unwrap();
+        let (bundle_hashes, bundled_frames) = ArchiveBuilder::bundle_archive_frames(
+            &cas,
+            None,
+            target,
+            &frames,
+            &frame_infos,
+            &Default::default(),
+        )
+        .unwrap();
         let mut metadata = MetadataChunk::new();
         metadata.frames = bundled_frames.clone();
         let lengths = crate::clonepack::archive_chunk_lengths(&metadata).unwrap();

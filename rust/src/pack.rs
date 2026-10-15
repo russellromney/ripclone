@@ -77,7 +77,7 @@ impl<'a> PackBuilder<'a> {
         let tmp = tempfile::TempDir::new()?;
         let index_path = tmp.path().join("index");
         git::write_prebuilt_index(&self.repo, commit, &index_path)?;
-        let (hash, _) = self.cas.put_file(&index_path)?;
+        let (hash, _) = self.cas.install_file(&index_path)?;
         Ok(hash)
     }
 
@@ -199,8 +199,8 @@ impl<'a> PackBuilder<'a> {
         })
     }
 
-    /// Read every `pack-<sha>.{pack,idx}` pair written under `dir`, store both
-    /// halves in the CAS, and return `(pack_hash, pack_len, idx_hash, idx_len)`
+    /// Move every `pack-<sha>.{pack,idx}` pair written under `dir` into the
+    /// CAS, and return `(pack_hash, pack_len, idx_hash, idx_len)`
     /// for each. A pack with no objects is dropped.
     fn store_packs_from_dir(&self, dir: &Path) -> Result<Vec<(String, u64, String, u64)>> {
         use std::collections::HashMap;
@@ -235,8 +235,8 @@ impl<'a> PackBuilder<'a> {
             if std::fs::metadata(pack_path)?.len() <= EMPTY_PACK_LEN {
                 continue;
             }
-            let (pack_hash, pack_len) = self.cas.put_file(pack_path)?;
-            let (idx_hash, idx_len) = self.cas.put_file(idx_path)?;
+            let (pack_hash, pack_len) = self.cas.install_file(pack_path)?;
+            let (idx_hash, idx_len) = self.cas.install_file(idx_path)?;
             out.push((pack_hash, pack_len, idx_hash, idx_len));
         }
         Ok(out)
