@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 const SKIP_WORKTREE_FLAG: gix::index::entry::Flags = gix::index::entry::Flags::SKIP_WORKTREE;
@@ -70,8 +69,14 @@ fn run_tracked(command: &mut Command, timeout: Option<Duration>) -> std::io::Res
 /// [`run_tracked`] for local maintenance: an error carries git's stderr, a
 /// timeout or a cancelled build is an error too.
 fn run_quiet_bounded(command: &mut Command, what: &str, timeout: Duration) -> Result<()> {
+    run_checked(command, what, Some(timeout))
+}
+
+/// [`run_tracked`] with its outcome as a `Result`: an error carries git's
+/// stderr, and a timeout or a cancelled build is an error too.
+fn run_checked(command: &mut Command, what: &str, timeout: Option<Duration>) -> Result<()> {
     use crate::cancel::Ended;
-    let run = run_tracked(command, Some(timeout)).with_context(|| format!("run git {what}"))?;
+    let run = run_tracked(command, timeout).with_context(|| format!("run git {what}"))?;
     match run.ended {
         Ended::Exited(status) if status.success() => Ok(()),
         Ended::Exited(_) => bail!(
@@ -116,95 +121,43 @@ fn write_index_file(index: &mut gix::index::File) -> Result<()> {
         .with_context(|| format!("writing index at {}", index.path().display()))
 }
 
-/// Update the index entries' cached file sizes (and zero out stat timestamps)
-/// so that `git status` can trust stat(2) without re-reading every blob.
-pub fn update_index_sizes<P: AsRef<Path>>(git_dir: P, sizes: &HashMap<String, u64>) -> Result<()> {
-    let index_path = git_dir.as_ref().join("index");
-    let mut index = open_index_file(&index_path)?;
+/// Write the index of `commit`'s tree to `index_path`, read from the bare
+/// mirror `repo` (`git read-tree` with `GIT_INDEX_FILE`, no work tree). Every
+/// entry is skip-worktree, so git treats the paths as present before the
+/// client writes them. Each file entry carries the blob's size and fixed stat
+/// times, so `git status` can trust stat(2) once the client has written the
+/// file and cleared the bit. Paths stay raw bytes, as git stores them.
+pub fn write_prebuilt_index(repo: &Path, commit: &str, index_path: &Path) -> Result<()> {
+    crate::validation::validate_git_rev(commit)
+        .with_context(|| format!("invalid commit: {commit}"))?;
+    let mut read_tree = command();
+    read_tree
+        .arg("-C")
+        .arg(repo)
+        .env("GIT_INDEX_FILE", index_path)
+        .args(["read-tree", "--end-of-options", commit]);
+    run_checked(&mut read_tree, "read-tree", None)?;
 
-    for (path, &size) in sizes {
-        let entry = index
-            .entry_mut_by_path_and_stage(
-                gix::bstr::BStr::new(path.as_bytes()),
-                gix::index::entry::Stage::Unconflicted,
-            )
-            .with_context(|| format!("path {path} not in index"))?;
-        entry.stat.size = clamp_u64_to_u32(size);
-        entry.stat.ctime = gix::index::entry::stat::Time { secs: 1, nsecs: 0 };
-        entry.stat.mtime = gix::index::entry::stat::Time { secs: 1, nsecs: 0 };
-        entry.stat.dev = 0;
-        entry.stat.ino = 0;
-        entry.stat.uid = 0;
-        entry.stat.gid = 0;
-    }
-
-    write_index_file(&mut index)
-}
-
-/// Update the skip-worktree bit for a set of paths directly via gix.
-/// `repo_dir` is the working tree (containing `.git`).
-/// This avoids spawning a `git update-index` subprocess.
-pub fn update_index_skip_worktree<P: AsRef<Path>>(
-    repo_dir: P,
-    paths: &[String],
-    set: bool,
-) -> Result<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let index_path = repo_dir.as_ref().join(".git").join("index");
-    update_index_skip_worktree_at(&index_path, paths, set)
-}
-
-fn update_index_skip_worktree_at(
-    index_path: &std::path::Path,
-    paths: &[String],
-    set: bool,
-) -> Result<()> {
+    let objects = crate::gix_util::open_repo(repo)?;
     let mut index = open_index_file(index_path)?;
-
-    let mut changed = false;
-    for path in paths {
-        let Some(entry) = index.entry_mut_by_path_and_stage(
-            gix::bstr::BStr::new(path.as_bytes()),
-            gix::index::entry::Stage::Unconflicted,
-        ) else {
-            continue;
-        };
-        let current = entry.flags.contains(SKIP_WORKTREE_FLAG);
-        if current == set {
-            continue;
+    for entry in index.entries_mut() {
+        if entry.mode != gix::index::entry::Mode::COMMIT {
+            let size = objects
+                .find_header(entry.id)
+                .with_context(|| format!("find header {}", entry.id))?
+                .size();
+            entry.stat = gix::index::entry::Stat {
+                size: clamp_u64_to_u32(size),
+                ctime: gix::index::entry::stat::Time { secs: 1, nsecs: 0 },
+                mtime: gix::index::entry::stat::Time { secs: 1, nsecs: 0 },
+                ..Default::default()
+            };
         }
-        entry.flags.set(SKIP_WORKTREE_FLAG, set);
-        if set {
-            entry.flags.insert(gix::index::entry::Flags::EXTENDED);
-        } else if (entry.flags & (gix::index::entry::Flags::INTENT_TO_ADD | SKIP_WORKTREE_FLAG))
-            .is_empty()
-        {
-            entry.flags.remove(gix::index::entry::Flags::EXTENDED);
-        }
-        changed = true;
+        entry
+            .flags
+            .insert(SKIP_WORKTREE_FLAG | gix::index::entry::Flags::EXTENDED);
     }
-    if changed {
-        write_index_file(&mut index)?;
-    }
-    Ok(())
-}
-
-/// Mark every tracked path in the index as skip-worktree.
-/// `repo_dir` is the working tree (containing `.git`).
-/// This lets git treat the working tree as clean even when files are not
-/// materialized yet, which is essential for skeleton/lazy-checkout snapshots.
-pub fn set_skip_worktree_all<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let repo_dir = repo_dir.as_ref();
-    let index_path = repo_dir.join(".git").join("index");
-    let index = open_index_file(&index_path)?;
-    let paths: Vec<String> = index
-        .entries()
-        .iter()
-        .map(|entry| String::from_utf8_lossy(entry.path_in(index.path_backing())).to_string())
-        .collect();
-    update_index_skip_worktree(repo_dir, &paths, true)
+    write_index_file(&mut index)
 }
 
 pub fn clear_skip_worktree_index_with_stats_byte_iter<'a, P, I>(
@@ -419,21 +372,6 @@ pub fn resolve_commit<P: AsRef<Path>>(repo: P, rev: &str) -> Result<String> {
 /// True when the mirror holds no references — an empty upstream with no commits.
 pub fn is_empty_repo<P: AsRef<Path>>(repo: P) -> Result<bool> {
     crate::gix_util::is_empty_repo(repo)
-}
-
-/// List objects reachable from `to` but not from `from` — i.e. the objects
-/// introduced in the commit range `(from, to]`. `from = None` means "everything
-/// reachable from `to`". Used by the LSM build to pack a single history range.
-pub fn list_object_shas_in_range<P: AsRef<Path>>(
-    repo: P,
-    from: Option<&str>,
-    to: &str,
-) -> Result<Vec<String>> {
-    crate::validation::validate_git_rev(to).with_context(|| format!("invalid commit: {}", to))?;
-    if let Some(f) = from {
-        crate::validation::validate_git_rev(f).with_context(|| format!("invalid commit: {}", f))?;
-    }
-    crate::gix_util::list_object_shas_in_range(repo, from, to)
 }
 
 /// Set of worktree paths (raw bytes) that differ between commits `from` and
@@ -795,13 +733,16 @@ pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     )
 }
 
-/// Pack everything reachable from `commit` into deltified packs under `prefix`,
-/// reusing the deltas git already has instead of recomputing them.
+/// Pack the objects reachable from `tip` but not from `exclude` (all of
+/// `tip`'s history when `exclude` is `None`) into one deltified pack under
+/// `prefix`, reusing the deltas git already has instead of recomputing them.
 ///
-/// `--revs` reads rev-list input from stdin (the commit), so git computes the
-/// reachable closure itself; `--use-bitmap-index` answers that from the mirror's
-/// multi-pack-index bitmap (no graph walk) and lets pack-objects copy existing
-/// pack deltas (`--reuse-delta` is on by default) rather than re-deltifying.
+/// `--revs` reads the rev-list input from stdin (`tip`, then `^exclude`), so
+/// git walks the range itself, the same walk as `rev-list --objects tip
+/// ^exclude`. The pack is not thin: an object outside the range is never a
+/// delta base. `use_bitmap` answers the walk from the mirror's multi-pack-index
+/// bitmap; git walks the graph for any commit the bitmap does not cover.
+///
 /// No `--max-pack-size`: split packs cannot retain deltas whose bases land in
 /// another output pack, turning this I/O-oriented reuse path back into
 /// expensive re-deltification. Even a 4 GiB split made Linux re-deltify for
@@ -809,34 +750,44 @@ pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
 /// otherwise bitmap-backed build 30x slower. Remote storage handles large files
 /// with multipart upload instead of imposing its transport boundary on Git's
 /// object representation.
-pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
+///
+/// An empty range writes a pack with no objects.
+pub fn pack_objects_range_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     repo: P,
-    commit: &str,
+    tip: &str,
+    exclude: Option<&str>,
     prefix: Q,
+    use_bitmap: bool,
 ) -> Result<()> {
-    // `commit` is fed to `pack-objects --revs` via stdin, where each line is a
-    // rev-list arg — a `-`-leading or range value would change the packed set.
-    // Callers pass a resolved hex SHA, but validate here too so this `pub` helper
-    // matches the rest of git.rs and never trusts an unvalidated rev.
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {commit}"))?;
+    // Each stdin line is a rev-list argument: a `-`-leading or range value
+    // would change the packed set, so only plain revisions get through.
+    crate::validation::validate_git_rev(tip).with_context(|| format!("invalid commit: {tip}"))?;
+    let exclude = exclude
+        .map(|rev| {
+            crate::validation::validate_git_rev(rev)
+                .with_context(|| format!("invalid commit: {rev}"))?;
+            anyhow::Ok(format!("^{rev}"))
+        })
+        .transpose()?;
 
     if let Some(parent) = prefix.as_ref().parent() {
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
 
-    // Capture rather than inherit: pack-objects prints each output pack's hash to
-    // stdout (noise in the server log), and stderr carries the real diagnostic when
-    // it fails. We write the packs by base-name, so stdout is not needed.
     let mut command = command();
     command
         .arg("-C")
         .arg(repo.as_ref())
-        .arg("pack-objects")
-        .arg("--revs")
-        .arg("--use-bitmap-index")
-        .arg(prefix.as_ref());
-    run_pack_objects(command, std::iter::once(commit), "pack-objects (reachable)")
+        .args(["pack-objects", "--delta-base-offset", "--revs"]);
+    if use_bitmap {
+        command.arg("--use-bitmap-index");
+    }
+    command.arg(prefix.as_ref());
+    run_pack_objects(
+        command,
+        std::iter::once(tip).chain(exclude.as_deref()),
+        "pack-objects (range)",
+    )
 }
 
 /// Run `pack-objects` with one line per `lines` item on stdin, as a tracked
@@ -912,7 +863,7 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
     command
         .arg("-C")
         .arg(repo.as_ref())
-        .arg("pack-objects")
+        .args(["pack-objects", "--delta-base-offset"])
         .args(extra_args)
         .arg(prefix.as_ref());
     run_pack_objects(
@@ -920,219 +871,6 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
         object_shas.iter().map(String::as_str),
         "pack-objects",
     )
-}
-
-/// Read and encode objects as pack base entries using scoped OS threads and
-/// per-chunk gix handles. The returned vector is sorted by object id so the
-/// final pack is deterministic.
-fn encode_objects_parallel(
-    repo: &gix::Repository,
-    ids: Vec<gix::hash::ObjectId>,
-) -> Result<Vec<gix_pack::data::output::Entry>> {
-    const PARALLEL_ENCODE_THRESHOLD: usize = 128;
-
-    if ids.len() < PARALLEL_ENCODE_THRESHOLD {
-        return ids
-            .into_iter()
-            .map(|id| {
-                let obj = repo
-                    .find_object(id)
-                    .with_context(|| format!("find object {id}"))?;
-                let count = gix_pack::data::output::Count::from_data(id, None);
-                let data = gix::objs::Data::new(&obj.data, obj.kind, gix::hash::Kind::Sha1);
-                let entry = gix_pack::data::output::Entry::from_data(&count, &data)
-                    .with_context(|| format!("encode object {id}"))?;
-                Ok(entry)
-            })
-            .collect::<Result<Vec<_>>>();
-    }
-
-    let num_workers =
-        crate::gix_util::worker_threads("pack-encode", crate::gix_util::default_worker_threads());
-    let repo_path = repo.path().to_path_buf();
-    let mut entries: Vec<gix_pack::data::output::Entry> =
-        crate::gix_util::parallel_map_repo(repo_path, ids, num_workers, |local_repo, id| {
-            let obj = local_repo
-                .find_object(*id)
-                .with_context(|| format!("find object {id}"))?;
-            let count = gix_pack::data::output::Count::from_data(*id, None);
-            let data = gix::objs::Data::new(&obj.data, obj.kind, gix::hash::Kind::Sha1);
-            let entry = gix_pack::data::output::Entry::from_data(&count, &data)
-                .with_context(|| format!("encode object {id}"))?;
-            Ok(entry)
-        })?;
-    entries.sort_by_key(|a| a.id);
-    Ok(entries)
-}
-
-/// Build a packfile + index containing the given object SHAs using gix instead of
-/// the `git pack-objects` subprocess. Objects are stored whole (no deltas) so the
-/// output is deterministic for a fixed sorted OID input, but not byte-identical
-/// to C-git. The resulting files are named `<prefix>-<packhash>.pack` and
-/// `<prefix>-<packhash>.idx`.
-pub fn pack_objects_to_prefix_gix<P: AsRef<Path>, Q: AsRef<Path>>(
-    repo: P,
-    object_shas: &[String],
-    prefix: Q,
-) -> Result<()> {
-    if object_shas.is_empty() {
-        bail!("no objects to pack");
-    }
-
-    let repo = crate::gix_util::open_repo(repo)?;
-    let ids: HashSet<gix::hash::ObjectId> = object_shas
-        .iter()
-        .map(|s| {
-            gix::hash::ObjectId::from_hex(s.as_bytes())
-                .with_context(|| format!("invalid object id: {s}"))
-        })
-        .collect::<Result<_>>()?;
-    let mut ids: Vec<_> = ids.into_iter().collect();
-    ids.sort();
-
-    let num_entries: u32 = ids.len().try_into().context("too many objects for pack")?;
-
-    // Encode objects as base entries. This is undeltified and therefore
-    // deterministic for a sorted input, at the cost of a larger pack than
-    // C-git would produce.
-    // Stream the pack bytes straight to a temp file so peak memory stays flat
-    // regardless of pack size; only the object entries are buffered in memory.
-    let entries = encode_objects_parallel(&repo, ids).context("collect objects for gix pack")?;
-
-    if let Some(parent) = prefix.as_ref().parent() {
-        std::fs::create_dir_all(parent).context("create pack prefix directory")?;
-    }
-    let parent = prefix
-        .as_ref()
-        .parent()
-        .context("prefix must have a parent directory")?;
-    let base = prefix
-        .as_ref()
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("pack");
-
-    let mut tmp_pack = tempfile::Builder::new()
-        .prefix(&format!("{}-tmp-", base))
-        .suffix(".pack")
-        .tempfile_in(parent)
-        .context("create temp pack file")?;
-
-    let pack_hash = {
-        let input = entries
-            .into_iter()
-            .map(|e| Ok::<_, std::convert::Infallible>(vec![e]));
-        let mut buf = std::io::BufWriter::new(tmp_pack.as_file_mut());
-        let mut writer = gix_pack::data::output::bytes::FromEntriesIter::new(
-            input,
-            &mut buf,
-            num_entries,
-            gix_pack::data::Version::V2,
-            gix::hash::Kind::Sha1,
-        );
-        for _ in writer.by_ref() {}
-        let hash = writer
-            .digest()
-            .context("gix pack writer did not produce a checksum")?
-            .to_hex()
-            .to_string();
-        drop(writer);
-        buf.flush().context("flush pack file")?;
-        hash
-    };
-
-    let pack_out = parent.join(format!("{}-{}.pack", base, pack_hash));
-    let idx_out = pack_out.with_extension("idx");
-    tmp_pack
-        .persist(&pack_out)
-        .with_context(|| format!("rename pack to {}", pack_out.display()))?;
-
-    // Generate the matching .idx file from the just-written pack file.
-    index_pack(parent.join(".git"), &pack_out)
-        .with_context(|| format!("index pack {} -> {}", pack_out.display(), idx_out.display()))?;
-    Ok(())
-}
-
-/// Build a `.idx` file for an existing `.pack` using gix instead of the
-/// `git index-pack` subprocess. The pack must already be named `pack-<hash>.pack`
-/// in its directory; gix will detect it and only write the missing `.idx`.
-pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> Result<()> {
-    let pack_path = pack_path.as_ref();
-    let directory = pack_path
-        .parent()
-        .context("pack path must have a parent directory")?;
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(pack_path)
-            .with_context(|| format!("open pack {}", pack_path.display()))?,
-    );
-    let mut progress = gix::features::progress::Discard;
-    let thread_limit =
-        crate::gix_util::worker_threads("gix-index", crate::gix_util::default_worker_threads());
-    let gix_result = gix_pack::Bundle::write_to_directory(
-        &mut reader,
-        Some(directory),
-        &mut progress,
-        &AtomicBool::new(false),
-        None::<&gix::Repository>,
-        gix_pack::bundle::write::Options {
-            thread_limit: Some(thread_limit),
-            iteration_mode: gix_pack::data::input::Mode::Verify,
-            index_version: gix_pack::index::Version::default(),
-            object_hash: gix::hash::Kind::Sha1,
-        },
-    )
-    .context("gix index-pack");
-
-    match gix_result {
-        Ok(outcome) => {
-            if outcome.index_path.is_none() {
-                bail!("gix index-pack produced no index (empty pack?)");
-            }
-            Ok(())
-        }
-        Err(e) => {
-            // gix occasionally chokes on very large or unusually-shaped packs
-            // (e.g. oven-sh/bun). Fall back to the stock git implementation,
-            // which has seen these objects before and is more forgiving.
-            tracing::warn!(
-                "gix index-pack failed for {}: {e:#}; falling back to git index-pack",
-                pack_path.display()
-            );
-            run_quiet(
-                command()
-                    .arg("index-pack")
-                    .arg(pack_path)
-                    .current_dir(directory),
-                &format!("index-pack {}", pack_path.display()),
-            )
-        }
-    }
-}
-
-pub fn init<P: AsRef<Path>>(git_dir: P) -> Result<()> {
-    run_quiet(command().args(["init", "-q"]).arg(git_dir.as_ref()), "init")
-}
-
-pub fn set_head<P: AsRef<Path>>(git_dir: P, commit: &str) -> Result<()> {
-    std::fs::write(git_dir.as_ref().join("HEAD"), format!("{}\n", commit))?;
-    Ok(())
-}
-
-/// Populate the index from the tree at `commit` without materializing blobs.
-pub fn read_tree<P: AsRef<Path>>(git_dir: P, commit: &str) -> Result<()> {
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {}", commit))?;
-    run_git(git_dir, &["read-tree", "--end-of-options", commit])?;
-    Ok(())
-}
-
-/// Return a map from path to blob size for every blob in the commit tree.
-/// Uses `git ls-tree -r -l` so it requires the blob objects to be present
-/// (e.g. in a bare mirror or full clone).
-pub fn ls_tree_sizes<P: AsRef<Path>>(repo: P, commit: &str) -> Result<HashMap<String, u64>> {
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {}", commit))?;
-    crate::gix_util::ls_tree_sizes(repo, commit)
 }
 
 /// Disable git's automatic gc on a bare mirror, persisted into the mirror's own
@@ -2717,24 +2455,6 @@ mod tests {
         assert_eq!(entry_map.get("run.sh").map(String::as_str), Some("100755"));
         assert_eq!(entry_map.get("link-a").map(String::as_str), Some("120000"));
 
-        // ls-tree sizes.
-        let expect_sizes: HashMap<String, u64> = {
-            let out = git(repo, &["ls-tree", "-r", "-l", "-z", "HEAD"]);
-            out.split('\0')
-                .filter(|r| !r.is_empty())
-                .filter_map(|record| {
-                    let tab = record.rfind('\t').unwrap();
-                    let path = record[tab + 1..].to_string();
-                    let meta: Vec<&str> = record[..tab].split_whitespace().collect();
-                    if meta.len() < 4 || meta[1] != "blob" {
-                        return None;
-                    }
-                    meta[3].parse::<u64>().ok().map(|s| (path, s))
-                })
-                .collect()
-        };
-        assert_eq!(ls_tree_sizes(repo, "HEAD").unwrap(), expect_sizes);
-
         // Type/size/classify.
         let types = classify_objects(repo, &expect_full).unwrap();
         for sha in &expect_full {
@@ -2776,312 +2496,6 @@ mod tests {
         assert_eq!(entries[0].1, "100644");
     }
 
-    /// gix pack encode produces a deterministic, valid pack+idx pair.
-    #[test]
-    fn gix_pack_encode_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let _ = Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .arg(repo)
-            .output()
-            .unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "config", "user.email", "t@t"])
-            .output()
-            .unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "config", "user.name", "t"])
-            .output()
-            .unwrap();
-        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
-            .output()
-            .unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "commit", "-q", "-m", "c1"])
-            .output()
-            .unwrap();
-
-        let objects: Vec<String> = {
-            let out = Command::new("git")
-                .args([
-                    "-C",
-                    repo.to_str().unwrap(),
-                    "rev-list",
-                    "--objects",
-                    "--no-object-names",
-                    "HEAD",
-                ])
-                .output()
-                .unwrap();
-            String::from_utf8(out.stdout)
-                .unwrap()
-                .lines()
-                .map(|s| s.to_string())
-                .collect()
-        };
-
-        let out_dir = tempfile::tempdir().unwrap();
-        let prefix = out_dir.path().join("pack");
-        pack_objects_to_prefix_gix(repo, &objects, &prefix).unwrap();
-
-        let mut pack_file = None;
-        let mut idx_file = None;
-        for entry in std::fs::read_dir(out_dir.path()).unwrap() {
-            let path = entry.unwrap().path();
-            match path.extension().and_then(|e| e.to_str()) {
-                Some("pack") => pack_file = Some(path),
-                Some("idx") => idx_file = Some(path),
-                _ => {}
-            }
-        }
-        assert!(pack_file.is_some(), "pack file written");
-        assert!(idx_file.is_some(), "idx file written");
-
-        // Determinism: the same input produces the same pack hash.
-        let out_dir2 = tempfile::tempdir().unwrap();
-        let prefix2 = out_dir2.path().join("pack");
-        pack_objects_to_prefix_gix(repo, &objects, &prefix2).unwrap();
-        let hash1 = crate::archive::sha1_bytes(&std::fs::read(pack_file.unwrap()).unwrap());
-        let pack2 = std::fs::read_dir(out_dir2.path())
-            .unwrap()
-            .find(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .path()
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    == Some("pack")
-            })
-            .unwrap()
-            .unwrap()
-            .path();
-        let hash2 = crate::archive::sha1_bytes(&std::fs::read(&pack2).unwrap());
-        assert_eq!(hash1, hash2, "gix pack encode must be deterministic");
-
-        // Validity: gix can open the generated bundle and iterate every object.
-        let bundle = gix_pack::Bundle::at(idx_file.unwrap(), gix::hash::Kind::Sha1).unwrap();
-        assert_eq!(bundle.index.num_objects() as usize, objects.len());
-        for oid in &objects {
-            let id = gix::hash::ObjectId::from_hex(oid.as_bytes()).unwrap();
-            assert!(
-                bundle.index.lookup(id).is_some(),
-                "generated index must contain {oid}"
-            );
-        }
-    }
-
-    /// gix pack encode fails with a useful error when an object is missing.
-    #[test]
-    fn gix_pack_encode_fails_on_missing_object() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let _ = Command::new("git").arg("init").arg(repo).output().unwrap();
-        let out_dir = tempfile::tempdir().unwrap();
-        let prefix = out_dir.path().join("pack");
-        let bad = vec!["0000000000000000000000000000000000000000".to_string()];
-        assert!(pack_objects_to_prefix_gix(repo, &bad, &prefix).is_err());
-    }
-
-    /// gix pack encode deduplicates duplicate OIDs and rejects invalid hex.
-    #[test]
-    fn gix_pack_encode_dedup_and_invalid_hex() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let _ = Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .arg(repo)
-            .output()
-            .unwrap();
-        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
-            let _ = Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "config", key, val])
-                .output()
-                .unwrap();
-        }
-        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
-            .output()
-            .unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "commit", "-q", "-m", "c"])
-            .output()
-            .unwrap();
-        let out = Command::new("git")
-            .args([
-                "-C",
-                repo.to_str().unwrap(),
-                "rev-list",
-                "--objects",
-                "--no-object-names",
-                "HEAD",
-            ])
-            .output()
-            .unwrap();
-        let objects: Vec<String> = String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(!objects.is_empty());
-        // Duplicate every OID.
-        let duplicated: Vec<String> = objects
-            .iter()
-            .cloned()
-            .chain(objects.iter().cloned())
-            .collect();
-
-        let out_dir = tempfile::tempdir().unwrap();
-        let prefix = out_dir.path().join("pack");
-        pack_objects_to_prefix_gix(repo, &duplicated, &prefix).unwrap();
-        let idx_file = std::fs::read_dir(out_dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("idx"))
-            .unwrap();
-        let bundle = gix_pack::Bundle::at(&idx_file, gix::hash::Kind::Sha1).unwrap();
-        assert_eq!(bundle.index.num_objects() as usize, objects.len());
-
-        assert!(pack_objects_to_prefix_gix(repo, &["zzzz".to_string()], &prefix).is_err());
-    }
-
-    /// gix index generation for an existing pack (Phase 3) produces an idx that
-    /// git can use to read objects.
-    #[test]
-    fn gix_index_pack_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let _ = Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .arg(repo)
-            .output()
-            .unwrap();
-        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
-            let _ = Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "config", key, val])
-                .output()
-                .unwrap();
-        }
-        std::fs::write(repo.join("file.txt"), "hello\n").unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "add", "file.txt"])
-            .output()
-            .unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "commit", "-q", "-m", "c"])
-            .output()
-            .unwrap();
-
-        // Build a pack with C-git, then index it with gix.
-        let pack_dir = tmp.path().join("packs");
-        std::fs::create_dir(&pack_dir).unwrap();
-        let pack_prefix = pack_dir.join("objects");
-        let out = Command::new("git")
-            .args([
-                "-C",
-                repo.to_str().unwrap(),
-                "rev-list",
-                "--objects",
-                "--no-object-names",
-                "HEAD",
-            ])
-            .output()
-            .unwrap();
-        let objects: Vec<String> = String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
-        let mut child = std::process::Command::new("git")
-            .args([
-                "-C",
-                repo.to_str().unwrap(),
-                "pack-objects",
-                "--window=0",
-                pack_prefix.to_str().unwrap(),
-            ])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        {
-            use std::io::Write;
-            let stdin = child.stdin.as_mut().unwrap();
-            for oid in &objects {
-                writeln!(stdin, "{}", oid).unwrap();
-            }
-        }
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success());
-
-        let pack_file = std::fs::read_dir(&pack_dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("pack"))
-            .unwrap();
-        index_pack(repo.join(".git"), &pack_file).unwrap();
-
-        let idx_file = pack_file.with_extension("idx");
-        assert!(idx_file.exists(), "gix index_pack must write .idx");
-
-        let bundle = gix_pack::Bundle::at(&idx_file, gix::hash::Kind::Sha1).unwrap();
-        assert_eq!(bundle.index.num_objects() as usize, objects.len());
-        for oid in &objects {
-            let id = gix::hash::ObjectId::from_hex(oid.as_bytes()).unwrap();
-            assert!(
-                bundle.index.lookup(id).is_some(),
-                "gix-generated index must contain {oid}"
-            );
-        }
-    }
-
-    /// gix index generation rejects a corrupt/truncated pack.
-    #[test]
-    fn gix_index_pack_rejects_truncated() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pack_dir = tmp.path().join("packs");
-        std::fs::create_dir(&pack_dir).unwrap();
-        let pack_file = pack_dir.join("pack-0000000000000000000000000000000000000000.pack");
-        std::fs::write(&pack_file, b"PKT\x00\x00").unwrap();
-        assert!(index_pack(pack_dir.join(".git"), &pack_file).is_err());
-    }
-
-    /// Setting and clearing skip-worktree via gix (Phase 5) round-trips through
-    /// a real git index.
-    #[test]
-    fn gix_index_skip_worktree_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let _ = Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .arg(repo)
-            .output()
-            .unwrap();
-        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
-            let _ = Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "config", key, val])
-                .output()
-                .unwrap();
-        }
-        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "add", "."])
-            .output()
-            .unwrap();
-
-        set_skip_worktree_all(repo).unwrap();
-        assert_skip_worktree_flag(repo, "a.txt", true);
-        assert_skip_worktree_flag(repo, "b.txt", true);
-
-        update_index_skip_worktree(repo, &["a.txt".to_string(), "b.txt".to_string()], false)
-            .unwrap();
-        assert_skip_worktree_flag(repo, "a.txt", false);
-        assert_skip_worktree_flag(repo, "b.txt", false);
-    }
-
     fn assert_skip_worktree_flag(repo: &Path, path: &str, expected: bool) {
         let out = Command::new("git")
             .args(["-C", repo.to_str().unwrap(), "ls-files", "-v", "--", path])
@@ -3118,8 +2532,17 @@ mod tests {
             .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
             .output()
             .unwrap();
-
-        set_skip_worktree_all(repo).unwrap();
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "update-index",
+                "--skip-worktree",
+                "a.txt",
+            ])
+            .output()
+            .unwrap();
+        assert_skip_worktree_flag(repo, "a.txt", true);
 
         let stats = vec![materialized_path_stat_from_metadata(
             b"a.txt".to_vec(),
@@ -3139,51 +2562,6 @@ mod tests {
             )
             .expect("a.txt in index");
         assert_eq!(entry.stat.size, 5);
-    }
-
-    /// update_index_sizes via gix (Phase 5) updates cached sizes and leaves
-    /// non-targeted entries untouched.
-    #[test]
-    fn gix_update_index_sizes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let _ = Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .arg(repo)
-            .output()
-            .unwrap();
-        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
-            let _ = Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "config", key, val])
-                .output()
-                .unwrap();
-        }
-        std::fs::write(repo.join("a.txt"), "aaaa\n").unwrap();
-        std::fs::write(repo.join("b.txt"), "bbbbbbbb\n").unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "add", "."])
-            .output()
-            .unwrap();
-
-        let mut sizes = std::collections::HashMap::new();
-        sizes.insert("a.txt".to_string(), 42u64);
-        update_index_sizes(repo.join(".git"), &sizes).unwrap();
-
-        let index = open_index_file(&repo.join(".git").join("index")).unwrap();
-        let a = index
-            .entry_by_path_and_stage(
-                gix::bstr::BStr::new(b"a.txt"),
-                gix::index::entry::Stage::Unconflicted,
-            )
-            .unwrap();
-        let b = index
-            .entry_by_path_and_stage(
-                gix::bstr::BStr::new(b"b.txt"),
-                gix::index::entry::Stage::Unconflicted,
-            )
-            .unwrap();
-        assert_eq!(a.stat.size, 42);
-        assert_eq!(b.stat.size, 9); // untouched
     }
 
     /// Basic metadata queries via gix (Phase 1).
@@ -3328,40 +2706,6 @@ mod tests {
             Some(shas[1].as_str())
         );
         assert_eq!(parent_commit(repo, &shas[0]).unwrap(), None);
-
-        let range = list_object_shas_in_range(repo, Some(shas[1].as_str()), &shas[2]).unwrap();
-        assert!(!range.is_empty());
-        assert!(range.contains(&shas[2]));
-        let stable_blob = String::from_utf8(
-            Command::new("git")
-                .args([
-                    "-C",
-                    repo.to_str().unwrap(),
-                    "rev-parse",
-                    &format!("{}:stable.txt", shas[1]),
-                ])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-        assert!(
-            !range.contains(&stable_blob),
-            "range must exclude blobs already reachable from the base commit"
-        );
-        assert_eq!(
-            range.len(),
-            3,
-            "one changed root file should introduce only commit + root tree + changed blob"
-        );
-
-        let full_range = list_object_shas_in_range(repo, None, &shas[2]).unwrap();
-        assert!(full_range.contains(&shas[0]));
-        assert!(full_range.contains(&shas[1]));
-        assert!(full_range.contains(&shas[2]));
-        assert!(full_range.contains(&stable_blob));
     }
 
     /// Regression: object lookups for ≥PARALLEL_LOOKUP_THRESHOLD objects must not

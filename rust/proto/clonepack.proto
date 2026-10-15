@@ -92,6 +92,12 @@ message MetadataChunk {
 
   // File table mapping paths to blobs and fragments.
   repeated FileEntry files = 5;
+
+  // Paths of submodule gitlinks (mode 160000). A clone creates each as an
+  // empty directory, as `git clone` does for a submodule it does not init.
+  // The prebuilt index keeps their entries skip-worktree; a client that
+  // creates the directory clears that bit.
+  repeated bytes gitlinks = 6;
 }
 
 // One zstd frame inside an archive chunk.

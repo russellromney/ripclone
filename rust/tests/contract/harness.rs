@@ -46,6 +46,30 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+/// Run git with `input` on stdin and return trimmed stdout; panic with
+/// stderr on failure.
+pub fn git_stdin(dir: &Path, args: &[&str], input: &[u8]) -> String {
+    use std::io::Write;
+    let mut child = git_cmd()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
 pub fn git_output(dir: &Path, args: &[&str]) -> Output {
     git_cmd()
         .arg("-C")
@@ -57,7 +81,7 @@ pub fn git_output(dir: &Path, args: &[&str]) -> Output {
 
 /// `git` with the user's global and system config ignored, so settings like a
 /// global excludes file cannot change what a test sees.
-fn git_cmd() -> Command {
+pub fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
     cmd.env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -861,6 +885,23 @@ fn listening_addr(line: &str) -> Option<String> {
         .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '[' | ']'))
         .collect();
     (!addr.is_empty()).then_some(addr)
+}
+
+/// The bare mirror under the server's repo root.
+pub fn mirror_dir(world: &World) -> PathBuf {
+    let root = world.path("server").join("repos");
+    let mut dirs = vec![root.clone()];
+    while let Some(dir) = dirs.pop() {
+        if dir.join("objects").join("pack").is_dir() {
+            return dir;
+        }
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    panic!("no mirror under {}", root.display());
 }
 
 /// Poll `check` until it returns `Some`, failing after [`WAIT`].

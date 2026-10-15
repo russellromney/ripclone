@@ -334,7 +334,8 @@ impl ArchiveBuilder {
         // content. Raw byte paths keep the file table byte-exact for non-UTF8
         // names (matching the worktree the client extracts).
         let mut blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
-        collect_blobs_raw_gix(repo, tree_id, &mut blobs).context("walk git tree for archive")?;
+        let gitlinks = collect_blobs_raw_gix(repo, tree_id, &mut blobs)
+            .context("walk git tree for archive")?;
 
         // The reader records each file's (path, mode, sha1) + byte range as it
         // serves blob bytes; we recover that table after the stream is drained.
@@ -407,6 +408,7 @@ impl ArchiveBuilder {
 
         let mut manifest = MetadataChunk::new();
         manifest.files = files;
+        manifest.gitlinks = gitlinks;
         Ok((manifest, bounds, raw_total, outputs))
     }
 
@@ -450,7 +452,7 @@ impl ArchiveBuilder {
             .detach();
 
         let mut blobs = Vec::new();
-        collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
+        let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
             .context("collect blobs for files table")?;
 
         // Hash blobs in parallel. Many-file repos (e.g. node_modules) spend most
@@ -460,6 +462,7 @@ impl ArchiveBuilder {
             hash_blobs_parallel(&self.mirror, blobs).context("hash blobs for files table")?;
 
         let mut manifest = MetadataChunk::new();
+        manifest.gitlinks = gitlinks;
         for (path, mode, blob_sha1) in hashes {
             manifest.files.push(FileEntry {
                 path,
@@ -512,10 +515,11 @@ impl ArchiveBuilder {
         // Paths are built from raw bytes at every level so they match
         // `git diff -z` and the `changed` set exactly.
         let mut blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
-        collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
+        let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
             .context("walk git tree for incremental files table")?;
 
         let mut manifest = MetadataChunk::new();
+        manifest.gitlinks = gitlinks;
         for (path, blob_oid, mode) in blobs {
             let reused = if changed.contains(&path) {
                 None
@@ -926,7 +930,8 @@ impl ArchiveBuilder {
         };
 
         let mut new_blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
-        collect_blobs_raw_gix(&repo, new_tree, &mut new_blobs).context("walk new tree")?;
+        let gitlinks =
+            collect_blobs_raw_gix(&repo, new_tree, &mut new_blobs).context("walk new tree")?;
         let mut old_blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
         collect_blobs_raw_gix(&repo, prev_tree, &mut old_blobs).context("walk prev tree")?;
 
@@ -1205,6 +1210,7 @@ impl ArchiveBuilder {
             .map(|f| (f.path.as_slice(), f.blob_sha1.as_slice()))
             .collect();
         let mut manifest = MetadataChunk::new();
+        manifest.gitlinks = gitlinks;
         let mut hint = 0usize;
         for (idx, (path, oid, mode)) in new_blobs.iter().enumerate() {
             let bstart = new_starts[idx];
@@ -1394,13 +1400,13 @@ impl Read for TreeBlobReader<'_> {
 
 /// Collect every blob in `tree_id` as `(raw_path_bytes, blob_oid, mode)` in
 /// git pre-order. Paths are built from raw entry names at every level so they
-/// are byte-exact (no lossy UTF-8), matching `git diff -z` output. Submodules
-/// and other non-blob entries are skipped.
+/// are byte-exact (no lossy UTF-8), matching `git diff -z` output. Returns the
+/// paths of submodule gitlinks, which are not files.
 fn collect_blobs_raw_gix(
     repo: &gix::Repository,
     tree_id: gix::hash::ObjectId,
     out: &mut Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,
-) -> Result<()> {
+) -> Result<Vec<Vec<u8>>> {
     let mut recorder = gix::traverse::tree::Recorder::default();
     gix::traverse::tree::depthfirst(
         tree_id,
@@ -1409,9 +1415,14 @@ fn collect_blobs_raw_gix(
         &mut recorder,
     )
     .context("walk git tree")?;
+    let mut gitlinks = Vec::new();
     for entry in recorder.records {
-        // Trees are recursed into; submodule commit entries are not worktree files.
-        if entry.mode.is_tree() || entry.mode.is_commit() {
+        // Trees are recursed into; a submodule gitlink is a directory, not a file.
+        if entry.mode.is_commit() {
+            gitlinks.push(entry.filepath.to_vec());
+            continue;
+        }
+        if entry.mode.is_tree() {
             continue;
         }
         out.push((
@@ -1420,7 +1431,7 @@ fn collect_blobs_raw_gix(
             entry.mode.value() as u32,
         ));
     }
-    Ok(())
+    Ok(gitlinks)
 }
 
 /// Hash a list of `(path, blob_oid, mode)` tuples in parallel using scoped OS

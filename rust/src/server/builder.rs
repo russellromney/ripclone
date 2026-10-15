@@ -22,6 +22,53 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tracing::{info, warn};
 
+/// Step timings of one Files or Full build, logged when it ends as one line:
+/// `build-phases kind=<files|full> repo=<key> commit=<short> outcome=<ready|failed>`
+/// followed by a `<step>_ms=<n>` pair for each step that ran, in order, and
+/// `total_ms=<n>`.
+#[derive(Debug, Default)]
+pub(super) struct BuildPhases {
+    steps: Vec<(&'static str, u64)>,
+}
+
+impl BuildPhases {
+    /// Record `step` as taking the time since `start`. A step recorded twice
+    /// adds up.
+    pub(super) fn record(&mut self, step: &'static str, start: Instant) {
+        self.add(step, duration_ms(start.elapsed()));
+    }
+
+    pub(super) fn add(&mut self, step: &'static str, ms: u64) {
+        match self.steps.iter_mut().find(|(name, _)| *name == step) {
+            Some((_, total)) => *total = total.saturating_add(ms),
+            None => self.steps.push((step, ms)),
+        }
+    }
+
+    pub(super) fn report(
+        &self,
+        kind: &str,
+        repo_id: &RepoId,
+        commit: &str,
+        ready: bool,
+        started: Instant,
+    ) {
+        use std::fmt::Write;
+        let mut line = format!(
+            "build-phases kind={} repo={} commit={} outcome={}",
+            kind,
+            repo_id.storage_key(),
+            &commit[..7.min(commit.len())],
+            if ready { "ready" } else { "failed" }
+        );
+        for (step, ms) in &self.steps {
+            let _ = write!(line, " {step}_ms={ms}");
+        }
+        let _ = write!(line, " total_ms={}", duration_ms(started.elapsed()));
+        info!("{line}");
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncPhases {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,8 +151,8 @@ async fn seal_and_compact(
     prev_levels: Vec<crate::HistoryLevel>,
     sealed_tip: Option<String>,
     tail_packs: Vec<(String, u64, String, u64)>,
-    history_target: u64,
     max_levels: usize,
+    phases: &mut BuildPhases,
 ) -> Result<(
     Vec<(String, u64, String, u64)>,
     Vec<(String, u64, String, u64)>,
@@ -137,22 +184,23 @@ async fn seal_and_compact(
 
     // Compact (off-thread; it re-packs ranges) so the level count stays bounded.
     if levels.len() > max_levels {
+        let start = Instant::now();
         let before = levels.len();
-        let (md, c, levels_in, max, tgt) = (
+        let (md, c, levels_in, max) = (
             mirror_dir.to_path_buf(),
             cas.clone(),
             levels.clone(),
             max_levels,
-            history_target,
         );
         let res = cancel::spawn_blocking(move || {
-            PackBuilder::new(&md, &c).compact_levels(levels_in, max, tgt)
+            PackBuilder::new(&md, &c).compact_levels(levels_in, max)
         })
         .await
         .context("compaction task")??;
         new_tuples.extend(res.new_packs.iter().cloned());
         levels = res.levels;
         info!("LSM: compacted {} levels -> {}", before, levels.len());
+        phases.record("level_compact", start);
     }
 
     // Manifest history = every sealed level's packs (prior reused by hash + any
@@ -465,6 +513,14 @@ pub(super) async fn build_head_result(
         info!("Head skeleton {:?}", s.elapsed());
         r
     });
+    // The prebuilt index reads the commit's tree from the mirror, so it builds
+    // alongside the skeleton rather than after it.
+    let (md4, c4, cm4) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let prebuilt_index_handle = cancel::spawn_blocking(move || {
+        let s = Instant::now();
+        let index = PackBuilder::new(&md4, &c4).build_prebuilt_index(&cm4)?;
+        anyhow::Ok((index, duration_ms(s.elapsed())))
+    });
     // Head-closure packs, incremental by delta against an immutable base: keep the
     // base packs (closure of `head_base_commit`) and pack only the depth-1 objects
     // new since that base (`closure(HEAD) − closure(base)`) into a delta pack. The
@@ -599,19 +655,10 @@ pub(super) async fn build_head_result(
     phases.files_table_ms = Some(duration_ms(ft_start.elapsed()));
     info!("Head result: packs+skeleton+files-table {:?}", t.elapsed());
 
-    let (md4, c4, cm4, skp) = (
-        mirror_dir.to_path_buf(),
-        cas.clone(),
-        commit.to_string(),
-        shallow_skeleton_pack.clone(),
-    );
-    let idx_start = Instant::now();
-    let shallow_prebuilt_index = cancel::spawn_blocking(move || {
-        PackBuilder::new(&md4, &c4).build_prebuilt_index(&cm4, &skp)
-    })
-    .await
-    .context("shallow prebuilt index")??;
-    phases.prebuilt_index_ms = Some(duration_ms(idx_start.elapsed()));
+    let (shallow_prebuilt_index, prebuilt_index_ms) = prebuilt_index_handle
+        .await
+        .context("shallow prebuilt index")??;
+    phases.prebuilt_index_ms = Some(prebuilt_index_ms);
 
     Cancel::check_current()?;
     // Assemble the metadata chunk, idx bundle, MIDX and manifest from CAS.
@@ -917,6 +964,7 @@ pub(super) async fn build_full_result(
     mut previous_levels: Vec<crate::HistoryLevel>,
     storage: &crate::storage::StorageRef,
     before_cold: impl std::future::Future<Output = ()>,
+    phases: &mut BuildPhases,
 ) -> Result<crate::FullResult> {
     // Head was built on this server moments ago, so local CAS usually still
     // has its manifest.
@@ -940,16 +988,11 @@ pub(super) async fn build_full_result(
     let mut head_packs = manifest_pack_tuples(&head_manifest)?;
     let parent = head.parent_commit.clone();
 
-    let history_target = 512 * 1024 * 1024;
     let mut sealed_tip = previous_levels.last().map(|level| level.tip_commit.clone());
     let build_tail = |since: Option<String>| {
         let (mirror, cas, commit) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
         cancel::spawn_blocking(move || {
-            PackBuilder::new(&mirror, &cas).build_history_tail(
-                &commit,
-                since.as_deref(),
-                history_target,
-            )
+            PackBuilder::new(&mirror, &cas).build_history_tail(&commit, since.as_deref())
         })
     };
     // A tail the mirror cannot list from the sealed tip builds cold instead:
@@ -960,7 +1003,7 @@ pub(super) async fn build_full_result(
             .await
             .context("Full history task")?
         {
-            Ok(packs) => Some(packs),
+            Ok(built) => Some(built),
             Err(error) => {
                 Cancel::check_current()?;
                 warn!(
@@ -974,13 +1017,17 @@ pub(super) async fn build_full_result(
         },
     };
     let built_history = match tail {
-        Some(packs) => packs,
+        Some(built) => built,
         None => {
+            let start = Instant::now();
             before_cold.await;
+            phases.record("bitmap", start);
             Cancel::check_current()?;
             build_tail(None).await.context("Full history task")??
         }
     };
+    phases.add("history", built_history.pack_ms);
+    phases.add("history_store", built_history.store_ms);
 
     let (history_packs, new_history, levels) = seal_and_compact(
         mirror_dir,
@@ -988,9 +1035,9 @@ pub(super) async fn build_full_result(
         commit,
         previous_levels,
         sealed_tip,
-        built_history,
-        history_target,
+        built_history.packs,
         lsm_max_levels()?,
+        phases,
     )
     .await?;
 
@@ -1003,6 +1050,7 @@ pub(super) async fn build_full_result(
     let mut head_base = None;
     Cancel::check_current()?;
     if delta_bytes > 0 && delta_bytes >= rebase_bytes {
+        let start = Instant::now();
         let compact_mirror = mirror_dir.to_path_buf();
         let compact_cas = cas.clone();
         let compact_commit = commit.to_string();
@@ -1035,6 +1083,7 @@ pub(super) async fn build_full_result(
             packs: compact_packs.iter().map(tuple_to_sized).collect(),
         });
         head_packs = compact_packs;
+        phases.record("head_rebase", start);
     }
 
     Cancel::check_current()?;
@@ -1047,6 +1096,7 @@ pub(super) async fn build_full_result(
     );
     let (vhead, vhistory) = (head_packs.clone(), history_packs.clone());
     let metadata_len = head_manifest.metadata_chunk.as_ref().map(|chunk| chunk.len);
+    let start = Instant::now();
     let (manifest_hash, idx_bundle_hash) = cancel::spawn_blocking(move || -> Result<_> {
         let tagged: Vec<(&(String, u64, String, u64), bool)> = vhead
             .iter()
@@ -1072,6 +1122,7 @@ pub(super) async fn build_full_result(
     })
     .await
     .context("Full manifest task")??;
+    phases.record("idx_bundle", start);
     let mut uploads = vec![manifest_hash.clone(), idx_bundle_hash.clone()];
     for (pack, _, idx, _) in &new_history {
         uploads.push(pack.clone());
@@ -1082,8 +1133,10 @@ pub(super) async fn build_full_result(
         .iter()
         .map(|(_, _, idx, _)| idx.clone())
         .collect();
+    let start = Instant::now();
     upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
     settle_storage(cas, storage, uploads, keep_idx).await;
+    phases.record("upload", start);
 
     let mut all_packs = head_packs;
     all_packs.extend(history_packs);
@@ -1114,7 +1167,9 @@ pub(super) async fn build_files_result(
     parent_files: Option<(&str, &crate::FilesResult)>,
     storage: &crate::storage::StorageRef,
     compression_level: i32,
+    phases: &mut BuildPhases,
 ) -> Result<crate::FilesResult> {
+    let start = Instant::now();
     let previous_frames = parent_files
         .map(|(_, files)| files.archive_frames.clone())
         .unwrap_or_default();
@@ -1129,6 +1184,8 @@ pub(super) async fn build_files_result(
     let previous_commit = parent_files
         .map(|(commit, _)| commit.to_string())
         .unwrap_or_default();
+    phases.record("base_files", start);
+    let start = Instant::now();
     let archive_mirror = mirror_dir.to_path_buf();
     let archive_cas = cas.clone();
     let archive_storage = storage.clone();
@@ -1147,8 +1204,10 @@ pub(super) async fn build_files_result(
     })
     .await
     .context("Files archive task")??;
+    phases.record("archive", start);
 
     Cancel::check_current()?;
+    let start = Instant::now();
     let archive_chunk_hashes = archive_output.download_bundle_hashes;
     let mut metadata = archive_output.metadata;
     let (fc, fs, fcommit, fhead) = (
@@ -1181,14 +1240,17 @@ pub(super) async fn build_files_result(
     })
     .await
     .context("Files manifest task")??;
+    phases.record("manifest", start);
     let uploads = archive_publish_upload_hashes(
         &metadata_hash,
         &manifest_hash,
         &archive_chunk_hashes,
         &archive_output.new_reuse_frame_hashes,
     );
+    let start = Instant::now();
     upload_artifacts(cas, storage, uploads.clone(), upload_concurrency()).await?;
     settle_storage(cas, storage, uploads, std::collections::HashSet::new()).await;
+    phases.record("upload", start);
 
     Ok(crate::FilesResult {
         clonepack: crate::ClonepackArtifacts {

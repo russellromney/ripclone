@@ -91,16 +91,13 @@ fn lsm_incremental_full_clone_is_complete() {
     let cas = Cas::new(tmp.path().join("cas")).unwrap();
     let builder = PackBuilder::new(&src, &cas);
     let head_target = 6 * 1024 * 1024;
-    let hist_target = 512 * 1024 * 1024;
 
     // Sync 1 @ C: seal the whole history up to C as level 0.
-    let level0 = builder.build_history_tail(&c, None, hist_target).unwrap();
+    let level0 = builder.build_history_tail(&c, None).unwrap().packs;
     assert!(!level0.is_empty(), "level 0 should have packs");
 
     // Sync 2 @ E: only the tail (C, E] is rebuilt, plus E's HEAD closure.
-    let tail = builder
-        .build_history_tail(&e, Some(&c), hist_target)
-        .unwrap();
+    let tail = builder.build_history_tail(&e, Some(&c)).unwrap().packs;
     assert!(!tail.is_empty(), "tail (C,E] should have packs");
     let head = builder.build_head_packs(&e, head_target).unwrap();
 
@@ -159,13 +156,12 @@ fn lsm_no_new_commits_yields_empty_tail() {
     let builder = PackBuilder::new(&src, &cas);
 
     // Seal everything up to HEAD, then "sync" again at the same commit.
-    let sealed = builder
-        .build_history_tail(&head, None, 512 * 1024 * 1024)
-        .unwrap();
+    let sealed = builder.build_history_tail(&head, None).unwrap().packs;
     assert!(!sealed.is_empty(), "level 0 should have packs");
     let again = builder
-        .build_history_tail(&head, Some(&head), 512 * 1024 * 1024)
-        .unwrap();
+        .build_history_tail(&head, Some(&head))
+        .unwrap()
+        .packs;
     assert!(
         again.is_empty(),
         "no new commits since the sealed tip -> empty tail"

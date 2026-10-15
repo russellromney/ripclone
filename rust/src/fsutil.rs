@@ -23,9 +23,11 @@ pub fn path_from_bytes(bytes: &[u8]) -> &Path {
     }
 }
 
-/// Validate that `path` is a non-empty relative path with no `..` components
-/// and no NUL bytes. This must be applied to every manifest path before any
-/// filesystem operation.
+/// Validate that `path` is a non-empty relative path with no `..` components,
+/// no `.git` component in any letter case, and no NUL bytes. This must be
+/// applied to every manifest path before any filesystem operation. Git
+/// refuses the same `.git` names on checkout, so a server that sends one
+/// cannot write into the clone's repository.
 pub fn validate_relative_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
         anyhow::bail!("path is empty");
@@ -37,6 +39,11 @@ pub fn validate_relative_path(path: &Path) -> Result<()> {
         match comp {
             std::path::Component::ParentDir => {
                 anyhow::bail!("path contains parent-dir component: {}", path.display());
+            }
+            std::path::Component::Normal(name)
+                if name.as_encoded_bytes().eq_ignore_ascii_case(b".git") =>
+            {
+                anyhow::bail!("path contains a .git component: {}", path.display());
             }
             std::path::Component::Normal(_) => {}
             _ => {

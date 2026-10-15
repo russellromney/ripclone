@@ -233,22 +233,6 @@ fn k3_burst_publishes_fulls_in_admission_order() {
     }
 }
 
-/// The bare mirror under the server's repo root.
-fn mirror_dir(root: &std::path::Path) -> std::path::PathBuf {
-    let mut dirs = vec![root.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        if dir.join("objects").join("pack").is_dir() {
-            return dir;
-        }
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            if entry.file_type().unwrap().is_dir() {
-                dirs.push(entry.path());
-            }
-        }
-    }
-    panic!("no mirror under {}", root.display());
-}
-
 fn pack_count(mirror: &std::path::Path) -> usize {
     std::fs::read_dir(mirror.join("objects").join("pack"))
         .unwrap()
@@ -272,7 +256,7 @@ fn k4_full_compacts_a_fragmented_mirror() {
     wait_output(&server, "acme/k4", &a, "head", "ready");
     server.kill();
 
-    let mirror = mirror_dir(&world.path("server").join("repos"));
+    let mirror = mirror_dir(&world);
     let seed = format!(
         "for i in $(seq 1 20); do \
            printf 'seed %s' \"$i\" | git hash-object -w --stdin \

@@ -36,18 +36,20 @@ impl Backends {
         metrics: &Arc<Metrics>,
         retention: &RetentionSettings,
     ) -> Result<Self> {
-        let cas = Cas::new(cas_dir)?;
         let s3_storage =
             S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
-        let storage: StorageRef = if let Some(s3) = s3_storage {
+        // With remote storage the build CAS is a cache of what was uploaded,
+        // so it skips directory syncs. Local storage is the CAS directory
+        // itself, so every object it reports stored must survive a crash.
+        let (cas, storage): (Cas, StorageRef) = if let Some(s3) = s3_storage {
             info!(
                 "using S3-compatible storage with build CAS at {}",
                 cas_dir.display()
             );
-            Arc::new(s3)
+            (Cas::cache(cas_dir)?, Arc::new(s3))
         } else {
             info!("using local storage at {}", cas_dir.display());
-            local(cas_dir)?
+            (Cas::new(cas_dir)?, local(cas_dir)?)
         };
         let cache_retention =
             LocalCacheRetention::new(cas.clone(), metrics.clone(), storage.clone(), retention);

@@ -91,7 +91,9 @@ pub struct ServerState {
 ///
 /// Fetches, the commit-graph and the bitmap only add files or atomically
 /// replace them, so builds read the mirror while they run; `write`
-/// serializes them. Compaction deletes packs, so it also needs `read`
+/// serializes fetches and the commit-graph. The bitmap, written by a cold
+/// Full under `read` alone, covers only the packs it found, so a fetch may
+/// run alongside it. Compaction deletes packs, so it also needs `read`
 /// exclusively, which it only tries for: it never waits for a build, and no
 /// build waits long for it. Order: `read`, then `write`.
 #[derive(Default)]

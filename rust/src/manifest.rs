@@ -14,6 +14,7 @@ impl MetadataChunk {
             prebuilt_index: Vec::new(),
             frames: Vec::new(),
             files: Vec::new(),
+            gitlinks: Vec::new(),
         }
     }
 
@@ -114,6 +115,19 @@ impl MetadataChunk {
                         frame.raw_len
                     );
                 }
+            }
+        }
+
+        for gitlink in &self.gitlinks {
+            if gitlink.is_empty() {
+                anyhow::bail!("gitlink has empty path");
+            }
+            crate::fsutil::validate_relative_path(crate::fsutil::path_from_bytes(gitlink))
+                .with_context(|| {
+                    format!("unsafe gitlink path: {}", String::from_utf8_lossy(gitlink))
+                })?;
+            if !paths.insert(gitlink.as_slice()) {
+                anyhow::bail!("duplicate path: {}", String::from_utf8_lossy(gitlink));
             }
         }
 

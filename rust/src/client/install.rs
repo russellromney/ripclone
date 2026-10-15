@@ -594,7 +594,7 @@ impl Client {
         // Build the blob→paths map and pre-create directories single-threaded
         // before the parallel writers run.
         let blob_map = Arc::new(crate::extract::build_blob_path_map(&metadata.files));
-        crate::extract::prepare_worktree_dirs(work_tree, &metadata.files)
+        crate::extract::prepare_worktree_dirs(work_tree, metadata)
             .context("prepare worktree dirs")?;
 
         // Download and pack parsing are decoupled stages with independent
@@ -781,8 +781,14 @@ impl Client {
             );
         }
 
-        // Files are materialized; clear skip-worktree for every tracked path.
-        let path_bytes: Vec<Vec<u8>> = metadata.files.iter().map(|e| e.path.clone()).collect();
+        // Files are materialized and each gitlink has its empty directory;
+        // clear skip-worktree for every tracked path, as `git clone` leaves it.
+        let path_bytes: Vec<Vec<u8>> = metadata
+            .files
+            .iter()
+            .map(|e| e.path.clone())
+            .chain(metadata.gitlinks.iter().cloned())
+            .collect();
         let index_tree = work_tree.to_path_buf();
         AbortOnDrop::new(
             tokio::task::spawn_blocking(move || {
