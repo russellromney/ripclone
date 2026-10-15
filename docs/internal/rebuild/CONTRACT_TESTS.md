@@ -212,10 +212,10 @@ so L1 checks clones only on Linux and the builds everywhere.
 
 | # | Test | Added |
 |---|---|---|
-| L1 | A tree of odd names (spaces at either end, leading dashes, newline, tab, quotes and backslash, glob characters, NFC and NFD forms, Latin-1 bytes in a file and a directory name, a symlink to a non-UTF-8 name, an executable) builds, and every clone shape equals the commit. A push renaming the non-UTF-8 file builds incrementally and clones exactly. | #PR |
-| L2 | A submodule gitlink, never in the mirror: Head, Files and Full build. Each clone shape matches `git clone` without `--recurse-submodules`: `ls-files --stage` and `-v`, `status`, `submodule status`, and an empty directory for the submodule. Bumping the submodule repeats it. | #PR |
-| L3 | After a cold Full, three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #PR |
-| L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #PR |
+| L1 | A tree of odd names (spaces at either end, leading dashes, newline, tab, quotes and backslash, glob characters, NFC and NFD forms, Latin-1 bytes in a file and a directory name, a symlink to a non-UTF-8 name, an executable) builds, and every clone shape equals the commit. A push renaming the non-UTF-8 file builds incrementally and clones exactly. | #219 |
+| L2 | A submodule gitlink, never in the mirror: Head, Files and Full build. Each clone shape matches `git clone` without `--recurse-submodules`: `ls-files --stage` and `-v`, `status`, `submodule status`, and an empty directory for the submodule. Bumping the submodule repeats it. | #219 |
+| L3 | After a cold Full, three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219 |
+| L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
 Total: 79 tests. Several are table-driven.
 
