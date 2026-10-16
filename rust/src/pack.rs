@@ -99,6 +99,50 @@ impl<'a> PackBuilder<'a> {
         self.build_packs_from_oids(&level, head_target_raw_bytes)
     }
 
+    /// Pack a new Head base for `commit` from the current base and levels,
+    /// each given with its idx bytes. A base pack in which objects `commit`
+    /// no longer uses take at most a tenth of the bytes is kept as it is.
+    /// The rest of the closure (the live objects of the other base packs
+    /// and of every level) is packed again, so a rebase uploads the packs
+    /// that changed, not the whole base. Levels are never kept: they are
+    /// small and folding them keeps the pack count bounded.
+    ///
+    /// Returns the new base's packs in manifest order (kept packs first)
+    /// and the number of kept packs; the packs after them are new.
+    pub fn rebase_head_packs(
+        &self,
+        commit: &str,
+        base: &[((String, u64, String, u64), Vec<u8>)],
+        head_target_raw_bytes: u64,
+    ) -> Result<(Vec<(String, u64, String, u64)>, usize)> {
+        let closure = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        if closure.is_empty() {
+            bail!("no objects to pack for {}", commit);
+        }
+        let live: HashSet<&str> = closure.iter().map(String::as_str).collect();
+        let mut kept = Vec::new();
+        let mut kept_ids = HashSet::new();
+        for (pack, idx) in base {
+            let objects = idx_object_sizes(idx, pack.1)?;
+            let dead: u64 = objects
+                .iter()
+                .filter(|(id, _)| !live.contains(id.as_str()))
+                .map(|(_, len)| len)
+                .sum();
+            if dead * 10 <= pack.1 {
+                kept.push(pack.clone());
+                kept_ids.extend(objects.into_iter().map(|(id, _)| id));
+            }
+        }
+        let rest: Vec<String> = closure
+            .into_iter()
+            .filter(|id| !kept_ids.contains(id))
+            .collect();
+        let count = kept.len();
+        kept.extend(self.build_packs_from_oids(&rest, head_target_raw_bytes)?);
+        Ok((kept, count))
+    }
+
     /// Build only the deltified *tail*: objects introduced in `(sealed_tip,
     /// commit]` (the whole history when `sealed_tip` is `None`). The HEAD
     /// closure is built separately by [`Self::build_head_packs`]. Returns the
@@ -316,6 +360,46 @@ impl<'a> PackBuilder<'a> {
     }
 }
 
+/// The object ids of a version 2 pack idx with the bytes each object takes
+/// in its pack, `pack_len` long: the distance to the next object's offset,
+/// or to the pack's trailing checksum.
+pub fn idx_object_sizes(idx: &[u8], pack_len: u64) -> Result<Vec<(String, u64)>> {
+    let ids = idx_object_ids(idx)?;
+    let count = ids.len();
+    let offsets_at = 8 + 256 * 4 + count * (20 + 4);
+    let large_at = offsets_at + count * 4;
+    let offsets = (0..count)
+        .map(|i| {
+            let at = offsets_at + i * 4;
+            let word = idx
+                .get(at..at + 4)
+                .context("pack idx is shorter than its offsets")?;
+            let word = u32::from_be_bytes(word.try_into()?);
+            if word & 0x8000_0000 == 0 {
+                return Ok(u64::from(word));
+            }
+            let at = large_at + (word & 0x7fff_ffff) as usize * 8;
+            let large = idx
+                .get(at..at + 8)
+                .context("pack idx is shorter than its large offsets")?;
+            Ok(u64::from_be_bytes(large.try_into()?))
+        })
+        .collect::<Result<Vec<u64>>>()?;
+    let end = pack_len
+        .checked_sub(20)
+        .context("pack is shorter than its checksum")?;
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|&i| offsets[i]);
+    let mut sizes = vec![0; count];
+    for (k, &i) in order.iter().enumerate() {
+        let next = order.get(k + 1).map_or(end, |&j| offsets[j]);
+        sizes[i] = next
+            .checked_sub(offsets[i])
+            .context("pack idx offset is past the end of its pack")?;
+    }
+    Ok(ids.into_iter().zip(sizes).collect())
+}
+
 /// The object ids, in hex, of a version 2 pack idx.
 pub fn idx_object_ids(idx: &[u8]) -> Result<Vec<String>> {
     const HEADER: usize = 8;
@@ -456,5 +540,109 @@ mod tests {
 
         // A corrupt idx is refused.
         assert!(idx_object_ids(b"not an idx").is_err());
+    }
+
+    #[test]
+    fn rebase_keeps_base_packs_that_stay_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let pb = PackBuilder::new(tmp.path(), &cas);
+        // Incompressible 8 KiB blobs, two per 16 KiB pack (and the commit
+        // and root tree with one of them): five packs.
+        let noise = |seed: u8| -> Vec<u8> {
+            let mut x = u32::from(seed).wrapping_mul(2_654_435_761) | 1;
+            (0..8192)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect()
+        };
+        let blobs: Vec<Vec<u8>> = (0..9).map(noise).collect();
+        let names = ["f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7"];
+        let files: Vec<(&str, &[u8])> = names
+            .iter()
+            .zip(&blobs)
+            .map(|(n, b)| (*n, &b[..]))
+            .collect();
+        let c1 = commit_onto(&repo, &files);
+        let target = 16 * 1024;
+        let base = pb.build_head_packs(&c1, target).unwrap();
+        assert_eq!(base.len(), 5);
+
+        // The idx sizes are what git reports for each object in its pack.
+        let dir = tempfile::tempdir().unwrap();
+        for (pack, pack_len, idx, _) in &base {
+            let idx_bytes = cas.get(idx).unwrap();
+            std::fs::write(dir.path().join("p.pack"), cas.get(pack).unwrap()).unwrap();
+            std::fs::write(dir.path().join("p.idx"), &idx_bytes).unwrap();
+            let out = std::process::Command::new("git")
+                .args(["verify-pack", "-v"])
+                .arg(dir.path().join("p.idx"))
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let want: BTreeSet<(String, u64)> = String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| {
+                    let f: Vec<&str> = line.split_whitespace().collect();
+                    (f.len() >= 5 && f[0].len() == 40)
+                        .then(|| (f[0].to_string(), f[3].parse().unwrap()))
+                })
+                .collect();
+            let got = idx_object_sizes(&idx_bytes, *pack_len).unwrap();
+            assert_eq!(got.iter().cloned().collect::<BTreeSet<_>>(), want);
+            assert_eq!(
+                got.iter().map(|(_, len)| len).sum::<u64>(),
+                pack_len - 12 - 20
+            );
+        }
+        assert!(idx_object_sizes(&cas.get(&base[0].2).unwrap(), 10).is_err());
+
+        // c2 changes f7. The pack with the commit and root tree loses only
+        // a small part of its bytes, so it is kept with the packs f7 is not
+        // in. The pack that held f7 is half dead, so it is dropped: the new
+        // commit, tree and f7 are packed with that pack's live blob.
+        let mut c2_files = files.clone();
+        c2_files[7] = ("f7", &blobs[8]);
+        let c2 = commit_onto(&repo, &c2_files);
+        let with_idx: Vec<_> = base
+            .iter()
+            .map(|pack| (pack.clone(), cas.get(&pack.2).unwrap()))
+            .collect();
+        let (rebased, kept) = pb.rebase_head_packs(&c2, &with_idx, target).unwrap();
+        let old_f7 = rev_parse(tmp.path(), &[format!("{c1}:f7")]);
+        let stays: Vec<_> = base
+            .iter()
+            .filter(|pack| packed_objects(&cas, &[(*pack).clone()]).is_disjoint(&old_f7))
+            .cloned()
+            .collect();
+        assert_eq!(kept, 4);
+        assert_eq!(rebased[..kept], stays[..]);
+        let built = packed_objects(&cas, &rebased[kept..]);
+        let mut want = rev_parse(
+            tmp.path(),
+            &[c2.clone(), format!("{c2}^{{tree}}"), format!("{c2}:f7")],
+        );
+        let dropped: Vec<_> = base
+            .iter()
+            .filter(|pack| !stays.contains(pack))
+            .cloned()
+            .collect();
+        want.extend(packed_objects(&cas, &dropped).difference(&old_f7).cloned());
+        assert_eq!(built, want);
+
+        // Disjoint and complete: every pack is read for the worktree.
+        let kept_objects = packed_objects(&cas, &rebased[..kept]);
+        assert!(built.is_disjoint(&kept_objects));
+        let mut closure: Vec<String> = vec![c2.clone(), format!("{c2}^{{tree}}")];
+        closure.extend(names.iter().map(|name| format!("{c2}:{name}")));
+        let all: BTreeSet<String> = built.union(&kept_objects).cloned().collect();
+        assert!(rev_parse(tmp.path(), &closure).is_subset(&all));
     }
 }

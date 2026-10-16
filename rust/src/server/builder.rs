@@ -969,9 +969,9 @@ fn manifest_pack_tuples(manifest: &ClonepackManifest) -> Result<Vec<(String, u64
 
 /// Build and upload the Full result: the Head packs plus history levels.
 /// When the Head levels have reached `RIPCLONE_HEAD_REBASE_BYTES`, the Head
-/// packs are first compacted into a fresh base for `commit`. Full uses the
-/// compact packs and records them as `head_base`, so later Heads add levels on
-/// it. The published Head result never changes. A cold history build packs
+/// packs are first rebased into a fresh base for `commit` (see
+/// [`PackBuilder::rebase_head_packs`]). Full uses the rebased packs and
+/// records them as `head_base`, so later Heads add levels on it. The published Head result never changes. A cold history build packs
 /// the whole history as level 0: on the first Full, and when the tail from
 /// the sealed tip cannot be listed.
 #[allow(clippy::too_many_arguments)]
@@ -1068,24 +1068,51 @@ pub(super) async fn build_full_result(
     Cancel::check_current()?;
     if level_packs > 0 && (delta_bytes >= rebase_bytes || level_packs > MAX_HEAD_LEVEL_PACKS) {
         let start = Instant::now();
-        let compact_mirror = mirror_dir.to_path_buf();
-        let compact_cas = cas.clone();
-        let compact_commit = commit.to_string();
-        let compact_packs = cancel::spawn_blocking(move || {
-            PackBuilder::new(&compact_mirror, &compact_cas)
-                .build_head_packs(&compact_commit, 4 * 1024 * 1024)
+        let (rm, rc, rs, rcommit) = (
+            mirror_dir.to_path_buf(),
+            cas.clone(),
+            storage.clone(),
+            commit.to_string(),
+        );
+        let base_count = head.base_packs.len().min(head_packs.len());
+        let current = head_packs.clone();
+        let (compact_packs, kept) = cancel::spawn_blocking(move || {
+            let builder = PackBuilder::new(&rm, &rc);
+            // Packs whose idx files cannot be read are packed again whole.
+            let idx: Vec<&str> = current[..base_count]
+                .iter()
+                .map(|(_, _, idx, _)| idx.as_str())
+                .collect();
+            match get_all_cached(&rc, &rs, &idx) {
+                Ok(idx) => {
+                    let base: Vec<_> = current[..base_count].iter().cloned().zip(idx).collect();
+                    builder.rebase_head_packs(&rcommit, &base, 4 * 1024 * 1024)
+                }
+                Err(error) => {
+                    warn!("Head base idx files unreadable ({error:#}); packing a full base");
+                    Ok((builder.build_head_packs(&rcommit, 4 * 1024 * 1024)?, 0))
+                }
+            }
         })
         .await
         .context("compact Head packs")??;
-        for (pack, _, idx, _) in &compact_packs {
+        for (pack, _, idx, _) in &compact_packs[kept..] {
             uploads.start_all([pack, idx]);
         }
+        let built_bytes: u64 = compact_packs[kept..]
+            .iter()
+            .map(|(_, len, _, _)| *len)
+            .sum();
         info!(
-            "compacted Head packs for {}@{} ({} MiB delta -> {} packs)",
+            "compacted Head packs for {}@{} ({} MiB in levels; kept {} of {} base packs, \
+             packed {} MiB in {} new)",
             repo_id.storage_key(),
             &commit[..7.min(commit.len())],
             delta_bytes / (1024 * 1024),
-            compact_packs.len()
+            kept,
+            base_count,
+            built_bytes / (1024 * 1024),
+            compact_packs.len() - kept
         );
         head_base = Some(crate::HeadBase {
             commit: commit.to_string(),
