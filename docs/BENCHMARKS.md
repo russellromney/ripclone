@@ -2,8 +2,10 @@
 
 Full results behind the summary table in the [README](../README.md#performance).
 
-Measured on Hetzner Cloud on 2026-10-14 with the current release code. To
-reproduce, see [`benchmark/README.md`](../benchmark/README.md).
+Measured on Hetzner Cloud. Clone and single-build times are from 2026-10-14;
+build load is from 2026-10-15. To reproduce, see
+[`benchmark/README.md`](../benchmark/README.md) and
+[`benchmark/load/README.md`](../benchmark/load/README.md).
 
 ## Setup
 
@@ -97,20 +99,61 @@ Cold, the first build of a repository, in seconds:
 A cold build is mostly the first fetch of the repository's history. Here that
 came from a local mirror; from GitHub it takes as long as a full `git clone`.
 
-Incremental, Linux, in seconds. Push C2 was 51 commits after the cold commit,
-and push C3 48 commits after C2, arriving 9 s after C2:
+After the first build, each output builds from the newest ready ancestor's,
+so a push costs only what changed. Under the steady load below, the median
+time from push to ready was, in seconds:
 
-| | Head | Files | Full |
+| repo | Head | Files | Full |
 |---|---|---|---|
-| C2 | 6.1 | 16.2 | 240 |
-| C3 | 4.6 | 16.2 | 316 |
+| `pandas-dev/pandas` | 1.8 | 3.5 | 5.3 |
+| `torvalds/linux` | 3.7 | 7.2 | 17.9 |
 
 Head and Files for a new push don't wait for an earlier push's Full. A
-repository's Fulls run one at a time, in the order its commits were admitted,
-so C3's Full starts when C2's finishes and takes 85 s on top of it. While a
-commit's Full is pending, a full clone of it uses the latest ready Full and
-fetches the remaining commits from upstream with the user's own git, so the
+repository's Fulls run one at a time, in the order its commits were admitted.
+While a commit's Full is pending, a full clone of it uses the latest ready Full
+and fetches the remaining commits from upstream with the user's own git, so the
 clone doesn't wait.
+
+## Build load
+
+How the server keeps up when many repositories push at once. One server on a
+Hetzner ccx33 (8 dedicated cores, 32 GB) with Tigris storage built 11 real
+repositories: express, react, cargo, bun, pandas, vscode, kubernetes, godot,
+rust, nixpkgs and linux. A second machine ran a real clone every 10 s
+throughout. The workload had three phases:
+
+- **cold:** all 11 repositories added at once;
+- **steady:** 132 pushes of real upstream commits, round-robin, one every 6 s;
+- **storm:** 44 pushes at once, 4 per repository.
+
+The table compares the release before incremental bases (`1462be1`) with the
+current server (`2d156cc`), on the same machine and workload. Times are from
+push to ready, in seconds. rust-lang/rust is left out of the comparison
+because every build of it failed on `1462be1`: its submodule broke Head.
+
+| | `1462be1` | `2d156cc` |
+|---|---|---|
+| steady, Head p50 | 6.3 | 2.9 |
+| steady, Files p90 | 33 | 7.8 |
+| steady, Full p50 | 2406 | 8.8 |
+| steady, Full p90 | 3872 | 17.6 |
+| storm, all 44 pushes ready | 1800 | 173 |
+| cold, all 11 repositories ready | 1731 | 1214 |
+| disk written | 562 GB | 32 GB |
+| uploaded to storage | 286 GB | 42 GB |
+| failed builds | every rust build, 3 vscode | 0 |
+| failed clones during the run | 1 of 657 | 0 of 90 |
+| API p99, ms | 6 | 13 |
+
+On `2d156cc` the steady pushes cost, on average, 2.0 s of Head, 2.3 s of
+Files and 3.4 s of Full build time, and the CPU was 15% busy. On `1462be1`
+each Linux push rebuilt Full from scratch: about 7 minutes and a new 6.7 GB
+upload per push, with every other repository's Full queued behind it.
+
+The cold phase is mostly the first fetch: about 600 s each for Linux and
+nixpkgs from local test mirrors that had no reachability bitmaps, so the
+mirror had to enumerate every object. GitHub serves from bitmaps.
+`2d156cc` ran with one Full slot; the default is now two on 8 cores.
 
 ## Why ripclone is faster
 

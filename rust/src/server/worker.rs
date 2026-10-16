@@ -75,9 +75,10 @@ impl WorkerSettings {
     /// cores, at least 2. A Files build after the first reads and compresses
     /// only changed bytes and waits on uploads, so it gets as many slots as
     /// Head; one slow repo's Files then does not hold back every other
-    /// repo's. Full runs multi-threaded `pack-objects` on all cores, so an
-    /// eighth, at least 1. A repo holds at most one slot of each pool, so more
-    /// slots only help when more repos build at once.
+    /// repo's. An incremental Full packs only the commits since its base and
+    /// spends most of its time on uploads, so it gets as many slots as Head
+    /// too. A repo holds at most one slot of each pool, so more slots only
+    /// help when more repos build at once.
     fn from_lookup(get: impl Fn(&str) -> Option<String>, cores: usize) -> Result<Self> {
         let number = |key: &str, default: usize| -> Result<u64> {
             crate::env::parse_number(key, get(key).as_deref(), default as u64)
@@ -85,7 +86,7 @@ impl WorkerSettings {
         let head_slots = number("RIPCLONE_HEAD_SLOTS", (cores / 4).max(2))?;
         anyhow::ensure!(head_slots >= 1, "RIPCLONE_HEAD_SLOTS must be at least 1");
         let files_slots = number("RIPCLONE_FILES_SLOTS", (cores / 4).max(2))?;
-        let full_slots = number("RIPCLONE_FULL_SLOTS", (cores / 8).max(1))?;
+        let full_slots = number("RIPCLONE_FULL_SLOTS", (cores / 4).max(2))?;
         let retry_base = number("RIPCLONE_BUILD_RETRY_BASE_MS", 2000)?;
         let max_attempts = number("RIPCLONE_BUILD_MAX_ATTEMPTS", 5)?;
         anyhow::ensure!(
@@ -844,16 +845,16 @@ mod tests {
             WorkerSettings {
                 head_slots: 2,
                 files_slots: 2,
-                full_slots: 1,
+                full_slots: 2,
                 retry_base: Duration::from_millis(2000),
                 max_attempts: 5,
             }
         );
-        for (cores, head, full) in [(1, 2, 1), (16, 4, 2), (64, 16, 8)] {
+        for (cores, slots) in [(1, 2), (16, 4), (64, 16)] {
             let scaled = WorkerSettings::from_lookup(|_| None, cores).unwrap();
             assert_eq!(
                 (scaled.head_slots, scaled.files_slots, scaled.full_slots),
-                (head, head, full),
+                (slots, slots, slots),
                 "{cores} cores"
             );
         }
