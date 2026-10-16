@@ -24,11 +24,12 @@ use tracing::{info, warn};
 
 /// Step timings of one Files or Full build, logged when it ends as one line:
 /// `build-phases kind=<files|full> repo=<key> commit=<short> outcome=<ready|failed>`
-/// followed by a `<step>_ms=<n>` pair for each step that ran, in order, and
-/// `total_ms=<n>`.
+/// followed by a `<step>_ms=<n>` pair for each step that ran, in order,
+/// `total_ms=<n>`, and a `<name>_bytes=<n>` pair for each size recorded.
 #[derive(Debug, Default)]
 pub(super) struct BuildPhases {
     steps: Vec<(&'static str, u64)>,
+    sizes: Vec<(&'static str, u64)>,
 }
 
 impl BuildPhases {
@@ -43,6 +44,11 @@ impl BuildPhases {
             Some((_, total)) => *total = total.saturating_add(ms),
             None => self.steps.push((step, ms)),
         }
+    }
+
+    /// Record `name` as `bytes` long, such as the bytes a step wrote.
+    pub(super) fn size(&mut self, name: &'static str, bytes: u64) {
+        self.sizes.push((name, bytes));
     }
 
     pub(super) fn report(
@@ -65,6 +71,9 @@ impl BuildPhases {
             let _ = write!(line, " {step}_ms={ms}");
         }
         let _ = write!(line, " total_ms={}", duration_ms(started.elapsed()));
+        for (name, bytes) in &self.sizes {
+            let _ = write!(line, " {name}_bytes={bytes}");
+        }
         info!("{line}");
     }
 }
@@ -85,6 +94,16 @@ pub struct SyncPhases {
     pub ref_publish_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish_head_ms: Option<u64>,
+    /// Bytes of the Head packs this sync built: the delta since the base,
+    /// or the whole base on a cold sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_packs_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_metadata_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_idx_bundle_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_head_bytes: Option<u64>,
 }
 
 impl From<&SyncPhases> for SyncPhaseMetrics {
@@ -602,8 +621,15 @@ pub(super) async fn build_head_result(
         parent.clone(),
     );
     let (fpacks, all_built) = (head_packs.clone(), head_built.all_local);
-    let (shallow_metadata_hash, shallow_clonepack_hash, head_idx_bundle_hash, head_midx_hash) =
-        cancel::spawn_blocking(move || -> Result<(String, String, String, String)> {
+    let (
+        shallow_metadata_hash,
+        shallow_clonepack_hash,
+        head_idx_bundle_hash,
+        head_midx_hash,
+        head_metadata_len,
+        head_idx_bundle_len,
+    ) = cancel::spawn_blocking(
+        move || -> Result<(String, String, String, String, u64, u64)> {
             let (cas, storage) = (&fc, &fs);
             let mut shallow_meta = metadata_base;
             shallow_meta.prebuilt_index = shallow_prebuilt_index;
@@ -614,6 +640,7 @@ pub(super) async fn build_head_result(
             let archive_chunks = archive_chunk_refs(&[], &shallow_meta)?;
             let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
                 assemble_head_packs(cas, storage, &fpacks)?;
+            let idx_bundle_len = head_idx_bundle_ref.as_ref().map_or(0, |r| r.len);
             Cancel::check_current()?;
             // Ship the head MIDX only on a cold full base (all pack bytes still
             // local). On a delta re-sync the base packs may be absent from local
@@ -641,10 +668,22 @@ pub(super) async fn build_head_result(
                 shallow_clonepack_hash,
                 head_idx_bundle_hash,
                 head_midx_hash,
+                shallow_meta_data.len() as u64,
+                idx_bundle_len,
             ))
-        })
-        .await
-        .context("Head manifest task")??;
+        },
+    )
+    .await
+    .context("Head manifest task")??;
+    phases.head_metadata_bytes = Some(head_metadata_len);
+    phases.head_idx_bundle_bytes = Some(head_idx_bundle_len);
+    phases.head_packs_bytes = Some(
+        head_built
+            .new_built
+            .iter()
+            .map(|(_, pack_len, _, idx_len)| pack_len + idx_len)
+            .sum(),
+    );
 
     let head = crate::HeadResult {
         clonepack: crate::ClonepackArtifacts {
@@ -688,6 +727,7 @@ pub(super) async fn build_head_result(
     let upload_start = Instant::now();
     uploads.start_all(&head_uploads);
     let uploaded = uploads.finish().await?;
+    phases.upload_head_bytes = Some(uploads.bytes());
     settle_storage(cas, storage, uploaded, head_idx_keep).await;
     phases.upload_head_ms = Some(duration_ms(upload_start.elapsed()));
 
@@ -1049,6 +1089,11 @@ pub(super) async fn build_full_result(
         .collect();
     let start = Instant::now();
     let uploaded = uploads.finish().await?;
+    phases.size(
+        "history",
+        new_history.iter().map(|(_, p, _, i)| p + i).sum(),
+    );
+    phases.size("upload", uploads.bytes());
     settle_storage(cas, storage, uploaded, keep_idx).await;
     phases.record("upload", start);
 
@@ -1122,6 +1167,7 @@ pub(super) async fn build_files_result(
     .context("Files archive task")??;
     phases.record("archive", start);
     info!("Files archive {:?}", archive_output.reuse);
+    phases.size("read", archive_output.reuse.bytes_read);
 
     Cancel::check_current()?;
     let start = Instant::now();
@@ -1129,26 +1175,28 @@ pub(super) async fn build_files_result(
     let metadata = archive_output.metadata;
     let (fc, fcommit, fparent) = (cas.clone(), commit.to_string(), parent);
     let fchunks = archive_chunk_hashes.clone();
-    let (metadata_hash, manifest_hash) = cancel::spawn_blocking(move || -> Result<_> {
-        let metadata_bytes = metadata.encode_stored()?;
-        let metadata_hash = fc.put(&metadata_bytes)?;
-        let archive_chunks = archive_chunk_refs(&fchunks, &metadata)?;
-        let manifest = make_manifest(
-            &fcommit,
-            &fparent,
-            &archive_chunks,
-            &metadata_hash,
-            metadata_bytes.len() as u64,
-            Vec::new(),
-            None,
-            None,
-        )?;
-        let manifest_hash = fc.put(&manifest.encode_to_vec())?;
-        Ok((metadata_hash, manifest_hash))
-    })
-    .await
-    .context("Files manifest task")??;
+    let (metadata_hash, manifest_hash, metadata_len) =
+        cancel::spawn_blocking(move || -> Result<_> {
+            let metadata_bytes = metadata.encode_stored()?;
+            let metadata_hash = fc.put(&metadata_bytes)?;
+            let archive_chunks = archive_chunk_refs(&fchunks, &metadata)?;
+            let manifest = make_manifest(
+                &fcommit,
+                &fparent,
+                &archive_chunks,
+                &metadata_hash,
+                metadata_bytes.len() as u64,
+                Vec::new(),
+                None,
+                None,
+            )?;
+            let manifest_hash = fc.put(&manifest.encode_to_vec())?;
+            Ok((metadata_hash, manifest_hash, metadata_bytes.len() as u64))
+        })
+        .await
+        .context("Files manifest task")??;
     phases.record("manifest", start);
+    phases.size("metadata", metadata_len);
 
     // Reused bundles are the base's, already durable.
     let mut publish_uploads = vec![metadata_hash.clone(), manifest_hash.clone()];
@@ -1156,6 +1204,7 @@ pub(super) async fn build_files_result(
     let start = Instant::now();
     uploads.start_all(&publish_uploads);
     let uploaded = uploads.finish().await?;
+    phases.size("upload", uploads.bytes());
     let keep = archive_chunk_hashes
         .iter()
         .cloned()
