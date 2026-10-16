@@ -339,11 +339,18 @@ fn j5_unrelated_branch_builds_cold() {
 }
 
 /// A depth-1 clone of `commit` is exact: HEAD, tree, clean status, fsck.
-fn depth_one_exact(world: &World, server: &Server, origin: &Origin, name: &str, commit: &str) {
+fn depth_one_exact(
+    world: &World,
+    server: &Server,
+    origin: &Origin,
+    repo: &str,
+    name: &str,
+    commit: &str,
+) {
     let target = world.target(name);
     let argv = [
         "clone",
-        "acme/j6",
+        repo,
         target.to_str().unwrap(),
         "--depth",
         "1",
@@ -381,7 +388,14 @@ fn j6_head_levels_then_rebase() {
         let tip = origin.commit(&[], what);
         origin.publish();
         sync_one(&world, &server, "acme/j6", &[], &tip);
-        depth_one_exact(&world, &server, &origin, &format!("j6-{}", &tip[..7]), &tip);
+        depth_one_exact(
+            &world,
+            &server,
+            &origin,
+            "acme/j6",
+            &format!("j6-{}", &tip[..7]),
+            &tip,
+        );
         packs(&server, "acme/j6", &tip)
     };
     let level_bytes = |prev: &Packs, built: &Packs| -> u64 {
@@ -457,4 +471,86 @@ fn j6_head_levels_then_rebase() {
         "{}",
         server.log()
     );
+}
+
+/// J7: a rebase keeps the base packs whose objects the new commit still
+/// uses and packs only the rest, so a push that edits one small file does
+/// not upload the large unchanged ones again. A pack that holds a replaced
+/// large file is dropped from the next base. Every depth-1 clone is exact.
+#[test]
+fn j7_rebase_keeps_unchanged_base_packs() {
+    let world = World::new();
+    let origin = world.origin("acme", "j7");
+    let write = |path: &str, bytes: &[u8]| std::fs::write(origin.work.join(path), bytes).unwrap();
+    // Two incompressible 3 MiB files: each fills its own 4 MiB Head pack.
+    write("a.bin", &crate::downloads::noise(1, 3 << 20));
+    write("b.bin", &crate::downloads::noise(2, 3 << 20));
+    let a = origin.commit(&[("small.txt", "a\n")], "A");
+    origin.publish();
+    // Every Head level is past the limit, so every Full rebases.
+    let server = world.server(&[("RIPCLONE_HEAD_REBASE_BYTES", "1")]);
+    world.cli(&server, &["add", "acme/j7", "--wait"]).ok();
+    let large = |packs: &Packs| -> BTreeMap<String, u64> {
+        packs
+            .head
+            .iter()
+            .filter(|(_, len)| **len > 2 << 20)
+            .map(|(hash, len)| (hash.clone(), *len))
+            .collect()
+    };
+    let base = large(&packs(&server, "acme/j7", &a));
+    assert_eq!(base.len(), 2, "{base:?}");
+    let push = |what: &str| {
+        let tip = origin.commit(&[], what);
+        origin.publish();
+        sync_one(&world, &server, "acme/j7", &[], &tip);
+        depth_one_exact(
+            &world,
+            &server,
+            &origin,
+            "acme/j7",
+            &format!("j7-{}", &tip[..7]),
+            &tip,
+        );
+        tip
+    };
+
+    // B edits the small file; Full(B) rebases. C's Head is a level on that
+    // base: it still has both large packs, and the rebase uploaded only
+    // small packs.
+    write("small.txt", b"b\n");
+    let b = push("B: edit");
+    assert!(
+        server.log().contains(&format!(
+            "compacted Head packs for github/acme%2Fj7@{}",
+            &b[..7]
+        )),
+        "{}",
+        server.log()
+    );
+    write("small.txt", b"c\n");
+    let c = push("C: edit");
+    let on_b = packs(&server, "acme/j7", &c);
+    assert_eq!(large(&on_b), base, "C's Head lost a large pack");
+    let rebase = server
+        .log()
+        .lines()
+        .find(|line| line.contains(&format!("@{} (", &b[..7])) && line.contains("compacted"))
+        .unwrap()
+        .to_string();
+    assert!(rebase.contains("kept 2 of"), "{rebase}");
+    assert!(rebase.contains("packed 0 MiB"), "{rebase}");
+
+    // D replaces a.bin: the next base drops a.bin's pack and keeps b.bin's.
+    write("a.bin", &crate::downloads::noise(3, 3 << 20));
+    push("D: replace a.bin");
+    write("small.txt", b"e\n");
+    let e = push("E: edit");
+    let on_d = large(&packs(&server, "acme/j7", &e));
+    let kept: Vec<_> = base
+        .keys()
+        .filter(|hash| on_d.contains_key(*hash))
+        .collect();
+    assert_eq!(kept.len(), 1, "{on_d:?} on {base:?}");
+    assert_eq!(on_d.len(), 2, "{on_d:?}");
 }

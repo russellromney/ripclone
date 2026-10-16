@@ -89,7 +89,7 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
 | `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per output before it fails, default 5. Head, Files and Full each count their own. At least 1. |
 | `RIPCLONE_LSM_MAX_LEVELS` | Most history levels a Full keeps before merging the smallest neighbors, default 16. |
-| `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head levels past their base reach this size, a quarter of the base, or 64 packs, its Full build compacts them into a new base for later Heads. Default 128 MiB. |
+| `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head levels past their base reach this size, a quarter of the base, or 64 packs, its Full build rebases: base packs that are still at least 90% live are kept, and the rest is packed into the new base for later Heads. Default 128 MiB. |
 | `RIPCLONE_FILES_TAIL_PERCENT` | How far, in percent, a Files archive with tail chunks may grow past its compact form before a push builds it compact again. Default 25. |
 | `RIPCLONE_ORIGIN_BASE` | Fetch repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. For mirrors and tests. |
 | `RIPCLONE_BENCH` | Log a JSON timing report for each build. |
