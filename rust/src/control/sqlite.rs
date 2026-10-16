@@ -91,7 +91,10 @@ impl SqliteControlStore {
             .close()
             .await
             .context("close control database setup connection")?;
-        let pool = SqlitePool::connect_with(options)
+        // The file exists now. A pool connection opened after it is deleted
+        // must fail, not create an empty database that readiness would then
+        // report as a replacement.
+        let pool = SqlitePool::connect_with(options.create_if_missing(false))
             .await
             .with_context(|| format!("open control database {}", path.display()))?;
         let file =
@@ -820,6 +823,25 @@ mod tests {
 
         std::fs::rename(&moved, &path).unwrap();
         store.health().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_pool_never_recreates_a_deleted_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let store = open(&path).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // Hold more connections than the pool has open, so it opens new ones.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            if let Ok(connection) = store.pool().acquire().await {
+                held.push(connection);
+            }
+        }
+        assert!(!path.exists(), "the pool created a fresh control database");
+        drop(held);
+        let error = store.health().await.unwrap_err().to_string();
+        assert!(error.contains("was deleted"), "{error}");
     }
 
     #[tokio::test]
