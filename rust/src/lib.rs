@@ -174,9 +174,6 @@ pub struct ArchiveFrame {
 pub struct ClonepackArtifacts {
     pub manifest: String,
     pub metadata_chunk: String,
-    pub skeleton_pack: String,
-    pub skeleton_idx: String,
-    pub prebuilt_index: String,
     /// CAS hash of the pre-built multi-pack-index over this variant's packs.
     pub midx: String,
     /// CAS hash of the concatenated idx bundle of a Head's packs. Empty for
@@ -259,16 +256,7 @@ pub(crate) fn exact_output_artifacts_ready(
         return false;
     }
 
-    let skeleton = || {
-        valid_hash(&artifacts.skeleton_pack)
-            && valid_hash(&artifacts.skeleton_idx)
-            && valid_hash(&artifacts.prebuilt_index)
-    };
-    match result {
-        ExactResultKind::Head => skeleton() && valid_hash(&artifacts.idx_bundle),
-        ExactResultKind::Full => skeleton(),
-        ExactResultKind::Files => true,
-    }
+    result != ExactResultKind::Head || valid_hash(&artifacts.idx_bundle)
 }
 
 pub(crate) fn exact_output_ready(info: &RefInfo, result: ExactResultKind, commit: &str) -> bool {
