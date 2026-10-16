@@ -195,6 +195,10 @@ pub struct HeadResult {
     pub base_commit: String,
     #[serde(default)]
     pub base_packs: Vec<SizedPack>,
+    /// The packs after the base: one level per Head since the base, each
+    /// holding only the objects no earlier Head pack has.
+    #[serde(default)]
+    pub levels: Vec<SizedPack>,
 }
 
 /// Published Full artifacts for one exact commit.
@@ -205,19 +209,22 @@ pub struct FullResult {
     pub packs: Vec<PackArtifact>,
     #[serde(default)]
     pub history_levels: Vec<HistoryLevel>,
-    /// Compacted Head packs for this commit, written when its Head delta grew
-    /// past `RIPCLONE_HEAD_REBASE_BYTES`. A child's Head builds its delta
-    /// against these instead of the parent Head's base.
+    /// Compacted Head packs for this commit, written when its Head levels grew
+    /// past `RIPCLONE_HEAD_REBASE_BYTES`. A child's Head adds its level on
+    /// these instead of the parent Head's packs.
     #[serde(default)]
     pub head_base: Option<HeadBase>,
 }
 
-/// A Head pack set that later Heads build deltas against. Lengths are kept so
+/// A Head pack set that later Heads add levels on. Lengths are kept so
 /// a manifest can list the packs without reading them.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HeadBase {
     pub commit: String,
     pub packs: Vec<SizedPack>,
+    /// Levels on top of `packs`, which a child's Head keeps and adds one to.
+    #[serde(default)]
+    pub levels: Vec<SizedPack>,
 }
 
 /// Published Files artifacts for one exact commit.

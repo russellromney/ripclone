@@ -64,53 +64,39 @@ impl<'a> PackBuilder<'a> {
         self.build_packs_from_oids(&head_oids, head_target_raw_bytes)
     }
 
-    /// Build a HEAD-closure *delta* pack against a base commit: only the depth-1
-    /// objects present at `commit` but not at `base_commit`. The base packs
-    /// (closure of `base_commit`) stay immutable; this packs just the difference
-    /// (for a few changed files, the changed blobs + the trees from root to leaf —
-    /// a handful of objects), so the depth=1 payload becomes O(diff-from-base)
-    /// instead of O(worktree).
+    /// Build a Head *level*: the depth-1 objects of `commit` that are not in
+    /// `have`, the objects of the Head packs it builds on (from their idx
+    /// files, see [`idx_object_ids`]). Each push adds one small level, its
+    /// changed blobs and the trees from root to leaf, instead of packing again
+    /// everything new since the base.
     ///
-    /// The delta is the **set difference of the two depth-1 closures**, NOT a
-    /// reachability exclude (`rev-list HEAD ^base`). Two properties matter:
-    /// - **Disjoint:** `delta ∩ closure(base) = ∅` by construction, so no object
-    ///   is ever in both the base and the delta. The client materializes the
-    ///   worktree by writing each blob it finds in a HEAD pack, so a blob present
-    ///   in two packs would be written (and counted) twice.
-    /// - **Re-add safe:** a blob removed after `base_commit` and re-added
-    ///   identically at `commit` is reachable from `base_commit`'s tip tree, so it
-    ///   is already in the base and correctly excluded from the delta — present
-    ///   exactly once. A reachability-exclude (`^base`) would instead drop a blob
-    ///   reachable only from `base`'s history, corrupting the worktree.
+    /// - **Disjoint:** no object of the level is in `have`, so no object is
+    ///   in two Head packs. The client materializes the worktree by writing
+    ///   each blob it finds in a Head pack, so a blob in two packs would be
+    ///   written twice.
+    /// - **Complete:** `have ∪ level ⊇ closure(commit)`, whatever `have` holds:
+    ///   a blob deleted and re-added identically is still in an earlier pack.
     ///
-    /// `base ∪ delta = closure(base) ∪ (closure(HEAD) − closure(base)) ⊇
-    /// closure(HEAD)`, so every object the worktree needs is present. Listing each
-    /// closure is cheap (`rev-list --objects`, no content); only the small
-    /// difference is packed (undeltified, so the client hand-parses blobs).
-    /// Returns the freshly built delta packs (manifest order); these are also the
-    /// only packs to upload.
-    pub fn build_head_delta_pack(
+    /// Objects in `have` that `commit` no longer uses stay in their packs
+    /// until a rebase packs a new base. Listing the closure is cheap
+    /// (`rev-list --objects`, no content); only the level is packed,
+    /// undeltified, so the client hand-parses blobs. Returns the new packs in
+    /// manifest order; these are the only packs to upload.
+    pub fn build_head_level(
         &self,
         commit: &str,
-        base_commit: &str,
+        have: &HashSet<String>,
         head_target_raw_bytes: u64,
     ) -> Result<Vec<(String, u64, String, u64)>> {
         let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
         if head_oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
-        let base_oids: HashSet<String> =
-            git::list_object_shas_with_depth(&self.repo, base_commit, Some(1))?
-                .into_iter()
-                .collect();
-        let delta_oids: Vec<String> = head_oids
+        let level: Vec<String> = head_oids
             .into_iter()
-            .filter(|o| !base_oids.contains(o))
+            .filter(|o| !have.contains(o))
             .collect();
-        if delta_oids.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.build_packs_from_oids(&delta_oids, head_target_raw_bytes)
+        self.build_packs_from_oids(&level, head_target_raw_bytes)
     }
 
     /// Build only the deltified *tail*: objects introduced in `(sealed_tip,
@@ -330,6 +316,21 @@ impl<'a> PackBuilder<'a> {
     }
 }
 
+/// The object ids, in hex, of a version 2 pack idx.
+pub fn idx_object_ids(idx: &[u8]) -> Result<Vec<String>> {
+    const HEADER: usize = 8;
+    const FANOUT: usize = 256 * 4;
+    anyhow::ensure!(
+        idx.len() >= HEADER + FANOUT && idx[..HEADER] == [0xff, b't', b'O', b'c', 0, 0, 0, 2],
+        "not a version 2 pack idx"
+    );
+    let count = u32::from_be_bytes(idx[HEADER + FANOUT - 4..HEADER + FANOUT].try_into()?) as usize;
+    let names = idx
+        .get(HEADER + FANOUT..HEADER + FANOUT + count * 20)
+        .context("pack idx is shorter than its object count")?;
+    Ok(names.chunks_exact(20).map(hex::encode).collect())
+}
+
 #[cfg(test)]
 mod lsm_incremental_tests;
 
@@ -388,7 +389,7 @@ mod tests {
     /// already has (here a blob restored to its base content) is not packed
     /// again.
     #[test]
-    fn head_delta_pack_is_minimal() {
+    fn head_levels_hold_only_new_objects() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = crate::test_fixture::init_bare(tmp.path());
         let cas_dir = tempfile::tempdir().unwrap();
@@ -409,23 +410,51 @@ mod tests {
         c1_objects.extend(base_files.iter().map(|(name, _)| format!("{c1}:{name}")));
         assert_eq!(base, rev_parse(tmp.path(), &c1_objects));
 
-        // c2 changes b: the delta is c2, its root tree, and the new blob.
+        // Each level is the objects of its commit's closure that no earlier
+        // pack has, and the idx parser lists exactly a pack's objects.
+        let mut packs = pb.build_head_packs(&c1, target).unwrap();
+        let mut level = |files: &[(&str, &[u8])]| {
+            let commit = commit_onto(&repo, files);
+            let mut have = HashSet::new();
+            for (_, _, idx, _) in &packs {
+                let ids = idx_object_ids(&cas.get(idx).unwrap()).unwrap();
+                assert_eq!(
+                    ids.iter().cloned().collect::<BTreeSet<_>>(),
+                    packed_objects(&cas, &[("".into(), 0, idx.clone(), 0)])
+                );
+                have.extend(ids);
+            }
+            let built = pb.build_head_level(&commit, &have, target).unwrap();
+            packs.extend(built.iter().cloned());
+            (commit, packed_objects(&cas, &built))
+        };
+
+        // c2 changes b: the level is c2, its root tree, and the new blob.
         let mut c2_files = base_files.clone();
         c2_files[1] = ("b", b"bbb-CHANGED");
-        let c2 = commit_onto(&repo, &c2_files);
-        let delta = pb.build_head_delta_pack(&c2, &c1, target).unwrap();
+        let (c2, got) = level(&c2_files);
         let want = [c2.clone(), format!("{c2}^{{tree}}"), format!("{c2}:b")];
-        assert_eq!(packed_objects(&cas, &delta), rev_parse(tmp.path(), &want));
+        assert_eq!(got, rev_parse(tmp.path(), &want));
 
-        // c3 restores b to its base content and adds g. Against the base c1,
-        // the delta is c3, its root tree, and g; the restored blob is in the
-        // base packs only.
+        // c3 restores b to its base content and adds g: the restored blob is
+        // in the base packs only.
         let mut c3_files = base_files.clone();
         c3_files.push(("g", b"ggg"));
-        let c3 = commit_onto(&repo, &c3_files);
-        let delta = packed_objects(&cas, &pb.build_head_delta_pack(&c3, &c1, target).unwrap());
+        let (c3, got) = level(&c3_files);
         let want = [c3.clone(), format!("{c3}^{{tree}}"), format!("{c3}:g")];
-        assert_eq!(delta, rev_parse(tmp.path(), &want));
-        assert!(delta.is_disjoint(&base));
+        assert_eq!(got, rev_parse(tmp.path(), &want));
+        assert!(got.is_disjoint(&base));
+
+        // c4 brings back c2's b: that blob is in c2's level, not packed again.
+        let mut c4_files = c3_files.clone();
+        c4_files[1] = ("b", b"bbb-CHANGED");
+        let (c4, got) = level(&c4_files);
+        assert_eq!(
+            got,
+            rev_parse(tmp.path(), &[c4.clone(), format!("{c4}^{{tree}}")])
+        );
+
+        // A corrupt idx is refused.
+        assert!(idx_object_ids(b"not an idx").is_err());
     }
 }

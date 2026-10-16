@@ -337,3 +337,124 @@ fn j5_unrelated_branch_builds_cold() {
     );
     assert!(!has_commit(&world.target("j5-full"), &a));
 }
+
+/// A depth-1 clone of `commit` is exact: HEAD, tree, clean status, fsck.
+fn depth_one_exact(world: &World, server: &Server, origin: &Origin, name: &str, commit: &str) {
+    let target = world.target(name);
+    let argv = [
+        "clone",
+        "acme/j6",
+        target.to_str().unwrap(),
+        "--depth",
+        "1",
+        "--at",
+        commit,
+    ];
+    world.cli(server, &argv).ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), commit, "{name}");
+    assert_eq!(listing(&target), origin.tree(commit), "{name}");
+    assert_eq!(git(&target, &["status", "--porcelain"]), "", "{name}");
+    git(&target, &["fsck"]);
+}
+
+/// J6: each push adds one Head level: it keeps every pack of the parent's
+/// Head and adds only what no earlier pack has, so a file restored to
+/// earlier bytes adds no blob. Replaced files stay in earlier levels until
+/// the levels pass a quarter of the base; then Full packs a new base and
+/// the next Head is that base plus one level, about the tree's size. When
+/// a parent pack's idx is lost from storage, the next Head packs a new base
+/// instead. Every depth-1 clone is exact.
+#[test]
+fn j6_head_levels_then_rebase() {
+    let world = World::new();
+    let origin = world.origin("acme", "j6");
+    let write = |path: &str, bytes: &[u8]| std::fs::write(origin.work.join(path), bytes).unwrap();
+    for i in 0..8u64 {
+        write(&format!("f{i}.bin"), &crate::downloads::noise(i, 64 << 10));
+    }
+    let a = origin.commit(&[("small.txt", "a\n")], "A");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/j6", "--wait"]).ok();
+    let mut prev = packs(&server, "acme/j6", &a);
+    let push = |what: &str| {
+        let tip = origin.commit(&[], what);
+        origin.publish();
+        sync_one(&world, &server, "acme/j6", &[], &tip);
+        depth_one_exact(&world, &server, &origin, &format!("j6-{}", &tip[..7]), &tip);
+        packs(&server, "acme/j6", &tip)
+    };
+    let level_bytes = |prev: &Packs, built: &Packs| -> u64 {
+        added(
+            &prev.head,
+            &built.head,
+            &format!("Head {}", &built.commit[..7]),
+        )
+        .iter()
+        .sum()
+    };
+
+    // A one-line edit adds a small level and keeps every earlier pack.
+    write("small.txt", b"b\n");
+    let b = push("B: edit");
+    assert!(level_bytes(&prev, &b) < 4 << 10, "{:?}", b.head);
+    prev = b;
+
+    // Restoring A's bytes adds the commit and its tree, no blob.
+    write("small.txt", b"a\n");
+    let c = push("C: restore");
+    assert!(level_bytes(&prev, &c) < 1 << 10, "{:?}", c.head);
+    prev = c;
+
+    // Replacing files grows the levels until Full packs a new base.
+    let base_bytes: u64 = packs(&server, "acme/j6", &a).head.values().sum();
+    let mut rebased = None;
+    for i in 0..4u64 {
+        write(
+            &format!("f{i}.bin"),
+            &crate::downloads::noise(100 + i, 64 << 10),
+        );
+        let built = push(&format!("replace f{i}.bin"));
+        let total: u64 = built.head.values().sum();
+        if prev.head.keys().all(|h| built.head.contains_key(h)) {
+            assert!(level_bytes(&prev, &built) < 80 << 10, "{:?}", built.head);
+            assert!(total < base_bytes + base_bytes / 4 + (80 << 10), "{total}");
+        } else {
+            rebased = Some(total);
+            assert!(
+                total < base_bytes + (80 << 10),
+                "{total} on a {base_bytes} base"
+            );
+            prev = built;
+            break;
+        }
+        prev = built;
+    }
+    assert!(rebased.is_some(), "Full never packed a new base");
+
+    // A lost idx of the parent's Head: the next Head packs a new base.
+    let lost = prev.head.keys().next().unwrap().clone();
+    let manifest_head = manifest(&server, "acme/j6", &prev.commit, "head");
+    let idx = manifest_head
+        .packs
+        .iter()
+        .find(|entry| hash_to_hex(&entry.pack.as_ref().unwrap().hash) == lost)
+        .map(|entry| hash_to_hex(&entry.idx.as_ref().unwrap().hash))
+        .unwrap();
+    let cache = world.path("server").join("cache");
+    let removed = server
+        .storage_listing()
+        .into_iter()
+        .filter(|path| path.ends_with(&idx))
+        .map(|path| std::fs::remove_file(cache.join(path)).unwrap())
+        .count();
+    assert_eq!(removed, 1, "idx {idx} in the store");
+    write("small.txt", b"lost\n");
+    let built = push("after a lost idx");
+    assert!(!built.head.contains_key(&lost), "{:?}", built.head);
+    assert!(
+        server.log().contains("packing a full base"),
+        "{}",
+        server.log()
+    );
+}

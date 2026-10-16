@@ -328,7 +328,7 @@ fn c5_later_build_never_changes_published_results() {
     let origin = world.origin("acme", "c5");
     origin.commit(&[("a.txt", "a\n"), ("keep.txt", "keep\n")], "A");
     origin.publish();
-    // Any Head delta compacts, so Full(B) records a new Head base.
+    // Any Head level compacts, so Full(B) records a new Head base.
     let server = world.server(&[("RIPCLONE_HEAD_REBASE_BYTES", "1")]);
     world.cli(&server, &["add", "acme/c5", "--wait"]).ok();
 
@@ -348,7 +348,7 @@ fn c5_later_build_never_changes_published_results() {
     world.cli(&server, &["sync", "acme/c5", "--wait"]).ok();
     wait_all_ready(&server, "acme/c5", &c);
 
-    let base_line = format!("delta vs base {}", &b[..7]);
+    let base_line = format!("level on base {}", &b[..7]);
     assert!(
         server.log().contains(&base_line),
         "Head(C) did not build on Full(B)'s base:\n{}",
@@ -361,7 +361,7 @@ fn c5_later_build_never_changes_published_results() {
         assert!(before.1 == after.1, "{kind} manifest bytes of B changed");
     }
 
-    // C's Head is a delta on the base Full(B) compacted; both clone right.
+    // C's Head is a level on the base Full(B) packed; both clone right.
     for (commit, name) in [(&c, "c5-c"), (&b, "c5-b")] {
         let target = world.target(name);
         world
