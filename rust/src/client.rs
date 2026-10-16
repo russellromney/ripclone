@@ -307,6 +307,9 @@ pub struct RefResponse {
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.
     #[serde(default)]
     pub pack_chunk_urls: Option<Vec<Option<String>>>,
+    /// Signed URL for each history pack's idx, ordered to match `manifest.packs`.
+    #[serde(default)]
+    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
     #[serde(default)]
     pub midx_url: Option<String>,

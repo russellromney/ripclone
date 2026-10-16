@@ -183,6 +183,17 @@ fn j1_multi_commit_push_builds_on_the_last_built_commit() {
     }
 
     assert_built_on(&built_a, &packs(&server, "acme/j1", &c));
+    // A Full stores no idx bundle: its history packs carry their own idx.
+    assert!(
+        manifest(&server, "acme/j1", &c, "head")
+            .idx_bundle
+            .is_some()
+    );
+    assert!(
+        manifest(&server, "acme/j1", &c, "full")
+            .idx_bundle
+            .is_none()
+    );
     let grown = stored_bytes(&world) - stored;
     assert!(grown < DIFF_BUDGET, "C's builds stored {grown} bytes");
     clones_exact(&world, &server, &origin, "j1", &[], &c, "main");

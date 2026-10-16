@@ -51,12 +51,15 @@ message ClonepackManifest {
   // omit it when base packs are no longer local; the client builds that MIDX.
   ChunkRef midx = 12;
 
-  // All pack idx files concatenated into one content-addressed blob. The idx
-  // for `packs[i]` lives at `[packs[i].idx_bundle_offset, +packs[i].idx.len)`.
-  // The client fetches this ONCE and slices each idx out locally, instead of a
-  // separate GET per pack idx — cutting per-pack round-trips from 2 to 1 (a big
-  // win on high-latency links). Each slice is still verified against
-  // `packs[i].idx.hash`. Every current manifest carries this bundle.
+  // A Head's pack idx files concatenated into one content-addressed blob.
+  // The idx for `packs[i]` lives at `[packs[i].idx_bundle_offset,
+  // +packs[i].idx.len)`. The client fetches this ONCE and slices each idx out
+  // locally, instead of a separate GET per small pack idx (a big win on
+  // high-latency links). Each slice is still verified against
+  // `packs[i].idx.hash`. A Full has none: its history packs hold every
+  // object, so a full clone installs only them, fetching each idx by
+  // `packs[i].idx` next to its pack, and reads the HEAD packs only for the
+  // working tree.
   ChunkRef idx_bundle = 13;
 }
 

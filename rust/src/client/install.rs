@@ -626,10 +626,16 @@ impl Client {
     /// Download the packs in parallel and, as each lands, install it into
     /// `pack_dir` and write its blobs into `work_tree`, so download and
     /// extraction overlap. History packs stream to a file; HEAD packs are
-    /// buffered, since extraction reads their bytes directly. Without a
-    /// `pack_dir` only the working tree is written: history packs are not
-    /// downloaded, and no pack, idx, index or multi-pack-index is kept.
-    /// Returns the bytes downloaded.
+    /// buffered, since extraction reads their bytes directly.
+    ///
+    /// A Head installs its HEAD packs with idx files sliced from the idx
+    /// bundle. A Full installs only its history packs, each with its own idx:
+    /// they hold every object, so the HEAD packs only write the working tree,
+    /// and a handful of packs needs no multi-pack-index. Without a `pack_dir`
+    /// only the working tree is written: history packs are not downloaded, and
+    /// no pack, idx, index or multi-pack-index is kept. Downloads run as their
+    /// own tasks, so they keep going while every parse slot is busy. Returns
+    /// the bytes downloaded.
     async fn install_editable_packs(
         &self,
         urls: &OutputUrls,
@@ -644,6 +650,9 @@ impl Client {
         if manifest.packs.is_empty() {
             anyhow::bail!("clonepack has no packs for editable install");
         }
+        let full = manifest.packs.iter().any(|entry| entry.history_only);
+        // Only a Head's `.git` keeps the HEAD packs.
+        let head_pack_dir = pack_dir.filter(|_| !full);
         let fetch = |artifact: Artifact, what: &'static str| {
             let (client, urls) = (self.clone(), urls.clone());
             AbortOnDrop::new(
@@ -653,7 +662,7 @@ impl Client {
                 cleanup.clone(),
             )
         };
-        let idx_bundle_task = match pack_dir {
+        let idx_bundle_task = match head_pack_dir {
             Some(_) => {
                 let bundle_ref = manifest
                     .idx_bundle
@@ -669,7 +678,7 @@ impl Client {
         let midx_task = manifest
             .midx
             .as_ref()
-            .filter(|_| pack_dir.is_some())
+            .filter(|_| head_pack_dir.is_some())
             .map(|midx_ref| {
                 fetch(
                     Artifact::chunk(midx_ref, UrlSlot::Midx),
@@ -737,46 +746,70 @@ impl Client {
         let packs = (manifest.packs.iter().enumerate())
             .filter(|(_, entry)| pack_dir.is_some() || !entry.history_only);
         let downloads = stream::iter(packs).map(|(i, entry): (usize, &PackEntry)| {
-            let idx_bundle = idx_bundle.clone();
-            async move {
-                let pack_ref = entry
-                    .pack
-                    .as_ref()
-                    .with_context(|| format!("pack {i} missing pack ref"))?;
-                let idx_bytes = idx_bundle
-                    .map(|bundle| manifest_pack_idx_bytes(entry, i, &bundle))
-                    .transpose()?;
-                let artifact = Artifact::chunk(pack_ref, UrlSlot::PackChunk(i));
-                let pack_fetch_start = Instant::now();
-                let pack_body = if let (true, Some(pack_dir)) = (entry.history_only, pack_dir) {
-                    let Downloaded::TempFile(file, len) = self
-                        .download(urls, &artifact, Sink::TempFile(pack_dir))
-                        .await
-                        .with_context(|| format!("stream history pack {i}"))?
-                    else {
-                        unreachable!("temp file sink");
-                    };
-                    PackBody::TempFile { file, len }
-                } else {
-                    // Hold a process-wide weighted permit from before the
-                    // body starts buffering until its blocking parser
-                    // exits, so concurrent clones share one byte budget.
-                    let memory_permit = tuning::acquire_editable_pack_memory(pack_ref.len).await;
-                    let bytes = self
-                        .download_bytes(urls, &artifact)
-                        .await
-                        .with_context(|| format!("fetch head pack {i}"))?;
-                    PackBody::Buffered {
-                        bytes,
-                        _memory_permit: memory_permit,
-                    }
-                };
-                crate::perf::record_editable_pack_fetch(
-                    pack_fetch_start.elapsed(),
-                    pack_body.len(),
-                );
-                anyhow::Ok((i, pack_body, idx_bytes))
-            }
+            let (client, urls, idx_bundle, entry) = (
+                self.clone(),
+                urls.clone(),
+                idx_bundle.clone(),
+                entry.clone(),
+            );
+            let pack_dir = pack_dir.map(Path::to_path_buf);
+            let task = AbortOnDrop::new(
+                tokio::spawn(async move {
+                    let (entry, urls, pack_dir) = (&entry, &urls, pack_dir.as_deref());
+                    let pack_ref = entry
+                        .pack
+                        .as_ref()
+                        .with_context(|| format!("pack {i} missing pack ref"))?;
+                    let artifact = Artifact::chunk(pack_ref, UrlSlot::PackChunk(i));
+                    let pack_fetch_start = Instant::now();
+                    let (pack_body, idx_bytes) =
+                        if let (true, Some(pack_dir)) = (entry.history_only, pack_dir) {
+                            // A history pack's idx is not in the bundle: fetch it
+                            // alongside the pack.
+                            let idx_ref = entry
+                                .idx
+                                .as_ref()
+                                .with_context(|| format!("pack {i} missing idx ref"))?;
+                            let idx = Artifact::chunk(idx_ref, UrlSlot::PackIdx(i));
+                            let (pack, idx) = tokio::join!(
+                                client.download(urls, &artifact, Sink::TempFile(pack_dir)),
+                                client.download_bytes(urls, &idx)
+                            );
+                            let Downloaded::TempFile(file, len) =
+                                pack.with_context(|| format!("stream history pack {i}"))?
+                            else {
+                                unreachable!("temp file sink");
+                            };
+                            let idx = idx.with_context(|| format!("fetch history pack idx {i}"))?;
+                            (PackBody::TempFile { file, len }, Some(idx))
+                        } else {
+                            let idx_bytes = idx_bundle
+                                .map(|bundle| manifest_pack_idx_bytes(entry, i, &bundle))
+                                .transpose()?;
+                            // Hold a process-wide weighted permit from before the
+                            // body starts buffering until its blocking parser
+                            // exits, so concurrent clones share one byte budget.
+                            let memory_permit =
+                                tuning::acquire_editable_pack_memory(pack_ref.len).await;
+                            let bytes = client
+                                .download_bytes(urls, &artifact)
+                                .await
+                                .with_context(|| format!("fetch head pack {i}"))?;
+                            let body = PackBody::Buffered {
+                                bytes,
+                                _memory_permit: memory_permit,
+                            };
+                            (body, idx_bytes)
+                        };
+                    crate::perf::record_editable_pack_fetch(
+                        pack_fetch_start.elapsed(),
+                        pack_body.len(),
+                    );
+                    anyhow::Ok((i, pack_body, idx_bytes))
+                }),
+                cleanup.clone(),
+            );
+            async move { task.join().await.context("pack download task")? }
         });
 
         // Stage 2: install each pack; hand-parse for the worktree only when it's
@@ -786,6 +819,7 @@ impl Client {
             .buffer_unordered(download_conc)
             .map(|res| {
                 let pack_dir = pack_dir.map(Path::to_path_buf);
+                let head_pack_dir = head_pack_dir.map(Path::to_path_buf);
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
                 async move {
@@ -809,7 +843,7 @@ impl Client {
                                         // pairs to the pack by basename.
                                         let name =
                                             hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-                                        if let Some(pack_dir) = &pack_dir {
+                                        if let Some(pack_dir) = &head_pack_dir {
                                             std::fs::write(
                                                 pack_dir.join(format!("pack-{name}.pack")),
                                                 &pack_bytes,
@@ -842,6 +876,8 @@ impl Client {
                                         (name, None, None)
                                     }
                                 };
+                                // The idx comes from the bundle for a Head pack,
+                                // or on its own for a history pack.
                                 if let (Some(pack_dir), Some(idx_bytes)) = (&pack_dir, &idx_bytes) {
                                     std::fs::write(
                                         pack_dir.join(format!("pack-{name}.idx")),
@@ -917,6 +953,9 @@ impl Client {
         .await
         .context("spawn clear skip-worktree and refresh index stats")??;
 
+        if full {
+            return Ok(total);
+        }
         // Install the multi-pack-index so git object lookups stay O(log) across
         // the many installed packs. A cold build supplies the prebuilt MIDX;
         // an incremental shallow build may omit it when base packs are remote,

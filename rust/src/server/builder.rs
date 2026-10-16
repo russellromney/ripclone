@@ -243,39 +243,48 @@ async fn load_metadata_async(
         .flatten()
 }
 
-/// Build one result's PackEntry list and concatenated idx bundle.
-fn assemble_variant(
+/// One manifest entry for `pack`, whose idx is at `idx_bundle_offset` in the
+/// idx bundle when the manifest has one.
+fn pack_entry(
+    pack: &(String, u64, String, u64),
+    history_only: bool,
+    idx_bundle_offset: u64,
+) -> Result<crate::clonepack::PackEntry> {
+    Ok(crate::clonepack::PackEntry {
+        pack: Some(ChunkRef {
+            hash: hash_from_hex(&pack.0)?,
+            len: pack.1,
+        }),
+        idx: Some(ChunkRef {
+            hash: hash_from_hex(&pack.2)?,
+            len: pack.3,
+        }),
+        history_only,
+        idx_bundle_offset,
+    })
+}
+
+/// Build a Head's PackEntry list and the bundle of its packs' idx files.
+fn assemble_head_packs(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
-    tagged: &[(&(String, u64, String, u64), bool)],
+    packs: &[(String, u64, String, u64)],
 ) -> Result<(Vec<crate::clonepack::PackEntry>, Option<ChunkRef>, String)> {
-    if tagged.is_empty() {
+    if packs.is_empty() {
         return Ok((Vec::new(), None, String::new()));
     }
     use std::io::Write;
 
     let mut bundle = cas.writer().context("create idx bundle")?;
-    let mut entries = Vec::with_capacity(tagged.len());
+    let mut entries = Vec::with_capacity(packs.len());
     let mut len = 0u64;
-    for &(pack, history_only) in tagged {
+    for pack in packs {
         let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
-        let offset = len;
         bundle
             .write_all(&idx_bytes)
             .context("write idx bytes to bundle")?;
+        entries.push(pack_entry(pack, false, len)?);
         len += idx_bytes.len() as u64;
-        entries.push(crate::clonepack::PackEntry {
-            pack: Some(ChunkRef {
-                hash: hash_from_hex(&pack.0)?,
-                len: pack.1,
-            }),
-            idx: Some(ChunkRef {
-                hash: hash_from_hex(&pack.2)?,
-                len: pack.3,
-            }),
-            history_only,
-            idx_bundle_offset: offset,
-        });
     }
     let (hash, stored_len) = bundle.finish()?;
     anyhow::ensure!(
@@ -375,8 +384,9 @@ fn archive_chunk_refs(
 }
 
 /// After upload, a remote backend may drop local copies, keeping `keep`:
-/// the tiny idx files used by later bundle and MIDX builds, and the archive
-/// bundles the next Files build reads unchanged frames from. Local storage
+/// the idx files used by later bundle and MIDX builds, the manifests and
+/// metadata the next builds read, and the archive bundles the next Files
+/// build reads unchanged frames from. Local storage
 /// owns the durable copy and keeps every uploaded artifact. The local cache's
 /// retention bounds what is kept.
 async fn settle_storage(
@@ -629,10 +639,8 @@ pub(super) async fn build_head_result(
 
             // Head has no archive frames. Files publishes its own archive result.
             let archive_chunks = archive_chunk_refs(&[], &shallow_meta)?;
-            let head_tagged: Vec<(&(String, u64, String, u64), bool)> =
-                fpacks.iter().map(|p| (p, false)).collect();
             let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
-                assemble_variant(cas, storage, &head_tagged)?;
+                assemble_head_packs(cas, storage, &fpacks)?;
             Cancel::check_current()?;
             // Ship the head MIDX only on a cold full base (all pack bytes still
             // local). On a delta re-sync the base packs may be absent from local
@@ -698,8 +706,16 @@ pub(super) async fn build_head_result(
         head_uploads.push(p.clone());
         head_uploads.push(i.clone());
     }
-    let head_idx_keep: std::collections::HashSet<String> =
-        head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
+    // Files and Full of this commit, and the next Head, read the manifest and
+    // metadata; keeping them saves a download of what was just uploaded.
+    let head_idx_keep: std::collections::HashSet<String> = head_packs
+        .iter()
+        .map(|(_, _, ih, _)| ih.clone())
+        .chain([
+            shallow_metadata_hash.clone(),
+            shallow_clonepack_hash.clone(),
+        ])
+        .collect();
     Cancel::check_current()?;
     // Each upload started when its artifact was stored; wait for the rest.
     let upload_start = Instant::now();
@@ -1030,13 +1046,15 @@ pub(super) async fn build_full_result(
     let (vhead, vhistory) = (head_packs.clone(), history_packs.clone());
     let metadata_len = head_manifest.metadata_chunk.as_ref().map(|chunk| chunk.len);
     let start = Instant::now();
-    let (manifest_hash, idx_bundle_hash) = cancel::spawn_blocking(move || -> Result<_> {
-        let tagged: Vec<(&(String, u64, String, u64), bool)> = vhead
+    let manifest_hash = cancel::spawn_blocking(move || -> Result<_> {
+        // The history levels hold every object, so a full clone installs only
+        // them, each with its own idx, and reads the HEAD packs for the
+        // working tree alone: no idx bundle.
+        let entries = vhead
             .iter()
-            .map(|pack| (pack, false))
-            .chain(vhistory.iter().map(|pack| (pack, true)))
-            .collect();
-        let (entries, idx_bundle_ref, idx_bundle_hash) = assemble_variant(&vc, &vs, &tagged)?;
+            .map(|pack| pack_entry(pack, false, 0))
+            .chain(vhistory.iter().map(|pack| pack_entry(pack, true, 0)))
+            .collect::<Result<Vec<_>>>()?;
         let metadata_len = match metadata_len {
             Some(len) => len,
             None => vs.size(&vmetadata).context("size Head metadata for Full")?,
@@ -1049,14 +1067,14 @@ pub(super) async fn build_full_result(
             metadata_len,
             entries,
             None,
-            idx_bundle_ref,
+            None,
         )?;
-        Ok((vc.put(&manifest.encode_to_vec())?, idx_bundle_hash))
+        vc.put(&manifest.encode_to_vec())
     })
     .await
     .context("Full manifest task")??;
-    phases.record("idx_bundle", start);
-    uploads.start_all([&manifest_hash, &idx_bundle_hash]);
+    phases.record("manifest", start);
+    uploads.start_all([&manifest_hash]);
     for (pack, _, idx, _) in &new_history {
         uploads.start_all([pack, idx]);
     }
@@ -1081,7 +1099,7 @@ pub(super) async fn build_full_result(
             skeleton_idx: head.clonepack.skeleton_idx.clone(),
             prebuilt_index: head.clonepack.prebuilt_index.clone(),
             midx: String::new(),
-            idx_bundle: idx_bundle_hash,
+            idx_bundle: String::new(),
             commit: commit.to_string(),
         },
         packs: pack_artifacts_of(&all_packs),
@@ -1130,11 +1148,11 @@ pub(super) async fn build_files_result(
     phases.record("base_files", start);
 
     let start = Instant::now();
-    let skeleton = (
-        std::mem::take(&mut head_metadata.skeleton_pack),
-        std::mem::take(&mut head_metadata.skeleton_idx),
-        std::mem::take(&mut head_metadata.prebuilt_index),
-    );
+    // A files clone writes no `.git`, so Files metadata carries no skeleton
+    // or index.
+    head_metadata.skeleton_pack.clear();
+    head_metadata.skeleton_idx.clear();
+    head_metadata.prebuilt_index.clear();
     let (archive_mirror, archive_cas, archive_storage, archive_commit) = (
         mirror_dir.to_path_buf(),
         cas.clone(),
@@ -1167,15 +1185,10 @@ pub(super) async fn build_files_result(
     Cancel::check_current()?;
     let start = Instant::now();
     let archive_chunk_hashes = archive_output.download_bundle_hashes;
-    let mut metadata = archive_output.metadata;
+    let metadata = archive_output.metadata;
     let (fc, fcommit, fparent) = (cas.clone(), commit.to_string(), head.parent_commit.clone());
     let fchunks = archive_chunk_hashes.clone();
     let (metadata_hash, manifest_hash) = cancel::spawn_blocking(move || -> Result<_> {
-        (
-            metadata.skeleton_pack,
-            metadata.skeleton_idx,
-            metadata.prebuilt_index,
-        ) = skeleton;
         let metadata_bytes = metadata.encode_to_vec();
         let metadata_hash = fc.put(&metadata_bytes)?;
         let archive_chunks = archive_chunk_refs(&fchunks, &metadata)?;
@@ -1202,7 +1215,11 @@ pub(super) async fn build_files_result(
     let start = Instant::now();
     uploads.start_all(&publish_uploads);
     let uploaded = uploads.finish().await?;
-    let keep = archive_chunk_hashes.iter().cloned().collect();
+    let keep = archive_chunk_hashes
+        .iter()
+        .cloned()
+        .chain([metadata_hash.clone()])
+        .collect();
     settle_storage(cas, storage, uploaded, keep).await;
     phases.record("upload", start);
 

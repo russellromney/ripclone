@@ -179,7 +179,8 @@ pub struct ClonepackArtifacts {
     pub prebuilt_index: String,
     /// CAS hash of the pre-built multi-pack-index over this variant's packs.
     pub midx: String,
-    /// CAS hash of the required concatenated idx bundle for this variant's packs.
+    /// CAS hash of the concatenated idx bundle of a Head's packs. Empty for
+    /// Full, whose history packs carry their own idx, and for Files.
     pub idx_bundle: String,
     /// The commit this variant's clonepack is built for. Complete artifacts
     /// always carry this identity explicitly.
@@ -258,13 +259,14 @@ pub(crate) fn exact_output_artifacts_ready(
         return false;
     }
 
+    let skeleton = || {
+        valid_hash(&artifacts.skeleton_pack)
+            && valid_hash(&artifacts.skeleton_idx)
+            && valid_hash(&artifacts.prebuilt_index)
+    };
     match result {
-        ExactResultKind::Head | ExactResultKind::Full => {
-            valid_hash(&artifacts.skeleton_pack)
-                && valid_hash(&artifacts.skeleton_idx)
-                && valid_hash(&artifacts.prebuilt_index)
-                && valid_hash(&artifacts.idx_bundle)
-        }
+        ExactResultKind::Head => skeleton() && valid_hash(&artifacts.idx_bundle),
+        ExactResultKind::Full => skeleton(),
         ExactResultKind::Files => true,
     }
 }

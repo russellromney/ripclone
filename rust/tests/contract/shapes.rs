@@ -233,6 +233,12 @@ pub fn clone_each_shape(
         );
         assert_eq!(git(&target, &["status", "--porcelain"]), "", "{case}");
         git(&target, &["fsck", "--full"]);
+        if shape == "full" {
+            // A full clone installs only the history packs, few enough to
+            // need no multi-pack-index.
+            let midx = target.join(".git/objects/pack/multi-pack-index");
+            assert!(!midx.exists(), "{case}");
+        }
     }
 }
 
