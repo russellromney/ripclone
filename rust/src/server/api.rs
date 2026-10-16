@@ -122,11 +122,7 @@ pub(super) fn unknown_provider() -> ApiError {
 }
 
 fn repo_not_added() -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_FOUND,
-        "repo_not_added",
-        "repo not added; run `ripclone add <repo>`",
-    )
+    ApiError::new(StatusCode::NOT_FOUND, "repo_not_added", "repo not added")
 }
 
 pub(super) async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, ApiError> {

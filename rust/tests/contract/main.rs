@@ -6,6 +6,7 @@
 mod harness;
 mod net;
 
+mod cli;
 mod coalesce;
 mod docs;
 mod downloads;

@@ -492,7 +492,7 @@ fn i10_verify_upstream_in_files_mode() {
             assert_eq!(listing(&target), origin.tree(&tip), "{mode}");
         } else {
             let err = out.err();
-            assert_eq!(out.code(), Some(1), "{mode}: {err}");
+            assert_eq!(out.code(), Some(2), "{mode}: {err}");
             assert!(
                 err.contains("cannot verify a files-mode clone"),
                 "{mode}: {err}"
