@@ -255,7 +255,10 @@ Each step is a separate PR with green CI. No step mixes a cut with a redo.
    migration (there are no users). The Head republish after Full compaction
    is replaced here by an immutable scheme: Full(A) records a compacted Head
    base that the next Head(B) builds its delta against, because cutting the
-   republish alone lets the Head delta grow without bound.
+   republish alone lets the Head delta grow without bound. (2026-10-16: each
+   Head now adds one level of only new objects instead of a cumulative delta,
+   and Files adds tail chunks instead of rewriting bundles; both compact past
+   a quarter of their compact size.)
    **Done:** #202 (`ControlStore` and `builds`), #203 (`POST builds`, `GET
    commits`), #207 (bitmap writes off the request lock).
 4. **Client.** Resolver, download layer, install plan.

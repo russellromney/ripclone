@@ -20,11 +20,11 @@ On every push, ripclone mirrors the repo and builds a **clonepack** for `HEAD` s
 
 ripclone builds the content three ways so each clone takes only what it needs:
 
-***HEAD packs.*** Undeltified git packfiles with `HEAD`'s commit, trees, and every blob: a complete `--depth=1` repo. They are a base, shared by later commits, plus small packs of what changed since it, about 4 MiB each. The client drops them into `.git/objects` and reads the working tree straight out of them as they land: no archive, no extra work. Because the objects live in `.git`, the git content commands work. An **editable** `--depth 1` clone installs just these.
+***HEAD packs.*** Undeltified git packfiles with `HEAD`'s commit, trees, and every blob: a complete `--depth=1` repo. They are a base, shared by later commits, plus one small level per push that holds only the objects no earlier pack has. When the levels reach a quarter of the base, or 64 packs, Full packs a fresh base that later commits build on. The client drops them into `.git/objects` and reads the working tree straight out of them as they land: no archive, no extra work. Because the objects live in `.git`, the git content commands work. An **editable** `--depth 1` clone installs just these.
 
 ***History packs.*** Every commit, tree, and blob, delta-compressed into at most 16 immutable levels, each one pack. A push adds a small level and merges the smallest neighbors, so earlier levels are reused. A full editable clone installs only these, each with its stored idx; it reads the HEAD packs only to write the working tree.
 
-***Archive.*** The same `HEAD` file bytes, zstd-compressed and split into chunks. Each chunk is made of independent frames, so the client can download many at once and start writing files as the first bytes land. It's the fastest path to a working tree, but the files don't go into `.git`, so git content commands don't work. This is what **files** mode uses.
+***Archive.*** The same `HEAD` file bytes, zstd-compressed and split into chunks. Each chunk is made of independent frames, so the client can download many at once and start writing files as the first bytes land. It's the fastest path to a working tree, but the files don't go into `.git`, so git content commands don't work. This is what **files** mode uses. A push keeps the earlier archive's chunks and adds the changed files as new tail chunks; a file that changed again leaves dead bytes behind. When the archive grows 25% past its compact form (`RIPCLONE_FILES_TAIL_PERCENT`), or after 32 tails, the next push builds it compact again.
 
 ### Separate exact results
 
