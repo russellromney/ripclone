@@ -8,15 +8,25 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
+/// One streamed PUT carries at most this many bytes: a whole object below
+/// it, or one part of a multipart upload. One stream to object storage can
+/// drop to 1-2 MB/s, so a part must fit the request timeout at that rate.
+/// Throughput comes from running parts at once.
 #[cfg(not(test))]
-const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
-#[cfg(not(test))]
-const MULTIPART_UPLOAD_PART_BYTES: u64 = 128 * 1024 * 1024;
-#[cfg(test)]
-const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+const MULTIPART_UPLOAD_PART_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(test)]
 const MULTIPART_UPLOAD_PART_BYTES: u64 = 8 * 1024 * 1024;
-const MULTIPART_UPLOAD_MAX_CONCURRENCY: usize = 8;
+const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = MULTIPART_UPLOAD_PART_BYTES;
+const MULTIPART_UPLOAD_MAX_CONCURRENCY: usize = 16;
+/// Tries per streamed PUT. The client cannot replay a streamed body, so a
+/// failed part is sent again from the file here; without this, one slow part
+/// fails the whole upload and the build that made it.
+const STREAM_PUT_ATTEMPTS: u32 = 3;
+/// Wait before the first resend; it doubles after each.
+#[cfg(not(test))]
+const STREAM_PUT_RETRY_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const STREAM_PUT_RETRY_DELAY: Duration = Duration::ZERO;
 const MULTIPART_UPLOAD_MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MULTIPART_UPLOAD_MAX_PARTS: u64 = 10_000;
 const MULTIPART_UPLOAD_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
@@ -50,6 +60,41 @@ fn multipart_upload_part_bytes(len: u64) -> Result<u64> {
     Ok(part_bytes)
 }
 
+/// `len` bytes of the file at `path` from `offset`, as a request body.
+async fn file_range_stream(
+    path: &Path,
+    offset: u64,
+    len: u64,
+) -> Result<ReaderStream<tokio::io::Take<tokio::fs::File>>> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("open {} for S3 upload", path.display()))?;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .with_context(|| format!("seek {} to {offset} for S3 upload", path.display()))?;
+    Ok(ReaderStream::new(file.take(len)))
+}
+
+/// Run a streamed PUT up to [`STREAM_PUT_ATTEMPTS`] times.
+async fn with_stream_retries<T, F, Fut>(key: &str, mut send: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match send().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < STREAM_PUT_ATTEMPTS => {
+                tracing::warn!("S3 upload of {key}, attempt {attempt} failed, retrying: {error:#}");
+                tokio::time::sleep(STREAM_PUT_RETRY_DELAY * (1 << (attempt - 1))).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// S3-compatible durable artifact storage.
 pub struct S3Storage {
     client: Client,
@@ -75,15 +120,10 @@ impl S3Storage {
         prefix: Option<&str>,
         auth: Auth,
     ) -> Result<Self> {
-        // Per-request timeout. The client default (~10s) is too tight for the
-        // cold first sync of a huge repo: that build uploads the whole history at
-        // once (hundreds of 8 MB chunks, no incremental reuse yet), and at
-        // upload concurrency N a chunk's share of a ~100 Mbps uplink can land
-        // right around 10s, so PUTs trip the timeout and thrash on retries.
-        // 30s gives ~3x headroom over the worst-case per-chunk time, so the
-        // timeout + retry policy almost never trips, while still failing fast on a
-        // genuinely stuck request. Steady-state re-syncs only upload the delta, so
-        // this barely ever matters.
+        // Per-request timeout. A streamed PUT carries at most one 16 MiB part
+        // (MULTIPART_UPLOAD_PART_BYTES), which takes 8-16 s at the 1-2 MB/s one
+        // stream to object storage can drop to. 30 s leaves headroom while
+        // still failing fast on a stuck request.
         //
         // Override with RIPCLONE_S3_REQUEST_TIMEOUT_SECS (e.g. tighter on
         // a local S3 emulator in tests). Must stay >0.
@@ -267,26 +307,21 @@ impl S3Storage {
                             .expect("S3 multipart upload semaphore is never closed");
                         let offset = part_index * part_bytes;
                         let part_len = (len - offset).min(part_bytes);
-                        let mut file = tokio::fs::File::open(&path).await.with_context(|| {
-                            format!("open {} for multipart upload", path.display())
-                        })?;
-                        file.seek(std::io::SeekFrom::Start(offset))
-                            .await
-                            .with_context(|| {
-                                format!("seek {} to multipart offset {offset}", path.display())
-                            })?;
-                        let stream = ReaderStream::new(file.take(part_len));
                         let part_number = u32::try_from(part_index + 1)
                             .context("S3 multipart part number overflow")?;
-                        let uploaded = client
-                            .objects()
-                            .upload_part(&bucket, &key, &upload_id, part_number)
-                            .body_stream_sized(stream, part_len)
-                            .send()
-                            .await
-                            .with_context(|| {
-                                format!("upload S3 multipart part {part_number} for {key}")
-                            })?;
+                        let uploaded = with_stream_retries(&key, || async {
+                            let stream = file_range_stream(&path, offset, part_len).await?;
+                            client
+                                .objects()
+                                .upload_part(&bucket, &key, &upload_id, part_number)
+                                .body_stream_sized(stream, part_len)
+                                .send()
+                                .await
+                                .with_context(|| {
+                                    format!("upload S3 multipart part {part_number} for {key}")
+                                })
+                        })
+                        .await?;
                         let etag = uploaded.etag.with_context(|| {
                             format!("S3 multipart part {part_number} for {key} omitted ETag")
                         })?;
@@ -560,17 +595,17 @@ impl StorageBackend for S3Storage {
         if len >= MULTIPART_UPLOAD_THRESHOLD_BYTES {
             self.multipart_put_file(&key, path, len).await?;
         } else {
-            let file = tokio::fs::File::open(path)
-                .await
-                .with_context(|| format!("open {} for S3 upload", path.display()))?;
-            let stream = ReaderStream::new(file);
-            self.client
-                .objects()
-                .put(&self.bucket, &key)
-                .body_stream_sized(stream, len)
-                .send()
-                .await
-                .with_context(|| format!("S3 put_object {key}"))?;
+            with_stream_retries(&key, || async {
+                let stream = file_range_stream(path, 0, len).await?;
+                self.client
+                    .objects()
+                    .put(&self.bucket, &key)
+                    .body_stream_sized(stream, len)
+                    .send()
+                    .await
+                    .with_context(|| format!("S3 put_object {key}"))
+            })
+            .await?;
         }
         Ok(())
     }
@@ -640,8 +675,8 @@ fn env_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
 mod tests {
     use super::{
         MULTIPART_UPLOAD_MAX_OBJECT_BYTES, MULTIPART_UPLOAD_MAX_PART_BYTES,
-        MULTIPART_UPLOAD_PART_BYTES, S3Storage, multipart_upload_concurrency_for_cores,
-        multipart_upload_part_bytes,
+        MULTIPART_UPLOAD_PART_BYTES, S3Storage, STREAM_PUT_ATTEMPTS,
+        multipart_upload_concurrency_for_cores, multipart_upload_part_bytes,
     };
     use crate::storage::StorageBackend;
     use std::io::Write;
@@ -652,7 +687,38 @@ mod tests {
         assert_eq!(multipart_upload_concurrency_for_cores(1), 2);
         assert_eq!(multipart_upload_concurrency_for_cores(2), 4);
         assert_eq!(multipart_upload_concurrency_for_cores(4), 8);
-        assert_eq!(multipart_upload_concurrency_for_cores(128), 8);
+        assert_eq!(multipart_upload_concurrency_for_cores(8), 16);
+        assert_eq!(multipart_upload_concurrency_for_cores(128), 16);
+    }
+
+    #[tokio::test]
+    async fn streamed_puts_are_resent_a_bounded_number_of_times() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let flaky = || async {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n < STREAM_PUT_ATTEMPTS {
+                anyhow::bail!("timeout {n}")
+            }
+            Ok(n)
+        };
+        assert_eq!(
+            super::with_stream_retries("k", flaky).await.unwrap(),
+            STREAM_PUT_ATTEMPTS
+        );
+
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let dead = || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("timeout")
+        };
+        let error = super::with_stream_retries::<(), _, _>("k", dead)
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{error}"), "timeout");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            STREAM_PUT_ATTEMPTS
+        );
     }
 
     #[test]
