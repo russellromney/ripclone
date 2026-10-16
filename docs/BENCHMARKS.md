@@ -127,6 +127,36 @@ While a commit's Full is pending, a full clone of it uses the latest ready Full
 and fetches the remaining commits from upstream with the user's own git, so the
 clone doesn't wait.
 
+### Bytes per push
+
+What a push uploads to storage, summed over 16 pushes of 5 upstream commits
+each, one at a time (Hetzner ccx33 with Tigris), in MB:
+
+| repo | Head | Files | Full | total |
+|---|---|---|---|---|
+| `torvalds/linux` | 265 → 157 | 809 → 65 | 16 → 16 | 1090 → 238 |
+| `pandas-dev/pandas` | 31 → 9 | 168 → 18 | 6 → 12 | 205 → 39 |
+| `oven-sh/bun` | 177 → 98 | 443 → 195 | 50 → 141 | 670 → 434 |
+
+Before (`5ae7c82`), each Head packed everything new since its base again,
+and each Files build rewrote its whole archive. Now:
+
+- Each Head adds one level with only the objects no earlier pack has.
+- Each Files build appends a tail of new blobs; it compacts once tails make
+  the archive 25% larger.
+- When the levels reach a quarter of the base, Full rebases. It keeps the
+  base packs that are still at least 90% live. Head packs follow paths, so a
+  push's edits dirty few of them.
+
+Bun changes about 4 MB of Head objects per push, so it rebased twice in 16
+pushes; each rebase uploaded 32–43 MB instead of the whole ~90 MB base.
+Most of what Linux still uploads per push is fixed: Head's metadata and idx
+bundle, about 10 MB.
+
+Clone times held. Warm Linux clones took 1.9 → 1.8 s (files), 2.5 → 2.3 s
+(depth 1) and 40–43 → 35–45 s (full, which varies that much from run to
+run); pandas and bun clones were within 0.1–0.5 s of before.
+
 ## Build load
 
 How the server keeps up when many repositories push at once. One server on a
@@ -175,6 +205,28 @@ From `2d156cc` to `7f95c99`:
   Full build time (was 2.0, 2.3 and 3.2 s), and the CPU was 9% busy instead
   of 15%. Under the storm it was 50% busy instead of 25%: more of the builds
   ran at once.
+
+The same workload on a fresh ccx33, comparing `5ae7c82` with Head levels
+and Files tails (`32f695f`):
+
+| | `5ae7c82` | `32f695f` |
+|---|---|---|
+| steady, Head p90 | 4.4 | 2.8 |
+| steady, Files p90 | 4.7 | 2.8 |
+| steady, Full p50 / p90 | 2.8 / 4.8 | 2.8 / 4.8 |
+| storm, Full p90 | 35.3 | 24.7 |
+| storm, all 44 pushes ready | 56 | 32 |
+| uploaded by the 176 pushes | 6.3 GB | 1.7 GB |
+| CPU busy, steady / storm | 8% / 49% | 4% / 44% |
+| server RSS, max | 4.5 GiB | 2.6 GiB |
+| failed builds | 1 | 0 |
+
+Files uploads by the pushes fell from 4.6 GB to 0.6 GB, and Head from 1.6 GB
+to 0.7 GB. Full rose from 0.2 GB to 0.4 GB: the rebases. The cold phase was
+the same. The one failure on `5ae7c82` was a Files build that could not find
+a blob the mirror had: threads sharing a freshly opened gix store raced to
+load its pack indices. It is fixed: they are loaded before the threads
+start.
 
 On `1462be1` each Linux push rebuilt Full from scratch: about 7 minutes and a
 new 6.7 GB upload per push, with every other repository's Full queued behind
