@@ -434,10 +434,11 @@ fn noisy_origin(world: &World, name: &str) -> Origin {
 /// A's unchanged archive bundles and uploads none of them again. A second
 /// repository with the same files builds the same bundles; the server finds
 /// each with a HEAD and writes only small objects over keys the bucket had. A
-/// bucket copy cut short is uploaded again: a third repository with the same
-/// files builds them once more, and its HEAD sees the wrong length. Every
-/// shape of the third repository clones exactly, and so do the Files clones
-/// of B and the second repository, which read the repaired objects.
+/// bucket copy cut short is uploaded again: a third repository with the
+/// second's commit builds every one of its objects once more, and its HEAD
+/// sees the wrong length. Every shape of the third repository clones exactly,
+/// and so do the Files clones of B and the second repository, which read the
+/// repaired objects.
 #[test]
 #[ignore = "needs the S3 emulator; run by the s3 CI job"]
 fn s3_h10_existing_objects_are_not_uploaded_again() {
@@ -513,8 +514,10 @@ fn s3_h10_existing_objects_are_not_uploaded_again() {
     );
 
     // Cut the skipped objects short in the bucket, then build a third
-    // repository with the same files: it makes those objects again, and its
-    // HEAD sees the wrong length.
+    // repository with the twin's commit: it makes those objects again, and
+    // its HEAD sees the wrong length. Only the same commit makes every object
+    // again: Head packs are split by object id, so another commit's id moves
+    // the split.
     for key in &skipped {
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -522,7 +525,13 @@ fn s3_h10_existing_objects_are_not_uploaded_again() {
             .unwrap();
         file.set_len(before[key] / 2).unwrap();
     }
-    let third = noisy_origin(&world, "h10-third");
+    let third = world.origin("acme", "h10-third");
+    git(
+        &third.work,
+        &["pull", "-q", twin.work.to_str().unwrap(), "main"],
+    );
+    third.publish();
+    assert_eq!(third.head(), twin.head());
     let (_, requests) = observe(&|| {
         world
             .cli(&server, &["add", "acme/h10-third", "--wait"])
