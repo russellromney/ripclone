@@ -126,6 +126,9 @@ Ripclone token reaches the origin.
 | F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes. | #191 (S3 job) |
 | F8 | SIGINT during the download: exit 130, no target, staging directory, or marker left; the next clone succeeds. | #188 |
 | F9 | An artifact that answers 503 every time: exactly 3 attempts, then exit 6; no target, no staging. | #208 |
+| F10 | With 256 KiB parts, the 2 MiB history pack downloads as parallel ranges whose 206 answers tile it exactly once; one 503 retries only that range; the clone is exact. | |
+| F11 | A proxy that ignores Range: the ranged download falls back to one whole GET of that artifact, and the clone is exact. | |
+| F12 | A flipped byte in one range fails the clone on the hash check and leaves nothing. | |
 
 ### G. Clone shapes produce correct trees (10)
 

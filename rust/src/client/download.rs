@@ -169,12 +169,15 @@ enum FetchFailure {
     RefreshUrl(anyhow::Error),
     /// 404, wrong length, wrong hash, or a local I/O failure: fail now.
     Permanent(anyhow::Error),
+    /// A range request got the whole artifact: fetch it in one stream.
+    RangeIgnored,
 }
 
 impl FetchFailure {
     fn into_error(self) -> anyhow::Error {
         match self {
             Self::Retry(err) | Self::RefreshUrl(err) | Self::Permanent(err) => err,
+            Self::RangeIgnored => anyhow::anyhow!("the server ignored a range request"),
         }
     }
 }
@@ -231,17 +234,19 @@ fn verify_artifact(
     Ok(())
 }
 
-/// Check a resumed response's `Content-Range` against the saved offset and,
-/// when known, the promised length.
+/// Check a partial response's `Content-Range`: it starts at `offset`, runs
+/// to `end` (exclusive) or, without one, to the end of the artifact, and
+/// names the promised length when there is one.
 fn validate_content_range(
     value: Option<&reqwest::header::HeaderValue>,
     offset: u64,
+    end: Option<u64>,
     expected_len: Option<u64>,
 ) -> Result<()> {
     let value = value
-        .context("resumed artifact response omitted Content-Range")?
+        .context("partial artifact response omitted Content-Range")?
         .to_str()
-        .context("resumed artifact response has non-text Content-Range")?;
+        .context("partial artifact response has non-text Content-Range")?;
     let parsed = value
         .strip_prefix("bytes ")
         .and_then(|rest| rest.split_once('/'))
@@ -253,16 +258,33 @@ fn validate_content_range(
                 total.parse::<u64>().ok()?,
             ))
         });
-    let Some((start, end, total)) = parsed else {
-        anyhow::bail!("resumed artifact response has malformed Content-Range {value}");
+    let Some((start, last, total)) = parsed else {
+        anyhow::bail!("partial artifact response has malformed Content-Range {value}");
     };
     let total_ok = expected_len.is_none_or(|len| len == total);
     anyhow::ensure!(
-        start == offset && end.checked_add(1) == Some(total) && total_ok,
-        "invalid Content-Range for resumed artifact: expected bytes {offset}-, got {value}"
+        start == offset && last.checked_add(1) == Some(end.unwrap_or(total)) && total_ok,
+        "invalid Content-Range for partial artifact: expected bytes {offset}-{}, got {value}",
+        end.map(|end| (end - 1).to_string()).unwrap_or_default()
     );
     Ok(())
 }
+
+/// A file download of at least four parts is fetched as ranges of this
+/// many bytes, [`RANGE_PARALLEL`] at a time. Object storage serves one
+/// stream at about 55 MB/s, and a full clone's base history pack is
+/// gigabytes. `RIPCLONE_DOWNLOAD_PART_BYTES` overrides it.
+fn range_part_bytes() -> u64 {
+    std::env::var("RIPCLONE_DOWNLOAD_PART_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(16 << 20)
+        .max(1)
+}
+
+/// Parts are hashed and written in order, so at most this many are held in
+/// memory: 256 MiB at the default part size.
+const RANGE_PARALLEL: usize = 16;
 
 /// Most bytes a memory download reserves up front from a promised length.
 const MAX_PREALLOC: u64 = 256 << 20;
@@ -430,6 +452,19 @@ impl Client {
             return Ok(Downloaded::Memory(data.into()));
         }
         let mut received = Received::open(&sink, artifact.len)?;
+        let part = range_part_bytes();
+        if let (Sink::TempFile(_), Some(len)) = (&sink, artifact.len)
+            && len >= part.saturating_mul(4)
+        {
+            if self
+                .download_ranges(urls, artifact, len, part, &mut received)
+                .await?
+            {
+                return received.finish(hash, artifact.len).await;
+            }
+            tracing::warn!("the server ignored Range for artifact {hash}; fetching it whole");
+            received.restart().await?;
+        }
         let (mut generation, mut url) = urls.current(artifact.slot);
         let (max_attempts, base_backoff_ms) = fetch_retry_config();
         for attempt in 1..=max_attempts {
@@ -478,6 +513,133 @@ impl Client {
         }
     }
 
+    /// Fetch `artifact`'s whole content as ranges, in order, into
+    /// `received`. Each range retries on its own and refreshes an expired
+    /// URL like a whole download. False when the server ignored Range.
+    async fn download_ranges(
+        &self,
+        urls: &OutputUrls,
+        artifact: &Artifact,
+        len: u64,
+        part: u64,
+        received: &mut Received,
+    ) -> Result<bool> {
+        use futures::{StreamExt, TryStreamExt};
+        let parts = (0..len.div_ceil(part)).map(|i| (i * part, ((i + 1) * part).min(len)));
+        let mut ranges = futures::stream::iter(parts)
+            .map(|(start, end)| self.download_range(urls, artifact, start, end))
+            .buffered(RANGE_PARALLEL);
+        while let Some(bytes) = ranges.try_next().await? {
+            let Some(bytes) = bytes else {
+                return Ok(false);
+            };
+            received.write(&bytes).await?;
+        }
+        Ok(true)
+    }
+
+    /// Bytes `start..end` of `artifact`, with retries. `None` when the
+    /// server ignored Range.
+    async fn download_range(
+        &self,
+        urls: &OutputUrls,
+        artifact: &Artifact,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<bytes::Bytes>> {
+        let (mut generation, mut url) = urls.current(artifact.slot);
+        let (max_attempts, base_backoff_ms) = fetch_retry_config();
+        let mut attempt = 1;
+        loop {
+            match self
+                .range_attempt(artifact, url.as_deref(), start, end)
+                .await
+            {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(FetchFailure::RangeIgnored) => return Ok(None),
+                Err(FetchFailure::RefreshUrl(_)) if attempt < max_attempts => {
+                    (generation, url) = urls.refresh(self, artifact.slot, generation).await?;
+                }
+                Err(FetchFailure::Retry(_)) if attempt < max_attempts => {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                }
+                Err(failure) => return Err(failure.into_error()),
+            }
+            attempt += 1;
+        }
+    }
+
+    /// One request for bytes `start..end`. Anything but exactly that range
+    /// fails.
+    async fn range_attempt(
+        &self,
+        artifact: &Artifact,
+        signed_url: Option<&str>,
+        start: u64,
+        end: u64,
+    ) -> std::result::Result<bytes::Bytes, FetchFailure> {
+        let range = format!("bytes={start}-{}", end - 1);
+        let response = self.request(artifact, signed_url, Some(range)).await?;
+        let permanent = FetchFailure::Permanent;
+        if response.status() == reqwest::StatusCode::OK {
+            return Err(FetchFailure::RangeIgnored);
+        }
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(permanent(anyhow::anyhow!(
+                "artifact {} range response had status {}",
+                artifact.hash,
+                response.status()
+            )));
+        }
+        validate_content_range(
+            response.headers().get(reqwest::header::CONTENT_RANGE),
+            start,
+            Some(end),
+            artifact.len,
+        )
+        .map_err(permanent)?;
+        let bytes = response.bytes().await.map_err(|e| {
+            FetchFailure::Retry(anyhow::anyhow!("artifact range body read error: {e}"))
+        })?;
+        if bytes.len() as u64 != end - start {
+            return Err(FetchFailure::Retry(anyhow::anyhow!(
+                "artifact {} range {start}..{end} returned {} bytes",
+                artifact.hash,
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Send a GET for `artifact`, optionally with a Range header, and
+    /// classify a failed status.
+    async fn request(
+        &self,
+        artifact: &Artifact,
+        signed_url: Option<&str>,
+        range: Option<String>,
+    ) -> std::result::Result<reqwest::Response, FetchFailure> {
+        let hash = artifact.hash.as_str();
+        let gateway_url = format!("{}/v1/artifacts/{hash}", self.server);
+        // A presigned URL authenticates itself, so it never carries the
+        // ripclone token to object storage.
+        let (http, url, signed) = match signed_url {
+            Some(url) => (&self.raw_http, url, true),
+            None => (&self.http, gateway_url.as_str(), false),
+        };
+        let mut request = http.get(url);
+        if let Some(range) = range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        let response = request.send().await.map_err(|e| {
+            FetchFailure::Retry(anyhow::anyhow!("artifact fetch transport error: {e}"))
+        })?;
+        match classify_fetch_status(response.status(), signed, hash) {
+            Some(failure) => Err(failure),
+            None => Ok(response),
+        }
+    }
+
     /// One request: from byte zero, or from `received.len` with Range.
     async fn download_attempt(
         &self,
@@ -488,23 +650,8 @@ impl Client {
         use futures::StreamExt;
         use reqwest::StatusCode;
         let hash = artifact.hash.as_str();
-        let gateway_url = format!("{}/v1/artifacts/{hash}", self.server);
-        // A presigned URL authenticates itself, so it never carries the
-        // ripclone token to object storage.
-        let (http, url, signed) = match signed_url {
-            Some(url) => (&self.raw_http, url, true),
-            None => (&self.http, gateway_url.as_str(), false),
-        };
-        let mut request = http.get(url);
-        if received.len > 0 {
-            request = request.header(reqwest::header::RANGE, format!("bytes={}-", received.len));
-        }
-        let response = request.send().await.map_err(|e| {
-            FetchFailure::Retry(anyhow::anyhow!("artifact fetch transport error: {e}"))
-        })?;
-        if let Some(failure) = classify_fetch_status(response.status(), signed, hash) {
-            return Err(failure);
-        }
+        let range = (received.len > 0).then(|| format!("bytes={}-", received.len));
+        let response = self.request(artifact, signed_url, range).await?;
         let permanent = FetchFailure::Permanent;
         match response.status() {
             StatusCode::OK if received.len > 0 => received.restart().await.map_err(permanent)?,
@@ -513,6 +660,7 @@ impl Client {
                 validate_content_range(
                     response.headers().get(reqwest::header::CONTENT_RANGE),
                     received.len,
+                    None,
                     artifact.len,
                 )
                 .map_err(permanent)?;
@@ -566,6 +714,7 @@ mod tests {
                 FetchFailure::Retry(_) => "retry",
                 FetchFailure::RefreshUrl(_) => "refresh",
                 FetchFailure::Permanent(_) => "permanent",
+                FetchFailure::RangeIgnored => "range ignored",
             })
         };
 
@@ -609,22 +758,29 @@ mod tests {
     }
 
     #[test]
-    fn content_range_must_resume_at_the_saved_offset() {
+    fn content_range_must_match_the_requested_range() {
         let header = |s: &str| reqwest::header::HeaderValue::from_str(s).unwrap();
-        for (value, offset, len, ok) in [
-            ("bytes 10-99/100", 10, Some(100), true),
-            ("bytes 10-99/100", 10, None, true),
-            ("bytes 0-99/100", 10, Some(100), false),
-            ("bytes 10-98/100", 10, Some(100), false),
-            ("bytes 10-99/100", 10, Some(200), false),
-            ("bytes */100", 10, Some(100), false),
+        for (value, offset, end, len, ok) in [
+            // Resume: from the offset to the end.
+            ("bytes 10-99/100", 10, None, Some(100), true),
+            ("bytes 10-99/100", 10, None, None, true),
+            ("bytes 0-99/100", 10, None, Some(100), false),
+            ("bytes 10-98/100", 10, None, Some(100), false),
+            ("bytes 10-99/100", 10, None, Some(200), false),
+            ("bytes */100", 10, None, Some(100), false),
+            // A part: exactly `offset..end`.
+            ("bytes 16-31/100", 16, Some(32), Some(100), true),
+            ("bytes 16-30/100", 16, Some(32), Some(100), false),
+            ("bytes 16-99/100", 16, Some(32), Some(100), false),
+            ("bytes 0-31/100", 16, Some(32), Some(100), false),
+            ("bytes 16-31/200", 16, Some(32), Some(100), false),
         ] {
             assert_eq!(
-                validate_content_range(Some(&header(value)), offset, len).is_ok(),
+                validate_content_range(Some(&header(value)), offset, end, len).is_ok(),
                 ok,
-                "{value} at {offset}"
+                "{value} at {offset}..{end:?}"
             );
         }
-        assert!(validate_content_range(None, 10, Some(100)).is_err());
+        assert!(validate_content_range(None, 10, None, Some(100)).is_err());
     }
 }
