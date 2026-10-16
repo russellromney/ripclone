@@ -654,7 +654,7 @@ async fn get_commit(
                 "state": "pending",
                 "commit": row.commit,
                 "kind": kind,
-                "attempts": row.attempts,
+                "attempts": row.lease(kind).attempts,
             });
             if let Some(error) = error {
                 body["error"] = serde_json::json!(error);
@@ -1034,11 +1034,15 @@ pub(super) async fn admit_build(
     {
         row = retried;
     }
-    match (&row.head, &row.files, &row.full) {
-        (Out::Pending { .. }, _, _) => state.head_wake.notify_one(),
-        (Out::Ready(_), Out::Pending { .. }, _) => state.files_wake.notify_one(),
-        (Out::Ready(_), _, Out::Pending { .. }) => state.full_wake.notify_one(),
-        _ => {}
+    // Head and Files build from the commit alone; Full once Head is ready.
+    if matches!(row.head, Out::Pending { .. }) {
+        state.head_wake.notify_one();
+    }
+    if matches!(row.files, Out::Pending { .. }) {
+        state.files_wake.notify_one();
+    }
+    if matches!(row.head, Out::Ready(_)) && matches!(row.full, Out::Pending { .. }) {
+        state.full_wake.notify_one();
     }
     Ok((row, inserted))
 }
@@ -1149,8 +1153,9 @@ mod tests {
             head: out(info.head),
             files: out(info.files),
             full: out(info.full),
-            attempts: 0,
-            lease_until: None,
+            head_lease: Default::default(),
+            files_lease: Default::default(),
+            full_lease: Default::default(),
         }
     }
 
@@ -1205,7 +1210,7 @@ mod tests {
             .unwrap();
         state
             .control
-            .fail(&files, ExactResultKind::Files, "archive broke", None)
+            .fail(&files, "archive broke", None)
             .await
             .unwrap();
         state.control.release(&files).await.unwrap();
@@ -1594,12 +1599,7 @@ mod tests {
         );
         state
             .control
-            .fail(
-                &claimed,
-                ExactResultKind::Head,
-                "retry later",
-                Some(Duration::from_secs(600)),
-            )
+            .fail(&claimed, "retry later", Some(Duration::from_secs(600)))
             .await
             .unwrap();
         state.control.release(&claimed).await.unwrap();
@@ -1861,11 +1861,16 @@ mod tests {
                 .applied
         );
         state.control.release(&head_claim).await.unwrap();
-        // Full ready while Files is pending, as after a retry of a failed
-        // Files.
+        // Full ready while Files is still building.
         let background = state
             .control
             .claim("status-files", crate::control::Pool::Files, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        let full_claim = state
+            .control
+            .claim("status-full", crate::control::Pool::Full, lease)
             .await
             .unwrap()
             .unwrap();
@@ -1876,11 +1881,12 @@ mod tests {
         assert!(
             state
                 .control
-                .publish(&background, full)
+                .publish(&full_claim, full)
                 .await
                 .unwrap()
                 .applied
         );
+        state.control.release(&full_claim).await.unwrap();
 
         let status = build_repo_status(&state, &repo_id, false, None)
             .await
@@ -1895,7 +1901,7 @@ mod tests {
 
         state
             .control
-            .fail(&background, ExactResultKind::Files, "archive broke", None)
+            .fail(&background, "archive broke", None)
             .await
             .unwrap();
         let status = build_repo_status(&state, &repo_id, false, None)

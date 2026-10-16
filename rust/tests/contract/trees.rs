@@ -383,6 +383,7 @@ fn l4_corrupt_tail_object_fails_full_cleanly() {
     let b = origin.commit(&[("b.txt", "b\n")], "B");
     origin.publish();
     world.cli(&server, &["sync", "acme/l4"]).ok();
+    wait_state(&server, "acme/l4", &b, "head", "ready");
     wait_state(&server, "acme/l4", &b, "files", "ready");
     server.kill();
 

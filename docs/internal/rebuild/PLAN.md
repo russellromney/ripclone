@@ -63,13 +63,15 @@ replaced, so several half-models now run at once:
    builds(repo, commit, seq, parent, ref_name, created_at,   -- ref_name: the ref that admitted it, for top-up
           head_state, head_manifest, files_state, files_manifest,
           full_state, full_manifest,          -- state: pending | ready | failed
-          attempts, error, lease_owner, lease_until, lease_kind, retry_after)
+          {head,files,full}_{attempts, error, lease_owner, lease_until, retry_after})
+                                              -- each output kind has its own lease
    ```
    - admit: `INSERT OR IGNORE` with `seq`, a strictly increasing admission
      number; an explicit retry resets failed outputs to pending.
-   - claim: one `UPDATE ... RETURNING` on the lowest-`seq` row with pending
-     outputs whose lease is empty or expired and whose `retry_after` has
-     passed, skipping repos that already hold a live lease of that kind.
+   - claim(kind): one `UPDATE ... RETURNING` on the lowest-`seq` row with
+     that kind pending, whose lease of that kind is empty or expired and whose
+     `retry_after` of that kind has passed, skipping repos that already hold a
+     live lease of that kind.
    - renew: extend `lease_until` (short lease, for example 60 s). An expired
      lease is lost: renew, publish and fail refuse it, and the worker cancels
      the build.
@@ -80,8 +82,8 @@ replaced, so several half-models now run at once:
    - status: read the row. One place.
    No jobs table, no workers table, no size classes, no key strings, no stored
    credentials.
-5. **Bounded sequencing.** Each commit's build runs Head, then Files, then
-   Full. Three process-wide caps: Head, Files and Full slots, one pool each, so
+5. **Bounded sequencing.** Each commit's Head and Files build at the same
+   time, and Full starts once Head is ready. Three process-wide caps: Head, Files and Full slots, one pool each, so
    a long Full never holds back another commit's Files. Each pool claims in
    admission order, and a repo holds at most one lease per pool.
 6. **Published outputs are immutable.** Head compaction, if kept, applies to the

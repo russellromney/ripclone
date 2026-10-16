@@ -1,7 +1,7 @@
 //! The server-owned SQLite control database.
 //!
-//! One `builds` row per (repo, commit) with a state per output kind, leases
-//! instead of jobs, and added repositories with their config.
+//! One `builds` row per (repo, commit) with a state and a lease per output
+//! kind, leases instead of jobs, and added repositories with their config.
 //! [`sqlite::SqliteControlStore`] implements [`ControlStore`].
 
 use crate::provider::RepoId;
@@ -18,16 +18,27 @@ pub mod sqlite;
 
 pub use sqlite::SqliteControlStore;
 
-/// Which claimers a build row is offered to. A row moves through the pools
-/// in order: Head while Head is pending, then Files once Head is ready, then
-/// Full once Files is ready or failed and no older row of the repo has Full
-/// pending. Files is fast, so a new push's Files never waits behind another
-/// commit's Full, and one row has one lease.
+/// Which claimers a build row is offered to. Head and Files are offered
+/// while pending; they need only the commit. Full is offered once Head is
+/// ready, since it reuses Head's packs. Each output kind has its own lease,
+/// attempts and retry time, so a row's Full never waits for its Files. A Full is offered only when no older row
+/// of the repo has Full pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pool {
     Head,
     Files,
     Full,
+}
+
+impl Pool {
+    /// The output kind this pool builds.
+    pub fn kind(self) -> ExactResultKind {
+        match self {
+            Self::Head => ExactResultKind::Head,
+            Self::Files => ExactResultKind::Files,
+            Self::Full => ExactResultKind::Full,
+        }
+    }
 }
 
 /// One output kind's state.
@@ -63,19 +74,52 @@ pub struct BuildRow {
     pub head: Out<HeadResult>,
     pub files: Out<FilesResult>,
     pub full: Out<FullResult>,
-    /// Claims in the current phase (Head, Files, then Full).
-    pub attempts: i64,
-    /// Lease expiry, epoch seconds. The row is building while this is in the
-    /// future.
-    pub lease_until: Option<i64>,
+    pub head_lease: Lease,
+    pub files_lease: Lease,
+    pub full_lease: Lease,
 }
 
-/// A leased build row. `build` is the row as it was when claimed.
+impl BuildRow {
+    /// The lease and attempts of one output kind.
+    pub fn lease(&self, kind: ExactResultKind) -> Lease {
+        match kind {
+            ExactResultKind::Head => self.head_lease,
+            ExactResultKind::Files => self.files_lease,
+            ExactResultKind::Full => self.full_lease,
+        }
+    }
+}
+
+/// One output kind's lease and attempts. Each kind of a row has its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lease {
+    /// Claims of this kind since admission or the last retry.
+    pub attempts: i64,
+    /// Lease expiry, epoch seconds. The kind is building while this is in
+    /// the future.
+    pub until: Option<i64>,
+}
+
+/// A leased output of a build row. `build` is the row as it was when
+/// claimed. The claim holds the lease of `pool`'s kind only.
 #[derive(Debug, Clone)]
 pub struct Claim {
     pub repo: RepoId,
     pub owner: String,
+    pub pool: Pool,
     pub build: BuildRow,
+}
+
+impl Claim {
+    /// The output kind this claim builds.
+    pub fn kind(&self) -> ExactResultKind {
+        self.pool.kind()
+    }
+
+    /// Claims of this kind so far, this one included.
+    pub fn attempts(&self) -> i64 {
+        self.build.lease(self.kind()).attempts
+    }
 }
 
 /// A finished output to publish for a claim.
@@ -91,8 +135,9 @@ pub enum Output {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Published {
-    /// The output was written. False when the claim no longer owns the row
-    /// or the output was already ready.
+    /// The output was written. False when the claim no longer owns its
+    /// kind's lease, the output is not the claim's kind, or the output is no
+    /// longer pending.
     pub applied: bool,
     /// This publish made every output of the row ready.
     pub row_complete: bool,
@@ -135,41 +180,39 @@ pub trait ControlStore: Send + Sync {
         commit: &str,
         ref_name: Option<&str>,
     ) -> Result<(BuildRow, bool)>;
-    /// Return failed outputs to pending with attempts and backoff cleared.
-    /// Ready and pending outputs are untouched. `None` if the row is unknown.
+    /// Return failed outputs to pending with their attempts and backoff
+    /// cleared. Ready and pending outputs are untouched. `None` if the row
+    /// is unknown.
     async fn retry(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>>;
-    /// Lease the oldest claimable row of `pool`, by admission order (a
-    /// strictly increasing sequence, so same-second admits keep their
-    /// order). A repo that already holds a live lease of `pool` is skipped,
-    /// so one repo cannot fill a pool. A Full row is claimable only when no
-    /// older row of its repo has Full pending, so a repo's Fulls publish in
-    /// admission order. First gives up on rows whose
-    /// lease expired after the last allowed attempt: the current phase's
-    /// output fails (a pending Head takes Files and Full with it), and a
-    /// failed Files hands the row to the Full phase.
+    /// Lease `pool`'s output of the oldest claimable row, by admission
+    /// order (a strictly increasing sequence, so same-second admits keep
+    /// their order). Head and Files are claimable while pending, Full once
+    /// Head is ready. The kind must have no
+    /// live lease, no retry time in the future and attempts left. A repo
+    /// that already holds a live lease of `pool`'s kind is skipped, so one
+    /// repo cannot fill a pool. A Full is claimable only when no older row
+    /// of its repo has Full pending, so a repo's Fulls publish in admission
+    /// order. First gives up on outputs of `pool`'s kind whose lease
+    /// expired after the last allowed attempt: that output fails, and a
+    /// failed Head takes Full with it.
     async fn claim(&self, owner: &str, pool: Pool, lease: Duration) -> Result<Option<Claim>>;
-    /// Extend the lease. False when the claim no longer owns the row or the
-    /// lease already expired: an expired lease is lost even if nobody has
-    /// claimed the row since.
+    /// Extend the claim's lease. False when the claim no longer owns it or
+    /// it already expired: an expired lease is lost even if nobody has
+    /// claimed the output since.
     async fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool>;
-    /// Write a ready output. Publishing Head or Files ends that phase and
-    /// clears attempts for the next one. Nothing is written for a claim
-    /// whose lease was lost or expired.
+    /// Write a ready output of the claim's kind. Nothing is written for a
+    /// claim whose lease was lost or expired, or for another kind's output.
     async fn publish(&self, claim: &Claim, output: Output) -> Result<Published>;
-    /// Record a failed build of `kind`. With `retry_after` and attempts left
-    /// the output stays pending and the row is not claimable until the delay
-    /// passes; otherwise it fails. A failed Head fails Files and Full too; a
-    /// failed Files starts the Full phase. Like `publish`, a lost or
-    /// expired lease records nothing.
-    async fn fail(
-        &self,
-        claim: &Claim,
-        kind: ExactResultKind,
-        error: &str,
-        retry_after: Option<Duration>,
-    ) -> Result<()>;
+    /// Record a failed build of the claim's kind. With `retry_after` and
+    /// attempts left the output stays pending and is not claimable until
+    /// the delay passes; otherwise it fails. A failed Head fails Files and
+    /// Full too; a failed Files or Full fails alone. Like `publish`, a lost
+    /// or expired lease records nothing.
+    async fn fail(&self, claim: &Claim, error: &str, retry_after: Option<Duration>) -> Result<()>;
+    /// Give up the claim's lease. Other kinds' leases of the row stay.
     async fn release(&self, claim: &Claim) -> Result<()>;
-    /// Clear every lease. Only safe while this process is the single owner.
+    /// Clear every lease of every kind. Returns the number of rows that
+    /// held one. Only safe while this process is the single owner.
     async fn reset_leases(&self) -> Result<u64>;
     async fn status(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>>;
     /// Every row of `repo`, oldest admission first.

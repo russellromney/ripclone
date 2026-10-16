@@ -29,11 +29,13 @@ ripclone builds the content three ways so each clone takes only what it needs:
 ### Separate exact results
 
 Each exact commit stores three independent results: **Head**, **Full**, and
-**Files**. A build publishes Head first, then the Files archive, then Full
-history, each as soon as it is complete. Head, Files and Full each have their
-own build slots, so a long Full never holds back the next commit's Head or
-Files. A repository's Full results build one at a time, in push order, so each
-can extend the history of the one before. A published result never changes,
+**Files**. Head and the Files archive build at the same time from the
+commit. Full history reuses Head's packs, so it starts once Head publishes.
+Each publishes as soon as it is complete.
+Head, Files and Full each have their own build slots, lease and attempt count,
+so a Full never waits for its commit's Files, and a long Full never holds back
+the next commit's Head or Files. A repository's Full results build one at a
+time, in push order, so each can extend the history of the one before. A published result never changes,
 and a later build never rebuilds one.
 
 A depth-1 editable clone needs Head, a full editable clone needs Full, and

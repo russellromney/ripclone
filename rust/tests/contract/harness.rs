@@ -80,11 +80,16 @@ pub fn git_output(dir: &Path, args: &[&str]) -> Output {
 }
 
 /// `git` with the user's global and system config ignored, so settings like a
-/// global excludes file cannot change what a test sees.
+/// global excludes file cannot change what a test sees. Objects are stored
+/// uncompressed: tests write megabytes of random bytes, and zlib on them only
+/// costs time.
 pub fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
     cmd.env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.compression")
+        .env("GIT_CONFIG_VALUE_0", "0")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
@@ -143,6 +148,8 @@ impl World {
             self.dir.path(),
             &["init", "--bare", "-q", "-b", "main", bare.to_str().unwrap()],
         );
+        // The server's fetches run upload-pack here with their own environment.
+        git(&bare, &["config", "core.compression", "0"]);
         Origin {
             slug: format!("{owner}/{name}"),
             work,

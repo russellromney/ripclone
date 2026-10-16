@@ -136,7 +136,8 @@ Ripclone token reaches the origin.
 | G3 | Files mode: tree equals `git archive` of B, including symlinks and exec bits. | #186 |
 | G4 | Push, rewind force-push, and non-ancestor force-push in sequence: each new full clone equals the new tip. | #186 |
 | G5 | Enough pushes to seal and compact history levels: full clone stays complete. | #186 |
-| G6 | Small push after a 12 MiB tree: B's Files clone reuses chunks A's Files clone downloaded, the store grows by under half the tree, and B's tree is exact. Two more pushes, each Files built on the last (an edit inside a large file and a new file beside it; then a delete, a move, an exec bit, a symlink and 50 small files): each Files clone equals the origin's tree. | #208, #221 |
+| G6 | Small push after a 12 MiB tree: B's Files clone reuses chunks A's Files clone downloaded, the store grows by under half the tree, and B's tree is exact. | #208, #221 |
+| G6b | Two pushes after the same 12 MiB tree, each Files built on the last (an edit inside a large file and a new file beside it; then a delete, a move, an exec bit, a symlink and 50 small files): each Files clone equals the origin's tree. Split from G6 so the two run in parallel. | #221 |
 | G7 | Delete a file, then re-add the same bytes (same blob id): depth-1, full and Files clones of the tip all have it. | #208 |
 | G8 | Empty trees: a root commit with no files, and a later commit that deletes every file. Every shape installs an empty tree. | #208 |
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | #208 |
@@ -201,9 +202,9 @@ another's builds or the API, and the mirror stays compact.
 | # | Test | Added |
 |---|---|---|
 | K1 | The origin holds every fetch of X, and a second push of X is admitted, with two Head slots. X fetches once: its second build waits for the first. Meanwhile Y is added, built and cloned at depth 1, and `/add`, `POST /builds` and `/status` each answer within 2 s. After the release both X commits clone. | #218 |
-| K2 | `RIPCLONE_FETCH_TIMEOUT_SECS=1`. The origin holds the fetch until the build retries, then answers: the build completes and clones. With the origin held throughout, Head fails after its 3 attempts (3 fetches) with a `timed out after` error, and nothing publishes. | #218 |
+| K2 | `RIPCLONE_FETCH_TIMEOUT_SECS=1`. The origin holds the fetch until the build retries, then answers: the build completes and clones. With the origin held throughout, Head and Files each fail after their 3 attempts (6 fetches) with a `timed out after` error, and nothing publishes. | #218 |
 | K3 | The tip of a repo is admitted, then three older commits by SHA in one burst, out of history order, with four Full slots. Fulls publish in admission order (server log), and each commit's full clone equals the origin, with `rev-list --count` and `git fsck` checked. | #218 |
-| K4 | While the server is down, its mirror gains 20 packs and 70 loose refs from outside. The next Full compacts it first: the log reports a repack and packed refs, under 16 packs remain, and full clones of the built commit and of a later push are exact. | #218 |
+| K4 | While the server is down, its mirror gains 20 packs and 70 loose refs from outside. The next commit's Files and Full run together, and the later of them to finish compacts it after publishing: the log reports a repack and packed refs, under 16 packs remain, and full clones of the built commit and of a later push are exact. | #218 |
 
 ### L. Any tree git allows (4)
 
