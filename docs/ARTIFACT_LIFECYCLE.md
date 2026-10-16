@@ -7,7 +7,8 @@ integrity contract for the bytes served to clients.
 
 The server mirrors the upstream repository and builds:
 
-- a metadata chunk with the index, archive frame table, and file table
+- a metadata chunk with the index, archive frame table, and file table,
+  zstd-compressed
 - clonepack manifests for depth-1, full/editable, and files mode
 - pack artifacts for editable clones
 - zstd archive frames and coarser download bundles for files mode
