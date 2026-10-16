@@ -74,3 +74,8 @@ cargo build --release --example ripclone-proxy
 - `RIPCLONE_ORIGIN_BASE` - local/offline `file://` origin root containing
   `<owner>/<repo>.git`.
 - `BENCH_SOURCE_URL` - native Git and tree-correctness source URL.
+
+## Build load
+
+`load/` measures how one server keeps up when many repositories push at once.
+See [`load/README.md`](load/README.md).

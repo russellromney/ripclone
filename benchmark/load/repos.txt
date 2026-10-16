@@ -1,0 +1,12 @@
+# owner/repo  first-parent-step
+expressjs/express 3
+facebook/react 5
+rust-lang/cargo 5
+oven-sh/bun 5
+pandas-dev/pandas 5
+microsoft/vscode 10
+kubernetes/kubernetes 10
+godotengine/godot 5
+rust-lang/rust 5
+NixOS/nixpkgs 20
+torvalds/linux 5
