@@ -126,7 +126,7 @@ fn l1_odd_path_names_clone_exactly() {
     wait_ready(&server, "acme/l1", &b);
     let log = server.log();
     assert!(
-        log.contains("Head files table (incremental"),
+        log.contains(&format!("Head packs (delta vs base {}", &a[..7])),
         "B's Head did not build on A:\n{log}"
     );
     if ANY_BYTES {

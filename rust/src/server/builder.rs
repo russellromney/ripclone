@@ -483,15 +483,12 @@ struct HeadBuild {
 /// Build and upload the Head result for `commit`. Head packs are a delta
 /// against `base`, an immutable Head pack set of an ancestor; without a base,
 /// or when the base commit cannot be read, the full closure is packed and
-/// becomes the base. `previous_head`, the ready Head of an ancestor, lets the
-/// files table hash only the paths changed since it.
-#[allow(clippy::too_many_arguments)]
+/// becomes the base.
 pub(super) async fn build_head_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     commit: &str,
     parent: Option<String>,
-    previous_head: Option<&crate::HeadResult>,
     base: Option<crate::HeadBase>,
     storage: &crate::storage::StorageRef,
     phases: &mut SyncPhases,
@@ -577,62 +574,13 @@ pub(super) async fn build_head_result(
             }
         }
     });
-    // Head builds only the cheap files table (no zstd frames): editable
-    // depth=1 materializes the worktree from the HEAD-closure packs, so it does
-    // not need the archive. The full zstd archive (for files mode) is built in
-    // concurrently afterward, off the time-to-Head critical path.
-    //
-    // Files-table by-diff: with an ancestor's ready Head, reuse its content
-    // hashes for unchanged paths and read+hash only the blobs that changed since
-    // that commit (O(changed) instead of O(worktree)). Falls back to a full
-    // table when there is no previous table.
-    let prev_files: Option<Vec<crate::clonepack::FileEntry>> = match previous_head {
-        Some(head) => load_metadata_async(cas, storage, &head.clonepack.metadata_chunk)
-            .await
-            .map(|metadata| metadata.files),
-        None => None,
-    };
-    let prev_commit_for_diff = previous_head.map(|head| head.clonepack.commit.clone());
-    // Carry the prior files table + commit so the bounded archive can hash only
-    // changed files and reuse frames for the unchanged prefix/suffix.
+    // Head builds only the files table, from the tree alone: editable
+    // depth=1 materializes the worktree from the Head packs, so it does not
+    // need the archive.
     let (md3, cm3) = (mirror_dir.to_path_buf(), commit.to_string());
     let ft_start = Instant::now();
-    let files_table_handle = match (prev_files, prev_commit_for_diff) {
-        (Some(pf), Some(from)) if !from.is_empty() => {
-            let (md, cm, frm) = (md3.clone(), cm3.clone(), from);
-            cancel::spawn_blocking(move || {
-                let s = Instant::now();
-                // If the diff fails (e.g. prev.commit was pruned after a
-                // force-push), fall back to a full rebuild rather than failing
-                // the sync — reuse is purely an optimization.
-                match crate::git::diff_name_set(&md, &frm, &cm) {
-                    Ok(changed) => {
-                        let r = ArchiveBuilder::new(&md)
-                            .build_files_table_incremental(&cm, &pf, &changed);
-                        info!(
-                            "Head files table (incremental, {} changed) {:?}",
-                            changed.len(),
-                            s.elapsed()
-                        );
-                        r
-                    }
-                    Err(e) => {
-                        Cancel::check_current()?;
-                        warn!("files-table diff failed ({e:#}); full rebuild");
-                        let r = ArchiveBuilder::new(&md).build_files_table(&cm);
-                        info!("Head files table (full, diff fallback) {:?}", s.elapsed());
-                        r
-                    }
-                }
-            })
-        }
-        _ => cancel::spawn_blocking(move || {
-            let s = Instant::now();
-            let r = ArchiveBuilder::new(&md3).build_files_table(&cm3);
-            info!("Head files table (full) {:?}", s.elapsed());
-            r
-        }),
-    };
+    let files_table_handle =
+        cancel::spawn_blocking(move || ArchiveBuilder::new(&md3).build_files_table(&cm3));
     let head_built = head_handle.await.context("head packs")??;
     phases.head_packs_ms = Some(head_built.elapsed_ms);
     let head_packs = head_built.all_packs.clone();
@@ -1120,16 +1068,15 @@ pub(super) async fn build_full_result(
     })
 }
 
-/// Build and upload the Files result. Head's metadata for the same commit
-/// gives the files table. `parent_files`, a ready Files result
-/// of an ancestor and its commit, lets the archive read only changed bytes
-/// and reuse its unchanged frames and bundles.
+/// Build and upload the Files result. `parent_files`, a ready Files result of
+/// an ancestor and its commit, lets the archive read only changed bytes and
+/// reuse its unchanged frames and bundles.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_files_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     commit: &str,
-    head: &crate::HeadResult,
+    parent: Option<String>,
     parent_files: Option<(&str, &crate::FilesResult)>,
     storage: &crate::storage::StorageRef,
     compression_level: i32,
@@ -1138,30 +1085,16 @@ pub(super) async fn build_files_result(
     let uploads = Uploads::new(cas, storage);
     let cas = &uploads.cas();
     let start = Instant::now();
-    let base_metadata = async {
-        match parent_files {
-            Some((_, files)) => {
-                load_metadata_async(cas, storage, &files.clonepack.metadata_chunk).await
-            }
-            None => None,
+    let base_metadata = match parent_files {
+        Some((_, files)) => {
+            load_metadata_async(cas, storage, &files.clonepack.metadata_chunk).await
         }
+        None => None,
     };
-    let (head_metadata, base_metadata) = tokio::join!(
-        load_metadata_async(cas, storage, &head.clonepack.metadata_chunk),
-        base_metadata
-    );
-    let mut head_metadata = head_metadata.with_context(|| {
-        format!(
-            "read Head metadata {} for Files",
-            head.clonepack.metadata_chunk
-        )
-    })?;
     let base = base_metadata.zip(parent_files.map(|(_, files)| files.clone()));
     phases.record("base_files", start);
 
     let start = Instant::now();
-    // A files clone writes no `.git`, so Files metadata carries no index.
-    head_metadata.prebuilt_index.clear();
     let (archive_mirror, archive_cas, archive_storage, archive_commit) = (
         mirror_dir.to_path_buf(),
         cas.clone(),
@@ -1181,7 +1114,6 @@ pub(super) async fn build_files_result(
             &archive_cas,
             Some(&archive_storage),
             compression_level,
-            Some(&head_metadata),
             base.as_ref(),
             crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
         )
@@ -1195,7 +1127,7 @@ pub(super) async fn build_files_result(
     let start = Instant::now();
     let archive_chunk_hashes = archive_output.download_bundle_hashes;
     let metadata = archive_output.metadata;
-    let (fc, fcommit, fparent) = (cas.clone(), commit.to_string(), head.parent_commit.clone());
+    let (fc, fcommit, fparent) = (cas.clone(), commit.to_string(), parent);
     let fchunks = archive_chunk_hashes.clone();
     let (metadata_hash, manifest_hash) = cancel::spawn_blocking(move || -> Result<_> {
         let metadata_bytes = metadata.encode_stored()?;

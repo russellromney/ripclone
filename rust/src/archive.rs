@@ -4,7 +4,6 @@ use crate::manifest::MetadataChunk;
 use anyhow::{Context, Result};
 use fastcdc::v2020::StreamCDC;
 use rayon::prelude::*;
-use sha1::{Digest, Sha1};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -222,7 +221,7 @@ struct BaseIndex<'a> {
     by_raw: HashMap<&'a str, usize>,
     /// Base bundle by the chunk hashes of its frames, in order.
     bundles: HashMap<String, &'a str>,
-    /// Base file by path: content SHA-1, start in the base stream, length.
+    /// Base file by path: blob id, start in the base stream, length.
     files: HashMap<&'a [u8], (&'a [u8], usize, usize)>,
 }
 
@@ -503,14 +502,11 @@ struct Piece {
     size: usize,
     lo: usize,
     hi: usize,
-    sha1: bool,
 }
 
 /// Read pieces of blobs on several threads. Each blob must have the size the
-/// caller planned with. With `sha1`, a piece also returns its whole blob's
-/// SHA-1. Results keep the input order.
-#[allow(clippy::type_complexity)]
-fn read_pieces(mirror: &Path, pieces: Vec<Piece>) -> Result<Vec<(Vec<u8>, Option<[u8; 20]>)>> {
+/// caller planned with. Results keep the input order.
+fn read_pieces(mirror: &Path, pieces: Vec<Piece>) -> Result<Vec<Vec<u8>>> {
     let workers = crate::gix_util::default_worker_threads();
     crate::gix_util::parallel_map_repo(mirror, pieces, workers, |repo, piece| {
         let mut blob = repo
@@ -523,13 +519,11 @@ fn read_pieces(mirror: &Path, pieces: Vec<Piece>) -> Result<Vec<(Vec<u8>, Option
             blob.data.len(),
             piece.size
         );
-        let sha1 = piece.sha1.then(|| sha1_bytes(&blob.data));
-        let data = if piece.lo == 0 && piece.hi == blob.data.len() {
+        Ok(if piece.lo == 0 && piece.hi == blob.data.len() {
             std::mem::take(&mut blob.data)
         } else {
             blob.data[piece.lo..piece.hi].to_vec()
-        };
-        Ok((data, sha1))
+        })
     })
 }
 
@@ -603,31 +597,22 @@ impl Layout {
     }
 
     /// The metadata's files table: each file's fragments over `bounds`.
-    fn files_table(&self, sha1s: &[&[u8]], bounds: &[(usize, usize)]) -> Result<MetadataChunk> {
+    fn files_table(&self, bounds: &[(usize, usize)]) -> Result<MetadataChunk> {
         let mut manifest = MetadataChunk::new();
         manifest.gitlinks = self.gitlinks.clone();
         let mut hint = 0usize;
-        for (idx, (path, _, mode)) in self.blobs.iter().enumerate() {
+        for (idx, (path, oid, mode)) in self.blobs.iter().enumerate() {
             let (fragments, next) = fragments_for(bounds, self.starts[idx], self.sizes[idx], hint)?;
             hint = next;
             manifest.files.push(FileEntry {
                 path: path.clone(),
                 mode: *mode,
-                blob_sha1: sha1s[idx].to_vec(),
+                blob_sha1: oid.as_bytes().to_vec(),
                 fragments,
             });
         }
         Ok(manifest)
     }
-}
-
-/// Head's files table, when it lists exactly this tree's files in order.
-fn head_hashes<'h>(head: &'h MetadataChunk, blobs: &[Blob]) -> Option<Vec<&'h [u8]>> {
-    let aligned = head.files.len() == blobs.len()
-        && head.files.iter().zip(blobs).all(|(f, (path, _, mode))| {
-            f.path == *path && f.mode == *mode && f.blob_sha1.len() == 20
-        });
-    aligned.then(|| head.files.iter().map(|f| f.blob_sha1.as_slice()).collect())
 }
 
 /// An incremental build's plan: base frames to keep, as `(new_start,
@@ -732,15 +717,14 @@ impl ArchiveBuilder {
         let target_chunk_size = target_chunk_size.max(1);
         let layout = self.layout(commit)?;
         let mut compressed_frames: Vec<Vec<u8>> = Vec::new();
-        let (bounds, sha1s) = self.stream_frames(&layout, true, level, None, |frame| {
+        let bounds = self.stream_frames(&layout, level, None, |frame| {
             compressed_frames.push(frame.bytes.unwrap_or_default());
             Ok(())
         })?;
-        let sha1s: Vec<&[u8]> = sha1s.iter().map(|h| h.as_slice()).collect();
         let mut manifest = if layout.blobs.is_empty() {
             MetadataChunk::new()
         } else {
-            layout.files_table(&sha1s, &bounds)?
+            layout.files_table(&bounds)?
         };
         manifest.gitlinks = layout.gitlinks.clone();
 
@@ -797,28 +781,24 @@ impl ArchiveBuilder {
     /// Three stages overlap: a reader thread loads windows of blobs, several
     /// blobs at once; this thread cuts frames; a compressor thread compresses
     /// each batch of frames on all cores and passes them to `consume`. Memory
-    /// stays a few windows and batches, never the whole worktree. With
-    /// `sha1`, the reader also hashes each blob for the files table.
+    /// stays a few windows and batches, never the whole worktree.
     ///
-    /// Returns each frame's `(start, end)` and, with `sha1`, each blob's
-    /// SHA-1. A worktree of only empty files gets one empty frame.
-    #[allow(clippy::type_complexity)]
+    /// Returns each frame's `(start, end)`. A worktree of only empty files
+    /// gets one empty frame.
     fn stream_frames<C>(
         &self,
         layout: &Layout,
-        sha1: bool,
         level: i32,
         base: Option<&BaseIndex>,
         mut consume: C,
-    ) -> Result<(Vec<(usize, usize)>, Vec<[u8; 20]>)>
+    ) -> Result<Vec<(usize, usize)>>
     where
         C: FnMut(BuiltFrame) -> Result<()> + Send,
     {
         let mirror = self.mirror.as_path();
-        let (bounds, sha1s) = std::thread::scope(|scope| -> Result<_> {
+        let bounds = std::thread::scope(|scope| -> Result<_> {
             let (window_tx, window_rx) = mpsc::sync_channel::<Vec<Vec<u8>>>(2);
-            let reader = scope.spawn(move || -> Result<Vec<[u8; 20]>> {
-                let mut sha1s = Vec::new();
+            let reader = scope.spawn(move || -> Result<()> {
                 let mut i = 0usize;
                 while i < layout.blobs.len() {
                     let mut j = i;
@@ -835,20 +815,14 @@ impl ArchiveBuilder {
                             size: layout.sizes[k],
                             lo: 0,
                             hi: layout.sizes[k],
-                            sha1,
                         })
                         .collect();
-                    let mut window = Vec::with_capacity(j - i);
-                    for (data, hash) in read_pieces(mirror, pieces)? {
-                        window.push(data);
-                        sha1s.extend(hash);
-                    }
-                    if window_tx.send(window).is_err() {
+                    if window_tx.send(read_pieces(mirror, pieces)?).is_err() {
                         break;
                     }
                     i = j;
                 }
-                Ok(sha1s)
+                Ok(())
             });
 
             let (batch_tx, batch_rx) = mpsc::sync_channel::<Vec<Vec<u8>>>(1);
@@ -905,11 +879,11 @@ impl ArchiveBuilder {
                 .join()
                 .map_err(|_| anyhow::anyhow!("archive reader panicked"))?;
             compressed.context("compress archive frames")?;
-            let sha1s = read.context("read worktree blobs")?;
+            read.context("read worktree blobs")?;
             if let Some(e) = cut_error {
                 return Err(e);
             }
-            Ok((bounds, sha1s))
+            Ok(bounds)
         })?;
 
         let streamed = bounds.last().map_or(0, |b| b.1);
@@ -923,7 +897,7 @@ impl ArchiveBuilder {
             bounds.push((0, 0));
             consume(build_frame(&[], level, base)?)?;
         }
-        Ok((bounds, sha1s))
+        Ok(bounds)
     }
 
     /// Convenience: build from a repo string "owner/repo" by locating the bare
@@ -942,88 +916,22 @@ impl ArchiveBuilder {
         builder.build(commit, archive_path, manifest_path, level)
     }
 
-    /// Build only the metadata *files table* (path, mode, blob sha1) — no zstd
-    /// frames. Editable clones materialize the worktree from the HEAD-closure
-    /// packs, not the archive, so they only need this table; the expensive frame
-    /// compression is only needed for files mode. This still reads each blob (to
-    /// hash it) but skips compression, so it is much cheaper — letting Head
-    /// publish without waiting on Files. `frames` is left empty.
+    /// Build only the metadata *files table*: each file's path, mode and
+    /// blob id, from the tree alone. No blob is read, and `frames` is left
+    /// empty. Editable clones materialize the worktree from the Head packs, so
+    /// they need only this table.
     pub fn build_files_table(&self, commit: &str) -> Result<MetadataChunk> {
         let (repo, tree_id) = self.open_tree(commit)?;
         let mut blobs = Vec::new();
         let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
             .context("collect blobs for files table")?;
-
-        // Hash blobs in parallel. Many-file repos (e.g. node_modules) spend most
-        // of the files-table time reading/decompressing small blobs; per-thread
-        // gix handles share the mmap'd ODB and keep order deterministically.
-        let hashes =
-            hash_blobs_parallel(&self.mirror, blobs).context("hash blobs for files table")?;
-
         let mut manifest = MetadataChunk::new();
         manifest.gitlinks = gitlinks;
-        for (path, mode, blob_sha1) in hashes {
+        for (path, oid, mode) in blobs {
             manifest.files.push(FileEntry {
                 path,
                 mode,
-                blob_sha1,
-                fragments: Vec::new(),
-            });
-        }
-        Ok(manifest)
-    }
-
-    /// Incremental files table: like [`build_files_table`] but reuses the prior
-    /// table's content hash for every path NOT in `changed`, so only changed or
-    /// added blobs are read + hashed. `changed` is the set of paths that differ
-    /// from the previously synced commit (see [`crate::git::diff_name_set`]);
-    /// `prev_files` is the prior sync's files table. Paths are encoded exactly as
-    /// in [`build_files_table`] so prior entries match by path. Falls back to a
-    /// full hash for any path not found in the prior table.
-    ///
-    /// This is O(changed) blob reads instead of O(worktree), which is the bulk of
-    /// the depth=1 files-table cost on a re-sync.
-    pub fn build_files_table_incremental(
-        &self,
-        commit: &str,
-        prev_files: &[FileEntry],
-        changed: &std::collections::HashSet<Vec<u8>>,
-    ) -> Result<MetadataChunk> {
-        // Prior path -> content hash. Mode is always taken from the current tree
-        // walk (so a mode-only change is picked up even if we reuse the hash).
-        let prev: HashMap<&[u8], &[u8]> = prev_files
-            .iter()
-            .map(|f| (f.path.as_slice(), f.blob_sha1.as_slice()))
-            .collect();
-        let (repo, tree_id) = self.open_tree(commit)?;
-
-        // Paths are built from raw bytes at every level so they match
-        // `git diff -z` and the `changed` set exactly.
-        let mut blobs: Vec<Blob> = Vec::new();
-        let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
-            .context("walk git tree for incremental files table")?;
-
-        let mut manifest = MetadataChunk::new();
-        manifest.gitlinks = gitlinks;
-        for (path, blob_oid, mode) in blobs {
-            let reused = if changed.contains(&path) {
-                None
-            } else {
-                prev.get(path.as_slice()).map(|h| h.to_vec())
-            };
-            let blob_sha1 = match reused {
-                Some(h) => h,
-                None => {
-                    let blob = repo
-                        .find_blob(blob_oid)
-                        .with_context(|| format!("read blob {} for {:?}", blob_oid, path))?;
-                    sha1_bytes(&blob.data).to_vec()
-                }
-            };
-            manifest.files.push(FileEntry {
-                path,
-                mode,
-                blob_sha1,
+                blob_sha1: oid.as_bytes().to_vec(),
                 fragments: Vec::new(),
             });
         }
@@ -1032,13 +940,12 @@ impl ArchiveBuilder {
 
     /// Build the archive for `commit` into download bundles in `cas`.
     ///
-    /// `head` is Head's metadata for the same commit; its files table gives
-    /// every file's content SHA-1, so no blob is hashed here. `base` is the
-    /// ready Files build of an ancestor. With both, the build reads only the
-    /// changed bytes: a base frame that lies wholly inside a run of files
-    /// unchanged since the base (same path, same SHA-1) is kept, and only the
-    /// ranges between kept frames are read, cut and compressed. Without them,
-    /// or when more than half the bytes changed, or one changed range exceeds
+    /// `base` is the ready Files build of an ancestor. With it, the build
+    /// reads only the changed bytes: a base frame that lies wholly inside a
+    /// run of files unchanged since the base (same path, same blob id) is
+    /// kept, and only the ranges between kept frames are read, cut and
+    /// compressed. Without it, or when more than half the bytes changed, or
+    /// one changed range exceeds
     /// [`MAX_GAP_BYTES`], the whole worktree is streamed.
     ///
     /// Frames go into bundles that are cut by frame content, so bundles away
@@ -1051,7 +958,6 @@ impl ArchiveBuilder {
         cas: &Cas,
         storage: Option<&crate::storage::StorageRef>,
         level: i32,
-        head: Option<&MetadataChunk>,
         base: Option<&ArchiveBase>,
         bundle_size: u64,
     ) -> Result<ArchiveBuildOutput> {
@@ -1060,7 +966,6 @@ impl ArchiveBuilder {
         let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
             .context("walk git tree for archive")?;
         drop(repo);
-        let head_sha1s = head.and_then(|head| head_hashes(head, &blobs));
         let base_index = match base.map(BaseIndex::new).transpose() {
             Ok(index) => index,
             Err(e) => {
@@ -1068,51 +973,42 @@ impl ArchiveBuilder {
                 None
             }
         };
-        let plan = match (&head_sha1s, &base_index) {
-            (Some(sha1s), Some(index)) => self.plan_incremental(&blobs, sha1s, index)?,
-            _ => None,
+        let plan = match &base_index {
+            Some(index) => self.plan_incremental(&blobs, index)?,
+            None => None,
         };
 
         let incremental = plan.is_some();
         let mut bundler = Bundler::new(cas, storage, base_index.as_ref(), bundle_size);
-        let (layout, bounds, owned_sha1s, bytes_read) = match plan {
+        let (layout, bounds, bytes_read) = match plan {
             Some((plan, sizes)) => {
                 let layout = Layout::new(blobs, gitlinks, sizes)?;
                 let base = base_index
                     .as_ref()
                     .context("incremental plan without a base")?;
                 let (bounds, read) = self.build_gaps(&layout, &plan, level, base, &mut bundler)?;
-                (layout, bounds, Vec::new(), read)
+                (layout, bounds, read)
             }
             None => {
                 let sizes = blob_sizes(&self.mirror, blobs.iter().map(|b| b.1).collect())?;
                 let layout = Layout::new(blobs, gitlinks, sizes)?;
-                let (bounds, sha1s) = self.stream_frames(
-                    &layout,
-                    head_sha1s.is_none(),
-                    level,
-                    base_index.as_ref(),
-                    |frame| bundler.push(frame),
-                )?;
+                let bounds = self.stream_frames(&layout, level, base_index.as_ref(), |frame| {
+                    bundler.push(frame)
+                })?;
                 let total = layout.total;
-                (layout, bounds, sha1s, total)
+                (layout, bounds, total)
             }
         };
         let (bundles, new_bundles, infos, frames, mut reuse) = bundler.finish()?;
         reuse.incremental = incremental;
         reuse.bytes_read = bytes_read as u64;
 
-        let owned: Vec<&[u8]> = owned_sha1s.iter().map(|h| h.as_slice()).collect();
-        let sha1s: &[&[u8]] = match &head_sha1s {
-            Some(sha1s) => sha1s,
-            None => &owned,
-        };
         let mut metadata = if layout.blobs.is_empty() {
             let mut metadata = MetadataChunk::new();
             metadata.gitlinks = layout.gitlinks.clone();
             metadata
         } else {
-            layout.files_table(sha1s, &bounds)?
+            layout.files_table(&bounds)?
         };
         metadata.frames = infos;
         Ok(ArchiveBuildOutput {
@@ -1130,7 +1026,6 @@ impl ArchiveBuilder {
     fn plan_incremental(
         &self,
         blobs: &[Blob],
-        sha1s: &[&[u8]],
         base: &BaseIndex,
     ) -> Result<Option<(Plan, Vec<usize>)>> {
         // A file is unchanged when the base has the same path with the same
@@ -1139,9 +1034,9 @@ impl ArchiveBuilder {
         let mut sizes = vec![0usize; blobs.len()];
         let mut old_starts: Vec<Option<usize>> = vec![None; blobs.len()];
         let mut unknown = Vec::new();
-        for (idx, (path, _, _)) in blobs.iter().enumerate() {
+        for (idx, (path, oid, _)) in blobs.iter().enumerate() {
             match base.files.get(path.as_slice()) {
-                Some(&(sha1, start, len)) if sha1 == sha1s[idx] => {
+                Some(&(id, start, len)) if id == oid.as_bytes() => {
                     sizes[idx] = len;
                     old_starts[idx] = Some(start);
                 }
@@ -1328,7 +1223,6 @@ impl ArchiveBuilder {
                         size,
                         lo: g0.max(start) - start,
                         hi: g1.min(start + size) - start,
-                        sha1: false,
                     });
                     owners.push(g);
                 }
@@ -1339,7 +1233,7 @@ impl ArchiveBuilder {
             .iter()
             .map(|&(g0, g1)| Vec::with_capacity(g1 - g0))
             .collect();
-        for ((data, _), g) in read_pieces(&self.mirror, pieces)?.into_iter().zip(owners) {
+        for (data, g) in read_pieces(&self.mirror, pieces)?.into_iter().zip(owners) {
             buffers[g].extend_from_slice(&data);
         }
         let mut cuts = Vec::new();
@@ -1362,10 +1256,6 @@ impl ArchiveBuilder {
             })
             .collect()
     }
-}
-
-pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
-    Sha1::digest(data).into()
 }
 
 /// Collect every blob in `tree_id` as `(raw_path_bytes, blob_oid, mode)` in
@@ -1402,38 +1292,6 @@ fn collect_blobs_raw_gix(
         ));
     }
     Ok(gitlinks)
-}
-
-/// Hash a list of `(path, blob_oid, mode)` tuples in parallel using scoped OS
-/// threads and per-chunk gix handles. Results keep the input order so the
-/// manifest order stays deterministic.
-fn hash_blobs_parallel(
-    mirror: &std::path::Path,
-    blobs: Vec<Blob>,
-) -> anyhow::Result<Vec<(Vec<u8>, u32, Vec<u8>)>> {
-    const PARALLEL_HASH_THRESHOLD: usize = 64;
-
-    if blobs.len() < PARALLEL_HASH_THRESHOLD {
-        let repo = crate::gix_util::open_repo(mirror)?;
-        return blobs
-            .into_iter()
-            .map(|(path, oid, mode)| {
-                let blob = repo.find_blob(oid).with_context(|| {
-                    format!("read blob {} for {}", oid, String::from_utf8_lossy(&path))
-                })?;
-                Ok((path, mode, sha1_bytes(&blob.data).to_vec()))
-            })
-            .collect::<anyhow::Result<Vec<_>>>();
-    }
-
-    let num_workers =
-        crate::gix_util::worker_threads("hash", crate::gix_util::default_worker_threads());
-    crate::gix_util::parallel_map_repo(mirror, blobs, num_workers, |repo, (path, oid, mode)| {
-        let blob = repo
-            .find_blob(*oid)
-            .with_context(|| format!("read blob {} for {}", oid, String::from_utf8_lossy(path)))?;
-        Ok((path.clone(), *mode, sha1_bytes(&blob.data).to_vec()))
-    })
 }
 
 #[cfg(test)]
@@ -1503,15 +1361,7 @@ mod tests {
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let out = ArchiveBuilder::new(tmp.path())
-            .build_into_cas(
-                &commit,
-                &cas,
-                None,
-                6,
-                None,
-                None,
-                DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
+            .build_into_cas(&commit, &cas, None, 6, None, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         assert!(
             out.archive_frames.len() >= 3,
@@ -1540,15 +1390,14 @@ mod tests {
         bundle_size: u64,
     }
 
-    /// Build `commit` against `prior` with Head's files table, as the server
-    /// does, and check the result: it decompresses to the worktree, its files
-    /// table matches a full one, and it read and wrote less than everything.
+    /// Build `commit` against `prior` and check the result: its files table
+    /// matches a fresh one, and it read and wrote less than everything.
     fn build_on(
         prior: &Prior,
         storage: Option<&crate::storage::StorageRef>,
         commit: &str,
     ) -> Result<ArchiveBuildOutput> {
-        let head = prior.builder.build_files_table(commit).unwrap();
+        let table = prior.builder.build_files_table(commit).unwrap();
         let base = ArchiveBase {
             frames: &prior.out.archive_frames,
             metadata: &prior.out.metadata,
@@ -1559,7 +1408,6 @@ mod tests {
             prior.cas,
             storage,
             3,
-            Some(&head),
             Some(&base),
             prior.bundle_size,
         )?;
@@ -1569,7 +1417,7 @@ mod tests {
                 .map(|f| (f.path.clone(), f.mode, f.blob_sha1.clone()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(fl(&out.metadata), fl(&head), "files table");
+        assert_eq!(fl(&out.metadata), fl(&table), "files table");
         Ok(out)
     }
 
@@ -1654,7 +1502,7 @@ mod tests {
         let builder = ArchiveBuilder::new(tmp.path()).with_cdc(SMALL_CDC);
         let c1 = commit_onto(&repo, &as_refs(&base));
         let out = builder
-            .build_into_cas(&c1, &cas, None, 3, None, None, SMALL_BUNDLE)
+            .build_into_cas(&c1, &cas, None, 3, None, SMALL_BUNDLE)
             .unwrap();
         assert!(
             out.archive_frames.len() > 15 && out.download_bundle_hashes.len() > 3,
@@ -1729,7 +1577,7 @@ mod tests {
         // Bundles of several frames, so frames next to the edit move.
         let bundle_size = 16 * SMALL_BUNDLE;
         let out = builder
-            .build_into_cas(&c1, &cas, None, 3, None, None, bundle_size)
+            .build_into_cas(&c1, &cas, None, 3, None, bundle_size)
             .unwrap();
         for hash in &out.download_bundle_hashes {
             storage.put(hash, &cas.get(hash).unwrap()).unwrap();
@@ -1798,49 +1646,6 @@ mod tests {
         crate::test_fixture::commit(repo, files)
     }
 
-    /// The incremental files table (prior table + diff) must be byte-identical to
-    /// a full rebuild at the new commit. A false "unchanged" would reuse a stale
-    /// content hash — silently wrong — so this equivalence is the safety net.
-    #[test]
-    fn incremental_files_table_matches_full() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = crate::test_fixture::init_bare(tmp.path());
-        // c1: a, b, dir/c. c2: modify b, add dir/e, remove dir/c, keep a.
-        let c1 = commit_onto(
-            &repo,
-            &[("a.txt", b"aaa"), ("b.txt", b"bbb"), ("dir/c.txt", b"ccc")],
-        );
-        let c2 = commit_onto(
-            &repo,
-            &[
-                ("a.txt", b"aaa"),
-                ("b.txt", b"BBB-changed"),
-                ("dir/e.txt", b"eee"),
-            ],
-        );
-
-        let builder = ArchiveBuilder::new(tmp.path());
-        let prev = builder.build_files_table(&c1).unwrap();
-        let full = builder.build_files_table(&c2).unwrap();
-        let changed = crate::git::diff_name_set(tmp.path(), &c1, &c2).unwrap();
-        let inc = builder
-            .build_files_table_incremental(&c2, &prev.files, &changed)
-            .unwrap();
-
-        let sort = |m: &MetadataChunk| {
-            let mut v: Vec<(Vec<u8>, u32, Vec<u8>)> = m
-                .files
-                .iter()
-                .map(|f| (f.path.clone(), f.mode, f.blob_sha1.clone()))
-                .collect();
-            v.sort();
-            v
-        };
-        assert_eq!(sort(&inc), sort(&full), "incremental table != full table");
-        // Sanity: the changed set drove a real diff (b modified, e added, c removed).
-        assert!(changed.contains(b"b.txt".as_slice()));
-    }
-
     /// `len` well-mixed (CDC-cuttable) bytes: splitmix64, eight bytes per step.
     fn mix_blob(seed: u64, len: usize) -> Vec<u8> {
         let mut blob = Vec::with_capacity(len + 8);
@@ -1870,49 +1675,6 @@ mod tests {
     /// Helper to commit files with explicit git modes (e.g. symlinks, executables).
     fn commit_with_modes(repo: &gix::Repository, files: &[(&str, u32, &[u8])]) -> String {
         crate::test_fixture::commit_with_modes(repo, files)
-    }
-
-    /// Regression: a non-UTF8 filename whose CONTENT changes must get a fresh
-    /// content hash in the incremental table, never the stale prior hash. The
-    /// raw-byte walk keeps the walk path byte-equal to `git diff -z` output so the
-    /// change is detected. (With a lossy UTF-8 walk key, the changed path would
-    /// not match and the old hash would be silently reused.)
-    #[test]
-    fn incremental_files_table_non_utf8_change_not_stale() {
-        let weird: &[u8] = b"caf\xe9.txt"; // invalid UTF-8 (Latin-1 é)
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = crate::test_fixture::init_bare(tmp.path());
-        let c1 = commit_onto_bytes(&repo, &[(b"a.txt", b"a"), (weird, b"v1")]);
-        let c2 = commit_onto_bytes(&repo, &[(b"a.txt", b"a"), (weird, b"v2-changed")]);
-
-        let builder = ArchiveBuilder::new(tmp.path());
-        let prev = builder.build_files_table(&c1).unwrap();
-        let changed = crate::git::diff_name_set(tmp.path(), &c1, &c2).unwrap();
-        let inc = builder
-            .build_files_table_incremental(&c2, &prev.files, &changed)
-            .unwrap();
-
-        // The diff must report the raw non-UTF8 path.
-        assert!(
-            changed.contains(weird),
-            "diff must report the non-UTF8 changed path"
-        );
-        // The incremental entry for the raw path must carry the NEW content hash.
-        let entry = inc
-            .files
-            .iter()
-            .find(|f| f.path == weird)
-            .expect("non-UTF8 entry present with raw path");
-        assert_eq!(
-            entry.blob_sha1,
-            sha1_bytes(b"v2-changed").to_vec(),
-            "must be the fresh hash, not the stale v1 hash"
-        );
-        assert_ne!(
-            entry.blob_sha1,
-            sha1_bytes(b"v1").to_vec(),
-            "must not reuse the stale prior hash"
-        );
     }
 
     /// Modes other than 100644 (regular files) must survive the gix tree walk:
@@ -2062,15 +1824,7 @@ mod tests {
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let output = builder
-            .build_into_cas(
-                &commit,
-                &cas,
-                None,
-                1,
-                None,
-                None,
-                DEFAULT_ARCHIVE_CHUNK_SIZE,
-            )
+            .build_into_cas(&commit, &cas, None, 1, None, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         assert_eq!(output.download_bundle_hashes.len(), 1);
         assert_eq!(
@@ -2157,8 +1911,8 @@ mod tests {
         let builder = ArchiveBuilder::new(tmp.path());
         let layout = builder.layout(&commit).unwrap();
         let mut frames = 0usize;
-        let (stream_bounds, sha1s) = builder
-            .stream_frames(&layout, true, 1, None, |_| {
+        let stream_bounds = builder
+            .stream_frames(&layout, 1, None, |_| {
                 frames += 1;
                 Ok(())
             })
@@ -2175,10 +1929,30 @@ mod tests {
             stream_bounds.len() >= 3,
             "test data should span many frames"
         );
-        let table = builder.build_files_table(&commit).unwrap();
-        let expected: Vec<Vec<u8>> = table.files.iter().map(|f| f.blob_sha1.clone()).collect();
-        let got: Vec<Vec<u8>> = sha1s.iter().map(|h| h.to_vec()).collect();
-        assert_eq!(got, expected, "blob SHA-1s");
+    }
+
+    /// The files table keys each file by its git blob id, the same id
+    /// `git rev-parse <commit>:<path>` reports, so clients can match pack
+    /// objects and check extracted files against it.
+    #[test]
+    fn files_table_uses_git_blob_ids() {
+        let (tmp, commit) = commit_files(&[("a.txt", b"hello\n"), ("dir/empty", b"")]);
+        let table = ArchiveBuilder::new(tmp.path())
+            .build_files_table(&commit)
+            .unwrap();
+        assert_eq!(table.files.len(), 2);
+        for f in &table.files {
+            let path = String::from_utf8(f.path.clone()).unwrap();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["rev-parse", &format!("{commit}:{path}")])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let id = String::from_utf8(out.stdout).unwrap();
+            assert_eq!(hex::encode(&f.blob_sha1), id.trim(), "{path}");
+        }
     }
 
     /// A non-UTF8 filename must survive into the archive manifest byte-exact (the

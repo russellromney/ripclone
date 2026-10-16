@@ -85,7 +85,7 @@ fn main() {
 
     let t = std::time::Instant::now();
     let result = builder
-        .build_into_cas(&commit, &cas, None, 3, None, None, 4 * 1024 * 1024)
+        .build_into_cas(&commit, &cas, None, 3, None, 4 * 1024 * 1024)
         .expect("archive build");
     let elapsed = t.elapsed();
 

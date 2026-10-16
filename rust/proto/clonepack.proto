@@ -121,7 +121,7 @@ message FileEntry {
   bytes path = 1;
   // Git mode, e.g. 0o100644 or 0o120000.
   uint32 mode = 2;
-  // 20-byte SHA-1 of the git blob.
+  // The blob's 20-byte git object id.
   bytes blob_sha1 = 3;
   // Fragments making up this file, in order.
   repeated Fragment fragments = 4;
