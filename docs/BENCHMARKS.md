@@ -78,8 +78,18 @@ from Tigris. 1000 Mbps, median of 3:
 
 The first run of each mode was 2–5× slower (bun full 7.8 s, pandas full 7.0 s)
 because the objects were not yet in Tigris's cache near the client. The later
-runs were 10–80% slower than local disk. pandas full is the slowest case: its
-history is one 326 MiB pack, so one stream from Tigris limits it.
+runs were 10–80% slower than local disk. pandas full was the slowest case: its
+history is one 326 MiB pack, and one stream from Tigris runs at about 55 MB/s.
+
+The client now downloads a large file as 16 MiB ranges, 16 at a time
+(`7f95c99`). Full clones from Tigris on the build server, before and after,
+in seconds:
+
+| repo | one stream | ranges |
+|---|---|---|
+| `torvalds/linux` (6.1 GiB pack) | 112, 115, 132 | 24, 26, 27 |
+| `pandas-dev/pandas` | 2.8, 3.5, 4.0, 4.1 | 1.5, 1.6, 1.6, 2.6 |
+| `oven-sh/bun` | 2.2, 3.4, 3.6, 8.6 | 2.2, 2.2, 2.4, 3.1 |
 
 ## Build time
 
@@ -98,15 +108,18 @@ Cold, the first build of a repository, in seconds:
 
 A cold build is mostly the first fetch of the repository's history. Here that
 came from a local mirror; from GitHub it takes as long as a full `git clone`.
+A cold Full stores the pack that first fetch wrote, rather than packing the
+history again: on Linux with Tigris storage, Full is now ready 60 s after
+Head instead of 175 s.
 
 After the first build, each output builds from the newest ready ancestor's,
 so a push costs only what changed. Under the steady load below, the median
-time from push to ready was, in seconds:
+time from push to ready was, in seconds (polled every 2 s):
 
 | repo | Head | Files | Full |
 |---|---|---|---|
-| `pandas-dev/pandas` | 1.8 | 3.5 | 5.3 |
-| `torvalds/linux` | 3.7 | 7.2 | 17.9 |
+| `pandas-dev/pandas` | 1.0 | 3.0 | 3.0 |
+| `torvalds/linux` | 3.0 | 3.0 | 4.8 |
 
 Head and Files for a new push don't wait for an earlier push's Full. A
 repository's Fulls run one at a time, in the order its commits were admitted.
@@ -126,34 +139,51 @@ throughout. The workload had three phases:
 - **steady:** 132 pushes of real upstream commits, round-robin, one every 6 s;
 - **storm:** 44 pushes at once, 4 per repository.
 
-The table compares the release before incremental bases (`1462be1`) with the
-current server (`2d156cc`), on the same machine and workload. Times are from
-push to ready, in seconds. rust-lang/rust is left out of the comparison
-because every build of it failed on `1462be1`: its submodule broke Head.
+The table compares the release before incremental bases (`1462be1`), the
+release after them (`2d156cc`), and the current server (`7f95c99`), on the
+same machine and workload. Times are from push to ready, in seconds; the
+driver polled every 2 s, so short times are coarse. rust-lang/rust is left out
+of the comparison because every build of it failed on `1462be1`: its submodule
+broke Head.
 
-| | `1462be1` | `2d156cc` |
-|---|---|---|
-| steady, Head p50 | 6.3 | 2.9 |
-| steady, Files p90 | 33 | 7.8 |
-| steady, Full p50 | 2406 | 8.8 |
-| steady, Full p90 | 3872 | 17.6 |
-| storm, all 44 pushes ready | 1800 | 173 |
-| cold, all 11 repositories ready | 1731 | 1214 |
-| disk written | 562 GB | 32 GB |
-| uploaded to storage | 286 GB | 42 GB |
-| failed builds | every rust build, 3 vscode | 0 |
-| failed clones during the run | 1 of 657 | 0 of 90 |
-| API p99, ms | 6 | 13 |
+| | `1462be1` | `2d156cc` | `7f95c99` |
+|---|---|---|---|
+| steady, Head p50 | 6.3 | 2.9 | 2.8 |
+| steady, Files p90 | 33 | 7.8 | 4.8 |
+| steady, Full p50 | 2406 | 8.8 | 3.0 |
+| steady, Full p90 | 3872 | 17.6 | 5.0 |
+| storm, all 44 pushes ready | 1800 | 173 | 53 |
+| cold, all 11 repositories ready | 1731 | 1214 | 989 |
+| disk written | 562 GB | 32 GB | 32 GB |
+| uploaded to storage | 286 GB | 42 GB | 23 GB |
+| failed builds | every rust build, 3 vscode | 0 | 0 |
+| failed clones during the run | 1 of 657 | 0 of 90 | 0 of 152 |
+| API p99, ms | 6 | 13 | 7 |
 
-On `2d156cc` the steady pushes cost, on average, 2.0 s of Head, 2.3 s of
-Files and 3.4 s of Full build time, and the CPU was 15% busy. On `1462be1`
-each Linux push rebuilt Full from scratch: about 7 minutes and a new 6.7 GB
-upload per push, with every other repository's Full queued behind it.
+From `2d156cc` to `7f95c99`:
 
-The cold phase is mostly the first fetch: about 600 s each for Linux and
-nixpkgs from local test mirrors that had no reachability bitmaps, so the
-mirror had to enumerate every object. GitHub serves from bitmaps.
-`2d156cc` ran with one Full slot; the default is now two on 8 cores.
+- Head, Files and Full of a commit build at the same time. Full waits only
+  for Head, whose packs it reuses, so it no longer queues behind Files.
+  `2d156cc` ran with one Full slot; `7f95c99` ran with the default two.
+- Files keys files by their git blob ids, so a cold Head no longer hashes
+  every blob (1.8 GB on Linux).
+- Less is uploaded: Full has no idx bundle, the skeleton pack and the
+  separate index upload are gone, and metadata is stored compressed. Large
+  uploads go up as 16 parallel parts, and Head fetches the idx files it
+  lacks at once.
+- A steady push cost, on average, 1.4 s of Head, 2.0 s of Files and 0.7 s of
+  Full build time (was 2.0, 2.3 and 3.2 s), and the CPU was 9% busy instead
+  of 15%. Under the storm it was 50% busy instead of 25%: more of the builds
+  ran at once.
+
+On `1462be1` each Linux push rebuilt Full from scratch: about 7 minutes and a
+new 6.7 GB upload per push, with every other repository's Full queued behind
+it.
+
+The cold phase is mostly the first fetch: Linux and nixpkgs took 680–800 s
+to Head, nearly all of it fetching from local test mirrors that had no
+reachability bitmaps, so the mirror had to enumerate every object. GitHub
+serves from bitmaps.
 
 ## Why ripclone is faster
 
