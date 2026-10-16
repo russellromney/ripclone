@@ -38,47 +38,16 @@ impl<'a> PackBuilder<'a> {
         }
     }
 
-    /// Build a skeleton pack limited to `max_depth` commits. `max_depth = None`
-    /// is the full history; `Some(1)` produces a depth=1 skeleton.
-    pub fn build_skeleton_pack_with_depth(
-        &self,
-        commit: &str,
-        max_depth: Option<usize>,
-    ) -> Result<(String, String)> {
-        let shas = git::list_object_shas_with_depth(&self.repo, commit, max_depth)?;
-        let types = git::classify_objects(&self.repo, &shas.iter().cloned().collect())?;
-        let mut skeleton_shas: Vec<String> = shas
-            .into_iter()
-            .filter(|sha| {
-                matches!(
-                    types.get(sha).map(|s| s.as_str()),
-                    Some("commit") | Some("tree")
-                )
-            })
-            .collect();
-
-        let symlink_shas = git::symlink_blob_shas(&self.repo, commit)?;
-        skeleton_shas.extend(symlink_shas);
-
-        self.pack_and_index(&skeleton_shas)
-    }
-
-    /// Build a depth=1 skeleton pack (single commit + HEAD trees + symlinks).
-    pub fn build_shallow_skeleton_pack(&self, commit: &str) -> Result<(String, String)> {
-        self.build_skeleton_pack_with_depth(commit, Some(1))
-    }
-
-    /// Build a ready-to-use `.git/index` for `commit` and store it in the CAS.
+    /// Build a ready-to-use `.git/index` for `commit`.
     ///
     /// The index contains every tracked path with `skip-worktree` set and
     /// accurate cached blob sizes. After the client materializes files it must
     /// clear skip-worktree for those paths.
-    pub fn build_prebuilt_index(&self, commit: &str) -> Result<String> {
+    pub fn build_prebuilt_index(&self, commit: &str) -> Result<Vec<u8>> {
         let tmp = tempfile::TempDir::new()?;
         let index_path = tmp.path().join("index");
         git::write_prebuilt_index(&self.repo, commit, &index_path)?;
-        let (hash, _) = self.cas.install_file(&index_path)?;
-        Ok(hash)
+        Ok(std::fs::read(&index_path)?)
     }
 
     /// Build just the HEAD closure (undeltified small packs) — the depth=1
@@ -320,23 +289,14 @@ impl<'a> PackBuilder<'a> {
         let cancel = crate::cancel::Cancel::current().unwrap_or_default();
         batches
             .par_iter()
-            .map(|batch| cancel.enter(|| self.pack_and_index_inner(batch, true)))
+            .map(|batch| cancel.enter(|| self.pack_undeltified(batch)))
             .collect()
-    }
-
-    fn pack_and_index(&self, object_shas: &[String]) -> Result<(String, String)> {
-        let (ph, _, ih, _) = self.pack_and_index_inner(object_shas, false)?;
-        Ok((ph, ih))
     }
 
     /// Pack `object_shas` and store the pack + idx in the CAS. Returns
     /// `(pack_hash, pack_len, idx_hash, idx_len)` — the lengths come straight
     /// from the bytes we already read, so callers never re-`get` from the CAS.
-    fn pack_and_index_inner(
-        &self,
-        object_shas: &[String],
-        undeltified: bool,
-    ) -> Result<(String, u64, String, u64)> {
+    fn pack_undeltified(&self, object_shas: &[String]) -> Result<(String, u64, String, u64)> {
         if object_shas.is_empty() {
             bail!("no objects to pack");
         }
@@ -344,11 +304,7 @@ impl<'a> PackBuilder<'a> {
 
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
-        if undeltified {
-            git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
-        } else {
-            git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;
-        }
+        git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
         let mut packs = self.store_packs_from_dir(tmp.path())?;
         anyhow::ensure!(packs.len() == 1, "pack-objects wrote {} packs", packs.len());
         Ok(packs.remove(0))

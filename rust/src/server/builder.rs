@@ -76,8 +76,6 @@ pub struct SyncPhases {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_packs_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub skeleton_build_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub files_table_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prebuilt_index_ms: Option<u64>,
@@ -94,7 +92,6 @@ impl From<&SyncPhases> for SyncPhaseMetrics {
         Self {
             mirror_fetch_ms: phases.mirror_fetch_ms,
             head_packs_ms: phases.head_packs_ms,
-            skeleton_build_ms: phases.skeleton_build_ms,
             files_table_ms: phases.files_table_ms,
             prebuilt_index_ms: phases.prebuilt_index_ms,
             upload_head_ms: phases.upload_head_ms,
@@ -452,18 +449,9 @@ pub(super) async fn build_head_result(
     let uploads = Uploads::new(cas, storage);
     let cas = &uploads.cas();
 
-    // Build the Head closure and shallow skeleton.
+    // The prebuilt index, the Head packs and the files table each read the
+    // commit's tree from the mirror, so they build at once.
     let t = Instant::now();
-    let sk_start = Instant::now();
-    let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-    let shallow_skeleton_handle = cancel::spawn_blocking(move || {
-        let s = Instant::now();
-        let r = PackBuilder::new(&md1, &c1).build_shallow_skeleton_pack(&cm1);
-        info!("Head skeleton {:?}", s.elapsed());
-        r
-    });
-    // The prebuilt index reads the commit's tree from the mirror, so it builds
-    // alongside the skeleton rather than after it.
     let (md4, c4, cm4) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let prebuilt_index_handle = cancel::spawn_blocking(move || {
         let s = Instant::now();
@@ -595,16 +583,12 @@ pub(super) async fn build_head_result(
             r
         }),
     };
-    let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
-        .await
-        .context("shallow skeleton")??;
-    phases.skeleton_build_ms = Some(duration_ms(sk_start.elapsed()));
     let head_built = head_handle.await.context("head packs")??;
     phases.head_packs_ms = Some(head_built.elapsed_ms);
     let head_packs = head_built.all_packs.clone();
     let metadata_base = files_table_handle.await.context("files table")??;
     phases.files_table_ms = Some(duration_ms(ft_start.elapsed()));
-    info!("Head result: packs+skeleton+files-table {:?}", t.elapsed());
+    info!("Head result: packs+files-table {:?}", t.elapsed());
 
     let (shallow_prebuilt_index, prebuilt_index_ms) = prebuilt_index_handle
         .await
@@ -619,21 +603,12 @@ pub(super) async fn build_head_result(
         commit.to_string(),
         parent.clone(),
     );
-    let (fsk_pack, fsk_idx, fprebuilt, fpacks, all_built) = (
-        shallow_skeleton_pack.clone(),
-        shallow_skeleton_idx.clone(),
-        shallow_prebuilt_index.clone(),
-        head_packs.clone(),
-        head_built.all_local,
-    );
+    let (fpacks, all_built) = (head_packs.clone(), head_built.all_local);
     let (shallow_metadata_hash, shallow_clonepack_hash, head_idx_bundle_hash, head_midx_hash) =
         cancel::spawn_blocking(move || -> Result<(String, String, String, String)> {
             let (cas, storage) = (&fc, &fs);
             let mut shallow_meta = metadata_base;
-            // Built moments ago by this build.
-            shallow_meta.skeleton_pack = cas.read_fresh(&fsk_pack)?;
-            shallow_meta.skeleton_idx = cas.read_fresh(&fsk_idx)?;
-            shallow_meta.prebuilt_index = cas.read_fresh(&fprebuilt)?;
+            shallow_meta.prebuilt_index = shallow_prebuilt_index;
             let shallow_meta_data = shallow_meta.encode_to_vec();
             let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
 
@@ -677,9 +652,6 @@ pub(super) async fn build_head_result(
         clonepack: crate::ClonepackArtifacts {
             manifest: shallow_clonepack_hash.clone(),
             metadata_chunk: shallow_metadata_hash.clone(),
-            skeleton_pack: shallow_skeleton_pack.clone(),
-            skeleton_idx: shallow_skeleton_idx.clone(),
-            prebuilt_index: shallow_prebuilt_index.clone(),
             midx: head_midx_hash.clone(),
             idx_bundle: head_idx_bundle_hash.clone(),
             commit: commit.to_string(),
@@ -690,13 +662,10 @@ pub(super) async fn build_head_result(
         base_packs: head_built.base_packs.clone(),
     };
 
-    // Upload Head artifacts (shallow skeleton/index/metadata, head idx-bundle
-    // + midx, shallow manifest, and only the FRESHLY BUILT head packs+idx).
+    // Upload Head artifacts (metadata, idx bundle, MIDX, manifest, and only
+    // the freshly built head packs and idx).
     // Reused bucket packs are already durable in storage from a prior sync.
     let mut head_uploads: Vec<String> = vec![
-        shallow_skeleton_pack.clone(),
-        shallow_skeleton_idx.clone(),
-        shallow_prebuilt_index.clone(),
         shallow_metadata_hash.clone(),
         shallow_clonepack_hash.clone(),
         head_idx_bundle_hash.clone(),
@@ -807,8 +776,7 @@ fn measure_storage_amplification(
         }
     }
 
-    // Metadata: manifests, metadata chunks, skeleton/index, prebuilt index,
-    // idx bundle, and MIDX.
+    // Metadata: manifests, metadata chunks, idx bundle, and MIDX.
     for artifacts in [
         info.head.as_ref().map(|result| &result.clonepack),
         info.full.as_ref().map(|result| &result.clonepack),
@@ -820,9 +788,6 @@ fn measure_storage_amplification(
         for hash in [
             &artifacts.manifest,
             &artifacts.metadata_chunk,
-            &artifacts.skeleton_pack,
-            &artifacts.skeleton_idx,
-            &artifacts.prebuilt_index,
             &artifacts.idx_bundle,
             &artifacts.midx,
         ] {
@@ -1095,9 +1060,6 @@ pub(super) async fn build_full_result(
         clonepack: crate::ClonepackArtifacts {
             manifest: manifest_hash,
             metadata_chunk: head.clonepack.metadata_chunk.clone(),
-            skeleton_pack: head.clonepack.skeleton_pack.clone(),
-            skeleton_idx: head.clonepack.skeleton_idx.clone(),
-            prebuilt_index: head.clonepack.prebuilt_index.clone(),
             midx: String::new(),
             idx_bundle: String::new(),
             commit: commit.to_string(),
@@ -1109,7 +1071,7 @@ pub(super) async fn build_full_result(
 }
 
 /// Build and upload the Files result. Head's metadata for the same commit
-/// gives the files table and skeleton. `parent_files`, a ready Files result
+/// gives the files table. `parent_files`, a ready Files result
 /// of an ancestor and its commit, lets the archive read only changed bytes
 /// and reuse its unchanged frames and bundles.
 #[allow(clippy::too_many_arguments)]
@@ -1148,10 +1110,7 @@ pub(super) async fn build_files_result(
     phases.record("base_files", start);
 
     let start = Instant::now();
-    // A files clone writes no `.git`, so Files metadata carries no skeleton
-    // or index.
-    head_metadata.skeleton_pack.clear();
-    head_metadata.skeleton_idx.clear();
+    // A files clone writes no `.git`, so Files metadata carries no index.
     head_metadata.prebuilt_index.clear();
     let (archive_mirror, archive_cas, archive_storage, archive_commit) = (
         mirror_dir.to_path_buf(),
@@ -1227,9 +1186,6 @@ pub(super) async fn build_files_result(
         clonepack: crate::ClonepackArtifacts {
             manifest: manifest_hash,
             metadata_chunk: metadata_hash,
-            skeleton_pack: head.clonepack.skeleton_pack.clone(),
-            skeleton_idx: head.clonepack.skeleton_idx.clone(),
-            prebuilt_index: head.clonepack.prebuilt_index.clone(),
             midx: String::new(),
             idx_bundle: String::new(),
             commit: commit.to_string(),

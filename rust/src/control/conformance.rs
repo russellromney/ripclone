@@ -97,9 +97,6 @@ fn artifacts(commit: &str, label: &str) -> ClonepackArtifacts {
     ClonepackArtifacts {
         manifest: hash("manifest"),
         metadata_chunk: hash("metadata"),
-        skeleton_pack: hash("skeleton-pack"),
-        skeleton_idx: hash("skeleton-idx"),
-        prebuilt_index: hash("index"),
         idx_bundle: hash("idx-bundle"),
         commit: commit.to_string(),
         ..Default::default()
