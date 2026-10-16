@@ -148,6 +148,36 @@ pub fn parent_commit<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<Optio
     })
 }
 
+/// The objects of `commit`'s depth-1 closure in path order: the commit, its
+/// trees, then its blobs, each in depth-first tree order and listed once.
+/// Head packs are cut from this list, so the files of one directory share
+/// packs and a push that edits a few directories leaves most packs live.
+pub fn list_head_objects<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<Vec<String>> {
+    let repo = open_repo(repo_path)?;
+    let id = repo
+        .rev_parse_single(commit)
+        .with_context(|| format!("resolving commit '{}'", commit))?;
+    let commit_obj = repo
+        .find_commit(id)
+        .with_context(|| format!("find commit {id}"))?;
+    let tree = commit_obj.tree_id()?.detach();
+    let mut collector = OidCollector::new();
+    collector.oids.insert(tree);
+    collector.trees.push(tree);
+    gix::traverse::tree::depthfirst(
+        tree,
+        gix::traverse::tree::depthfirst::State::default(),
+        &repo.objects,
+        &mut collector,
+    )
+    .context("tree traversal")?;
+    Ok(std::iter::once(id.detach())
+        .chain(collector.trees)
+        .chain(collector.blobs)
+        .map(|oid| oid.to_string())
+        .collect())
+}
+
 /// List every object reachable from `commit`, optionally limiting the number of
 /// commits walked (`max_depth`). The returned list includes each walked commit
 /// plus the full tree/blob closure reachable from those commits, deduplicated
@@ -276,12 +306,17 @@ fn mode_to_object_type(mode: &EntryMode) -> String {
 
 struct OidCollector {
     oids: HashSet<gix::hash::ObjectId>,
+    /// Trees and blobs, each once, in the order the walk first met them.
+    trees: Vec<gix::hash::ObjectId>,
+    blobs: Vec<gix::hash::ObjectId>,
 }
 
 impl OidCollector {
     fn new() -> Self {
         Self {
             oids: HashSet::new(),
+            trees: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 }
@@ -295,6 +330,7 @@ impl Visit for OidCollector {
 
     fn visit_tree(&mut self, entry: &gix::objs::tree::EntryRef<'_>) -> Action {
         if self.oids.insert(entry.oid.to_owned()) {
+            self.trees.push(entry.oid.to_owned());
             Action::Continue(true)
         } else {
             Action::Continue(false)
@@ -304,8 +340,8 @@ impl Visit for OidCollector {
     fn visit_nontree(&mut self, entry: &gix::objs::tree::EntryRef<'_>) -> Action {
         // A gitlink (submodule) names a commit of another repository. It is
         // not an object of this one, as with `git rev-list --objects`.
-        if !entry.mode.is_commit() {
-            self.oids.insert(entry.oid.to_owned());
+        if !entry.mode.is_commit() && self.oids.insert(entry.oid.to_owned()) {
+            self.blobs.push(entry.oid.to_owned());
         }
         Action::Continue(true)
     }
