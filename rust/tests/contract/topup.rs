@@ -84,6 +84,8 @@ impl TopUp {
 
         assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
         assert_eq!(git(&target, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        // The branch tracks the upstream at the topped-up commit.
+        assert_eq!(git(&target, &["rev-parse", "@{upstream}"]), b);
         assert_eq!(
             git(&target, &["config", "remote.origin.url"]),
             self.upstream

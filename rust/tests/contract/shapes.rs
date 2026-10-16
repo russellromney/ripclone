@@ -708,3 +708,102 @@ fn g10_awkward_names_clone_exactly() {
         Some("feature/new-ui"),
     );
 }
+
+/// G12: an editable clone works with the user's later git like `git clone`
+/// does. The branch tracks its upstream branch, `origin` is the configured
+/// upstream, and `git pull` and `git push` work. A depth-1 clone pulls too.
+/// A tag or an `--at` commit checks out with no upstream, and a branch name
+/// with config quoting characters tracks correctly.
+#[test]
+fn g12_editable_clones_pull_and_push_like_git_clone() {
+    let world = World::new();
+    let origin = world.origin("acme", "g12");
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    git(&origin.work, &["tag", "v1"]);
+    let odd = "fix/#1;\"q\"";
+    git(&origin.work, &["checkout", "-q", "-b", odd]);
+    let o = origin.commit(&[("odd.txt", "o\n")], "O");
+    git(&origin.work, &["checkout", "-q", "main"]);
+    let b = origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+    origin.publish_branch(odd);
+    git(
+        &origin.work,
+        &["push", "-q", origin.bare.to_str().unwrap(), "v1"],
+    );
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/g12", "--wait"]).ok();
+    let url = format!("file://{}", origin.bare.display());
+    let clone = |name: &str, args: &[&str]| {
+        let target = world.target(name);
+        let mut argv = vec!["clone", "acme/g12", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&server, &argv).ok();
+        assert_eq!(
+            git(&target, &["config", "remote.origin.url"]),
+            url,
+            "{name}"
+        );
+        target
+    };
+    let upstream = |dir: &std::path::Path| {
+        let out = git_output(dir, &["rev-parse", "--symbolic-full-name", "@{upstream}"]);
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    let full = clone("full", &[]);
+    let shallow = clone("shallow", &["--depth", "1"]);
+    for dir in [&full, &shallow] {
+        assert_eq!(upstream(dir).as_deref(), Some("refs/remotes/origin/main"));
+        assert_eq!(git(dir, &["rev-parse", "origin/main"]), b);
+        assert_eq!(
+            git(dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]),
+            "refs/remotes/origin/main"
+        );
+        assert_eq!(git(dir, &["status", "-sb"]), "## main...origin/main");
+    }
+
+    // A push upstream: both clones pull it.
+    let c = origin.commit(&[("c.txt", "c\n")], "C");
+    origin.publish();
+    for dir in [&full, &shallow] {
+        git(dir, &["pull", "-q", "--ff-only"]);
+        assert_eq!(git(dir, &["rev-parse", "HEAD"]), c);
+        assert_eq!(listing(dir), origin.tree(&c));
+    }
+    // The user's commit pushes to the upstream.
+    std::fs::write(full.join("d.txt"), "d\n").unwrap();
+    git(&full, &["add", "d.txt"]);
+    git(&full, &["commit", "-q", "-m", "D"]);
+    git(&full, &["push", "-q"]);
+    assert_eq!(
+        git(&origin.bare, &["rev-parse", "main"]),
+        git(&full, &["rev-parse", "HEAD"])
+    );
+
+    // A branch with `#`, `;` and `"` in its name tracks that branch.
+    let branch = clone("odd", &["--at", odd]);
+    assert_eq!(git(&branch, &["rev-parse", "HEAD"]), o);
+    assert_eq!(
+        upstream(&branch),
+        Some(format!("refs/remotes/origin/{odd}"))
+    );
+    git(&branch, &["pull", "-q", "--ff-only"]);
+
+    // A tag is detached; an `--at` commit on a named local branch tracks
+    // nothing, and no remote-tracking ref claims the upstream has it.
+    let tag = clone("tag", &["--at", "v1"]);
+    assert_eq!(git(&tag, &["rev-parse", "HEAD"]), a);
+    assert!(
+        git_output(&tag, &["symbolic-ref", "-q", "HEAD"])
+            .stdout
+            .is_empty()
+    );
+    assert_eq!(upstream(&tag), None);
+    let local = clone("local", &["--at", &a, "--branch", "mine"]);
+    assert_eq!(git(&local, &["symbolic-ref", "HEAD"]), "refs/heads/mine");
+    assert_eq!(upstream(&local), None);
+    assert_eq!(git(&local, &["for-each-ref", "refs/remotes"]), "");
+}

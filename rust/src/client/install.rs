@@ -44,6 +44,11 @@ struct Pin {
     commit: String,
     /// The branch to check out; empty is detached.
     checkout: String,
+    /// The upstream branch the checkout tracks: the resolved branch, not a
+    /// local name `--branch` gives an `--at` commit.
+    tracks: bool,
+    /// The checkout is the upstream's default branch.
+    default_branch: bool,
     /// The hosted server's per-clone id, for the metrics report.
     clone_id: Option<String>,
 }
@@ -220,9 +225,12 @@ impl Client {
             .map(str::to_string)
             .or(summary.checkout_name)
             .unwrap_or_default();
+        let tracks = checkout_override.is_none() && !checkout.is_empty();
         Ok(Pin {
             commit: summary.commit,
             checkout,
+            tracks,
+            default_branch: tracks && request.at.is_none() && request.branch == "HEAD",
             clone_id,
         })
     }
@@ -349,7 +357,7 @@ impl Client {
         let root = self
             .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
             .await?;
-        let origin_url = if let Plan::TopUp { base, upstream_url } = plan {
+        if let Plan::TopUp { base, upstream_url } = plan {
             top_up(&root, upstream_url, &pin.commit, cleanup)
                 .await
                 .with_context(|| {
@@ -358,13 +366,15 @@ impl Client {
                         pin.commit, base.commit
                     )
                 })?;
-            upstream_url.clone()
-        } else if output.origin_url.is_empty() {
-            format!("https://github.com/{repo_path}.git")
-        } else {
-            output.origin_url.clone()
+        }
+        // The user's later fetches and pushes go to the locally configured
+        // upstream, never to a URL the server names.
+        let origin_url = match self.top_up_url(repo_path) {
+            Ok(url) => url,
+            Err(_) if output.origin_url.is_empty() => format!("https://github.com/{repo_path}.git"),
+            Err(_) => output.origin_url.clone(),
         };
-        write_origin_config(&root.join(".git"), &origin_url)?;
+        write_git_config(&root.join(".git"), &origin_url, pin)?;
         Ok(root)
     }
 
@@ -1119,12 +1129,65 @@ fn write_git_dir(
     Ok(())
 }
 
-fn write_origin_config(git_dir: &Path, origin_url: &str) -> Result<()> {
-    let config = format!(
-        "[core]\n\tsymlinks = true\n\tcheckStat = minimal\n[remote \"origin\"]\n\turl = {origin_url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
-    );
+/// Write `.git/config` as `git clone` would: the origin remote, the checked
+/// out branch tracking its upstream branch with a remote-tracking ref at the
+/// installed commit, and the filesystem probes `git init` makes. `git pull`
+/// then works in the clone.
+fn write_git_config(git_dir: &Path, origin_url: &str, pin: &Pin) -> Result<()> {
+    let mut config = String::from("[core]\n\tsymlinks = true\n\tcheckStat = minimal\n");
+    // A case-insensitive filesystem finds `HEAD` under another case.
+    if git_dir.join("hEaD").exists() {
+        config.push_str("\tignorecase = true\n");
+    }
+    if precomposes_unicode(git_dir)? {
+        config.push_str("\tprecomposeunicode = true\n");
+    }
+    config.push_str(&format!(
+        "[remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        quoted(origin_url)
+    ));
+    if pin.tracks {
+        let branch = &pin.checkout;
+        config.push_str(&format!(
+            "[branch {}]\n\tremote = origin\n\tmerge = {}\n",
+            quoted(branch),
+            quoted(&format!("refs/heads/{branch}"))
+        ));
+        let remote = git_dir.join("refs").join("remotes").join("origin");
+        let tracking = remote.join(branch);
+        std::fs::create_dir_all(tracking.parent().context("remote-tracking ref")?)?;
+        std::fs::write(&tracking, format!("{}\n", pin.commit))?;
+        if pin.default_branch {
+            std::fs::write(
+                remote.join("HEAD"),
+                format!("ref: refs/remotes/origin/{branch}\n"),
+            )?;
+        }
+    }
     std::fs::write(git_dir.join("config"), config)?;
     Ok(())
+}
+
+/// A git config subsection or value in quotes: a branch name may hold `"`,
+/// `#` or `;`.
+fn quoted(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Whether the filesystem finds a precomposed (NFC) name under its
+/// decomposed (NFD) form, as `git init` probes on macOS.
+#[cfg(target_os = "macos")]
+fn precomposes_unicode(git_dir: &Path) -> Result<bool> {
+    let probe = git_dir.join("\u{c4}");
+    std::fs::write(&probe, b"")?;
+    let found = git_dir.join("A\u{308}").exists();
+    std::fs::remove_file(&probe)?;
+    Ok(found)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn precomposes_unicode(_git_dir: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
