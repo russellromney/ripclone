@@ -117,7 +117,9 @@ fn k2_stalled_fetch_times_out_and_retries() {
     let env = [
         ("RIPCLONE_FETCH_TIMEOUT_SECS", "1"),
         ("RIPCLONE_BUILD_RETRY_BASE_MS", "100"),
-        ("RIPCLONE_BUILD_MAX_ATTEMPTS", "3"),
+        // Head and Files fetch under one lock, so a held origin costs
+        // 2 x attempts serial timeouts.
+        ("RIPCLONE_BUILD_MAX_ATTEMPTS", "2"),
     ];
 
     // The origin answers once the build has retried.
@@ -164,7 +166,7 @@ fn k2_stalled_fetch_times_out_and_retries() {
         let error = out["error"].as_str().unwrap_or_default();
         assert!(error.contains("timed out after"), "{out}");
     }
-    assert_eq!(http.fetches(), 6, "one fetch per Head and Files attempt");
+    assert_eq!(http.fetches(), 4, "one fetch per Head and Files attempt");
     assert_eq!(server.metric("ripclone_builds_failed_total"), 2);
     for kind in ["head", "full", "files"] {
         assert_eq!(

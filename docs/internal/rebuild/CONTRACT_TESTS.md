@@ -202,7 +202,7 @@ another's builds or the API, and the mirror stays compact.
 | # | Test | Added |
 |---|---|---|
 | K1 | The origin holds every fetch of X, and a second push of X is admitted, with two Head slots. X fetches once: its second build waits for the first. Meanwhile Y is added, built and cloned at depth 1, and `/add`, `POST /builds` and `/status` each answer within 2 s. After the release both X commits clone. | #218 |
-| K2 | `RIPCLONE_FETCH_TIMEOUT_SECS=1`. The origin holds the fetch until the build retries, then answers: the build completes and clones. With the origin held throughout, Head and Files each fail after their 3 attempts (6 fetches) with a `timed out after` error, and nothing publishes. | #218 |
+| K2 | `RIPCLONE_FETCH_TIMEOUT_SECS=1`. The origin holds the fetch until the build retries, then answers: the build completes and clones. With the origin held throughout, with 2 attempts, Head and Files each fail after both (4 fetches) with a `timed out after` error, and nothing publishes. | #218 |
 | K3 | The tip of a repo is admitted, then three older commits by SHA in one burst, out of history order, with four Full slots. Fulls publish in admission order (server log), and each commit's full clone equals the origin, with `rev-list --count` and `git fsck` checked. | #218 |
 | K4 | While the server is down, its mirror gains 20 packs and 70 loose refs from outside. The next commit's Files and Full run together, and the later of them to finish compacts it after publishing: the log reports a repack and packed refs, under 16 packs remain, and full clones of the built commit and of a later push are exact. | #218 |
 
