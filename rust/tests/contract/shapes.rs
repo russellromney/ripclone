@@ -1,6 +1,7 @@
 //! G. Clone shapes produce correct trees.
 
 use crate::harness::*;
+use prost::Message;
 
 /// An origin with history, a nested dir, an executable, and a symlink.
 pub fn rich_origin(world: &World, name: &str) -> (Origin, String) {
@@ -388,6 +389,144 @@ fn g6b_files_built_on_files_stay_exact() {
         world.cli(&server, &["sync", "acme/g6b", "--wait"]).ok();
         let target = files_clone(&world, &server, "acme/g6b", &format!("g6b-{i}"));
         assert_eq!(listing(&target), origin.tree(&tip), "{what}");
+    }
+}
+
+/// The bundles a Files clone of `commit` downloads, by hash, and their bytes.
+fn files_download(server: &Server, repo: &str, commit: &str) -> (Vec<String>, u64) {
+    let (status, body) = api::read_commit(server, repo, commit, Some("files"));
+    assert_eq!(status, 200, "{body}");
+    let hash = body["clonepack_manifest"].as_str().unwrap();
+    let (status, bytes) = server.get_bytes(&format!("/v1/artifacts/{hash}"));
+    assert_eq!(status, 200, "Files manifest {hash}");
+    let manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice()).unwrap();
+    let bundles = manifest
+        .archive_chunks
+        .iter()
+        .map(|chunk| ripclone::clonepack::hash_to_hex(&chunk.hash))
+        .collect();
+    (bundles, manifest.archive_chunks.iter().map(|c| c.len).sum())
+}
+
+/// Bytes of every file in `commit`'s tree.
+fn tree_bytes(origin: &Origin, commit: &str) -> u64 {
+    git(&origin.work, &["ls-tree", "-r", "-l", commit])
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(3)?.parse::<u64>().ok())
+        .sum()
+}
+
+/// G11: pushes add tails to the Files archive. A small push stores only
+/// its new files and keeps every bundle a clone of its parent downloaded.
+/// Files replaced since the last compaction stay in old bundles, so clones
+/// download dead bytes, until a build past `RIPCLONE_FILES_TAIL_PERCENT`
+/// (25 by default) compacts the archive back to about the tree's size.
+/// Every Files clone, of the tip and of an older commit, is exact.
+#[test]
+fn g11_files_tails_then_compact() {
+    let world = World::new();
+    let (origin, a) = twelve_mib_origin(&world, "g11");
+    let server = world.server(&[]);
+    let repo = "acme/g11";
+    world.cli(&server, &["add", repo, "--wait"]).ok();
+    let push = |what: &str| {
+        let tip = origin.commit(&[], what);
+        origin.publish();
+        world.cli(&server, &["sync", repo, "--wait"]).ok();
+        let target = files_clone(&world, &server, repo, &format!("g11-{}", &tip[..7]));
+        assert_eq!(listing(&target), origin.tree(&tip), "{what}");
+        tip
+    };
+    let write = |path: &str, bytes: &[u8]| {
+        let path = origin.work.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    };
+    let (bundles_a, download_a) = files_download(&server, repo, &a);
+
+    // A one-line edit and a new small file: a tail of a few bytes.
+    let stored = stored_bytes(&world);
+    write("zz.txt", b"b\n");
+    write("src/lib.rs", b"pub fn f() {}\n");
+    let b = push("B: small edit");
+    let (bundles_b, download_b) = files_download(&server, repo, &b);
+    assert!(
+        bundles_a.iter().all(|h| bundles_b.contains(h)),
+        "B keeps A's bundles"
+    );
+    assert!(
+        download_b < download_a + (64 << 10),
+        "{download_a} -> {download_b}"
+    );
+    let grown = stored_bytes(&world) - stored;
+    assert!(grown < 1 << 20, "B stored {grown} bytes");
+
+    // A rename, a delete, an exec bit and a symlink add no file bytes.
+    std::fs::create_dir_all(origin.work.join("data/x")).unwrap();
+    std::fs::rename(
+        origin.work.join("data/0.bin"),
+        origin.work.join("data/x/0.bin"),
+    )
+    .unwrap();
+    std::fs::remove_file(origin.work.join("data/3.bin")).unwrap();
+    write("bin/run.sh", b"#!/bin/sh\necho hi\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = origin.work.join("bin/run.sh");
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("data/1.bin", origin.work.join("link.bin")).unwrap();
+    }
+    let c = push("C: rename, delete, exec bit, symlink");
+    let (_, download_c) = files_download(&server, repo, &c);
+    assert!(
+        download_c < download_b + (64 << 10),
+        "{download_b} -> {download_c}"
+    );
+
+    // Replacing large files leaves their old bytes in the download. A
+    // file replaced again drops its earlier tail, so the dead bytes stay
+    // bounded; once they pass 25%, the next build compacts.
+    let (mut dead, mut compacted) = (false, false);
+    for (seed, path) in ["data/1.bin", "data/2.bin", "data/x/0.bin", "data/1.bin"]
+        .into_iter()
+        .enumerate()
+    {
+        write(path, &crate::downloads::noise(20 + seed as u64, 4 << 20));
+        let tip = push(&format!("replace {path}"));
+        let (_, download) = files_download(&server, repo, &tip);
+        let tree = tree_bytes(&origin, &tip);
+        assert!(
+            download < tree + tree / 4 + (5 << 20),
+            "{tip}: downloads {download} for {tree} bytes of files"
+        );
+        if download > tree + (1 << 20) {
+            dead = true;
+        } else if dead {
+            compacted = true;
+            assert!(download < tree + (256 << 10), "{download} for {tree}");
+            break;
+        }
+    }
+    assert!(
+        dead && compacted,
+        "dead bytes {dead}, compacted {compacted}"
+    );
+
+    // Older commits keep their own archives.
+    for (commit, name) in [(&b, "g11-at-b"), (&c, "g11-at-c")] {
+        let target = world.target(name);
+        let argv = [
+            "clone",
+            repo,
+            target.to_str().unwrap(),
+            "--mode",
+            "files",
+            "--at",
+            commit,
+        ];
+        world.cli(&server, &argv).ok();
+        assert_eq!(listing(&target), origin.tree(commit), "{name}");
     }
 }
 

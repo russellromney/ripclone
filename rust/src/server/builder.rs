@@ -144,11 +144,43 @@ fn head_rebase_bytes() -> Result<u64> {
     crate::env::number("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024)
 }
 
+/// How much larger than its compact archive, in percent, a Files archive
+/// with tails may grow before the next build compacts it. Zero never adds
+/// a tail.
+fn files_tail_percent() -> Result<u64> {
+    crate::env::number("RIPCLONE_FILES_TAIL_PERCENT", 25)
+}
+
+/// Tail bundles past which the next Files build compacts.
+const MAX_FILES_TAILS: usize = 32;
+
 /// Fail on a bad value of a setting the builder reads at build time.
 pub(super) fn check_environment() -> Result<()> {
     lsm_max_levels()?;
     head_rebase_bytes()?;
+    files_tail_percent()?;
     Ok(())
+}
+
+/// Whether a Files build may add a tail to `parent`, whose compact archive
+/// is `compact`: while `parent` downloads less than `percent` more bytes
+/// than `compact` and has fewer than [`MAX_FILES_TAILS`] tail bundles.
+fn files_tail_fits(
+    parent: &crate::FilesResult,
+    compact: &crate::FilesResult,
+    percent: u64,
+) -> bool {
+    let bytes = |files: &crate::FilesResult| -> u64 {
+        files.archive_frames.iter().map(|f| f.compressed_len).sum()
+    };
+    let packed: std::collections::HashSet<&String> = compact.archive_chunks.iter().collect();
+    let tails = parent
+        .archive_chunks
+        .iter()
+        .filter(|hash| !packed.contains(hash))
+        .count();
+    u128::from(bytes(parent)) * 100 < u128::from(bytes(compact)) * u128::from(100 + percent)
+        && tails < MAX_FILES_TAILS
 }
 
 /// Given the prior sealed levels and a freshly built tail, decide whether to
@@ -1114,8 +1146,10 @@ pub(super) async fn build_full_result(
 }
 
 /// Build and upload the Files result. `parent_files`, a ready Files result of
-/// an ancestor and its commit, lets the archive read only changed bytes and
-/// reuse its unchanged frames and bundles.
+/// an ancestor and its commit, lets the archive read only changed bytes: a
+/// tail on it holds only the blobs it lacks, and a compaction (once the
+/// tails grow past `RIPCLONE_FILES_TAIL_PERCENT`) reuses the unchanged frames
+/// and bundles of its compact archive.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_files_result(
     cas: &Cas,
@@ -1130,13 +1164,24 @@ pub(super) async fn build_files_result(
     let uploads = Uploads::new(cas, storage);
     let cas = &uploads.cas();
     let start = Instant::now();
-    let base_metadata = match parent_files {
-        Some((_, files)) => {
-            load_metadata_async(cas, storage, &files.clonepack.metadata_chunk).await
+    let previous = parent_files.map(|(_, files)| files);
+    let compact = previous.map(|files| files.compact.as_deref().unwrap_or(files).clone());
+    let tail = match (previous, &compact) {
+        (Some(previous), Some(compact)) => {
+            files_tail_fits(previous, compact, files_tail_percent()?)
         }
+        _ => false,
+    };
+    let base_files = if tail {
+        previous.cloned()
+    } else {
+        compact.clone()
+    };
+    let base_metadata = match &base_files {
+        Some(files) => load_metadata_async(cas, storage, &files.clonepack.metadata_chunk).await,
         None => None,
     };
-    let base = base_metadata.zip(parent_files.map(|(_, files)| files.clone()));
+    let base = base_metadata.zip(base_files);
     phases.record("base_files", start);
 
     let start = Instant::now();
@@ -1154,7 +1199,28 @@ pub(super) async fn build_files_result(
                 metadata,
                 bundles: &files.archive_chunks,
             });
-        ArchiveBuilder::new(&archive_mirror).build_into_cas(
+        let builder = ArchiveBuilder::new(&archive_mirror);
+        if tail && let Some(base) = &base {
+            match builder.build_tail_into_cas(
+                &archive_commit,
+                &archive_cas,
+                compression_level,
+                base,
+                crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+            ) {
+                Ok(output) => return Ok(output),
+                Err(e) => warn!("Files tail is unusable ({e:#}); building without it"),
+            }
+            return builder.build_into_cas(
+                &archive_commit,
+                &archive_cas,
+                Some(&archive_storage),
+                compression_level,
+                None,
+                crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+            );
+        }
+        builder.build_into_cas(
             &archive_commit,
             &archive_cas,
             Some(&archive_storage),
@@ -1168,6 +1234,15 @@ pub(super) async fn build_files_result(
     phases.record("archive", start);
     info!("Files archive {:?}", archive_output.reuse);
     phases.size("read", archive_output.reuse.bytes_read);
+    phases.size(
+        "download",
+        archive_output
+            .archive_frames
+            .iter()
+            .map(|f| f.compressed_len)
+            .sum(),
+    );
+    let compact = compact.filter(|_| archive_output.reuse.tail).map(Box::new);
 
     Cancel::check_current()?;
     let start = Instant::now();
@@ -1223,6 +1298,7 @@ pub(super) async fn build_files_result(
         },
         archive_chunks: archive_chunk_hashes,
         archive_frames: archive_output.archive_frames,
+        compact,
     })
 }
 

@@ -228,6 +228,11 @@ pub struct FilesResult {
     pub archive_chunks: Vec<String>,
     #[serde(default)]
     pub archive_frames: Vec<ArchiveFrame>,
+    /// The packed archive this one is a tail on, when it is one: see
+    /// `ArchiveBuilder::build_tail_into_cas`. A later build that compacts
+    /// the tails builds on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<Box<FilesResult>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
