@@ -57,7 +57,7 @@ impl<'a> PackBuilder<'a> {
         commit: &str,
         head_target_raw_bytes: u64,
     ) -> Result<Vec<(String, u64, String, u64)>> {
-        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        let head_oids = git::list_head_objects(&self.repo, commit)?;
         if head_oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
@@ -88,7 +88,7 @@ impl<'a> PackBuilder<'a> {
         have: &HashSet<String>,
         head_target_raw_bytes: u64,
     ) -> Result<Vec<(String, u64, String, u64)>> {
-        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        let head_oids = git::list_head_objects(&self.repo, commit)?;
         if head_oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
@@ -115,7 +115,7 @@ impl<'a> PackBuilder<'a> {
         base: &[((String, u64, String, u64), Vec<u8>)],
         head_target_raw_bytes: u64,
     ) -> Result<(Vec<(String, u64, String, u64)>, usize)> {
-        let closure = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        let closure = git::list_head_objects(&self.repo, commit)?;
         if closure.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
@@ -540,6 +540,76 @@ mod tests {
 
         // A corrupt idx is refused.
         assert!(idx_object_ids(b"not an idx").is_err());
+    }
+
+    #[test]
+    fn head_packs_follow_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let pb = PackBuilder::new(tmp.path(), &cas);
+        let noise = |seed: u32| -> Vec<u8> {
+            let mut x = seed.wrapping_mul(2_654_435_761) | 1;
+            (0..8192)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect()
+        };
+        // 8 KiB blobs, two per 16 KiB pack: [commit, trees, a/1], [a/2, a/3],
+        // [b/1, b/2], [b/3, b/4].
+        let names = ["a/1", "a/2", "a/3", "b/1", "b/2", "b/3", "b/4"];
+        let old: Vec<Vec<u8>> = (0..7).map(noise).collect();
+        let new: Vec<Vec<u8>> = (7..14).map(noise).collect();
+        let files = |blobs: &[Vec<u8>]| -> Vec<(&str, Vec<u8>)> {
+            names.iter().copied().zip(blobs.iter().cloned()).collect()
+        };
+        let c1_files = files(&old);
+        let c1_refs: Vec<(&str, &[u8])> = c1_files.iter().map(|(n, b)| (*n, &b[..])).collect();
+        let c1 = commit_onto(&repo, &c1_refs);
+
+        // The listing is the depth-1 closure: commit, then trees, then blobs
+        // in path order.
+        let listed = git::list_head_objects(tmp.path(), &c1).unwrap();
+        let mut sorted = listed.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            git::list_object_shas_with_depth(tmp.path(), &c1, Some(1)).unwrap()
+        );
+        let blob_at = |commit: &str, name: &str| {
+            rev_parse(tmp.path(), &[format!("{commit}:{name}")])
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        let mut want = vec![c1.clone()];
+        want.extend(["", "a", "b"].iter().map(|dir| blob_at(&c1, dir)));
+        want.extend(names.iter().map(|name| blob_at(&c1, name)));
+        assert_eq!(listed, want);
+
+        // c2 rewrites every file under b/: the packs of a/ stay in the base,
+        // and the b/ packs are packed again.
+        let mut c2_blobs = old.clone();
+        c2_blobs[3..].clone_from_slice(&new[3..]);
+        let c2_files = files(&c2_blobs);
+        let c2_refs: Vec<(&str, &[u8])> = c2_files.iter().map(|(n, b)| (*n, &b[..])).collect();
+        let c2 = commit_onto(&repo, &c2_refs);
+        let target = 16 * 1024;
+        let base = pb.build_head_packs(&c1, target).unwrap();
+        let with_idx: Vec<_> = base
+            .iter()
+            .map(|pack| (pack.clone(), cas.get(&pack.2).unwrap()))
+            .collect();
+        let (rebased, kept) = pb.rebase_head_packs(&c2, &with_idx, target).unwrap();
+        let a_blobs: BTreeSet<String> = names[..3].iter().map(|name| blob_at(&c1, name)).collect();
+        assert!(a_blobs.is_subset(&packed_objects(&cas, &rebased[..kept])));
+        assert!(a_blobs.is_disjoint(&packed_objects(&cas, &rebased[kept..])));
+        assert_eq!(kept, 2);
     }
 
     #[test]
