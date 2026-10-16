@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 /// Default compressed size of an archive download bundle.
-pub const DEFAULT_ARCHIVE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+pub const DEFAULT_ARCHIVE_CHUNK_SIZE: u64 = 1024 * 1024;
 
 /// Content-defined chunking bounds for the worktree stream (fastcdc v2020).
 /// Boundaries depend on content, not cumulative position, so a localized edit
@@ -29,9 +29,9 @@ struct CdcBounds {
 
 /// The production bounds. Only tests build with others.
 const CDC: CdcBounds = CdcBounds {
-    min: 1024 * 1024,
-    avg: 4 * 1024 * 1024,
-    max: 16 * 1024 * 1024,
+    min: 256 * 1024,
+    avg: 1024 * 1024,
+    max: 4 * 1024 * 1024,
 };
 
 /// Raw frame bytes the chunker hands the compressor at once. One batch is
