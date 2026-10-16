@@ -133,12 +133,31 @@ impl<'a> PackBuilder<'a> {
 
     /// Pack the objects of `(exclude, tip]` with git's own walk and delta
     /// reuse (see `git::pack_objects_range_to_prefix`) and store the pack.
+    /// `tip`'s whole history is the pack the mirror's first fetch wrote, when
+    /// that fetch was of `tip`: that pack is stored as it is.
     fn build_history_range(&self, tip: &str, exclude: Option<&str>) -> Result<HistoryBuild> {
         crate::cancel::Cancel::check_current()?;
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
         let start = std::time::Instant::now();
-        git::pack_objects_range_to_prefix(&self.repo, tip, exclude, &prefix)?;
+        let fetched = exclude
+            .is_none()
+            .then(|| git::fetched_history_pack(&self.repo, tip))
+            .flatten();
+        if let Some((pack, idx)) = fetched {
+            for (from, ext) in [(&pack, "pack"), (&idx, "idx")] {
+                let to = tmp.path().join(format!("fetched.{ext}"));
+                if std::fs::hard_link(from, &to).is_err() {
+                    std::fs::copy(from, &to).with_context(|| format!("copy {}", from.display()))?;
+                }
+            }
+            tracing::info!(
+                "history of {}: stored the mirror's fetched pack",
+                &tip[..7.min(tip.len())]
+            );
+        } else {
+            git::pack_objects_range_to_prefix(&self.repo, tip, exclude, &prefix)?;
+        }
         let pack_ms = elapsed_ms(start);
         let start = std::time::Instant::now();
         let packs = self.store_packs_from_dir(tmp.path())?;
