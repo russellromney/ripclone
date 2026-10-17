@@ -161,6 +161,38 @@ impl<'a> PackBuilder<'a> {
         self.build_history_range(commit, sealed_tip)
     }
 
+    /// The tags `commit` reaches (see `git::reachable_tags`), and a pack of
+    /// their annotated tag objects when there are any. History packs hold
+    /// only commits, trees and blobs of their range, and a tag can be made
+    /// on an old commit after its level was sealed, so each Full packs its
+    /// tag objects anew. An unchanged tag set packs to the same bytes.
+    pub fn build_tags(
+        &self,
+        commit: &str,
+    ) -> Result<(
+        Vec<crate::clonepack::TagRef>,
+        Option<(String, u64, String, u64)>,
+    )> {
+        crate::cancel::Cancel::check_current()?;
+        let tags = git::reachable_tags(&self.repo, commit)?;
+        let annotated: Vec<String> = tags
+            .iter()
+            .filter(|(_, _, annotated)| *annotated)
+            .map(|(_, id, _)| id.clone())
+            .collect();
+        let pack = if annotated.is_empty() {
+            None
+        } else {
+            let objects = crate::gix_util::tag_objects(&self.repo, &annotated)?;
+            Some(self.pack_undeltified(&objects)?)
+        };
+        let tags = tags
+            .into_iter()
+            .map(|(name, object, _)| crate::clonepack::TagRef { name, object })
+            .collect();
+        Ok((tags, pack))
+    }
+
     /// Pack the objects of `(exclude, tip]` with git's own walk and delta
     /// reuse (see `git::pack_objects_range_to_prefix`) and store the pack.
     /// `tip`'s whole history is the pack the mirror's first fetch wrote, when

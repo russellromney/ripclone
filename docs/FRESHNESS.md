@@ -55,7 +55,9 @@ branch (or the parent commit's Full) as a base A. A full clone then:
 
 The clone ends up with B's tree and B's full history. The fetch carries only
 what your git sends: no ripclone token and no server provider credential. If
-B does not descend from A (a force-push), the fetch just transfers more. If
+B does not descend from A (a force-push), the fetch just transfers more. The
+clone keeps Full(A)'s tags when A is in B's history and has none after a
+force-push; tags of the fetched commits come with your next `git fetch`. If
 the fetch fails, the clone fails with git's error and installs nothing; retry
 with `--wait` to clone the exact build instead.
 

@@ -44,6 +44,11 @@ struct Pin {
     commit: String,
     /// The branch to check out; empty is detached.
     checkout: String,
+    /// The upstream branch the checkout tracks: the resolved branch, not a
+    /// local name `--branch` gives an `--at` commit.
+    tracks: bool,
+    /// The checkout is the upstream's default branch.
+    default_branch: bool,
     /// The hosted server's per-clone id, for the metrics report.
     clone_id: Option<String>,
 }
@@ -220,9 +225,12 @@ impl Client {
             .map(str::to_string)
             .or(summary.checkout_name)
             .unwrap_or_default();
+        let tracks = checkout_override.is_none() && !checkout.is_empty();
         Ok(Pin {
             commit: summary.commit,
             checkout,
+            tracks,
+            default_branch: tracks && request.at.is_none() && request.branch == "HEAD",
             clone_id,
         })
     }
@@ -346,10 +354,11 @@ impl Client {
             }
             _ => {}
         }
-        let root = self
+        let (root, manifest) = self
             .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
             .await?;
-        let origin_url = if let Plan::TopUp { base, upstream_url } = plan {
+        let (mut tags, tag_objects) = (manifest.tags, manifest.tag_objects);
+        if let Plan::TopUp { base, upstream_url } = plan {
             top_up(&root, upstream_url, &pin.commit, cleanup)
                 .await
                 .with_context(|| {
@@ -358,13 +367,22 @@ impl Client {
                         pin.commit, base.commit
                     )
                 })?;
-            upstream_url.clone()
-        } else if output.origin_url.is_empty() {
-            format!("https://github.com/{repo_path}.git")
-        } else {
-            output.origin_url.clone()
+            // The base's tags are the target's when the base is in its
+            // history. The tags of the fetched commits, or all of them after
+            // a force-push, come with the user's next `git fetch`.
+            if !is_ancestor(&root, &base.commit, &pin.commit, cleanup).await? {
+                tags.clear();
+            }
+        }
+        write_tags(&root.join(".git"), tags, &tag_objects)?;
+        // The user's later fetches and pushes go to the locally configured
+        // upstream, never to a URL the server names.
+        let origin_url = match self.top_up_url(repo_path) {
+            Ok(url) => url,
+            Err(_) if output.origin_url.is_empty() => format!("https://github.com/{repo_path}.git"),
+            Err(_) => output.origin_url.clone(),
         };
-        write_origin_config(&root.join(".git"), &origin_url)?;
+        write_git_config(&root.join(".git"), &origin_url, pin)?;
         Ok(root)
     }
 
@@ -504,7 +522,8 @@ impl Client {
     }
 
     /// Head or Full: `.git` from the metadata chunk, then the packs, whose
-    /// blobs are written into the working tree as each pack lands.
+    /// blobs are written into the working tree as each pack lands. Returns
+    /// the staging root and the output's manifest.
     async fn materialize_git(
         &self,
         urls: &OutputUrls,
@@ -513,7 +532,7 @@ impl Client {
         staging: &Staging,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
-    ) -> Result<PathBuf> {
+    ) -> Result<(PathBuf, ClonepackManifest)> {
         let (manifest, metadata) =
             tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
                 .context("fetch manifest/metadata")?;
@@ -542,7 +561,7 @@ impl Client {
             manifest.packs.len()
         );
         bench.mark_archive_download(bytes);
-        Ok(root)
+        Ok((root, manifest))
     }
 
     /// The clonepack manifest of `urls`' output, checked against its commit.
@@ -1038,6 +1057,23 @@ async fn top_up(root: &Path, upstream_url: &str, target: &str, cleanup: &Cleanup
 /// failure the error carries the end of its stderr. Cancelling the clone
 /// kills it.
 async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
+    run_git_answer(repo, args, cleanup, None).await.map(drop)
+}
+
+/// Whether `ancestor` is an ancestor of `commit`, by the user's git.
+async fn is_ancestor(repo: &Path, ancestor: &str, commit: &str, cleanup: &Cleanup) -> Result<bool> {
+    let args = ["merge-base", "--is-ancestor", ancestor, commit];
+    run_git_answer(repo, &args, cleanup, Some(1)).await
+}
+
+/// [`run_git`] for a git command that answers yes or no: `Ok(false)` when it
+/// exits with `no`.
+async fn run_git_answer(
+    repo: &Path,
+    args: &[&str],
+    cleanup: &Cleanup,
+    no: Option<i32>,
+) -> Result<bool> {
     use std::io::{Read, Seek};
     use std::process::Stdio;
 
@@ -1057,7 +1093,10 @@ async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
     let mut git = GitChild::new(child, cleanup.clone());
     let status = git.wait().await.context("wait for git")?;
     if status.success() {
-        return Ok(());
+        return Ok(true);
+    }
+    if no.is_some() && status.code() == no {
+        return Ok(false);
     }
     stderr.rewind().context("rewind git stderr")?;
     let mut detail = String::new();
@@ -1119,12 +1158,102 @@ fn write_git_dir(
     Ok(())
 }
 
-fn write_origin_config(git_dir: &Path, origin_url: &str) -> Result<()> {
-    let config = format!(
-        "[core]\n\tsymlinks = true\n\tcheckStat = minimal\n[remote \"origin\"]\n\turl = {origin_url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
-    );
+/// Write `.git/config` as `git clone` would: the origin remote, the checked
+/// out branch tracking its upstream branch with a remote-tracking ref at the
+/// installed commit, and the filesystem probes `git init` makes. `git pull`
+/// then works in the clone.
+fn write_git_config(git_dir: &Path, origin_url: &str, pin: &Pin) -> Result<()> {
+    let mut config = String::from("[core]\n\tsymlinks = true\n\tcheckStat = minimal\n");
+    // A case-insensitive filesystem finds `HEAD` under another case.
+    if git_dir.join("hEaD").exists() {
+        config.push_str("\tignorecase = true\n");
+    }
+    if precomposes_unicode(git_dir)? {
+        config.push_str("\tprecomposeunicode = true\n");
+    }
+    config.push_str(&format!(
+        "[remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        quoted(origin_url)
+    ));
+    if pin.tracks {
+        let branch = &pin.checkout;
+        config.push_str(&format!(
+            "[branch {}]\n\tremote = origin\n\tmerge = {}\n",
+            quoted(branch),
+            quoted(&format!("refs/heads/{branch}"))
+        ));
+        let remote = git_dir.join("refs").join("remotes").join("origin");
+        let tracking = remote.join(branch);
+        std::fs::create_dir_all(tracking.parent().context("remote-tracking ref")?)?;
+        std::fs::write(&tracking, format!("{}\n", pin.commit))?;
+        if pin.default_branch {
+            std::fs::write(
+                remote.join("HEAD"),
+                format!("ref: refs/remotes/origin/{branch}\n"),
+            )?;
+        }
+    }
     std::fs::write(git_dir.join("config"), config)?;
     Ok(())
+}
+
+/// Write `tags` to `packed-refs` as `git clone` does, and each of
+/// `tag_objects` (a Head's annotated tag objects) as a loose object named by
+/// its hash. Git peels the annotated tags itself, so the file declares no
+/// peeled lines.
+fn write_tags(
+    git_dir: &Path,
+    mut tags: Vec<crate::clonepack::TagRef>,
+    tag_objects: &[Vec<u8>],
+) -> Result<()> {
+    use sha1::{Digest, Sha1};
+    use std::io::Write;
+    if tags.is_empty() {
+        return Ok(());
+    }
+    tags.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut packed = String::from("# pack-refs with: sorted \n");
+    for tag in &tags {
+        crate::validation::validate_tag_name(&tag.name)
+            .context("clonepack integrity error: invalid tag")?;
+        crate::validation::validate_object_id(&tag.object)
+            .with_context(|| format!("clonepack integrity error: tag {}", tag.name))?;
+        packed.push_str(&format!("{} refs/tags/{}\n", tag.object, tag.name));
+    }
+    for data in tag_objects {
+        let mut object = format!("tag {}\0", data.len()).into_bytes();
+        object.extend_from_slice(data);
+        let id = hex::encode(Sha1::digest(&object));
+        let dir = git_dir.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir)?;
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zlib.write_all(&object)?;
+        std::fs::write(dir.join(&id[2..]), zlib.finish()?)
+            .with_context(|| format!("write tag object {id}"))?;
+    }
+    std::fs::write(git_dir.join("packed-refs"), packed).context("write packed-refs")
+}
+
+/// A git config subsection or value in quotes: a branch name may hold `"`,
+/// `#` or `;`.
+fn quoted(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Whether the filesystem finds a precomposed (NFC) name under its
+/// decomposed (NFD) form, as `git init` probes on macOS.
+#[cfg(target_os = "macos")]
+fn precomposes_unicode(git_dir: &Path) -> Result<bool> {
+    let probe = git_dir.join("\u{c4}");
+    std::fs::write(&probe, b"")?;
+    let found = git_dir.join("A\u{308}").exists();
+    std::fs::remove_file(&probe)?;
+    Ok(found)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn precomposes_unicode(_git_dir: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
@@ -1193,5 +1322,58 @@ mod tests {
         };
         assert!(validate_manifest_commit(&manifest, &"a".repeat(40)).is_err());
         assert!(validate_manifest_commit(&manifest, &"b".repeat(40)).is_ok());
+    }
+
+    /// Tags land in `packed-refs` sorted by name, a Head's tag objects as
+    /// loose objects. A name or object id git would refuse fails the clone
+    /// and writes nothing: a newline in a name would otherwise add a ref
+    /// line of the server's choosing.
+    #[test]
+    fn tags_are_checked_and_written_sorted() {
+        let tag = |name: &str, object: &str| crate::clonepack::TagRef {
+            name: name.to_string(),
+            object: object.to_string(),
+        };
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let dir = tempfile::tempdir().unwrap();
+        write_tags(dir.path(), vec![tag("v2", &b), tag("rel/v1", &a)], &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("packed-refs")).unwrap(),
+            format!("# pack-refs with: sorted \n{a} refs/tags/rel/v1\n{b} refs/tags/v2\n")
+        );
+        // A Head's tag object lands loose under the name its bytes hash to.
+        let data = format!("object {a}\ntype commit\ntag v2\ntagger t <t@t> 0 +0000\n\nv2\n");
+        let header = format!("tag {}\0", data.len());
+        let id = {
+            use sha1::{Digest, Sha1};
+            hex::encode(Sha1::digest(format!("{header}{data}")))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_tags(
+            dir.path(),
+            vec![tag("v2", &id)],
+            &[data.clone().into_bytes()],
+        )
+        .unwrap();
+        let loose =
+            std::fs::read(dir.path().join("objects").join(&id[..2]).join(&id[2..])).unwrap();
+        let mut inflated = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::ZlibDecoder::new(&loose[..]),
+            &mut inflated,
+        )
+        .unwrap();
+        assert_eq!(inflated, format!("{header}{data}"));
+        for bad in [
+            tag(&format!("v1\n{b} refs/heads/main"), &a),
+            tag("../v1", &a),
+            tag("v1", "HEAD"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let objects = [data.clone().into_bytes()];
+            assert!(write_tags(dir.path(), vec![tag("ok", &a), bad], &objects).is_err());
+            assert!(!dir.path().join("packed-refs").exists());
+            assert!(!dir.path().join("objects").exists());
+        }
     }
 }

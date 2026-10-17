@@ -39,8 +39,8 @@ downloading a file from object storage.
 
 | Command | You get | Use it when |
 |---|---|---|
-| `ripclone clone owner/repo` | A full editable git repo with complete history | You want a drop-in `git clone`. |
-| `ripclone clone owner/repo --depth 1` | An editable git repo with only `HEAD` | CI and agents that run git but don't walk history. |
+| `ripclone clone owner/repo` | A full editable git repo with complete history and the tags it reaches | You want a drop-in `git clone`. |
+| `ripclone clone owner/repo --depth 1` | An editable git repo with only `HEAD` and its tags | CI and agents that run git but don't walk history. |
 | `ripclone clone owner/repo --mode files` | The working tree only, no `.git` | You only need the files. Fastest. |
 
 **Git LFS:** ripclone stores LFS pointer files, never the blobs. Run
@@ -132,6 +132,7 @@ ripclone clone owner/repo [dir] [--branch B] [--depth 0|1] [--mode editable|file
 ripclone clone owner/repo --at <ref>        # a full commit SHA, branch, or tag
 ripclone clone owner/repo --wait            # wait for the exact full build, no top-up
 ripclone clone gitlab:group/project         # another provider
+ripclone clone https://github.com/owner/repo.git  # a pasted clone URL works anywhere owner/repo does
 ripclone clone owner/repo --bench           # print a per-phase timing report
 ripclone clone owner/repo --no-metrics      # never send the metrics report
 ripclone sync owner/repo                    # build the default branch tip
@@ -139,14 +140,17 @@ ripclone sync owner/repo --at <ref> [--wait]
 ripclone add owner/repo [--wait]
 ripclone list
 ripclone rm owner/repo
-ripclone provider add|list|rm|test          # provider instances in this CLI's config
+ripclone provider add|list|rm|test          # provider instances in this CLI's config; test runs git ls-remote
 ripclone version                            # CLI and server versions, with a compatibility check
 ripclone update                             # check GitHub for a newer release
 ripclone login | logout                     # sign in to https://ripclone.com
 ```
 
 `dir` defaults to the repository name. As with `git clone`, it may be an
-existing empty directory; a non-empty one is refused. `--depth` takes `0`
+existing empty directory; a non-empty one is refused. The branch tracks
+`origin`, so `git pull` and `git push` work in the clone; `origin` is the
+upstream from this CLI's provider config. `--branch` picks the branch to
+clone; with `--at` it names the local branch instead. `--depth` takes `0`
 (full history, the default) or `1`. `sync` builds failed outputs of the commit
 again; with `--at` it also waits. `--wait` on `sync`, `add`, or `clone` polls
 at most 40 times, about 70 seconds; run the command again to keep waiting.

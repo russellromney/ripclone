@@ -311,3 +311,37 @@ fn run_a7_case(
     let code = body["code"].as_str().map(str::to_string);
     (vec![clone, sync], (status, code))
 }
+
+/// A8: an upstream with no commits is refused at `add` (exit 5) and nothing
+/// builds; `sync` and `clone` say the repo isn't added. After the first push,
+/// `add` builds it and a clone gets that commit.
+#[test]
+fn a8_empty_upstream_is_refused_until_its_first_push() {
+    let world = World::new();
+    let origin = world.origin("acme", "a8");
+    let server = world.server(&[]);
+    let target = world.target("a8");
+    let add = world.cli(&server, &["add", "acme/a8", "--wait"]);
+    assert_eq!(add.code(), Some(5), "{}", add.stderr());
+    assert!(add.err().contains("upstream ref not found: HEAD"));
+    for args in [
+        &["sync", "acme/a8"][..],
+        &["clone", "acme/a8", target.to_str().unwrap()],
+    ] {
+        let out = world.cli(&server, args);
+        assert_eq!(out.code(), Some(5), "{args:?}: {}", out.stderr());
+        assert!(out.err().contains("repo not added"), "{args:?}");
+    }
+    assert!(!target.exists());
+    assert_eq!(server.metric("ripclone_builds_queued_total"), 0);
+
+    let tip = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    world.cli(&server, &["add", "acme/a8", "--wait"]).ok();
+    world
+        .cli(&server, &["clone", "acme/a8", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(listing(&target), origin.tree(&tip));
+    assert_eq!(server.metric("ripclone_builds_failed_total"), 0);
+}

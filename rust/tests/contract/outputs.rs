@@ -243,6 +243,62 @@ fn c4_killed_builds_complete_after_restart() {
     assert_eq!(listing(&files), origin.tree(&b));
 }
 
+/// C10: a fetch stopped after it stored its pack but before it wrote refs
+/// leaves B's objects in the mirror and no refs, as a second build of B
+/// finds it while the first is still fetching. After a restart, B builds
+/// from those objects, and its full and Files clones are exact.
+#[test]
+fn c10_mirror_with_objects_but_no_refs_builds() {
+    let world = World::new();
+    let origin = world.origin("acme", "c10");
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let mut server = world.server(&[]);
+    world.cli(&server, &["add", "acme/c10"]).ok();
+    wait_all_ready(&server, "acme/c10", &a);
+    server.kill();
+
+    let b = origin.commit(&[("a.txt", "b\n"), ("c/d.txt", "d\n")], "B");
+    origin.publish();
+    let mirror = mirror_dir(&world);
+    git(&mirror, &["fetch", "-q", origin.bare.to_str().unwrap(), &b]);
+    let deletes = git(&mirror, &["for-each-ref", "--format=delete %(refname)"]);
+    git_stdin(
+        &mirror,
+        &["update-ref", "--stdin"],
+        format!("{deletes}\n").as_bytes(),
+    );
+    assert_eq!(git(&mirror, &["for-each-ref"]), "");
+    git(&mirror, &["cat-file", "-e", &format!("{b}^{{commit}}")]);
+
+    server.restart();
+    world.cli(&server, &["sync", "acme/c10"]).ok();
+    wait_all_ready(&server, "acme/c10", &b);
+    assert_eq!(server.metric("ripclone_builds_failed_total"), 0);
+    let target = world.target("c10-b");
+    world
+        .cli(&server, &["clone", "acme/c10", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
+    assert_eq!(listing(&target), origin.tree(&b));
+    assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "2");
+    git(&target, &["fsck", "--full"]);
+    let files = world.target("c10-b-files");
+    world
+        .cli(
+            &server,
+            &[
+                "clone",
+                "acme/c10",
+                files.to_str().unwrap(),
+                "--mode",
+                "files",
+            ],
+        )
+        .ok();
+    assert_eq!(listing(&files), origin.tree(&b));
+}
+
 /// Names of the objects in the local store (`<cache>/xx/<name>`), sorted.
 /// Temporary files, whose names start with a dot, are left out.
 fn store_objects(world: &World) -> Vec<String> {

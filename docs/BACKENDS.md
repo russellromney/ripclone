@@ -22,7 +22,9 @@ command ends, alongside a restarted server. This holds on every OS.
 Local disk is the default and needs no configuration. With local disk, the
 `cache` directory is the durable artifact store and must be kept. Builds
 stage temporary files in `cache/tmp`; the server empties it at startup, so a
-crashed build leaves nothing behind.
+crashed build leaves nothing behind. A leftover still in use, such as one a
+killed server's git process is writing, is logged and removed at a later
+start.
 
 For S3-compatible storage (AWS S3, Cloudflare R2, Tigris, MinIO):
 

@@ -374,11 +374,6 @@ pub fn resolve_commit<P: AsRef<Path>>(repo: P, rev: &str) -> Result<String> {
     crate::gix_util::resolve_commit(repo, rev)
 }
 
-/// True when the mirror holds no references — an empty upstream with no commits.
-pub fn is_empty_repo<P: AsRef<Path>>(repo: P) -> Result<bool> {
-    crate::gix_util::is_empty_repo(repo)
-}
-
 /// Set of worktree paths (raw bytes) that differ between commits `from` and
 /// `to` — added, modified, deleted, or mode-changed. Used to rebuild only the
 /// changed entries on a re-sync (files-table by-diff, etc.).
@@ -1557,10 +1552,49 @@ fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// The tags of `repo` whose target `commit` reaches, as `git clone
+/// --single-branch` would fetch them: `(name under refs/tags/, object id,
+/// annotated)`, sorted by name. The mirror holds the tags its fetches
+/// auto-followed (see [`sync_bare_mirror_rev`]). The commit-graph written
+/// before a Full keeps the walk short.
+pub fn reachable_tags<P: AsRef<Path>>(
+    repo: P,
+    commit: &str,
+) -> Result<Vec<(String, String, bool)>> {
+    crate::validation::validate_object_id(commit)
+        .with_context(|| format!("invalid commit: {commit}"))?;
+    let out = run_git(
+        repo,
+        &[
+            "for-each-ref",
+            &format!("--merged={commit}"),
+            "--sort=refname",
+            "--format=%(objecttype) %(objectname) %(refname:lstrip=2)",
+            "refs/tags/",
+        ],
+    )?;
+    out.lines()
+        .map(|line| {
+            let mut fields = line.splitn(3, ' ');
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some(kind), Some(id), Some(name)) => {
+                    Ok((name.to_string(), id.to_string(), kind == "tag"))
+                }
+                _ => bail!("unexpected for-each-ref line: {line}"),
+            }
+        })
+        .collect()
+}
+
 /// Fetch `rev` from upstream, bounded twice: git's low-speed limit fails a
 /// stalled transfer, and `timeout` caps the whole fetch. Either way the
 /// fetch's process group (with its HTTP helper) is killed and the error is
 /// retryable. A cancelled build kills it too.
+///
+/// Git's tag auto-follow fetches the tags that point into the fetched
+/// history, their tag objects in the same pack, and the tags on commits the
+/// mirror already has: a Full publishes those `rev` reaches. A tag on
+/// another branch's history is not fetched, and nor is that history.
 fn sync_bare_mirror_rev(
     mirror_dir: &Path,
     url: &str,
@@ -1581,7 +1615,7 @@ fn sync_bare_mirror_rev(
             .args(LOW_SPEED_ARGS)
             .arg("-C")
             .arg(mirror_dir.as_os_str())
-            .args(["fetch", "--no-tags", "origin", &refspec]),
+            .args(["fetch", "origin", &refspec]),
         Some(timeout),
     )
     .context("git fetch rev")?;
@@ -2061,22 +2095,6 @@ mod tests {
         server
             .join()
             .expect("the fixture connection closed after process-group kill");
-    }
-
-    #[test]
-    fn is_empty_repo_true_until_first_commit() {
-        let base = tempfile::tempdir().unwrap();
-        let repo_dir = base.path().join("empty.git");
-        let repo = crate::test_fixture::init_bare(&repo_dir);
-        assert!(
-            is_empty_repo(&repo_dir).unwrap(),
-            "a fresh bare repo has no refs and is empty"
-        );
-        crate::test_fixture::commit(&repo, &[("README.md", b"hi")]);
-        assert!(
-            !is_empty_repo(&repo_dir).unwrap(),
-            "a repo with a commit is not empty"
-        );
     }
 
     #[test]

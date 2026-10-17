@@ -130,17 +130,6 @@ pub fn resolve_commit<P: AsRef<Path>>(repo_path: P, rev: &str) -> Result<String>
     Ok(commit.id.to_string())
 }
 
-/// True when the repository holds no references at all — i.e. an empty upstream
-/// with no commits. A fresh `git clone --mirror` of an empty repo succeeds and
-/// leaves a bare repo with zero refs, so this cleanly distinguishes "nothing to
-/// clone" from "a specific branch/rev is missing".
-pub fn is_empty_repo<P: AsRef<Path>>(repo_path: P) -> Result<bool> {
-    let repo = open_repo(repo_path)?;
-    let platform = repo.references().context("open references")?;
-    let mut iter = platform.all().context("iterate references")?;
-    Ok(iter.next().is_none())
-}
-
 /// Return the immediate parent of `commit` only when it has exactly one.
 ///
 /// Roots and merges deliberately return `None`: callers use this value as an
@@ -296,6 +285,73 @@ pub fn object_sizes<P: AsRef<Path>>(repo_path: P, oids: &[String]) -> Result<Has
         Ok((oid_str.clone(), header.size()))
     })?;
     Ok(pairs.into_iter().collect())
+}
+
+/// The annotated tag objects `tags` name, each followed by the tags it
+/// names in turn (a tag of a tag), down to the first object that is not a
+/// tag. Sorted, without repeats.
+pub fn tag_objects<P: AsRef<Path>>(repo_path: P, tags: &[String]) -> Result<Vec<String>> {
+    let repo = open_repo(repo_path)?;
+    let mut out = std::collections::BTreeSet::new();
+    for tag in tags {
+        let mut id = parse_oid(tag)?;
+        while out.insert(id.to_string()) {
+            let object = repo
+                .find_object(id)
+                .with_context(|| format!("find tag {id}"))?;
+            let tag = object
+                .try_into_tag()
+                .with_context(|| format!("{id} is not a tag"))?;
+            let decoded = tag.decode().with_context(|| format!("decode tag {id}"))?;
+            if decoded.target_kind != gix::object::Kind::Tag {
+                break;
+            }
+            id = decoded.target();
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// The tags whose target, after peeling every tag, is `commit`, as
+/// `(name under refs/tags/, object id)` sorted by name, and the raw content
+/// of the annotated tag objects they name (see [`tag_objects`]).
+pub fn tags_at<P: AsRef<Path>>(
+    repo_path: P,
+    commit: &str,
+) -> Result<(Vec<(String, String)>, Vec<Vec<u8>>)> {
+    let repo = open_repo(&repo_path)?;
+    let commit = parse_oid(commit)?;
+    let mut tags = Vec::new();
+    let mut annotated = Vec::new();
+    let references = repo.references().context("read refs")?;
+    for reference in references
+        .tags()
+        .map_err(|e| anyhow::anyhow!("list tags: {e}"))?
+    {
+        let mut reference = reference.map_err(|e| anyhow::anyhow!("read tag: {e}"))?;
+        let Some(id) = reference.target().try_id().map(|id| id.to_owned()) else {
+            continue;
+        };
+        let name = reference.name().shorten().to_string();
+        let peeled = reference
+            .peel_to_id()
+            .with_context(|| format!("peel tag {name}"))?;
+        if peeled == commit {
+            if id != commit {
+                annotated.push(id.to_string());
+            }
+            tags.push((name, id.to_string()));
+        }
+    }
+    tags.sort();
+    let objects = tag_objects(&repo_path, &annotated)?
+        .iter()
+        .map(|id| {
+            let object = repo.find_object(parse_oid(id)?)?;
+            anyhow::Ok(object.data.clone())
+        })
+        .collect::<Result<_>>()?;
+    Ok((tags, objects))
 }
 
 // ---------------------------------------------------------------------------

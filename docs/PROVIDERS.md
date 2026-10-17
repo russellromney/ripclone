@@ -35,7 +35,10 @@ table name. A `[providers]` entry beats a `RIPCLONE_PROVIDERS` entry with the
 same id.
 
 Address a repo by instance id: `gitlab:mygroup/project` on the CLI,
-`/v1/repos/gitlab/mygroup/project/...` on the API.
+`/v1/repos/gitlab/mygroup/project/...` on the API. The CLI also takes a
+pasted clone URL (`https://gitlab.com/mygroup/project.git` or
+`git@gitlab.com:mygroup/project.git`) and picks the instance whose host
+matches.
 
 ## Server and CLI
 
@@ -47,5 +50,8 @@ The CLI needs the instance too, to clone. A full clone that tops up fetches
 from the instance's host with your own git, and `--verify-upstream` reads the
 same host. The CLI never sends the instance's token to the ripclone server.
 `ripclone provider add <id> --kind <kind> --host <host>` writes an instance to
-the CLI's `config.toml`; `ripclone provider list` and `ripclone provider rm
-<id>` manage them.
+the CLI's `config.toml`; run it again with only the flags to change. `ripclone
+provider list` shows every instance the CLI knows, the built-in `github`
+included, and `ripclone provider rm <id>` removes one. `ripclone provider test
+<id> owner/repo` reads the repo's `HEAD` with `git ls-remote` and the
+instance's token, so it checks your config, not the server's.

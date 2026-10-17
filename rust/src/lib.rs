@@ -214,6 +214,10 @@ pub struct FullResult {
     /// these instead of the parent Head's packs.
     #[serde(default)]
     pub head_base: Option<HeadBase>,
+    /// The annotated tag objects of the tags in the manifest, packed for
+    /// this commit: the last of `packs`, installed like a history pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_pack: Option<SizedPack>,
 }
 
 /// A Head pack set that later Heads add levels on. Lengths are kept so

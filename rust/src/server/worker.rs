@@ -454,6 +454,12 @@ async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {
 /// commit of the repo does not hold this build. Head and Files of a new
 /// commit start together: the one that waited for the write lock finds the
 /// commit fetched and does not fetch again. The caller holds `lock.read`.
+///
+/// Without the write lock, a fetch may still be running. That is safe because
+/// each fetch lands as one pack (`fetch.unpackLimit=1`), which git makes
+/// visible only when its idx is in place, so a visible commit has every object
+/// it needs. That fetch writes its refs and the fetched-pack marker last, so a
+/// build must read neither to decide what to build.
 async fn ensure_commit(
     state: &ServerState,
     repo_id: &RepoId,
@@ -550,10 +556,6 @@ async fn head_output(
     phases.mirror_fetch_ms = Some(duration_ms(t.elapsed()));
     let (prep_dir, prep_commit) = (mirror_dir.clone(), commit.to_string());
     let parent = cancel::spawn_blocking(move || -> Result<Option<String>> {
-        // An empty upstream mirrors fine but has nothing to build.
-        if git::is_empty_repo(&prep_dir).unwrap_or(false) {
-            anyhow::bail!("repository has no commits (nothing to clone)");
-        }
         let resolved = git::resolve_commit(&prep_dir, &prep_commit)
             .with_context(|| format!("resolve admitted commit {prep_commit}"))?;
         anyhow::ensure!(
