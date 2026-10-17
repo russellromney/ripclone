@@ -550,10 +550,6 @@ async fn head_output(
     phases.mirror_fetch_ms = Some(duration_ms(t.elapsed()));
     let (prep_dir, prep_commit) = (mirror_dir.clone(), commit.to_string());
     let parent = cancel::spawn_blocking(move || -> Result<Option<String>> {
-        // An empty upstream mirrors fine but has nothing to build.
-        if git::is_empty_repo(&prep_dir).unwrap_or(false) {
-            anyhow::bail!("repository has no commits (nothing to clone)");
-        }
         let resolved = git::resolve_commit(&prep_dir, &prep_commit)
             .with_context(|| format!("resolve admitted commit {prep_commit}"))?;
         anyhow::ensure!(

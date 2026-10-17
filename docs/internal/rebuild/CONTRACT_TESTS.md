@@ -49,7 +49,7 @@ a unit test or it is not needed.
 "Added" names the PR that added the row's test. Each row's test is named
 after the row (`a1_...`, `s3_c2_...`).
 
-### A. Resolve and admit (7)
+### A. Resolve and admit (8)
 
 | # | Test | Added |
 |---|---|---|
@@ -60,6 +60,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | A5 | `--at HEAD~1` (a rev expression) is rejected with a clear error and no build. | #203 |
 | A6 | Table: repo not added (clone and sync), unknown ref, missing upstream repo. Each gives its own error code and no build. | #186 |
 | A7 | After `add`, the origin is deleted (`repo_not_found`, exit 5) or accepts and never answers (`RIPCLONE_LS_REMOTE_TIMEOUT_SECS=1`: `upstream_unavailable`, exit 6). Clone, sync and the API fail with no build; the built commit still clones by SHA. | #208 |
+| A8 | An upstream with no commits: `add` fails with `ref_not_found` (exit 5), `sync` and `clone` say the repo isn't added, and nothing builds or is installed. After the first push, `add` builds it and a clone is exact. | #234 |
 
 ### B. Coalescing (3)
 
@@ -69,7 +70,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | #188 |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | #188 |
 
-### C. Outputs are independent and immutable (8)
+### C. Outputs are independent and immutable (9)
 
 | # | Test | Added |
 |---|---|---|
@@ -81,6 +82,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | C7 | S3 only: the bucket holds Full(B)'s first write while push C arrives. Head(C) and Files(C) become ready while Full(B) is still pending; after release, Full(B) publishes before Full(C). | Hetzner benchmark |
 | C8 | S3 only: the bucket holds one of Head's writes and refuses the next. Head fails with the storage error and publishes nothing; a depth-1 clone fails and leaves no target. With the fault gone, `sync --at` builds every output and each shape clones exactly. | #220 (S3 job) |
 | C9 | Every output of A is ready; the origin holds B's fetch, so nothing of B is. A files clone and a depth-1 clone of B each report B pending, download nothing, and install nothing: neither falls back to A. After release both install B. | #221 |
+| C10 | The mirror holds B's objects but no refs, as a fetch stopped between storing its pack and writing refs leaves it. After a restart, B builds with no failures, and its full and Files clones are exact. | #234 |
 
 A SIGKILLed server's `git` children run until their command ends, on every
 OS. #209 killed them on Linux with a parent-death signal (row C6), but
@@ -224,7 +226,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 81 tests. Several are table-driven.
+Total: 83 tests. Several are table-driven.
 
 ## What it replaced
 

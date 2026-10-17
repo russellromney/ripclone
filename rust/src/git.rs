@@ -374,11 +374,6 @@ pub fn resolve_commit<P: AsRef<Path>>(repo: P, rev: &str) -> Result<String> {
     crate::gix_util::resolve_commit(repo, rev)
 }
 
-/// True when the mirror holds no references — an empty upstream with no commits.
-pub fn is_empty_repo<P: AsRef<Path>>(repo: P) -> Result<bool> {
-    crate::gix_util::is_empty_repo(repo)
-}
-
 /// Set of worktree paths (raw bytes) that differ between commits `from` and
 /// `to` — added, modified, deleted, or mode-changed. Used to rebuild only the
 /// changed entries on a re-sync (files-table by-diff, etc.).
@@ -2061,22 +2056,6 @@ mod tests {
         server
             .join()
             .expect("the fixture connection closed after process-group kill");
-    }
-
-    #[test]
-    fn is_empty_repo_true_until_first_commit() {
-        let base = tempfile::tempdir().unwrap();
-        let repo_dir = base.path().join("empty.git");
-        let repo = crate::test_fixture::init_bare(&repo_dir);
-        assert!(
-            is_empty_repo(&repo_dir).unwrap(),
-            "a fresh bare repo has no refs and is empty"
-        );
-        crate::test_fixture::commit(&repo, &[("README.md", b"hi")]);
-        assert!(
-            !is_empty_repo(&repo_dir).unwrap(),
-            "a repo with a commit is not empty"
-        );
     }
 
     #[test]
