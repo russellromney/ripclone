@@ -91,6 +91,13 @@ impl TopUp {
             self.upstream
         );
         assert_eq!(listing(&target), self.origin.tree(b));
+        // The top-up's fetch and checkout leave nothing `git clone` would
+        // not: the reflog starts at B, and there is no ORIG_HEAD.
+        assert_eq!(
+            git(&target, &["reflog", "--format=%H %gs"]),
+            format!("{b} clone: from {}", self.upstream)
+        );
+        assert!(!target.join(".git").join("ORIG_HEAD").exists());
         assert_eq!(
             git(&target, &["rev-list", "--count", "HEAD"]),
             self.origin.count(b)
