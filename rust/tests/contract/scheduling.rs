@@ -110,14 +110,16 @@ fn k1_held_fetch_of_one_repo_does_not_block_another() {
 /// K2: with `RIPCLONE_FETCH_TIMEOUT_SECS=1`, a fetch the origin never
 /// answers is stopped and the build retries; when the origin answers the
 /// retry, the build completes and clones. With the origin held throughout,
-/// Head fails after its attempts with a timeout error and nothing else
-/// builds.
+/// Head and Files, which each fetch the commit, fail after their attempts
+/// with a timeout error, and nothing builds.
 #[test]
 fn k2_stalled_fetch_times_out_and_retries() {
     let env = [
         ("RIPCLONE_FETCH_TIMEOUT_SECS", "1"),
         ("RIPCLONE_BUILD_RETRY_BASE_MS", "100"),
-        ("RIPCLONE_BUILD_MAX_ATTEMPTS", "3"),
+        // Head and Files fetch under one lock, so a held origin costs
+        // 2 x attempts serial timeouts.
+        ("RIPCLONE_BUILD_MAX_ATTEMPTS", "2"),
     ];
 
     // The origin answers once the build has retried.
@@ -158,12 +160,14 @@ fn k2_stalled_fetch_times_out_and_retries() {
     let server = world.server(&env);
     http.hold_fetches();
     world.cli(&server, &["add", "acme/k2"]).ok();
-    wait_output(&server, "acme/k2", &tip, "head", "failed");
-    let head = output(&server, "acme/k2", &tip, "head");
-    let error = head["error"].as_str().unwrap_or_default();
-    assert!(error.contains("timed out after"), "{head}");
-    assert_eq!(http.fetches(), 3, "one fetch per attempt");
-    assert_eq!(server.metric("ripclone_builds_failed_total"), 1);
+    for kind in ["head", "files"] {
+        wait_output(&server, "acme/k2", &tip, kind, "failed");
+        let out = output(&server, "acme/k2", &tip, kind);
+        let error = out["error"].as_str().unwrap_or_default();
+        assert!(error.contains("timed out after"), "{out}");
+    }
+    assert_eq!(http.fetches(), 4, "one fetch per Head and Files attempt");
+    assert_eq!(server.metric("ripclone_builds_failed_total"), 2);
     for kind in ["head", "full", "files"] {
         assert_eq!(
             server.metric(&format!(
@@ -242,11 +246,12 @@ fn pack_count(mirror: &std::path::Path) -> usize {
 }
 
 /// K4: while the server is down, its mirror gathers 20 more packs and 70
-/// loose refs, as months of pushes leave it. The next Full compacts it first
+/// loose refs, as months of pushes leave it. The next commit's Files and
+/// Full run together; once both have published, the mirror is compacted
 /// (the log says so, and under 16 packs remain), and full clones of the
 /// built commit and of a later push are exact.
 #[test]
-fn k4_full_compacts_a_fragmented_mirror() {
+fn k4_builds_compact_a_fragmented_mirror() {
     let world = World::new();
     let origin = world.origin("acme", "k4");
     let a = origin.commit(&[("a.txt", "a\n")], "A");
@@ -277,11 +282,15 @@ fn k4_full_compacts_a_fragmented_mirror() {
 
     server.restart_with(&[("RIPCLONE_FILES_SLOTS", "1"), ("RIPCLONE_FULL_SLOTS", "1")]);
     wait_output(&server, "acme/k4", &a, "full", "ready");
-    let log = server.log();
-    assert!(
-        log.contains("repacked: true, packed_refs: true"),
-        "the mirror was not compacted:\n{log}"
-    );
+    wait_output(&server, "acme/k4", &a, "files", "ready");
+    // The later of Files and Full to finish finds the mirror free and
+    // compacts it after publishing.
+    wait_for("the mirror compacted", || {
+        server
+            .log()
+            .contains("repacked: true, packed_refs: true")
+            .then_some(())
+    });
     assert!(pack_count(&mirror) < 16, "{} packs", pack_count(&mirror));
 
     let b = origin.commit(&[("b.txt", "b\n")], "B");

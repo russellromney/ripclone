@@ -261,16 +261,10 @@ pub fn stored_bytes(world: &World) -> u64 {
     walk(&world.path("server").join("cache"))
 }
 
-/// G6: after a small push, the Files build of B reuses A's archive. A Files
-/// clone of B downloads chunks a Files clone of A also downloaded, the
-/// store grows by much less than the repository, and B's tree is exact.
-/// Two more pushes, each Files built on the last: an edit inside a large
-/// file plus a new file beside it; then a delete, a move, an exec bit, a
-/// symlink and 50 small files. Each Files clone is exact.
-#[test]
-fn g6_incremental_files_rebuild_after_small_push() {
-    let world = World::new();
-    let origin = world.origin("acme", "g6");
+/// A 12 MiB origin: four 3 MiB random files and `zz.txt`, committed as A
+/// and published. Big enough that its Files archive has several frames.
+fn twelve_mib_origin(world: &World, name: &str) -> (Origin, String) {
+    let origin = world.origin("acme", name);
     for i in 0..4u64 {
         let path = origin.work.join(format!("data/{i}.bin"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -278,31 +272,42 @@ fn g6_incremental_files_rebuild_after_small_push() {
     }
     let a = origin.commit(&[("zz.txt", "a\n")], "A");
     origin.publish();
+    (origin, a)
+}
+
+/// A Files clone of `repo` into `name`, through `server`.
+fn files_clone(
+    world: &World,
+    server: &impl Endpoint,
+    repo: &str,
+    name: &str,
+) -> std::path::PathBuf {
+    let target = world.target(name);
+    let argv = ["clone", repo, target.to_str().unwrap(), "--mode", "files"];
+    world.cli(server, &argv).ok();
+    target
+}
+
+/// G6: after a small push, the Files build of B reuses A's archive. A Files
+/// clone of B downloads chunks a Files clone of A also downloaded, the
+/// store grows by much less than the repository, and B's tree is exact.
+#[test]
+fn g6_incremental_files_rebuild_after_small_push() {
+    let world = World::new();
+    let (origin, a) = twelve_mib_origin(&world, "g6");
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g6", "--wait"]).ok();
     let proxy = FaultProxy::start(&server);
-    let files_clone = |name: &str| {
-        let target = world.target(name);
+    let fetched_by = |name: &str| {
         let before = proxy.artifact_gets().len();
-        world
-            .cli(
-                &proxy,
-                &[
-                    "clone",
-                    "acme/g6",
-                    target.to_str().unwrap(),
-                    "--mode",
-                    "files",
-                ],
-            )
-            .ok();
+        let target = files_clone(&world, &proxy, "acme/g6", name);
         let fetched: std::collections::BTreeSet<String> = proxy.artifact_gets()[before..]
             .iter()
             .map(|s| s.path.clone())
             .collect();
         (target, fetched)
     };
-    let (target_a, fetched_a) = files_clone("g6-a");
+    let (target_a, fetched_a) = fetched_by("g6-a");
     assert_eq!(listing(&target_a), origin.tree(&a));
     let stored_a = stored_bytes(&world);
 
@@ -310,7 +315,7 @@ fn g6_incremental_files_rebuild_after_small_push() {
     origin.publish();
     world.cli(&server, &["sync", "acme/g6", "--wait"]).ok();
     let grown = stored_bytes(&world) - stored_a;
-    let (target_b, fetched_b) = files_clone("g6-b");
+    let (target_b, fetched_b) = fetched_by("g6-b");
 
     assert_eq!(listing(&target_b), origin.tree(&b));
     let shared = fetched_a.intersection(&fetched_b).count();
@@ -322,6 +327,18 @@ fn g6_incremental_files_rebuild_after_small_push() {
         grown < (12 << 20) / 2,
         "B's builds stored {grown} bytes for a one-line change"
     );
+}
+
+/// G6b: two pushes after A, each Files built on the last: an edit inside a
+/// large file plus a new file beside it; then a delete, a move, an exec bit,
+/// a symlink and 50 small files. Each Files clone is exact. Apart from G6 so
+/// the two run in parallel.
+#[test]
+fn g6b_files_built_on_files_stay_exact() {
+    let world = World::new();
+    let (origin, _) = twelve_mib_origin(&world, "g6b");
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/g6b", "--wait"]).ok();
 
     let write = |path: &str, bytes: &[u8]| {
         let path = origin.work.join(path);
@@ -368,8 +385,8 @@ fn g6_incremental_files_rebuild_after_small_push() {
         }
         let tip = origin.commit(&[], what);
         origin.publish();
-        world.cli(&server, &["sync", "acme/g6", "--wait"]).ok();
-        let (target, _) = files_clone(&format!("g6-{i}"));
+        world.cli(&server, &["sync", "acme/g6b", "--wait"]).ok();
+        let target = files_clone(&world, &server, "acme/g6b", &format!("g6b-{i}"));
         assert_eq!(listing(&target), origin.tree(&tip), "{what}");
     }
 }

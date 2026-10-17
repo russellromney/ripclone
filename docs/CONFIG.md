@@ -86,7 +86,7 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | `RIPCLONE_FILES_SLOTS` | Builds that run Files at once. Default: a quarter of the CPU cores, at least 2. `0` pauses Files; Head and Full still build. |
 | `RIPCLONE_FULL_SLOTS` | Builds that run Full at once. Default: a quarter of the CPU cores, at least 2. `0` pauses Full; Head and Files still build. A long Full never holds back another commit's Files. |
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
-| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Files, then Full) before the output fails, default 5. At least 1. |
+| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per output before it fails, default 5. Head, Files and Full each count their own. At least 1. |
 | `RIPCLONE_LSM_MAX_LEVELS` | Most history levels a Full keeps before merging the smallest neighbors, default 16. |
 | `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head packs past their base reach this size, its Full build compacts them into a new base for later Heads. Default 128 MiB. |
 | `RIPCLONE_ORIGIN_BASE` | Fetch repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. For mirrors and tests. |
@@ -97,7 +97,8 @@ per kind only help when several repositories build at once. After a
 repository's first build, each kind builds only what changed since its base
 and spends much of its time waiting on uploads, so every pool defaults to a
 quarter of the cores, at least 2: 2 each on 8 cores, 4 on 16, 16 on 64. A
-repository's Fulls build in the order its commits were admitted.
+commit's Head and Files build at the same time, and its Full once Head is
+ready. A repository's Fulls build in the order its commits were admitted.
 
 Every numeric server setting is a non-negative integer, except
 `RIPCLONE_RATE_LIMIT_PER_SEC`, which may be a decimal. A value that is set but

@@ -129,7 +129,7 @@ Files output has `archive_chunk_urls` instead of `pack_chunk_urls`. Signed URLs 
 }
 ```
 
-`attempts` counts build attempts so far. After a failed attempt that will be
+`attempts` counts this output's build attempts so far. After a failed attempt that will be
 retried, `error` holds that attempt's error. `top_up` appears only for a
 pending Full when an earlier Full is ready: the newest ready Full admitted from
 the same branch, else the parent commit's. A full clone installs `base`, then
