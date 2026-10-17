@@ -287,6 +287,31 @@ pub fn object_sizes<P: AsRef<Path>>(repo_path: P, oids: &[String]) -> Result<Has
     Ok(pairs.into_iter().collect())
 }
 
+/// The annotated tag objects `tags` name, each followed by the tags it
+/// names in turn (a tag of a tag), down to the first object that is not a
+/// tag. Sorted, without repeats.
+pub fn tag_objects<P: AsRef<Path>>(repo_path: P, tags: &[String]) -> Result<Vec<String>> {
+    let repo = open_repo(repo_path)?;
+    let mut out = std::collections::BTreeSet::new();
+    for tag in tags {
+        let mut id = parse_oid(tag)?;
+        while out.insert(id.to_string()) {
+            let object = repo
+                .find_object(id)
+                .with_context(|| format!("find tag {id}"))?;
+            let tag = object
+                .try_into_tag()
+                .with_context(|| format!("{id} is not a tag"))?;
+            let decoded = tag.decode().with_context(|| format!("decode tag {id}"))?;
+            if decoded.target_kind != gix::object::Kind::Tag {
+                break;
+            }
+            id = decoded.target();
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

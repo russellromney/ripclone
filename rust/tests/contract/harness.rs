@@ -551,6 +551,43 @@ impl Origin {
     }
 }
 
+/// The tags of the repo at `dir`, one `<name> <type> <object>` line each.
+pub fn tag_refs(dir: &Path) -> String {
+    git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=2) %(objecttype) %(objectname)",
+            "refs/tags/",
+        ],
+    )
+}
+
+/// [`tag_refs`] of what `git clone --single-branch <args>` of `bare` gets,
+/// with `git describe` and `git describe --tags` of its HEAD (empty when
+/// it fails).
+pub fn git_clone_tags(bare: &Path, args: &[&str]) -> (String, String, String) {
+    let scratch = tempfile::tempdir().unwrap();
+    let target = scratch.path().join("clone");
+    let url = format!("file://{}", bare.display());
+    let mut argv = vec!["clone", "-q", "--single-branch"];
+    argv.extend_from_slice(args);
+    argv.extend([url.as_str(), target.to_str().unwrap()]);
+    git(scratch.path(), &argv);
+    let (all, tags) = describe(&target);
+    (tag_refs(&target), all, tags)
+}
+
+/// `git describe` and `git describe --tags` of HEAD at `dir`, each empty
+/// when it fails.
+pub fn describe(dir: &Path) -> (String, String) {
+    let run = |args: &[&str]| {
+        let out = git_output(dir, args);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    (run(&["describe"]), run(&["describe", "--tags"]))
+}
+
 /// The files on disk under `dir` as `ls-tree -r` lines, hashed through a
 /// throwaway repo so the clone itself is untouched. Git never adds a `.git`
 /// entry, so this works for editable and Files clones alike.

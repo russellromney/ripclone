@@ -3,7 +3,7 @@ pub mod pb {
 }
 
 pub use pb::{
-    ChunkRef, ClonepackManifest, FileEntry, Fragment, FrameInfo, MetadataChunk, PackEntry,
+    ChunkRef, ClonepackManifest, FileEntry, Fragment, FrameInfo, MetadataChunk, PackEntry, TagRef,
 };
 
 use anyhow::{Context, Result};

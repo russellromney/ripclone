@@ -753,7 +753,9 @@ fn ref_response(
         .map(|full| {
             full.history_levels
                 .iter()
-                .flat_map(|level| level.packs.iter().map(|p| p.idx.as_str()))
+                .flat_map(|level| &level.packs)
+                .chain(&full.tag_pack)
+                .map(|p| p.idx.as_str())
                 .collect()
         })
         .unwrap_or_default();

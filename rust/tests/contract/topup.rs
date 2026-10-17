@@ -30,7 +30,13 @@ impl TopUp {
         http.require_header("authorization", &user_auth);
         let origin = world.origin("acme", name);
         let a = origin.commit(&[("a.txt", "a\n"), ("d/b.txt", "b\n")], "A");
+        git(&origin.work, &["tag", "-a", "-m", "release a", "v-a"]);
+        git(&origin.work, &["tag", "light-a"]);
         origin.publish();
+        git(
+            &origin.work,
+            &["push", "-q", origin.bare.to_str().unwrap(), "--tags"],
+        );
 
         let server_providers = providers_json(
             http.url(),
@@ -64,7 +70,9 @@ impl TopUp {
     }
 
     /// Full-clone the branch, with the user's credential in their git config,
-    /// and check the clone equals the origin at `b`.
+    /// and check the clone equals the origin at `b`. It has Full(A)'s tags
+    /// when A is in B's history, as a `git clone --single-branch` of B does,
+    /// and none after a force-push.
     fn clone_equals_origin(&self, b: &str) {
         let target = self.world.target("clone");
         let header = format!("Authorization: {}", self.user_auth);
@@ -95,6 +103,20 @@ impl TopUp {
             git(&target, &["rev-list", "--count", "HEAD"]),
             self.origin.count(b)
         );
+        let ancestor = git_output(
+            &self.origin.bare,
+            &["merge-base", "--is-ancestor", &self.a, b],
+        )
+        .status
+        .success();
+        let (refs, all, tags) = git_clone_tags(&self.origin.bare, &[]);
+        assert_eq!(
+            refs.contains("v-a tag") && refs.contains("light-a commit"),
+            ancestor,
+            "{refs}"
+        );
+        assert_eq!(tag_refs(&target), refs);
+        assert_eq!(describe(&target), (all, tags));
         let fsck = git_output(&target, &["fsck", "--no-dangling", "--no-progress"]);
         assert!(
             fsck.status.success() && fsck.stdout.is_empty() && fsck.stderr.is_empty(),

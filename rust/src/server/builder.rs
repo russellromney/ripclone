@@ -1123,6 +1123,15 @@ pub(super) async fn build_full_result(
         phases.record("head_rebase", start);
     }
 
+    // Tags go last: everything else in the manifest is already known.
+    let start = Instant::now();
+    let (tm, tc, tcommit) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let (tags, tag_pack) =
+        cancel::spawn_blocking(move || PackBuilder::new(&tm, &tc).build_tags(&tcommit))
+            .await
+            .context("Full tags task")??;
+    phases.record("tags", start);
+
     Cancel::check_current()?;
     let (vc, vs, vcommit, vparent, vmetadata) = (
         cas.clone(),
@@ -1131,7 +1140,8 @@ pub(super) async fn build_full_result(
         parent.clone(),
         head.clonepack.metadata_chunk.clone(),
     );
-    let (vhead, vhistory) = (head_packs.clone(), history_packs.clone());
+    let (vhead, vhistory, vtag_pack) =
+        (head_packs.clone(), history_packs.clone(), tag_pack.clone());
     let metadata_len = head_manifest.metadata_chunk.as_ref().map(|chunk| chunk.len);
     let start = Instant::now();
     let manifest_hash = cancel::spawn_blocking(move || -> Result<_> {
@@ -1142,12 +1152,13 @@ pub(super) async fn build_full_result(
             .iter()
             .map(|pack| pack_entry(pack, false, 0))
             .chain(vhistory.iter().map(|pack| pack_entry(pack, true, 0)))
+            .chain(vtag_pack.iter().map(|pack| pack_entry(pack, true, 0)))
             .collect::<Result<Vec<_>>>()?;
         let metadata_len = match metadata_len {
             Some(len) => len,
             None => vs.size(&vmetadata).context("size Head metadata for Full")?,
         };
-        let manifest = make_manifest(
+        let mut manifest = make_manifest(
             &vcommit,
             &vparent,
             &[],
@@ -1157,13 +1168,14 @@ pub(super) async fn build_full_result(
             None,
             None,
         )?;
+        manifest.tags = tags;
         vc.put(&manifest.encode_to_vec())
     })
     .await
     .context("Full manifest task")??;
     phases.record("manifest", start);
     uploads.start_all([&manifest_hash]);
-    for (pack, _, idx, _) in &new_history {
+    for (pack, _, idx, _) in new_history.iter().chain(&tag_pack) {
         uploads.start_all([pack, idx]);
     }
     // Later builds read the idx files of the packs this Full references.
@@ -1184,6 +1196,7 @@ pub(super) async fn build_full_result(
 
     let mut all_packs = head_packs;
     all_packs.extend(history_packs);
+    all_packs.extend(tag_pack.clone());
     Ok(crate::FullResult {
         clonepack: crate::ClonepackArtifacts {
             manifest: manifest_hash,
@@ -1195,6 +1208,7 @@ pub(super) async fn build_full_result(
         packs: pack_artifacts_of(&all_packs),
         history_levels: levels,
         head_base,
+        tag_pack: tag_pack.as_ref().map(tuple_to_sized),
     })
 }
 

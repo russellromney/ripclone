@@ -104,9 +104,9 @@ whole server for every git spawn. C6 is retired. The unit test
 
 | # | Test | Added |
 |---|---|---|
-| E1 | Full(A) ready; restart with `files_slots = 0` and `full_slots = 0`; push B; full clone: installs B by top-up without waiting on any server build. Tree and `rev-list --count` equal origin at B, `git fsck` clean. | #205 |
+| E1 | Full(A) ready; restart with `files_slots = 0` and `full_slots = 0`; push B; full clone: installs B by top-up without waiting on any server build. Tree and `rev-list --count` equal origin at B, `git fsck` clean. A's annotated and lightweight tags and `git describe` equal a `git clone --single-branch` of B. | #205 |
 | E2 | Same with a push of several commits including a merge (A is an ancestor, not the parent). | #205 |
-| E3 | Same after a force-push (A is not an ancestor): clone still equals origin at B. | #205 |
+| E3 | Same after a force-push (A is not an ancestor): clone still equals origin at B, and has no tags, as git's has none. | #205 |
 | E4 | No ready Full exists for the ref: full clone waits for Full(B) instead of failing. | #205 |
 
 Top-up uses the user's git credentials. E1-E3 run against an auth-checking
@@ -130,7 +130,7 @@ Ripclone token reaches the origin.
 | F11 | A proxy that ignores Range: the ranged download falls back to one whole GET of that artifact, and the clone is exact. | |
 | F12 | A flipped byte in one range fails the clone on the hash check and leaves nothing. | |
 
-### G. Clone shapes produce correct trees (10)
+### G. Clone shapes produce correct trees (11)
 
 | # | Test | Added |
 |---|---|---|
@@ -145,6 +145,7 @@ Ripclone token reaches the origin.
 | G8 | Empty trees: a root commit with no files, and a later commit that deletes every file. Every shape installs an empty tree. | #208 |
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | #208 |
 | G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | #208 |
+| G13 | Full clones have the tags their commit reaches, equal to `git clone --single-branch` (refs and both `git describe` forms): annotated, a tag of a tag, and lightweight; `fsck --strict` clean. A tag on a second built branch (in the mirror) and a tag on a later commit are left out (`--at v1`). A tag made on an old commit after its Full is in the next Full. A depth-1 clone of an untagged tip has no tags, like `git clone --depth 1`. | |
 
 ### H. Storage and server state (10)
 
@@ -224,7 +225,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 81 tests. Several are table-driven.
+Total: 82 tests. Several are table-driven.
 
 ## What it replaced
 

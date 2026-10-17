@@ -60,6 +60,18 @@ message ClonepackManifest {
   // `packs[i].idx` next to its pack, and reads the HEAD packs only for the
   // working tree.
   ChunkRef idx_bundle = 13;
+
+  // The tags whose target `commit` reaches, which a full clone writes to
+  // `packed-refs` as `git clone --single-branch` would. Their annotated tag
+  // objects are in a Full's last history pack. Head and Files have none.
+  repeated TagRef tags = 14;
+}
+
+// One tag: its name under `refs/tags/` and the object it names, an
+// annotated tag object or the commit of a lightweight tag.
+message TagRef {
+  string name = 1;
+  string object = 2;
 }
 
 // One self-contained git pack plus its index, addressed by content hash.

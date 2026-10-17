@@ -807,3 +807,128 @@ fn g12_editable_clones_pull_and_push_like_git_clone() {
     assert_eq!(upstream(&local), None);
     assert_eq!(git(&local, &["for-each-ref", "refs/remotes"]), "");
 }
+
+/// G13: a full clone has the tags its commit reaches, as `git clone
+/// --single-branch` gets them: annotated, a tag of a tag, and lightweight,
+/// with every tag object present, so `git describe` answers as in the git
+/// clone. A tag on another built branch is left out though the mirror has
+/// it, and so is a tag on a later commit. A tag made on an old commit after
+/// its Full is in the next Full. A depth-1 clone of an untagged tip has no
+/// tags, as `git clone --depth 1` has none.
+#[test]
+fn g13_full_clones_have_the_tags_their_commit_reaches() {
+    let world = World::new();
+    let origin = world.origin("acme", "g13");
+    let (work, bare) = (&origin.work, origin.bare.to_str().unwrap());
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    git(work, &["tag", "-a", "-m", "release 1", "v1"]);
+    git(
+        work,
+        &[
+            "-c",
+            "advice.nestedTag=false",
+            "tag",
+            "-a",
+            "-m",
+            "of v1",
+            "v1-of",
+            "v1",
+        ],
+    );
+    let b = origin.commit(&[("b.txt", "b\n")], "B");
+    git(work, &["tag", "light"]);
+    git(work, &["checkout", "-q", "-b", "side", &a]);
+    origin.commit(&[("s.txt", "s\n")], "S");
+    git(work, &["tag", "-a", "-m", "side", "side-v1"]);
+    git(work, &["tag", "side-light"]);
+    git(work, &["checkout", "-q", "main"]);
+    let c = origin.commit(&[("c.txt", "c\n")], "C");
+    origin.publish();
+    origin.publish_branch("side");
+    git(work, &["push", "-q", bare, "--tags"]);
+
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/g13", "--wait"]).ok();
+    // The side branch builds too, so the mirror holds its tags.
+    world
+        .cli(&server, &["sync", "acme/g13", "--at", "side", "--wait"])
+        .ok();
+    let mirror = mirror_dir(&world);
+    assert!(
+        tag_refs(&mirror).contains("side-v1 tag"),
+        "{}",
+        tag_refs(&mirror)
+    );
+
+    let clone = |name: &str, args: &[&str]| {
+        let target = world.target(name);
+        let mut argv = vec!["clone", "acme/g13", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&server, &argv).ok();
+        target
+    };
+    let tag_id = |name: &str| git(&origin.bare, &["rev-parse", &format!("refs/tags/{name}")]);
+    let full = clone("full", &[]);
+    assert_eq!(git(&full, &["rev-parse", "HEAD"]), c);
+    assert_eq!(
+        tag_refs(&full),
+        format!(
+            "light commit {b}\nv1 tag {}\nv1-of tag {}",
+            tag_id("v1"),
+            tag_id("v1-of")
+        )
+    );
+    let (refs, all, tags) = git_clone_tags(&origin.bare, &[]);
+    assert_eq!(tag_refs(&full), refs);
+    assert_eq!(describe(&full), (all, tags));
+    assert!(
+        describe(&full).1.starts_with("light-1-g"),
+        "{:?}",
+        describe(&full)
+    );
+    assert_eq!(git(&full, &["rev-parse", "v1-of^{commit}"]), a);
+    git(&full, &["fsck", "--full", "--strict"]);
+    assert_eq!(git(&full, &["status", "--porcelain"]), "");
+
+    // A clone of A has neither B's tag nor the side branch's.
+    let at_a = clone("at-a", &["--at", "v1"]);
+    assert_eq!(git(&at_a, &["rev-parse", "HEAD"]), a);
+    assert_eq!(
+        tag_refs(&at_a),
+        format!("v1 tag {}\nv1-of tag {}", tag_id("v1"), tag_id("v1-of"))
+    );
+    let (refs, all, tags) = git_clone_tags(&origin.bare, &["--branch", "v1"]);
+    assert_eq!(tag_refs(&at_a), refs);
+    assert_eq!(describe(&at_a), (all, tags));
+
+    // A tag on A made after its Full, and a push: the next Full has it.
+    // Full(C) was built before the side branch was; this one is built after.
+    git(work, &["tag", "-a", "-m", "late", "late", &a]);
+    git(work, &["push", "-q", bare, "late"]);
+    let d = origin.commit(&[("d.txt", "d\n")], "D");
+    origin.publish();
+    world.cli(&server, &["sync", "acme/g13", "--wait"]).ok();
+    let later = clone("later", &[]);
+    assert_eq!(git(&later, &["rev-parse", "HEAD"]), d);
+    let (refs, all, tags) = git_clone_tags(&origin.bare, &[]);
+    assert!(
+        refs.contains(&format!("late tag {}", tag_id("late"))),
+        "{refs}"
+    );
+    assert!(!refs.contains("side"), "{refs}");
+    assert_eq!(tag_refs(&later), refs);
+    assert_eq!(describe(&later), (all, tags));
+    git(&later, &["fsck", "--full", "--strict"]);
+
+    // Depth 1: no tags, as in git's depth-1 clone of the same tip.
+    let shallow = clone("shallow", &["--depth", "1"]);
+    assert_eq!(git(&shallow, &["rev-parse", "HEAD"]), d);
+    let (refs, _, _) = git_clone_tags(&origin.bare, &["--depth", "1"]);
+    assert_eq!(refs, "");
+    assert_eq!(tag_refs(&shallow), "");
+    assert!(
+        git_output(&shallow, &["describe", "--tags"])
+            .stdout
+            .is_empty()
+    );
+}

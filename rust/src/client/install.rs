@@ -354,9 +354,10 @@ impl Client {
             }
             _ => {}
         }
-        let root = self
+        let (root, manifest) = self
             .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
             .await?;
+        let mut tags = manifest.tags;
         if let Plan::TopUp { base, upstream_url } = plan {
             top_up(&root, upstream_url, &pin.commit, cleanup)
                 .await
@@ -366,7 +367,14 @@ impl Client {
                         pin.commit, base.commit
                     )
                 })?;
+            // The base's tags are the target's when the base is in its
+            // history. The tags of the fetched commits, or all of them after
+            // a force-push, come with the user's next `git fetch`.
+            if !is_ancestor(&root, &base.commit, &pin.commit, cleanup).await? {
+                tags.clear();
+            }
         }
+        write_tags(&root.join(".git"), tags)?;
         // The user's later fetches and pushes go to the locally configured
         // upstream, never to a URL the server names.
         let origin_url = match self.top_up_url(repo_path) {
@@ -514,7 +522,8 @@ impl Client {
     }
 
     /// Head or Full: `.git` from the metadata chunk, then the packs, whose
-    /// blobs are written into the working tree as each pack lands.
+    /// blobs are written into the working tree as each pack lands. Returns
+    /// the staging root and the output's manifest.
     async fn materialize_git(
         &self,
         urls: &OutputUrls,
@@ -523,7 +532,7 @@ impl Client {
         staging: &Staging,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
-    ) -> Result<PathBuf> {
+    ) -> Result<(PathBuf, ClonepackManifest)> {
         let (manifest, metadata) =
             tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
                 .context("fetch manifest/metadata")?;
@@ -552,7 +561,7 @@ impl Client {
             manifest.packs.len()
         );
         bench.mark_archive_download(bytes);
-        Ok(root)
+        Ok((root, manifest))
     }
 
     /// The clonepack manifest of `urls`' output, checked against its commit.
@@ -1048,6 +1057,23 @@ async fn top_up(root: &Path, upstream_url: &str, target: &str, cleanup: &Cleanup
 /// failure the error carries the end of its stderr. Cancelling the clone
 /// kills it.
 async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
+    run_git_answer(repo, args, cleanup, None).await.map(drop)
+}
+
+/// Whether `ancestor` is an ancestor of `commit`, by the user's git.
+async fn is_ancestor(repo: &Path, ancestor: &str, commit: &str, cleanup: &Cleanup) -> Result<bool> {
+    let args = ["merge-base", "--is-ancestor", ancestor, commit];
+    run_git_answer(repo, &args, cleanup, Some(1)).await
+}
+
+/// [`run_git`] for a git command that answers yes or no: `Ok(false)` when it
+/// exits with `no`.
+async fn run_git_answer(
+    repo: &Path,
+    args: &[&str],
+    cleanup: &Cleanup,
+    no: Option<i32>,
+) -> Result<bool> {
     use std::io::{Read, Seek};
     use std::process::Stdio;
 
@@ -1067,7 +1093,10 @@ async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
     let mut git = GitChild::new(child, cleanup.clone());
     let status = git.wait().await.context("wait for git")?;
     if status.success() {
-        return Ok(());
+        return Ok(true);
+    }
+    if no.is_some() && status.code() == no {
+        return Ok(false);
     }
     stderr.rewind().context("rewind git stderr")?;
     let mut detail = String::new();
@@ -1168,6 +1197,24 @@ fn write_git_config(git_dir: &Path, origin_url: &str, pin: &Pin) -> Result<()> {
     Ok(())
 }
 
+/// Write `tags` to `packed-refs` as `git clone` does. Git peels the
+/// annotated ones itself, so the file declares no peeled lines.
+fn write_tags(git_dir: &Path, mut tags: Vec<crate::clonepack::TagRef>) -> Result<()> {
+    if tags.is_empty() {
+        return Ok(());
+    }
+    tags.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut packed = String::from("# pack-refs with: sorted \n");
+    for tag in &tags {
+        crate::validation::validate_tag_name(&tag.name)
+            .context("clonepack integrity error: invalid tag")?;
+        crate::validation::validate_object_id(&tag.object)
+            .with_context(|| format!("clonepack integrity error: tag {}", tag.name))?;
+        packed.push_str(&format!("{} refs/tags/{}\n", tag.object, tag.name));
+    }
+    std::fs::write(git_dir.join("packed-refs"), packed).context("write packed-refs")
+}
+
 /// A git config subsection or value in quotes: a branch name may hold `"`,
 /// `#` or `;`.
 fn quoted(text: &str) -> String {
@@ -1256,5 +1303,32 @@ mod tests {
         };
         assert!(validate_manifest_commit(&manifest, &"a".repeat(40)).is_err());
         assert!(validate_manifest_commit(&manifest, &"b".repeat(40)).is_ok());
+    }
+
+    /// Tags land in `packed-refs` sorted by name. A name or object id git
+    /// would refuse fails the clone and writes nothing: a newline in a name
+    /// would otherwise add a ref line of the server's choosing.
+    #[test]
+    fn tags_are_checked_and_written_sorted() {
+        let tag = |name: &str, object: &str| crate::clonepack::TagRef {
+            name: name.to_string(),
+            object: object.to_string(),
+        };
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let dir = tempfile::tempdir().unwrap();
+        write_tags(dir.path(), vec![tag("v2", &b), tag("rel/v1", &a)]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("packed-refs")).unwrap(),
+            format!("# pack-refs with: sorted \n{a} refs/tags/rel/v1\n{b} refs/tags/v2\n")
+        );
+        for bad in [
+            tag(&format!("v1\n{b} refs/heads/main"), &a),
+            tag("../v1", &a),
+            tag("v1", "HEAD"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(write_tags(dir.path(), vec![tag("ok", &a), bad]).is_err());
+            assert!(!dir.path().join("packed-refs").exists());
+        }
     }
 }
