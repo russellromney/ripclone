@@ -645,37 +645,56 @@ async fn get_commit(
             "kind": kind,
             "error": error,
         }),
-        Out::Pending { error } => {
-            let mut body = serde_json::json!({
-                "state": "pending",
-                "commit": row.commit,
-                "kind": kind,
-                "attempts": row.lease(kind).attempts,
-            });
-            if let Some(error) = error {
-                body["error"] = serde_json::json!(error);
-            }
-            if kind == ExactResultKind::Full
-                && let Some(top_up) = top_up_plan(state, repo_id, provider, &row).await?
-            {
-                body["top_up"] = top_up;
-            }
-            body
-        }
+        Out::Pending { error } => pending_body(state, repo_id, provider, &row, kind, error).await?,
     };
     Ok(Json(body).into_response())
+}
+
+/// The answer for `row`'s pending `kind` output. A pending Full names its
+/// top-up base, read after `row`: when that base is the commit itself, its
+/// Full was published in between, and the answer is that ready Full.
+async fn pending_body(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    row: &BuildRow,
+    kind: ExactResultKind,
+    error: Option<String>,
+) -> Result<serde_json::Value, ApiError> {
+    let base = match kind {
+        ExactResultKind::Full => top_up_base(state, repo_id, row).await?,
+        _ => None,
+    };
+    if let Some(base) = base.as_ref().filter(|base| base.commit == row.commit) {
+        return Ok(ready_body(state, repo_id, provider, base, kind));
+    }
+    let mut body = serde_json::json!({
+        "state": "pending",
+        "commit": row.commit,
+        "kind": kind,
+        "attempts": row.lease(kind).attempts,
+    });
+    if let Some(error) = error {
+        body["error"] = serde_json::json!(error);
+    }
+    if let Some(base) = base {
+        body["top_up"] = serde_json::json!({
+            "base_commit": base.commit,
+            "base": ready_body(state, repo_id, provider, &base, ExactResultKind::Full),
+        });
+    }
+    Ok(body)
 }
 
 /// While Full(B) is pending, a full clone can install a ready Full of an
 /// older commit and fetch the rest from the upstream. The base is the newest
 /// ready Full admitted from B's ref, else B's parent's Full. Head(B) need not
 /// be ready: a full clone never waits on the server.
-async fn top_up_plan(
+async fn top_up_base(
     state: &ServerState,
     repo_id: &RepoId,
-    provider: &ProviderInstance,
     row: &BuildRow,
-) -> Result<Option<serde_json::Value>, ApiError> {
+) -> Result<Option<BuildRow>, ApiError> {
     let control = |error: anyhow::Error| {
         state.metrics.record_error();
         ApiError::control(error)
@@ -692,19 +711,12 @@ async fn top_up_plan(
     let Some(base_commit) = base_commit.or_else(|| row.parent.clone()) else {
         return Ok(None);
     };
-    let Some(base) = state
+    Ok(state
         .control
         .status(repo_id, &base_commit)
         .await
         .map_err(control)?
-        .filter(|base| base.full.ready().is_some())
-    else {
-        return Ok(None);
-    };
-    Ok(Some(serde_json::json!({
-        "base_commit": base_commit,
-        "base": ready_body(state, repo_id, provider, &base, ExactResultKind::Full),
-    })))
+        .filter(|base| base.full.ready().is_some()))
 }
 
 pub(super) const DEFAULT_SIGNED_URL_TTL: Duration = Duration::from_secs(1200);
@@ -1325,6 +1337,43 @@ mod tests {
             call(&app, "GET", &format!("{commits}/main?kind=full"), None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(invalid["code"], "invalid_commit");
+    }
+
+    #[tokio::test]
+    async fn a_full_built_after_its_row_was_read_answers_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let repo_id = RepoId::github("acme/api");
+        let commit = "c".repeat(40);
+        state
+            .control
+            .admit(&repo_id, &commit, Some("refs/tags/v1"))
+            .await
+            .unwrap();
+        let stale = state
+            .control
+            .status(&repo_id, &commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stale.full.ready().is_none());
+        publish_head_and_full(&state, &repo_id, &commit, Some("refs/tags/v1"), None).await;
+        let (_, provider) = repo_from_path(&state, "github/acme/api").unwrap();
+        let provider = provider.clone();
+
+        let body = pending_body(
+            &state,
+            &repo_id,
+            &provider,
+            &stale,
+            ExactResultKind::Full,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["state"], "ready");
+        assert_eq!(body["commit"], commit);
+        assert!(body.get("top_up").is_none());
     }
 
     #[tokio::test]
