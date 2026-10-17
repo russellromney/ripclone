@@ -15,6 +15,7 @@ pub(super) enum UrlSlot {
     Metadata,
     ArchiveChunk(usize),
     PackChunk(usize),
+    PackIdx(usize),
     Midx,
     IdxBundle,
 }
@@ -32,6 +33,7 @@ impl UrlSlot {
             Self::Metadata => info.metadata_chunk_url.clone(),
             Self::ArchiveChunk(index) => indexed(&info.archive_chunk_urls, index),
             Self::PackChunk(index) => indexed(&info.pack_chunk_urls, index),
+            Self::PackIdx(index) => indexed(&info.pack_idx_urls, index),
             Self::Midx => info.midx_url.clone(),
             Self::IdxBundle => info.idx_bundle_url.clone(),
         }
@@ -43,6 +45,7 @@ impl UrlSlot {
             Self::Metadata => "metadata".to_string(),
             Self::ArchiveChunk(index) => format!("archive chunk {index}"),
             Self::PackChunk(index) => format!("pack {index}"),
+            Self::PackIdx(index) => format!("pack idx {index}"),
             Self::Midx => "multi-pack-index".to_string(),
             Self::IdxBundle => "idx bundle".to_string(),
         }

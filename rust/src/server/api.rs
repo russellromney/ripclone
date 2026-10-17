@@ -170,6 +170,11 @@ pub struct RefResponse {
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pack_chunk_urls: Option<Vec<Option<String>>>,
+    /// Signed URL for each history pack's idx, ordered to match
+    /// `manifest.packs`. HEAD-closure packs read theirs from the idx bundle
+    /// and have `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub midx_url: Option<String>,
@@ -737,16 +742,37 @@ fn ref_response(
         .filter(|_| kind == ExactResultKind::Files)
         .map(|files| files.archive_chunks.clone())
         .unwrap_or_default();
-    let packs: Vec<String> = match kind {
+    let pack_artifacts = match kind {
         ExactResultKind::Head => info.head.as_ref().map(|head| head.packs.as_slice()),
         ExactResultKind::Full => info.full.as_ref().map(|full| full.packs.as_slice()),
         ExactResultKind::Files => None,
     }
-    .unwrap_or_default()
-    .iter()
-    .map(|p| p.pack.clone())
-    .collect();
+    .unwrap_or_default();
+    let packs: Vec<String> = pack_artifacts.iter().map(|p| p.pack.clone()).collect();
+    // A history pack's idx is fetched on its own; the rest are in the bundle.
+    let history_idx: std::collections::HashSet<&str> = info
+        .full
+        .as_ref()
+        .filter(|_| kind == ExactResultKind::Full)
+        .map(|full| {
+            full.history_levels
+                .iter()
+                .flat_map(|level| level.packs.iter().map(|p| p.idx.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
     let signed = |hash: &str| signed_url(storage, ttl, hash);
+    let pack_idx_urls: Option<Vec<Option<String>>> = (!history_idx.is_empty()).then(|| {
+        pack_artifacts
+            .iter()
+            .map(|p| {
+                history_idx
+                    .contains(p.idx.as_str())
+                    .then(|| signed(&p.idx))
+                    .flatten()
+            })
+            .collect()
+    });
     // Ordered to match the manifest's own chunk and pack lists.
     let signed_list = |hashes: &[String]| -> Option<Vec<Option<String>>> {
         if hashes.is_empty() {
@@ -773,6 +799,7 @@ fn ref_response(
         metadata_chunk_url: signed(&artifacts.metadata_chunk),
         archive_chunk_urls: signed_list(&archive_chunks),
         pack_chunk_urls: signed_list(&packs),
+        pack_idx_urls: pack_idx_urls.filter(|urls| urls.iter().any(Option::is_some)),
         // The pre-built MIDX lets the client skip `git multi-pack-index
         // write`; the idx bundle fetches every idx in one GET.
         midx_url: signed(&artifacts.midx),
@@ -1676,6 +1703,17 @@ mod tests {
                     ..ready_artifacts(&commit, "full")
                 },
                 packs: vec![pack("f1"), pack("f2"), pack("f3")],
+                // f2 and f3 are history packs; f1 is the Head closure.
+                history_levels: ["f2", "f3"]
+                    .map(|name| crate::HistoryLevel {
+                        tip_commit: commit.clone(),
+                        packs: vec![crate::SizedPack {
+                            pack: format!("{name}-pack"),
+                            idx: format!("{name}-idx"),
+                            ..Default::default()
+                        }],
+                    })
+                    .to_vec(),
                 ..Default::default()
             }),
             files: Some(crate::FilesResult {
@@ -1718,6 +1756,10 @@ mod tests {
                 signed(1200, "f3-pack"),
             ])
         );
+        assert_eq!(
+            full.pack_idx_urls,
+            Some(vec![None, signed(1200, "f2-idx"), signed(1200, "f3-idx")])
+        );
         assert_eq!(full.midx_url, signed(1200, "full-midx"));
         assert_eq!(
             full.idx_bundle_url,
@@ -1755,6 +1797,7 @@ mod tests {
             ExactResultKind::Head,
         );
         assert_eq!(head.pack_chunk_urls, Some(vec![signed(1200, "h1-pack")]));
+        assert!(head.pack_idx_urls.is_none());
     }
 
     #[tokio::test]
