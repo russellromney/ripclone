@@ -567,7 +567,7 @@ async fn head_output(
 
     // Head packs are a delta against an immutable base: the compacted base
     // recorded by Full of the base commit, else the base its Head used, else
-    // none. The base commit's files table also seeds this one.
+    // none.
     let base_row = ancestor_base(state, claim, ExactResultKind::Head, &mirror_dir).await?;
     let base_head = base_row.as_ref().and_then(|row| row.head.ready());
     let base = base_row
@@ -586,7 +586,6 @@ async fn head_output(
         &mirror_dir,
         commit,
         parent.clone(),
-        base_head,
         base,
         &state.storage,
         phases,
@@ -599,7 +598,6 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
     let started = Instant::now();
     let mut phases = BuildPhases::default();
     let built = async {
-        let head = ready_head(claim)?;
         let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
         let lock = repo_lock(state, &claim.repo).await;
         let start = Instant::now();
@@ -608,6 +606,11 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
         let start = Instant::now();
         ensure_commit(state, &claim.repo, &claim.build.commit, &mirror_dir, &lock).await?;
         phases.record("fetch", start);
+        let (dir, commit) = (mirror_dir.clone(), claim.build.commit.clone());
+        let parent =
+            cancel::spawn_blocking(move || git::parent_commit(&dir, &commit).ok().flatten())
+                .await
+                .context("parent lookup task")?;
         let config = state
             .control
             .get_config(&claim.repo)
@@ -624,7 +627,7 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
             &state.cas,
             &mirror_dir,
             &claim.build.commit,
-            &head,
+            parent,
             base_files,
             &state.storage,
             config.compression_level(),

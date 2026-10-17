@@ -314,21 +314,30 @@ fn decompress_frame_recorded(compressed: &[u8], frame: &FrameInfo, idx: usize) -
     Ok(raw)
 }
 
+/// A hasher primed with git's blob header, so it yields the blob's object id.
+fn blob_hasher(len: usize) -> Sha1 {
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {len}\0").as_bytes());
+    hasher
+}
+
+/// The git object id of a blob with this content.
 fn sha1_digest_recorded(content: &[u8]) -> sha1::digest::Output<Sha1> {
     let start = Instant::now();
-    let hash = <Sha1 as Sha1Digest>::digest(content);
+    let mut hasher = blob_hasher(content.len());
+    hasher.update(content);
+    let hash = hasher.finalize();
     crate::perf::record_sha1(start.elapsed(), content.len());
     hash
 }
 
+/// The git object id of the blob these fragments make up.
 fn sha1_digest_fragments_recorded(fragments: &[FileSlice]) -> sha1::digest::Output<Sha1> {
     let start = Instant::now();
-    let mut hasher = Sha1::new();
-    let mut bytes = 0usize;
+    let bytes: usize = fragments.iter().map(|f| f.len).sum();
+    let mut hasher = blob_hasher(bytes);
     for fragment in fragments {
-        let data = &fragment.data[fragment.offset..fragment.offset + fragment.len];
-        bytes += data.len();
-        hasher.update(data);
+        hasher.update(&fragment.data[fragment.offset..fragment.offset + fragment.len]);
     }
     let hash = hasher.finalize();
     crate::perf::record_sha1(start.elapsed(), bytes);
@@ -836,8 +845,7 @@ pub fn extract_blobs_from_pack_bytes(
             .checked_add(compressed_len)
             .context("pack object end offset overflow")?;
 
-        // type 3 == OBJ_BLOB. The manifest keys blobs by the plain sha1 of the
-        // raw content (no git "blob <len>\0" header), so match that.
+        // type 3 == OBJ_BLOB. The manifest keys blobs by their git object id.
         if obj_type == 3 {
             let sha: [u8; 20] = sha1_digest_recorded(&content).into();
             if let Some(paths) = blob_paths.get(&sha) {
@@ -928,11 +936,10 @@ mod tests {
     use super::*;
     use crate::clonepack::Fragment;
     use crate::manifest::{FrameInfo, MetadataChunk};
-    use sha1::{Digest, Sha1};
     use tempfile::TempDir;
 
     fn sha1_bytes(data: &[u8]) -> [u8; 20] {
-        Sha1::digest(data).into()
+        super::sha1_digest_recorded(data).into()
     }
 
     fn empty_manifest() -> MetadataChunk {
