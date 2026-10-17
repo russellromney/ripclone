@@ -657,6 +657,10 @@ pub(super) async fn build_head_result(
     let ft_start = Instant::now();
     let files_table_handle =
         cancel::spawn_blocking(move || ArchiveBuilder::new(&md3).build_files_table(&cm3));
+    // The tags on this commit, which a depth-1 clone gets as `git clone
+    // --depth 1` does.
+    let (md5, cm5) = (mirror_dir.to_path_buf(), commit.to_string());
+    let tags_handle = cancel::spawn_blocking(move || crate::gix_util::tags_at(&md5, &cm5));
     let head_built = head_handle.await.context("head packs")??;
     phases.head_packs_ms = Some(head_built.elapsed_ms);
     let head_packs = head_built.all_packs.clone();
@@ -668,6 +672,7 @@ pub(super) async fn build_head_result(
         .await
         .context("shallow prebuilt index")??;
     phases.prebuilt_index_ms = Some(prebuilt_index_ms);
+    let (tags, tag_objects) = tags_handle.await.context("Head tags")??;
 
     Cancel::check_current()?;
     // Assemble the metadata chunk, idx bundle, MIDX and manifest from CAS.
@@ -709,7 +714,7 @@ pub(super) async fn build_head_result(
                 (None, String::new())
             };
 
-            let shallow_manifest = make_manifest(
+            let mut shallow_manifest = make_manifest(
                 &fcommit,
                 &fparent,
                 &archive_chunks,
@@ -719,6 +724,11 @@ pub(super) async fn build_head_result(
                 head_midx_ref,
                 head_idx_bundle_ref,
             )?;
+            shallow_manifest.tags = tags
+                .into_iter()
+                .map(|(name, object)| crate::clonepack::TagRef { name, object })
+                .collect();
+            shallow_manifest.tag_objects = tag_objects;
             let shallow_clonepack_hash = cas.put(&shallow_manifest.encode_to_vec())?;
             Ok((
                 shallow_metadata_hash,

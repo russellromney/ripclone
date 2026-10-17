@@ -40,7 +40,7 @@ downloading a file from object storage.
 | Command | You get | Use it when |
 |---|---|---|
 | `ripclone clone owner/repo` | A full editable git repo with complete history and the tags it reaches | You want a drop-in `git clone`. |
-| `ripclone clone owner/repo --depth 1` | An editable git repo with only `HEAD`, no tags | CI and agents that run git but don't walk history. |
+| `ripclone clone owner/repo --depth 1` | An editable git repo with only `HEAD` and its tags | CI and agents that run git but don't walk history. |
 | `ripclone clone owner/repo --mode files` | The working tree only, no `.git` | You only need the files. Fastest. |
 
 **Git LFS:** ripclone stores LFS pointer files, never the blobs. Run

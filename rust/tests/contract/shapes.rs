@@ -813,10 +813,10 @@ fn g12_editable_clones_pull_and_push_like_git_clone() {
 /// with every tag object present, so `git describe` answers as in the git
 /// clone. A tag on another built branch is left out though the mirror has
 /// it, and so is a tag on a later commit. A tag made on an old commit after
-/// its Full is in the next Full. A depth-1 clone of an untagged tip has no
-/// tags, as `git clone --depth 1` has none.
+/// its Full is in the next Full. A depth-1 clone has only the tags on its
+/// commit, as `git clone --depth 1` does: none for an untagged tip.
 #[test]
-fn g13_full_clones_have_the_tags_their_commit_reaches() {
+fn g13_clones_have_the_tags_git_clone_gets() {
     let world = World::new();
     let origin = world.origin("acme", "g13");
     let (work, bare) = (&origin.work, origin.bare.to_str().unwrap());
@@ -920,7 +920,7 @@ fn g13_full_clones_have_the_tags_their_commit_reaches() {
     assert_eq!(describe(&later), (all, tags));
     git(&later, &["fsck", "--full", "--strict"]);
 
-    // Depth 1: no tags, as in git's depth-1 clone of the same tip.
+    // Depth 1 of an untagged tip: no history tags, as in git's clone.
     let shallow = clone("shallow", &["--depth", "1"]);
     assert_eq!(git(&shallow, &["rev-parse", "HEAD"]), d);
     let (refs, _, _) = git_clone_tags(&origin.bare, &["--depth", "1"]);
@@ -931,4 +931,43 @@ fn g13_full_clones_have_the_tags_their_commit_reaches() {
             .stdout
             .is_empty()
     );
+
+    // Depth 1 of a tagged tip: the tip's lightweight and annotated tags and
+    // a tag of the annotated one, as in git's clone, and still no history
+    // tags.
+    let e = origin.commit(&[("e.txt", "e\n")], "E");
+    git(work, &["tag", "tip-light"]);
+    git(work, &["tag", "-a", "-m", "release 2", "v2"]);
+    git(
+        work,
+        &[
+            "-c",
+            "advice.nestedTag=false",
+            "tag",
+            "-a",
+            "-m",
+            "of v2",
+            "v2-of",
+            "v2",
+        ],
+    );
+    origin.publish();
+    git(work, &["push", "-q", bare, "--tags"]);
+    world.cli(&server, &["sync", "acme/g13", "--wait"]).ok();
+    let tipped = clone("tipped", &["--depth", "1"]);
+    assert_eq!(git(&tipped, &["rev-parse", "HEAD"]), e);
+    let (refs, all, tags) = git_clone_tags(&origin.bare, &["--depth", "1"]);
+    assert_eq!(
+        refs,
+        format!(
+            "tip-light commit {e}\nv2 tag {}\nv2-of tag {}",
+            tag_id("v2"),
+            tag_id("v2-of")
+        )
+    );
+    assert_eq!(tag_refs(&tipped), refs);
+    assert_eq!(describe(&tipped), (all, tags));
+    assert_eq!(git(&tipped, &["rev-parse", "v2-of^{commit}"]), e);
+    git(&tipped, &["fsck", "--strict"]);
+    assert_eq!(git(&tipped, &["status", "--porcelain"]), "");
 }

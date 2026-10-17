@@ -61,10 +61,16 @@ message ClonepackManifest {
   // working tree.
   ChunkRef idx_bundle = 13;
 
-  // The tags whose target `commit` reaches, which a full clone writes to
-  // `packed-refs` as `git clone --single-branch` would. Their annotated tag
-  // objects are in a Full's last history pack. Head and Files have none.
+  // The tags a clone writes to `packed-refs`, as `git clone
+  // --single-branch` would get them: for a Full, those whose target
+  // `commit` reaches, their annotated tag objects in its last history pack;
+  // for a Head, those whose target is `commit`, as `--depth 1` gets them.
+  // Files has none.
   repeated TagRef tags = 14;
+
+  // A Head's annotated tag objects for `tags`, each tag of a tag included,
+  // as raw object content. A depth-1 clone writes each as a loose object.
+  repeated bytes tag_objects = 15;
 }
 
 // One tag: its name under `refs/tags/` and the object it names, an

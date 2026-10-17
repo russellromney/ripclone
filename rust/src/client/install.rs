@@ -357,7 +357,7 @@ impl Client {
         let (root, manifest) = self
             .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
             .await?;
-        let mut tags = manifest.tags;
+        let (mut tags, tag_objects) = (manifest.tags, manifest.tag_objects);
         if let Plan::TopUp { base, upstream_url } = plan {
             top_up(&root, upstream_url, &pin.commit, cleanup)
                 .await
@@ -374,7 +374,7 @@ impl Client {
                 tags.clear();
             }
         }
-        write_tags(&root.join(".git"), tags)?;
+        write_tags(&root.join(".git"), tags, &tag_objects)?;
         // The user's later fetches and pushes go to the locally configured
         // upstream, never to a URL the server names.
         let origin_url = match self.top_up_url(repo_path) {
@@ -1197,9 +1197,17 @@ fn write_git_config(git_dir: &Path, origin_url: &str, pin: &Pin) -> Result<()> {
     Ok(())
 }
 
-/// Write `tags` to `packed-refs` as `git clone` does. Git peels the
-/// annotated ones itself, so the file declares no peeled lines.
-fn write_tags(git_dir: &Path, mut tags: Vec<crate::clonepack::TagRef>) -> Result<()> {
+/// Write `tags` to `packed-refs` as `git clone` does, and each of
+/// `tag_objects` (a Head's annotated tag objects) as a loose object named by
+/// its hash. Git peels the annotated tags itself, so the file declares no
+/// peeled lines.
+fn write_tags(
+    git_dir: &Path,
+    mut tags: Vec<crate::clonepack::TagRef>,
+    tag_objects: &[Vec<u8>],
+) -> Result<()> {
+    use sha1::{Digest, Sha1};
+    use std::io::Write;
     if tags.is_empty() {
         return Ok(());
     }
@@ -1211,6 +1219,17 @@ fn write_tags(git_dir: &Path, mut tags: Vec<crate::clonepack::TagRef>) -> Result
         crate::validation::validate_object_id(&tag.object)
             .with_context(|| format!("clonepack integrity error: tag {}", tag.name))?;
         packed.push_str(&format!("{} refs/tags/{}\n", tag.object, tag.name));
+    }
+    for data in tag_objects {
+        let mut object = format!("tag {}\0", data.len()).into_bytes();
+        object.extend_from_slice(data);
+        let id = hex::encode(Sha1::digest(&object));
+        let dir = git_dir.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir)?;
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zlib.write_all(&object)?;
+        std::fs::write(dir.join(&id[2..]), zlib.finish()?)
+            .with_context(|| format!("write tag object {id}"))?;
     }
     std::fs::write(git_dir.join("packed-refs"), packed).context("write packed-refs")
 }
@@ -1305,9 +1324,10 @@ mod tests {
         assert!(validate_manifest_commit(&manifest, &"b".repeat(40)).is_ok());
     }
 
-    /// Tags land in `packed-refs` sorted by name. A name or object id git
-    /// would refuse fails the clone and writes nothing: a newline in a name
-    /// would otherwise add a ref line of the server's choosing.
+    /// Tags land in `packed-refs` sorted by name, a Head's tag objects as
+    /// loose objects. A name or object id git would refuse fails the clone
+    /// and writes nothing: a newline in a name would otherwise add a ref
+    /// line of the server's choosing.
     #[test]
     fn tags_are_checked_and_written_sorted() {
         let tag = |name: &str, object: &str| crate::clonepack::TagRef {
@@ -1316,19 +1336,44 @@ mod tests {
         };
         let (a, b) = ("a".repeat(40), "b".repeat(40));
         let dir = tempfile::tempdir().unwrap();
-        write_tags(dir.path(), vec![tag("v2", &b), tag("rel/v1", &a)]).unwrap();
+        write_tags(dir.path(), vec![tag("v2", &b), tag("rel/v1", &a)], &[]).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("packed-refs")).unwrap(),
             format!("# pack-refs with: sorted \n{a} refs/tags/rel/v1\n{b} refs/tags/v2\n")
         );
+        // A Head's tag object lands loose under the name its bytes hash to.
+        let data = format!("object {a}\ntype commit\ntag v2\ntagger t <t@t> 0 +0000\n\nv2\n");
+        let header = format!("tag {}\0", data.len());
+        let id = {
+            use sha1::{Digest, Sha1};
+            hex::encode(Sha1::digest(format!("{header}{data}")))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_tags(
+            dir.path(),
+            vec![tag("v2", &id)],
+            &[data.clone().into_bytes()],
+        )
+        .unwrap();
+        let loose =
+            std::fs::read(dir.path().join("objects").join(&id[..2]).join(&id[2..])).unwrap();
+        let mut inflated = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::ZlibDecoder::new(&loose[..]),
+            &mut inflated,
+        )
+        .unwrap();
+        assert_eq!(inflated, format!("{header}{data}"));
         for bad in [
             tag(&format!("v1\n{b} refs/heads/main"), &a),
             tag("../v1", &a),
             tag("v1", "HEAD"),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            assert!(write_tags(dir.path(), vec![tag("ok", &a), bad]).is_err());
+            let objects = [data.clone().into_bytes()];
+            assert!(write_tags(dir.path(), vec![tag("ok", &a), bad], &objects).is_err());
             assert!(!dir.path().join("packed-refs").exists());
+            assert!(!dir.path().join("objects").exists());
         }
     }
 }

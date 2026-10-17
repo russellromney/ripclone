@@ -312,6 +312,48 @@ pub fn tag_objects<P: AsRef<Path>>(repo_path: P, tags: &[String]) -> Result<Vec<
     Ok(out.into_iter().collect())
 }
 
+/// The tags whose target, after peeling every tag, is `commit`, as
+/// `(name under refs/tags/, object id)` sorted by name, and the raw content
+/// of the annotated tag objects they name (see [`tag_objects`]).
+pub fn tags_at<P: AsRef<Path>>(
+    repo_path: P,
+    commit: &str,
+) -> Result<(Vec<(String, String)>, Vec<Vec<u8>>)> {
+    let repo = open_repo(&repo_path)?;
+    let commit = parse_oid(commit)?;
+    let mut tags = Vec::new();
+    let mut annotated = Vec::new();
+    let references = repo.references().context("read refs")?;
+    for reference in references
+        .tags()
+        .map_err(|e| anyhow::anyhow!("list tags: {e}"))?
+    {
+        let mut reference = reference.map_err(|e| anyhow::anyhow!("read tag: {e}"))?;
+        let Some(id) = reference.target().try_id().map(|id| id.to_owned()) else {
+            continue;
+        };
+        let name = reference.name().shorten().to_string();
+        let peeled = reference
+            .peel_to_id()
+            .with_context(|| format!("peel tag {name}"))?;
+        if peeled == commit {
+            if id != commit {
+                annotated.push(id.to_string());
+            }
+            tags.push((name, id.to_string()));
+        }
+    }
+    tags.sort();
+    let objects = tag_objects(&repo_path, &annotated)?
+        .iter()
+        .map(|id| {
+            let object = repo.find_object(parse_oid(id)?)?;
+            anyhow::Ok(object.data.clone())
+        })
+        .collect::<Result<_>>()?;
+    Ok((tags, objects))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

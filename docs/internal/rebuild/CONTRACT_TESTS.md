@@ -147,7 +147,7 @@ Ripclone token reaches the origin.
 | G8 | Empty trees: a root commit with no files, and a later commit that deletes every file. Every shape installs an empty tree. | #208 |
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | #208 |
 | G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | #208 |
-| G13 | Full clones have the tags their commit reaches, equal to `git clone --single-branch` (refs and both `git describe` forms): annotated, a tag of a tag, and lightweight; `fsck --strict` clean. A tag on a second built branch (in the mirror) and a tag on a later commit are left out (`--at v1`). A tag made on an old commit after its Full is in the next Full. A depth-1 clone of an untagged tip has no tags, like `git clone --depth 1`. | |
+| G13 | Full clones have the tags their commit reaches, equal to `git clone --single-branch` (refs and both `git describe` forms): annotated, a tag of a tag, and lightweight; `fsck --strict` clean. A tag on a second built branch (in the mirror) and a tag on a later commit are left out (`--at v1`). A tag made on an old commit after its Full is in the next Full. A depth-1 clone has only its tip's tags, equal to `git clone --depth 1`: none for an untagged tip; lightweight, annotated and a tag of a tag on a tagged one, `fsck --strict` clean. | |
 
 ### H. Storage and server state (11)
 
