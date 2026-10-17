@@ -173,6 +173,12 @@ fn h4_invalid_config_fails_before_side_effects() {
             "RIPCLONE_HEAD_REBASE_BYTES must be a non-negative integer",
         ),
         (
+            "bad Files tail percent",
+            "",
+            &[("RIPCLONE_FILES_TAIL_PERCENT", "25%")],
+            "RIPCLONE_FILES_TAIL_PERCENT must be a non-negative integer",
+        ),
+        (
             "bad S3 timeout",
             "",
             &[

@@ -488,6 +488,14 @@ pub fn count_commits_since<P: AsRef<Path>>(repo: P, base: &str, commit: &str) ->
         .with_context(|| format!("parse rev-list count {count:?}"))
 }
 
+/// The objects of `commit`'s depth-1 closure in path order. See
+/// [`crate::gix_util::list_head_objects`].
+pub fn list_head_objects<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Vec<String>> {
+    crate::validation::validate_git_rev(commit)
+        .with_context(|| format!("invalid commit: {}", commit))?;
+    crate::gix_util::list_head_objects(repo, commit)
+}
+
 /// List objects reachable from `commit`, optionally limiting the commit history
 /// depth. `max_depth = None` returns the full history. With a depth of `1`, only
 /// the HEAD commit and the trees/blobs reachable from it are returned, which is

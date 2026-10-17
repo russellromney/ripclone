@@ -565,9 +565,8 @@ async fn head_output(
     .await
     .context("mirror prep task")??;
 
-    // Head packs are a delta against an immutable base: the compacted base
-    // recorded by Full of the base commit, else the base its Head used, else
-    // none.
+    // Head packs are a base plus levels: the new base Full of the base
+    // commit packed, else the base commit's Head packs, else none.
     let base_row = ancestor_base(state, claim, ExactResultKind::Head, &mirror_dir).await?;
     let base_head = base_row.as_ref().and_then(|row| row.head.ready());
     let base = base_row
@@ -578,6 +577,7 @@ async fn head_output(
             base_head.map(|head| crate::HeadBase {
                 commit: head.base_commit.clone(),
                 packs: head.base_packs.clone(),
+                levels: head.levels.clone(),
             })
         });
     Cancel::check_current()?;

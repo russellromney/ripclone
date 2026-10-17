@@ -49,6 +49,17 @@ where
         .clamp(1, DEFAULT_THREAD_CAP)
         .min(items.len().max(1));
     let sync_repo = Arc::new(open_sync_repo(repo_path)?);
+    // Load every pack index into the shared store before the threads start.
+    // Threads that load indices lazily at once can miss an object that is
+    // on disk (gix-odb 0.82): on Linux about one parallel run in 3000 failed
+    // with "could not be found", as a Files build did under load.
+    if num_workers > 1 {
+        sync_repo
+            .to_thread_local()
+            .objects
+            .packed_object_count()
+            .context("load pack indices")?;
+    }
 
     if num_workers == 1 || items.is_empty() {
         let repo = sync_repo.to_thread_local();
@@ -146,6 +157,36 @@ pub fn parent_commit<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<Optio
         (Some(parent), None) => Some(parent),
         _ => None,
     })
+}
+
+/// The objects of `commit`'s depth-1 closure in path order: the commit, its
+/// trees, then its blobs, each in depth-first tree order and listed once.
+/// Head packs are cut from this list, so the files of one directory share
+/// packs and a push that edits a few directories leaves most packs live.
+pub fn list_head_objects<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<Vec<String>> {
+    let repo = open_repo(repo_path)?;
+    let id = repo
+        .rev_parse_single(commit)
+        .with_context(|| format!("resolving commit '{}'", commit))?;
+    let commit_obj = repo
+        .find_commit(id)
+        .with_context(|| format!("find commit {id}"))?;
+    let tree = commit_obj.tree_id()?.detach();
+    let mut collector = OidCollector::new();
+    collector.oids.insert(tree);
+    collector.trees.push(tree);
+    gix::traverse::tree::depthfirst(
+        tree,
+        gix::traverse::tree::depthfirst::State::default(),
+        &repo.objects,
+        &mut collector,
+    )
+    .context("tree traversal")?;
+    Ok(std::iter::once(id.detach())
+        .chain(collector.trees)
+        .chain(collector.blobs)
+        .map(|oid| oid.to_string())
+        .collect())
 }
 
 /// List every object reachable from `commit`, optionally limiting the number of
@@ -276,12 +317,17 @@ fn mode_to_object_type(mode: &EntryMode) -> String {
 
 struct OidCollector {
     oids: HashSet<gix::hash::ObjectId>,
+    /// Trees and blobs, each once, in the order the walk first met them.
+    trees: Vec<gix::hash::ObjectId>,
+    blobs: Vec<gix::hash::ObjectId>,
 }
 
 impl OidCollector {
     fn new() -> Self {
         Self {
             oids: HashSet::new(),
+            trees: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 }
@@ -295,6 +341,7 @@ impl Visit for OidCollector {
 
     fn visit_tree(&mut self, entry: &gix::objs::tree::EntryRef<'_>) -> Action {
         if self.oids.insert(entry.oid.to_owned()) {
+            self.trees.push(entry.oid.to_owned());
             Action::Continue(true)
         } else {
             Action::Continue(false)
@@ -304,8 +351,8 @@ impl Visit for OidCollector {
     fn visit_nontree(&mut self, entry: &gix::objs::tree::EntryRef<'_>) -> Action {
         // A gitlink (submodule) names a commit of another repository. It is
         // not an object of this one, as with `git rev-list --objects`.
-        if !entry.mode.is_commit() {
-            self.oids.insert(entry.oid.to_owned());
+        if !entry.mode.is_commit() && self.oids.insert(entry.oid.to_owned()) {
+            self.blobs.push(entry.oid.to_owned());
         }
         Action::Continue(true)
     }
@@ -327,4 +374,80 @@ fn collect_tree_objects(
     .context("tree traversal")?;
     oids.extend(collector.oids);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    fn git(args: &[&str]) -> String {
+        let out = Command::new("git").args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Parallel lookups on a freshly opened repo find every object. Without
+    /// loading the pack indices first, 7 of 20000 rounds missed an object on
+    /// Linux (none on macOS), as a Files build did under load.
+    /// Slow and probabilistic, so ignored; run on Linux with
+    /// `ROUNDS=30000 cargo test --release --lib parallel_lookups -- --ignored`.
+    #[test]
+    #[ignore]
+    fn parallel_lookups_on_a_fresh_repo_find_every_object() {
+        let base = tempfile::tempdir().unwrap();
+        let path = |name: &str| base.path().join(name).to_str().unwrap().to_string();
+        let (origin, w, m) = (path("origin.git"), path("work"), path("mirror.git"));
+        git(&["init", "-q", "--bare", &origin]);
+        git(&["init", "-q", &w]);
+        git(&["-C", &w, "config", "user.email", "t@t"]);
+        git(&["-C", &w, "config", "user.name", "t"]);
+        git(&["init", "-q", "--bare", &m]);
+        git(&["-C", &m, "config", "gc.auto", "0"]);
+        git(&["-C", &m, "config", "fetch.unpackLimit", "1"]);
+        git(&["-C", &m, "remote", "add", "origin", &origin]);
+        // Twelve packs, one per fetched commit, as a mirror holds between
+        // compactions.
+        let mut blobs = Vec::new();
+        for i in 0..12 {
+            for j in 0..20 {
+                let file = base.path().join("work").join(format!("f{i}_{j}"));
+                std::fs::write(file, format!("blob {i} {j}\n")).unwrap();
+            }
+            git(&["-C", &w, "add", "-A"]);
+            git(&["-C", &w, "commit", "-q", "-m", &format!("c{i}")]);
+            git(&["-C", &w, "push", "-q", &origin, "HEAD:refs/heads/main"]);
+            let commit = git(&["-C", &w, "rev-parse", "HEAD"]);
+            let refspec = format!("{commit}:refs/ripclone/revs/{commit}");
+            git(&["-C", &m, "fetch", "-q", "--no-tags", "origin", &refspec]);
+            for j in 0..20 {
+                let blob = git(&["-C", &w, "rev-parse", &format!("HEAD:f{i}_{j}")]);
+                blobs.push(gix::ObjectId::from_hex(blob.as_bytes()).unwrap());
+            }
+        }
+        let mirror = std::path::PathBuf::from(&m);
+        let rounds: usize = std::env::var("ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+        let failed: Vec<String> = (0..rounds)
+            .filter_map(|_| {
+                super::parallel_map_repo(&mirror, blobs.clone(), 16, |repo, oid| {
+                    repo.find_header(*oid)
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from)
+                })
+                .err()
+                .map(|e| format!("{e:#}"))
+            })
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "{} of {rounds} rounds: {failed:?}",
+            failed.len()
+        );
+    }
 }

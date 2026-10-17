@@ -139,16 +139,53 @@ fn lsm_max_levels() -> Result<usize> {
     crate::env::number("RIPCLONE_LSM_MAX_LEVELS", 16)
 }
 
-/// Head packs past the base that trigger a rebase onto a new base.
+/// Head level bytes past the base that trigger a rebase onto a new base.
+/// Levels past a quarter of the base, or [`MAX_HEAD_LEVEL_PACKS`] packs,
+/// also do.
 fn head_rebase_bytes() -> Result<u64> {
     crate::env::number("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024)
 }
+
+/// How much larger than its compact archive, in percent, a Files archive
+/// with tails may grow before the next build compacts it. Zero never adds
+/// a tail.
+fn files_tail_percent() -> Result<u64> {
+    crate::env::number("RIPCLONE_FILES_TAIL_PERCENT", 25)
+}
+
+/// Head level packs past which Full packs a new base.
+const MAX_HEAD_LEVEL_PACKS: usize = 64;
+
+/// Tail bundles past which the next Files build compacts.
+const MAX_FILES_TAILS: usize = 32;
 
 /// Fail on a bad value of a setting the builder reads at build time.
 pub(super) fn check_environment() -> Result<()> {
     lsm_max_levels()?;
     head_rebase_bytes()?;
+    files_tail_percent()?;
     Ok(())
+}
+
+/// Whether a Files build may add a tail to `parent`, whose compact archive
+/// is `compact`: while `parent` downloads less than `percent` more bytes
+/// than `compact` and has fewer than [`MAX_FILES_TAILS`] tail bundles.
+fn files_tail_fits(
+    parent: &crate::FilesResult,
+    compact: &crate::FilesResult,
+    percent: u64,
+) -> bool {
+    let bytes = |files: &crate::FilesResult| -> u64 {
+        files.archive_frames.iter().map(|f| f.compressed_len).sum()
+    };
+    let packed: std::collections::HashSet<&String> = compact.archive_chunks.iter().collect();
+    let tails = parent
+        .archive_chunks
+        .iter()
+        .filter(|hash| !packed.contains(hash))
+        .count();
+    u128::from(bytes(parent)) * 100 < u128::from(bytes(compact)) * u128::from(100 + percent)
+        && tails < MAX_FILES_TAILS
 }
 
 /// Given the prior sealed levels and a freshly built tail, decide whether to
@@ -482,27 +519,29 @@ fn pack_artifacts_of(packs: &[(String, u64, String, u64)]) -> Vec<crate::PackArt
         .collect()
 }
 
-/// Result of the Head-closure build: a small delta pack against the
-/// immutable base, or a fresh full base on a cold sync / rebase. See
-/// `build_head_delta_pack` / `build_head_packs`.
+/// Result of the Head-closure build: a new level on the prior Head packs, or
+/// a fresh full base on a cold sync. See `build_head_level` /
+/// `build_head_packs`.
 struct HeadBuild {
-    /// Every current HEAD pack (base + delta), manifest order — for the clonepack.
+    /// Every current HEAD pack (base + levels), manifest order — for the clonepack.
     all_packs: Vec<(String, u64, String, u64)>,
     /// Only the packs built this sync (to upload). Reused base packs are durable.
     new_built: Vec<(String, u64, String, u64)>,
     /// The commit whose closure `base_packs` covers (carried, or = commit on cold).
     base_commit: String,
-    /// The base packs (closure of `base_commit`), carried unchanged across deltas.
+    /// The base packs (closure of `base_commit`), carried unchanged across levels.
     base_packs: Vec<crate::SizedPack>,
+    /// The levels after the base, this sync's last.
+    levels: Vec<crate::SizedPack>,
     /// True when every pack was built this sync (cold/rebase) → head MIDX buildable.
     all_local: bool,
     elapsed_ms: u64,
 }
 
-/// Build and upload the Head result for `commit`. Head packs are a delta
-/// against `base`, an immutable Head pack set of an ancestor; without a base,
-/// or when the base commit cannot be read, the full closure is packed and
-/// becomes the base.
+/// Build and upload the Head result for `commit`. Head packs are `base`, the
+/// Head packs of an ancestor, plus one new level; without a base, or when
+/// its packs cannot be read, the full closure is packed and becomes the
+/// base.
 pub(super) async fn build_head_result(
     cas: &Cas,
     mirror_dir: &std::path::Path,
@@ -524,53 +563,70 @@ pub(super) async fn build_head_result(
         let index = PackBuilder::new(&md4, &c4).build_prebuilt_index(&cm4)?;
         anyhow::Ok((index, duration_ms(s.elapsed())))
     });
-    // Head-closure packs, incremental by delta against an immutable base: keep the
-    // base packs (closure of `head_base_commit`) and pack only the depth-1 objects
-    // new since that base (`closure(HEAD) − closure(base)`) into a delta pack. The
-    // base and delta are disjoint by construction, so no object is ever in two HEAD
-    // packs (which would double-materialize a worktree file). A cold sync (no base)
-    // packs the full closure as the base. The cumulative delta grows as HEAD moves
-    // from the base; once it reaches RIPCLONE_HEAD_REBASE_BYTES, the Full build
-    // compacts a new base for later Heads, off the depth=1 critical path.
+    // Head packs are a base plus levels. A Head on an earlier Head keeps
+    // all its packs and adds one level: the depth-1 objects no earlier pack
+    // has, read from their idx files. Packs stay disjoint by construction, so
+    // no object is in two Head packs (which would double-materialize a
+    // worktree file). A cold sync (no base) packs the full closure as the
+    // base. Once the levels reach RIPCLONE_HEAD_REBASE_BYTES or a quarter of
+    // the base, the Full build packs a new base for later Heads, off the
+    // depth=1 critical path.
     let head_target = 4 * 1024 * 1024;
     let base = base.filter(|base| !base.commit.is_empty() && !base.packs.is_empty());
-    let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let (md2, c2, s2, cm2) = (
+        mirror_dir.to_path_buf(),
+        cas.clone(),
+        storage.clone(),
+        commit.to_string(),
+    );
     let head_handle = cancel::spawn_blocking(move || -> Result<HeadBuild> {
         let s = Instant::now();
         let b = PackBuilder::new(&md2, &c2);
-        // Delta path: a base exists; pack only what is new since the base. A
-        // base the mirror cannot read falls back to the cold path.
-        let base =
-            base.and_then(
-                |base| match b.build_head_delta_pack(&cm2, &base.commit, head_target) {
-                    Ok(delta) => Some((base, delta)),
-                    Err(e) => {
-                        warn!(
-                            "Head delta vs base {} failed ({e:#}); packing a full base",
-                            &base.commit[..7.min(base.commit.len())]
-                        );
-                        None
-                    }
-                },
-            );
-        match base {
-            Some((base, delta)) => {
-                let mut all_packs: Vec<(String, u64, String, u64)> =
-                    base.packs.iter().map(sized_to_tuple).collect();
-                all_packs.extend(delta.iter().cloned());
+        // Level path: a base exists. Prior packs whose idx files cannot be
+        // read fall back to the cold path.
+        let leveled = base.and_then(|base| {
+            let level = (|| -> Result<_> {
+                let idx: Vec<&str> = (base.packs.iter().chain(&base.levels))
+                    .map(|pack| pack.idx.as_str())
+                    .collect();
+                let mut have = std::collections::HashSet::new();
+                for bytes in get_all_cached(&c2, &s2, &idx)? {
+                    have.extend(crate::pack::idx_object_ids(&bytes)?);
+                }
+                b.build_head_level(&cm2, &have, head_target)
+            })();
+            match level {
+                Ok(level) => Some((base, level)),
+                Err(e) => {
+                    warn!(
+                        "Head level on base {} failed ({e:#}); packing a full base",
+                        &base.commit[..7.min(base.commit.len())]
+                    );
+                    None
+                }
+            }
+        });
+        match leveled {
+            Some((base, level)) => {
+                let mut levels = base.levels;
+                levels.extend(level.iter().map(tuple_to_sized));
+                let all_packs: Vec<_> = (base.packs.iter().chain(&levels))
+                    .map(sized_to_tuple)
+                    .collect();
                 let elapsed = s.elapsed();
                 info!(
-                    "Head packs (delta vs base {}: {} new pack(s), {} total) {:?}",
+                    "Head packs (level on base {}: {} new pack(s), {} total) {:?}",
                     &base.commit[..7.min(base.commit.len())],
-                    delta.len(),
+                    level.len(),
                     all_packs.len(),
                     elapsed
                 );
                 Ok(HeadBuild {
                     all_packs,
-                    new_built: delta,
+                    new_built: level,
                     base_commit: base.commit,
                     base_packs: base.packs,
+                    levels,
                     all_local: false,
                     elapsed_ms: duration_ms(elapsed),
                 })
@@ -587,6 +643,7 @@ pub(super) async fn build_head_result(
                     new_built: base,
                     base_commit: cm2,
                     base_packs,
+                    levels: Vec::new(),
                     all_local: true,
                     elapsed_ms: duration_ms(elapsed),
                 })
@@ -697,6 +754,7 @@ pub(super) async fn build_head_result(
         packs: pack_artifacts_of(&head_packs),
         base_commit: head_built.base_commit.clone(),
         base_packs: head_built.base_packs.clone(),
+        levels: head_built.levels.clone(),
     };
 
     // Upload Head artifacts (metadata, idx bundle, MIDX, manifest, and only
@@ -910,10 +968,10 @@ fn manifest_pack_tuples(manifest: &ClonepackManifest) -> Result<Vec<(String, u64
 }
 
 /// Build and upload the Full result: the Head packs plus history levels.
-/// When the Head delta has reached `RIPCLONE_HEAD_REBASE_BYTES`, the Head
-/// packs are first compacted into a fresh base for `commit`. Full uses the
-/// compact packs and records them as `head_base`, so later Heads delta against
-/// it. The published Head result never changes. A cold history build packs
+/// When the Head levels have reached `RIPCLONE_HEAD_REBASE_BYTES`, the Head
+/// packs are first rebased into a fresh base for `commit` (see
+/// [`PackBuilder::rebase_head_packs`]). Full uses the rebased packs and
+/// records them as `head_base`, so later Heads add levels on it. The published Head result never changes. A cold history build packs
 /// the whole history as level 0: on the first Full, and when the tail from
 /// the sealed tip cannot be listed.
 #[allow(clippy::too_many_arguments)]
@@ -1001,38 +1059,65 @@ pub(super) async fn build_full_result(
     )
     .await?;
 
-    let rebase_bytes = head_rebase_bytes()?;
-    let delta_bytes: u64 = head_packs
-        .iter()
-        .skip(head.base_packs.len())
-        .map(|(_, pack_len, _, _)| *pack_len)
-        .sum();
+    let base_bytes: u64 = head.base_packs.iter().map(|pack| pack.pack_len).sum();
+    let head_levels = &head_packs[head.base_packs.len().min(head_packs.len())..];
+    let level_packs = head_levels.len();
+    let delta_bytes: u64 = head_levels.iter().map(|(_, len, _, _)| *len).sum();
+    let rebase_bytes = head_rebase_bytes()?.min(base_bytes / 4);
     let mut head_base = None;
     Cancel::check_current()?;
-    if delta_bytes > 0 && delta_bytes >= rebase_bytes {
+    if level_packs > 0 && (delta_bytes >= rebase_bytes || level_packs > MAX_HEAD_LEVEL_PACKS) {
         let start = Instant::now();
-        let compact_mirror = mirror_dir.to_path_buf();
-        let compact_cas = cas.clone();
-        let compact_commit = commit.to_string();
-        let compact_packs = cancel::spawn_blocking(move || {
-            PackBuilder::new(&compact_mirror, &compact_cas)
-                .build_head_packs(&compact_commit, 4 * 1024 * 1024)
+        let (rm, rc, rs, rcommit) = (
+            mirror_dir.to_path_buf(),
+            cas.clone(),
+            storage.clone(),
+            commit.to_string(),
+        );
+        let base_count = head.base_packs.len().min(head_packs.len());
+        let current = head_packs.clone();
+        let (compact_packs, kept) = cancel::spawn_blocking(move || {
+            let builder = PackBuilder::new(&rm, &rc);
+            // Packs whose idx files cannot be read are packed again whole.
+            let idx: Vec<&str> = current[..base_count]
+                .iter()
+                .map(|(_, _, idx, _)| idx.as_str())
+                .collect();
+            match get_all_cached(&rc, &rs, &idx) {
+                Ok(idx) => {
+                    let base: Vec<_> = current[..base_count].iter().cloned().zip(idx).collect();
+                    builder.rebase_head_packs(&rcommit, &base, 4 * 1024 * 1024)
+                }
+                Err(error) => {
+                    warn!("Head base idx files unreadable ({error:#}); packing a full base");
+                    Ok((builder.build_head_packs(&rcommit, 4 * 1024 * 1024)?, 0))
+                }
+            }
         })
         .await
         .context("compact Head packs")??;
-        for (pack, _, idx, _) in &compact_packs {
+        for (pack, _, idx, _) in &compact_packs[kept..] {
             uploads.start_all([pack, idx]);
         }
+        let built_bytes: u64 = compact_packs[kept..]
+            .iter()
+            .map(|(_, len, _, _)| *len)
+            .sum();
         info!(
-            "compacted Head packs for {}@{} ({} MiB delta -> {} packs)",
+            "compacted Head packs for {}@{} ({} MiB in levels; kept {} of {} base packs, \
+             packed {} MiB in {} new)",
             repo_id.storage_key(),
             &commit[..7.min(commit.len())],
             delta_bytes / (1024 * 1024),
-            compact_packs.len()
+            kept,
+            base_count,
+            built_bytes / (1024 * 1024),
+            compact_packs.len() - kept
         );
         head_base = Some(crate::HeadBase {
             commit: commit.to_string(),
             packs: compact_packs.iter().map(tuple_to_sized).collect(),
+            levels: Vec::new(),
         });
         head_packs = compact_packs;
         phases.record("head_rebase", start);
@@ -1114,8 +1199,10 @@ pub(super) async fn build_full_result(
 }
 
 /// Build and upload the Files result. `parent_files`, a ready Files result of
-/// an ancestor and its commit, lets the archive read only changed bytes and
-/// reuse its unchanged frames and bundles.
+/// an ancestor and its commit, lets the archive read only changed bytes: a
+/// tail on it holds only the blobs it lacks, and a compaction (once the
+/// tails grow past `RIPCLONE_FILES_TAIL_PERCENT`) reuses the unchanged frames
+/// and bundles of its compact archive.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_files_result(
     cas: &Cas,
@@ -1130,13 +1217,24 @@ pub(super) async fn build_files_result(
     let uploads = Uploads::new(cas, storage);
     let cas = &uploads.cas();
     let start = Instant::now();
-    let base_metadata = match parent_files {
-        Some((_, files)) => {
-            load_metadata_async(cas, storage, &files.clonepack.metadata_chunk).await
+    let previous = parent_files.map(|(_, files)| files);
+    let compact = previous.map(|files| files.compact.as_deref().unwrap_or(files).clone());
+    let tail = match (previous, &compact) {
+        (Some(previous), Some(compact)) => {
+            files_tail_fits(previous, compact, files_tail_percent()?)
         }
+        _ => false,
+    };
+    let base_files = if tail {
+        previous.cloned()
+    } else {
+        compact.clone()
+    };
+    let base_metadata = match &base_files {
+        Some(files) => load_metadata_async(cas, storage, &files.clonepack.metadata_chunk).await,
         None => None,
     };
-    let base = base_metadata.zip(parent_files.map(|(_, files)| files.clone()));
+    let base = base_metadata.zip(base_files);
     phases.record("base_files", start);
 
     let start = Instant::now();
@@ -1154,7 +1252,28 @@ pub(super) async fn build_files_result(
                 metadata,
                 bundles: &files.archive_chunks,
             });
-        ArchiveBuilder::new(&archive_mirror).build_into_cas(
+        let builder = ArchiveBuilder::new(&archive_mirror);
+        if tail && let Some(base) = &base {
+            match builder.build_tail_into_cas(
+                &archive_commit,
+                &archive_cas,
+                compression_level,
+                base,
+                crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+            ) {
+                Ok(output) => return Ok(output),
+                Err(e) => warn!("Files tail is unusable ({e:#}); building without it"),
+            }
+            return builder.build_into_cas(
+                &archive_commit,
+                &archive_cas,
+                Some(&archive_storage),
+                compression_level,
+                None,
+                crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+            );
+        }
+        builder.build_into_cas(
             &archive_commit,
             &archive_cas,
             Some(&archive_storage),
@@ -1168,6 +1287,15 @@ pub(super) async fn build_files_result(
     phases.record("archive", start);
     info!("Files archive {:?}", archive_output.reuse);
     phases.size("read", archive_output.reuse.bytes_read);
+    phases.size(
+        "download",
+        archive_output
+            .archive_frames
+            .iter()
+            .map(|f| f.compressed_len)
+            .sum(),
+    );
+    let compact = compact.filter(|_| archive_output.reuse.tail).map(Box::new);
 
     Cancel::check_current()?;
     let start = Instant::now();
@@ -1223,6 +1351,7 @@ pub(super) async fn build_files_result(
         },
         archive_chunks: archive_chunk_hashes,
         archive_frames: archive_output.archive_frames,
+        compact,
     })
 }
 

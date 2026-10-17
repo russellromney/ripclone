@@ -152,6 +152,9 @@ pub struct ArchiveBase<'a> {
 pub struct ArchiveReuse {
     /// Whether the build read only the changed bytes.
     pub incremental: bool,
+    /// Whether the build is a tail on its base: see
+    /// [`ArchiveBuilder::build_tail_into_cas`].
+    pub tail: bool,
     /// Blob bytes read from the mirror.
     pub bytes_read: u64,
     pub frames_built: usize,
@@ -1020,6 +1023,180 @@ impl ArchiveBuilder {
         })
     }
 
+    /// Build the archive for `commit` as a tail on `base`. A file whose blob
+    /// the base holds keeps the base's fragments; the other blobs are read,
+    /// cut and compressed into new frames in new bundles after the base's.
+    /// Nothing of the base is read or written again.
+    ///
+    /// A base bundle that still holds a frame some file uses is kept whole,
+    /// with every frame in it, so the frame table stays packed in bundle
+    /// order. A frame no file uses is downloaded and not written. A base
+    /// bundle with no used frame is dropped.
+    pub fn build_tail_into_cas(
+        &self,
+        commit: &str,
+        cas: &Cas,
+        level: i32,
+        base: &ArchiveBase,
+        bundle_size: u64,
+    ) -> Result<ArchiveBuildOutput> {
+        let (repo, tree_id) = self.open_tree(commit)?;
+        let mut blobs = Vec::new();
+        let gitlinks = collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
+            .context("walk git tree for archive")?;
+        drop(repo);
+        let infos = &base.metadata.frames;
+        anyhow::ensure!(
+            infos.len() == base.frames.len(),
+            "base has {} frames but its metadata places {}",
+            base.frames.len(),
+            infos.len()
+        );
+        let by_blob: HashMap<&[u8], &[Fragment]> = base
+            .metadata
+            .files
+            .iter()
+            .filter(|file| !file.fragments.is_empty())
+            .map(|file| (file.blob_sha1.as_slice(), file.fragments.as_slice()))
+            .collect();
+
+        // Each file keeps the base's fragments of its blob, or takes the
+        // fragments of its blob in the tail. A blob in the tail twice is
+        // streamed once.
+        let mut kept: Vec<Option<&[Fragment]>> = Vec::with_capacity(blobs.len());
+        let mut in_tail = std::collections::HashSet::new();
+        let mut tail_blobs: Vec<Blob> = Vec::new();
+        for blob in &blobs {
+            let fragments = by_blob.get(blob.1.as_bytes()).copied();
+            if fragments.is_none() && in_tail.insert(blob.1) {
+                tail_blobs.push(blob.clone());
+            }
+            kept.push(fragments);
+        }
+
+        // The base bundles that hold a used frame, and the new index of every
+        // frame in them.
+        let mut live_bundles = vec![false; base.bundles.len()];
+        for fragment in kept.iter().flatten().flat_map(|f| f.iter()) {
+            let info = infos
+                .get(fragment.frame_index as usize)
+                .context("base fragment names a missing frame")?;
+            *live_bundles
+                .get_mut(info.chunk_index as usize)
+                .context("base frame names a missing bundle")? = true;
+        }
+        let mut bundle_index = vec![u32::MAX; base.bundles.len()];
+        let mut bundles = Vec::new();
+        for (k, hash) in base.bundles.iter().enumerate() {
+            if live_bundles[k] {
+                bundle_index[k] = u32::try_from(bundles.len()).context("too many bundles")?;
+                bundles.push(hash.clone());
+            }
+        }
+        let mut frame_index = vec![u32::MAX; infos.len()];
+        let mut frame_infos = Vec::new();
+        let mut frames = Vec::new();
+        for (k, (info, frame)) in infos.iter().zip(base.frames).enumerate() {
+            let chunk_index = bundle_index[info.chunk_index as usize];
+            if chunk_index == u32::MAX {
+                continue;
+            }
+            frame_index[k] = u32::try_from(frame_infos.len()).context("too many frames")?;
+            frame_infos.push(FrameInfo {
+                chunk_index,
+                ..*info
+            });
+            frames.push(frame.clone());
+        }
+        let mut reuse = ArchiveReuse {
+            incremental: true,
+            tail: true,
+            frames_reused: frames.len(),
+            bundles_reused: bundles.len(),
+            ..ArchiveReuse::default()
+        };
+
+        // Stream the tail into new frames and bundles. An empty blob needs
+        // no bytes: it points at frame 0, unless it would be the only frame.
+        let mut tail_fragments: HashMap<gix::hash::ObjectId, Vec<Fragment>> = HashMap::new();
+        let mut new_bundles = Vec::new();
+        let mut sizes = blob_sizes(&self.mirror, tail_blobs.iter().map(|b| b.1).collect())?;
+        let streams_bytes = sizes.iter().any(|&size| size > 0);
+        if !frames.is_empty() || streams_bytes {
+            let (empty, full): (Vec<_>, Vec<_>) = tail_blobs
+                .into_iter()
+                .zip(sizes)
+                .partition(|(_, size)| *size == 0);
+            for (blob, _) in empty {
+                let at_start = Fragment {
+                    frame_index: 0,
+                    frame_offset: 0,
+                    raw_len: 0,
+                };
+                tail_fragments.insert(blob.1, vec![at_start]);
+            }
+            (tail_blobs, sizes) = full.into_iter().unzip();
+        }
+        if !tail_blobs.is_empty() {
+            let layout = Layout::new(tail_blobs, Vec::new(), sizes)?;
+            let mut bundler = Bundler::new(cas, None, None, bundle_size);
+            let bounds = self.stream_frames(&layout, level, None, |frame| bundler.push(frame))?;
+            let (tail_bundles, written, tail_infos, tail_frames, tail_reuse) = bundler.finish()?;
+            let (frame_base, bundle_base) = (
+                u32::try_from(frames.len()).context("too many frames")?,
+                u32::try_from(bundles.len()).context("too many bundles")?,
+            );
+            for (blob, mut file) in layout.blobs.iter().zip(layout.files_table(&bounds)?.files) {
+                for fragment in &mut file.fragments {
+                    fragment.frame_index += frame_base;
+                }
+                tail_fragments.insert(blob.1, file.fragments);
+            }
+            frame_infos.extend(tail_infos.into_iter().map(|info| FrameInfo {
+                chunk_index: info.chunk_index + bundle_base,
+                ..info
+            }));
+            frames.extend(tail_frames);
+            bundles.extend(tail_bundles);
+            new_bundles = written;
+            reuse.bytes_read = layout.total as u64;
+            reuse.frames_built = tail_reuse.frames_built;
+            reuse.bundles_built = tail_reuse.bundles_built;
+        }
+
+        let mut metadata = MetadataChunk::new();
+        metadata.gitlinks = gitlinks;
+        for ((path, oid, mode), kept) in blobs.into_iter().zip(kept) {
+            let fragments = match kept {
+                Some(fragments) => fragments
+                    .iter()
+                    .map(|fragment| Fragment {
+                        frame_index: frame_index[fragment.frame_index as usize],
+                        ..*fragment
+                    })
+                    .collect(),
+                None => tail_fragments
+                    .get(&oid)
+                    .context("tail blob has no fragments")?
+                    .clone(),
+            };
+            metadata.files.push(FileEntry {
+                path,
+                mode,
+                blob_sha1: oid.as_bytes().to_vec(),
+                fragments,
+            });
+        }
+        metadata.frames = frame_infos;
+        Ok(ArchiveBuildOutput {
+            download_bundle_hashes: bundles,
+            new_bundle_hashes: new_bundles,
+            metadata,
+            archive_frames: frames,
+            reuse,
+        })
+    }
+
     /// Plan an incremental build: which base frames to keep and which byte
     /// ranges to read again. Returns the plan and every blob's size, or `None`
     /// when the whole worktree should be streamed instead.
@@ -1551,6 +1728,135 @@ mod tests {
                 h.join().expect("incremental scenario panicked");
             }
         });
+    }
+
+    /// Extract `out` with the client's extractor into a new directory and
+    /// check every file of `commit` there, byte for byte.
+    fn extract_matches_tree(out: &ArchiveBuildOutput, cas: &Cas, mirror: &Path, commit: &str) {
+        out.metadata.validate_geometry().unwrap();
+        let lengths = crate::clonepack::archive_chunk_lengths(&out.metadata).unwrap();
+        let bundles: Vec<Vec<u8>> = out
+            .download_bundle_hashes
+            .iter()
+            .map(|h| cas.get(h).unwrap())
+            .collect();
+        let sizes: Vec<u64> = bundles.iter().map(|b| b.len() as u64).collect();
+        assert_eq!(lengths, sizes, "bundle lengths");
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("out");
+        std::fs::create_dir(&target).unwrap();
+        let manifest_path = tmp.path().join("metadata.pb");
+        out.metadata
+            .write(&mut File::create(&manifest_path).unwrap())
+            .unwrap();
+        crate::extract::extract_archive_with_chunk_fetcher(
+            &manifest_path,
+            Some(&target),
+            u64::MAX,
+            move |chunk| Ok(bundles[chunk.chunk_index].clone()),
+        )
+        .unwrap();
+        let repo = crate::gix_util::open_repo(mirror).unwrap();
+        let id = repo.rev_parse_single(commit).unwrap();
+        let tree_id = repo.find_commit(id).unwrap().tree_id().unwrap().detach();
+        let mut blobs = Vec::new();
+        collect_blobs_raw_gix(&repo, tree_id, &mut blobs).unwrap();
+        assert_eq!(out.metadata.files.len(), blobs.len());
+        for (path, oid, _) in &blobs {
+            let path = std::str::from_utf8(path).unwrap();
+            let got = std::fs::read(target.join(path)).unwrap();
+            assert!(got == repo.find_blob(*oid).unwrap().data, "{path} differs");
+        }
+    }
+
+    /// Tails built one on another stay exact, read only the blobs their
+    /// base lacks, and keep the base's bundles that still hold a used frame,
+    /// across edits, deletes, adds, a rename, a copy, an empty file and a
+    /// delete that leaves a bundle with no used frame.
+    #[test]
+    fn tail_archives_are_exact_and_read_only_new_blobs() {
+        let mut files: Vec<(String, Vec<u8>)> = (0..10)
+            .map(|s| (format!("f{s:02}.bin"), mix_blob(s, 200_000)))
+            .collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let builder = ArchiveBuilder::new(tmp.path()).with_cdc(SMALL_CDC);
+        let c1 = commit_onto(&repo, &as_refs(&files));
+        let mut out = builder
+            .build_into_cas(&c1, &cas, None, 3, None, SMALL_BUNDLE)
+            .unwrap();
+        assert!(
+            out.download_bundle_hashes.len() > 3,
+            "need several bundles, got {}",
+            out.download_bundle_hashes.len()
+        );
+
+        let steps: Vec<(&str, Box<dyn Fn(&mut Vec<(String, Vec<u8>)>)>, usize)> = vec![
+            ("nothing changes", Box::new(|_| {}), 0),
+            (
+                "edit in the middle",
+                Box::new(|f| f[5].1 = mix_blob(900, 200_000)),
+                200_000,
+            ),
+            ("delete", Box::new(|f| drop(f.remove(2))), 0),
+            (
+                "add",
+                Box::new(|f| f.push(("new.bin".into(), mix_blob(901, 50_000)))),
+                50_000,
+            ),
+            ("rename", Box::new(|f| f[0].0 = "renamed/f00.bin".into()), 0),
+            (
+                "copy of a new blob",
+                Box::new(|f| {
+                    let blob = mix_blob(902, 30_000);
+                    f.push(("copy/a.bin".into(), blob.clone()));
+                    f.push(("copy/b.bin".into(), blob));
+                }),
+                30_000,
+            ),
+            (
+                "empty file",
+                Box::new(|f| f.push(("empty".into(), Vec::new()))),
+                0,
+            ),
+            ("delete all but the first", Box::new(|f| f.truncate(1)), 0),
+        ];
+        for (what, change, read) in steps {
+            change(&mut files);
+            files.sort();
+            let commit = commit_onto(&repo, &as_refs(&files));
+            let base = ArchiveBase {
+                frames: &out.archive_frames,
+                metadata: &out.metadata,
+                bundles: &out.download_bundle_hashes,
+            };
+            let next = builder
+                .build_tail_into_cas(&commit, &cas, 3, &base, SMALL_BUNDLE)
+                .unwrap();
+            extract_matches_tree(&next, &cas, tmp.path(), &commit);
+            let reuse = next.reuse;
+            assert!(reuse.tail, "{what}: {reuse:?}");
+            assert_eq!(reuse.bytes_read, read as u64, "{what}: {reuse:?}");
+            assert_eq!(reuse.bundles_built > 0, read > 0, "{what}: {reuse:?}");
+            let kept = &next.download_bundle_hashes[..reuse.bundles_reused];
+            assert!(
+                kept.iter().all(|h| out.download_bundle_hashes.contains(h)),
+                "{what}: kept bundles are the base's"
+            );
+            assert_eq!(
+                next.new_bundle_hashes,
+                next.download_bundle_hashes[reuse.bundles_reused..],
+                "{what}"
+            );
+            out = next;
+        }
+        assert!(
+            out.download_bundle_hashes.len() < 3,
+            "bundles with no used frame are dropped: {}",
+            out.download_bundle_hashes.len()
+        );
     }
 
     /// The base's bundles may be gone from the local cache (evicted after
