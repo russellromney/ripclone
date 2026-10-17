@@ -39,6 +39,7 @@ the token. Hashing gives no protection if the hash leaks.
 | `--no-metrics`, `RIPCLONE_NO_METRICS` | Never send the post-clone metrics report. |
 | `RIPCLONE_POLL_MS` | Longest wait between polls while an output the CLI needs is pending, default 2000. Polls start at 100 ms and double up to this cap. A command stops after 40 polls. |
 | `RIPCLONE_FETCH_MAX_ATTEMPTS`, `RIPCLONE_FETCH_BACKOFF_MS` | Attempts per artifact download and the first retry delay, defaults 3 and 100 ms. |
+| `RIPCLONE_DOWNLOAD_PART_BYTES` | Size of each range when a large artifact is downloaded as 16 parallel ranges, default 16 MiB. Artifacts of at least four parts download this way. |
 | `RIPCLONE_FSYNC` | `1` or `true`: flush the tree, index, and rename before reporting success. Off by default, like `git checkout`. |
 | `--bench`, `RIPCLONE_BENCH` | Print a per-phase timing report after a clone. |
 | `RIPCLONE_NO_BROWSER` | Set: `ripclone login` does not open a browser. |

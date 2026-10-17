@@ -272,6 +272,132 @@ fn f6_ignored_range_restarts_only_that_artifact() {
     assert_eq!(listing(&target), origin.tree(&tip));
 }
 
+/// The part size for F10-F12, so the 2 MiB history pack downloads as about
+/// eight ranges.
+const PART: usize = 256 * 1024;
+const RANGED: [(&str, &str); 1] = [("RIPCLONE_DOWNLOAD_PART_BYTES", "262144")];
+
+/// The closed range `bytes=a-b` a GET asked for.
+fn asked_range(seen: &Seen) -> Option<(u64, u64)> {
+    let (a, b) = seen
+        .range
+        .as_deref()?
+        .strip_prefix("bytes=")?
+        .split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// The artifact that was fetched in ranges, and its GETs.
+fn ranged_gets(proxy: &FaultProxy) -> Vec<Seen> {
+    let gets = proxy.artifact_gets();
+    let path = gets
+        .iter()
+        .find(|s| asked_range(s).is_some())
+        .map(|s| s.path.clone())
+        .unwrap_or_else(|| panic!("no ranged artifact GET among {gets:#?}"));
+    big_gets(proxy, &path)
+}
+
+/// F10: a large artifact downloads as parallel ranges whose answers tile it
+/// exactly once; a 503 on one range retries that range alone.
+#[test]
+fn f10_large_artifact_downloads_in_ranges() {
+    let world = World::new();
+    let (origin, _server, proxy, tip) = big_history(&world, "f10");
+    proxy.fault_artifacts(Fault::Status(503), PART, 1);
+
+    let target = world.target("f10");
+    world
+        .cli_env(
+            &proxy,
+            &["clone", "acme/f10", target.to_str().unwrap()],
+            &RANGED,
+        )
+        .ok();
+
+    let gets = ranged_gets(&proxy);
+    assert!(gets.iter().all(|s| asked_range(s).is_some()), "{gets:#?}");
+    let failed: Vec<&Seen> = gets.iter().filter(|s| s.status == 503).collect();
+    assert_eq!(failed.len(), 1, "{gets:#?}");
+    let mut parts: Vec<(u64, u64)> = gets
+        .iter()
+        .filter(|s| s.status == 206)
+        .map(|s| asked_range(s).unwrap())
+        .collect();
+    assert_eq!(parts.len() + 1, gets.len(), "{gets:#?}");
+    assert!(parts.len() >= 4, "{gets:#?}");
+    assert!(parts.contains(&asked_range(failed[0]).unwrap()));
+    parts.sort();
+    assert_eq!(parts[0].0, 0);
+    for pair in parts.windows(2) {
+        assert_eq!(pair[0].1 + 1, pair[1].0, "{parts:?}");
+    }
+    assert!(
+        parts[..parts.len() - 1]
+            .iter()
+            .all(|(a, b)| b - a + 1 == PART as u64)
+    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+    git(&target, &["fsck", "--full"]);
+    assert_eq!(listing(&target), origin.tree(&tip));
+}
+
+/// F11: when the server ignores Range, a ranged download falls back to one
+/// whole GET of that artifact.
+#[test]
+fn f11_ignored_range_falls_back_to_one_stream() {
+    let world = World::new();
+    let (origin, _server, proxy, tip) = big_history(&world, "f11");
+    proxy.ignore_range();
+
+    let target = world.target("f11");
+    world
+        .cli_env(
+            &proxy,
+            &["clone", "acme/f11", target.to_str().unwrap()],
+            &RANGED,
+        )
+        .ok();
+
+    let gets = ranged_gets(&proxy);
+    let last = gets.last().unwrap();
+    assert_eq!(
+        (last.range.as_deref(), last.status),
+        (None, 200),
+        "{gets:#?}"
+    );
+    assert!(
+        gets[..gets.len() - 1]
+            .iter()
+            .all(|s| asked_range(s).is_some())
+    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+    git(&target, &["fsck", "--full"]);
+    assert_eq!(listing(&target), origin.tree(&tip));
+}
+
+/// F12: a flipped byte in one range fails the clone on the hash check and
+/// leaves nothing.
+#[test]
+fn f12_flipped_byte_in_a_range_fails_on_hash() {
+    let world = World::new();
+    let (_origin, _server, proxy, _tip) = big_history(&world, "f12");
+    proxy.fault_artifacts(Fault::FlipByte, PART, 1);
+
+    let target = world.target("f12");
+    let err = world
+        .cli_env(
+            &proxy,
+            &["clone", "acme/f12", target.to_str().unwrap()],
+            &RANGED,
+        )
+        .err();
+
+    assert!(err.contains("hash mismatch"), "{err}");
+    assert!(ranged_gets(&proxy).iter().any(|s| s.faulted));
+    assert_clean_failure(&world, &target);
+}
+
 /// F8: Ctrl-C during the download removes the staging directory and exits
 /// 130; the next clone into the same path succeeds.
 #[test]
