@@ -454,6 +454,12 @@ async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {
 /// commit of the repo does not hold this build. Head and Files of a new
 /// commit start together: the one that waited for the write lock finds the
 /// commit fetched and does not fetch again. The caller holds `lock.read`.
+///
+/// Without the write lock, a fetch may still be running. That is safe because
+/// each fetch lands as one pack (`fetch.unpackLimit=1`), which git makes
+/// visible only when its idx is in place, so a visible commit has every object
+/// it needs. That fetch writes its refs and the fetched-pack marker last, so a
+/// build must read neither to decide what to build.
 async fn ensure_commit(
     state: &ServerState,
     repo_id: &RepoId,
