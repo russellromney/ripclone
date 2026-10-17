@@ -951,4 +951,35 @@ fn g13_editable_clones_match_git_clone() {
     assert_eq!(git(&sha256, &["rev-parse", "--show-object-format"]), "sha1");
     assert_eq!(git(&sha256, &["rev-parse", "HEAD"]), b);
     git(&sha256, &["fsck", "--no-progress"]);
+
+    // A user whose git has no identity (`git var` refuses) still gets the
+    // reflogs `git clone` writes, under git's fallback committer.
+    let anonymous = world.path("gitconfig-anonymous");
+    std::fs::write(&anonymous, "[user]\n\tuseConfigOnly = true\n").unwrap();
+    let anonymous = anonymous.to_str().unwrap();
+    let ours = world.target("g13-anonymous");
+    world
+        .cli_env(
+            &server,
+            &["clone", "acme/g13", ours.to_str().unwrap()],
+            &[("GIT_CONFIG_GLOBAL", anonymous)],
+        )
+        .ok();
+    let theirs = world.target("g13-anonymous-git");
+    let out = std::process::Command::new("git")
+        .args(["clone", "-q", url.as_str(), theirs.to_str().unwrap()])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", world.path("home"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", anonymous)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(reflogs(&ours), reflogs(&theirs));
+    assert!(reflogs(&ours)[0].starts_with(&format!("{b} clone: from {url} ")));
+    assert_eq!(
+        git(&ours, &["for-each-ref", "--format=%(refname)"]),
+        "refs/heads/main\nrefs/remotes/origin/HEAD\nrefs/remotes/origin/main"
+    );
 }

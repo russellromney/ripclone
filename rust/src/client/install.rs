@@ -377,6 +377,10 @@ impl Client {
         let git_dir = root.join(".git");
         let shallow = output.result == ExactResultKind::Head;
         write_git_config(&git_dir, &origin_url, pin, shallow)?;
+        let ident = match ident {
+            Some(ident) => Some(ident),
+            None => reflog_ident(&root, &pin.commit, cleanup).await?,
+        };
         if let Some(ident) = ident {
             write_clone_reflogs(&git_dir, &origin_url, pin, &ident)?;
         }
@@ -1067,7 +1071,8 @@ async fn top_up(root: &Path, upstream_url: &str, target: &str, cleanup: &Cleanup
 /// filesystem, and git's layout. The object and ref formats stay SHA-1 and
 /// files, whatever the user's defaults, since the clone's packs and refs are
 /// written in them. Beside it, the committer that `git clone` names in its
-/// reflog entries, with the time: `None` when git has no identity.
+/// reflog entries, with the time: `None` when `git var` finds no identity,
+/// and [`reflog_ident`] asks git for its fallback.
 async fn init_git_dir(root: &Path, cleanup: &Cleanup) -> Result<Option<String>> {
     let init = [
         "-c",
@@ -1087,6 +1092,42 @@ async fn init_git_dir(root: &Path, cleanup: &Cleanup) -> Result<Option<String>> 
         (status.success() && !ident.contains('\n') && ident.contains('>'))
             .then(|| ident.to_string()),
     )
+}
+
+/// The committer git writes in reflog entries when `git var` finds no
+/// identity, as with no configured email or `user.useConfigOnly`: reflogs
+/// take git's fallback where `git var` refuses. git writes a throwaway
+/// reflog at `commit` and its committer is read back. `None` when git
+/// writes none.
+async fn reflog_ident(root: &Path, commit: &str, cleanup: &Cleanup) -> Result<Option<String>> {
+    const REF: &str = "refs/ripclone-ident";
+    let args = [
+        "update-ref",
+        "--create-reflog",
+        "-m",
+        "ripclone",
+        REF,
+        commit,
+    ];
+    let (status, _, _) = git_capture(root, &args, cleanup).await?;
+    let git_dir = root.join(".git");
+    let log = std::fs::read_to_string(git_dir.join("logs").join(REF)).unwrap_or_default();
+    for path in [git_dir.join(REF), git_dir.join("logs").join(REF)] {
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("remove {}", path.display()));
+            }
+            _ => {}
+        }
+    }
+    // `<old> <new> <ident>\t<message>`
+    let ident = log
+        .lines()
+        .next()
+        .and_then(|line| line.split_once('\t'))
+        .and_then(|(head, _)| head.splitn(3, ' ').nth(2))
+        .filter(|ident| ident.contains('>'));
+    Ok(ident.filter(|_| status.success()).map(str::to_string))
 }
 
 /// Run the user's git in `repo` and return its status, stdout and stderr.
