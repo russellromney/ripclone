@@ -97,7 +97,9 @@ replaced, so several half-models now run at once:
    it runs only while no build reads. No reachability bitmap is written: a
    cold Full packs history with a plain `pack-objects --revs` walk. The
    mirror's `attr.tree` names the empty tree, so that walk does not resolve
-   the mirror's missing `HEAD` once per object.
+   the mirror's missing `HEAD` once per object. When the cold Full's commit
+   was the first fetch into an empty mirror, the pack that fetch wrote is
+   exactly its history, and the Full stores that pack instead.
 
 ## Keep (reuse with little change)
 

@@ -1463,6 +1463,59 @@ pub fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
             .is_ok_and(|status| status.success())
 }
 
+/// The file naming the pack that the first fetch into an empty mirror wrote,
+/// and the commit it fetched: `<commit> <pack name>`. A fetch of one commit
+/// with nothing to negotiate gets exactly that commit's history, so the pack
+/// is the commit's whole history, ready to store as a cold Full.
+const FETCHED_PACK_MARKER: &str = "ripclone-fetched-pack";
+
+/// True when the mirror holds no objects: no packs and no loose objects.
+fn mirror_is_empty(mirror_dir: &Path) -> bool {
+    let objects = mirror_dir.join("objects");
+    count_entries(&objects.join("pack"), |name| name.ends_with(".pack")) == 0
+        && count_entries(&objects, |name| {
+            name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
+        }) == 0
+}
+
+/// After the first fetch into an empty mirror, record its pack. The mirror
+/// fetches with `fetch.unpackLimit=1`, so the objects land in one pack; any
+/// other shape is left unrecorded.
+fn mark_fetched_pack(mirror_dir: &Path, commit: &str) -> Result<()> {
+    let pack_dir = mirror_dir.join("objects").join("pack");
+    let mut packs = Vec::new();
+    for entry in std::fs::read_dir(&pack_dir).context("list mirror packs")? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix(".pack") {
+            packs.push(stem.to_string());
+        }
+    }
+    let [pack] = packs.as_slice() else {
+        return Ok(());
+    };
+    let tmp = mirror_dir.join(format!("{FETCHED_PACK_MARKER}.tmp"));
+    std::fs::write(&tmp, format!("{commit} {pack}\n")).context("write fetched-pack marker")?;
+    std::fs::rename(&tmp, mirror_dir.join(FETCHED_PACK_MARKER))
+        .context("install fetched-pack marker")
+}
+
+/// The `.pack` and `.idx` paths of the pack holding exactly `commit`'s
+/// history, when the mirror's first fetch was of `commit` and that pack is
+/// still there (a repack may have merged it away).
+pub fn fetched_history_pack(mirror_dir: &Path, commit: &str) -> Option<(PathBuf, PathBuf)> {
+    let marker = std::fs::read_to_string(mirror_dir.join(FETCHED_PACK_MARKER)).ok()?;
+    let (marked, pack) = marker.trim_end().split_once(' ')?;
+    if marked != commit || pack.contains(['/', '\\']) {
+        return None;
+    }
+    let dir = mirror_dir.join("objects").join("pack");
+    let (pack, idx) = (
+        dir.join(format!("{pack}.pack")),
+        dir.join(format!("{pack}.idx")),
+    );
+    (pack.is_file() && idx.is_file()).then_some((pack, idx))
+}
+
 fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     if !mirror_dir.exists() {
         std::fs::create_dir_all(mirror_dir.parent().unwrap_or(Path::new("")))?;
@@ -1510,6 +1563,7 @@ fn sync_bare_mirror_rev(
 ) -> Result<()> {
     use crate::cancel::Ended;
     ensure_bare_origin(mirror_dir, url)?;
+    let empty = mirror_is_empty(mirror_dir);
 
     let refspec = format!("{rev}:refs/ripclone/revs/{}", rev_internal_ref_name(rev));
 
@@ -1524,7 +1578,12 @@ fn sync_bare_mirror_rev(
     )
     .context("git fetch rev")?;
     match run.ended {
-        Ended::Exited(status) if status.success() => Ok(()),
+        Ended::Exited(status) if status.success() => {
+            if empty {
+                mark_fetched_pack(mirror_dir, rev)?;
+            }
+            Ok(())
+        }
         Ended::Exited(_) => Err(upstream_git_error(
             "fetch rev",
             url,
@@ -2069,6 +2128,102 @@ mod tests {
             resolve_commit(&mirror, "main").is_err(),
             "an immutable fetch must not update the moving branch ref"
         );
+    }
+
+    /// The first fetch into an empty mirror writes one pack holding exactly
+    /// the fetched commit's history. Its cold Full stores that pack as it is;
+    /// any other range, or a mirror whose pack was repacked away, is packed
+    /// with `pack-objects`.
+    #[test]
+    fn cold_full_stores_the_first_fetched_pack() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("cold.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let a = crate::test_fixture::commit(&src, &[("a", b"a"), ("b", b"b")]);
+        let b = crate::test_fixture::commit(&src, &[("a", b"a2"), ("b", b"b")]);
+        let c = crate::test_fixture::commit(&src, &[("a", b"a3"), ("c", b"c")]);
+        let mirror = base.path().join("mirror.git");
+        let registry = ProviderRegistry::new();
+        let provider = registry.get("github").unwrap();
+        let repo_id = RepoId::github("acme/cold");
+        let fetch = |commit: &str| {
+            sync_bare_mirror_admitted_from(
+                &mirror,
+                provider,
+                &repo_id,
+                commit,
+                None,
+                base.path().to_str(),
+                Duration::from_secs(60),
+            )
+            .unwrap()
+        };
+        let objects = |args: &[&str]| -> std::collections::BTreeSet<String> {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&mirror)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| line.split_whitespace().next().unwrap().to_string())
+                .collect()
+        };
+
+        fetch(&b);
+        let (pack, idx) = fetched_history_pack(&mirror, &b).expect("b's fetched pack");
+        assert!(fetched_history_pack(&mirror, &a).is_none());
+        let idx_objects: std::collections::BTreeSet<String> = {
+            let out = Command::new("git")
+                .arg("show-index")
+                .stdin(std::fs::File::open(&idx).unwrap())
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(idx_objects, objects(&["rev-list", "--objects", &b]));
+
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = crate::cas::Cas::new(cas_dir.path()).unwrap();
+        let builder = crate::pack::PackBuilder::new(&mirror, &cas);
+        let stored = builder.build_history_tail(&b, None).unwrap().packs;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, crate::cas::hash_file(&pack).unwrap().0);
+        assert!(pack.is_file(), "the mirror keeps its pack");
+        // pack-objects can write the same bytes; a stored pack shares its inode.
+        let inode =
+            |path: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap());
+        assert_eq!(inode(&cas.path(&stored[0].0)), inode(&pack));
+
+        // A later fetch is not into an empty mirror: b stays marked, and c's
+        // history is packed by pack-objects.
+        fetch(&c);
+        assert_eq!(fetched_history_pack(&mirror, &b), Some((pack.clone(), idx)));
+        assert!(fetched_history_pack(&mirror, &c).is_none());
+        let c_history = builder.build_history_tail(&c, None).unwrap().packs;
+        assert_ne!(c_history[0].0, stored[0].0);
+
+        // After a repack the marked pack is gone, and b is packed again.
+        let repack = Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["repack", "-a", "-d", "-q"])
+            .status()
+            .unwrap();
+        assert!(repack.success());
+        assert!(fetched_history_pack(&mirror, &b).is_none());
+        let repacked = builder.build_history_tail(&b, None).unwrap().packs;
+        assert_eq!(repacked.len(), 1);
+        assert_eq!(repacked[0].0, stored[0].0, "the same history, packed again");
     }
 
     #[test]
