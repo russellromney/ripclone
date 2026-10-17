@@ -282,29 +282,45 @@ fn ls_remote_semaphore() -> &'static tokio::sync::Semaphore {
     SEM.get_or_init(|| tokio::sync::Semaphore::new(16))
 }
 
-/// Put every temporary file and directory this process makes under `dir`,
-/// emptied first. Builds stage packs and archives in temp directories; a
-/// killed or crashed server cannot remove them, and for a large repo each is
-/// gigabytes. Under the cache directory they are cleared on the next start
-/// instead of filling the system temp directory. Call only after this process
-/// owns the control database, so no other server is using `dir`.
-fn use_scratch_dir(dir: &std::path::Path) -> Result<()> {
-    match std::fs::remove_dir_all(dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("clear scratch dir {}", dir.display()));
+/// Put every temporary file and directory this process makes in a fresh
+/// directory under `root`, and remove what earlier processes left there.
+/// Builds stage packs and archives in temp directories; a killed or crashed
+/// server cannot remove them, and for a large repo each is gigabytes. Under
+/// the cache directory they are cleared on the next start instead of filling
+/// the system temp directory. A killed server's git children can still be
+/// writing there, so a leftover that won't go is logged and left for the next
+/// start; it never stops this one. Call only after this process owns the
+/// control database, so no other server is using `root`.
+fn use_scratch_dir(root: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create scratch dir {}", root.display()))?;
+    let entries =
+        std::fs::read_dir(root).with_context(|| format!("list scratch dir {}", root.display()))?;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("list scratch dir {}", root.display()))?
+            .path();
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                "left stale scratch {} for the next start: {error}",
+                path.display()
+            ),
         }
     }
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("create scratch dir {}", dir.display()))?;
-    if let Err(current) = tempfile::env::override_temp_dir(dir) {
-        anyhow::ensure!(
-            current == dir,
-            "temp dir already set to {}, not {}",
-            current.display(),
-            dir.display()
-        );
+    let dir = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(root)
+        .with_context(|| format!("create scratch dir in {}", root.display()))?
+        .keep();
+    if let Err(current) = tempfile::env::override_temp_dir(&dir) {
+        anyhow::bail!("temp dir already set to {}", current.display());
     }
     Ok(())
 }
