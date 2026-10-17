@@ -5,8 +5,12 @@
 //! the same time; both need only the commit. Once Head is ready, a Full slot
 //! builds the row's Full, which reuses Head's packs. Each output kind has its
 //! own lease, so a Full never waits for its commit's Files, and a new push's
-//! Files never waits behind another commit's Full or Head. A slot holds a 60 s lease and renews it
-//! every 20 s. A lost lease cancels the build: its git children are stopped,
+//! Files never waits behind another commit's Full or Head. A slot holds a
+//! lease (`RIPCLONE_BUILD_LEASE_SECS`, 60 s) and renews it every third of
+//! that. A process never claims its own leases again, even expired ones, so a
+//! process that stalls (a sleeping laptop, a long pause) carries on with its
+//! builds when it resumes. A lease is lost only when it expired and another
+//! process took it; that cancels the build: its git children are stopped,
 //! it stops at its next step, and it never publishes. Failures record a retry
 //! time instead of sleeping, so no slot waits while holding a lease. A repo
 //! holds at most one lease per pool, so one repo's builds never fill a pool.
@@ -38,11 +42,9 @@ use axum::http::StatusCode;
 use std::env;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
-const LEASE: Duration = Duration::from_secs(60);
-const RENEW_EVERY: Duration = Duration::from_secs(20);
 const IDLE_POLL: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(300);
 /// Cap on each mirror upkeep step: the commit-graph before a Full, and
@@ -64,6 +66,9 @@ pub(super) struct WorkerSettings {
     pub retry_base: Duration,
     /// Claims of one output kind before it fails.
     pub max_attempts: i64,
+    /// How long a claim holds its output without renewing. Renewed every
+    /// third of it.
+    pub lease: Duration,
 }
 
 impl WorkerSettings {
@@ -95,6 +100,8 @@ impl WorkerSettings {
             max_attempts >= 1,
             "RIPCLONE_BUILD_MAX_ATTEMPTS must be at least 1"
         );
+        let lease = number("RIPCLONE_BUILD_LEASE_SECS", 60)?;
+        anyhow::ensure!(lease >= 3, "RIPCLONE_BUILD_LEASE_SECS must be at least 3");
         Ok(Self {
             head_slots: usize::try_from(head_slots).context("RIPCLONE_HEAD_SLOTS is too large")?,
             files_slots: usize::try_from(files_slots)
@@ -103,6 +110,7 @@ impl WorkerSettings {
             retry_base: Duration::from_millis(retry_base),
             max_attempts: i64::try_from(max_attempts)
                 .context("RIPCLONE_BUILD_MAX_ATTEMPTS is too large")?,
+            lease: Duration::from_secs(lease),
         })
     }
 }
@@ -211,14 +219,9 @@ fn is_retryable_io_error(error: &std::io::Error) -> bool {
     )
 }
 
-/// Start every slot. Lease owners are `{pid}-{boot nanos}-{pool}-{slot}-{seq}`,
-/// unique across restarts.
+/// Start every slot. Lease owners are `{pool}-{slot}-{seq}`; the store adds
+/// its instance, so they are unique across restarts.
 pub(super) fn spawn_workers(state: &ServerState, settings: &WorkerSettings) {
-    let boot_nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let boot = format!("{}-{boot_nanos:x}", std::process::id());
     for (pool, slots, name) in [
         (Pool::Head, settings.head_slots, "head"),
         (Pool::Files, settings.files_slots, "files"),
@@ -229,7 +232,7 @@ pub(super) fn spawn_workers(state: &ServerState, settings: &WorkerSettings) {
                 state.clone(),
                 *settings,
                 pool,
-                format!("{boot}-{name}-{slot}"),
+                format!("{name}-{slot}"),
             ));
         }
     }
@@ -252,7 +255,7 @@ async fn run_slot(state: ServerState, settings: WorkerSettings, pool: Pool, slot
         notified.as_mut().enable();
         sequence = sequence.wrapping_add(1);
         let owner = format!("{slot}-{sequence}");
-        match state.control.claim(&owner, pool, LEASE).await {
+        match state.control.claim(&owner, pool, settings.lease).await {
             Ok(Some(claim)) => {
                 run_claim(&state, settings, pool, claim).await;
                 continue;
@@ -269,7 +272,7 @@ async fn run_slot(state: ServerState, settings: WorkerSettings, pool: Pool, slot
 
 /// Run one leased build, renewing the lease until it finishes. A lost lease
 /// cancels the build, and the slot waits for it to stop before it claims
-/// again; another worker owns the row now.
+/// again; another process owns the output now.
 async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, claim: Claim) {
     let claim = Arc::new(claim);
     let cancel = Cancel::new();
@@ -287,8 +290,8 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
             })
             .await
     });
-    let mut renew =
-        tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
+    let every = settings.lease / 3;
+    let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -299,7 +302,7 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
                 }
                 break;
             }
-            _ = renew.tick() => match state.control.renew(&claim, LEASE).await {
+            _ = renew.tick() => match state.control.renew(&claim, settings.lease).await {
                 Ok(true) => {}
                 Ok(false) => {
                     warn!(
@@ -319,16 +322,26 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
             },
         }
     }
-    if let Err(error) = state.control.release(&claim).await {
-        error!(
-            "release lease for {}@{} failed: {error:#}",
-            claim.repo.storage_key(),
-            claim.build.commit
-        );
-    }
+    release(state, &claim).await;
     // A ready Head makes the row's Full claimable.
     if pool == Pool::Head {
         state.wake(Pool::Full).notify_one();
+    }
+}
+
+/// Give up the claim's lease, retrying until the store takes it. This process
+/// never claims its own leases again, so one left behind would keep the
+/// output from building until a restart.
+async fn release(state: &ServerState, claim: &Claim) {
+    let mut delay = Duration::from_millis(100);
+    while let Err(error) = state.control.release(claim).await {
+        error!(
+            "release lease for {}@{} failed, retrying in {delay:?}: {error:#}",
+            claim.repo.storage_key(),
+            claim.build.commit
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -454,6 +467,12 @@ async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {
 /// commit of the repo does not hold this build. Head and Files of a new
 /// commit start together: the one that waited for the write lock finds the
 /// commit fetched and does not fetch again. The caller holds `lock.read`.
+///
+/// Without the write lock, a fetch may still be running, so the check is the
+/// fetch's ref, which git writes only once the commit's history is in place
+/// and connected. The commit object alone is not enough: it may be in a pack
+/// whose fetch has not finished or failed. Such a commit is fetched again
+/// under the write lock; git skips the transfer when the history is there.
 async fn ensure_commit(
     state: &ServerState,
     repo_id: &RepoId,
@@ -464,7 +483,7 @@ async fn ensure_commit(
     let has_commit = || {
         let (dir, wanted) = (mirror_dir.to_path_buf(), commit.to_string());
         async move {
-            cancel::spawn_blocking(move || git::mirror_has_commit(&dir, &wanted))
+            cancel::spawn_blocking(move || git::mirror_fetched_commit(&dir, &wanted))
                 .await
                 .context("mirror check task")
         }
@@ -550,10 +569,6 @@ async fn head_output(
     phases.mirror_fetch_ms = Some(duration_ms(t.elapsed()));
     let (prep_dir, prep_commit) = (mirror_dir.clone(), commit.to_string());
     let parent = cancel::spawn_blocking(move || -> Result<Option<String>> {
-        // An empty upstream mirrors fine but has nothing to build.
-        if git::is_empty_repo(&prep_dir).unwrap_or(false) {
-            anyhow::bail!("repository has no commits (nothing to clone)");
-        }
         let resolved = git::resolve_commit(&prep_dir, &prep_commit)
             .with_context(|| format!("resolve admitted commit {prep_commit}"))?;
         anyhow::ensure!(
@@ -867,6 +882,7 @@ mod tests {
                 full_slots: 2,
                 retry_base: Duration::from_millis(2000),
                 max_attempts: 5,
+                lease: Duration::from_secs(60),
             }
         );
         for (cores, slots) in [(1, 2), (16, 4), (64, 16)] {
@@ -886,6 +902,7 @@ mod tests {
                         "RIPCLONE_FULL_SLOTS" => "4",
                         "RIPCLONE_BUILD_RETRY_BASE_MS" => "50",
                         "RIPCLONE_BUILD_MAX_ATTEMPTS" => "2",
+                        "RIPCLONE_BUILD_LEASE_SECS" => "6",
                         _ => return None,
                     }
                     .to_string(),
@@ -899,6 +916,7 @@ mod tests {
         assert_eq!(set.full_slots, 4);
         assert_eq!(set.retry_base, Duration::from_millis(50));
         assert_eq!(set.max_attempts, 2);
+        assert_eq!(set.lease, Duration::from_secs(6));
         for (key, value) in [
             ("RIPCLONE_HEAD_SLOTS", "0"),
             ("RIPCLONE_HEAD_SLOTS", "two"),
@@ -906,6 +924,7 @@ mod tests {
             ("RIPCLONE_FULL_SLOTS", "many"),
             ("RIPCLONE_BUILD_RETRY_BASE_MS", "soon"),
             ("RIPCLONE_BUILD_MAX_ATTEMPTS", "0"),
+            ("RIPCLONE_BUILD_LEASE_SECS", "2"),
         ] {
             let error = WorkerSettings::from_lookup(|k| (k == key).then(|| value.to_string()), 8)
                 .unwrap_err();

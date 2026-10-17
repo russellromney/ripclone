@@ -44,6 +44,11 @@ struct Pin {
     commit: String,
     /// The branch to check out; empty is detached.
     checkout: String,
+    /// The upstream branch the checkout tracks: the resolved branch, not a
+    /// local name `--branch` gives an `--at` commit.
+    tracks: bool,
+    /// The checkout is the upstream's default branch.
+    default_branch: bool,
     /// The hosted server's per-clone id, for the metrics report.
     clone_id: Option<String>,
 }
@@ -220,9 +225,12 @@ impl Client {
             .map(str::to_string)
             .or(summary.checkout_name)
             .unwrap_or_default();
+        let tracks = checkout_override.is_none() && !checkout.is_empty();
         Ok(Pin {
             commit: summary.commit,
             checkout,
+            tracks,
+            default_branch: tracks && request.at.is_none() && request.branch == "HEAD",
             clone_id,
         })
     }
@@ -346,10 +354,10 @@ impl Client {
             }
             _ => {}
         }
-        let root = self
+        let (root, ident) = self
             .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
             .await?;
-        let origin_url = if let Plan::TopUp { base, upstream_url } = plan {
+        if let Plan::TopUp { base, upstream_url } = plan {
             top_up(&root, upstream_url, &pin.commit, cleanup)
                 .await
                 .with_context(|| {
@@ -358,13 +366,24 @@ impl Client {
                         pin.commit, base.commit
                     )
                 })?;
-            upstream_url.clone()
-        } else if output.origin_url.is_empty() {
-            format!("https://github.com/{repo_path}.git")
-        } else {
-            output.origin_url.clone()
+        }
+        // The user's later fetches and pushes go to the locally configured
+        // upstream, never to a URL the server names.
+        let origin_url = match self.top_up_url(repo_path) {
+            Ok(url) => url,
+            Err(_) if output.origin_url.is_empty() => format!("https://github.com/{repo_path}.git"),
+            Err(_) => output.origin_url.clone(),
         };
-        write_origin_config(&root.join(".git"), &origin_url)?;
+        let git_dir = root.join(".git");
+        let shallow = output.result == ExactResultKind::Head;
+        write_git_config(&git_dir, &origin_url, pin, shallow)?;
+        let ident = match ident {
+            Some(ident) => Some(ident),
+            None => reflog_ident(&root, &pin.commit, cleanup).await?,
+        };
+        if let Some(ident) = ident {
+            write_clone_reflogs(&git_dir, &origin_url, pin, &ident)?;
+        }
         Ok(root)
     }
 
@@ -503,8 +522,9 @@ impl Client {
         Ok(root)
     }
 
-    /// Head or Full: `.git` from the metadata chunk, then the packs, whose
-    /// blobs are written into the working tree as each pack lands.
+    /// Head or Full: `git init`, `.git` from the metadata chunk, then the
+    /// packs, whose blobs are written into the working tree as each pack
+    /// lands. Returns the staging root and the committer for the reflog.
     async fn materialize_git(
         &self,
         urls: &OutputUrls,
@@ -513,14 +533,19 @@ impl Client {
         staging: &Staging,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
-    ) -> Result<PathBuf> {
-        let (manifest, metadata) =
-            tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
-                .context("fetch manifest/metadata")?;
+    ) -> Result<(PathBuf, Option<String>)> {
+        let root = stage(target, staging)?;
+        let (manifest, metadata, ident) = tokio::try_join!(
+            async {
+                tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
+                    .context("fetch manifest/metadata")
+            },
+            init_git_dir(&root, cleanup),
+        )
+        .map(|((manifest, metadata), ident)| (manifest, metadata, ident))?;
         bench.mark_manifest();
         bench.add_bytes(metadata_bytes(&metadata), 0);
 
-        let root = stage(target, staging)?;
         let git_dir = root.join(".git");
         write_git_dir(&git_dir, urls.output(), checkout, &metadata)?;
         bench.mark_metadata();
@@ -542,7 +567,7 @@ impl Client {
             manifest.packs.len()
         );
         bench.mark_archive_download(bytes);
-        Ok(root)
+        Ok((root, ident))
     }
 
     /// The clonepack manifest of `urls`' output, checked against its commit.
@@ -1031,7 +1056,119 @@ async fn top_up(root: &Path, upstream_url: &str, target: &str, cleanup: &Cleanup
         .with_context(|| format!("fetch {target} from {upstream_url}"))?;
     run_git(root, &["reset", "--hard", "--quiet", target], cleanup)
         .await
-        .with_context(|| format!("check out {target}"))
+        .with_context(|| format!("check out {target}"))?;
+    // `git clone` leaves no ORIG_HEAD.
+    match std::fs::remove_file(root.join(".git").join("ORIG_HEAD")) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).context("remove ORIG_HEAD")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `git init` the staging directory as `git clone` does, so the clone gets
+/// the user's templates (their hooks), the settings git probes on this
+/// filesystem, and git's layout. The object and ref formats stay SHA-1 and
+/// files, whatever the user's defaults, since the clone's packs and refs are
+/// written in them. Beside it, the committer that `git clone` names in its
+/// reflog entries, with the time: `None` when `git var` finds no identity,
+/// and [`reflog_ident`] asks git for its fallback.
+async fn init_git_dir(root: &Path, cleanup: &Cleanup) -> Result<Option<String>> {
+    let init = [
+        "-c",
+        "init.defaultRefFormat=files",
+        "init",
+        "--quiet",
+        "--object-format=sha1",
+    ];
+    let ident = ["var", "GIT_COMMITTER_IDENT"];
+    let ((status, _, stderr), (ident_status, stdout, _)) = tokio::try_join!(
+        git_capture(root, &init, cleanup),
+        git_capture(root, &ident, cleanup)
+    )?;
+    anyhow::ensure!(status.success(), "git init failed: {}", stderr.trim());
+    let (status, ident) = (ident_status, stdout.trim());
+    Ok(
+        (status.success() && !ident.contains('\n') && ident.contains('>'))
+            .then(|| ident.to_string()),
+    )
+}
+
+/// The committer git writes in reflog entries when `git var` finds no
+/// identity, as with no configured email or `user.useConfigOnly`: reflogs
+/// take git's fallback where `git var` refuses. git writes a throwaway
+/// reflog at `commit` and its committer is read back. `None` when git
+/// writes none.
+async fn reflog_ident(root: &Path, commit: &str, cleanup: &Cleanup) -> Result<Option<String>> {
+    const REF: &str = "refs/ripclone-ident";
+    let args = [
+        "update-ref",
+        "--create-reflog",
+        "-m",
+        "ripclone",
+        REF,
+        commit,
+    ];
+    let (status, _, _) = git_capture(root, &args, cleanup).await?;
+    let git_dir = root.join(".git");
+    let log = std::fs::read_to_string(git_dir.join("logs").join(REF)).unwrap_or_default();
+    for path in [git_dir.join(REF), git_dir.join("logs").join(REF)] {
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("remove {}", path.display()));
+            }
+            _ => {}
+        }
+    }
+    // `<old> <new> <ident>\t<message>`
+    let ident = log
+        .lines()
+        .next()
+        .and_then(|line| line.split_once('\t'))
+        .and_then(|(head, _)| head.splitn(3, ' ').nth(2))
+        .filter(|ident| ident.contains('>'));
+    Ok(ident.filter(|_| status.success()).map(str::to_string))
+}
+
+/// Run the user's git in `repo` and return its status, stdout and stderr.
+/// The object and ref format defaults of the environment are dropped.
+/// Cancelling the clone kills it.
+async fn git_capture(
+    repo: &Path,
+    args: &[&str],
+    cleanup: &Cleanup,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    use std::io::{Read, Seek};
+    use std::process::Stdio;
+
+    let mut stdout = tempfile::tempfile().context("create git stdout file")?;
+    let mut stderr = tempfile::tempfile().context("create git stderr file")?;
+    let child = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env_remove("GIT_DEFAULT_HASH")
+        .env_remove("GIT_DEFAULT_REF_FORMAT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            stdout.try_clone().context("clone git stdout file")?,
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().context("clone git stderr file")?,
+        ))
+        .spawn()
+        .context("run git")?;
+    let status = GitChild::new(child, cleanup.clone())
+        .wait()
+        .await
+        .context("wait for git")?;
+    let read = |file: &mut std::fs::File| -> Result<String> {
+        let mut text = String::new();
+        file.rewind()?;
+        file.read_to_string(&mut text)?;
+        Ok(text)
+    };
+    Ok((status, read(&mut stdout)?, read(&mut stderr)?))
 }
 
 /// Run the user's git in `repo`, with their environment and config. On
@@ -1080,8 +1217,9 @@ fn stage(target: &Path, staging: &Staging) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Lay down `.git` from the metadata chunk: HEAD and the checked-out branch,
-/// and the prebuilt index. The packs bring the objects. No git command runs.
+/// Lay down `.git` from the metadata chunk over what `git init` wrote: HEAD
+/// and the checked-out branch, and the prebuilt index. The packs bring the
+/// objects.
 fn write_git_dir(
     git_dir: &Path,
     output: &RefResponse,
@@ -1091,7 +1229,6 @@ fn write_git_dir(
     let heads = git_dir.join("refs").join("heads");
     std::fs::create_dir_all(&heads)?;
     std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
-    std::fs::create_dir_all(git_dir.join("info"))?;
     let commit = &output.commit;
     if checkout.is_empty() {
         std::fs::write(git_dir.join("HEAD"), format!("{commit}\n"))?;
@@ -1106,7 +1243,6 @@ fn write_git_dir(
         }
         std::fs::write(branch_ref, format!("{commit}\n"))?;
     }
-    std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
     if output.result == ExactResultKind::Head {
         // Mark HEAD as a shallow boundary so git does not try to traverse
         // missing parents.
@@ -1119,12 +1255,94 @@ fn write_git_dir(
     Ok(())
 }
 
-fn write_origin_config(git_dir: &Path, origin_url: &str) -> Result<()> {
-    let config = format!(
-        "[core]\n\tsymlinks = true\n\tcheckStat = minimal\n[remote \"origin\"]\n\turl = {origin_url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
-    );
-    std::fs::write(git_dir.join("config"), config)?;
+/// Add to the `.git/config` that `git init` wrote what `git clone` adds:
+/// the origin remote, and the checked out branch tracking its upstream
+/// branch with a remote-tracking ref at the installed commit. A `shallow`
+/// clone fetches only that branch, as `git clone --depth` sets up. `git pull`
+/// then works in the clone. `checkStat = minimal` lets git trust the
+/// prebuilt index's stat data, so the first `git status` reads no file.
+fn write_git_config(git_dir: &Path, origin_url: &str, pin: &Pin, shallow: bool) -> Result<()> {
+    let path = git_dir.join("config");
+    let mut config = std::fs::read_to_string(&path).context("read the config git init wrote")?;
+    config.push_str("[core]\n\tcheckStat = minimal\n");
+    let refspec = if shallow && pin.tracks {
+        let branch = &pin.checkout;
+        format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    } else {
+        "+refs/heads/*:refs/remotes/origin/*".to_string()
+    };
+    config.push_str(&format!(
+        "[remote \"origin\"]\n\turl = {}\n\tfetch = {}\n",
+        quoted(origin_url),
+        quoted(&refspec)
+    ));
+    if pin.tracks {
+        let branch = &pin.checkout;
+        config.push_str(&format!(
+            "[branch {}]\n\tremote = origin\n\tmerge = {}\n",
+            quoted(branch),
+            quoted(&format!("refs/heads/{branch}"))
+        ));
+        let remote = git_dir.join("refs").join("remotes").join("origin");
+        let tracking = remote.join(branch);
+        std::fs::create_dir_all(tracking.parent().context("remote-tracking ref")?)?;
+        std::fs::write(&tracking, format!("{}\n", pin.commit))?;
+        if pin.default_branch {
+            std::fs::write(
+                remote.join("HEAD"),
+                format!("ref: refs/remotes/origin/{branch}\n"),
+            )?;
+        }
+    }
+    std::fs::write(&path, config)?;
     Ok(())
+}
+
+/// The reflog entries `git clone` starts with: HEAD, the checked out branch,
+/// and `origin/HEAD`, each created at the installed commit by `ident` (name,
+/// email and time) with `clone: from <url>`. Credentials in the URL are left
+/// out, as git does. Earlier entries, from a top-up's reset, are replaced.
+fn write_clone_reflogs(git_dir: &Path, origin_url: &str, pin: &Pin, ident: &str) -> Result<()> {
+    let entry = format!(
+        "{} {} {ident}\tclone: from {}\n",
+        "0".repeat(pin.commit.len()),
+        pin.commit,
+        without_credentials(origin_url)
+    );
+    let logs = git_dir.join("logs");
+    let mut refs = vec![PathBuf::from("HEAD")];
+    if !pin.checkout.is_empty() {
+        refs.push(Path::new("refs/heads").join(&pin.checkout));
+    }
+    if pin.default_branch {
+        refs.push(PathBuf::from("refs/remotes/origin/HEAD"));
+    }
+    for name in refs {
+        let log = logs.join(name);
+        std::fs::create_dir_all(log.parent().context("reflog path")?)?;
+        std::fs::write(&log, &entry).with_context(|| format!("write {}", log.display()))?;
+    }
+    Ok(())
+}
+
+/// `url` without a `user:password@` part.
+fn without_credentials(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let host_end = rest.find('/').unwrap_or(rest.len());
+            match rest[..host_end].rfind('@') {
+                Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+                None => url.to_string(),
+            }
+        }
+        None => url.to_string(),
+    }
+}
+
+/// A git config subsection or value in quotes: a branch name may hold `"`,
+/// `#` or `;`.
+fn quoted(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
@@ -1193,5 +1411,25 @@ mod tests {
         };
         assert!(validate_manifest_commit(&manifest, &"a".repeat(40)).is_err());
         assert!(validate_manifest_commit(&manifest, &"b".repeat(40)).is_ok());
+    }
+
+    /// A reflog names the clone's URL without its credentials, as git does.
+    #[test]
+    fn reflog_urls_drop_credentials() {
+        for (url, shown) in [
+            (
+                "https://user:tok@github.com/a/b.git",
+                "https://github.com/a/b.git",
+            ),
+            (
+                "https://tok@host:8443/a@b/c.git",
+                "https://host:8443/a@b/c.git",
+            ),
+            ("https://github.com/a/b.git", "https://github.com/a/b.git"),
+            ("file:///srv/a.git", "file:///srv/a.git"),
+            ("git@github.com:a/b.git", "git@github.com:a/b.git"),
+        ] {
+            assert_eq!(without_credentials(url), shown, "{url}");
+        }
     }
 }

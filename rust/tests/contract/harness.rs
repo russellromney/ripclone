@@ -732,6 +732,15 @@ impl Server {
         self.spawn();
     }
 
+    /// Stop the server process (SIGSTOP) for `stopped`, then resume it, as a
+    /// laptop that sleeps does. Its git children keep running.
+    pub fn pause(&self, stopped: Duration) {
+        let pid = self.child.as_ref().expect("server is running").id() as i32;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "SIGSTOP");
+        std::thread::sleep(stopped);
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0, "SIGCONT");
+    }
+
     pub fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();

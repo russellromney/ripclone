@@ -88,6 +88,7 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | `RIPCLONE_FULL_SLOTS` | Builds that run Full at once. Default: a quarter of the CPU cores, at least 2. `0` pauses Full; Head and Files still build. A long Full never holds back another commit's Files. |
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
 | `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per output before it fails, default 5. Head, Files and Full each count their own. At least 1. |
+| `RIPCLONE_BUILD_LEASE_SECS` | How long a build holds its output without renewing, default 60, at least 3. A build renews every third of it. A server never takes back its own builds, so one that stalls (a sleeping laptop, a stopped process) carries on when it resumes. Only another server may take a lease that expired. |
 | `RIPCLONE_LSM_MAX_LEVELS` | Most history levels a Full keeps before merging the smallest neighbors, default 16. |
 | `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head levels past their base reach this size, a quarter of the base, or 64 packs, its Full build rebases: base packs that are still at least 90% live are kept, and the rest is packed into the new base for later Heads. Default 128 MiB. |
 | `RIPCLONE_FILES_TAIL_PERCENT` | How far, in percent, a Files archive with tail chunks may grow past its compact form before a push builds it compact again. Default 25. |

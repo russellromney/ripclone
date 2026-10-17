@@ -903,22 +903,6 @@ impl ArchiveBuilder {
         Ok(bounds)
     }
 
-    /// Convenience: build from a repo string "owner/repo" by locating the bare
-    /// mirror under `repo_root`.
-    pub fn build_repo(
-        repo_root: &Path,
-        owner: &str,
-        repo_name: &str,
-        commit: &str,
-        archive_path: &Path,
-        manifest_path: &Path,
-        level: i32,
-    ) -> Result<ArchiveStats> {
-        let mirror = repo_root.join(format!("{}_{}.git", owner, repo_name));
-        let builder = ArchiveBuilder::new(&mirror);
-        builder.build(commit, archive_path, manifest_path, level)
-    }
-
     /// Build only the metadata *files table*: each file's path, mode and
     /// blob id, from the tree alone. No blob is read, and `frames` is left
     /// empty. Editable clones materialize the worktree from the Head packs, so

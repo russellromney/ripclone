@@ -708,3 +708,278 @@ fn g10_awkward_names_clone_exactly() {
         Some("feature/new-ui"),
     );
 }
+
+/// G12: an editable clone works with the user's later git like `git clone`
+/// does. The branch tracks its upstream branch, `origin` is the configured
+/// upstream, and `git pull` and `git push` work. A depth-1 clone pulls too.
+/// A tag or an `--at` commit checks out with no upstream, and a branch name
+/// with config quoting characters tracks correctly.
+#[test]
+fn g12_editable_clones_pull_and_push_like_git_clone() {
+    let world = World::new();
+    let origin = world.origin("acme", "g12");
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    git(&origin.work, &["tag", "v1"]);
+    let odd = "fix/#1;\"q\"";
+    git(&origin.work, &["checkout", "-q", "-b", odd]);
+    let o = origin.commit(&[("odd.txt", "o\n")], "O");
+    git(&origin.work, &["checkout", "-q", "main"]);
+    let b = origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+    origin.publish_branch(odd);
+    git(
+        &origin.work,
+        &["push", "-q", origin.bare.to_str().unwrap(), "v1"],
+    );
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/g12", "--wait"]).ok();
+    let url = format!("file://{}", origin.bare.display());
+    let clone = |name: &str, args: &[&str]| {
+        let target = world.target(name);
+        let mut argv = vec!["clone", "acme/g12", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&server, &argv).ok();
+        assert_eq!(
+            git(&target, &["config", "remote.origin.url"]),
+            url,
+            "{name}"
+        );
+        target
+    };
+    let upstream = |dir: &std::path::Path| {
+        let out = git_output(dir, &["rev-parse", "--symbolic-full-name", "@{upstream}"]);
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    let full = clone("full", &[]);
+    let shallow = clone("shallow", &["--depth", "1"]);
+    for dir in [&full, &shallow] {
+        assert_eq!(upstream(dir).as_deref(), Some("refs/remotes/origin/main"));
+        assert_eq!(git(dir, &["rev-parse", "origin/main"]), b);
+        assert_eq!(
+            git(dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]),
+            "refs/remotes/origin/main"
+        );
+        assert_eq!(git(dir, &["status", "-sb"]), "## main...origin/main");
+    }
+
+    // A push upstream: both clones pull it.
+    let c = origin.commit(&[("c.txt", "c\n")], "C");
+    origin.publish();
+    for dir in [&full, &shallow] {
+        git(dir, &["pull", "-q", "--ff-only"]);
+        assert_eq!(git(dir, &["rev-parse", "HEAD"]), c);
+        assert_eq!(listing(dir), origin.tree(&c));
+    }
+    // The user's commit pushes to the upstream.
+    std::fs::write(full.join("d.txt"), "d\n").unwrap();
+    git(&full, &["add", "d.txt"]);
+    git(&full, &["commit", "-q", "-m", "D"]);
+    git(&full, &["push", "-q"]);
+    assert_eq!(
+        git(&origin.bare, &["rev-parse", "main"]),
+        git(&full, &["rev-parse", "HEAD"])
+    );
+
+    // A branch with `#`, `;` and `"` in its name tracks that branch.
+    let branch = clone("odd", &["--at", odd]);
+    assert_eq!(git(&branch, &["rev-parse", "HEAD"]), o);
+    assert_eq!(
+        upstream(&branch),
+        Some(format!("refs/remotes/origin/{odd}"))
+    );
+    git(&branch, &["pull", "-q", "--ff-only"]);
+
+    // A tag is detached; an `--at` commit on a named local branch tracks
+    // nothing, and no remote-tracking ref claims the upstream has it.
+    let tag = clone("tag", &["--at", "v1"]);
+    assert_eq!(git(&tag, &["rev-parse", "HEAD"]), a);
+    assert!(
+        git_output(&tag, &["symbolic-ref", "-q", "HEAD"])
+            .stdout
+            .is_empty()
+    );
+    assert_eq!(upstream(&tag), None);
+    let local = clone("local", &["--at", &a, "--branch", "mine"]);
+    assert_eq!(git(&local, &["symbolic-ref", "HEAD"]), "refs/heads/mine");
+    assert_eq!(upstream(&local), None);
+    assert_eq!(git(&local, &["for-each-ref", "refs/remotes"]), "");
+}
+
+/// G13: an editable clone is the repository `git clone` makes. With the
+/// user's global git config naming a template dir and an identity, a full
+/// and a depth-1 clone have the local config, reflog and template hooks of
+/// `git clone` and `git clone --depth 1`, apart from `core.checkstat`. The
+/// template's commit-msg hook runs on the user's commit, and `HEAD@{1}` is
+/// then the cloned commit. A depth-1 clone fetches only its branch; a full
+/// clone fetches every branch. A SHA-256 default in the user's environment
+/// still gives a SHA-1 clone.
+#[test]
+fn g13_editable_clones_match_git_clone() {
+    let world = World::new();
+    let origin = world.origin("acme", "g13");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    git(&origin.work, &["checkout", "-q", "-b", "dev"]);
+    origin.commit(&[("dev.txt", "d\n")], "D");
+    git(&origin.work, &["checkout", "-q", "main"]);
+    let b = origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+    origin.publish_branch("dev");
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/g13", "--wait"]).ok();
+
+    let templates = world.path("templates");
+    std::fs::create_dir_all(templates.join("hooks")).unwrap();
+    let hook = templates.join("hooks").join("commit-msg");
+    std::fs::write(&hook, "#!/bin/sh\necho 'Hooked: yes' >> \"$1\"\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let global = world.path("gitconfig");
+    std::fs::write(
+        &global,
+        format!(
+            "[init]\n\ttemplateDir = {}\n[user]\n\tname = U\n\temail = u@example.com\n",
+            templates.display()
+        ),
+    )
+    .unwrap();
+    let global = global.to_str().unwrap();
+    let url = format!("file://{}", origin.bare.display());
+    // The user's own git, as the CLI runs with it.
+    let user_git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", world.path("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", global)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let local_config = |dir: &std::path::Path| {
+        user_git(dir, &["config", "--local", "--list"])
+            .lines()
+            .filter(|line| *line != "core.checkstat=minimal")
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let reflogs = |dir: &std::path::Path| {
+        ["HEAD", "main", "origin/HEAD"]
+            .map(|name| user_git(dir, &["reflog", "show", "--format=%H %gs %gn %ge", name]))
+    };
+
+    let mut clones = Vec::new();
+    for (name, args) in [("full", vec![]), ("depth1", vec!["--depth", "1"])] {
+        let ours = world.target(&format!("g13-{name}"));
+        let mut argv = vec!["clone", "acme/g13", ours.to_str().unwrap()];
+        argv.extend(args.iter().copied());
+        world
+            .cli_env(&server, &argv, &[("GIT_CONFIG_GLOBAL", global)])
+            .ok();
+        let theirs = world.target(&format!("g13-{name}-git"));
+        let mut argv = vec!["clone", "-q"];
+        argv.extend(args.iter().copied());
+        argv.extend([url.as_str(), theirs.to_str().unwrap()]);
+        user_git(&world.path("home"), &argv);
+
+        assert_eq!(local_config(&ours), local_config(&theirs), "{name}");
+        assert!(
+            user_git(&ours, &["config", "--local", "--list"]).contains("core.checkstat=minimal")
+        );
+        assert_eq!(reflogs(&ours), reflogs(&theirs), "{name}");
+        assert_eq!(
+            reflogs(&ours)[0],
+            format!("{b} clone: from {url} U u@example.com")
+        );
+        assert_eq!(
+            std::fs::read(ours.join(".git/hooks/commit-msg")).unwrap(),
+            std::fs::read(&hook).unwrap(),
+            "{name}"
+        );
+        assert_eq!(user_git(&ours, &["status", "--porcelain"]), "", "{name}");
+        clones.push(ours);
+    }
+    let (full, depth1) = (&clones[0], &clones[1]);
+
+    // The template's hook runs on the user's commit, and the reflog goes on
+    // from the clone.
+    user_git(full, &["commit", "-q", "--allow-empty", "-m", "Mine"]);
+    assert!(user_git(full, &["log", "-1", "--format=%B"]).contains("Hooked: yes"));
+    assert_eq!(user_git(full, &["rev-parse", "HEAD@{1}"]), b);
+
+    // A new branch upstream: only the full clone's fetch takes it.
+    git(&origin.work, &["checkout", "-q", "-b", "next"]);
+    origin.commit(&[("next.txt", "n\n")], "N");
+    origin.publish_branch("next");
+    for dir in [full, depth1] {
+        user_git(dir, &["fetch", "-q"]);
+    }
+    let remote_refs = |dir: &std::path::Path| {
+        user_git(
+            dir,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+        )
+    };
+    assert_eq!(
+        remote_refs(full),
+        "refs/remotes/origin/HEAD\nrefs/remotes/origin/dev\nrefs/remotes/origin/main\nrefs/remotes/origin/next"
+    );
+    assert_eq!(
+        remote_refs(depth1),
+        "refs/remotes/origin/HEAD\nrefs/remotes/origin/main"
+    );
+    assert_eq!(
+        user_git(depth1, &["rev-parse", "--is-shallow-repository"]),
+        "true"
+    );
+
+    // The user's SHA-256 default does not reach the clone.
+    let sha256 = world.target("g13-sha256");
+    world
+        .cli_env(
+            &server,
+            &["clone", "acme/g13", sha256.to_str().unwrap()],
+            &[("GIT_DEFAULT_HASH", "sha256")],
+        )
+        .ok();
+    assert_eq!(git(&sha256, &["rev-parse", "--show-object-format"]), "sha1");
+    assert_eq!(git(&sha256, &["rev-parse", "HEAD"]), b);
+    git(&sha256, &["fsck", "--no-progress"]);
+
+    // A user whose git has no identity (`git var` refuses) still gets the
+    // reflogs `git clone` writes, under git's fallback committer.
+    let anonymous = world.path("gitconfig-anonymous");
+    std::fs::write(&anonymous, "[user]\n\tuseConfigOnly = true\n").unwrap();
+    let anonymous = anonymous.to_str().unwrap();
+    let ours = world.target("g13-anonymous");
+    world
+        .cli_env(
+            &server,
+            &["clone", "acme/g13", ours.to_str().unwrap()],
+            &[("GIT_CONFIG_GLOBAL", anonymous)],
+        )
+        .ok();
+    let theirs = world.target("g13-anonymous-git");
+    let out = std::process::Command::new("git")
+        .args(["clone", "-q", url.as_str(), theirs.to_str().unwrap()])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", world.path("home"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", anonymous)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(reflogs(&ours), reflogs(&theirs));
+    assert!(reflogs(&ours)[0].starts_with(&format!("{b} clone: from {url} ")));
+    assert_eq!(
+        git(&ours, &["for-each-ref", "--format=%(refname)"]),
+        "refs/heads/main\nrefs/remotes/origin/HEAD\nrefs/remotes/origin/main"
+    );
+}

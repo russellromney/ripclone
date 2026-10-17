@@ -188,26 +188,30 @@ pub trait ControlStore: Send + Sync {
     /// order (a strictly increasing sequence, so same-second admits keep
     /// their order). Head and Files are claimable while pending, Full once
     /// Head is ready. The kind must have no
-    /// live lease, no retry time in the future and attempts left. A repo
-    /// that already holds a live lease of `pool`'s kind is skipped, so one
+    /// held lease, no retry time in the future and attempts left. A lease is
+    /// held until it expires, and a lease this store claimed is held until
+    /// it is released, even past expiry: a process that stalled longer than
+    /// a lease still runs those builds and must not start them again. A
+    /// repo that already holds a lease of `pool`'s kind is skipped, so one
     /// repo cannot fill a pool. A Full is claimable only when no older row
     /// of its repo has Full pending, so a repo's Fulls publish in admission
-    /// order. First gives up on outputs of `pool`'s kind whose lease
-    /// expired after the last allowed attempt: that output fails, and a
-    /// failed Head takes Full with it.
+    /// order. First gives up on outputs of `pool`'s kind whose last allowed
+    /// attempt is no longer held: that output fails, and a failed Head
+    /// takes Full with it. The returned claim's owner is `owner` prefixed
+    /// with this store's instance.
     async fn claim(&self, owner: &str, pool: Pool, lease: Duration) -> Result<Option<Claim>>;
-    /// Extend the claim's lease. False when the claim no longer owns it or
-    /// it already expired: an expired lease is lost even if nobody has
-    /// claimed the output since.
+    /// Extend the claim's lease. False when the claim no longer owns it: it
+    /// expired and another store claimed the output. An expired lease nobody
+    /// took renews.
     async fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool>;
     /// Write a ready output of the claim's kind. Nothing is written for a
-    /// claim whose lease was lost or expired, or for another kind's output.
+    /// claim whose lease was lost, or for another kind's output.
     async fn publish(&self, claim: &Claim, output: Output) -> Result<Published>;
     /// Record a failed build of the claim's kind. With `retry_after` and
     /// attempts left the output stays pending and is not claimable until
     /// the delay passes; otherwise it fails. A failed Head fails Files and
     /// Full too; a failed Files or Full fails alone. Like `publish`, a lost
-    /// or expired lease records nothing.
+    /// lease records nothing.
     async fn fail(&self, claim: &Claim, error: &str, retry_after: Option<Duration>) -> Result<()>;
     /// Give up the claim's lease. Other kinds' leases of the row stay.
     async fn release(&self, claim: &Claim) -> Result<()>;
