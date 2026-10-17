@@ -261,6 +261,55 @@ fn pack_entry(
     })
 }
 
+/// Objects fetched from object storage at once by [`get_all_cached`].
+const FETCH_THREADS: usize = 16;
+
+/// The bytes of each of `hashes`, from the local CAS or else from object
+/// storage, several at once. What storage returns is kept in the local CAS,
+/// so a builder that did not make these objects fetches each one once.
+fn get_all_cached(
+    cas: &Cas,
+    storage: &crate::storage::StorageRef,
+    hashes: &[&str],
+) -> Result<Vec<Vec<u8>>> {
+    // Caching is not storing: no upload hook.
+    let cache = cas.detached();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = FETCH_THREADS.min(hashes.len());
+    let fetched: Vec<Vec<(usize, Result<Vec<u8>>)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(hash) = hashes.get(i) else { break };
+                        let bytes = cache.get(hash).or_else(|_| {
+                            let bytes = storage.get(hash)?;
+                            cache.put_with_hash(hash, &bytes)?;
+                            anyhow::Ok(bytes)
+                        });
+                        out.push((i, bytes));
+                    }
+                    out
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("fetch worker panicked"))
+            .collect()
+    });
+    let mut all: Vec<Option<Vec<u8>>> = vec![None; hashes.len()];
+    for (i, bytes) in fetched.into_iter().flatten() {
+        all[i] = Some(bytes.with_context(|| format!("read {}", hashes[i]))?);
+    }
+    all.into_iter()
+        .zip(hashes)
+        .map(|(bytes, hash)| bytes.with_context(|| format!("{hash} was not fetched")))
+        .collect()
+}
+
 /// Build a Head's PackEntry list and the bundle of its packs' idx files.
 fn assemble_head_packs(
     cas: &Cas,
@@ -272,11 +321,12 @@ fn assemble_head_packs(
     }
     use std::io::Write;
 
+    let idx_hashes: Vec<&str> = packs.iter().map(|pack| pack.2.as_str()).collect();
+    let idxs = get_all_cached(cas, storage, &idx_hashes)?;
     let mut bundle = cas.writer().context("create idx bundle")?;
     let mut entries = Vec::with_capacity(packs.len());
     let mut len = 0u64;
-    for pack in packs {
-        let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
+    for (pack, idx_bytes) in packs.iter().zip(idxs) {
         bundle
             .write_all(&idx_bytes)
             .context("write idx bytes to bundle")?;
@@ -1198,6 +1248,41 @@ pub(super) async fn build_files_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn get_all_cached_fetches_in_order_and_keeps_what_storage_had() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = Cas::new(tmp.path().join("remote")).unwrap();
+        let storage: crate::storage::StorageRef =
+            Arc::new(crate::storage::LocalStorage::new(tmp.path().join("remote")).unwrap());
+        let stored = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = stored.clone();
+        let cas = Cas::new(tmp.path().join("local"))
+            .unwrap()
+            .with_on_store(Arc::new(move |hash: &str| {
+                seen.lock().unwrap().push(hash.to_string())
+            }));
+        let local_only = cas.detached().put(b"local").unwrap();
+        let objects: Vec<Vec<u8>> = (0..40).map(|i| format!("idx {i}").into_bytes()).collect();
+        let mut hashes: Vec<String> = objects.iter().map(|o| remote.put(o).unwrap()).collect();
+        hashes.insert(7, local_only.clone());
+
+        let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+        let got = get_all_cached(&cas, &storage, &refs).unwrap();
+        let mut want = objects.clone();
+        want.insert(7, b"local".to_vec());
+        assert_eq!(got, want);
+        assert!(
+            hashes.iter().all(|h| cas.has(h)),
+            "fetched objects are cached"
+        );
+        assert!(stored.lock().unwrap().is_empty(), "caching uploads nothing");
+
+        let missing = crate::cas::hash(b"nowhere");
+        let err = get_all_cached(&cas, &storage, &[&hashes[0], &missing]).unwrap_err();
+        assert!(format!("{err:#}").contains(&missing), "{err:#}");
+    }
 
     #[test]
     fn archive_chunk_refs_rejects_hash_length_mismatch() {
