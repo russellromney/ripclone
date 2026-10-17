@@ -200,7 +200,7 @@ origin, and runs `git fsck` and `rev-list --count` on the editable clones.
 | J4 | The mirror directory is deleted between restarts: a push of two commits on A fetches A again and builds on it. After the origin force-pushes unrelated history and prunes A and C, the mirror is deleted again and the next build is cold. | #217 |
 | J5 | A branch with no history in common with the built main builds cold, and its full clone lacks main's commit. | #217 |
 
-### K. Scheduling and the mirror (4)
+### K. Scheduling and the mirror (5)
 
 A repository runs at most one build of each kind at a time, and its Fulls
 build in admission order. One repository's slow upstream never holds
@@ -212,6 +212,7 @@ another's builds or the API, and the mirror stays compact.
 | K2 | `RIPCLONE_FETCH_TIMEOUT_SECS=1`. The origin holds the fetch until the build retries, then answers: the build completes and clones. With the origin held throughout, with 2 attempts, Head and Files each fail after both (4 fetches) with a `timed out after` error, and nothing publishes. | #218 |
 | K3 | The tip of a repo is admitted, then three older commits by SHA in one burst, out of history order, with four Full slots. Fulls publish in admission order (server log), and each commit's full clone equals the origin, with `rev-list --count` and `git fsck` checked. | #218 |
 | K4 | While the server is down, its mirror gains 20 packs and 70 loose refs from outside. The next commit's Files and Full run together, and the later of them to finish compacts it after publishing: the log reports a repack and packed refs, under 16 packs remain, and full clones of the built commit and of a later push are exact. | #218 |
+| K5 | `RIPCLONE_BUILD_LEASE_SECS=3`. The origin holds the first fetch while the server is stopped (SIGSTOP) for 4 s, then resumed. No lease is lost, Head starts once, the origin sees one fetch, nothing fails, and full and Files clones are exact. | #234 |
 
 ### L. Any tree git allows (4)
 
@@ -228,7 +229,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 85 tests. Several are table-driven.
+Total: 86 tests. Several are table-driven.
 
 ## What it replaced
 

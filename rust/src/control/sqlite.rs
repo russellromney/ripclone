@@ -46,6 +46,13 @@ pub struct SqliteControlStore {
     /// compares the two.
     path: PathBuf,
     file: FileId,
+    /// Prefix of every lease owner this store writes, unique to this open
+    /// (`{pid}-{nanos}:`, digits and hex only, so it is safe inline in SQL).
+    /// A lease with this prefix stays this store's until it is released,
+    /// even past its expiry: a process that stalled longer than a lease
+    /// still runs those builds, so it must not claim them again. Another
+    /// store, a later or concurrent process, may take an expired one.
+    instance: String,
     _ownership: ControlPathLock,
 }
 
@@ -113,14 +120,39 @@ impl SqliteControlStore {
             clock,
             path: path.to_path_buf(),
             file,
+            instance: instance_id(),
             _ownership: ownership,
         })
+    }
+
+    /// SQL true when `{alias}{k}`'s lease is held: it has not expired, or
+    /// this store holds it. `$1` is now.
+    fn lease_held(&self, alias: &str, k: &str) -> String {
+        let owner = format!("{alias}{k}_lease_owner");
+        let instance = &self.instance;
+        format!(
+            "({owner} IS NOT NULL AND ({alias}{k}_lease_until > $1
+               OR substr({owner}, 1, {len}) = '{instance}'))",
+            len = instance.len()
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+/// `{pid}-{nanos}:`, distinct for every store opened, in this process or
+/// another.
+fn instance_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static OPENED: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let opened = OPENED.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos:x}-{opened}:", std::process::id())
 }
 
 async fn initialize(connection: &mut SqliteConnection, path: &Path) -> Result<()> {
@@ -354,6 +386,7 @@ impl ControlStore for SqliteControlStore {
 
     async fn claim(&self, owner: &str, pool: Pool, lease: Duration) -> Result<Option<Claim>> {
         let now = self.clock.now();
+        let owner = format!("{}{owner}", self.instance);
         let k = column_prefix(pool.kind());
         // Head and Files build from the commit alone. Full is built from
         // Head, and waits for every older Full of its repo, so Fulls publish
@@ -368,27 +401,26 @@ impl ControlStore for SqliteControlStore {
                      AND older.seq < b.seq)"
             }
         };
-        // The oldest claimable row. A repo that already holds a live lease
-        // of this kind is skipped, so one repo cannot take every slot of a
+        let held = self.lease_held("", k);
+        let busy_held = self.lease_held("busy.", k);
+        // The oldest claimable row. A repo that already holds a lease of
+        // this kind is skipped, so one repo cannot take every slot of a
         // pool. `$1` is now, `$2` the attempt limit.
         let candidate = format!(
             "SELECT repo, commit_id FROM builds AS b
              WHERE {k}_state = 'pending' {needs}
-               AND ({k}_lease_until IS NULL OR {k}_lease_until <= $1)
+               AND NOT {held}
                AND {k}_retry_after <= $1
                AND {k}_attempts < $2
                AND NOT EXISTS (
                  SELECT 1 FROM builds AS busy
-                 WHERE busy.repo = b.repo AND busy.{k}_lease_until > $1)
+                 WHERE busy.repo = b.repo AND {busy_held})
              ORDER BY seq
              LIMIT 1"
         );
         // Outputs of this kind whose last allowed attempt ended without a
         // result.
-        let exhausted = format!(
-            "{k}_state = 'pending' AND {k}_attempts >= $2
-             AND ({k}_lease_until IS NULL OR {k}_lease_until <= $1)"
-        );
+        let exhausted = format!("{k}_state = 'pending' AND {k}_attempts >= $2 AND NOT {held}");
         // Idle polls stop here, on a read, without taking the write lock.
         let work: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS (SELECT 1 FROM builds WHERE {exhausted}) OR EXISTS ({candidate})"
@@ -439,7 +471,7 @@ impl ControlStore for SqliteControlStore {
         ))
         .bind(now)
         .bind(self.max_attempts)
-        .bind(owner)
+        .bind(&owner)
         .bind(now.saturating_add(duration_secs(lease)))
         .fetch_optional(&mut *tx)
         .await
@@ -450,7 +482,7 @@ impl ControlStore for SqliteControlStore {
         };
         Ok(Some(Claim {
             repo: RepoId::from_storage_key(&row.try_get::<String, _>("repo")?)?,
-            owner: owner.to_string(),
+            owner,
             pool,
             build: decode_build(&row)?,
         }))
@@ -460,14 +492,12 @@ impl ControlStore for SqliteControlStore {
         let k = column_prefix(claim.kind());
         let renewed = sqlx::query(&format!(
             "UPDATE builds SET {k}_lease_until = $1
-             WHERE repo = $2 AND commit_id = $3 AND {k}_lease_owner = $4
-               AND {k}_lease_until > $5"
+             WHERE repo = $2 AND commit_id = $3 AND {k}_lease_owner = $4"
         ))
         .bind(self.clock.now().saturating_add(duration_secs(lease)))
         .bind(claim.repo.storage_key())
         .bind(&claim.build.commit)
         .bind(&claim.owner)
-        .bind(self.clock.now())
         .execute(&self.pool)
         .await
         .context("renew build lease")?
@@ -512,25 +542,24 @@ impl ControlStore for SqliteControlStore {
         }
         let k = column_prefix(kind);
         let parent_column = if kind == ExactResultKind::Head {
-            ", parent = $6"
+            ", parent = $5"
         } else {
             ""
         };
-        // An expired lease publishes nothing, even before another worker
-        // claims the output.
+        // The owner fences a lost lease. An expired one nobody took publishes:
+        // the output is the same whoever builds it.
         let sql = format!(
             "UPDATE builds SET {k}_state = 'ready', {k}_output = $1,
                {k}_error = NULL{parent_column}
              WHERE repo = $2 AND commit_id = $3 AND {k}_lease_owner = $4
-               AND {k}_lease_until > $5 AND {k}_state = 'pending'
+               AND {k}_state = 'pending'
              RETURNING head_state, files_state, full_state"
         );
         let mut query = sqlx::query_as::<_, (String, String, String)>(&sql)
             .bind(data)
             .bind(claim.repo.storage_key())
             .bind(commit)
-            .bind(&claim.owner)
-            .bind(self.clock.now());
+            .bind(&claim.owner);
         if kind == ExactResultKind::Head {
             query = query.bind(parent);
         }
@@ -555,7 +584,7 @@ impl ControlStore for SqliteControlStore {
         let gives_up = format!("($4 IS NULL OR {k}_attempts >= $5)");
         // A Head that fails takes the pending Full with it.
         let cascade = if kind == ExactResultKind::Head {
-            head_failure_cascade(&gives_up, "$8")
+            head_failure_cascade(&gives_up, "$7")
         } else {
             String::new()
         };
@@ -565,7 +594,7 @@ impl ControlStore for SqliteControlStore {
                {k}_error = $1,
                {k}_retry_after = CASE WHEN {gives_up} THEN {k}_retry_after ELSE $4 END{cascade}
              WHERE repo = $2 AND commit_id = $3 AND {k}_lease_owner = $6
-               AND {k}_lease_until > $7 AND {k}_state = 'pending'"
+               AND {k}_state = 'pending'"
         );
         let mut query = sqlx::query(&sql)
             .bind(error)
@@ -573,8 +602,7 @@ impl ControlStore for SqliteControlStore {
             .bind(&claim.build.commit)
             .bind(retry_after.map(|delay| self.clock.now().saturating_add(duration_secs(delay))))
             .bind(self.max_attempts)
-            .bind(&claim.owner)
-            .bind(self.clock.now());
+            .bind(&claim.owner);
         if kind == ExactResultKind::Head {
             query = query.bind(format!("head failed: {error}"));
         }

@@ -314,3 +314,53 @@ fn k4_builds_compact_a_fragmented_mirror() {
         git(&target, &["fsck"]);
     }
 }
+
+/// K5: the server is stopped (SIGSTOP) for longer than its lease while it
+/// builds, then resumed, as a laptop that sleeps is. It carries on with its
+/// builds: none is cancelled or claimed again, the origin is fetched once,
+/// and the clones are exact.
+#[test]
+fn k5_a_server_paused_past_its_lease_builds_each_output_once() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let origin = world.origin("acme", "k5");
+    let tip = origin.commit(&[("a.txt", "a\n"), ("d/b.txt", "b\n")], "A");
+    origin.publish();
+    let server = world.server(&[("RIPCLONE_BUILD_LEASE_SECS", "3")]);
+    http.hold_fetches();
+    let (status, body) = api::add(&server, "acme/k5");
+    assert!((200..300).contains(&status), "{status} {body}");
+    http.wait_held(1);
+
+    server.pause(Duration::from_secs(4));
+    // Renewals due during the pause run now, and idle slots poll every
+    // second: give both time to act on the expired leases.
+    std::thread::sleep(Duration::from_millis(1500));
+    http.release_fetches();
+    let target = world.target("k5");
+    world
+        .cli(&server, &["clone", "acme/k5", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(listing(&target), origin.tree(&tip));
+    let files = world.target("k5-files");
+    world
+        .cli(
+            &server,
+            &[
+                "clone",
+                "acme/k5",
+                files.to_str().unwrap(),
+                "--mode",
+                "files",
+            ],
+        )
+        .ok();
+    assert_eq!(listing(&files), origin.tree(&tip));
+
+    let log = server.log();
+    assert!(!log.contains("lost"), "a lease was lost:\n{log}");
+    assert_eq!(log.matches("building Head for").count(), 1, "{log}");
+    assert_eq!(http.fetches(), 1, "the origin was fetched again");
+    assert_eq!(server.metric("ripclone_builds_failed_total"), 0);
+}
