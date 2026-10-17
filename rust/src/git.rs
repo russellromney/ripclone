@@ -1,7 +1,7 @@
 use crate::provider::{ProviderInstance, RepoId};
 use anyhow::{Context, Result, bail};
 use secrecy::ExposeSecret;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -673,16 +673,6 @@ pub fn object_sizes<P: AsRef<Path>>(repo: P, oids: &[String]) -> Result<HashMap<
     crate::gix_util::object_sizes(repo, oids)
 }
 
-/// Return the blob SHAs of all symlinks reachable from `commit`.
-pub fn symlink_blob_shas<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Vec<String>> {
-    let entries = list_tree_entries(repo, commit)?;
-    Ok(entries
-        .into_iter()
-        .filter(|(_, raw_mode, _, obj_type)| obj_type == "blob" && raw_mode.starts_with("120"))
-        .map(|(_, _, sha, _)| sha)
-        .collect())
-}
-
 /// List every tree entry reachable from `commit`.
 /// Returns tuples of `(path, raw_mode, sha, object_type)`.
 pub fn list_tree_entries<P: AsRef<Path>>(
@@ -694,26 +684,8 @@ pub fn list_tree_entries<P: AsRef<Path>>(
     crate::gix_util::list_tree_entries(repo, commit)
 }
 
-/// Classify many objects by type in one batch using temp files.
-pub fn classify_objects<P: AsRef<Path>>(
-    repo: P,
-    shas: &HashSet<String>,
-) -> Result<HashMap<String, String>> {
-    crate::gix_util::classify_objects(repo, shas)
-}
-
-/// Build a packfile + index containing the given object SHAs, writing them to
-/// files starting with `prefix`. Git emits `<prefix>-<packhash>.pack` and
-/// `<prefix>-<packhash>.idx`.
-pub fn pack_objects_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
-    repo: P,
-    object_shas: &[String],
-    prefix: Q,
-) -> Result<()> {
-    pack_objects_to_prefix_inner(repo, object_shas, prefix, &[])
-}
-
-/// Like `pack_objects_to_prefix` but stores every object whole — no new delta
+/// Pack the given objects into `<prefix>-<packhash>.pack` and `.idx`, every
+/// object stored whole — no new delta
 /// search (`--window=0`) and no reuse of deltas already present in the source
 /// repo (`--no-reuse-delta`). Required so the client can read objects with plain
 /// zlib and no delta resolution, at the cost of a larger pack.
@@ -1594,6 +1566,7 @@ pub fn parent_commit<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Option<Str
 mod tests {
     use super::*;
     use rayon::scope;
+    use std::collections::HashSet;
     use std::io::Read;
 
     /// Git's output is captured, not printed, and a failure still carries
@@ -1615,7 +1588,7 @@ mod tests {
         let missing = "1".repeat(40);
         let err = format!(
             "{:#}",
-            pack_objects_to_prefix(
+            pack_objects_undeltified_to_prefix(
                 dir.path(),
                 std::slice::from_ref(&missing),
                 dir.path().join("p/pack")
@@ -1881,7 +1854,7 @@ mod tests {
         std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
         let repo = crate::test_fixture::init_bare(&repo_dir);
         let tip = crate::test_fixture::commit(&repo, &[("README.md", b"one")]);
-        let packed = pack_objects_to_prefix(
+        let packed = pack_objects_undeltified_to_prefix(
             &repo_dir,
             std::slice::from_ref(&tip),
             base.path().join("p/pack"),
@@ -2431,12 +2404,7 @@ mod tests {
         assert_eq!(entry_map.get("run.sh").map(String::as_str), Some("100755"));
         assert_eq!(entry_map.get("link-a").map(String::as_str), Some("120000"));
 
-        // Type/size/classify.
-        let types = classify_objects(repo, &expect_full).unwrap();
-        for sha in &expect_full {
-            let want_type = git(repo, &["cat-file", "-t", sha]);
-            assert_eq!(types.get(sha).unwrap(), &want_type);
-        }
+        // Sizes.
         let sizes = object_sizes(repo, &expect_full.iter().cloned().collect::<Vec<_>>()).unwrap();
         for sha in &expect_full {
             let want_size = git(repo, &["cat-file", "-s", sha])
@@ -2570,9 +2538,6 @@ mod tests {
         assert_eq!(resolve_commit(repo, "main").unwrap(), commit);
 
         assert_eq!(parent_commit(repo, &commit).unwrap(), None);
-
-        let symlinks = symlink_blob_shas(repo, "HEAD").unwrap();
-        assert!(symlinks.is_empty());
 
         let oids = list_object_shas_with_depth(repo, &commit, None).unwrap();
         assert!(!oids.is_empty());

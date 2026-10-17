@@ -13,22 +13,16 @@ ripclone moves that work to the server, ahead of time. By the time you clone, th
 On every push, ripclone mirrors the repo and builds a **clonepack** for `HEAD` so the clone is fast. A clonepack has three parts:
 
 - **Manifest.** A small file listing everything else. The client grabs this first to know what to fetch.
-- **Metadata chunk.** The repo's shape: a skeleton pack, a ready-made `.git/index`, and a table that says where each file lives. The client uses it to build `.git/` without running any git commands.
-- **Content.** The objects and file bytes themselves, built three ways (HEAD pack, history packs, archive) so each clone takes only what it needs.
-
-### The skeleton
-
-The skeleton is a git packfile with the `HEAD` commit and every tree, but no file contents. That's enough for git to know the shape of the repo — every folder, file, mode, and blob hash. The client drops it into `.git/objects/pack/` next to the prebuilt index, so `git ls-tree`, `git log`, and `git status` work right away.
-
-It is exactly the [HEAD pack](#the-three-content-artifacts) **minus the blobs**, and it ships inside the metadata chunk — small, and downloaded first — so **every** clone has the repo's full shape before any file content arrives. The content artifacts then layer the file bytes on top. The trees end up in both the skeleton and the HEAD pack, but git dedupes objects by hash, so the overlap costs nothing. This shape-first split is what lets a clone be useful almost immediately and stream the bulk of the bytes behind it.
+- **Metadata chunk.** A ready-made `.git/index` and a table that says where each file lives. The client uses it to build `.git/` without running any git commands.
+- **Content.** The objects and file bytes themselves, built three ways (HEAD packs, history packs, archive) so each clone takes only what it needs.
 
 ### The three content artifacts
 
 ripclone builds the content three ways so each clone takes only what it needs:
 
-***HEAD pack.*** One undeltified git packfile with `HEAD`'s commit, trees, and every blob — the skeleton's shape plus the actual file bytes, a complete `--depth=1` repo. The client drops it into `.git/objects` and reads the working tree straight out of it: one download, no archive, no extra work. Because the objects live in `.git`, the git content commands work. An **editable** `--depth 1` clone installs just this.
+***HEAD packs.*** Undeltified git packfiles with `HEAD`'s commit, trees, and every blob: a complete `--depth=1` repo. They are a base, shared by later commits, plus small packs of what changed since it, about 4 MiB each. The client drops them into `.git/objects` and reads the working tree straight out of them as they land: no archive, no extra work. Because the objects live in `.git`, the git content commands work. An **editable** `--depth 1` clone installs just these.
 
-***History packs.*** The rest of the commits, trees, and blobs, delta-compressed and split into immutable levels plus a small tail. A deeper or full editable clone (`--depth N` / `--depth 0`) adds these on top of the HEAD pack; git reads them for older history and the client never hand-parses them.
+***History packs.*** Every commit, tree, and blob, delta-compressed into at most 16 immutable levels, each one pack. A push adds a small level and merges the smallest neighbors, so earlier levels are reused. A full editable clone installs only these, each with its stored idx; it reads the HEAD packs only to write the working tree.
 
 ***Archive.*** The same `HEAD` file bytes, zstd-compressed and split into chunks. Each chunk is made of independent frames, so the client can download many at once and start writing files as the first bytes land. It's the fastest path to a working tree, but the files don't go into `.git`, so git content commands don't work. This is what **files** mode uses.
 

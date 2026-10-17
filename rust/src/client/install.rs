@@ -14,7 +14,6 @@ use super::{
 };
 use crate::ExactResultKind;
 use crate::bench::{Benchmark, BenchmarkReport};
-use crate::cas::hash as cas_hash;
 use crate::clonepack::{ClonepackManifest, MetadataChunk, PackEntry, manifest_pack_idx_bytes};
 use crate::extract::extract_archive_from_chunk_receiver;
 use crate::provider::RepoId;
@@ -564,7 +563,7 @@ impl Client {
         Ok(manifest)
     }
 
-    /// The metadata chunk of `urls`' output: skeleton pack, index, file table.
+    /// The metadata chunk of `urls`' output: index, frame and file tables.
     async fn fetch_metadata(&self, urls: &OutputUrls) -> Result<MetadataChunk> {
         let hash = &urls.output().metadata_chunk;
         let artifact = Artifact {
@@ -1082,7 +1081,7 @@ fn stage(target: &Path, staging: &Staging) -> Result<PathBuf> {
 }
 
 /// Lay down `.git` from the metadata chunk: HEAD and the checked-out branch,
-/// the skeleton pack, and the prebuilt index. No git command runs.
+/// and the prebuilt index. The packs bring the objects. No git command runs.
 fn write_git_dir(
     git_dir: &Path,
     output: &RefResponse,
@@ -1116,20 +1115,7 @@ fn write_git_dir(
 
     let pack_dir = git_dir.join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)?;
-    let skeleton = cas_hash(&metadata.skeleton_pack);
-    std::fs::write(
-        pack_dir.join(format!("pack-{skeleton}.pack")),
-        &metadata.skeleton_pack,
-    )?;
-    std::fs::write(
-        pack_dir.join(format!("pack-{skeleton}.idx")),
-        &metadata.skeleton_idx,
-    )?;
     std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
-    info!(
-        "wrote skeleton pack + idx + prebuilt index ({} bytes)",
-        metadata.skeleton_pack.len() + metadata.skeleton_idx.len() + metadata.prebuilt_index.len()
-    );
     Ok(())
 }
 
@@ -1142,14 +1128,9 @@ fn write_origin_config(git_dir: &Path, origin_url: &str) -> Result<()> {
 }
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
-    // The metadata chunk is the protobuf encoding of skeleton pack/idx, index,
-    // frame table, and file table. The actual encoded size is dominated by the
-    // three byte blobs; add a small estimate for the repeated message overhead.
-    (metadata.skeleton_pack.len()
-        + metadata.skeleton_idx.len()
-        + metadata.prebuilt_index.len()
-        + metadata.frames.len() * 24
-        + metadata.files.len() * 64) as u64
+    // The metadata chunk is the protobuf encoding of the index, frame table,
+    // and file table: the index bytes plus an estimate per table entry.
+    (metadata.prebuilt_index.len() + metadata.frames.len() * 24 + metadata.files.len() * 64) as u64
 }
 
 /// Log the clone's phase timings and perf counters.

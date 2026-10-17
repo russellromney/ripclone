@@ -257,54 +257,12 @@ pub fn object_sizes<P: AsRef<Path>>(repo_path: P, oids: &[String]) -> Result<Has
     Ok(pairs.into_iter().collect())
 }
 
-/// Classify many objects by type.
-pub fn classify_objects<P: AsRef<Path>>(
-    repo_path: P,
-    shas: &HashSet<String>,
-) -> Result<HashMap<String, String>> {
-    let shas: Vec<String> = shas.iter().cloned().collect();
-    if shas.is_empty() {
-        return Ok(HashMap::new());
-    }
-    if shas.len() < PARALLEL_LOOKUP_THRESHOLD {
-        let repo = open_repo(repo_path)?;
-        let mut map = HashMap::with_capacity(shas.len());
-        for sha in &shas {
-            let id = parse_oid(sha)?;
-            let header = repo
-                .find_header(id)
-                .with_context(|| format!("find header {}", sha))?;
-            map.insert(sha.clone(), kind_to_str(header.kind()).to_string());
-        }
-        return Ok(map);
-    }
-
-    let num_workers = worker_threads("lookup", default_worker_threads());
-    let pairs = parallel_map_repo(repo_path, shas, num_workers, |repo, sha| {
-        let id = parse_oid(sha)?;
-        let header = repo
-            .find_header(id)
-            .with_context(|| format!("find header {}", sha))?;
-        Ok((sha.clone(), kind_to_str(header.kind()).to_string()))
-    })?;
-    Ok(pairs.into_iter().collect())
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn parse_oid(s: &str) -> Result<gix::hash::ObjectId> {
     gix::hash::ObjectId::from_hex(s.as_bytes()).with_context(|| format!("invalid object id: {}", s))
-}
-
-fn kind_to_str(kind: gix::objs::Kind) -> &'static str {
-    match kind {
-        gix::objs::Kind::Commit => "commit",
-        gix::objs::Kind::Tree => "tree",
-        gix::objs::Kind::Blob => "blob",
-        gix::objs::Kind::Tag => "tag",
-    }
 }
 
 fn mode_to_object_type(mode: &EntryMode) -> String {

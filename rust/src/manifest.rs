@@ -9,8 +9,6 @@ impl MetadataChunk {
     /// Create an empty metadata chunk.
     pub fn new() -> Self {
         Self {
-            skeleton_pack: Vec::new(),
-            skeleton_idx: Vec::new(),
             prebuilt_index: Vec::new(),
             frames: Vec::new(),
             files: Vec::new(),

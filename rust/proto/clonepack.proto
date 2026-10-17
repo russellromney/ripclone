@@ -21,8 +21,8 @@ message ClonepackManifest {
   optional string parent_commit = 2;
   reserved 3;
 
-  // Metadata chunk holds the small .git artifacts (skeleton pack + idx,
-  // prebuilt index) and the file/frame tables needed to decode archive chunks.
+  // Metadata chunk holds the prebuilt .git/index and the file/frame tables
+  // needed to decode archive chunks.
   ChunkRef metadata_chunk = 4;
 
   // Archive chunks contain working-tree zstd frames. They are shared across
@@ -83,9 +83,9 @@ message PackEntry {
 // Per-commit metadata chunk. This is the only chunk that changes on every
 // commit; archive chunks are shared and immutable.
 message MetadataChunk {
-  // Git objects needed to make HEAD usable (commit, tree, and symlink blobs).
-  bytes skeleton_pack = 1;
-  bytes skeleton_idx = 2;
+  // Fields 1 and 2 held a skeleton pack and idx (commit, trees, symlink
+  // blobs). The packs already hold those objects.
+  reserved 1, 2;
 
   // Prebuilt .git/index with skip-worktree set on every tracked path.
   bytes prebuilt_index = 3;
