@@ -609,7 +609,7 @@ pub(super) async fn build_head_result(
             let (cas, storage) = (&fc, &fs);
             let mut shallow_meta = metadata_base;
             shallow_meta.prebuilt_index = shallow_prebuilt_index;
-            let shallow_meta_data = shallow_meta.encode_to_vec();
+            let shallow_meta_data = shallow_meta.encode_stored()?;
             let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
 
             // Head has no archive frames. Files publishes its own archive result.
@@ -1148,7 +1148,7 @@ pub(super) async fn build_files_result(
     let (fc, fcommit, fparent) = (cas.clone(), commit.to_string(), head.parent_commit.clone());
     let fchunks = archive_chunk_hashes.clone();
     let (metadata_hash, manifest_hash) = cancel::spawn_blocking(move || -> Result<_> {
-        let metadata_bytes = metadata.encode_to_vec();
+        let metadata_bytes = metadata.encode_stored()?;
         let metadata_hash = fc.put(&metadata_bytes)?;
         let archive_chunks = archive_chunk_refs(&fchunks, &metadata)?;
         let manifest = make_manifest(

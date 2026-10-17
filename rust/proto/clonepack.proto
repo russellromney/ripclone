@@ -6,8 +6,7 @@ package ripclone;
 message ChunkRef {
   // Raw hash bytes. SHA-256 (32 bytes) by default.
   bytes hash = 1;
-  // Byte length of the chunk as stored. For archive chunks this is the
-  // compressed size; for the metadata chunk it is the protobuf size.
+  // Byte length of the chunk as stored, compressed.
   uint64 len = 2;
 }
 
@@ -81,7 +80,7 @@ message PackEntry {
 }
 
 // Per-commit metadata chunk. This is the only chunk that changes on every
-// commit; archive chunks are shared and immutable.
+// commit; archive chunks are shared and immutable. Stored zstd-compressed.
 message MetadataChunk {
   // Fields 1 and 2 held a skeleton pack and idx (commit, trees, symlink
   // blobs). The packs already hold those objects.

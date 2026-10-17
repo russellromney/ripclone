@@ -13,7 +13,7 @@ ripclone moves that work to the server, ahead of time. By the time you clone, th
 On every push, ripclone mirrors the repo and builds a **clonepack** for `HEAD` so the clone is fast. A clonepack has three parts:
 
 - **Manifest.** A small file listing everything else. The client grabs this first to know what to fetch.
-- **Metadata chunk.** A ready-made `.git/index` and a table that says where each file lives. The client uses it to build `.git/` without running any git commands.
+- **Metadata chunk.** A ready-made `.git/index` and a table that says where each file lives, zstd-compressed. The client uses it to build `.git/` without running any git commands.
 - **Content.** The objects and file bytes themselves, built three ways (HEAD packs, history packs, archive) so each clone takes only what it needs.
 
 ### The three content artifacts
