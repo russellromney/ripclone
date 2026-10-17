@@ -1442,10 +1442,10 @@ fn sync_bare_mirror_admitted_from(
     }
 
     let _mirror_lock = MirrorLock::acquire(mirror_dir)?;
-    // A commit already in the mirror (an earlier attempt, or the Files and
-    // Full phases after Head) needs no upstream round trip. Auto-gc is off, so it
+    // A commit already fetched (an earlier attempt, or the Files and Full
+    // phases after Head) needs no upstream round trip. Auto-gc is off, so it
     // stays.
-    if mirror_has_commit(mirror_dir, commit) {
+    if mirror_fetched_commit(mirror_dir, commit) {
         return Ok(());
     }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential, origin_base);
@@ -1453,17 +1453,27 @@ fn sync_bare_mirror_admitted_from(
     sync_bare_mirror_rev(mirror_dir, &url, &git_args, auth_header, commit, timeout)
 }
 
-/// True when the mirror already holds `commit`.
-pub fn mirror_has_commit(mirror_dir: &Path, commit: &str) -> bool {
+/// True when a fetch of `commit` into the mirror completed. git writes the
+/// fetch's ref only after the pack is in place and the commit's history
+/// passed its connectivity check, so the ref proves the mirror holds all of
+/// it. The commit object alone does not: a fetch still running, or one that
+/// failed after writing its pack, can leave the commit without objects it
+/// reaches.
+pub fn mirror_fetched_commit(mirror_dir: &Path, commit: &str) -> bool {
+    let fetched = format!(
+        "refs/ripclone/revs/{}^{{commit}}",
+        rev_internal_ref_name(commit)
+    );
     mirror_dir.exists()
         && command()
             .arg("-C")
             .arg(mirror_dir.as_os_str())
-            .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
-            .stdout(Stdio::null())
+            .args(["rev-parse", "--verify", "-q", &fetched])
             .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+            .output()
+            .is_ok_and(|out| {
+                out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == commit
+            })
 }
 
 /// The file naming the pack that the first fetch into an empty mirror wrote,

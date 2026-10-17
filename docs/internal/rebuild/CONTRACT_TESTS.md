@@ -70,7 +70,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | #188 |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | #188 |
 
-### C. Outputs are independent and immutable (9)
+### C. Outputs are independent and immutable (10)
 
 | # | Test | Added |
 |---|---|---|
@@ -83,6 +83,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | C8 | S3 only: the bucket holds one of Head's writes and refuses the next. Head fails with the storage error and publishes nothing; a depth-1 clone fails and leaves no target. With the fault gone, `sync --at` builds every output and each shape clones exactly. | #220 (S3 job) |
 | C9 | Every output of A is ready; the origin holds B's fetch, so nothing of B is. A files clone and a depth-1 clone of B each report B pending, download nothing, and install nothing: neither falls back to A. After release both install B. | #221 |
 | C10 | The mirror holds B's objects but no refs, as a fetch stopped between storing its pack and writing refs leaves it. After a restart, B builds with no failures, and its full and Files clones are exact. | #234 |
+| C11 | The mirror holds B's commit but not its tree, as a fetch that failed after writing part of B leaves it. B is fetched again, builds with no failures, and its full and Files clones are exact. | #234 |
 
 A SIGKILLed server's `git` children run until their command ends, on every
 OS. #209 killed them on Linux with a parent-death signal (row C6), but
@@ -227,7 +228,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 84 tests. Several are table-driven.
+Total: 85 tests. Several are table-driven.
 
 ## What it replaced
 

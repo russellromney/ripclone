@@ -455,11 +455,11 @@ async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {
 /// commit start together: the one that waited for the write lock finds the
 /// commit fetched and does not fetch again. The caller holds `lock.read`.
 ///
-/// Without the write lock, a fetch may still be running. That is safe because
-/// each fetch lands as one pack (`fetch.unpackLimit=1`), which git makes
-/// visible only when its idx is in place, so a visible commit has every object
-/// it needs. That fetch writes its refs and the fetched-pack marker last, so a
-/// build must read neither to decide what to build.
+/// Without the write lock, a fetch may still be running, so the check is the
+/// fetch's ref, which git writes only once the commit's history is in place
+/// and connected. The commit object alone is not enough: it may be in a pack
+/// whose fetch has not finished or failed. Such a commit is fetched again
+/// under the write lock; git skips the transfer when the history is there.
 async fn ensure_commit(
     state: &ServerState,
     repo_id: &RepoId,
@@ -470,7 +470,7 @@ async fn ensure_commit(
     let has_commit = || {
         let (dir, wanted) = (mirror_dir.to_path_buf(), commit.to_string());
         async move {
-            cancel::spawn_blocking(move || git::mirror_has_commit(&dir, &wanted))
+            cancel::spawn_blocking(move || git::mirror_fetched_commit(&dir, &wanted))
                 .await
                 .context("mirror check task")
         }
