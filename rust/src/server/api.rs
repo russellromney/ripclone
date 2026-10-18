@@ -726,17 +726,21 @@ async fn ready_body(
 
 /// Whether `base` is in `commit`'s history in the mirror: then a Full of
 /// `commit` holds all of the base's. A mirror that cannot answer says no,
-/// and the clone downloads the base's history too.
+/// and the clone downloads the base's history too. Asked once per pair.
 async fn in_history(state: &ServerState, repo_id: &RepoId, base: &str, commit: &str) -> bool {
-    let dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let (base, commit) = (base.to_string(), commit.to_string());
-    let answer =
-        crate::cancel::spawn_blocking(move || crate::git::is_ancestor(&dir, &base, &commit)).await;
-    match answer
-        .map_err(anyhow::Error::from)
-        .and_then(|answer| answer)
-    {
-        Ok(answer) => answer,
+    let cell = (state.ancestry).cell(format!("{} {base} {commit}", repo_id.storage_key()));
+    let answer = cell
+        .get_or_try_init(|| async {
+            let dir = state.repo_root.join(repo_id.mirror_dir_name());
+            let (base, commit) = (base.to_string(), commit.to_string());
+            crate::cancel::spawn_blocking(move || crate::git::is_ancestor(&dir, &base, &commit))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|answer| answer)
+        })
+        .await;
+    match answer {
+        Ok(answer) => *answer,
         Err(error) => {
             tracing::debug!("ancestry in {}: {error:#}", repo_id.storage_key());
             false

@@ -581,14 +581,18 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   only when its commit is on no ref, which the objects show.
 - **A commit in no ref's history downloads the shared history once.** Its
   own history packs that Full(D)'s manifest lists too are skipped: both
-  Fulls built on an older Full share its levels by hash (G27). What they
+  Fulls built on an older Full share its levels by hash (G27). Its own
+  manifest, already read for the working tree, is not fetched again. What they
   share in levels built apart, a cold Full or a compaction, still comes
   twice; a pack of only the commit's own objects would need a server
   build per request.
 - **A commit with D in its history gets no `refs_base`** (the mirror's
-  `merge-base --is-ancestor`, a few ms): its own history holds D's, as
-  for a push built before the refresh published it, by branch or by
-  commit (G16). A mirror that cannot answer gets `refs_base`.
+  `merge-base --is-ancestor`, about 18 ms on tokio): its own history
+  holds D's, as for a push built before the refresh published it, by
+  branch or by commit (G16). A mirror that cannot answer gets
+  `refs_base`. The server keeps each answer, since ancestry never
+  changes, so a pinned commit's reads and a top-up's polls ask git once
+  (G16 counts the runs); concurrent reads of one pair wait for one run.
 - **The last refs with a ready base serve while Full(D) builds.** A
   refresh that replaces branches whose base has a ready Full keeps them as
   `ready`, with the tags artifact built from the same listing, not the

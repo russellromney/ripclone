@@ -478,15 +478,20 @@ impl Client {
         let mut side_download = side_download;
         let ident = match refs_base {
             None => {
-                self.materialize_git(&urls, &pin.checkout, &root, true, cleanup, bench)
+                (self.materialize_git(&urls, &pin.checkout, &root, true, cleanup, bench))
                     .await?
+                    .0
             }
             Some(base) => {
                 let base_urls = OutputUrls::new(repo_path, base.clone());
                 let none = HashSet::new();
-                let (ident, (packs, base_packs)) = tokio::try_join!(
+                let ((ident, manifest), (packs, base_packs)) = tokio::try_join!(
                     self.materialize_git(&urls, &pin.checkout, &root, false, cleanup, bench),
-                    self.fetch_history_packs(&base_urls, &root, &none, cleanup),
+                    async {
+                        let manifest = self.fetch_manifest(&base_urls).await?;
+                        let urls = &base_urls;
+                        (self.fetch_history_packs(urls, &manifest, &root, &none, cleanup)).await
+                    },
                 )?;
                 let side = match side_download.take() {
                     Some(download) => {
@@ -509,7 +514,8 @@ impl Client {
                 // its Full shares with the base's (levels both built on).
                 if !held {
                     let (packs, _) =
-                        (self.fetch_history_packs(&urls, &root, &base_packs, cleanup)).await?;
+                        (self.fetch_history_packs(&urls, &manifest, &root, &base_packs, cleanup))
+                            .await?;
                     let git_dir = root.join(".git");
                     tokio::task::spawn_blocking(move || {
                         install_packs(&git_dir, packs, "history pack")
@@ -725,7 +731,7 @@ impl Client {
 
     /// Head or Full: `git init`, `.git` from the metadata chunk, then the
     /// packs, whose blobs are written into the working tree as each pack
-    /// lands. Returns the staging root and the committer for the reflog.
+    /// lands. Returns the committer for the reflog and the manifest.
     async fn materialize_git(
         &self,
         urls: &OutputUrls,
@@ -734,7 +740,7 @@ impl Client {
         history: bool,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
-    ) -> Result<Option<String>> {
+    ) -> Result<(Option<String>, ClonepackManifest)> {
         let (manifest, metadata, ident) = tokio::try_join!(
             async {
                 tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
@@ -768,21 +774,22 @@ impl Client {
             manifest.packs.len()
         );
         bench.mark_archive_download(bytes);
-        Ok(ident)
+        Ok((ident, manifest))
     }
 
-    /// Download the history packs of `urls`' Full, each with its own idx,
-    /// into files in `dir` for [`install_pack`].
+    /// Download the history packs `manifest`, of `urls`' Full, lists but
+    /// `held` does, each with its own idx, into files in `dir` for
+    /// [`install_pack`]. Returns them and every listed history pack hash.
     async fn fetch_history_packs(
         &self,
         urls: &OutputUrls,
+        manifest: &ClonepackManifest,
         dir: &Path,
         held: &HashSet<Vec<u8>>,
         cleanup: &Cleanup,
     ) -> Result<(Vec<PackFiles>, HashSet<Vec<u8>>)> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
-        let manifest = self.fetch_manifest(urls).await?;
         let history: Vec<(usize, PackEntry)> = (manifest.packs.iter().cloned().enumerate())
             .filter(|(_, entry)| entry.history_only)
             .collect();

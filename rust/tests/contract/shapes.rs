@@ -1887,7 +1887,22 @@ impl RefsRepo {
 /// downloads its own history only.
 #[test]
 fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
-    let t = RefsRepo::start("g16");
+    let mut wrapper = None;
+    let t = RefsRepo::start_with(
+        "g16",
+        |world| {
+            let w = GitWrapper::new(
+                world,
+                "server",
+                r#"case " $* " in *" merge-base --is-ancestor "*) note ancestry ;; esac"#,
+            );
+            let path = w.path.clone();
+            wrapper = Some(w);
+            vec![("PATH".into(), path)]
+        },
+        true,
+    );
+    let wrapper = wrapper.unwrap();
     let (work, bare) = (&t.origin.work, t.origin.bare.to_str().unwrap());
     // A commit on a branch that is then deleted: built, but on no ref.
     git(work, &["checkout", "-q", "-b", "gone", &t.a]);
@@ -1992,6 +2007,19 @@ fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
     let fetches = t.http.fetches();
     let (by_sha, out) = t.clone_via(&proxy, "by-sha", &["--at", &e], &[]);
     out.ok();
+    // The server asked git whether D is in E's history once: later reads
+    // of E take the kept answer.
+    let asked = wrapper.notes("ancestry");
+    assert!(asked > 0, "the server never asked git");
+    for _ in 0..3 {
+        let (_, body) = api::parse(t.server.get(&api::commit_path(&t.repo, &e, Some("full"))));
+        assert!(body.get("refs_base").is_none(), "{body}");
+    }
+    assert_eq!(
+        wrapper.notes("ancestry"),
+        asked,
+        "a read of E asked git again"
+    );
     assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
     assert_eq!(git(&by_sha, &["rev-parse", "HEAD"]), e);
     assert_eq!(
@@ -2237,13 +2265,20 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
         fetches,
         "the clone fetched from the upstream"
     );
+    // Each shared pack, and X's and C's manifests, come down once.
+    let manifests = [&x, &c].map(|commit| {
+        full(commit)["clonepack_manifest"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    });
     let gets = proxy.artifact_gets();
-    for pack in &shared {
+    for artifact in shared.iter().chain(&manifests) {
         let count = gets
             .iter()
-            .filter(|get| get.path.ends_with(pack.as_str()))
+            .filter(|get| get.path.ends_with(artifact.as_str()))
             .count();
-        assert_eq!(count, 1, "pack {pack} downloaded {count} times");
+        assert_eq!(count, 1, "{artifact} downloaded {count} times");
     }
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), x);
     assert_eq!(listing(&target), origin.tree(&x));
