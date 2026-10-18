@@ -580,8 +580,9 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   Full(D)'s history packs and the side pack in place of its own history,
   and adds its own history only when its commit is on no ref, which the
   objects show. While Full(D) is not ready it takes the upstream fetch.
-  A clone at a commit newer than D (a refresh still running) downloads
-  both histories.
+  A commit admitted from D's branch after D (a refresh not yet
+  published) gets no `refs_base`: its own history holds D's. After a
+  force-push such a commit does not hold D and takes the upstream fetch.
 
 G14 runs its full clones, `--at v1` included, with an origin base that
 does not exist, so a clone that fell back to the upstream fails it. G16
