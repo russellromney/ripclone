@@ -6,6 +6,8 @@
 # Env:
 #   RIPCLONE_VERSION  pin a tag (e.g. v0.1.0); default: latest
 #   RIPCLONE_BIN_DIR  install dir; default: $HOME/.local/bin
+#   RIPCLONE_DOWNLOAD_URL  where the release assets are, in place of the
+#                     GitHub release (a mirror, or file:// for a local build)
 set -eu
 
 REPO="russellromney/ripclone"
@@ -32,7 +34,9 @@ if ! git --version >/dev/null 2>&1; then
   echo "ripclone: Files-only client clones can run without Git." >&2
 fi
 
-if [ "$VERSION" = "latest" ]; then
+if [ -n "${RIPCLONE_DOWNLOAD_URL:-}" ]; then
+  base="$RIPCLONE_DOWNLOAD_URL"
+elif [ "$VERSION" = "latest" ]; then
   base="https://github.com/$REPO/releases/latest/download"
 else
   base="https://github.com/$REPO/releases/download/$VERSION"
