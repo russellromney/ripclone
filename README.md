@@ -40,6 +40,7 @@ downloading a file from object storage.
 | Command | Same as | You get | Use it when |
 |---|---|---|---|
 | `ripclone clone owner/repo` | `git clone` | A full editable git repo with complete history, every branch and every tag | Coding: you or an agent will switch branches, read history, push. |
+| `ripclone clone owner/repo --single-branch` | `git clone --single-branch` | A full editable git repo with one branch's complete history and the tags in it | You need history but not the other branches. |
 | `ripclone clone owner/repo --depth 1` | `git clone --depth 1` | An editable git repo with only `HEAD` and the tags it reaches | CI and agents that run git but don't walk history. |
 | `ripclone clone owner/repo --mode files` | `git archive` of the tip | The working tree only, no `.git` | Builds that never run git. Fastest. |
 

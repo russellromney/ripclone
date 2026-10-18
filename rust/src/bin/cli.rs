@@ -103,6 +103,10 @@ enum Commands {
         /// Clone this full commit SHA, branch or tag instead of the branch tip.
         #[arg(long)]
         at: Option<String>,
+        /// Clone only the branch or tag to check out and the tags in its
+        /// history, as `git clone --single-branch`. `--depth 1` implies it.
+        #[arg(long)]
+        single_branch: bool,
         /// Wait for the server's exact build of the commit. Without it, a
         /// full clone whose build is still pending installs the newest ready
         /// build and fetches the rest from the upstream with your git, and a
@@ -794,6 +798,7 @@ async fn run() -> Result<()> {
             progress,
             verify_upstream,
             wait,
+            single_branch,
         } => {
             if let Some(at) = at.as_deref() {
                 Selector::parse(at).map_err(|e| usage(format!("--at {at}: {e:#}")))?;
@@ -848,6 +853,7 @@ async fn run() -> Result<()> {
                 at: at.as_deref(),
                 kind,
                 wait,
+                single_branch,
             };
             // Like `git clone`, the target may be an existing empty directory.
             // A failed clone must leave it there.

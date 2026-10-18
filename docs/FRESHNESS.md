@@ -27,7 +27,7 @@ and installs that commit, even if the branch moves during the clone.
 | `--depth 1` | Head | waits for it |
 | `--mode files` | Files | writes the same commit's tree from its Head, or waits if Head is pending too |
 | `--mode files` with `--wait` | Files | waits for it |
-| full (default) | Full | tops up from an earlier Full, or waits if there is none |
+| full (default), or `--single-branch` | Full | tops up from an earlier Full, or waits if there is none |
 | full with `--wait` | Full | waits for it |
 
 A depth-1 clone always waits: Head is the first result built for a commit,
@@ -66,8 +66,11 @@ Depth-1 and files clones never top up.
 
 A full clone gets what `git clone` gets: every upstream branch as
 `refs/remotes/origin/<branch>` and every tag, with all the history they
-reach. A depth-1 clone gets what `git clone --depth 1` gets: its own branch
-and the tags whose target it holds.
+reach. A `--single-branch` clone gets what `git clone --single-branch` gets:
+its own branch or tag, with the history it reaches and the tags in that
+history, and a fetch refspec for that branch or tag alone. It downloads no
+other branch. A depth-1 clone gets what `git clone --depth 1` gets: its own
+branch and the tags whose target it holds.
 
 The server keeps the repository's refs and publishes them:
 
