@@ -41,6 +41,7 @@ jobs:
               - 'tests/docker/**'
               - 'scripts/s3_emulator.sh'
               - 'scripts/gitea_live.sh'
+              - 'scripts/trial_*.sh'
               - '.github/workflows/ci.yml'
             bench:
               - 'rust/**'
@@ -189,13 +190,16 @@ jobs:
           grep -Eq "test result: ok\. $want passed; 0 failed" "$RUNNER_TEMP/s3.log"
 
   # Contract row: a private repo on a live Gitea, read with the server's token.
-  # Prebuilt contract binary from ci-build — no cargo on this runner.
+  # Then the user trial on Gitea, which pushes this checkout's history.
+  # Prebuilt binaries from ci-build — no cargo on this runner.
   gitea:
     needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Download ci artifacts
         uses: actions/download-artifact@v8
         with:
@@ -209,6 +213,10 @@ jobs:
           set -euo pipefail
           chmod +x bin/*
           bash scripts/gitea_live.sh
+      - name: Gitea user trial
+        env:
+          RIPCLONE_BIN_DIR: ${{ github.workspace }}/bin
+        run: bash scripts/trial_gitea.sh
 
   # Benchmark-harness smoke — prebuilt bins from ci-build.
   benchmark:

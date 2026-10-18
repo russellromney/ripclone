@@ -248,11 +248,34 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
   after compile. The one S3 unit test (multipart upload) runs here against
   `scripts/s3_emulator.sh`, reusing the unit-test binary.
 - `s3`: C2, C3, C7, C8, F7, H2, H6 and H10 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
-- `gitea`: the live Gitea provider row.
+- `gitea`: the live Gitea provider row, then `scripts/trial_gitea.sh`.
 - `lint`, `musl`, `docker`, `cargo-deny`.
 - `e2e`: `scripts/e2e_local.sh` against prebuilt binaries.
 - `benchmark`: a smoke run of `benchmark/shaped_benchmark.sh` when benchmark
   files change.
+
+## User trials
+
+Two scripts run the release binaries the way a user would, against private
+repos, and exit non-zero on any failed check. Both start their own servers on
+OS-picked ports, keep the machine's git config and keychain out, never print a
+token, and delete their work directory (`KEEP_TRIAL=1` keeps it).
+`RIPCLONE_BIN_DIR` names the binaries, default `rust/target/release`.
+
+- `scripts/trial_gitea.sh`: a digest-pinned Gitea in Docker, with this
+  checkout's history pushed as a private repo. Covers `provider add` and
+  `provider test`, add by URL, a full clone into the default directory, depth
+  1, files and `--branch`, push from a clone and pull in another, and a clone
+  right after a push. Refusals: a missing repo, a repo the server's token cannot
+  read, a non-empty target, a wrong server token, a server without an upstream
+  token. Runs in the `gitea` CI job.
+- `scripts/trial_github.sh owner/repo...`: read-only, against private GitHub
+  repos. The server reads with `RIPCLONE_GITHUB_TOKEN`; the user's git uses
+  their gh login, or `RIPCLONE_TRIAL_GIT_TOKEN`. Full, depth-1 and files clones
+  are compared with `git clone` (history, tree, local config, reflog), then
+  pulled and fetched. Refusals: a missing repo and a server without a token.
+  Manual: it needs a token and private repos. For this repo's owner: `soup run
+  -p ripclone -e development -- scripts/trial_github.sh <private repos>`.
 
 ## Current state
 
