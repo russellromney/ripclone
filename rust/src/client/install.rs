@@ -19,6 +19,7 @@ use crate::extract::extract_archive_from_chunk_receiver;
 use crate::provider::RepoId;
 use anyhow::{Context, Result};
 use prost::Message;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -482,9 +483,10 @@ impl Client {
             }
             Some(base) => {
                 let base_urls = OutputUrls::new(repo_path, base.clone());
-                let (ident, packs) = tokio::try_join!(
+                let none = HashSet::new();
+                let (ident, (packs, base_packs)) = tokio::try_join!(
                     self.materialize_git(&urls, &pin.checkout, &root, false, cleanup, bench),
-                    self.fetch_history_packs(&base_urls, &root, cleanup),
+                    self.fetch_history_packs(&base_urls, &root, &none, cleanup),
                 )?;
                 let side = match side_download.take() {
                     Some(download) => {
@@ -503,9 +505,11 @@ impl Client {
                 })
                 .await
                 .context("pack install task")??;
-                // A commit on no ref: its own history too.
+                // A commit on no ref: its own history too, but for the packs
+                // its Full shares with the base's (levels both built on).
                 if !held {
-                    let packs = self.fetch_history_packs(&urls, &root, cleanup).await?;
+                    let (packs, _) =
+                        (self.fetch_history_packs(&urls, &root, &base_packs, cleanup)).await?;
                     let git_dir = root.join(".git");
                     tokio::task::spawn_blocking(move || {
                         install_packs(&git_dir, packs, "history pack")
@@ -773,8 +777,9 @@ impl Client {
         &self,
         urls: &OutputUrls,
         dir: &Path,
+        held: &HashSet<Vec<u8>>,
         cleanup: &Cleanup,
-    ) -> Result<Vec<PackFiles>> {
+    ) -> Result<(Vec<PackFiles>, HashSet<Vec<u8>>)> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         let manifest = self.fetch_manifest(urls).await?;
@@ -786,6 +791,14 @@ impl Client {
             "the Full of {} has no history packs",
             urls.output().commit
         );
+        let listed: HashSet<Vec<u8>> = (history.iter())
+            .filter_map(|(_, entry)| Some(entry.pack.as_ref()?.hash.clone()))
+            .collect();
+        let history: Vec<(usize, PackEntry)> = (history.into_iter())
+            .filter(|(_, entry)| {
+                (entry.pack.as_ref()).is_none_or(|pack| !held.contains(&pack.hash))
+            })
+            .collect();
         self.progress.add_total(
             (history.iter())
                 .flat_map(|(_, entry)| entry.pack.iter().chain(entry.idx.iter()))
@@ -823,6 +836,7 @@ impl Client {
             .buffer_unordered(conc)
             .try_collect()
             .await
+            .map(|packs| (packs, listed))
     }
 
     /// The clonepack manifest of `urls`' output, checked against its commit.
@@ -1688,7 +1702,7 @@ async fn install_tags(
         let root_tree = git_stdout(root, &["rev-parse", "--verify", &tree], cleanup).await?;
         let listed =
             git_stdout(root, &["ls-tree", "-r", "-t", "--full-tree", tip], cleanup).await?;
-        let held: std::collections::HashSet<&str> = (listed.lines())
+        let held: HashSet<&str> = (listed.lines())
             .filter_map(|line| line.split_once('\t')?.0.split(' ').nth(2))
             .chain([tip, root_tree.trim()])
             .collect();

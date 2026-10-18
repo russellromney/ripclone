@@ -1,7 +1,9 @@
 //! Behavior every [`ControlStore`] must have. A backend passes by running
 //! [`run_all`] with a factory for empty backends.
 
-use super::{Clock, ControlStore, Lease, Out, Output, Pool, RepoBranches, RepoRefs, SidePack};
+use super::{
+    Clock, ControlStore, Lease, Out, Output, Pool, PublishedTags, RepoBranches, RepoRefs, SidePack,
+};
 use crate::provider::{ProviderInstanceId, RepoId};
 use crate::{ClonepackArtifacts, ExactResultKind, FilesResult, FullResult, HeadResult};
 use anyhow::Result;
@@ -1581,6 +1583,7 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
         tags_count: 3,
         tags_hash: crate::cas::hash(b"tags 1"),
         branches: None,
+        ready: None,
     };
     assert!(
         !store.set_refs(&repo(), &first).await.unwrap(),
@@ -1605,11 +1608,20 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
                 idx: crate::cas::hash(b"idx"),
                 idx_len: 1100,
             }),
+            tags: PublishedTags {
+                artifact: crate::cas::hash(b"first"),
+                len: 120,
+                count: 3,
+                hash: crate::cas::hash(b"tags 1"),
+            },
         }),
         ..first.clone()
     };
     assert!(store.set_refs(&repo(), &with_side).await.unwrap());
-    assert_eq!(store.get_refs(&repo()).await.unwrap(), Some(with_side));
+    assert_eq!(
+        store.get_refs(&repo()).await.unwrap(),
+        Some(with_side.clone())
+    );
     let second = RepoRefs {
         tags_artifact: crate::cas::hash(b"second"),
         tags_len: 0,
@@ -1624,7 +1636,9 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
             side_base: None,
             side_tips: crate::cas::hash(b"tips 2"),
             side_pack: None,
+            tags: PublishedTags::default(),
         }),
+        ready: with_side.branches.clone(),
     };
     assert!(store.set_refs(&repo(), &second).await.unwrap());
     let store = reopen(backend, &clock, store).await;
@@ -1656,23 +1670,47 @@ async fn refs_name_their_artifacts_until_purged(backend: &dyn Backend) {
                 idx: crate::cas::hash(b"my idx"),
                 idx_len: 10,
             }),
+            tags: PublishedTags {
+                artifact: crate::cas::hash(b"shared tags"),
+                len: 10,
+                count: 1,
+                hash: crate::cas::hash(b"tags"),
+            },
+        }),
+        // The older branches keep the tags of their time.
+        ready: Some(RepoBranches {
+            artifact: crate::cas::hash(b"my older branches"),
+            len: 30,
+            refs_hash: crate::cas::hash(b"older refs"),
+            default_branch: Some("main".into()),
+            base: Some("2".repeat(40)),
+            side_base: Some("2".repeat(40)),
+            side_tips: crate::cas::hash(b"older tips"),
+            side_pack: None,
+            tags: PublishedTags {
+                artifact: crate::cas::hash(b"my older tags"),
+                len: 5,
+                count: 0,
+                hash: crate::cas::hash(b"older tags"),
+            },
         }),
     };
     let theirs = RepoRefs {
         branches: None,
+        ready: None,
         ..mine.clone()
     };
     assert!(store.set_refs(&repo(), &mine).await.unwrap());
     assert!(store.set_refs(&other, &theirs).await.unwrap());
     let named: Vec<String> = mine.artifacts().into_iter().map(str::to_string).collect();
-    assert_eq!(named.len(), 4);
+    assert_eq!(named.len(), 6);
     store.queue_deletions(&named, START).await.unwrap();
     for hash in &named {
         assert!(!store.deletable(hash, START + 1).await.unwrap(), "{hash}");
     }
 
     let purged = store.purge_repo(&repo(), START).await.unwrap();
-    assert_eq!(purged.queued, 3, "the shared tags stay");
+    assert_eq!(purged.queued, 5, "the shared tags stay");
     assert_eq!(store.get_refs(&repo()).await.unwrap(), None);
     assert_eq!(store.get_refs(&other).await.unwrap(), Some(theirs));
     for hash in &named {

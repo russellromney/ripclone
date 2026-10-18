@@ -84,13 +84,17 @@ with any clone, never moves or deletes a tag you have.
 
 A full clone writes the server's refs when it holds the default branch's
 tip. It does when it clones that tip or tops up past it, and when it clones
-another commit (`--branch`, `--at`) while the tip's Full is ready: as `git
-clone --branch` does, it downloads the history every ref reaches, the tip's
-Full and the side pack, then checks out its own commit's tree. A commit on
-no ref adds its own history. Otherwise, as before the server's first publish
-or while the tip's Full builds, it fetches the branches and tags from the
-upstream with your own git, as top-up does. If that fetch fails, the clone
-warns and keeps only its own branch and the tags whose targets it holds.
+another commit (`--branch`, `--at`): as `git clone --branch` does, it
+downloads the history every ref reaches, the tip's Full and the side pack,
+then checks out its own commit's tree. A commit on no ref adds the history
+its Full does not share with the tip's. While the newest tip's Full builds
+after a push, such a clone gets the refs as they were at the last tip with
+a ready Full, as if cloned just before the push; your next `git fetch`
+brings the push. A commit newer than the published tip downloads its own
+history only. Otherwise, as before any tip's Full is ready, it fetches the
+branches and tags from the upstream with your own git, as top-up does. If
+that fetch fails, the clone warns and keeps only its own branch and the
+tags whose targets it holds.
 
 ## Waiting
 

@@ -137,9 +137,11 @@ installs the side pack and writes every branch as
 `refs/remotes/origin/<branch>`.
 
 A Full of another commit also carries `refs_base` when the default branch's
-tip has a ready Full: that Full's ready body. A full clone installs its
-history packs with the side pack, in place of its own commit's, and writes
-the working tree from its own commit's Head packs.
+tip has a ready Full and is not in the commit's own history: that Full's
+ready body. A full clone installs its history packs with the side pack, in
+place of its own commit's, and writes the working tree from its own
+commit's Head packs. While the newest tip has no ready Full, `tags_artifact`,
+`branches` and `refs_base` are those of the last refresh whose tip has one.
 
 **Pending.** The output is not built yet:
 
