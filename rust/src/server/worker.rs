@@ -449,13 +449,7 @@ async fn publish_or_fail(
 /// Queue every artifact the build pinned but `keep` does not name for
 /// deletion now. Deletion keeps those that any published output names.
 async fn discard(state: &ServerState, claim: &Claim, pins: &PinSet, keep: &BTreeSet<String>) {
-    let mut hashes = pins.hashes();
-    hashes.retain(|hash| !keep.contains(hash));
-    if hashes.is_empty() {
-        return;
-    }
-    let now = crate::control::Clock::now(&crate::control::SystemClock);
-    if let Err(error) = state.control.queue_deletions(&hashes, now).await {
+    if let Err(error) = super::purge::queue_unnamed(state, pins, keep).await {
         warn!(
             "queue the unnamed {} artifacts of {}@{} for deletion: {error:#}",
             claim.kind(),
@@ -1190,7 +1184,7 @@ mod tests {
         async fn get_refs(&self, repo: &RepoId) -> Result<Option<crate::control::RepoRefs>> {
             self.inner.get_refs(repo).await
         }
-        async fn set_refs(&self, repo: &RepoId, refs: &crate::control::RepoRefs) -> Result<()> {
+        async fn set_refs(&self, repo: &RepoId, refs: &crate::control::RepoRefs) -> Result<bool> {
             self.inner.set_refs(repo, refs).await
         }
         async fn health(&self) -> Result<()> {

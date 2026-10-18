@@ -11,10 +11,11 @@
 use super::ServerState;
 use super::worker::repo_lock;
 use crate::control::{Clock, Purged, SystemClock};
+use crate::pins::PinSet;
 use crate::provider::RepoId;
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -92,6 +93,24 @@ async fn remove_dir(dir: std::path::PathBuf) -> Result<()> {
     })
     .await
     .context("remove task")?
+}
+
+/// Queue each artifact `pins` holds that `keep` does not name for deletion
+/// now. Deletion keeps those that any repository names.
+pub(super) async fn queue_unnamed(
+    state: &ServerState,
+    pins: &PinSet,
+    keep: &BTreeSet<String>,
+) -> Result<()> {
+    let mut hashes = pins.hashes();
+    hashes.retain(|hash| !keep.contains(hash));
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    state
+        .control
+        .queue_deletions(&hashes, SystemClock.now())
+        .await
 }
 
 /// Sweep every `interval`. A zero interval turns sweeping off, as it does
@@ -189,7 +208,6 @@ async fn sweep_one(state: &ServerState, hash: &str, now: i64) -> Result<Swept> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pins::PinSet;
     use crate::server::tests::test_state;
 
     #[tokio::test]

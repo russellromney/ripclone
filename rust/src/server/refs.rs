@@ -17,10 +17,13 @@ use super::ServerState;
 use super::worker::repo_lock;
 use crate::branches::MirrorRefs;
 use crate::cancel;
+use crate::cas::Cas;
 use crate::control::{RepoBranches, SidePack};
 use crate::git::{self, UpstreamRefs};
+use crate::pins::PinSet;
 use crate::provider::RepoId;
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use tracing::warn;
@@ -158,7 +161,32 @@ pub(super) enum Scope {
 /// The branches and side pack are built before taking `lock.refs`, which
 /// a Head's tags publish waits on. Only a refresh builds them, and
 /// refreshes run one at a time, so no other publish writes them meanwhile.
+///
+/// What it stores is pinned until the refs that name it are written, and
+/// whatever it stored that they do not name is queued for deletion.
 pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope) -> Result<()> {
+    let pins = PinSet::new(&state.pins);
+    let published = publish_pinned(state, repo_id, scope, &state.cas.with_pins(&pins)).await;
+    let named = published
+        .as_ref()
+        .map_or_else(|_| BTreeSet::new(), Clone::clone);
+    if let Err(error) = super::purge::queue_unnamed(state, &pins, &named).await {
+        warn!(
+            "queue the unnamed refs artifacts of {} for deletion: {error:#}",
+            repo_id.storage_key()
+        );
+    }
+    published.map(|_| ())
+}
+
+/// Publish, returning the artifacts the repo's refs name afterwards: none
+/// when the repo was purged meanwhile.
+async fn publish_pinned(
+    state: &ServerState,
+    repo_id: &RepoId,
+    scope: Scope,
+    cas: &Cas,
+) -> Result<BTreeSet<String>> {
     let lock = repo_lock(state, repo_id).await;
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branches = match scope {
@@ -172,7 +200,7 @@ pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope)
                 .and_then(|row| row.branches);
             match previous {
                 Some(previous) if previous.refs_hash == refs.hash() => Some(previous),
-                previous => Some(publish_branches(state, &mirror_dir, refs, previous).await?),
+                previous => Some(publish_branches(state, cas, &mirror_dir, refs, previous).await?),
             }
         }
     };
@@ -183,7 +211,7 @@ pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope)
     let mut row = stored.clone().unwrap_or_default();
     if stored.is_none() || row.tags_hash != refs.tags_hash {
         let (dir, tags) = (mirror_dir.clone(), refs.tags.clone());
-        let (artifact, len) = put_bytes(state, move || crate::tags::build(&dir, &tags))
+        let (artifact, len) = put_bytes(state, cas, move || crate::tags::build(&dir, &tags))
             .await
             .context("tags artifact")?;
         row.tags_artifact = artifact;
@@ -194,13 +222,13 @@ pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope)
     if branches.is_some() {
         row.branches = branches;
     }
-    if stored.as_ref() != Some(&row) {
-        state.control.set_refs(repo_id, &row).await?;
+    if stored.as_ref() != Some(&row) && !state.control.set_refs(repo_id, &row).await? {
+        return Ok(BTreeSet::new());
     }
     if row.branches.is_none() {
         spawn_refresh(state, repo_id, "first build");
     }
-    Ok(())
+    Ok(row.artifacts().into_iter().map(str::to_string).collect())
 }
 
 async fn read_refs(mirror_dir: &Path) -> Result<MirrorRefs> {
@@ -216,12 +244,13 @@ async fn read_refs(mirror_dir: &Path) -> Result<MirrorRefs> {
 /// still in the default branch's history.
 async fn publish_branches(
     state: &ServerState,
+    cas: &Cas,
     mirror_dir: &Path,
     refs: MirrorRefs,
     previous: Option<RepoBranches>,
 ) -> Result<RepoBranches> {
     let built = refs.build()?;
-    let (artifact, len) = put_bytes(state, move || Ok(built))
+    let (artifact, len) = put_bytes(state, cas, move || Ok(built))
         .await
         .context("branches artifact")?;
     let refs_hash = refs.hash();
@@ -243,7 +272,7 @@ async fn publish_branches(
         Some(kept) => kept,
         None => (
             base.clone(),
-            build_side_pack(state, mirror_dir, refs).await?,
+            build_side_pack(state, cas, mirror_dir, refs).await?,
         ),
     };
     Ok(RepoBranches {
@@ -268,6 +297,7 @@ async fn moved_forward(mirror_dir: &Path, old: &str, new: &str) -> Result<bool> 
 /// Build and store the side pack of `refs`.
 async fn build_side_pack(
     state: &ServerState,
+    cas: &Cas,
     mirror_dir: &Path,
     refs: MirrorRefs,
 ) -> Result<Option<SidePack>> {
@@ -279,8 +309,8 @@ async fn build_side_pack(
     let Some((pack, idx)) = files else {
         return Ok(None);
     };
-    let (pack, pack_len) = put_file(state, pack).await.context("side pack")?;
-    let (idx, idx_len) = put_file(state, idx).await.context("side pack idx")?;
+    let (pack, pack_len) = put_file(state, cas, pack).await.context("side pack")?;
+    let (idx, idx_len) = put_file(state, cas, idx).await.context("side pack idx")?;
     Ok(Some(SidePack {
         pack,
         pack_len,
@@ -289,12 +319,13 @@ async fn build_side_pack(
     }))
 }
 
-/// Store the bytes `build` makes in the CAS and the artifact store.
+/// Store the bytes `build` makes in `cas` and the artifact store.
 async fn put_bytes(
     state: &ServerState,
+    cas: &Cas,
     build: impl FnOnce() -> Result<Vec<u8>> + Send + 'static,
 ) -> Result<(String, u64)> {
-    let cas = state.cas.clone();
+    let cas = cas.clone();
     let (artifact, len, path) = cancel::spawn_blocking(move || -> Result<_> {
         let bytes = build()?;
         let artifact = cas.put(&bytes)?;
@@ -311,9 +342,13 @@ async fn put_bytes(
     Ok((artifact, len))
 }
 
-/// Store the file at `source` in the CAS and the artifact store.
-async fn put_file(state: &ServerState, source: std::path::PathBuf) -> Result<(String, u64)> {
-    let cas = state.cas.clone();
+/// Store the file at `source` in `cas` and the artifact store.
+async fn put_file(
+    state: &ServerState,
+    cas: &Cas,
+    source: std::path::PathBuf,
+) -> Result<(String, u64)> {
+    let cas = cas.clone();
     let (artifact, len, path) = cancel::spawn_blocking(move || -> Result<_> {
         let (artifact, _) = crate::cas::hash_file(&source)?;
         let len = cas.put_file_with_hash(&artifact, &source)?;

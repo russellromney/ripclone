@@ -187,6 +187,22 @@ pub struct RepoRefs {
     pub branches: Option<RepoBranches>,
 }
 
+impl RepoRefs {
+    /// Every stored artifact the refs name.
+    pub fn artifacts(&self) -> std::collections::BTreeSet<&str> {
+        let mut hashes = std::collections::BTreeSet::from([self.tags_artifact.as_str()]);
+        if let Some(branches) = &self.branches {
+            hashes.insert(&branches.artifact);
+            if let Some(side) = &branches.side_pack {
+                hashes.insert(&side.pack);
+                hashes.insert(&side.idx);
+            }
+        }
+        hashes.retain(|hash| !hash.is_empty());
+        hashes
+    }
+}
+
 /// The branches a refresh published, for full clones.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepoBranches {
@@ -315,7 +331,7 @@ pub trait ControlStore: Send + Sync {
     async fn get_repo(&self, repo: &RepoId) -> Result<Option<AddedRepo>>;
     async fn list_repos(&self) -> Result<Vec<AddedRepo>>;
     /// Delete the repository, in one transaction: drop it from the added
-    /// set, delete its build rows and artifact references, and queue each
+    /// set, delete its build rows, refs and artifact references, and queue each
     /// artifact it named that no other repository names, due at `due_at`.
     /// A leased build of it can no longer renew, publish or fail.
     async fn purge_repo(&self, repo: &RepoId, due_at: i64) -> Result<Purged>;
@@ -338,8 +354,11 @@ pub trait ControlStore: Send + Sync {
     async fn known_repos(&self) -> Result<Vec<RepoId>>;
     /// The repository's published refs; `None` before its first publish.
     async fn get_refs(&self, repo: &RepoId) -> Result<Option<RepoRefs>>;
-    /// Replace the repository's published refs.
-    async fn set_refs(&self, repo: &RepoId, refs: &RepoRefs) -> Result<()>;
+    /// Replace the repository's published refs, and record that the repo
+    /// names each of their artifacts. Nothing is written for a repo that is
+    /// no longer known, such as one purged while its refs were built.
+    /// Returns whether the refs were written.
+    async fn set_refs(&self, repo: &RepoId, refs: &RepoRefs) -> Result<bool>;
     async fn health(&self) -> Result<()>;
 }
 

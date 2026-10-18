@@ -35,6 +35,16 @@ fn json_list<'a>(hashes: impl IntoIterator<Item = &'a str>) -> String {
     serde_json::Value::from_iter(hashes).to_string()
 }
 
+/// Whether the repository `$1` is added or has build rows.
+const KNOWN_REPO: &str = "SELECT EXISTS (SELECT 1 FROM added_repos WHERE repo = $1)
+    OR EXISTS (SELECT 1 FROM builds WHERE repo = $1)";
+
+/// Record that the repository `$1` names each artifact in the JSON array
+/// `$2`. `WHERE true` lets SQLite parse the upsert after a SELECT.
+const RECORD_REFS: &str = "INSERT INTO artifact_refs (repo, hash)
+    SELECT $1, value FROM json_each($2) WHERE true
+    ON CONFLICT (repo, hash) DO NOTHING";
+
 /// A queued artifact queued again keeps the later of its due times.
 const KEEP_LATER_DUE: &str = "ON CONFLICT (hash) DO UPDATE SET due_at = CASE
     WHEN excluded.due_at > deletions.due_at THEN excluded.due_at ELSE deletions.due_at END";
@@ -583,17 +593,12 @@ impl ControlStore for SqliteControlStore {
         else {
             return Ok(not_applied);
         };
-        // `WHERE true` lets SQLite parse the upsert after a SELECT.
-        sqlx::query(
-            "INSERT INTO artifact_refs (repo, hash)
-             SELECT $1, value FROM json_each($2) WHERE true
-             ON CONFLICT (repo, hash) DO NOTHING",
-        )
-        .bind(claim.repo.storage_key())
-        .bind(json_list(output.artifacts()))
-        .execute(&mut *tx)
-        .await
-        .context("record artifact references")?;
+        sqlx::query(RECORD_REFS)
+            .bind(claim.repo.storage_key())
+            .bind(json_list(output.artifacts()))
+            .execute(&mut *tx)
+            .await
+            .context("record artifact references")?;
         tx.commit().await.context("commit publish")?;
         Ok(Published {
             applied: true,
@@ -805,6 +810,11 @@ impl ControlStore for SqliteControlStore {
         .await
         .context("queue purged artifacts")?
         .rows_affected();
+        sqlx::query("DELETE FROM repo_refs WHERE repo = $1")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .context("purge refs")?;
         sqlx::query("DELETE FROM artifact_refs WHERE repo = $1")
             .bind(&key)
             .execute(&mut *tx)
@@ -873,14 +883,11 @@ impl ControlStore for SqliteControlStore {
     }
 
     async fn knows_repo(&self, repo: &RepoId) -> Result<bool> {
-        sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM added_repos WHERE repo = $1)
-                 OR EXISTS (SELECT 1 FROM builds WHERE repo = $1)",
-        )
-        .bind(repo.storage_key())
-        .fetch_one(&self.pool)
-        .await
-        .context("check repository")
+        sqlx::query_scalar(KNOWN_REPO)
+            .bind(repo.storage_key())
+            .fetch_one(&self.pool)
+            .await
+            .context("check repository")
     }
 
     async fn known_repos(&self) -> Result<Vec<RepoId>> {
@@ -945,11 +952,24 @@ impl ControlStore for SqliteControlStore {
         .transpose()
     }
 
-    async fn set_refs(&self, repo: &RepoId, refs: &RepoRefs) -> Result<()> {
+    async fn set_refs(&self, repo: &RepoId, refs: &RepoRefs) -> Result<bool> {
         let key = repo.storage_key();
         let number = |n: u64| i64::try_from(n).context("refs number too large");
         let branches = refs.branches.as_ref();
         let side = branches.and_then(|branches| branches.side_pack.as_ref());
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("begin refs write")?;
+        let known: bool = sqlx::query_scalar(KNOWN_REPO)
+            .bind(&key)
+            .fetch_one(&mut *tx)
+            .await
+            .context("check repository")?;
+        if !known {
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT INTO repo_refs (repo, tags_artifact, tags_len, tags_count, tags_hash,
                branches_artifact, branches_len, refs_hash, default_branch, branches_base,
@@ -980,10 +1000,17 @@ impl ControlStore for SqliteControlStore {
         .bind(side.map(|side| number(side.pack_len)).transpose()?)
         .bind(side.map(|side| side.idx.clone()))
         .bind(side.map(|side| number(side.idx_len)).transpose()?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .with_context(|| format!("write refs of {key}"))?;
-        Ok(())
+        sqlx::query(RECORD_REFS)
+            .bind(&key)
+            .bind(json_list(refs.artifacts()))
+            .execute(&mut *tx)
+            .await
+            .context("record refs artifact references")?;
+        tx.commit().await.context("commit refs write")?;
+        Ok(true)
     }
 
     async fn health(&self) -> Result<()> {

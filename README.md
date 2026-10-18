@@ -103,7 +103,7 @@ ripclone clone oven-sh/bun bun
 `add` returns once the build is accepted; `--wait` waits for it to finish.
 `ripclone list` and `ripclone rm owner/repo` manage registrations. Removing a
 registration keeps the published artifacts; `rm --purge` also deletes the
-repo's builds, its mirror, and the artifacts no other repo uses. Without `RIPCLONE_SERVER` (or
+repo's builds, its refs, its mirror, and the artifacts no other repo uses. Without `RIPCLONE_SERVER` (or
 `server` in the config file) the CLI talks to `https://ripclone.com`.
 
 ## Keeping repos fresh
