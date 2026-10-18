@@ -173,9 +173,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, platform: linux-x86_64, args: "--manylinux 2_28" }
-          - { os: macos-14, platform: macos-arm64, args: "" }
-          - { os: macos-15-intel, platform: macos-x86_64, args: "" }
+          - { os: ubuntu-latest, platform: linux-x86_64 }
+          - { os: macos-14, platform: macos-arm64 }
+          - { os: macos-15-intel, platform: macos-x86_64 }
     runs-on: ${{ matrix.os }}
     permissions:
       id-token: write # PyPI Trusted Publishing (OIDC)
@@ -188,7 +188,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --manifest-path rust/Cargo.toml ${{ matrix.args }}
+          args: --release --out dist --manifest-path rust/Cargo.toml
           manylinux: ${{ runner.os == 'Linux' && '2_28' || 'auto' }}
           before-script-linux: |
             dnf install -y protobuf-compiler cmake || \
