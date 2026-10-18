@@ -97,9 +97,7 @@ pub mod mode;
 pub mod pack;
 pub mod perf;
 pub mod provider;
-pub mod provider_config;
 #[doc(hidden)]
-pub mod repo_config;
 #[doc(hidden)]
 pub mod retention;
 #[doc(hidden)]

@@ -140,11 +140,11 @@ fn k3_provider_commands_manage_the_cli_config() {
     let origin = world.origin("acme", "k3");
     let tip = origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
-    let server_providers = providers_json(
+    world.server_providers(
         http.url(),
         &[("forge", "gitea", Some("k3-secret"), serde_json::json!({}))],
     );
-    let server = world.server(&[("RIPCLONE_PROVIDERS", &server_providers)]);
+    let server = world.server(&[]);
     let host = http.url();
     let url = format!("{host}/acme/k3.git");
 
@@ -400,12 +400,11 @@ fn i14_terminal_top_up_shows_its_phase_and_seconds() {
     let origin = world.origin("acme", "i14t");
     origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
-    let providers = providers_json(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
-    let env = [("RIPCLONE_PROVIDERS", providers.as_str())];
-    let mut server = world.server(&env);
-    world
-        .cli_env(&server, &["add", "gh:acme/i14t", "--wait"], &env)
-        .ok();
+    let gh = [("gh", "github", None, serde_json::json!({}))];
+    world.server_providers(http.url(), &gh);
+    world.cli_providers(http.url(), &gh);
+    let mut server = world.server(&[]);
+    world.cli(&server, &["add", "gh:acme/i14t", "--wait"]).ok();
     server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
     let b = origin.commit(&[("a.txt", "b\n")], "B");
     origin.publish();
@@ -416,7 +415,7 @@ fn i14_terminal_top_up_shows_its_phase_and_seconds() {
     let (terminal, stderr) = Terminal::open(200);
     let target = world.target("i14t");
     let args = ["clone", "gh:acme/i14t", target.to_str().unwrap()];
-    let cli = world.cli_spawn_stderr(&server, &args, &env, stderr);
+    let cli = world.cli_spawn_stderr(&server, &args, &[], stderr);
     let phase = format!("ripclone: fetching {} from upstream", &b[..7]);
     terminal.wait_for(&format!("{phase} (1s)"));
     http.release_fetches();
@@ -439,14 +438,15 @@ fn i14_terminal_add_wait_shows_output_states_within_its_width() {
     let origin = world.origin("acme", "i14w");
     let a = origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
-    let providers = providers_json(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
-    let env = [("RIPCLONE_PROVIDERS", providers.as_str())];
-    let server = world.server(&env);
+    let gh = [("gh", "github", None, serde_json::json!({}))];
+    world.server_providers(http.url(), &gh);
+    world.cli_providers(http.url(), &gh);
+    let server = world.server(&[]);
 
     // The origin parks the build's fetch until the line is on the terminal.
     http.hold_fetches();
     let (terminal, stderr) = Terminal::open(60);
-    let cli = world.cli_spawn_stderr(&server, &["add", "gh:acme/i14w", "--wait"], &env, stderr);
+    let cli = world.cli_spawn_stderr(&server, &["add", "gh:acme/i14w", "--wait"], &[], stderr);
     terminal.wait_for(&format!("ripclone: waiting for {}: Head pending", &a[..7]));
     http.release_fetches();
     let out = cli.wait();

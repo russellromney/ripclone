@@ -51,8 +51,6 @@ enum Commands {
     Logout,
     /// Show the CLI and server versions and whether they are compatible.
     Version,
-    /// Check for a newer ripclone release and show how to update.
-    Update,
     /// Add a repo to the server and start building its default branch tip.
     Add {
         /// owner/name, provider:path, or a clone URL.
@@ -108,8 +106,8 @@ enum Commands {
         /// files clone writes the same commit's tree from its ready Head.
         #[arg(long)]
         wait: bool,
-        /// Print a per-phase benchmark report after the clone.
-        #[arg(long)]
+        /// Print a per-phase timing report after the clone. For benchmarks.
+        #[arg(long, hide = true)]
         bench: bool,
         /// Operate quietly: no progress or notes on stderr, only warnings
         /// and errors. Progress is shown only when stderr is a terminal.
@@ -387,88 +385,6 @@ async fn run_version(server: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct LatestRelease {
-    #[serde(default)]
-    tag_name: String,
-}
-
-/// How the current build compares to the latest published release tag.
-#[derive(Debug, PartialEq, Eq)]
-enum ReleaseStatus {
-    None,
-    UpToDate,
-    Newer(String),
-}
-
-/// Compare the current build version to a release tag (with or without a leading
-/// `v`). `current` is the bare `CARGO_PKG_VERSION` (no `v`).
-fn release_status(current: &str, latest_tag: &str) -> ReleaseStatus {
-    let latest = latest_tag.trim_start_matches('v');
-    if latest.is_empty() {
-        ReleaseStatus::None
-    } else if latest == current {
-        ReleaseStatus::UpToDate
-    } else {
-        ReleaseStatus::Newer(latest_tag.to_string())
-    }
-}
-
-/// Check the latest published release on GitHub and, if newer, show how to
-/// update. Deliberately does not replace the binary itself — it prints the
-/// install command — so it works the same however ripclone was installed.
-async fn run_update() -> Result<()> {
-    let current = env!("CARGO_PKG_VERSION");
-    println!("ripclone {current}");
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("ripclone/", env!("CARGO_PKG_VERSION")))
-        .build()?;
-    let url = "https://api.github.com/repos/russellromney/ripclone/releases/latest";
-    let resp = match http
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            println!("could not reach GitHub releases ({e})");
-            return Ok(());
-        }
-    };
-    // A 404 here means the repo has no published releases yet — not a failure.
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        println!("no published releases yet.");
-        return Ok(());
-    }
-    let resp = match resp.error_for_status() {
-        Ok(r) => r,
-        Err(e) => {
-            println!("could not reach GitHub releases ({e})");
-            return Ok(());
-        }
-    };
-    match resp.json::<LatestRelease>().await {
-        Ok(rel) => match release_status(current, &rel.tag_name) {
-            ReleaseStatus::None => println!("no published releases yet."),
-            ReleaseStatus::UpToDate => {
-                println!("you're on the latest release ({}).", rel.tag_name)
-            }
-            ReleaseStatus::Newer(tag) => {
-                println!("a newer release is available: {tag}");
-                println!("update with one of:");
-                println!(
-                    "  curl -fsSL https://github.com/russellromney/ripclone/releases/latest/download/install.sh | sh"
-                );
-                println!("  cargo install ripclone --locked");
-                println!("  pip install --upgrade ripclone");
-            }
-        },
-        Err(e) => println!("could not read the latest release ({e})"),
-    }
-    Ok(())
-}
-
 /// What a waiting command writes to stderr: `--quiet` nothing, `--progress`
 /// or a terminal a progress line, else notes only.
 fn stderr_mode(quiet: bool, progress: bool) -> Stderr {
@@ -619,8 +535,7 @@ async fn run_provider_add(
     Ok(())
 }
 
-/// Every provider this CLI knows: the built-in `github`, `RIPCLONE_PROVIDERS`
-/// and the config file.
+/// Every provider this CLI knows: the built-in `github` and the config file's.
 fn run_provider_list(registry: &ProviderRegistry) -> Result<()> {
     let mut providers: Vec<&ProviderInstance> = registry.iter().collect();
     providers.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
@@ -755,12 +670,11 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Commands::Version => return run_version(&server).await,
-        Commands::Update => return run_update().await,
         _ => {}
     }
 
     let provider_registry =
-        ripclone::provider_config::load_registry().context("load provider registry")?;
+        ProviderRegistry::from_config(&config).context("load provider registry")?;
 
     // Server-token precedence: RIPCLONE_SERVER_TOKEN > saved login token.
     // Raw tokens are hashed before being sent.
@@ -783,7 +697,7 @@ async fn run() -> Result<()> {
 
     match args.command {
         // Handled before the client is built.
-        Commands::Login | Commands::Logout | Commands::Version | Commands::Update => {
+        Commands::Login | Commands::Logout | Commands::Version => {
             unreachable!()
         }
         Commands::Provider { action } => match action {

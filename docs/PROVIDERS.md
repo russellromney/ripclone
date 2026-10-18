@@ -2,17 +2,14 @@
 
 By default ripclone knows one host, the built-in `github` instance
 (`github.com`). To build from GitLab, Gitea/Forgejo/Codeberg, or a self-hosted
-host, register provider instances with `RIPCLONE_PROVIDERS` or in
-`config.toml`:
-
-```bash
-export RIPCLONE_PROVIDERS='{"providers":[
-  {"id":"gitlab","kind":"gitlab","host":"gitlab.com"},
-  {"id":"company-gitea","kind":"gitea","host":"git.example.com","token":"gitea-token"}
-]}'
-```
+host, register provider instances in `config.toml`
+(`~/.config/ripclone/config.toml`, or the path in `RIPCLONE_CONFIG`). The
+table name is the instance id:
 
 ```toml
+[providers.gitlab]
+kind = "gitlab"
+
 [providers.company-gitea]
 kind = "gitea"
 host = "git.example.com"
@@ -29,10 +26,7 @@ Each instance has:
 | `auth_template` | How the token is sent, with one `{token}` placeholder, for example `"token {token}"`. Required for `generic`. |
 | `auth_header_name` | Header that carries the token. Default `Authorization`. |
 
-An entry with id `github` replaces the built-in instance's settings. In
-`RIPCLONE_PROVIDERS` the id is the `id` field; in `config.toml` it is the
-table name. A `[providers]` entry beats a `RIPCLONE_PROVIDERS` entry with the
-same id.
+An entry with id `github` replaces the built-in instance's settings.
 
 Address a repo by instance id: `gitlab:mygroup/project` on the CLI,
 `/v1/repos/gitlab/mygroup/project/...` on the API. The CLI also takes a
@@ -42,9 +36,11 @@ matches.
 
 ## Server and CLI
 
-The server needs the instance to build and serve its repos. For private repos
-it needs read access to the upstream: a `token` on the instance, or a GitHub
-App for GitHub (see [Configuration](CONFIG.md#github-app-credentials)).
+The server needs the instance in its own config file to build and serve its
+repos. For private repos it needs read access to the upstream: a `token` on
+the instance, or a GitHub App for GitHub (see
+[Configuration](CONFIG.md#github-app-credentials)). Keep that file readable
+only by the server's user; `ripclone provider add` writes it with mode 0600.
 
 The CLI needs the instance too, to clone. A full clone that tops up fetches
 from the instance's host with your own git, and `--verify-upstream` reads the

@@ -5,24 +5,20 @@ use std::str::FromStr;
 /// how the working tree is materialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum CloneMode {
-    /// Default. A real, editable git repo. Downloads one undeltified pack (the
-    /// depth pack: commit + tree + every blob for the requested depth), installs
-    /// it into `.git/objects`, and materializes the working tree by reading
-    /// blobs straight out of it. `git diff`/`show`/`log` and edits/commits all
-    /// work. One download of HEAD content, no archive, no local pack rebuild.
+    /// Default. A git repository: log, diff, commit, pull and push work. Full
+    /// history, or only the commit with `--depth 1`.
     #[default]
     #[value(name = "editable")]
     Editable,
 
-    /// Working tree only, materialized from the zstd files artifact. No git
-    /// object database, so `git diff`/`show` do not work. Fastest path for CI
-    /// jobs that only need the files.
+    /// The files only, with no `.git`, so git commands do not work. The
+    /// fastest mode, for jobs that only read the files.
     #[value(name = "files")]
     Files,
 }
 
 impl CloneMode {
-    /// True for modes that download and install the prebuilt depth pack.
+    /// True for modes that install git objects.
     pub fn needs_prebuilt_blob_pack(self) -> bool {
         matches!(self, CloneMode::Editable)
     }

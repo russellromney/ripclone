@@ -159,10 +159,9 @@ Ripclone token reaches the origin.
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | #186 |
 | H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | #191 (S3 job) |
 | H3 | A second server on the same control database is rejected before it binds. | #186 |
-| H4 | Table: invalid storage, rate-limit and worker config (an S3 bucket without an endpoint, a malformed config file) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention size, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size), with an error naming it. | #208 |
+| H4 | Table: invalid storage and worker config (an S3 bucket without an endpoint, a malformed config file) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention size, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size), with an error naming it. | #208 |
 | H5 | Local disk with retention every second and a 1 GB limit: the server reports retention off; month-old artifacts, past the 7-day limit, stay and clone. | #208 |
 | H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | #208 (S3 job) |
-| H7 | A repository's config (`/v1/admin/config`) survives a server restart. | #208 |
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | #209 |
 | H9 | Build scratch goes under `<cache>/tmp`, which startup empties: with a read-only `TMPDIR`, a stale scratch entry is removed and a full build and clone succeed. | #211 |
 | H10 | S3 emulator: after a one-line push, B uploads no object of 1 MiB or more that the bucket already holds (its Files reuses A's bundles). A second repository with the same files builds the same large objects: the bucket proxy sees a HEAD and no PUT for each. A bucket copy cut short is uploaded again when a third repository with the same files makes it; that repository's clones and the Files clones of B and the second repository are exact. | #220 (S3 job), #221 |
@@ -233,7 +232,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 90 tests. Several are table-driven.
+Total: 89 tests. Several are table-driven.
 
 ## Test settings
 

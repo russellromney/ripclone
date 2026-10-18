@@ -12,11 +12,6 @@ CREATE TABLE added_repos (
   added_at INTEGER NOT NULL            -- epoch seconds
 );
 
-CREATE TABLE repo_config (
-  repo TEXT PRIMARY KEY,               -- RepoId::storage_key()
-  data TEXT NOT NULL                   -- serde JSON of RepoConfig
-);
-
 -- One row per (repo, commit). Each output kind (head, files, full) is
 -- pending | ready | failed and has its own lease, attempts and retry time,
 -- so one row's outputs build at the same time. A kind is building

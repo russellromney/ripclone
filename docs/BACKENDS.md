@@ -44,20 +44,3 @@ download through signed URLs, and the local cache and git mirrors are
 disposable. S3 holds artifacts only, never control state.
 
 Published artifacts never expire. See [Artifact lifecycle](ARTIFACT_LIFECYCLE.md).
-
-## Per-repo build settings
-
-`GET` and `POST /v1/admin/config/{provider}/{path}` (for example
-`/v1/admin/config/github/acme/app`) read and replace a repo's
-build settings. There is one setting:
-
-```json
-{"compression_level": 9}
-```
-
-`compression_level` is the zstd level of the Files archive, 1 to 22, default
-6; a level out of range is `400 invalid_request`. An unknown key is rejected
-with `422`, except `clonepack_depths`, `archive_chunk_size` and
-`head_blobs_chunk_size`, which are accepted and ignored. A repo with no stored
-settings uses the default, and `GET` answers `404 config_not_found`. Full and
-Files builds read the settings when they start.

@@ -16,13 +16,13 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | Setting | Meaning |
 |---|---|
 | `RIPCLONE_SERVER`, config `server` | Server URL. Default `https://ripclone.com`. |
-| `RIPCLONE_PROVIDERS`, config `[providers.<id>]` | Provider instances. A repo without a `provider:` prefix uses `github`. See [Providers](PROVIDERS.md). |
+| Config `[providers.<id>]` | Provider instances. A repo without a `provider:` prefix uses `github`. See [Providers](PROVIDERS.md). |
 | `RIPCLONE_CACHE_DIR` | Turn on the local artifact cache at this path. Off by default. |
 | `RIPCLONE_NO_METRICS` | Set: never send the post-clone metrics report. |
 | `RUST_LOG` | Tracing filter. |
 
 `ripclone clone` takes `--branch`, `--depth`, `--mode`, `--at`, `--wait`,
-`--bench`, `--verify-upstream`, `--quiet` and `--progress`; `ripclone clone
+`--verify-upstream`, `--quiet` and `--progress`; `ripclone clone
 --help` explains each. The progress line is drawn only when stderr is a
 terminal, unless `--progress` is given; `--quiet` prints only warnings and
 errors.
@@ -37,7 +37,7 @@ errors.
 | Variable | Meaning |
 |---|---|
 | `RIPCLONE_SERVER_TOKEN` | The token clients must present. |
-| `RIPCLONE_PROVIDERS`, config `[providers.<id>]` | Provider instances and their tokens. Config entries beat `RIPCLONE_PROVIDERS` entries with the same id. See [Providers](PROVIDERS.md). |
+| `RIPCLONE_CONFIG`, config `[providers.<id>]` | The config file path, and the provider instances and their tokens in it. See [Providers](PROVIDERS.md). |
 | `RIPCLONE_S3_BUCKET` | Bucket. Setting it turns S3 storage on. See [Server state and storage](BACKENDS.md). |
 | `RIPCLONE_S3_ENDPOINT` | S3-compatible endpoint. Required with a bucket. |
 | `RIPCLONE_S3_REGION` | Region, default `us-east-1`. |
@@ -46,8 +46,6 @@ errors.
 | `RIPCLONE_RETENTION_MAX_GB` | With S3 storage, the local artifact cache keeps at most this many GB and nothing older than 7 days. Default 100; `0` keeps any size. It never deletes S3 objects. With local storage, nothing is trimmed. |
 | `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>` | Webhook secret per provider instance. See [Webhooks](WEBHOOKS.md). |
 | `RIPCLONE_POLL_INTERVAL_SECS` | How often the server checks added repos for new commits, default 300; `0` turns polling off. |
-| `RIPCLONE_RATE_LIMIT_PER_SEC` | Per-IP requests per second, default 10, with bursts of six seconds' worth. See [API](API.md#authentication). |
-| `RIPCLONE_TRUST_FORWARDED_FOR` | `1` or `true`: rate-limit by the last `X-Forwarded-For` address. Only behind one trusted proxy. |
 | `RUST_LOG` | Tracing filter. Default `info`. |
 
 A value that is set but does not parse, including an empty one, stops the

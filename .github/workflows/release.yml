@@ -102,8 +102,8 @@ jobs:
             ripclone-${{ matrix.platform }}.tar.gz.sha256
           fail_on_unmatched_files: true
 
-  # Upload the installer alongside the binaries so the curl|sh one-liner and
-  # `ripclone update` can fetch `.../releases/latest/download/install.sh`.
+  # Upload the installer alongside the binaries so the curl|sh one-liner can
+  # fetch `.../releases/latest/download/install.sh`.
   installer:
     needs: version
     runs-on: ubuntu-latest

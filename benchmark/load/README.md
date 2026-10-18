@@ -25,8 +25,8 @@ On the server machine:
    `repos.txt`. Every version then replays the same commits.
 6. Write the storage settings (`RIPCLONE_S3_*` and `AWS_*`) to `/root/s3.env`. Each run uses
    a fresh `loadtest-<time>-<label>/` prefix.
-7. Run `srv_run.sh LABEL /opt/rc/bin/<rev>`, one run at a time. It starts a fresh server with
-   the rate limit raised (the driver polls from one address), plus `sampler.py` (CPU, memory,
+7. Run `srv_run.sh LABEL /opt/rc/bin/<rev>`, one run at a time. It starts a fresh server (with
+   the old rate limit raised, for revisions that still have one), plus `sampler.py` (CPU, memory,
    disk, network, every 2 s) and `driver.py`.
 
 `driver.py` runs three phases:

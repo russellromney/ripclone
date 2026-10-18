@@ -9,7 +9,7 @@ cd $R
 nohup env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=$R/home \
   RIPCLONE_SERVER_TOKEN="$(cat /root/bench_token)" RUST_LOG=info \
   RIPCLONE_ORIGIN_BASE=file:///opt/rc/origin RIPCLONE_POLL_INTERVAL_SECS=0 \
-  RIPCLONE_RATE_LIMIT_PER_SEC=1000000 \
+  RIPCLONE_RATE_LIMIT_PER_SEC=1000000 `# revisions before the limiter was removed` \
   RIPCLONE_S3_PREFIX="$prefix" ${EXTRA_ENV:-} ENVFILE=/root/s3.env \
   bash -c 'set -a; . "$ENVFILE"; set +a; unset ENVFILE; exec "$@"' _ \
   $bindir/ripclone-server --data-dir $R --host 0.0.0.0 --port $port >> $R/server.log 2>&1 &
