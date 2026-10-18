@@ -993,17 +993,13 @@ async fn run() -> Result<()> {
             } else {
                 ExactResultKind::Full
             };
-            let upstream_snapshot = observe_upstream_for_verification(
+            let check = upstream_check(
                 &provider,
-                &repo_path,
-                &branch,
                 at.as_deref(),
                 mode,
-                upstream_token.as_deref(),
                 verify_upstream,
                 &provider_registry,
-            )
-            .await?;
+            )?;
             // End-to-end wall clock for the clone, for the metrics report.
             let clone_started = std::time::Instant::now();
             let request = CloneRequest {
@@ -1016,14 +1012,35 @@ async fn run() -> Result<()> {
             // Like `git clone`, the target may be an existing empty directory.
             // A failed clone must leave it there.
             let target_was_dir = target.is_dir();
-            let outcome = client
-                .clone_repo(&request, &target, enable_bench.then_some(&mut benchmark))
-                .await?;
+            // The upstream's tip is read beside the clone, so the check adds
+            // no wait unless the upstream answers after the clone is done.
+            let observe = async {
+                match check {
+                    UpstreamCheck::Read(provider) => {
+                        observe_upstream(
+                            &provider,
+                            &repo_path,
+                            &branch,
+                            upstream_token.as_deref(),
+                            verify_upstream,
+                        )
+                        .await
+                    }
+                    UpstreamCheck::Known(upstream) => Ok(upstream),
+                }
+            };
+            let (upstream, outcome) = tokio::join!(
+                observe,
+                client.clone_repo(&request, &target, enable_bench.then_some(&mut benchmark))
+            );
+            let outcome = outcome?;
             let total_ms = u64::try_from(clone_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             println!("installed {} into {}", repo_path, target.display());
-            if let Err(error) =
-                verify_upstream_snapshot(&target, &outcome.commit, &upstream_snapshot).await
-            {
+            let verified = match upstream {
+                Ok(upstream) => verify_upstream_snapshot(&target, &outcome.commit, &upstream).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = verified {
                 remove_clone(&target, target_was_dir)
                     .await
                     .with_context(|| {
@@ -1096,20 +1113,18 @@ fn provider_instance(provider_id: &str, registry: &ProviderRegistry) -> Option<P
 ///   * `Never` — skip.
 ///
 /// An `--at` clone or a Files clone has no upstream tip to check, so `auto`
-/// skips them silently and `always` refuses them.
-#[allow(clippy::too_many_arguments)]
-async fn observe_upstream_for_verification(
+/// skips them silently and `always` refuses them. Those refusals come from the
+/// arguments alone, before anything is downloaded; the upstream itself is read
+/// by [`observe_upstream`] beside the clone.
+fn upstream_check(
     provider_id: &str,
-    repo_path: &str,
-    branch: &str,
     at: Option<&str>,
     mode: CloneMode,
-    upstream_token: Option<&str>,
     requested: VerifyUpstream,
     registry: &ProviderRegistry,
-) -> Result<Upstream> {
+) -> Result<UpstreamCheck> {
     if requested == VerifyUpstream::Never {
-        return Ok(Upstream::Unchecked);
+        return Ok(UpstreamCheck::Known(Upstream::Unchecked));
     }
     if let Some(rev) = at {
         match requested {
@@ -1119,7 +1134,7 @@ async fn observe_upstream_for_verification(
                      omit --at or use --verify-upstream=auto"
                 )));
             }
-            VerifyUpstream::Auto => return Ok(Upstream::Unchecked),
+            VerifyUpstream::Auto => return Ok(UpstreamCheck::Known(Upstream::Unchecked)),
             VerifyUpstream::Never => unreachable!(),
         }
     }
@@ -1133,24 +1148,37 @@ async fn observe_upstream_for_verification(
                  use --mode editable or --verify-upstream=auto",
             ));
         }
-        return Ok(Upstream::Unchecked);
+        return Ok(UpstreamCheck::Known(Upstream::Unchecked));
     }
 
-    let provider = match provider_instance(provider_id, registry) {
-        Some(p) => p,
-        None => {
-            if requested == VerifyUpstream::Always {
-                anyhow::bail!(
-                    "unknown provider '{provider_id}'; \
-                     register it with `ripclone provider add` to use --verify-upstream=always"
-                );
-            }
-            return Ok(Upstream::Skipped(format!(
-                "unknown provider '{provider_id}'"
-            )));
-        }
-    };
+    match provider_instance(provider_id, registry) {
+        Some(provider) => Ok(UpstreamCheck::Read(provider)),
+        None if requested == VerifyUpstream::Always => anyhow::bail!(
+            "unknown provider '{provider_id}'; \
+             register it with `ripclone provider add` to use --verify-upstream=always"
+        ),
+        None => Ok(UpstreamCheck::Known(Upstream::Skipped(format!(
+            "unknown provider '{provider_id}'"
+        )))),
+    }
+}
 
+/// What [`upstream_check`] decided.
+enum UpstreamCheck {
+    /// Read the upstream tip from this provider.
+    Read(ProviderInstance),
+    /// Nothing to read; this is the answer.
+    Known(Upstream),
+}
+
+/// Read the upstream tip of `branch` for [`upstream_check`]'s `Read`.
+async fn observe_upstream(
+    provider: &ProviderInstance,
+    repo_path: &str,
+    branch: &str,
+    upstream_token: Option<&str>,
+    requested: VerifyUpstream,
+) -> Result<Upstream> {
     let mut upstream_tip: Option<String> = None;
     match requested {
         VerifyUpstream::Always => {}
@@ -1162,21 +1190,19 @@ async fn observe_upstream_for_verification(
                 provider: provider.id.clone(),
                 path: repo_path.to_string(),
             };
-            upstream_tip = match ripclone::git::ls_remote_commit_async(
-                &provider, &repo_id, branch, None,
-            )
-            .await
-            {
-                Ok(Some(sha)) => Some(sha),
-                Ok(None) => {
-                    return Ok(Upstream::Skipped(
-                        "private upstream without credential".to_string(),
-                    ));
-                }
-                Err(e) => {
-                    return Ok(Upstream::Skipped(format!("upstream probe failed: {e:#}")));
-                }
-            };
+            upstream_tip =
+                match ripclone::git::ls_remote_commit_async(provider, &repo_id, branch, None).await
+                {
+                    Ok(Some(sha)) => Some(sha),
+                    Ok(None) => {
+                        return Ok(Upstream::Skipped(
+                            "private upstream without credential".to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(Upstream::Skipped(format!("upstream probe failed: {e:#}")));
+                    }
+                };
         }
         VerifyUpstream::Never => return Ok(Upstream::Unchecked),
     }
@@ -1190,7 +1216,7 @@ async fn observe_upstream_for_verification(
             };
             let credential = upstream_token.map(|t| SecretString::new(t.to_owned().into()));
             match ripclone::git::ls_remote_commit_async(
-                &provider,
+                provider,
                 &repo_id,
                 branch,
                 credential.as_ref(),
@@ -1218,7 +1244,7 @@ async fn observe_upstream_for_verification(
     Ok(Upstream::Tip(upstream_tip))
 }
 
-/// What `--verify-upstream` found before the clone.
+/// What `--verify-upstream` found.
 enum Upstream {
     /// The upstream tip the installed commit must equal.
     Tip(String),
