@@ -431,7 +431,7 @@ fn k6_a_side_pack_build_holds_no_head() {
     wait_output(&server, "acme/k6", &b, "full", "ready");
     wait_for("the side branch's publish", || {
         let (_, body) = api::read_commit(&server, "acme/k6", &b, Some("full"));
-        body["branches"]["side_pack"].is_object().then_some(())
+        body["branches"]["side_packs"][0].is_object().then_some(())
     });
     let full = world.target("full");
     let out = world.cli_env(

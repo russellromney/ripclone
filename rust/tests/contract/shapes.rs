@@ -1565,20 +1565,32 @@ fn g23_depth_one_clones_keep_only_the_tips_tags() {
     git(&listless, &["fsck", "--strict"]);
 }
 
-/// The side pack a read of `commit`'s Full points at.
-fn side_pack(server: &Server, repo: &str, commit: &str) -> Option<String> {
+/// The side pack layers a read of `commit`'s Full points at, oldest first.
+fn side_packs(server: &Server, repo: &str, commit: &str) -> Vec<String> {
     let (_, body) = api::read_commit(server, repo, commit, Some("full"));
-    body["branches"]["side_pack"]["pack"]
-        .as_str()
-        .map(str::to_string)
+    (body["branches"]["side_packs"]
+        .as_array()
+        .into_iter()
+        .flatten())
+    .filter_map(|layer| layer["pack"].as_str().map(str::to_string))
+    .collect()
+}
+
+/// The object count in the header of the stored pack `hash`.
+fn pack_objects(server: &Server, hash: &str) -> u32 {
+    let (status, pack) = server.get_bytes(&format!("/v1/artifacts/{hash}"));
+    assert_eq!(status, 200);
+    assert_eq!(&pack[..4], b"PACK");
+    u32::from_be_bytes(pack[8..12].try_into().unwrap())
 }
 
 /// G24: a push to the default branch keeps the side pack: the refresh
-/// publishes new branches and builds no side pack. A push to a side branch
-/// builds a new one, and so does a force-push of the default branch, after
-/// which a tag on its old commit needs that commit in the side pack. Each
-/// full clone has every branch and tag of `git clone`, from the server's
-/// refs.
+/// publishes new branches and builds no side pack. A push to a side branch,
+/// or a new tag, adds a layer holding only what it added. At eight layers
+/// the next change builds the side pack whole again, and so does a
+/// force-push of the default branch, after which a tag on its old commit
+/// needs that commit in the side pack. Each full clone has every branch
+/// and tag of `git clone`, from the server's refs.
 #[test]
 fn g24_the_side_pack_is_kept_while_only_the_default_branch_moves_on() {
     let world = World::new();
@@ -1605,26 +1617,37 @@ fn g24_the_side_pack_is_kept_while_only_the_default_branch_moves_on() {
     world.cli(&server, &["add", "acme/g24", "--wait"]).ok();
     wait_first_refs(&server, "acme/g24", &a);
     let repo = "acme/g24";
-    let first = side_pack(&server, repo, &a).expect("a side pack");
+    let first = side_packs(&server, repo, &a);
+    assert_eq!(first.len(), 1);
     assert_eq!(wrapper.notes("side"), 1);
 
-    // After `push` and its webhook, the side pack of `commit`'s Full, once
-    // a clone of it from the server's refs has every ref.
-    let clones = std::cell::Cell::new(0);
-    let published = |commit: &str, push: &dyn Fn()| {
-        clones.set(clones.get() + 1);
-        let before = api::branches_artifact(&server, repo, &a);
+    // After `push` and its webhook, the side pack layers of `commit`'s
+    // Full, once its branches or layers changed.
+    let refs = |commit: &str| {
+        (
+            api::branches_artifact(&server, repo, commit),
+            side_packs(&server, repo, commit),
+        )
+    };
+    let publish = |commit: &str, push: &dyn Fn()| {
+        let before = refs(&a);
         push();
         wait_for("the refresh's publish", || {
-            let now = api::branches_artifact(&server, repo, commit)?;
-            (Some(&now) != before.as_ref()).then_some(())
-        });
+            let now = refs(commit);
+            (now.0.is_some() && now != before).then_some(now.1)
+        })
+    };
+    // And a clone of it from the server's refs has every ref.
+    let clones = std::cell::Cell::new(0);
+    let published = |commit: &str, push: &dyn Fn()| {
+        let layers = publish(commit, push);
+        clones.set(clones.get() + 1);
         let clone = server_refs_clone(&world, &server, repo, &format!("clone-{}", clones.get()));
         assert_eq!(git(&clone, &["rev-parse", "HEAD"]), commit);
         assert_eq!(remote_refs(&clone), git_clone_remotes(&origin.bare, &[]));
         assert_eq!(tag_refs(&clone), git_clone_tags(&origin.bare, &[]).0);
         git(&clone, &["fsck", "--strict"]);
-        side_pack(&server, repo, commit).expect("a side pack")
+        layers
     };
 
     let b = origin.commit(&[("b.txt", "b\n")], "B");
@@ -1639,21 +1662,58 @@ fn g24_the_side_pack_is_kept_while_only_the_default_branch_moves_on() {
         "a default branch push built a side pack"
     );
 
-    let rebuilt = published(&b, &|| {
+    let s2 = std::cell::RefCell::new(String::new());
+    let layered = published(&b, &|| {
         git(work, &["checkout", "-q", "side"]);
-        let s2 = origin.commit(&[("s.txt", "s2\n")], "S2");
+        *s2.borrow_mut() = origin.commit(&[("s.txt", "s2\n")], "S2");
         git(work, &["tag", "on-b", &b]);
         git(work, &["checkout", "-q", "main"]);
         origin.publish_branch("side");
         git(work, &["push", "-q", bare, "on-b"]);
-        github_push(&server, secret, repo, "refs/heads/side", &s2);
+        github_push(&server, secret, repo, "refs/heads/side", &s2.borrow());
     });
-    assert_ne!(rebuilt, kept);
+    assert_eq!(layered.len(), 2, "{layered:?}");
     assert_eq!(
-        wrapper.notes("side"),
-        2,
-        "a side branch push kept the side pack"
+        layered[0], first[0],
+        "a side branch push rebuilt the side pack"
     );
+    assert_eq!(wrapper.notes("side"), 2);
+    // The layer holds S2's commit, tree and blob, and nothing older.
+    assert_eq!(pack_objects(&server, &layered[1]), 3);
+
+    // Annotated tags on B: a layer each, of the tag object alone, until
+    // eight; the next builds the side pack whole.
+    let mut below = layered.clone();
+    for n in 3..=9 {
+        // A clone of eight layers has every ref too.
+        let publish = |commit: &str, push: &dyn Fn()| match n {
+            8 => published(commit, push),
+            _ => publish(commit, push),
+        };
+        let layers = publish(&b, &|| {
+            let tag = format!("t{n}");
+            git(work, &["tag", "-a", "-m", &tag, &tag, &b]);
+            git(work, &["push", "-q", bare, &tag]);
+            let id = git(work, &["rev-parse", &tag]);
+            github_push(&server, secret, repo, &format!("refs/tags/{tag}"), &id);
+        });
+        if n <= 8 {
+            assert_eq!(layers.len(), n, "{layers:?}");
+            assert_eq!(layers[..n - 1], below[..], "{layers:?}");
+            assert_eq!(pack_objects(&server, &layers[n - 1]), 1, "tag t{n}");
+            below = layers;
+        } else {
+            assert_eq!(layers.len(), 1, "{layers:?}");
+            assert_ne!(layers[0], first[0]);
+        }
+    }
+    let whole = published(&b, &|| {
+        git(work, &["tag", "-a", "-m", "t10", "t10", &s2.borrow()]);
+        git(work, &["push", "-q", bare, "t10"]);
+        let id = git(work, &["rev-parse", "t10"]);
+        github_push(&server, secret, repo, "refs/tags/t10", &id);
+    });
+    assert_eq!(whole.len(), 2, "a layer on the whole side pack: {whole:?}");
 
     git(work, &["reset", "-q", "--hard", &a]);
     let c = origin.commit(&[("c.txt", "c\n")], "C");
@@ -1661,8 +1721,8 @@ fn g24_the_side_pack_is_kept_while_only_the_default_branch_moves_on() {
         git(work, &["push", "-q", "-f", bare, "main"]);
         github_push(&server, secret, repo, "refs/heads/main", &c);
     });
-    assert_ne!(forced, rebuilt);
-    assert_eq!(wrapper.notes("side"), 3, "a force-push kept the side pack");
+    assert_eq!(forced.len(), 1, "a force-push kept the layers: {forced:?}");
+    assert_ne!(forced[0], whole[0]);
 }
 
 /// G25: a full clone without the server's refs fetches every branch and
@@ -2301,7 +2361,7 @@ fn g18_a_bad_refs_base_or_side_pack_fails_the_clone_cleanly() {
     let full_a = api::commit_path(&t.repo, &t.a, Some("full"));
     let (_, body) = api::parse(t.server.get(&full_a));
     assert_eq!(body["refs_base"]["commit"], t.c.as_str(), "{body}");
-    let side = body["branches"]["side_pack"]["pack"]
+    let side = body["branches"]["side_packs"][0]["pack"]
         .as_str()
         .unwrap()
         .to_string();
@@ -2339,7 +2399,7 @@ fn every_branch_artifacts(t: &RefsRepo, commit: &str) -> [String; 2] {
             .get(&api::commit_path(&t.repo, commit, Some("full"))),
     );
     let branches = &full["branches"];
-    [&branches["artifact"], &branches["side_pack"]["pack"]].map(|hash| {
+    [&branches["artifact"], &branches["side_packs"][0]["pack"]].map(|hash| {
         hash.as_str()
             .expect("published branches and side pack")
             .to_string()

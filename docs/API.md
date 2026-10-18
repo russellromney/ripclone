@@ -129,12 +129,12 @@ pushed, moved, or deleted (see [Freshness](FRESHNESS.md#branches-and-tags)).
 
 A Full output also carries `branches` once the repository's refs are
 published: `artifact` and `artifact_url`, the repository's branches and the
-default branch's tip, and `side_pack` (`pack`, `pack_len`, `pack_url`,
-`idx`, `idx_len`, `idx_url`), the objects the other branches and tags reach
-that the default branch's history does not. It is left out when every ref
-is in that history. A full clone that holds the default branch's tip
-installs the side pack and writes every branch as
-`refs/remotes/origin/<branch>`.
+default branch's tip, and `side_packs`, a list of layers (`pack`,
+`pack_len`, `pack_url`, `idx`, `idx_len`, `idx_url`) that together hold the
+objects the other branches and tags reach that the default branch's history
+does not. It is empty when every ref is in that history. A full clone that
+holds the default branch's tip installs every layer and writes every branch
+as `refs/remotes/origin/<branch>`.
 
 A Full of another commit also carries `refs_base` when the default branch's
 tip has a ready Full and is not in the commit's own history: that Full's

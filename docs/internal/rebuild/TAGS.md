@@ -506,7 +506,8 @@ branch.
    `--single-branch`.
 
 **Cost.** No new round trip on the common path. The server builds one
-pack per change of a branch or tag other than the default branch. A push
+pack per change of a branch or tag other than the default branch: a
+layer of what changed, and the whole side pack every eighth change. A push
 that only moves the default branch forward keeps the side pack (see "As
 built").
 
@@ -521,15 +522,26 @@ The trial scripts compare `git branch -r` with `git clone`'s.
 - **Two artifacts, not one.** The tags artifact stays as it was. A
   separate branches artifact (`BranchesArtifact`: default branch, base D,
   and each branch's commit) and the side pack with its idx sit next to it
-  in the `repo_refs` row (schema 7). Only a Full response carries the
+  in the `repo_refs` row (schema 8). Only a Full response carries the
   branches artifact and side pack URLs.
 - **The side pack is kept while only the default branch moves on.** The
   row stores the commit the side pack leaves out (`side_base`) and a hash
   of the tips it completes: every branch but the default branch, and every
   tag. A refresh with the same tips, whose new D has `side_base` in its
   history, publishes the new branches with the old side pack: what that
-  pack leaves out is still in D's history. A changed tip, or a force-push
-  of the default branch, builds a new one (G24).
+  pack leaves out is still in D's history. A force-push of the default
+  branch builds a new one (G24).
+- **A changed tip adds a layer.** The side pack is a list of layers, oldest
+  first. When the tips change and D only moved forward, the refresh packs
+  what the new tips reach that the old tips and the new D do not (`^old`
+  for each old tip, and `^D`), and adds it as one more layer. The old tips
+  are listed in a file in the mirror, `ripclone-side-tips`, used only when
+  its hash is the row's. A push to a side branch or a new tag then stores
+  about what it added: on tokio, a tag push uploaded the 1.7 MB side pack
+  again before, and a one-object layer now. At eight layers, when the file
+  is missing or stale, or when a layer cannot be built (an old tip a
+  repack dropped), the refresh builds the side pack whole as one layer.
+  A clone downloads every layer at once and installs each (G24).
 - **Who publishes what.** Head publishes the tags only, as before, so a
   ready Head still never points at older tags and pays no side pack
   build. The refresh publishes everything. It builds and uploads the
