@@ -22,7 +22,10 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | `RUST_LOG` | Tracing filter. |
 
 `ripclone clone` takes `--branch`, `--depth`, `--mode`, `--at`, `--wait`,
-`--bench` and `--verify-upstream`; `ripclone clone --help` explains each.
+`--bench`, `--verify-upstream`, `--quiet` and `--progress`; `ripclone clone
+--help` explains each. The progress line is drawn only when stderr is a
+terminal, unless `--progress` is given; `--quiet` prints only warnings and
+errors.
 
 ## Server
 

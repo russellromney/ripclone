@@ -135,6 +135,8 @@ ripclone clone owner/repo --wait            # wait for the exact full build, no 
 ripclone clone gitlab:group/project         # another provider
 ripclone clone https://github.com/owner/repo.git  # a pasted clone URL works anywhere owner/repo does
 ripclone clone owner/repo --bench           # print a per-phase timing report
+ripclone clone owner/repo --quiet           # no progress or notes on stderr
+ripclone clone owner/repo --progress        # progress on stderr even when it is not a terminal
 ripclone sync owner/repo                    # build the default branch tip
 ripclone sync owner/repo --at <ref> [--wait]
 ripclone add owner/repo [--wait]

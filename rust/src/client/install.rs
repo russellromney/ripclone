@@ -124,6 +124,20 @@ impl Client {
         target: &Path,
         bench: Option<&mut Benchmark>,
     ) -> Result<CloneOutcome> {
+        let client = Self {
+            progress: self.progress.fresh(),
+            ..self.clone()
+        };
+        let _drawing = client.progress.draw();
+        client.install(request, target, bench).await
+    }
+
+    async fn install(
+        &self,
+        request: &CloneRequest<'_>,
+        target: &Path,
+        bench: Option<&mut Benchmark>,
+    ) -> Result<CloneOutcome> {
         let repo_path = request.repo_path;
         info!(
             "installing {repo_path}#{} into {} as {}",
@@ -291,7 +305,9 @@ impl Client {
                         return Ok((plan, cold));
                     }
                     if attempt == 0 {
-                        eprintln!("ripclone: warming {repo_path} — this can take a moment…");
+                        self.progress
+                            .note(&format!("warming {repo_path} — this can take a moment…"));
+                        self.progress.phase("waiting for the build");
                     }
                     if attempt + 1 < MAX_POLLS {
                         tokio::time::sleep(poll_delay(attempt)).await;
@@ -341,6 +357,7 @@ impl Client {
     ) -> Result<PathBuf> {
         let output = plan.output();
         let urls = OutputUrls::new(repo_path, output.clone());
+        self.progress.phase("fetching manifest");
         match plan {
             Plan::Files(_) => {
                 return self
@@ -358,6 +375,8 @@ impl Client {
             .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
             .await?;
         if let Plan::TopUp { base, upstream_url } = plan {
+            self.progress
+                .phase(format!("fetching {} from upstream", &pin.commit[..7]));
             top_up(&root, upstream_url, &pin.commit, cleanup)
                 .await
                 .with_context(|| {
@@ -479,6 +498,7 @@ impl Client {
             .join()
             .await
             .context("archive download coordinator")??;
+        self.progress.phase("writing files");
         bridge.join().await.context("archive download bridge")?;
         let stats = extractor
             .join()
@@ -621,6 +641,8 @@ impl Client {
             let artifacts: Vec<Artifact> = (manifest.archive_chunks.iter().enumerate())
                 .map(|(index, chunk)| Artifact::chunk(chunk, UrlSlot::ArchiveChunk(index)))
                 .collect();
+            self.progress
+                .add_total(artifacts.iter().filter_map(|a| a.len).sum());
             stream::iter(artifacts.into_iter().enumerate())
                 .map(|(index, artifact)| {
                     let (client, urls, tx) = (&self, &urls, tx.clone());
@@ -677,6 +699,22 @@ impl Client {
         let full = manifest.packs.iter().any(|entry| entry.history_only);
         // Only a Head's `.git` keeps the HEAD packs.
         let head_pack_dir = pack_dir.filter(|_| !full);
+        // The planned download: the packs fetched, each history pack's own
+        // idx, and a Head's idx bundle and multi-pack-index.
+        let wanted = |entry: &&PackEntry| pack_dir.is_some() || !entry.history_only;
+        let pack_bytes: u64 = (manifest.packs.iter().filter(wanted))
+            .flat_map(|entry| {
+                let own_idx = entry.idx.as_ref().filter(|_| entry.history_only);
+                entry.pack.iter().chain(own_idx)
+            })
+            .map(|chunk| chunk.len)
+            .sum();
+        let index_bytes: u64 = [&manifest.idx_bundle, &manifest.midx]
+            .into_iter()
+            .filter(|_| head_pack_dir.is_some())
+            .filter_map(|chunk| chunk.as_ref().map(|chunk| chunk.len))
+            .sum();
+        self.progress.add_total(pack_bytes + index_bytes);
         let fetch = |artifact: Artifact, what: &'static str| {
             let (client, urls) = (self.clone(), urls.clone());
             AbortOnDrop::new(
@@ -767,8 +805,7 @@ impl Client {
 
         // Stage 1: download packs (network concurrency `download_conc`).
         // History packs hold no blob of the working tree.
-        let packs = (manifest.packs.iter().enumerate())
-            .filter(|(_, entry)| pack_dir.is_some() || !entry.history_only);
+        let packs = (manifest.packs.iter().enumerate()).filter(|(_, entry)| wanted(entry));
         let downloads = stream::iter(packs).map(|(i, entry): (usize, &PackEntry)| {
             let (client, urls, idx_bundle, entry) = (
                 self.clone(),
@@ -953,6 +990,7 @@ impl Client {
         let Some(pack_dir) = pack_dir else {
             return Ok(total);
         };
+        self.progress.phase("writing index");
 
         // Files are materialized and each gitlink has its empty directory;
         // clear skip-worktree for every tracked path, as `git clone` leaves it.

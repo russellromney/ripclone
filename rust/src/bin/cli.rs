@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use ripclone::ExactResultKind;
 use ripclone::auth::token_store::{FileBackedTokenStore, TokenStore};
 use ripclone::bench::Benchmark;
-use ripclone::client::{Client, CloneRequest};
+use ripclone::client::{Client, CloneRequest, Stderr};
 use ripclone::config::ProviderEntry;
 use ripclone::mode::CloneMode;
 use ripclone::provider::{ProviderInstance, ProviderKind, ProviderRegistry, RepoId};
@@ -111,6 +111,13 @@ enum Commands {
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
+        /// Operate quietly: no progress or notes on stderr, only warnings
+        /// and errors. Progress is shown only when stderr is a terminal.
+        #[arg(short, long, conflicts_with = "progress")]
+        quiet: bool,
+        /// Show progress on stderr even when it is not a terminal.
+        #[arg(long)]
+        progress: bool,
         /// Cross-check the installed tip against the upstream git host.
         /// `auto` (default) enables verification for public repos and whenever an
         /// upstream credential is available; `always` requires verification;
@@ -460,6 +467,18 @@ async fn run_update() -> Result<()> {
         Err(e) => println!("could not read the latest release ({e})"),
     }
     Ok(())
+}
+
+/// What a waiting command writes to stderr: `--quiet` nothing, `--progress`
+/// or a terminal a progress line, else notes only.
+fn stderr_mode(quiet: bool, progress: bool) -> Stderr {
+    if quiet {
+        Stderr::Quiet
+    } else if progress || std::io::stderr().is_terminal() {
+        Stderr::Progress
+    } else {
+        Stderr::Notes
+    }
 }
 
 fn is_cloud_default(server: &str) -> bool {
@@ -813,7 +832,7 @@ async fn run() -> Result<()> {
         },
         Commands::Add { repo, wait } => {
             let (provider, repo_path) = resolve_repo(&repo, default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
+            let client = (client.with_provider(&provider)).with_stderr(stderr_mode(false, false));
             let summary = client.add_repo(&repo_path).await?;
             if wait {
                 let summary = client.wait_for_build(&repo_path, summary).await?;
@@ -855,7 +874,7 @@ async fn run() -> Result<()> {
                 Selector::parse(at).map_err(|e| usage(format!("--at {at}: {e:#}")))?;
             }
             let (provider, repo_path) = resolve_repo(&repo, default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
+            let client = (client.with_provider(&provider)).with_stderr(stderr_mode(false, false));
             if wait || at.is_some() {
                 let selector = at.as_deref().unwrap_or("HEAD");
                 let summary = client.build_and_wait(&repo_path, selector).await?;
@@ -877,6 +896,8 @@ async fn run() -> Result<()> {
             depth,
             at,
             bench,
+            quiet,
+            progress,
             verify_upstream,
             wait,
         } => {
@@ -892,7 +913,9 @@ async fn run() -> Result<()> {
             // from one the server names.
             let local_provider = provider_instance(&provider, &provider_registry)
                 .with_context(|| format!("provider '{provider}' is not configured locally"))?;
-            let client = client.with_provider_instance(local_provider);
+            let client = client
+                .with_provider_instance(local_provider)
+                .with_stderr(stderr_mode(quiet, progress));
             let target_name = repo_path
                 .rsplit('/')
                 .next()
