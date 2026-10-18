@@ -859,22 +859,32 @@ async fn run() -> Result<()> {
             // A failed clone must leave it there.
             let target_was_dir = target.is_dir();
             // The upstream's tip is read beside the clone, so the check adds
-            // no wait unless the upstream answers after the clone is done.
+            // no wait unless the upstream answers after the download is done.
+            // The clone installs the tip it reads, whatever the server named.
+            let (tip_tx, tip_rx) = tokio::sync::oneshot::channel();
             let observe = async {
-                match check {
+                let upstream = match check {
                     UpstreamCheck::Read(provider) => {
                         observe_upstream(&provider, &repo_path, &branch, verify_upstream).await
                     }
                     UpstreamCheck::Known(upstream) => Ok(upstream),
+                };
+                if let Ok(Upstream::Tip(tip)) = &upstream {
+                    let _ = tip_tx.send(tip.clone());
                 }
+                upstream
             };
             let (upstream, outcome) = tokio::join!(
                 observe,
-                client.clone_repo(&request, &target, bench.then_some(&mut benchmark))
+                client.clone_repo(
+                    &request,
+                    &target,
+                    Some(tip_rx),
+                    bench.then_some(&mut benchmark)
+                )
             );
             let outcome = outcome?;
             let total_ms = u64::try_from(clone_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            println!("installed {} into {}", repo_path, target.display());
             let verified = match upstream {
                 Ok(upstream) => {
                     verify_upstream_snapshot(&target, &outcome.commit, &upstream, verify_upstream)
@@ -893,6 +903,7 @@ async fn run() -> Result<()> {
                     })?;
                 return Err(error);
             }
+            println!("installed {} into {}", repo_path, target.display());
             if bench {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);

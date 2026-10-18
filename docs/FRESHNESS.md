@@ -17,8 +17,14 @@ finished building the commit it asked for.
    Typical times are in [Benchmarks](BENCHMARKS.md#build-time).
 3. A published result never changes.
 
-A clone of a branch asks the server once which commit the branch points at
-and installs that commit, even if the branch moves during the clone.
+A clone of a branch asks the server which commit the branch points at and
+downloads that commit. With `--verify-upstream`, the CLI also reads the branch
+from the git host while it downloads, and installs the commit it read. If a
+push landed between the two reads, or the server is behind, the CLI fetches
+that commit from the git host on top of the download before the clone is
+published, as a top-up does. Without the check (Files clones, `never`, or an
+`auto` clone that cannot reach the git host), the clone installs the commit
+the server named.
 
 ## What each clone waits for
 

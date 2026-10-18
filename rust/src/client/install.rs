@@ -128,10 +128,18 @@ impl Client {
     /// directory. Downloads the
     /// prebuilt `.git` and working tree of one ready output and lays them
     /// down directly; the server already ran every git step.
+    ///
+    /// `upstream_tip` is the branch tip the caller read from the upstream
+    /// while the clone downloads. An editable clone installs that commit:
+    /// when the server named another one, because a push landed between
+    /// the two reads or the server is behind, the clone fetches the tip from
+    /// the upstream before it is published. A dropped sender leaves the
+    /// server's commit.
     pub async fn clone_repo(
         &self,
         request: &CloneRequest<'_>,
         target: &Path,
+        upstream_tip: Option<tokio::sync::oneshot::Receiver<String>>,
         bench: Option<&mut Benchmark>,
     ) -> Result<CloneOutcome> {
         let client = Self {
@@ -139,13 +147,14 @@ impl Client {
             ..self.clone()
         };
         let _drawing = client.progress.draw();
-        client.install(request, target, bench).await
+        client.install(request, target, upstream_tip, bench).await
     }
 
     async fn install(
         &self,
         request: &CloneRequest<'_>,
         target: &Path,
+        upstream_tip: Option<tokio::sync::oneshot::Receiver<String>>,
         bench: Option<&mut Benchmark>,
     ) -> Result<CloneOutcome> {
         let repo_path = request.repo_path;
@@ -161,7 +170,7 @@ impl Client {
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
-        let pin = self.resolve(request).await?;
+        let mut pin = self.resolve(request).await?;
         // A full clone never waits on the server: while Full(B) builds, it
         // installs the newest ready Full and fetches the rest upstream. A
         // files clone takes B's working tree from Head(B) while Files(B)
@@ -197,7 +206,16 @@ impl Client {
         let close_on_drop = CloseOnDrop(cleanup.clone());
         let result = async {
             let root = self
-                .materialize(repo_path, &pin, &plan, target, &staging, &cleanup, bench)
+                .materialize(
+                    repo_path,
+                    &mut pin,
+                    &plan,
+                    upstream_tip,
+                    target,
+                    &staging,
+                    &cleanup,
+                    bench,
+                )
                 .await?;
             publish(&root, target, keep)
         }
@@ -365,13 +383,15 @@ impl Client {
     }
 
     /// Build the clone in a new staging directory next to `target` and
-    /// return its path.
+    /// return its path. An editable clone ends at `upstream_tip` when one
+    /// arrives, and `pin` names that commit.
     #[allow(clippy::too_many_arguments)]
     async fn materialize(
         &self,
         repo_path: &str,
-        pin: &Pin,
+        pin: &mut Pin,
         plan: &Plan,
+        upstream_tip: Option<tokio::sync::oneshot::Receiver<String>>,
         target: &Path,
         staging: &Staging,
         cleanup: &Cleanup,
@@ -542,11 +562,49 @@ impl Client {
                 ident
             }
         };
+        // The tip read while the packs downloaded is the commit the clone
+        // installs; the server's commit is only where the download started.
+        let moved_from = match upstream_tip {
+            Some(tip) => match tip.await {
+                Ok(tip) if tip != pin.commit => Some(std::mem::replace(&mut pin.commit, tip)),
+                _ => None,
+            },
+            None => None,
+        };
         let mut reaches = None;
-        if let Plan::TopUp { base, upstream_url } = plan {
+        if let Some(server_commit) = &moved_from {
+            crate::validation::validate_object_id(&pin.commit).context("invalid upstream tip")?;
+            self.progress.note(&format!(
+                "{repo_path} is at {} upstream, not {}; fetching it",
+                &pin.commit[..12],
+                &server_commit[..12]
+            ));
+            let upstream_url = self.top_up_url(repo_path)?;
             self.progress
                 .phase(format!("fetching {} from upstream", &pin.commit[..7]));
-            top_up(&root, upstream_url, &pin.commit, cleanup)
+            let shallow = output.result == ExactResultKind::Head;
+            top_up(&root, &upstream_url, &pin.commit, shallow, cleanup)
+                .await
+                .with_context(|| {
+                    format!(
+                        "fetch of upstream tip {} failed (the server named {server_commit})",
+                        pin.commit
+                    )
+                })?;
+            // The installed objects are the base's on a top-up, else the
+            // server's commit's; after a force-push they are no part of the
+            // new tip's history. A depth-1 clone keeps only the tip's tags.
+            let installed = match plan {
+                Plan::TopUp { base, .. } => &base.commit,
+                _ => server_commit,
+            };
+            if !shallow && !is_ancestor(&root, installed, &pin.commit, cleanup).await? {
+                reaches = Some(pin.commit.as_str());
+            }
+        } else if let Plan::TopUp { base, upstream_url } = plan {
+            self.progress
+                .phase(format!("fetching {} from upstream", &pin.commit[..7]));
+            top_up(&root, upstream_url, &pin.commit, false, cleanup)
                 .await
                 .with_context(|| {
                     format!(
@@ -1455,18 +1513,25 @@ impl Client {
 /// fetch of that exact commit from the upstream, then a checkout. The user's
 /// config and credential helpers apply; no ripclone token or provider config
 /// takes part. When the base is not an ancestor of `target` (a force-push),
-/// the fetch just transfers more.
-async fn top_up(root: &Path, upstream_url: &str, target: &str, cleanup: &Cleanup) -> Result<()> {
-    let fetch = [
+/// the fetch just transfers more. A `shallow` clone stays at depth 1.
+async fn top_up(
+    root: &Path,
+    upstream_url: &str,
+    target: &str,
+    shallow: bool,
+    cleanup: &Cleanup,
+) -> Result<()> {
+    let mut fetch = vec![
         "fetch",
         "--no-write-fetch-head",
         "--no-tags",
         "--no-recurse-submodules",
         "--refmap=",
-        "--",
-        upstream_url,
-        target,
     ];
+    if shallow {
+        fetch.push("--depth=1");
+    }
+    fetch.extend(["--", upstream_url, target]);
     run_git(root, &fetch, cleanup)
         .await
         .with_context(|| format!("fetch {target} from {upstream_url}"))?;
