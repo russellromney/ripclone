@@ -3,7 +3,10 @@
 #
 #   RIPCLONE_GITHUB_TOKEN=... scripts/trial_github.sh owner/private-repo...
 #
-# The server reads the repos with RIPCLONE_GITHUB_TOKEN. The user's git
+# The server reads the repos with RIPCLONE_GITHUB_TOKEN, or as a GitHub App
+# when RIPCLONE_GITHUB_APP_ID and RIPCLONE_GITHUB_APP_PRIVATE_KEY are set; the
+# app must be installed on every repo, which may be on different accounts.
+# The user's git
 # authenticates with their gh login (`gh auth git-credential`), or with
 # RIPCLONE_TRIAL_GIT_TOKEN when set. Each repo gets add, full, depth-1 and
 # files clones, compared with `git clone` (history, tree, local config,
@@ -13,9 +16,23 @@
 # directory. Exits non-zero on any failed check.
 set -o pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/trial_lib.sh"
-[ -n "${RIPCLONE_GITHUB_TOKEN:-}" ] || { echo "error: set RIPCLONE_GITHUB_TOKEN" >&2; exit 2; }
+if [ -n "${RIPCLONE_GITHUB_APP_ID:-}" ]; then
+  [ -n "${RIPCLONE_GITHUB_APP_PRIVATE_KEY:-}" ] || { echo "error: set RIPCLONE_GITHUB_APP_PRIVATE_KEY" >&2; exit 2; }
+  CREDENTIAL="the GitHub App"
+  SERVER_CONFIG=""
+  SERVER_ENV=(RIPCLONE_GITHUB_APP_ID="$RIPCLONE_GITHUB_APP_ID" RIPCLONE_GITHUB_APP_PRIVATE_KEY="$RIPCLONE_GITHUB_APP_PRIVATE_KEY")
+  SECRETS=()
+elif [ -n "${RIPCLONE_GITHUB_TOKEN:-}" ]; then
+  CREDENTIAL="the GitHub token"
+  SERVER_CONFIG="$(printf '[providers.github]\nkind = "github"\ntoken = "%s"' "$RIPCLONE_GITHUB_TOKEN")"
+  SERVER_ENV=()
+  SECRETS=("$RIPCLONE_GITHUB_TOKEN")
+else
+  echo "error: set RIPCLONE_GITHUB_TOKEN, or RIPCLONE_GITHUB_APP_ID and RIPCLONE_GITHUB_APP_PRIVATE_KEY" >&2
+  exit 2
+fi
 [ $# -gt 0 ] || { echo "usage: $0 owner/private-repo..." >&2; exit 2; }
-SECRETS=("$RIPCLONE_GITHUB_TOKEN" "${RIPCLONE_TRIAL_GIT_TOKEN:-$RIPCLONE_GITHUB_TOKEN}")
+[ -n "${RIPCLONE_TRIAL_GIT_TOKEN:-}" ] && SECRETS+=("$RIPCLONE_TRIAL_GIT_TOKEN")
 trap trial_cleanup EXIT
 
 step "the repos are private"
@@ -24,10 +41,10 @@ for repo in "$@"; do
     && bad "$repo is readable anonymously" || ok "$repo refuses anonymous reads"
 done
 
-step "server with the GitHub token"
+step "server with $CREDENTIAL"
 export RIPCLONE_SERVER_TOKEN="$(openssl rand -hex 32)"
 SECRETS+=("$RIPCLONE_SERVER_TOKEN")
-start_server server "$(printf '[providers.github]\nkind = "github"\ntoken = "%s"' "$RIPCLONE_GITHUB_TOKEN")"
+start_server server "$SERVER_CONFIG" "${SERVER_ENV[@]}"
 export RIPCLONE_SERVER="$SERVER_URL"
 ok "$SERVER_URL"
 
@@ -74,6 +91,6 @@ expect_failure rc add "$1-no-such-repo" --wait
 start_server no-token ""
 expect_failure env RIPCLONE_SERVER="$SERVER_URL" "$BIN/ripclone" add "$1" --wait
 expect_failure env RIPCLONE_SERVER="$SERVER_URL" "$BIN/ripclone" clone "$1" no-token
-[ ! -e no-token ] && ok "no directory from a server without a token" || bad "no-token written"
+[ ! -e no-token ] && ok "no directory from a server without a credential" || bad "no-token written"
 
 trial_finish

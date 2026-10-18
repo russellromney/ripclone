@@ -54,13 +54,15 @@ server at startup with an error that names the variable.
 ### GitHub App credentials
 
 Instead of a static token, the server can mint short-lived installation tokens
-for GitHub repos:
+for GitHub repos. It looks up the app's installation on each repo, so one app
+serves every account that installed it; a repo the app is not installed on is
+read anonymously. A lookup is reused for ten minutes, so a new installation
+takes effect within that time.
 
 | Variable | Meaning |
 |---|---|
 | `RIPCLONE_GITHUB_APP_ID` | App id. Setting it turns the GitHub App broker on. |
-| `RIPCLONE_GITHUB_APP_INSTALLATION_ID` | Installation id. Required with the app id. |
-| `RIPCLONE_GITHUB_APP_PRIVATE_KEY` | The app's PEM private key. |
+| `RIPCLONE_GITHUB_APP_PRIVATE_KEY` | The app's PEM private key. One line with literal `\n` escapes also works. |
 | `RIPCLONE_GITHUB_API_BASE` | GitHub API base URL for GitHub Enterprise, `https://` only. Default `https://api.github.com`. |
 
 ## Build scheduling
