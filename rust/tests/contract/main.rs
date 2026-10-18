@@ -5,6 +5,8 @@
 
 mod harness;
 mod net;
+#[path = "../../src/test_tmp.rs"]
+mod test_tmp;
 
 mod cli;
 mod coalesce;

@@ -12,7 +12,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 
 pub use crate::net::{Fault, FaultProxy, GitHttp, Seen};
 
@@ -97,9 +96,10 @@ pub fn git_cmd() -> Command {
     cmd
 }
 
-/// Everything one test needs, under one temp dir.
+/// Everything one test needs, under one temp dir. Dropping it removes the
+/// dir, or fails the test.
 pub struct World {
-    pub dir: TempDir,
+    dir: PathBuf,
     /// Where the server and CLI find origins: `file://` by default, or the
     /// URL of a [`GitHttp`] after [`World::serve_origins_over_http`].
     origin_base: Mutex<String>,
@@ -113,11 +113,12 @@ impl Default for World {
 
 impl World {
     pub fn new() -> Self {
-        let dir = tempfile::tempdir().expect("world dir");
+        // Removed by `Drop for World`, which retries and checks.
+        let dir = tempfile::tempdir().expect("world dir").keep();
         for sub in ["origins", "server", "home", "work"] {
-            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        let origin_base = Mutex::new(format!("file://{}", dir.path().join("origins").display()));
+        let origin_base = Mutex::new(format!("file://{}", dir.join("origins").display()));
         Self { dir, origin_base }
     }
 
@@ -134,7 +135,7 @@ impl World {
     }
 
     pub fn path(&self, sub: &str) -> PathBuf {
-        self.dir.path().join(sub)
+        self.dir.join(sub)
     }
 
     /// A git origin served to the server at `github:<owner>/<name>`.
@@ -145,7 +146,7 @@ impl World {
         let bare = self.path("origins").join(owner).join(format!("{name}.git"));
         std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
         git(
-            self.dir.path(),
+            &self.dir,
             &["init", "--bare", "-q", "-b", "main", bare.to_str().unwrap()],
         );
         // The server's fetches run upload-pack here with their own environment.
@@ -309,6 +310,36 @@ impl World {
             .collect();
         names.sort();
         names
+    }
+}
+
+impl Drop for World {
+    /// Remove the world dir. A killed server's git children can still be
+    /// writing in it for a moment (a parked fetch resumes when its origin
+    /// shuts down), so removal is retried. A dir that will not go fails the
+    /// test rather than being left behind silently.
+    fn drop(&mut self) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let removed = std::fs::remove_dir_all(&self.dir);
+            if std::fs::symlink_metadata(&self.dir).is_err() {
+                return;
+            }
+            if Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            let message = format!(
+                "world dir {} was not removed: {removed:?}",
+                self.dir.display()
+            );
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+            return;
+        }
     }
 }
 

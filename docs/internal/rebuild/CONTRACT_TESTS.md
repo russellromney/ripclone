@@ -39,6 +39,10 @@ a unit test or it is not needed.
 4. **Parallel.** Each test gets its own tempdir, server process, and port (the
    server binds `:0` and prints the bound address). No shared statics, no
    `--test-threads=1`, no `lsm_on_`/`lsm_off_` passes.
+   Every temp dir a test process makes is under `$TMPDIR/ripclone-test-<pid>`
+   (`rust/src/test_tmp.rs`). The next test run removes it if the process was
+   killed mid-run. A World dir that cannot be removed fails its test, and
+   `scripts/ci.sh test` fails if the tests leave anything in their `TMPDIR`.
 5. **No 2 s floor.** One documented setting, `RIPCLONE_POLL_MS`, shortens client
    and server polling for every test.
 6. **No proving a negative by sleeping.** Wait on an observable event (a
