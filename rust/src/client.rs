@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 
 mod download;
 mod install;
+mod progress;
 mod staging;
 mod tuning;
 
 pub use install::CloneRequest;
+pub use progress::Stderr;
 pub use staging::wait_for_cancelled_cleanup;
 
 /// Sent on every request so the server can attribute usage and nudge upgrades.
@@ -68,6 +70,19 @@ impl BuildSummary {
         self.outputs()
             .iter()
             .all(|(_, output)| output.state == "ready")
+    }
+
+    /// Each output's state, e.g. `Head ready, Files pending, Full pending`.
+    fn states(&self) -> String {
+        let states = self.outputs().map(|(kind, output)| {
+            let name = match kind {
+                ExactResultKind::Head => "Head",
+                ExactResultKind::Files => "Files",
+                ExactResultKind::Full => "Full",
+            };
+            format!("{name} {}", output.state)
+        });
+        states.join(", ")
     }
 
     /// The first failed output and its error.
@@ -209,7 +224,11 @@ fn transport_cause(e: &reqwest::Error) -> String {
 /// Turn a non-success HTTP response into a clear, actionable error. Parses the
 /// `{ "error", "code" }` body the gateway returns and appends a next-step hint
 /// keyed on status/code. Surfaces an upgrade nudge from `X-Ripclone-Upgrade`.
-async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
+async fn server_error(
+    progress: &progress::Progress,
+    context: &str,
+    resp: reqwest::Response,
+) -> anyhow::Error {
     let status = resp.status();
     let origin = resp.url().origin().unicode_serialization();
     let is_cloud = origin == "https://ripclone.com";
@@ -234,7 +253,7 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
         });
     let hint = error_hint(status.as_u16(), code, is_cloud);
     if let Some(u) = upgrade {
-        eprintln!("ripclone: {u}");
+        progress.note(&u);
     }
     HttpFailure::status(status.as_u16(), format!("{context}: {msg}{hint}"))
 }
@@ -365,6 +384,8 @@ pub struct Client {
     provider_instance: Option<ProviderInstance>,
     /// When true, suppress the post-clone metrics report regardless of env.
     skip_metrics: bool,
+    /// What a clone writes to stderr, and the running clone's counts.
+    progress: progress::Progress,
 }
 
 impl Client {
@@ -420,6 +441,7 @@ impl Client {
             provider: "github".to_string(),
             provider_instance: None,
             skip_metrics: false,
+            progress: progress::Progress::new(Stderr::default()),
         }
     }
 
@@ -441,6 +463,12 @@ impl Client {
     /// honored via `clone_metrics::opted_out`.
     pub fn with_metrics_disabled(mut self) -> Self {
         self.skip_metrics = true;
+        self
+    }
+
+    /// Choose what clones write to stderr; see [`Stderr`].
+    pub fn with_stderr(mut self, mode: Stderr) -> Self {
+        self.progress = progress::Progress::new(mode);
         self
     }
 
@@ -480,7 +508,7 @@ impl Client {
             .send(self.http.request(reqwest::Method::GET, &url))
             .await?;
         if !resp.status().is_success() {
-            return Err(server_error("list failed", resp).await);
+            return Err(server_error(&self.progress, "list failed", resp).await);
         }
         resp.json()
             .await
@@ -494,7 +522,7 @@ impl Client {
             .send(self.http.request(reqwest::Method::DELETE, &url))
             .await?;
         if !resp.status().is_success() {
-            return Err(server_error("rm failed", resp).await);
+            return Err(server_error(&self.progress, "rm failed", resp).await);
         }
         Ok(())
     }
@@ -525,7 +553,7 @@ impl Client {
             .json(&serde_json::json!({"selector": selector, "retry": retry}));
         let resp = self.send(request).await?;
         if !resp.status().is_success() {
-            return Err(server_error("build request failed", resp).await);
+            return Err(server_error(&self.progress, "build request failed", resp).await);
         }
         let clone_id = resp
             .headers()
@@ -554,7 +582,7 @@ impl Client {
             .send(self.http.request(reqwest::Method::GET, &url))
             .await?;
         if !resp.status().is_success() {
-            return Err(server_error("build lookup failed", resp).await);
+            return Err(server_error(&self.progress, "build lookup failed", resp).await);
         }
         let summary: BuildSummary = resp
             .json()
@@ -581,7 +609,7 @@ impl Client {
             .send(self.http.request(reqwest::Method::GET, &url))
             .await?;
         if !resp.status().is_success() {
-            return Err(server_error("build lookup failed", resp).await);
+            return Err(server_error(&self.progress, "build lookup failed", resp).await);
         }
         resp.json()
             .await
@@ -600,10 +628,22 @@ impl Client {
     pub async fn wait_for_build(
         &self,
         repo_path: &str,
-        mut summary: BuildSummary,
+        summary: BuildSummary,
     ) -> Result<BuildSummary> {
+        let client = Self {
+            progress: self.progress.fresh(),
+            ..self.clone()
+        };
+        let _drawing = client.progress.draw();
+        client.poll_build(repo_path, summary).await
+    }
+
+    async fn poll_build(&self, repo_path: &str, mut summary: BuildSummary) -> Result<BuildSummary> {
+        self.progress
+            .phase(format!("waiting for {}", &summary.commit[..7]));
         let mut attempt = 0;
         while summary.pending() {
+            self.progress.detail(summary.states());
             if attempt == MAX_POLLS {
                 anyhow::bail!(
                     "{repo_path} is still building {} after {MAX_POLLS} polls; run the command again to keep waiting",
@@ -631,7 +671,7 @@ impl Client {
             .send(self.http.request(reqwest::Method::POST, &url))
             .await?;
         if !resp.status().is_success() {
-            return Err(server_error("add failed", resp).await);
+            return Err(server_error(&self.progress, "add failed", resp).await);
         }
         let summary: BuildSummary = resp
             .json()

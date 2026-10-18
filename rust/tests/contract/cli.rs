@@ -1,0 +1,260 @@
+//! I13, I14. What the CLI writes to stderr.
+
+use crate::downloads::noise;
+use crate::harness::*;
+use crate::net::{Fault, FaultProxy};
+use std::io::Read;
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+
+/// I13: the progress line is for a terminal only. A clone whose stderr is a
+/// pipe writes nothing there in any shape, and `--quiet` also drops the
+/// "warming" note a pending build prints.
+#[test]
+fn i13_piped_clone_prints_no_progress() {
+    let world = World::new();
+    let origin = world.origin("acme", "i13");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    origin.commit(&[("dir/b.txt", "b\n")], "B");
+    origin.publish();
+    let mut server = world.server(&[]);
+    world.cli(&server, &["add", "acme/i13", "--wait"]).ok();
+
+    let shapes: [&[&str]; 4] = [&["--depth", "1"], &[], &["--mode", "files"], &["--quiet"]];
+    for (i, flags) in shapes.into_iter().enumerate() {
+        let target = world.target(&format!("i13-{i}"));
+        let mut args = vec!["clone", "acme/i13", target.to_str().unwrap()];
+        args.extend_from_slice(flags);
+        let out = world.cli(&server, &args);
+        out.ok();
+        assert_eq!(out.stderr(), "", "{flags:?} wrote to stderr");
+    }
+
+    server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
+    let c = origin.commit(&[("a.txt", "c\n")], "C");
+    origin.publish();
+    let target = world.target("i13-pending");
+    let args = ["clone", "acme/i13", target.to_str().unwrap(), "--wait"];
+    // Polls 50 ms apart run the CLI's 40-poll budget out in about 2 s.
+    let poll = [("RIPCLONE_POLL_MS", "50")];
+    let err = world.cli_env(&server, &args, &poll).err();
+    assert!(err.contains("warming"), "{err}");
+    let quiet = [&args[..], &["--quiet"]].concat();
+    let err = world.cli_env(&server, &quiet, &poll).err();
+    assert!(err.contains("pending") && err.contains(&c), "{err}");
+    assert!(!err.contains("warming"), "{err}");
+    assert!(!err.contains('\r'), "{err:?}");
+}
+
+/// The CLI's stderr on a pseudo-terminal or a pipe. A thread collects what
+/// it shows as it is written.
+struct Terminal {
+    seen: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Terminal {
+    /// A terminal `columns` wide, and the end to hand the CLI as its stderr.
+    fn open(columns: u16) -> (Self, Stdio) {
+        let (mut master, mut slave) = (0, 0);
+        let mut size = libc::winsize {
+            ws_row: 24,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
+        Self::collect(master, slave)
+    }
+
+    /// Not a terminal: a pipe, read as the CLI writes it.
+    fn pipe() -> (Self, Stdio) {
+        let mut fds = [0; 2];
+        let opened = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(opened, 0, "pipe: {}", std::io::Error::last_os_error());
+        Self::collect(fds[0], fds[1])
+    }
+
+    /// Read `reader` on a thread; `writer` goes to the CLI.
+    fn collect(reader: i32, writer: i32) -> (Self, Stdio) {
+        let mut master = unsafe { std::fs::File::from_raw_fd(reader) };
+        let slave = unsafe { OwnedFd::from_raw_fd(writer) };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        // Ends when the last writer closes the terminal (EOF, or EIO on
+        // Linux).
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = master.read(&mut buf) {
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        (Self { seen }, Stdio::from(slave))
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.seen.lock().unwrap()).into_owned()
+    }
+
+    fn wait_for(&self, what: &str) {
+        wait_for(&format!("{what:?} on the terminal"), || {
+            self.text().contains(what).then_some(())
+        });
+    }
+
+    /// Everything shown, once the last line drawn has been blanked.
+    fn cleared(&self) -> String {
+        wait_for("the progress line to be cleared", || {
+            let text = self.text();
+            let last = text.rsplit('\r').next().unwrap_or_default();
+            (text.contains('\r') && last.is_empty()).then_some(text)
+        })
+    }
+}
+
+/// I14: on a terminal, a clone redraws one line with its phase and bytes,
+/// then blanks it before printing the result on stdout. A top-up shows the
+/// fetch's phase and seconds instead of the base's bytes.
+#[test]
+fn i14_terminal_clone_draws_then_clears_progress() {
+    let world = World::new();
+    let origin = world.origin("acme", "i14");
+    std::fs::write(origin.work.join("blob.bin"), noise(14, 4 << 20)).unwrap();
+    origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/i14", "--wait"]).ok();
+
+    // Holding the large pack keeps the clone downloading until the line is
+    // on the terminal.
+    let proxy = FaultProxy::start(&server);
+    proxy.fault_artifacts(Fault::Hold, 1 << 20, 1);
+    let (terminal, stderr) = Terminal::open(200);
+    let target = world.target("i14");
+    let args = ["clone", "acme/i14", target.to_str().unwrap()];
+    let cli = world.cli_spawn_stderr(&proxy, &args, &[], stderr);
+    terminal.wait_for("ripclone: downloading ");
+    proxy.release();
+    let out = cli.wait();
+    out.ok();
+
+    assert_eq!(
+        out.stdout(),
+        format!("installed acme/i14 into {}\n", target.display())
+    );
+    let shown = terminal.cleared();
+    assert!(
+        shown.contains(" MiB (") && shown.contains("%)"),
+        "{shown:?}"
+    );
+    assert!(!shown.contains('\x1b'), "escape codes: {shown:?}");
+}
+
+#[test]
+fn i14_terminal_top_up_shows_its_phase_and_seconds() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let origin = world.origin("acme", "i14t");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let providers = providers_json(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
+    let env = [("RIPCLONE_PROVIDERS", providers.as_str())];
+    let mut server = world.server(&env);
+    world
+        .cli_env(&server, &["add", "gh:acme/i14t", "--wait"], &env)
+        .ok();
+    server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
+    let b = origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+
+    // The origin parks every fetch, the top-up's included, until the line
+    // has counted a second.
+    http.hold_fetches();
+    let (terminal, stderr) = Terminal::open(200);
+    let target = world.target("i14t");
+    let args = ["clone", "gh:acme/i14t", target.to_str().unwrap()];
+    let cli = world.cli_spawn_stderr(&server, &args, &env, stderr);
+    let phase = format!("ripclone: fetching {} from upstream", &b[..7]);
+    terminal.wait_for(&format!("{phase} (1s)"));
+    http.release_fetches();
+    cli.wait().ok();
+
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
+    let shown = terminal.cleared();
+    let fetch_lines = shown.split('\r').filter(|line| line.starts_with(&phase));
+    for line in fetch_lines {
+        assert!(!line.contains("MiB") && !line.contains('%'), "{line:?}");
+    }
+}
+
+/// I14: `add --wait` on a terminal draws the commit's output states while it
+/// waits, cut to the terminal's width, and clears them before stdout.
+#[test]
+fn i14_terminal_add_wait_shows_output_states_within_its_width() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let origin = world.origin("acme", "i14w");
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let providers = providers_json(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
+    let env = [("RIPCLONE_PROVIDERS", providers.as_str())];
+    let server = world.server(&env);
+
+    // The origin parks the build's fetch until the line is on the terminal.
+    http.hold_fetches();
+    let (terminal, stderr) = Terminal::open(60);
+    let cli = world.cli_spawn_stderr(&server, &["add", "gh:acme/i14w", "--wait"], &env, stderr);
+    terminal.wait_for(&format!("ripclone: waiting for {}: Head pending", &a[..7]));
+    http.release_fetches();
+    let out = cli.wait();
+    out.ok();
+
+    assert_eq!(out.stdout(), format!("added acme/i14w at {a}\n"));
+    let shown = terminal.cleared();
+    for line in shown.split('\r') {
+        assert!(
+            line.chars().count() < 60,
+            "wider than the terminal: {line:?}"
+        );
+    }
+}
+
+/// I14: `--progress` draws the line on a pipe too.
+#[test]
+fn i14_progress_flag_draws_on_a_pipe() {
+    let world = World::new();
+    let origin = world.origin("acme", "i14p");
+    std::fs::write(origin.work.join("blob.bin"), noise(15, 4 << 20)).unwrap();
+    origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/i14p", "--wait"]).ok();
+
+    let err = world
+        .cli(
+            &server,
+            &["clone", "acme/i14p", "x", "--progress", "--quiet"],
+        )
+        .err();
+    assert!(err.contains("cannot be used with"), "{err}");
+
+    let proxy = FaultProxy::start(&server);
+    proxy.fault_artifacts(Fault::Hold, 1 << 20, 1);
+    let (pipe, stderr) = Terminal::pipe();
+    let target = world.target("i14p");
+    let args = ["clone", "acme/i14p", target.to_str().unwrap(), "--progress"];
+    let cli = world.cli_spawn_stderr(&proxy, &args, &[], stderr);
+    pipe.wait_for("\rripclone: downloading ");
+    proxy.release();
+    cli.wait().ok();
+    pipe.cleared();
+}

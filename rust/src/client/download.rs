@@ -2,6 +2,7 @@
 //! with retries, Range resume, a fresh signed URL when one expires, and a
 //! length and hash check before any byte is used.
 
+use super::progress::Progress;
 use super::{Client, CommitOutput, HttpFailure, RefResponse, validate_output};
 use anyhow::{Context, Result};
 use sha2::Digest as Sha2Digest;
@@ -269,6 +270,8 @@ struct Received {
     body: Body,
     hasher: sha2::Sha256,
     len: u64,
+    /// Counts the bytes of an artifact whose length the plan totals.
+    progress: Option<Progress>,
 }
 
 enum Body {
@@ -280,7 +283,11 @@ enum Body {
 }
 
 impl Received {
-    fn open(sink: &Sink<'_>, expected_len: Option<u64>) -> Result<Self> {
+    fn open(
+        sink: &Sink<'_>,
+        expected_len: Option<u64>,
+        progress: Option<Progress>,
+    ) -> Result<Self> {
         let body = match sink {
             Sink::Memory => {
                 let reserve = expected_len.unwrap_or(0).min(MAX_PREALLOC);
@@ -305,6 +312,7 @@ impl Received {
             body,
             hasher: sha2::Sha256::new(),
             len: 0,
+            progress,
         })
     }
 
@@ -319,6 +327,9 @@ impl Received {
         }
         self.hasher.update(chunk);
         self.len += chunk.len() as u64;
+        if let Some(progress) = &self.progress {
+            progress.add(chunk.len() as u64);
+        }
         Ok(())
     }
 
@@ -335,6 +346,9 @@ impl Received {
                     .await
                     .context("seek restarted artifact temp file")?;
             }
+        }
+        if let Some(progress) = &self.progress {
+            progress.sub(self.len);
         }
         self.hasher = sha2::Sha256::new();
         self.len = 0;
@@ -423,10 +437,15 @@ impl Client {
             Sink::Memory => self.cache.as_ref(),
             Sink::TempFile(_) => None,
         };
+        // Only artifacts of known length are in the planned total.
+        let progress = artifact.len.map(|_| self.progress.clone());
         if let Some(data) = cache.and_then(|cache| cache.get(hash).ok()) {
+            if let Some(progress) = &progress {
+                progress.add(data.len() as u64);
+            }
             return Ok(Downloaded::Memory(data.into()));
         }
-        let mut received = Received::open(&sink, artifact.len)?;
+        let mut received = Received::open(&sink, artifact.len, progress)?;
         let (mut generation, mut url) = urls.current(artifact.slot);
         let (max_attempts, base_backoff_ms) = fetch_retry_config();
         for attempt in 1..=max_attempts {

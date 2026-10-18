@@ -232,6 +232,18 @@ impl World {
         self.cli_spawn_unset(server, args, env, &[])
     }
 
+    /// Start the CLI with its stderr on `stderr`, such as a terminal. The
+    /// output's stderr is then empty.
+    pub fn cli_spawn_stderr(
+        &self,
+        server: &impl Endpoint,
+        args: &[&str],
+        env: &[(&str, &str)],
+        stderr: Stdio,
+    ) -> RunningCli {
+        self.cli_spawn_to(server, args, env, &[], stderr)
+    }
+
     /// Run the CLI with `unset` removed from the env the harness gives it.
     pub fn cli_unset(
         &self,
@@ -249,6 +261,17 @@ impl World {
         args: &[&str],
         env: &[(&str, &str)],
         unset: &[&str],
+    ) -> RunningCli {
+        self.cli_spawn_to(server, args, env, unset, Stdio::piped())
+    }
+
+    fn cli_spawn_to(
+        &self,
+        server: &impl Endpoint,
+        args: &[&str],
+        env: &[(&str, &str)],
+        unset: &[&str],
+        stderr: Stdio,
     ) -> RunningCli {
         let home = self.path("home");
         let mut cmd = Command::new(bin("ripclone"));
@@ -277,7 +300,7 @@ impl World {
         }
         let child = cmd
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .expect("spawn ripclone");
         RunningCli {

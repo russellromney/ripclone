@@ -41,6 +41,8 @@ the token. Hashing gives no protection if the hash leaks.
 | `RIPCLONE_FETCH_MAX_ATTEMPTS`, `RIPCLONE_FETCH_BACKOFF_MS` | Attempts per artifact download and the first retry delay, defaults 3 and 100 ms. |
 | `RIPCLONE_FSYNC` | `1` or `true`: flush the tree, index, and rename before reporting success. Off by default, like `git checkout`. |
 | `--bench`, `RIPCLONE_BENCH` | Print a per-phase timing report after a clone. |
+| `--quiet`, `-q` | No progress line or notes on stderr during a clone; warnings and errors still print. |
+| `--progress` | Draw the clone's progress line even when stderr is not a terminal. Without it, the line (phase and bytes downloaded of the total, or the phase and its seconds) is drawn only on a terminal, cut to its width. `add --wait` and `sync --wait` draw each output's state while they wait, on a terminal only. |
 | `RIPCLONE_NO_BROWSER` | Set: `ripclone login` does not open a browser. |
 | `RIPCLONE_ORIGIN_BASE` | Top up and verify repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. |
 | `RIPCLONE_PROVIDERS`, config `[providers.<id>]` | Provider instances. See [Providers](PROVIDERS.md). |
