@@ -212,17 +212,13 @@ fn i7_world(name: &str) -> (World, Server, Origin, String) {
     (world, server, origin, tip)
 }
 
+/// What an I7 clone should do: install `commit` and say whether the check
+/// was skipped, or fail with this text.
+type I7Expect<'a> = Result<(&'a str, bool), &'a str>;
+
 /// Clone with each `--verify-upstream` mode while the CLI sees the upstream at
-/// `base` (empty: the real origin). Expected per mode: `Ok(warns)` or
-/// `Err(text)`.
-fn i7_cases(
-    world: &World,
-    server: &Server,
-    name: &str,
-    tip: &str,
-    base: &str,
-    cases: &[(&str, Result<bool, &str>)],
-) {
+/// `base` (empty: the real origin).
+fn i7_cases(world: &World, server: &Server, name: &str, base: &str, cases: &[(&str, I7Expect)]) {
     for (mode, expected) in cases {
         let case = format!("{name}-{mode}");
         let target = world.target(&case);
@@ -243,9 +239,9 @@ fn i7_cases(
             &env,
         );
         match expected {
-            Ok(warns) => {
+            Ok((commit, warns)) => {
                 out.ok();
-                assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "{case}");
+                assert_eq!(git(&target, &["rev-parse", "HEAD"]), *commit, "{case}");
                 assert_eq!(
                     out.stderr().contains("--verify-upstream skipped"),
                     *warns,
@@ -272,14 +268,14 @@ fn i7_verify_upstream_same_tip() {
         &world,
         &server,
         "i7-same",
-        &tip,
         "",
-        &[("always", Ok(false))],
+        &[("always", Ok((&tip, false)))],
     );
 }
 
 /// I7: the CLI's upstream is broken. `never` stays quiet, `auto` warns and
-/// clones, `always` fails.
+/// clones, `always` fails and removes the clone. A target that was an empty
+/// directory is left as an empty directory.
 #[test]
 fn i7_verify_upstream_broken() {
     let (world, server, _origin, tip) = i7_world("i7-broken");
@@ -288,19 +284,39 @@ fn i7_verify_upstream_broken() {
         &world,
         &server,
         "i7-broken",
-        &tip,
         &broken.url(),
         &[
-            ("never", Ok(false)),
-            ("auto", Ok(true)),
+            ("never", Ok((&tip, false))),
+            ("auto", Ok((&tip, true))),
             ("always", Err("upstream verification failed")),
         ],
     );
+
+    let empty = world.target("i7-broken-empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = world.cli_env(
+        &server,
+        &[
+            "clone",
+            "acme/i7-broken",
+            empty.to_str().unwrap(),
+            "--depth",
+            "1",
+            "--verify-upstream=always",
+        ],
+        &[("RIPCLONE_ORIGIN_BASE", &broken.url())],
+    );
+    let err = out.err();
+    assert!(err.contains("upstream verification failed"), "{err}");
+    let entries = std::fs::read_dir(&empty)
+        .unwrap_or_else(|e| panic!("the empty target is gone: {e}"))
+        .count();
+    assert_eq!(entries, 0, "the failed clone left files in the target");
 }
 
-/// I7: the CLI's upstream has moved past what the server built. `never`
-/// clones; `auto` and `always` refuse, and remove the clone they installed.
-/// A target that was an empty directory is left as an empty directory.
+/// I7: the CLI's upstream has moved past what the server built, and the
+/// server never sees the move. `never` installs the server's commit; `auto`
+/// and `always` install the tip the CLI read, fetched from its upstream.
 #[test]
 fn i7_verify_upstream_moved_tip() {
     let (world, server, origin, tip) = i7_world("i7-moved");
@@ -318,7 +334,7 @@ fn i7_verify_upstream_moved_tip() {
             moved_bare.to_str().unwrap(),
         ],
     );
-    origin.commit(&[("a.txt", "moved\n")], "moved");
+    let ahead = origin.commit(&[("a.txt", "moved\n")], "moved");
     git(
         &origin.work,
         &["push", "-q", moved_bare.to_str().unwrap(), "HEAD:main"],
@@ -327,36 +343,13 @@ fn i7_verify_upstream_moved_tip() {
         &world,
         &server,
         "i7-moved",
-        &tip,
         &format!("file://{}", moved.display()),
         &[
-            ("never", Ok(false)),
-            ("auto", Err("does not match upstream tip")),
-            ("always", Err("does not match upstream tip")),
+            ("never", Ok((&tip, false))),
+            ("auto", Ok((&ahead, false))),
+            ("always", Ok((&ahead, false))),
         ],
     );
-
-    let empty = world.target("i7-moved-empty");
-    std::fs::create_dir_all(&empty).unwrap();
-    let base = format!("file://{}", moved.display());
-    let out = world.cli_env(
-        &server,
-        &[
-            "clone",
-            "acme/i7-moved",
-            empty.to_str().unwrap(),
-            "--depth",
-            "1",
-            "--verify-upstream=always",
-        ],
-        &[("RIPCLONE_ORIGIN_BASE", &base)],
-    );
-    let err = out.err();
-    assert!(err.contains("does not match upstream tip"), "{err}");
-    let entries = std::fs::read_dir(&empty)
-        .unwrap_or_else(|e| panic!("the empty target is gone: {e}"))
-        .count();
-    assert_eq!(entries, 0, "the failed clone left files in the target");
 }
 
 /// I7: the upstream check runs beside the clone. While the CLI's upstream
@@ -386,6 +379,115 @@ fn i7_verify_upstream_runs_beside_the_clone() {
     upstream.release_listings();
     running.wait().ok();
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+}
+
+/// I7: a push lands during the clone, after the server read the branch and
+/// before the CLI did. Full and depth-1 clones install the pushed commit,
+/// fetched on top of the server's, as a fresh clone of it would be.
+#[test]
+fn i7_verify_upstream_installs_a_push_during_the_clone() {
+    let (world, server, origin, _tip) = i7_world("i7-push");
+    let upstream = GitHttp::start(world.path("origins"));
+    let proxy = FaultProxy::start(&server);
+    for (kind, flags) in [("full", &[][..]), ("depth-1", &["--depth", "1"][..])] {
+        upstream.hold_listings();
+        let target = world.target(&format!("i7-push-{kind}"));
+        let mut args = vec![
+            "clone",
+            "acme/i7-push",
+            target.to_str().unwrap(),
+            "--verify-upstream=always",
+        ];
+        args.extend(flags);
+        let gets = proxy.artifact_gets().len();
+        let running =
+            world.cli_spawn_env(&proxy, &args, &[("RIPCLONE_ORIGIN_BASE", upstream.url())]);
+        upstream.wait_listings_held(1);
+        // The clone is downloading, so the server has resolved the old tip.
+        proxy.wait_seen("an artifact download", |_| {
+            proxy.artifact_gets().len() > gets
+        });
+        let server_commit = git(&origin.work, &["rev-parse", "HEAD"]);
+        let pushed = origin.commit(&[("a.txt", format!("{kind}\n").as_str())], kind);
+        origin.publish();
+        upstream.release_listings();
+        let out = running.wait();
+        out.ok();
+        let note = format!(
+            "is at {} upstream, not {}; fetching it",
+            &pushed[..12],
+            &server_commit[..12]
+        );
+        assert!(out.stderr().contains(&note), "{kind}: {}", out.stderr());
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]), pushed, "{kind}");
+        assert_eq!(
+            git(&target, &["rev-parse", "origin/main"]),
+            pushed,
+            "{kind}"
+        );
+        assert_eq!(git(&target, &["status", "--porcelain"]), "", "{kind}");
+        assert_eq!(listing(&target), origin.tree(&pushed), "{kind}");
+        let shallow = git(&target, &["rev-parse", "--is-shallow-repository"]);
+        assert_eq!(shallow, (kind == "depth-1").to_string(), "{kind}");
+        if kind == "full" {
+            assert_eq!(
+                git(&target, &["rev-parse", "HEAD~1"]),
+                server_commit,
+                "{kind}: history"
+            );
+        }
+        assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+    }
+}
+
+/// I7: a force-push during a single-branch clone. The clone installs the
+/// new tip and, as `git clone --single-branch` does, keeps only the tags in
+/// its history: not the one on the commit the server named.
+#[test]
+fn i7_verify_upstream_installs_a_force_push_during_the_clone() {
+    let world = World::new();
+    let origin = world.origin("acme", "i7-forced");
+    let (work, bare) = (&origin.work, origin.bare.to_str().unwrap());
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    git(work, &["tag", "-a", "-m", "release a", "v-a"]);
+    let b = origin.commit(&[("b.txt", "b\n")], "B");
+    git(work, &["tag", "-a", "-m", "release b", "v-b"]);
+    origin.publish();
+    git(work, &["push", "-q", bare, "--tags"]);
+    let server = world.server(&[]);
+    world
+        .cli(&server, &["add", "acme/i7-forced", "--wait"])
+        .ok();
+    wait_first_refs(&server, "acme/i7-forced", &b);
+    let upstream = GitHttp::start(world.path("origins"));
+    let proxy = FaultProxy::start(&server);
+    upstream.hold_listings();
+    let target = world.target("i7-forced");
+    let args = [
+        "clone",
+        "acme/i7-forced",
+        target.to_str().unwrap(),
+        "--single-branch",
+        "--verify-upstream=always",
+    ];
+    let running = world.cli_spawn_env(&proxy, &args, &[("RIPCLONE_ORIGIN_BASE", upstream.url())]);
+    upstream.wait_listings_held(1);
+    proxy.wait_seen("an artifact download", |_| {
+        !proxy.artifact_gets().is_empty()
+    });
+    git(work, &["reset", "-q", "--hard", &a]);
+    let forced = origin.commit(&[("c.txt", "c\n")], "C");
+    origin.publish();
+    upstream.release_listings();
+    let out = running.wait();
+    out.ok();
+    let note = format!("is at {} upstream, not {}", &forced[..12], &b[..12]);
+    assert!(out.stderr().contains(&note), "{}", out.stderr());
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), forced);
+    assert_eq!(git(&target, &["rev-parse", "HEAD~1"]), a);
+    assert_eq!(git(&target, &["tag", "--list"]), "v-a");
+    assert_eq!(git(&target, &["status", "--porcelain"]), "");
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
 }
 
 /// I10: a Files clone has no git objects to check against the upstream.
