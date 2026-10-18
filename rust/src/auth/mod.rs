@@ -1,2 +1,2 @@
-pub mod broker;
+pub mod credential;
 pub mod token_store;

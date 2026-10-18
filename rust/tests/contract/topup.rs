@@ -31,12 +31,9 @@ impl TopUp {
         let a = origin.commit(&[("a.txt", "a\n"), ("d/b.txt", "b\n")], "A");
         origin.publish();
 
-        world.server_providers(
-            http.url(),
-            &[("gh", "github", Some("server-secret"), serde_json::json!({}))],
-        );
-        let mut server = world.server(&[]);
-        world.cli_providers(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
+        world.server_providers(http.url(), &[("gh", "github", serde_json::json!({}))]);
+        let mut server = world.server(&[("RIPCLONE_TOKEN_GH", "server-secret")]);
+        world.cli_providers(http.url(), &[("gh", "github", serde_json::json!({}))]);
         let repo = format!("gh:acme/{name}");
         let upstream = format!("{}/acme/{name}.git", http.url());
         world.cli(&server, &["add", &repo, "--wait"]).ok();

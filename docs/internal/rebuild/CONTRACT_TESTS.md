@@ -163,7 +163,7 @@ Ripclone token reaches the origin.
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | #186 |
 | H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | #191 (S3 job) |
 | H3 | A second server on the same control database is rejected before it binds. | #186 |
-| H4 | Table: invalid storage and worker config (an S3 bucket without an endpoint, a malformed config file) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention size, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size), with an error naming it. | #208 |
+| H4 | Table: invalid storage, credential and worker config (an S3 bucket without an endpoint, a malformed config file, a provider `token` in the file, an app key without an `app_id`) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention size, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size), with an error naming it. | #208 |
 | H5 | Local disk with retention every second and a 1 GB limit: the server reports retention off; month-old artifacts, past the 7-day limit, stay and clone. | #208 |
 | H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | #208 (S3 job) |
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | #209 |
@@ -176,7 +176,7 @@ Ripclone token reaches the origin.
 | # | Test | Added |
 |---|---|---|
 | I1 | Missing or wrong server token: 401; a valid token works. | #186 |
-| I2 | Private repo with a token on the server's provider instance: the server builds it; the CLI holds no upstream token. | #202 |
+| I2 | Private repo with a token for the provider in the server's environment: the server builds it; the CLI holds no upstream token. | #202 |
 | I3 | Table across GitHub, GitLab, Gitea, generic: the provider's auth header reaches the origin. | #191 |
 | I4 | Table across GitHub, GitLab, Gitea webhooks: a signed push builds before any clone; a bad signature gets 401 and no build. | #191 |
 | I5 | Poller: with no webhook, a push is built within one poll interval. | #186 |
@@ -298,12 +298,14 @@ keychain out, never print a token, and delete their work directory
   read, a non-empty target, a wrong server token, a server without an upstream
   token. Runs in the `gitea` CI job.
 - `scripts/trial_github.sh owner/repo...`: read-only, against private GitHub
-  repos. The server reads with `RIPCLONE_GITHUB_TOKEN`; the user's git uses
-  their gh login, or `RIPCLONE_TRIAL_GIT_TOKEN`. Full, depth-1 and files clones
+  repos. The server reads with `RIPCLONE_TOKEN_GITHUB`, or as a GitHub App
+  with `RIPCLONE_APP_KEY_GITHUB` and `RIPCLONE_TRIAL_APP_ID`; the user's git
+  uses their gh login, or `RIPCLONE_TRIAL_GIT_TOKEN`. Full, depth-1 and files clones
   are compared with `git clone` (history, tree, local config, reflog), then
   pulled and fetched. Refusals: a missing repo and a server without a token.
   Manual: it needs a token and private repos. For this repo's owner: `soup run
-  -p ripclone -e development -- scripts/trial_github.sh <private repos>`.
+  -p ripclone -e development -- sh -c 'RIPCLONE_TOKEN_GITHUB="$RIPCLONE_GITHUB_TOKEN"
+  scripts/trial_github.sh <private repos>'`.
 
 ## Current state
 

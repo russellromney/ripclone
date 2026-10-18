@@ -173,10 +173,11 @@ was:
 | 6 | Server unreachable, rate limited, or unavailable (429, 5xx) | Retry |
 | 130 | Interrupted (Ctrl-C); staging is removed before exit | |
 
-**Private repos.** The server needs read access to the upstream: a token on the
-provider instance ([Providers](docs/PROVIDERS.md)) or a GitHub App
-([Configuration](docs/CONFIG.md#github-app-credentials)). A full clone that
-tops up fetches from the upstream with your own git credentials.
+**Private repos.** The server needs read access to the upstream: a token or a
+GitHub App key in its environment, per provider
+([Providers](docs/PROVIDERS.md#credentials)). The config file holds no
+secrets. The CLI reads the upstream (top-up, `--verify-upstream`) with your
+own git credentials.
 
 **Checking the server.** `--verify-upstream` (`auto` by default) cross-checks an
 editable clone's commit against the git host when it can. A Files clone has no

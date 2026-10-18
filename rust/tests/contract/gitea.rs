@@ -104,15 +104,9 @@ fn gitea_private_repo_with_server_side_token() {
         "the repo is readable anonymously"
     );
 
-    world.server_providers(
-        &gitea.url,
-        &[("gitea", "gitea", Some(&gitea.token), serde_json::json!({}))],
-    );
-    let server = world.server(&[]);
-    world.cli_providers(
-        &gitea.url,
-        &[("gitea", "gitea", None, serde_json::json!({}))],
-    );
+    world.server_providers(&gitea.url, &[("gitea", "gitea", serde_json::json!({}))]);
+    let server = world.server(&[("RIPCLONE_TOKEN_GITEA", &gitea.token)]);
+    world.cli_providers(&gitea.url, &[("gitea", "gitea", serde_json::json!({}))]);
     let arg = format!("gitea:{}/{repo}", gitea.user);
     world.cli(&server, &["add", &arg, "--wait"]).ok();
 

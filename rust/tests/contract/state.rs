@@ -48,10 +48,10 @@ fn state_entries(world: &World) -> Vec<String> {
     names
 }
 
-/// H4: each invalid storage or numeric setting stops the server before it
-/// creates anything: no control database, cache, or mirror directory. A
-/// number that does not parse is an error naming the variable, never a
-/// silent default.
+/// H4: each invalid storage, credential or numeric setting stops the server
+/// before it creates anything: no control database, cache, or mirror
+/// directory. A number that does not parse is an error naming the variable,
+/// never a silent default.
 #[test]
 fn h4_invalid_config_fails_before_side_effects() {
     type Env<'a> = &'a [(&'a str, &'a str)];
@@ -64,6 +64,18 @@ fn h4_invalid_config_fails_before_side_effects() {
             "RIPCLONE_S3_ENDPOINT",
         ),
         ("malformed file", "[providers\n", &[], "parse config"),
+        (
+            "token in the file",
+            "[providers.forge]\nkind = \"gitea\"\nhost = \"h\"\ntoken = \"t\"\n",
+            &[],
+            "unknown field `token`",
+        ),
+        (
+            "app key without app id",
+            "",
+            &[("RIPCLONE_APP_KEY_GITHUB", "k")],
+            "RIPCLONE_APP_KEY_GITHUB is set but provider 'github' has no app_id",
+        ),
         (
             "no head slots",
             "",

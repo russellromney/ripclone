@@ -9,6 +9,7 @@
 //! GitHub, GitLab and Gitea have `WebhookProvider` impls behind the same
 //! trait — adding a provider is implementing this one trait, nothing else.
 
+use crate::auth::credential::{env_var, secret};
 use crate::provider::{ProviderKind, ProviderRegistry};
 use axum::http::HeaderMap;
 use secrecy::SecretString;
@@ -42,7 +43,7 @@ pub struct CanonicalEvent {
     pub default_branch: Option<String>,
     /// Repo visibility, when the payload carries it. Currently **informational**
     /// only: the warm path always resolves the upstream credential from the
-    /// configured broker regardless of visibility, so this does not gate
+    /// server's credentials regardless of visibility, so this does not gate
     /// behavior today. Kept for parity across adapters and future use.
     pub private: Option<bool>,
 }
@@ -104,9 +105,10 @@ impl WebhookConfig {
         let mut secrets = HashMap::new();
         for instance in registry.iter() {
             let id = instance.id.as_str();
-            let var = format!("RIPCLONE_WEBHOOK_SECRET_{}", env_suffix(id));
-            let value = std::env::var(var).ok();
-            if let Some(secret) = parse_secret(value) {
+            let value = std::env::var(env_var("RIPCLONE_WEBHOOK_SECRET", id)).ok();
+            // Blank is no secret, so the handler fails closed: for GitLab the
+            // secret is the bare token, and a blank one is trivially guessed.
+            if let Some(secret) = secret(value) {
                 secrets.insert(id.to_string(), secret);
             }
         }
@@ -141,55 +143,5 @@ impl WebhookConfig {
             SecretString::new(secret.to_string().into()),
         );
         Self { secrets }
-    }
-}
-
-/// Turn a raw env value into a secret. An absent, empty, **or all-whitespace**
-/// value yields no secret — fail closed: a blank `RIPCLONE_WEBHOOK_SECRET_*`
-/// must never be treated as a usable key (for GitLab the secret *is* the bare
-/// token, so a whitespace-only token would be a trivially guessable credential).
-/// The secret is kept verbatim (not trimmed) so a token that legitimately
-/// contains spaces still matches what the provider sends.
-fn parse_secret(raw: Option<String>) -> Option<SecretString> {
-    raw.filter(|s| !s.trim().is_empty())
-        .map(|s| SecretString::new(s.into()))
-}
-
-/// Normalize a provider instance id into the `RIPCLONE_WEBHOOK_SECRET_<...>`
-/// env-var suffix: upper-case, with any non-alphanumeric byte mapped to `_`.
-fn env_suffix(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_suffix_normalizes_instance_ids() {
-        assert_eq!(env_suffix("github"), "GITHUB");
-        assert_eq!(env_suffix("company-gitea"), "COMPANY_GITEA");
-        assert_eq!(env_suffix("my.gitlab"), "MY_GITLAB");
-    }
-
-    #[test]
-    fn parse_secret_rejects_absent_empty_and_whitespace() {
-        use secrecy::ExposeSecret;
-        // Absent / empty / all-whitespace ⇒ no secret (fail closed).
-        assert!(parse_secret(None).is_none());
-        assert!(parse_secret(Some(String::new())).is_none());
-        assert!(parse_secret(Some("   ".to_string())).is_none());
-        assert!(parse_secret(Some("\t\n".to_string())).is_none());
-        // A real value is kept verbatim (not trimmed).
-        let s = parse_secret(Some(" hunter2 ".to_string())).expect("non-blank secret");
-        assert_eq!(s.expose_secret(), " hunter2 ");
     }
 }

@@ -503,7 +503,8 @@ async fn fetch_commit(
         .cloned()
         .with_context(|| format!("unknown provider {}", repo_id.provider.as_str()))?;
     let credential = state
-        .fetch_credential(repo_id)
+        .credentials
+        .get(repo_id)
         .await
         .with_context(|| format!("fetch credential for {}", repo_id.storage_key()))?;
     let (mirror_dir, repo_id, commit) = (

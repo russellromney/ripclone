@@ -8,8 +8,6 @@ use ripclone::config::ProviderEntry;
 use ripclone::mode::CloneMode;
 use ripclone::provider::{ProviderInstance, ProviderKind, ProviderRegistry, RepoId};
 use ripclone::validation::Selector;
-use secrecy::ExposeSecret;
-use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::io::IsTerminal;
@@ -149,16 +147,14 @@ enum ProviderAction {
         /// Header name for the credential. Defaults to "Authorization".
         #[arg(long)]
         auth_header_name: Option<String>,
-        /// Read token for private repos (prompted on a terminal if omitted).
-        #[arg(short, long)]
-        token: Option<String>,
     },
     /// List the providers this CLI knows, the built-in github included.
     List,
     /// Remove a provider from the CLI's config.
     Rm { id: String },
-    /// Check that this provider config and its token can read a repo's ref
-    /// on the git host. Runs `git ls-remote`; the server takes no part.
+    /// Check that this provider config and your git credentials can read a
+    /// repo's ref on the git host. Runs `git ls-remote`; the server takes no
+    /// part.
     Test {
         /// Provider instance id.
         id: String,
@@ -490,7 +486,6 @@ async fn run_provider_add(
     host: Option<String>,
     auth_template: Option<String>,
     auth_header_name: Option<String>,
-    token: Option<String>,
 ) -> Result<()> {
     if id.is_empty() {
         return Err(usage("provider id cannot be empty"));
@@ -508,19 +503,10 @@ async fn run_provider_add(
             "generic provider '{id}' requires --auth-template (e.g. 'token {{token}}')"
         )));
     }
-    let token = match token {
-        Some(t) => Some(t),
-        None if std::io::stdin().is_terminal() => Some(rpassword::prompt_password(format!(
-            "Token for provider '{id}' (empty for none): "
-        ))?),
-        None => None,
-    }
-    .filter(|t| !t.is_empty())
-    .or_else(|| existing.as_ref()?.token.clone());
     let entry = ProviderEntry {
         kind,
         host: host.or_else(|| existing.as_ref()?.host.clone()),
-        token,
+        app_id: existing.as_ref().and_then(|e| e.app_id),
         auth_template,
         auth_header_name: auth_header_name.or_else(|| existing.as_ref()?.auth_header_name.clone()),
     };
@@ -539,19 +525,13 @@ async fn run_provider_add(
 fn run_provider_list(registry: &ProviderRegistry) -> Result<()> {
     let mut providers: Vec<&ProviderInstance> = registry.iter().collect();
     providers.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-    println!("{:<16} {:<10} {:<24} TOKEN", "ID", "KIND", "HOST");
+    println!("{:<16} {:<10} HOST", "ID", "KIND");
     for provider in providers {
-        let id = provider.id.as_str();
         println!(
-            "{:<16} {:<10} {:<24} {}",
-            id,
+            "{:<16} {:<10} {}",
+            provider.id.as_str(),
             provider.kind.as_str(),
             clean_host(&provider.host),
-            if registry.token(id).is_some() {
-                "configured"
-            } else {
-                "none"
-            }
         );
     }
     Ok(())
@@ -707,9 +687,8 @@ async fn run() -> Result<()> {
                 host,
                 auth_template,
                 auth_header_name,
-                token,
             } => {
-                run_provider_add(&id, kind, host, auth_template, auth_header_name, token).await?;
+                run_provider_add(&id, kind, host, auth_template, auth_header_name).await?;
             }
             ProviderAction::List => {
                 run_provider_list(&provider_registry)?;
@@ -727,17 +706,10 @@ async fn run() -> Result<()> {
                 };
                 ripclone::validation::validate_repo_path(&provider, &repo_id)
                     .map_err(|e| usage(format!("{e:#}")))?;
-                let token =
-                    upstream_token(&id, &provider_registry).map(|t| SecretString::new(t.into()));
                 let url = ripclone::git::upstream_url(&provider, &repo_id);
-                match ripclone::git::ls_remote_commit_async(
-                    &provider,
-                    &repo_id,
-                    &branch,
-                    token.as_ref(),
-                )
-                .await
-                .with_context(|| format!("read {url}"))?
+                match ripclone::git::ls_remote_commit_async(&provider, &repo_id, &branch, None)
+                    .await
+                    .with_context(|| format!("read {url}"))?
                 {
                     Some(commit) => println!("{url} {branch} is {commit}"),
                     None => anyhow::bail!("{url} has no ref '{branch}'"),
@@ -822,7 +794,6 @@ async fn run() -> Result<()> {
                 ripclone::git::require_system_git()?;
             }
             let (provider, repo_path) = resolve_repo(&repo, default_provider, &provider_registry)?;
-            let upstream_token = upstream_token(&provider, &provider_registry);
             // A top-up fetches from the URL this provider config gives, never
             // from one the server names.
             let local_provider = provider_instance(&provider, &provider_registry)
@@ -878,14 +849,7 @@ async fn run() -> Result<()> {
             let observe = async {
                 match check {
                     UpstreamCheck::Read(provider) => {
-                        observe_upstream(
-                            &provider,
-                            &repo_path,
-                            &branch,
-                            upstream_token.as_deref(),
-                            verify_upstream,
-                        )
-                        .await
+                        observe_upstream(&provider, &repo_path, &branch, verify_upstream).await
                     }
                     UpstreamCheck::Known(upstream) => Ok(upstream),
                 }
@@ -924,13 +888,6 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// The provider's configured upstream credential; `None` reads anonymously.
-fn upstream_token(provider_id: &str, registry: &ProviderRegistry) -> Option<String> {
-    registry
-        .token(provider_id)
-        .map(|token| token.expose_secret().to_string())
 }
 
 /// Strip scheme and trailing slashes from a provider host so it can be used
@@ -1018,77 +975,34 @@ enum UpstreamCheck {
     Known(Upstream),
 }
 
-/// Read the upstream tip of `branch` for [`upstream_check`]'s `Read`.
+/// Read the upstream tip of `branch` for [`upstream_check`]'s `Read`, with
+/// the user's own git: their config and credential helpers apply. `auto`
+/// skips the check when the upstream cannot be read; `always` fails.
 async fn observe_upstream(
     provider: &ProviderInstance,
     repo_path: &str,
     branch: &str,
-    upstream_token: Option<&str>,
     requested: VerifyUpstream,
 ) -> Result<Upstream> {
-    let mut upstream_tip: Option<String> = None;
-    match requested {
-        VerifyUpstream::Always => {}
-        VerifyUpstream::Auto if upstream_token.is_some() => {}
-        VerifyUpstream::Auto => {
-            // Anonymous probe. If the repo is public, the returned tip is reused
-            // for verification so we only issue one ls-remote to the upstream host.
-            let repo_id = RepoId {
-                provider: provider.id.clone(),
-                path: repo_path.to_string(),
-            };
-            upstream_tip =
-                match ripclone::git::ls_remote_commit_async(provider, &repo_id, branch, None).await
-                {
-                    Ok(Some(sha)) => Some(sha),
-                    Ok(None) => {
-                        return Ok(Upstream::Skipped(
-                            "private upstream without credential".to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        return Ok(Upstream::Skipped(format!("upstream probe failed: {e:#}")));
-                    }
-                };
-        }
-        VerifyUpstream::Never => return Ok(Upstream::Unchecked),
+    if requested == VerifyUpstream::Never {
+        return Ok(Upstream::Unchecked);
     }
-
-    let upstream_tip = match upstream_tip {
-        Some(tip) => tip,
-        None => {
-            let repo_id = RepoId {
-                provider: provider.id.clone(),
-                path: repo_path.to_string(),
-            };
-            let credential = upstream_token.map(|t| SecretString::new(t.to_owned().into()));
-            match ripclone::git::ls_remote_commit_async(
-                provider,
-                &repo_id,
-                branch,
-                credential.as_ref(),
-            )
-            .await
-            {
-                Ok(Some(sha)) => sha,
-                Ok(None) => {
-                    anyhow::bail!(
-                        "upstream verification failed: ref '{branch}' not found on upstream host"
-                    );
-                }
-                Err(e) => {
-                    if requested == VerifyUpstream::Auto {
-                        return Ok(Upstream::Skipped(format!("upstream unreachable: {e:#}")));
-                    }
-                    anyhow::bail!(
-                        "upstream verification failed: could not reach upstream host: {e:#}"
-                    );
-                }
-            }
-        }
+    let repo_id = RepoId {
+        provider: provider.id.clone(),
+        path: repo_path.to_string(),
     };
-
-    Ok(Upstream::Tip(upstream_tip))
+    match ripclone::git::ls_remote_commit_async(provider, &repo_id, branch, None).await {
+        Ok(Some(sha)) => Ok(Upstream::Tip(sha)),
+        Ok(None) => {
+            anyhow::bail!("upstream verification failed: ref '{branch}' not found on upstream host")
+        }
+        Err(e) if requested == VerifyUpstream::Auto => {
+            Ok(Upstream::Skipped(format!("upstream unreachable: {e:#}")))
+        }
+        Err(e) => {
+            anyhow::bail!("upstream verification failed: could not reach upstream host: {e:#}")
+        }
+    }
 }
 
 /// What `--verify-upstream` found.
@@ -1167,7 +1081,7 @@ mod tests {
             id: id.to_string(),
             kind: Some(kind.to_string()),
             host: Some(host.to_string()),
-            token: None,
+            app_id: None,
             auth_template: None,
             auth_header_name: None,
         }

@@ -1,8 +1,10 @@
 //! The config file, `~/.config/ripclone/config.toml` or the path in
 //! `RIPCLONE_CONFIG`: the server URL and provider instances.
 //!
-//! Provider tokens may be declared here for self-host/server-side syncs. The
-//! CLI's saved server token is stored separately in the ripclone token file.
+//! It holds no secrets, so it can be committed or templated. Upstream
+//! credentials come from the server's environment (see
+//! [`crate::auth::credential`]), and the CLI's saved server token is in the
+//! token file.
 
 use crate::provider::ProviderConfig;
 use anyhow::{Context, Result};
@@ -23,10 +25,12 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderEntry {
     pub kind: String,
     pub host: Option<String>,
-    pub token: Option<String>,
+    /// GitHub App id, for a `github` provider the server reads as an app.
+    pub app_id: Option<u64>,
     pub auth_template: Option<String>,
     /// Optional header name for the credential. Defaults to `Authorization`.
     pub auth_header_name: Option<String>,
@@ -114,7 +118,7 @@ impl Config {
                 id: id.clone(),
                 kind: Some(entry.kind.clone()),
                 host: entry.host.clone(),
-                token: entry.token.clone(),
+                app_id: entry.app_id,
                 auth_template: entry.auth_template.clone(),
                 auth_header_name: entry.auth_header_name.clone(),
             })
@@ -136,6 +140,16 @@ mod tests {
 
         std::fs::write(&path, "server = [").unwrap();
         assert!(try_load_from(&path).is_err());
+
+        // A secret has no place in the file: a provider `token` is refused,
+        // not ignored.
+        std::fs::write(
+            &path,
+            "[providers.forge]\nkind = \"gitea\"\nhost = \"h\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", try_load_from(&path).unwrap_err());
+        assert!(error.contains("unknown field `token`"), "{error}");
     }
 
     #[test]

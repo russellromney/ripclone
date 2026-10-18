@@ -48,12 +48,20 @@ trial_cleanup() {
   [ -n "${KEEP_TRIAL:-}" ] && echo "kept $WORK" || rm -rf "$WORK"
 }
 
-# start_server <name> <config.toml> [env assignments...]: start a ripclone
+# start_server <name> <config.toml> [variable names...]: start a ripclone
 # server with its own data, home, config file, empty git config and local
-# storage, on a port the OS picks. Sets SERVER_URL.
+# storage, on a port the OS picks. Of the upstream credential variables in
+# the environment, only the named ones reach it. Sets SERVER_URL.
 start_server() {
-  local name="$1" log="$WORK/$1.log" dir="$WORK/$1" config="$2"
+  local name="$1" log="$WORK/$1.log" dir="$WORK/$1" config="$2" var
   shift 2
+  local drop=()
+  for var in $(compgen -e); do
+    case "$var" in
+      RIPCLONE_TOKEN_*|RIPCLONE_APP_KEY_*|RIPCLONE_WEBHOOK_SECRET_*)
+        [[ " $* " == *" $var "* ]] || drop+=(-u "$var") ;;
+    esac
+  done
   mkdir -p "$dir/home/.config/ripclone"
   (umask 077 && printf '%s\n' "$config" >"$dir/home/.config/ripclone/config.toml")
   # Local storage only. S3 settings in the environment (soup sets them) would
@@ -61,9 +69,9 @@ start_server() {
   # removed; without RIPCLONE_S3_BUCKET the server stores locally.
   env -u RIPCLONE_S3_BUCKET -u RIPCLONE_S3_ENDPOINT -u RIPCLONE_S3_REGION -u RIPCLONE_S3_PREFIX \
     -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u RIPCLONE_CONFIG \
-    -u RIPCLONE_GITHUB_APP_ID -u RIPCLONE_GITHUB_APP_PRIVATE_KEY -u RIPCLONE_GITHUB_API_BASE \
+    ${drop[@]+"${drop[@]}"} \
     HOME="$dir/home" GIT_CONFIG_GLOBAL=/dev/null \
-    RIPCLONE_POLL_INTERVAL_SECS=0 RUST_LOG=info "$@" \
+    RIPCLONE_POLL_INTERVAL_SECS=0 RUST_LOG=info \
     "$BIN/ripclone-server" --host 127.0.0.1 --port 0 --data-dir "$dir" >"$log" 2>&1 &
   PIDS+=($!)
   SERVER_URL=""

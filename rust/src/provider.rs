@@ -9,8 +9,6 @@
 //! accepts bare `owner/repo` input for its configured default provider.
 //!
 //! Phase 3+ handoff notes:
-//! - Add Tier-A token minting (`AppTokenBroker`) behind the same
-//!   `CredentialBroker` trait.
 //! - Add per-provider id charset validation rules once opaque paths can contain
 //!   `/`, `~`, `+`, etc. (currently `validation::validate_repo_id` is still the
 //!   GitHub-only check).
@@ -252,9 +250,9 @@ pub struct ProviderConfig {
     pub kind: Option<String>,
     /// Hostname used in clone URLs, e.g. `"gitlab.com"` or `"gitea.example.com"`.
     pub host: Option<String>,
-    /// Optional per-instance static token. If present, it is used as a Tier-B
-    /// passthrough credential for syncs of repos in this instance.
-    pub token: Option<String>,
+    /// GitHub App id, for a `github` kind provider whose server reads
+    /// repositories as that app. Not a secret: the key is in the environment.
+    pub app_id: Option<u64>,
     /// Optional credential template for `generic` hosts or overrides for presets.
     /// Must contain exactly one `{token}` placeholder.
     pub auth_template: Option<String>,
@@ -267,10 +265,8 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone)]
 pub struct ProviderRegistry {
     providers: HashMap<String, ProviderInstance>,
-    /// Tier-B passthrough tokens keyed by instance id. Kept separate from
-    /// `ProviderInstance` so the broker can decide whether to use a request
-    /// token, a configured token, or (later) a minted Tier-A token.
-    tokens: HashMap<String, secrecy::SecretString>,
+    /// GitHub App ids by instance id.
+    app_ids: HashMap<String, u64>,
 }
 
 impl ProviderRegistry {
@@ -289,7 +285,7 @@ impl ProviderRegistry {
         );
         Self {
             providers,
-            tokens: HashMap::new(),
+            app_ids: HashMap::new(),
         }
     }
 
@@ -343,15 +339,16 @@ impl ProviderRegistry {
             );
         }
 
-        // Treat an empty/blank token as absent. A provider config entry that
-        // re-declares kind/host but carries a blank token (e.g. a client
-        // `provider add <id> --token ""` writing the shared config, or a
-        // later merge layer) must not clobber a real token set by an earlier
-        // layer, and a blank token must never be sent as an empty credential
-        // (which surfaces as `Basic oauth2:` and is rejected by GitLab).
-        if let Some(token) = cfg.token.filter(|t| !t.trim().is_empty()) {
-            self.tokens
-                .insert(id.clone(), secrecy::SecretString::new(token.into()));
+        match cfg.app_id {
+            Some(_) if kind != ProviderKind::GitHub => {
+                anyhow::bail!("provider '{id}' has app_id, but only github providers take one")
+            }
+            Some(app_id) => {
+                self.app_ids.insert(id.clone(), app_id);
+            }
+            None => {
+                self.app_ids.remove(&id);
+            }
         }
 
         self.providers.insert(
@@ -372,9 +369,9 @@ impl ProviderRegistry {
         self.providers.get(id)
     }
 
-    /// Configured passthrough token for an instance, if any.
-    pub fn token(&self, id: &str) -> Option<&secrecy::SecretString> {
-        self.tokens.get(id)
+    /// The GitHub App id configured for an instance, if any.
+    pub fn app_id(&self, id: &str) -> Option<u64> {
+        self.app_ids.get(id).copied()
     }
 
     /// Iterate over all configured instances.
@@ -627,11 +624,10 @@ mod tests {
     #[test]
     fn registry_is_github_plus_config_entries() {
         use crate::config::{Config, ProviderEntry};
-        use secrecy::ExposeSecret;
-        let entry = |kind: &str, host: &str, token: &str| ProviderEntry {
+        let entry = |kind: &str, host: &str, app_id: Option<u64>| ProviderEntry {
             kind: kind.into(),
             host: Some(host.into()),
-            token: Some(token.into()),
+            app_id,
             auth_template: None,
             auth_header_name: None,
         };
@@ -639,61 +635,39 @@ mod tests {
             providers: HashMap::from([
                 (
                     "my-gitea".to_string(),
-                    entry("gitea", "https://gitea.example.com", "gitea-secret"),
+                    entry("gitea", "https://gitea.example.com", None),
                 ),
                 (
                     "github".to_string(),
-                    entry("github", "github.com", "gh-token"),
+                    entry("github", "github.com", Some(42)),
                 ),
             ]),
             ..Config::default()
         };
         let registry = ProviderRegistry::from_config(&config).unwrap();
-        for (id, host, token) in [
-            ("github", "github.com", "gh-token"),
-            ("my-gitea", "https://gitea.example.com", "gitea-secret"),
+        for (id, host, app_id) in [
+            ("github", "github.com", Some(42)),
+            ("my-gitea", "https://gitea.example.com", None),
         ] {
             assert_eq!(
                 registry.get(id).map(|p| p.host.as_str()),
                 Some(host),
                 "{id}"
             );
-            assert_eq!(registry.token(id).unwrap().expose_secret(), token, "{id}");
+            assert_eq!(registry.app_id(id), app_id, "{id}");
         }
         assert_eq!(registry.iter().count(), 2);
-    }
 
-    fn gitlab_cfg(token: Option<&str>) -> ProviderConfig {
-        ProviderConfig {
-            id: "gitlab".to_string(),
-            kind: Some("gitlab".to_string()),
-            host: Some("gitlab.com".to_string()),
-            token: token.map(str::to_string),
-            auth_template: None,
-            auth_header_name: None,
-        }
-    }
-
-    /// A blank token is never stored, and never overwrites a real one. An
-    /// empty token would surface as `Basic oauth2:` and be rejected by GitLab.
-    #[test]
-    fn blank_token_is_never_stored() {
-        use secrecy::ExposeSecret;
-        let token = |layers: &[&str]| {
-            let mut registry = ProviderRegistry::new();
-            for layer in layers {
-                registry.merge_one(gitlab_cfg(Some(layer))).unwrap();
-            }
-            registry
-                .token("gitlab")
-                .map(|t| t.expose_secret().to_string())
+        // Only a github provider reads as an app.
+        let config = Config {
+            providers: HashMap::from([(
+                "my-gitea".to_string(),
+                entry("gitea", "https://gitea.example.com", Some(42)),
+            )]),
+            ..Config::default()
         };
-        assert_eq!(token(&[""]), None);
-        assert_eq!(token(&["   "]), None);
-        assert_eq!(
-            token(&["real-token", "   ", ""]),
-            Some("real-token".to_string())
-        );
+        let error = ProviderRegistry::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("only github"), "{error}");
     }
 
     #[test]
