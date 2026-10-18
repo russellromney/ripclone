@@ -70,6 +70,8 @@ pub struct BuildRow {
     pub parent: Option<String>,
     /// Admission time, epoch seconds.
     pub created_at: i64,
+    /// Admission order: a later admit has a larger one.
+    pub seq: i64,
     pub head: Out<HeadResult>,
     pub files: Out<FilesResult>,
     pub full: Out<FullResult>,
@@ -185,14 +187,20 @@ pub struct RepoRefs {
     pub tags_hash: String,
     /// What the last refresh published; `None` before the first.
     pub branches: Option<RepoBranches>,
+    /// The newest earlier `branches` whose base had a ready Full when a
+    /// refresh replaced them. A full clone of another commit installs these
+    /// while `branches`' base has no ready Full, rather than fetching every
+    /// ref from the upstream.
+    pub ready: Option<RepoBranches>,
 }
 
 impl RepoRefs {
     /// Every stored artifact the refs name.
     pub fn artifacts(&self) -> std::collections::BTreeSet<&str> {
         let mut hashes = std::collections::BTreeSet::from([self.tags_artifact.as_str()]);
-        if let Some(branches) = &self.branches {
+        for branches in self.branches.iter().chain(&self.ready) {
             hashes.insert(&branches.artifact);
+            hashes.insert(&branches.tags.artifact);
             if let Some(side) = &branches.side_pack {
                 hashes.insert(&side.pack);
                 hashes.insert(&side.idx);
@@ -204,7 +212,7 @@ impl RepoRefs {
 }
 
 /// The branches a refresh published, for full clones.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RepoBranches {
     /// CAS id of the zstd-compressed `BranchesArtifact`.
     pub artifact: String,
@@ -225,10 +233,24 @@ pub struct RepoBranches {
     pub side_tips: String,
     /// `None` when every ref is in the default branch's history.
     pub side_pack: Option<SidePack>,
+    /// The tags artifact built from the same listing, so these branches
+    /// can be served with the tags of their time once newer ones replace
+    /// them.
+    pub tags: PublishedTags,
+}
+
+/// A tags artifact as a refresh published it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct PublishedTags {
+    pub artifact: String,
+    pub len: u64,
+    pub count: u64,
+    /// Hash of the `refs/tags/` listing it was built from.
+    pub hash: String,
 }
 
 /// The CAS ids and lengths of a side pack and its idx.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SidePack {
     pub pack: String,
     pub pack_len: u64,

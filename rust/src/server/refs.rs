@@ -18,7 +18,7 @@ use super::worker::repo_lock;
 use crate::branches::MirrorRefs;
 use crate::cancel;
 use crate::cas::Cas;
-use crate::control::{RepoBranches, SidePack};
+use crate::control::{PublishedTags, RepoBranches, SidePack};
 use crate::git::{self, UpstreamRefs};
 use crate::pins::PinSet;
 use crate::provider::RepoId;
@@ -161,6 +161,7 @@ pub(super) enum Scope {
 /// The branches and side pack are built before taking `lock.refs`, which
 /// a Head's tags publish waits on. Only a refresh builds them, and
 /// refreshes run one at a time, so no other publish writes them meanwhile.
+/// Branches it replaces stay as `ready` when their base's Full is ready.
 ///
 /// What it stores is pinned until the refs that name it are written, and
 /// whatever it stored that they do not name is queued for deletion. A Head
@@ -195,14 +196,22 @@ pub(super) async fn publish_pinned(
         Scope::Tags => None,
         Scope::All => {
             let refs = read_refs(&mirror_dir).await?;
-            let previous = state
-                .control
-                .get_refs(repo_id)
-                .await?
-                .and_then(|row| row.branches);
-            match previous {
+            let stored = state.control.get_refs(repo_id).await?.unwrap_or_default();
+            match stored.branches {
                 Some(previous) if previous.refs_hash == refs.hash() => Some(previous),
-                previous => Some(publish_branches(state, cas, &mirror_dir, refs, previous).await?),
+                previous => {
+                    let tags = if stored.tags_hash == refs.tags_hash {
+                        PublishedTags {
+                            artifact: stored.tags_artifact,
+                            len: stored.tags_len,
+                            count: stored.tags_count,
+                            hash: stored.tags_hash,
+                        }
+                    } else {
+                        build_tags(state, cas, &mirror_dir, &refs).await?
+                    };
+                    Some(publish_branches(state, cas, &mirror_dir, refs, previous, tags).await?)
+                }
             }
         }
     };
@@ -212,25 +221,71 @@ pub(super) async fn publish_pinned(
     let stored = state.control.get_refs(repo_id).await?;
     let mut row = stored.clone().unwrap_or_default();
     if stored.is_none() || row.tags_hash != refs.tags_hash {
-        let (dir, tags) = (mirror_dir.clone(), refs.tags.clone());
-        let (artifact, len) = put_bytes(state, cas, move || crate::tags::build(&dir, &tags))
-            .await
-            .context("tags artifact")?;
-        row.tags_artifact = artifact;
-        row.tags_len = len;
-        row.tags_count = refs.tags.len() as u64;
+        let tags = match &branches {
+            Some(branches) if branches.tags.hash == refs.tags_hash => branches.tags.clone(),
+            _ => build_tags(state, cas, &mirror_dir, &refs).await?,
+        };
+        row.tags_artifact = tags.artifact;
+        row.tags_len = tags.len;
+        row.tags_count = tags.count;
         row.tags_hash = refs.tags_hash.clone();
     }
-    if branches.is_some() {
-        row.branches = branches;
+    if let Some(branches) = branches
+        && row.branches.as_ref() != Some(&branches)
+    {
+        if let Some(replaced) = row.branches.take()
+            && full_ready(state, repo_id, replaced.base.as_deref()).await?
+        {
+            row.ready = Some(replaced);
+        }
+        row.branches = Some(branches);
     }
-    if stored.as_ref() != Some(&row) && !state.control.set_refs(repo_id, &row).await? {
-        return Ok(BTreeSet::new());
+    if stored.as_ref() != Some(&row) {
+        if !state.control.set_refs(repo_id, &row).await? {
+            return Ok(BTreeSet::new());
+        }
+        if row.branches != stored.and_then(|stored| stored.branches) {
+            tracing::info!(
+                "published refs of {}: base {}",
+                repo_id.storage_key(),
+                (row.branches.as_ref())
+                    .and_then(|branches| branches.base.as_deref())
+                    .unwrap_or("none")
+            );
+        }
     }
     if row.branches.is_none() {
         spawn_refresh(state, repo_id, "first build");
     }
     Ok(row.artifacts().into_iter().map(str::to_string).collect())
+}
+
+/// Whether `commit`'s Full is ready.
+async fn full_ready(state: &ServerState, repo_id: &RepoId, commit: Option<&str>) -> Result<bool> {
+    let Some(commit) = commit else {
+        return Ok(false);
+    };
+    let row = state.control.status(repo_id, commit).await?;
+    Ok(row.is_some_and(|row| row.full.ready().is_some()))
+}
+
+/// Build and store the tags artifact of `refs`.
+async fn build_tags(
+    state: &ServerState,
+    cas: &Cas,
+    mirror_dir: &Path,
+    refs: &MirrorRefs,
+) -> Result<PublishedTags> {
+    let (dir, tags) = (mirror_dir.to_path_buf(), refs.tags.clone());
+    let (artifact, len) = put_bytes(state, cas, move || crate::tags::build(&dir, &tags))
+        .await
+        .context("tags artifact")?;
+    Ok(PublishedTags {
+        artifact,
+        len,
+        count: refs.tags.len() as u64,
+        hash: refs.tags_hash.clone(),
+    })
 }
 
 async fn read_refs(mirror_dir: &Path) -> Result<MirrorRefs> {
@@ -250,6 +305,7 @@ async fn publish_branches(
     mirror_dir: &Path,
     refs: MirrorRefs,
     previous: Option<RepoBranches>,
+    tags: PublishedTags,
 ) -> Result<RepoBranches> {
     let built = refs.build()?;
     let (artifact, len) = put_bytes(state, cas, move || Ok(built))
@@ -286,8 +342,10 @@ async fn publish_branches(
         side_base,
         side_tips,
         side_pack,
+        tags,
     })
 }
+
 /// Whether `old` is in `new`'s history.
 async fn moved_forward(mirror_dir: &Path, old: &str, new: &str) -> Result<bool> {
     let (dir, old, new) = (mirror_dir.to_path_buf(), old.to_string(), new.to_string());

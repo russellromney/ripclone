@@ -13,26 +13,17 @@ CREATE TABLE added_repos (
 );
 
 -- The repository's published refs (see docs/internal/rebuild/TAGS.md): the
--- newest tags artifact, and the branches artifact and side pack of the last
--- refresh. The branch columns are NULL before the first refresh, the side
--- pack's when every ref is in the default branch's history.
+-- newest tags artifact, and the branches, side pack and tags of the last
+-- refresh and of the last one whose base had a ready Full, each a JSON
+-- control::RepoBranches. The branches are NULL before the first refresh.
 CREATE TABLE repo_refs (
   repo              TEXT PRIMARY KEY,  -- RepoId::storage_key()
   tags_artifact     TEXT NOT NULL,     -- CAS id of the TagsArtifact
   tags_len          INTEGER NOT NULL,
   tags_count        INTEGER NOT NULL,  -- tags in the artifact
   tags_hash         TEXT NOT NULL,     -- hash of the mirror's refs/tags listing
-  branches_artifact TEXT,              -- CAS id of the BranchesArtifact
-  branches_len      INTEGER,
-  refs_hash         TEXT,              -- hash of the mirror's refs it was built from
-  default_branch    TEXT,              -- the branch the mirror's HEAD named
-  branches_base     TEXT,              -- the default branch's commit
-  side_base         TEXT,              -- the commit the side pack leaves out
-  side_tips         TEXT,              -- hash of the tips the side pack holds
-  side_pack         TEXT,              -- CAS id of the side pack
-  side_pack_len     INTEGER,
-  side_idx          TEXT,              -- CAS id of its idx
-  side_idx_len      INTEGER
+  branches          TEXT,              -- the last refresh's RepoBranches
+  ready_branches    TEXT               -- RepoRefs::ready
 );
 
 -- One row per (repo, commit). Each output kind (head, files, full) is

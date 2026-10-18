@@ -82,6 +82,27 @@ pub struct ServerState {
     pub signed_url_ttl: Duration,
     /// Artifacts the running builds rely on, which deletion skips.
     pub pins: Arc<crate::pins::Pins>,
+    /// Answers of whether one commit is in another's history, which never
+    /// change, so a read of a pinned commit asks git once.
+    pub ancestry: Arc<Ancestry>,
+}
+
+/// `git merge-base --is-ancestor` answers by repo, ancestor and commit.
+/// Concurrent reads of one key wait for one git run, and a failed run is
+/// not kept. Past [`Ancestry::MAX`] keys it starts over.
+#[derive(Default)]
+pub struct Ancestry(std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<bool>>>>);
+
+impl Ancestry {
+    const MAX: usize = 4096;
+
+    pub fn cell(&self, key: String) -> Arc<tokio::sync::OnceCell<bool>> {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= Self::MAX && !map.contains_key(&key) {
+            map.clear();
+        }
+        map.entry(key).or_default().clone()
+    }
 }
 
 /// The locks of one repo's bare mirror.
@@ -379,6 +400,7 @@ pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Re
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+        ancestry: Arc::default(),
         signed_url_ttl,
         pins: crate::pins::Pins::new(),
     };
@@ -449,6 +471,7 @@ mod tests {
             webhook_config: Arc::new(WebhookConfig::default()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+            ancestry: Arc::default(),
             signed_url_ttl: api::DEFAULT_SIGNED_URL_TTL,
             pins: crate::pins::Pins::new(),
         }

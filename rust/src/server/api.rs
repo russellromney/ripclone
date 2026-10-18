@@ -187,6 +187,12 @@ pub struct RefResponse {
     /// repository's first refresh.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branches: Option<crate::branches::BranchesRef>,
+    /// The ready Full of the commit the side pack is built against, the
+    /// default branch's tip, when it is another commit. A full clone
+    /// installs its history with the side pack to hold every ref, as `git
+    /// clone --branch` downloads every ref before its checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refs_base: Option<Box<RefResponse>>,
     pub kind: ExactResultKind,
 }
 
@@ -637,6 +643,12 @@ struct ReadyBody {
 /// A ready output's body, with the repository's refs as of now. Refs that
 /// cannot be read are left out, as before the first publish: the clone
 /// still comes, and fetches its refs from upstream.
+///
+/// A Full gets the newest published branches it can complete every ref
+/// from: those whose base is in its own history, or else whose base has a
+/// ready Full, named as `refs_base` for the clone to install. With none, it
+/// gets the newest branches and no `refs_base`, and the clone fetches the
+/// refs from the upstream.
 async fn ready_body(
     state: &ServerState,
     repo_id: &RepoId,
@@ -644,6 +656,10 @@ async fn ready_body(
     row: &BuildRow,
     kind: ExactResultKind,
 ) -> Result<serde_json::Value, ApiError> {
+    let control = |error: anyhow::Error| {
+        state.metrics.record_error();
+        ApiError::control(error)
+    };
     let refs = state
         .control
         .get_refs(repo_id)
@@ -656,18 +672,89 @@ async fn ready_body(
             );
             None
         });
-    Ok(serde_json::json!(ReadyBody {
-        state: "ready",
-        result: ref_response(
+    let respond = |row: &BuildRow, refs: Option<&crate::control::RepoRefs>| {
+        ref_response(
             repo_id,
             provider,
             row,
-            refs.as_ref(),
+            refs,
             &state.storage,
             state.signed_url_ttl,
-            kind
-        ),
+            kind,
+        )
+    };
+    let mut result = respond(row, refs.as_ref());
+    if let Some(stored) = refs.as_ref().filter(|_| kind == ExactResultKind::Full) {
+        // The ready branches with the tags of their own refresh.
+        let ready = stored
+            .ready
+            .clone()
+            .map(|branches| crate::control::RepoRefs {
+                tags_artifact: branches.tags.artifact.clone(),
+                tags_len: branches.tags.len,
+                tags_count: branches.tags.count,
+                tags_hash: branches.tags.hash.clone(),
+                branches: Some(branches),
+                ready: None,
+            });
+        for served in [Some(stored), ready.as_ref()].into_iter().flatten() {
+            let Some(base) = (served.branches.as_ref()).and_then(|branches| branches.base.clone())
+            else {
+                continue;
+            };
+            if base == row.commit || in_history(state, repo_id, &base, &row.commit).await {
+                result = respond(row, Some(served));
+                break;
+            }
+            let base = state
+                .control
+                .status(repo_id, &base)
+                .await
+                .map_err(control)?;
+            // A later admit of the base's branch that does not descend from
+            // it was force-pushed: these refs are behind the upstream, so
+            // the clone, lacking the base, fetches them from there.
+            let newer = |base: &BuildRow| {
+                row.ref_name.is_some() && row.ref_name == base.ref_name && row.seq > base.seq
+            };
+            if base.as_ref().is_some_and(newer) {
+                break;
+            }
+            if let Some(base) = base.filter(|base| base.full.ready().is_some()) {
+                result = respond(row, Some(served));
+                result.refs_base = Some(Box::new(respond(&base, Some(served))));
+                break;
+            }
+        }
+    }
+    Ok(serde_json::json!(ReadyBody {
+        state: "ready",
+        result,
     }))
+}
+
+/// Whether `base` is in `commit`'s history in the mirror: then a Full of
+/// `commit` holds all of the base's. A mirror that cannot answer says no,
+/// and the clone downloads the base's history too. Asked once per pair.
+async fn in_history(state: &ServerState, repo_id: &RepoId, base: &str, commit: &str) -> bool {
+    let cell = (state.ancestry).cell(format!("{} {base} {commit}", repo_id.storage_key()));
+    let answer = cell
+        .get_or_try_init(|| async {
+            let dir = state.repo_root.join(repo_id.mirror_dir_name());
+            let (base, commit) = (base.to_string(), commit.to_string());
+            crate::cancel::spawn_blocking(move || crate::git::is_ancestor(&dir, &base, &commit))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|answer| answer)
+        })
+        .await;
+    match answer {
+        Ok(answer) => *answer,
+        Err(error) => {
+            tracing::debug!("ancestry in {}: {error:#}", repo_id.storage_key());
+            false
+        }
+    }
 }
 
 /// `GET .../commits/{sha}[?kind=]`: a pure read of one build. With a kind,
@@ -903,6 +990,7 @@ fn ref_response(
                         idx_url: signed(&side.idx),
                     }),
             }),
+        refs_base: None,
         kind,
     }
 }
@@ -1200,6 +1288,7 @@ mod tests {
             ref_name: None,
             parent,
             created_at: 0,
+            seq: 0,
             head: out(info.head),
             files: out(info.files),
             full: out(info.full),

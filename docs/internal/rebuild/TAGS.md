@@ -520,7 +520,7 @@ The trial scripts compare `git branch -r` with `git clone`'s.
 - **Two artifacts, not one.** The tags artifact stays as it was. A
   separate branches artifact (`BranchesArtifact`: default branch, base D,
   and each branch's commit) and the side pack with its idx sit next to it
-  in the `repo_refs` row (schema 6). Only a Full response carries the
+  in the `repo_refs` row (schema 7). Only a Full response carries the
   branches artifact and side pack URLs.
 - **The side pack is kept while only the default branch moves on.** The
   row stores the commit the side pack leaves out (`side_base`) and a hash
@@ -571,11 +571,49 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   (G25).
 - **The checked-out branch's remote-tracking ref** is the installed
   commit, even when the branches artifact is older.
-- **Cost of `--at` an older commit:** it does not hold D, so it always
-  takes the upstream fetch, which transfers the history after its commit.
+- **A clone of another commit** (`--branch`, `--at`) does what `git clone
+  --branch` does: it downloads every ref's history, then checks out its
+  commit. A Full response of a commit other than D carries `refs_base`,
+  Full(D)'s ready body, when Full(D) is ready (the base is kept in the
+  branches, schema 7). The client writes the working tree and index from
+  its own Full's Head packs and metadata, installs Full(D)'s history packs
+  and the side pack in place of its own history, and adds its own history
+  only when its commit is on no ref, which the objects show.
+- **A commit in no ref's history downloads the shared history once.** Its
+  own history packs that Full(D)'s manifest lists too are skipped: both
+  Fulls built on an older Full share its levels by hash (G27). Its own
+  manifest, already read for the working tree, is not fetched again. What they
+  share in levels built apart, a cold Full or a compaction, still comes
+  twice; a pack of only the commit's own objects would need a server
+  build per request.
+- **A commit with D in its history gets no `refs_base`** (the mirror's
+  `merge-base --is-ancestor`, about 18 ms on tokio): its own history
+  holds D's, as for a push built before the refresh published it, by
+  branch or by commit (G16). A mirror that cannot answer gets
+  `refs_base`. The server keeps each answer, since ancestry never
+  changes, so a pinned commit's reads and a top-up's polls ask git once
+  (G16 counts the runs); concurrent reads of one pair wait for one run.
+- **A force-pushed later admit of D's branch gets no `refs_base`.** The
+  published refs are behind the upstream there, so the clone, which lacks
+  D, fetches the refs from the upstream and holds none of D's objects
+  (J3).
+- **The last refs with a ready base serve while Full(D) builds.** A
+  refresh that replaces branches whose base has a ready Full keeps them as
+  `ready`, with the tags artifact built from the same listing, not the
+  newest tags (which may name commits the old branches lack). While the
+  newest base has no ready Full, a Full of another commit gets the ready
+  branches, their tags and their base as `refs_base`, or none when its
+  commit holds that base: the refs as they were before the push, with no
+  upstream fetch (G17). Only when no published base has a ready Full (the
+  first tip's Full building or failed) does the clone fetch the refs from
+  the upstream (G26). Each publish of new branches logs `published refs
+  of <repo>: base <commit>`.
 
-G14 runs its full clones with an origin base that does not exist, so a
-clone that fell back to the upstream fails it; skipping the side pack on
+G14 runs its full clones, `--at v1` included, with an origin base that
+does not exist, so a clone that fell back to the upstream fails it. G16
+counts the upstream fetches of tag, branch and orphan-commit clones (none),
+G17 covers Full(D) not ready after a push, G26 no ready base at all, and
+G18 a lying refs base and a corrupt side pack; skipping the side pack on
 the server and skipping the remote branches on the client each failed it
 when tried.
 

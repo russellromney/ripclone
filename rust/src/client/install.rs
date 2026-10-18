@@ -19,6 +19,7 @@ use crate::extract::extract_archive_from_chunk_receiver;
 use crate::provider::RepoId;
 use anyhow::{Context, Result};
 use prost::Message;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -270,6 +271,16 @@ impl Client {
             match self.commit_output(repo_path, target, kind).await? {
                 CommitOutput::Ready(output) => {
                     validate_output(&output, target, kind, repo_path)?;
+                    if let Some(base) = &output.refs_base {
+                        crate::validation::validate_object_id(&base.commit)
+                            .context("invalid refs base")?;
+                        validate_output(base, &base.commit, ExactResultKind::Full, repo_path)
+                            .context("invalid refs base")?;
+                        anyhow::ensure!(
+                            &base.commit != target,
+                            "invalid refs base for pinned commit {target}: base is not distinct"
+                        );
+                    }
                     return Ok((Plan::exact(*output), cold));
                 }
                 CommitOutput::Failed { commit, error } => {
@@ -403,6 +414,14 @@ impl Client {
             )
         });
         let branches = output.branches.clone().filter(|_| full);
+        // A full clone of a commit other than the default branch's tip
+        // installs that tip's history in place of its own: with the side
+        // pack it holds every ref, as `git clone --branch` downloads every
+        // ref before its checkout.
+        let refs_base = match plan {
+            Plan::Full(_) if branches.is_some() => output.refs_base.as_deref(),
+            _ => None,
+        };
         let branches_download = branches.as_ref().map(|branches| {
             let (client, urls) = (self.clone(), urls.clone());
             let hash = branches.artifact.clone();
@@ -448,7 +467,7 @@ impl Client {
                         let Downloaded::TempFile(pack, _) = pack.context("fetch side pack")? else {
                             unreachable!("temp file sink");
                         };
-                        anyhow::Ok(SidePackFiles {
+                        anyhow::Ok(PackFiles {
                             pack,
                             idx: idx.context("fetch side pack idx")?,
                         })
@@ -456,9 +475,57 @@ impl Client {
                     cleanup.clone(),
                 )
             });
-        let ident = self
-            .materialize_git(&urls, &pin.checkout, &root, cleanup, bench)
-            .await?;
+        let mut side_download = side_download;
+        let ident = match refs_base {
+            None => {
+                (self.materialize_git(&urls, &pin.checkout, &root, true, cleanup, bench))
+                    .await?
+                    .0
+            }
+            Some(base) => {
+                let base_urls = OutputUrls::new(repo_path, base.clone());
+                let none = HashSet::new();
+                let ((ident, manifest), (packs, base_packs)) = tokio::try_join!(
+                    self.materialize_git(&urls, &pin.checkout, &root, false, cleanup, bench),
+                    async {
+                        let manifest = self.fetch_manifest(&base_urls).await?;
+                        let urls = &base_urls;
+                        (self.fetch_history_packs(urls, &manifest, &root, &none, cleanup)).await
+                    },
+                )?;
+                let side = match side_download.take() {
+                    Some(download) => {
+                        Some(download.join().await.context("side pack download task")??)
+                    }
+                    None => None,
+                };
+                let commit = pin.commit.clone();
+                let git_dir = root.join(".git");
+                let held = tokio::task::spawn_blocking(move || {
+                    install_packs(&git_dir, packs, "history pack")?;
+                    if let Some(side) = side {
+                        install_pack(&git_dir, side, "side pack")?;
+                    }
+                    anyhow::Ok(crate::tags::Present::scan(&git_dir)?.contains_hex(&commit))
+                })
+                .await
+                .context("pack install task")??;
+                // A commit on no ref: its own history too, but for the packs
+                // its Full shares with the base's (levels both built on).
+                if !held {
+                    let (packs, _) =
+                        (self.fetch_history_packs(&urls, &manifest, &root, &base_packs, cleanup))
+                            .await?;
+                    let git_dir = root.join(".git");
+                    tokio::task::spawn_blocking(move || {
+                        install_packs(&git_dir, packs, "history pack")
+                    })
+                    .await
+                    .context("pack install task")??;
+                }
+                ident
+            }
+        };
         let mut reaches = None;
         if let Plan::TopUp { base, upstream_url } = plan {
             self.progress
@@ -653,7 +720,7 @@ impl Client {
         let root = stage(target, staging)?;
         bench.mark_metadata();
         let bytes = self
-            .install_editable_packs(urls, &manifest, None, &root, &metadata, cleanup)
+            .install_editable_packs(urls, &manifest, None, false, &root, &metadata, cleanup)
             .await
             .context("write the working tree from Head packs")?;
         bench.mark_write();
@@ -664,15 +731,16 @@ impl Client {
 
     /// Head or Full: `git init`, `.git` from the metadata chunk, then the
     /// packs, whose blobs are written into the working tree as each pack
-    /// lands. Returns the staging root and the committer for the reflog.
+    /// lands. Returns the committer for the reflog and the manifest.
     async fn materialize_git(
         &self,
         urls: &OutputUrls,
         checkout: &str,
         root: &Path,
+        history: bool,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
-    ) -> Result<Option<String>> {
+    ) -> Result<(Option<String>, ClonepackManifest)> {
         let (manifest, metadata, ident) = tokio::try_join!(
             async {
                 tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
@@ -693,6 +761,7 @@ impl Client {
                 urls,
                 &manifest,
                 Some(&git_dir.join("objects").join("pack")),
+                history,
                 root,
                 &metadata,
                 cleanup,
@@ -705,7 +774,76 @@ impl Client {
             manifest.packs.len()
         );
         bench.mark_archive_download(bytes);
-        Ok(ident)
+        Ok((ident, manifest))
+    }
+
+    /// Download the history packs `manifest`, of `urls`' Full, lists but
+    /// `held` does, each with its own idx, into files in `dir` for
+    /// [`install_pack`]. Returns them and every listed history pack hash.
+    async fn fetch_history_packs(
+        &self,
+        urls: &OutputUrls,
+        manifest: &ClonepackManifest,
+        dir: &Path,
+        held: &HashSet<Vec<u8>>,
+        cleanup: &Cleanup,
+    ) -> Result<(Vec<PackFiles>, HashSet<Vec<u8>>)> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let history: Vec<(usize, PackEntry)> = (manifest.packs.iter().cloned().enumerate())
+            .filter(|(_, entry)| entry.history_only)
+            .collect();
+        anyhow::ensure!(
+            !history.is_empty(),
+            "the Full of {} has no history packs",
+            urls.output().commit
+        );
+        let listed: HashSet<Vec<u8>> = (history.iter())
+            .filter_map(|(_, entry)| Some(entry.pack.as_ref()?.hash.clone()))
+            .collect();
+        let history: Vec<(usize, PackEntry)> = (history.into_iter())
+            .filter(|(_, entry)| {
+                (entry.pack.as_ref()).is_none_or(|pack| !held.contains(&pack.hash))
+            })
+            .collect();
+        self.progress.add_total(
+            (history.iter())
+                .flat_map(|(_, entry)| entry.pack.iter().chain(entry.idx.iter()))
+                .map(|chunk| chunk.len)
+                .sum(),
+        );
+        let conc = ClientTuning::load().editable_download_concurrency;
+        stream::iter(history)
+            .map(|(i, entry)| {
+                let (client, urls, dir) = (self.clone(), urls.clone(), dir.to_path_buf());
+                let task = AbortOnDrop::new(
+                    tokio::spawn(async move {
+                        let pack = (entry.pack.as_ref())
+                            .with_context(|| format!("pack {i} missing pack ref"))?;
+                        let idx = (entry.idx.as_ref())
+                            .with_context(|| format!("pack {i} missing idx ref"))?;
+                        let pack = Artifact::chunk(pack, UrlSlot::PackChunk(i));
+                        let idx = Artifact::chunk(idx, UrlSlot::PackIdx(i));
+                        let (pack, idx) = tokio::join!(
+                            client.download(&urls, &pack, Sink::TempFile(&dir)),
+                            client.download_bytes(&urls, &idx)
+                        );
+                        let Downloaded::TempFile(pack, _) =
+                            pack.with_context(|| format!("stream history pack {i}"))?
+                        else {
+                            unreachable!("temp file sink");
+                        };
+                        let idx = idx.with_context(|| format!("fetch history pack idx {i}"))?;
+                        anyhow::Ok(PackFiles { pack, idx })
+                    }),
+                    cleanup.clone(),
+                );
+                async move { task.join().await.context("history pack download task")? }
+            })
+            .buffer_unordered(conc)
+            .try_collect()
+            .await
+            .map(|packs| (packs, listed))
     }
 
     /// The clonepack manifest of `urls`' output, checked against its commit.
@@ -797,14 +935,17 @@ impl Client {
     /// they hold every object, so the HEAD packs only write the working tree,
     /// and a handful of packs needs no multi-pack-index. Without a `pack_dir`
     /// only the working tree is written: history packs are not downloaded, and
-    /// no pack, idx, index or multi-pack-index is kept. Downloads run as their
-    /// own tasks, so they keep going while every parse slot is busy. Returns
-    /// the bytes downloaded.
+    /// no pack, idx, index or multi-pack-index is kept. Without `history` a
+    /// Full's history packs are not downloaded either, but the index is
+    /// written: the clone's objects come from elsewhere. Downloads run as
+    /// their own tasks, so they keep going while every parse slot is busy.
+    /// Returns the bytes downloaded.
     async fn install_editable_packs(
         &self,
         urls: &OutputUrls,
         manifest: &ClonepackManifest,
         pack_dir: Option<&Path>,
+        history: bool,
         work_tree: &Path,
         metadata: &MetadataChunk,
         cleanup: &Cleanup,
@@ -819,7 +960,7 @@ impl Client {
         let head_pack_dir = pack_dir.filter(|_| !full);
         // The planned download: the packs fetched, each history pack's own
         // idx, and a Head's idx bundle and multi-pack-index.
-        let wanted = |entry: &&PackEntry| pack_dir.is_some() || !entry.history_only;
+        let wanted = |entry: &&PackEntry| !entry.history_only || (pack_dir.is_some() && history);
         let pack_bytes: u64 = (manifest.packs.iter().filter(wanted))
             .flat_map(|entry| {
                 let own_idx = entry.idx.as_ref().filter(|_| entry.history_only);
@@ -1192,7 +1333,7 @@ impl Client {
                 side,
             } = refs;
             if let Some(side) = side {
-                install_side_pack(&dir, side)?;
+                install_pack(&dir, side, "side pack")?;
             }
             let present = crate::tags::Present::scan(&dir)?;
             // The clone's objects are whole histories, so holding a commit
@@ -1568,7 +1709,7 @@ async fn install_tags(
         let root_tree = git_stdout(root, &["rev-parse", "--verify", &tree], cleanup).await?;
         let listed =
             git_stdout(root, &["ls-tree", "-r", "-t", "--full-tree", tip], cleanup).await?;
-        let held: std::collections::HashSet<&str> = (listed.lines())
+        let held: HashSet<&str> = (listed.lines())
             .filter_map(|line| line.split_once('\t')?.0.split(' ').nth(2))
             .chain([tip, root_tree.trim()])
             .collect();
@@ -1595,8 +1736,8 @@ async fn install_tags(
         .context("tags task")?
 }
 
-/// A downloaded side pack and its idx, checked against their hashes.
-struct SidePackFiles {
+/// A downloaded pack and its idx, checked against their hashes.
+struct PackFiles {
     pack: tempfile::NamedTempFile,
     idx: bytes::Bytes,
 }
@@ -1605,34 +1746,44 @@ struct SidePackFiles {
 struct FullRefs {
     tags: crate::tags::Kept,
     branches: Option<crate::branches::Branches>,
-    side: Option<SidePackFiles>,
+    side: Option<PackFiles>,
 }
 
-/// Move the side pack into the clone's pack directory with its idx, named
+/// Move a downloaded pack into the clone's pack directory with its idx, named
 /// by the checksum both carry, as git names packs.
-fn install_side_pack(git_dir: &Path, side: SidePackFiles) -> Result<()> {
+fn install_pack(git_dir: &Path, files: PackFiles, what: &str) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let integrity = "side pack integrity error";
-    let idx = &side.idx;
-    anyhow::ensure!(idx.len() >= 40, "{integrity}: idx too short");
+    let idx = &files.idx;
+    anyhow::ensure!(idx.len() >= 40, "{what} integrity error: idx too short");
     let checksum = &idx[idx.len() - 40..idx.len() - 20];
-    let mut file = side.pack.as_file().try_clone().context("open side pack")?;
+    let mut file = files
+        .pack
+        .as_file()
+        .try_clone()
+        .with_context(|| format!("open {what}"))?;
     let mut trailer = [0u8; 20];
     file.seek(SeekFrom::End(-20))
         .and_then(|_| file.read_exact(&mut trailer))
-        .context("read side pack trailer")?;
+        .with_context(|| format!("read {what} trailer"))?;
     anyhow::ensure!(
         trailer == checksum,
-        "{integrity}: the idx is not the pack's"
+        "{what} integrity error: the idx is not the pack's"
     );
     let name = hex::encode(trailer);
     let dir = git_dir.join("objects").join("pack");
-    side.pack
+    files
+        .pack
         .persist(dir.join(format!("pack-{name}.pack")))
-        .with_context(|| format!("install side pack {name}"))?;
+        .with_context(|| format!("install {what} {name}"))?;
     // The idx last: git ignores a pack until its idx is there.
     std::fs::write(dir.join(format!("pack-{name}.idx")), idx)
-        .with_context(|| format!("write side pack idx {name}"))
+        .with_context(|| format!("write {what} idx {name}"))
+}
+
+fn install_packs(git_dir: &Path, packs: Vec<PackFiles>, what: &str) -> Result<()> {
+    packs
+        .into_iter()
+        .try_for_each(|files| install_pack(git_dir, files, what))
 }
 
 /// Fetch every upstream branch and tag with the user's git, as `git clone`
