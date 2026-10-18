@@ -168,7 +168,7 @@ Ripclone token reaches the origin.
 | H10 | S3 emulator: after a one-line push, B uploads no object of 1 MiB or more that the bucket already holds (its Files reuses A's bundles). A second repository with the same files builds the same large objects: the bucket proxy sees a HEAD and no PUT for each. A bucket copy cut short is uploaded again when a third repository with the same files makes it; that repository's clones and the Files clones of B and the second repository are exact. | #220 (S3 job), #221 |
 | H11 | A scratch leftover the server cannot remove, as when a killed server's git child is still writing it, doesn't stop the next start: the server logs it, builds and clones in its own scratch dir, and once the leftover can go, the next start removes it. | #234 |
 
-### I. Auth, integrations, CLI (12)
+### I. Auth, integrations, CLI (14)
 
 | # | Test | Added |
 |---|---|---|
@@ -184,6 +184,8 @@ Ripclone token reaches the origin.
 | I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | #208 |
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | #208 |
 | I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | #209 |
+| I13 | A clone with stderr on a pipe prints no progress line: depth-1, full, Files and `--quiet` clones leave stderr empty. A `--wait` clone of a pending build prints the "warming" note, and with `--quiet` only the pending error. | — |
+| I14 | Stderr on a pseudo-terminal: a clone held mid-download draws one line with its phase, bytes of the total and percent, blanks it with spaces (no escape codes) before stdout reports the install. A top-up held at the origin shows `fetching <sha> from upstream (1s)`, with no byte figures. `add --wait` with the build held shows each output's state, every line narrower than the 60-column terminal. `--progress` draws the line on a pipe; with `--quiet` it is rejected. | — |
 
 ### J. Builds start from the newest ready ancestor (5)
 
@@ -289,5 +291,5 @@ keychain out, never print a token, and delete their work directory
   `s3` CI job runs them with `--ignored s3_`. The live Gitea row runs in the
   `gitea` job with `--ignored gitea_`.
 - The CLI polls at most 200 ms apart in every test, so `--wait` lasts about
-  8 s, inside the 10 s wait. D4 sets 50 ms to run out its budget.
+  8 s, inside the 10 s wait. D4 and I13 set 50 ms to run out its budget.
 - No nightly stress or benchmark job exists.
