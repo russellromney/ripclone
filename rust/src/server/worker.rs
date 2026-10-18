@@ -1088,19 +1088,6 @@ mod tests {
         async fn list_repos(&self) -> Result<Vec<crate::control::AddedRepo>> {
             self.inner.list_repos().await
         }
-        async fn get_config(
-            &self,
-            repo: &RepoId,
-        ) -> Result<Option<crate::repo_config::RepoConfig>> {
-            self.inner.get_config(repo).await
-        }
-        async fn set_config(
-            &self,
-            repo: &RepoId,
-            config: &crate::repo_config::RepoConfig,
-        ) -> Result<()> {
-            self.inner.set_config(repo, config).await
-        }
         async fn health(&self) -> Result<()> {
             self.inner.health().await
         }
