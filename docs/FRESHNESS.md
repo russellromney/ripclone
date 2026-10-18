@@ -82,12 +82,15 @@ missing or stale in a clone; your checked-out branch is always the commit
 you cloned. A later `git fetch` brings branches up to date, but, like git
 with any clone, never moves or deletes a tag you have.
 
-A full clone writes the server's refs only when it holds the default
-branch's tip, which it does when it clones that tip or tops up past it.
-Otherwise, as for `--at` an older commit, or before the server's first
-publish, it fetches the branches and tags from the upstream with your own
-git, as top-up does. If that fetch fails, the clone warns and keeps only its
-own branch and the tags it holds.
+A full clone writes the server's refs when it holds the default branch's
+tip. It does when it clones that tip or tops up past it, and when it clones
+another commit (`--branch`, `--at`) while the tip's Full is ready: as `git
+clone --branch` does, it downloads the history every ref reaches, the tip's
+Full and the side pack, then checks out its own commit's tree. A commit on
+no ref adds its own history. Otherwise, as before the server's first publish
+or while the tip's Full builds, it fetches the branches and tags from the
+upstream with your own git, as top-up does. If that fetch fails, the clone
+warns and keeps only its own branch and the tags whose targets it holds.
 
 ## Waiting
 

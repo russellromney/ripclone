@@ -352,6 +352,10 @@ pub struct RefResponse {
     /// branch's commit writes every branch and tag from them.
     #[serde(default)]
     pub branches: Option<crate::branches::BranchesRef>,
+    /// A Full's: the ready Full of the default branch's tip, when that is
+    /// another commit. Its history and the side pack hold every ref.
+    #[serde(default)]
+    pub refs_base: Option<Box<RefResponse>>,
     #[serde(rename = "kind")]
     pub result: ExactResultKind,
 }

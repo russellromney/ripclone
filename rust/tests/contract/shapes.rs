@@ -994,7 +994,7 @@ fn g13_editable_clones_match_git_clone() {
 /// branch and `origin/HEAD`, and annotated, nested and lightweight tags,
 /// those on a branch never built included, with every object they reach,
 /// so `git describe`, `git switch` and `git fsck` answer as in the git
-/// clone. A clone at a tag gets them too. A pushed, deleted or moved branch
+/// clone. A clone at a tag gets them from the server too. A pushed, deleted or moved branch
 /// or tag reaches the next clone after its webhook, with no build. A
 /// depth-1 clone has only its branch and the tags on its commit, as `git
 /// clone --depth 1` does: none for an untagged tip.
@@ -1050,10 +1050,7 @@ fn g14_clones_have_the_refs_git_clone_gets() {
         target
     };
     let matches_git_clone = |target: &std::path::Path, args: &[&str]| {
-        let (refs, all, tags) = git_clone_tags(&origin.bare, args);
-        assert_eq!(tag_refs(target), refs);
-        assert_eq!(describe(target), (all, tags));
-        assert_eq!(remote_refs(target), git_clone_remotes(&origin.bare, args));
+        assert_matches_git_clone(&origin.bare, target, args);
     };
     let tag_id = |name: &str| git(&origin.bare, &["rev-parse", &format!("refs/tags/{name}")]);
     let full = clone("full", &[]);
@@ -1089,13 +1086,7 @@ fn g14_clones_have_the_refs_git_clone_gets() {
     assert_eq!(listing(&full), origin.tree(&s));
 
     // A clone at a tag has every branch and tag too.
-    let at_a = world.target("at-a");
-    world
-        .cli(
-            &server,
-            &["clone", "acme/g14", at_a.to_str().unwrap(), "--at", "v1"],
-        )
-        .ok();
+    let at_a = clone("at-a", &["--at", "v1"]);
     assert_eq!(git(&at_a, &["rev-parse", "HEAD"]), a);
     matches_git_clone(&at_a, &["--branch", "v1"]);
     git(&at_a, &["fsck", "--full", "--strict"]);
@@ -1735,4 +1726,288 @@ fn g25_a_local_failure_of_the_refs_fetch_fails_the_clone() {
     assert!(remote_refs(&fetched).contains(&format!("origin/side {s}")));
     assert_eq!(remote_refs(&fetched), git_clone_remotes(&origin.bare, &[]));
     assert_eq!(tag_refs(&fetched), git_clone_tags(&origin.bare, &[]).0);
+}
+
+/// A repo whose origin is served over HTTP, so a test can count the
+/// upstream fetches: main is A (tag v1), B (tag light), C; branch side is S
+/// (tag side-v1) off A. Added with the default branch built and its refs
+/// published.
+struct RefsRepo {
+    world: World,
+    http: GitHttp,
+    origin: Origin,
+    server: Server,
+    repo: String,
+    a: String,
+    c: String,
+    s: String,
+}
+
+const REFS_SECRET: &str = "refs-secret";
+
+impl RefsRepo {
+    fn start(name: &str) -> Self {
+        let world = World::new();
+        let http = world.serve_origins_over_http();
+        let origin = world.origin("acme", name);
+        let (work, bare) = (&origin.work, origin.bare.to_str().unwrap());
+        let a = origin.commit(&[("a.txt", "a\n"), ("d/x.txt", "x\n")], "A");
+        git(work, &["tag", "-a", "-m", "release 1", "v1"]);
+        origin.commit(&[("b.txt", "b\n")], "B");
+        git(work, &["tag", "light"]);
+        git(work, &["checkout", "-q", "-b", "side", &a]);
+        let s = origin.commit(&[("s.txt", "s\n"), ("d/x.txt", "side\n")], "S");
+        git(work, &["tag", "-a", "-m", "side", "side-v1"]);
+        git(work, &["checkout", "-q", "main"]);
+        let c = origin.commit(&[("c.txt", "c\n")], "C");
+        origin.publish();
+        origin.publish_branch("side");
+        git(work, &["push", "-q", bare, "--tags"]);
+        let server = world.server(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", REFS_SECRET)]);
+        let repo = format!("acme/{name}");
+        world.cli(&server, &["add", &repo, "--wait"]).ok();
+        let t = Self {
+            world,
+            http,
+            origin,
+            server,
+            repo,
+            a,
+            c,
+            s,
+        };
+        wait_for("the first refs publish", || t.published().1);
+        t
+    }
+
+    /// The tags and branches artifacts a Full read points at.
+    fn published(&self) -> (Option<String>, Option<String>) {
+        (
+            api::tags_artifact(&self.server, &self.repo, &self.c),
+            api::branches_artifact(&self.server, &self.repo, &self.c),
+        )
+    }
+
+    fn sync(&self, args: &[&str]) {
+        let mut argv = vec!["sync", self.repo.as_str(), "--wait"];
+        argv.extend_from_slice(args);
+        self.world.cli(&self.server, &argv).ok();
+    }
+
+    /// Post a signed push webhook for `ref_` and wait for the refs it
+    /// refreshes to publish.
+    fn hook(&self, ref_: &str, after: &str) {
+        let before = self.published();
+        let (headers, body) = push_hook("github", REFS_SECRET, &self.repo, ref_, after);
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let resp = self.server.post("/webhooks/github", &headers, &body);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        wait_for("the refs publish", || {
+            (self.published() != before).then_some(())
+        });
+    }
+
+    /// Run `ripclone clone <repo> <name> <args>` through `endpoint`.
+    fn clone_via(
+        &self,
+        endpoint: &impl Endpoint,
+        name: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (std::path::PathBuf, CliOutput) {
+        let target = self.world.target(name);
+        let mut argv = vec!["clone", self.repo.as_str(), target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        let out = self.world.cli_env(endpoint, &argv, env);
+        (target, out)
+    }
+
+    /// A clone that must succeed with every ref, from the server's.
+    fn clone(&self, name: &str, args: &[&str]) -> std::path::PathBuf {
+        let (target, out) = self.clone_via(&self.server, name, args, &[]);
+        out.ok();
+        assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+        target
+    }
+
+    /// The clone at `target` is what `git clone <args>` gets: the checkout,
+    /// every ref, every object those reach, and a clean `git fsck`.
+    fn assert_git_clone(&self, target: &std::path::Path, args: &[&str]) {
+        assert_matches_git_clone(&self.origin.bare, target, args);
+        assert_eq!(
+            reachable_objects(target),
+            git_clone_objects(&self.origin.bare, args)
+        );
+        git(target, &["fsck", "--full", "--strict", "--no-dangling"]);
+        assert_eq!(git(target, &["status", "--porcelain"]), "");
+    }
+}
+
+/// G16: a full clone of a commit other than the default branch's tip, at a
+/// tag, a branch or a bare commit on no ref, has what `git clone --branch`
+/// gets, every branch and tag included, and the clone's own tree checked
+/// out, without fetching from the upstream. The user's next steps work as
+/// in a git clone: switching to another branch, and pulling a later push.
+#[test]
+fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
+    let t = RefsRepo::start("g16");
+    let (work, bare) = (&t.origin.work, t.origin.bare.to_str().unwrap());
+    // A commit on a branch that is then deleted: built, but on no ref.
+    git(work, &["checkout", "-q", "-b", "gone", &t.a]);
+    let x = t.origin.commit(&[("x.txt", "x\n")], "X");
+    git(work, &["checkout", "-q", "main"]);
+    t.origin.publish_branch("gone");
+    t.hook("refs/heads/gone", &x);
+    t.sync(&["--at", &x]);
+    git(work, &["push", "-q", bare, ":refs/heads/gone"]);
+    t.hook("refs/heads/gone", &"0".repeat(40));
+    // Built first, so a fetch from the upstream below can only be a clone's.
+    t.sync(&["--at", "v1"]);
+    t.sync(&["--at", "side"]);
+    let fetches = t.http.fetches();
+
+    let at_v1 = t.clone("at-v1", &["--at", "v1"]);
+    assert_eq!(git(&at_v1, &["rev-parse", "HEAD"]), t.a);
+    assert_eq!(listing(&at_v1), t.origin.tree(&t.a));
+    t.assert_git_clone(&at_v1, &["--branch", "v1"]);
+    assert!(
+        remote_refs(&at_v1).contains(&format!("origin/side {}", t.s)),
+        "{}",
+        remote_refs(&at_v1)
+    );
+
+    let side = t.clone("side", &["--branch", "side"]);
+    assert_eq!(git(&side, &["symbolic-ref", "HEAD"]), "refs/heads/side");
+    assert_eq!(git(&side, &["rev-parse", "@{upstream}"]), t.s);
+    assert_eq!(listing(&side), t.origin.tree(&t.s));
+    t.assert_git_clone(&side, &["--branch", "side"]);
+
+    // Every ref, and the commit's own history besides.
+    let orphan = t.clone("orphan", &["--at", &x]);
+    assert_eq!(git(&orphan, &["rev-parse", "HEAD"]), x);
+    assert_eq!(listing(&orphan), t.origin.tree(&x));
+    assert_eq!(remote_refs(&orphan), git_clone_remotes(&t.origin.bare, &[]));
+    assert_eq!(
+        tag_refs(&orphan).lines().count(),
+        3,
+        "{}",
+        tag_refs(&orphan)
+    );
+    assert_eq!(
+        git(&orphan, &["rev-list", "--count", "HEAD"]),
+        t.origin.count(&x)
+    );
+    git(&orphan, &["fsck", "--full", "--strict"]);
+
+    assert_eq!(
+        t.http.fetches(),
+        fetches,
+        "a clone fetched from the upstream"
+    );
+
+    // The user goes on as in a git clone.
+    git(&at_v1, &["switch", "-q", "main"]);
+    assert_eq!(git(&at_v1, &["rev-parse", "@{upstream}"]), t.c);
+    assert_eq!(listing(&at_v1), t.origin.tree(&t.c));
+    git(&at_v1, &["switch", "-q", "side"]);
+    assert_eq!(listing(&at_v1), t.origin.tree(&t.s));
+    let d = t.origin.commit(&[("d.txt", "d\n")], "D");
+    t.origin.publish();
+    git(&at_v1, &["switch", "-q", "main"]);
+    git(&at_v1, &["pull", "-q", "--ff-only"]);
+    assert_eq!(git(&at_v1, &["rev-parse", "HEAD"]), d);
+    assert_eq!(listing(&at_v1), t.origin.tree(&d));
+    git(&at_v1, &["fsck", "--full", "--strict"]);
+}
+
+/// G17: when the default branch's tip has no ready Full, a clone of another
+/// commit fetches the refs from the upstream with the user's git and still
+/// has what `git clone --branch` gets. With no upstream either, the clone
+/// succeeds with its own commit and the tags whose targets it holds, and
+/// says what it lacks.
+#[test]
+fn g17_with_no_tip_full_a_clone_of_another_commit_falls_back() {
+    let mut t = RefsRepo::start("g17");
+    t.sync(&["--at", "v1"]);
+    // D's Full cannot build, but the refs move to D.
+    t.server.restart_with(&[("RIPCLONE_FULL_SLOTS", "0")]);
+    let d = t.origin.commit(&[("d.txt", "d\n")], "D");
+    t.origin.publish();
+    t.hook("refs/heads/main", &d);
+    let (_, body) = api::parse(t.server.get(&api::commit_path(&t.repo, &t.a, Some("full"))));
+    assert!(body.get("refs_base").is_none(), "{body}");
+
+    let fetches = t.http.fetches();
+    let fetched = t.clone("fetched", &["--at", "v1"]);
+    assert!(
+        t.http.fetches() > fetches,
+        "the clone should fetch from the upstream"
+    );
+    assert_eq!(git(&fetched, &["rev-parse", "HEAD"]), t.a);
+    assert_eq!(listing(&fetched), t.origin.tree(&t.a));
+    t.assert_git_clone(&fetched, &["--branch", "v1"]);
+    assert!(
+        remote_refs(&fetched).contains(&format!("origin/main {d}")),
+        "{}",
+        remote_refs(&fetched)
+    );
+
+    let (alone, out) = t.clone_via(&t.server, "alone", &["--at", "v1"], &[NO_UPSTREAM]);
+    out.ok();
+    assert!(out.stderr().contains(NO_REFS), "{}", out.stderr());
+    assert_eq!(git(&alone, &["rev-parse", "HEAD"]), t.a);
+    assert_eq!(listing(&alone), t.origin.tree(&t.a));
+    // The side pack holds side-v1's commit; D's history, and so B's tag,
+    // never came.
+    let tag_id = |name: &str| git(&t.origin.bare, &["rev-parse", name]);
+    assert_eq!(
+        tag_refs(&alone),
+        format!("side-v1 tag {}\nv1 tag {}", tag_id("side-v1"), tag_id("v1"))
+    );
+    assert!(
+        !remote_refs(&alone).contains("origin/side"),
+        "{}",
+        remote_refs(&alone)
+    );
+    git(&alone, &["fsck", "--full", "--strict"]);
+}
+
+/// G18: a server that names a refs base its artifacts do not match, or
+/// serves a corrupt side pack, fails the clone with an integrity error and
+/// leaves no target and no staging behind.
+#[test]
+fn g18_a_bad_refs_base_or_side_pack_fails_the_clone_cleanly() {
+    let t = RefsRepo::start("g18");
+    t.sync(&["--at", "v1"]);
+    let full_a = api::commit_path(&t.repo, &t.a, Some("full"));
+    let (_, body) = api::parse(t.server.get(&full_a));
+    assert_eq!(body["refs_base"]["commit"], t.c.as_str(), "{body}");
+    let side = body["branches"]["side_pack"]["pack"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let lying = FaultProxy::start(&t.server);
+    let b = git(&t.origin.bare, &["rev-parse", "main~1"]);
+    lying.rewrite(
+        &format!("/commits/{}", t.a),
+        &format!("\"commit\":\"{}\"", t.c),
+        &format!("\"commit\":\"{b}\""),
+    );
+    let (target, out) = t.clone_via(&lying, "lying", &["--at", "v1"], &[]);
+    assert!(!out.success(), "{}", out.stderr());
+    assert!(out.stderr().contains("integrity"), "{}", out.stderr());
+    assert!(!target.exists());
+
+    let corrupt = FaultProxy::start(&t.server);
+    corrupt.fault_requests(&format!("/v1/artifacts/{side}"), Fault::FlipByte, 1000);
+    let (target, out) = t.clone_via(&corrupt, "corrupt", &["--at", "v1"], &[]);
+    assert!(!out.success(), "{}", out.stderr());
+    assert!(out.stderr().contains("side pack"), "{}", out.stderr());
+    assert!(!target.exists());
+    assert!(t.world.staging_leftovers().is_empty());
+
+    // The same clone through the server itself succeeds.
+    let good = t.clone("good", &["--at", "v1"]);
+    t.assert_git_clone(&good, &["--branch", "v1"]);
 }

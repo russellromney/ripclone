@@ -672,6 +672,42 @@ pub fn git_clone_remotes(bare: &Path, args: &[&str]) -> String {
     git_clone(bare, args, remote_refs)
 }
 
+/// What a user sees of the refs of the repo at `dir`: the branch checked out
+/// (`HEAD` when detached) and the commit, every remote-tracking ref and tag,
+/// and both `git describe` forms.
+fn user_refs(dir: &Path) -> String {
+    let (all, tags) = describe(dir);
+    format!(
+        "{}\n{}\n{}\n{}\n{all}\n{tags}",
+        git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        git(dir, &["rev-parse", "HEAD"]),
+        remote_refs(dir),
+        tag_refs(dir),
+    )
+}
+
+/// The clone at `target` has what `git clone <args>` of `bare` gets now:
+/// the same checkout, remote-tracking refs, tags and `git describe`.
+pub fn assert_matches_git_clone(bare: &Path, target: &Path, args: &[&str]) {
+    assert_eq!(
+        user_refs(target),
+        git_clone(bare, args, user_refs),
+        "{args:?}"
+    );
+}
+
+/// The number of objects every ref of the repo at `dir` reaches.
+pub fn reachable_objects(dir: &Path) -> usize {
+    git(dir, &["rev-list", "--objects", "--all"])
+        .lines()
+        .count()
+}
+
+/// [`reachable_objects`] of what `git clone <args>` of `bare` gets.
+pub fn git_clone_objects(bare: &Path, args: &[&str]) -> usize {
+    git_clone(bare, args, reachable_objects)
+}
+
 /// A provider origin base with no repos, so a clone that fetches from the
 /// upstream fails where the server's refs would do.
 pub const NO_UPSTREAM: (&str, &str) = (

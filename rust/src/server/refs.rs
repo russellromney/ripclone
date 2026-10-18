@@ -288,6 +288,7 @@ async fn publish_branches(
         side_pack,
     })
 }
+
 /// Whether `old` is in `new`'s history.
 async fn moved_forward(mirror_dir: &Path, old: &str, new: &str) -> Result<bool> {
     let (dir, old, new) = (mirror_dir.to_path_buf(), old.to_string(), new.to_string());

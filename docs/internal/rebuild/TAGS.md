@@ -571,11 +571,23 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   (G25).
 - **The checked-out branch's remote-tracking ref** is the installed
   commit, even when the branches artifact is older.
-- **Cost of `--at` an older commit:** it does not hold D, so it always
-  takes the upstream fetch, which transfers the history after its commit.
+- **A clone of another commit** (`--branch`, `--at`) does what `git clone
+  --branch` does: it downloads every ref's history, then checks out its
+  commit. A Full response of a commit other than D carries `refs_base`,
+  Full(D)'s ready body, when Full(D) is ready (the base is kept in
+  `repo_refs.branches_base`, schema 6). The client writes the working
+  tree and index from its own Full's Head packs and metadata, installs
+  Full(D)'s history packs and the side pack in place of its own history,
+  and adds its own history only when its commit is on no ref, which the
+  objects show. While Full(D) is not ready it takes the upstream fetch.
+  A clone at a commit newer than D (a refresh still running) downloads
+  both histories.
 
-G14 runs its full clones with an origin base that does not exist, so a
-clone that fell back to the upstream fails it; skipping the side pack on
+G14 runs its full clones, `--at v1` included, with an origin base that
+does not exist, so a clone that fell back to the upstream fails it. G16
+counts the upstream fetches of tag, branch and orphan-commit clones (none),
+G17 covers Full(D) not ready, and G18 a lying refs base and a corrupt side
+pack; skipping the side pack on
 the server and skipping the remote branches on the client each failed it
 when tried.
 

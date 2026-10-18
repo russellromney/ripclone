@@ -187,6 +187,12 @@ pub struct RefResponse {
     /// repository's first refresh.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branches: Option<crate::branches::BranchesRef>,
+    /// The ready Full of the commit the side pack is built against, the
+    /// default branch's tip, when it is another commit. A full clone
+    /// installs its history with the side pack to hold every ref, as `git
+    /// clone --branch` downloads every ref before its checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refs_base: Option<Box<RefResponse>>,
     pub kind: ExactResultKind,
 }
 
@@ -644,6 +650,10 @@ async fn ready_body(
     row: &BuildRow,
     kind: ExactResultKind,
 ) -> Result<serde_json::Value, ApiError> {
+    let control = |error: anyhow::Error| {
+        state.metrics.record_error();
+        ApiError::control(error)
+    };
     let refs = state
         .control
         .get_refs(repo_id)
@@ -656,17 +666,30 @@ async fn ready_body(
             );
             None
         });
-    Ok(serde_json::json!(ReadyBody {
-        state: "ready",
-        result: ref_response(
+    let respond = |row: &BuildRow| {
+        ref_response(
             repo_id,
             provider,
             row,
             refs.as_ref(),
             &state.storage,
             state.signed_url_ttl,
-            kind
-        ),
+            kind,
+        )
+    };
+    let mut result = respond(row);
+    let base = (refs.as_ref())
+        .and_then(|refs| refs.branches.as_ref()?.base.as_deref())
+        .filter(|base| kind == ExactResultKind::Full && *base != row.commit);
+    if let Some(base) = base {
+        let base = state.control.status(repo_id, base).await.map_err(control)?;
+        if let Some(base) = base.filter(|base| base.full.ready().is_some()) {
+            result.refs_base = Some(Box::new(respond(&base)));
+        }
+    }
+    Ok(serde_json::json!(ReadyBody {
+        state: "ready",
+        result,
     }))
 }
 
@@ -903,6 +926,7 @@ fn ref_response(
                         idx_url: signed(&side.idx),
                     }),
             }),
+        refs_base: None,
         kind,
     }
 }
