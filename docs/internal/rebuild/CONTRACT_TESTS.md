@@ -172,7 +172,7 @@ Ripclone token reaches the origin.
 | H10 | S3 emulator: after a one-line push, B uploads no object of 1 MiB or more that the bucket already holds (its Files reuses A's bundles). A second repository with the same files builds the same large objects: the bucket proxy sees a HEAD and no PUT for each. A bucket copy cut short is uploaded again when a third repository with the same files makes it; that repository's clones and the Files clones of B and the second repository are exact. | #220 (S3 job), #221 |
 | H11 | A scratch leftover the server cannot remove, as when a killed server's git child is still writing it, doesn't stop the next start: the server logs it, builds and clones in its own scratch dir, and once the leftover can go, the next start removes it. | #234 |
 
-### I. Auth, integrations, CLI (12)
+### I. Auth, integrations, CLI (14)
 
 | # | Test | Added |
 |---|---|---|
@@ -182,12 +182,14 @@ Ripclone token reaches the origin.
 | I4 | Table across GitHub, GitLab, Gitea webhooks: a signed push builds before any clone; a bad signature gets 401 and no build. | #191 |
 | I5 | Poller: with no webhook, a push is built within one poll interval. | #186 |
 | I6 | Every documented CLI verb exists (keep `docs_cli_surface`). | #193 |
-| I7 | `--verify-upstream` auto, always, never (table). A clone that fails verification is removed; a target that was an empty directory is left empty. | #191 |
+| I7 | `--verify-upstream` auto, always, never (table). A clone that fails verification is removed; a target that was an empty directory is left empty. The upstream check runs while the clone downloads: with the upstream listing held, an artifact download still starts. | #191 |
 | I8 | Only `/healthz`, `/readyz`, `/metrics` and `/v1/version` answer without the token; unsigned webhooks fail closed (503 without a secret); every other route, `/v1/artifacts/{hash}` included, gives 401 to a missing or wrong token. | #208 |
 | I9 | A client declaring another protocol gets 426; the CLI names the mismatch and says to run `ripclone version`; nothing builds. | #208 |
 | I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | #208 |
 | I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | #208 |
 | I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | #209 |
+| I13 | A clone with stderr on a pipe prints no progress line: depth-1, full, Files and `--quiet` clones leave stderr empty. A `--wait` clone of a pending build prints the "warming" note, and with `--quiet` only the pending error. | — |
+| I14 | Stderr on a pseudo-terminal: a clone held mid-download draws one line with its phase, bytes of the total and percent, blanks it with spaces (no escape codes) before stdout reports the install. A top-up held at the origin shows `fetching <sha> from upstream (1s)`, with no byte figures. `add --wait` with the build held shows each output's state, every line narrower than the 60-column terminal. `--progress` draws the line on a pipe; with `--quiet` it is rejected. | — |
 
 ### J. Builds start from the newest ready ancestor (5)
 
@@ -252,11 +254,36 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
   after compile. The one S3 unit test (multipart upload) runs here against
   `scripts/s3_emulator.sh`, reusing the unit-test binary.
 - `s3`: C2, C3, C7, C8, F7, H2, H6 and H10 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
-- `gitea`: the live Gitea provider row.
+- `gitea`: the live Gitea provider row, then `scripts/trial_gitea.sh`.
 - `lint`, `musl`, `docker`, `cargo-deny`.
 - `e2e`: `scripts/e2e_local.sh` against prebuilt binaries.
 - `benchmark`: a smoke run of `benchmark/shaped_benchmark.sh` when benchmark
   files change.
+
+## User trials
+
+Two scripts run the release binaries the way a user would, against private
+repos, and exit non-zero on any failed check. Both start their own servers on
+OS-picked ports on local storage (even under soup, whose S3 settings would
+send private content to a real bucket), keep the machine's git config and
+keychain out, never print a token, and delete their work directory
+(`KEEP_TRIAL=1` keeps it).
+`RIPCLONE_BIN_DIR` names the binaries, default `rust/target/release`.
+
+- `scripts/trial_gitea.sh`: a digest-pinned Gitea in Docker, with this
+  checkout's history pushed as a private repo. Covers `provider add` and
+  `provider test`, add by URL, a full clone into the default directory, depth
+  1, files and `--branch`, push from a clone and pull in another, and a clone
+  right after a push. Refusals: a missing repo, a repo the server's token cannot
+  read, a non-empty target, a wrong server token, a server without an upstream
+  token. Runs in the `gitea` CI job.
+- `scripts/trial_github.sh owner/repo...`: read-only, against private GitHub
+  repos. The server reads with `RIPCLONE_GITHUB_TOKEN`; the user's git uses
+  their gh login, or `RIPCLONE_TRIAL_GIT_TOKEN`. Full, depth-1 and files clones
+  are compared with `git clone` (history, tree, local config, reflog), then
+  pulled and fetched. Refusals: a missing repo and a server without a token.
+  Manual: it needs a token and private repos. For this repo's owner: `soup run
+  -p ripclone -e development -- scripts/trial_github.sh <private repos>`.
 
 ## Current state
 
@@ -268,5 +295,5 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
   `s3` CI job runs them with `--ignored s3_`. The live Gitea row runs in the
   `gitea` job with `--ignored gitea_`.
 - The CLI polls at most 200 ms apart in every test, so `--wait` lasts about
-  8 s, inside the 10 s wait. D4 sets 50 ms to run out its budget.
+  8 s, inside the 10 s wait. D4 and I13 set 50 ms to run out its budget.
 - No nightly stress or benchmark job exists.

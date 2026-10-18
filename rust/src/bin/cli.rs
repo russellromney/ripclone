@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use ripclone::ExactResultKind;
 use ripclone::auth::token_store::{FileBackedTokenStore, TokenStore};
 use ripclone::bench::Benchmark;
-use ripclone::client::{Client, CloneRequest};
+use ripclone::client::{Client, CloneRequest, Stderr};
 use ripclone::config::ProviderEntry;
 use ripclone::mode::{CloneMode, resolve_mode};
 use ripclone::provider::{ProviderInstance, ProviderKind, ProviderRegistry, RepoId};
@@ -131,6 +131,13 @@ enum Commands {
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
+        /// Operate quietly: no progress or notes on stderr, only warnings
+        /// and errors. Progress is shown only when stderr is a terminal.
+        #[arg(short, long, conflicts_with = "progress")]
+        quiet: bool,
+        /// Show progress on stderr even when it is not a terminal.
+        #[arg(long)]
+        progress: bool,
         /// Suppress the fire-and-forget clone metrics report.
         #[arg(long)]
         no_metrics: bool,
@@ -483,6 +490,18 @@ async fn run_update() -> Result<()> {
         Err(e) => println!("could not read the latest release ({e})"),
     }
     Ok(())
+}
+
+/// What a waiting command writes to stderr: `--quiet` nothing, `--progress`
+/// or a terminal a progress line, else notes only.
+fn stderr_mode(quiet: bool, progress: bool) -> Stderr {
+    if quiet {
+        Stderr::Quiet
+    } else if progress || std::io::stderr().is_terminal() {
+        Stderr::Progress
+    } else {
+        Stderr::Notes
+    }
 }
 
 fn is_cloud_default(server: &str) -> bool {
@@ -868,7 +887,7 @@ async fn run() -> Result<()> {
         },
         Commands::Add { repo, wait } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
+            let client = (client.with_provider(&provider)).with_stderr(stderr_mode(false, false));
             let summary = client.add_repo(&repo_path).await?;
             if wait {
                 let summary = client.wait_for_build(&repo_path, summary).await?;
@@ -910,7 +929,7 @@ async fn run() -> Result<()> {
                 Selector::parse(at).map_err(|e| usage(format!("--at {at}: {e:#}")))?;
             }
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
+            let client = (client.with_provider(&provider)).with_stderr(stderr_mode(false, false));
             if wait || at.is_some() {
                 let selector = at.as_deref().unwrap_or("HEAD");
                 let summary = client.build_and_wait(&repo_path, selector).await?;
@@ -932,6 +951,8 @@ async fn run() -> Result<()> {
             depth,
             at,
             bench,
+            quiet,
+            progress,
             no_metrics,
             verify_upstream,
             wait,
@@ -955,6 +976,7 @@ async fn run() -> Result<()> {
             if no_metrics {
                 client = client.with_metrics_disabled();
             }
+            client = client.with_stderr(stderr_mode(quiet, progress));
             let target_name = repo_path
                 .rsplit('/')
                 .next()
@@ -968,7 +990,7 @@ async fn run() -> Result<()> {
             // this. Never a silent size-based switch — see `config::agent_mode`.
             let agent = ripclone::config::agent_mode(config.agent);
             let default_depth = if agent { 1 } else { 0 };
-            if agent {
+            if agent && !quiet {
                 eprintln!(
                     "ripclone: agent-fleet mode — fleet defaults on (depth-1 unless overridden, no prompts)"
                 );
@@ -993,17 +1015,13 @@ async fn run() -> Result<()> {
             } else {
                 ExactResultKind::Full
             };
-            let upstream_snapshot = observe_upstream_for_verification(
+            let check = upstream_check(
                 &provider,
-                &repo_path,
-                &branch,
                 at.as_deref(),
                 mode,
-                upstream_token.as_deref(),
                 verify_upstream,
                 &provider_registry,
-            )
-            .await?;
+            )?;
             // End-to-end wall clock for the clone, for the metrics report.
             let clone_started = std::time::Instant::now();
             let request = CloneRequest {
@@ -1016,14 +1034,35 @@ async fn run() -> Result<()> {
             // Like `git clone`, the target may be an existing empty directory.
             // A failed clone must leave it there.
             let target_was_dir = target.is_dir();
-            let outcome = client
-                .clone_repo(&request, &target, enable_bench.then_some(&mut benchmark))
-                .await?;
+            // The upstream's tip is read beside the clone, so the check adds
+            // no wait unless the upstream answers after the clone is done.
+            let observe = async {
+                match check {
+                    UpstreamCheck::Read(provider) => {
+                        observe_upstream(
+                            &provider,
+                            &repo_path,
+                            &branch,
+                            upstream_token.as_deref(),
+                            verify_upstream,
+                        )
+                        .await
+                    }
+                    UpstreamCheck::Known(upstream) => Ok(upstream),
+                }
+            };
+            let (upstream, outcome) = tokio::join!(
+                observe,
+                client.clone_repo(&request, &target, enable_bench.then_some(&mut benchmark))
+            );
+            let outcome = outcome?;
             let total_ms = u64::try_from(clone_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             println!("installed {} into {}", repo_path, target.display());
-            if let Err(error) =
-                verify_upstream_snapshot(&target, &outcome.commit, &upstream_snapshot).await
-            {
+            let verified = match upstream {
+                Ok(upstream) => verify_upstream_snapshot(&target, &outcome.commit, &upstream).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = verified {
                 remove_clone(&target, target_was_dir)
                     .await
                     .with_context(|| {
@@ -1096,20 +1135,18 @@ fn provider_instance(provider_id: &str, registry: &ProviderRegistry) -> Option<P
 ///   * `Never` — skip.
 ///
 /// An `--at` clone or a Files clone has no upstream tip to check, so `auto`
-/// skips them silently and `always` refuses them.
-#[allow(clippy::too_many_arguments)]
-async fn observe_upstream_for_verification(
+/// skips them silently and `always` refuses them. Those refusals come from the
+/// arguments alone, before anything is downloaded; the upstream itself is read
+/// by [`observe_upstream`] beside the clone.
+fn upstream_check(
     provider_id: &str,
-    repo_path: &str,
-    branch: &str,
     at: Option<&str>,
     mode: CloneMode,
-    upstream_token: Option<&str>,
     requested: VerifyUpstream,
     registry: &ProviderRegistry,
-) -> Result<Upstream> {
+) -> Result<UpstreamCheck> {
     if requested == VerifyUpstream::Never {
-        return Ok(Upstream::Unchecked);
+        return Ok(UpstreamCheck::Known(Upstream::Unchecked));
     }
     if let Some(rev) = at {
         match requested {
@@ -1119,7 +1156,7 @@ async fn observe_upstream_for_verification(
                      omit --at or use --verify-upstream=auto"
                 )));
             }
-            VerifyUpstream::Auto => return Ok(Upstream::Unchecked),
+            VerifyUpstream::Auto => return Ok(UpstreamCheck::Known(Upstream::Unchecked)),
             VerifyUpstream::Never => unreachable!(),
         }
     }
@@ -1133,24 +1170,37 @@ async fn observe_upstream_for_verification(
                  use --mode editable or --verify-upstream=auto",
             ));
         }
-        return Ok(Upstream::Unchecked);
+        return Ok(UpstreamCheck::Known(Upstream::Unchecked));
     }
 
-    let provider = match provider_instance(provider_id, registry) {
-        Some(p) => p,
-        None => {
-            if requested == VerifyUpstream::Always {
-                anyhow::bail!(
-                    "unknown provider '{provider_id}'; \
-                     register it with `ripclone provider add` to use --verify-upstream=always"
-                );
-            }
-            return Ok(Upstream::Skipped(format!(
-                "unknown provider '{provider_id}'"
-            )));
-        }
-    };
+    match provider_instance(provider_id, registry) {
+        Some(provider) => Ok(UpstreamCheck::Read(provider)),
+        None if requested == VerifyUpstream::Always => anyhow::bail!(
+            "unknown provider '{provider_id}'; \
+             register it with `ripclone provider add` to use --verify-upstream=always"
+        ),
+        None => Ok(UpstreamCheck::Known(Upstream::Skipped(format!(
+            "unknown provider '{provider_id}'"
+        )))),
+    }
+}
 
+/// What [`upstream_check`] decided.
+enum UpstreamCheck {
+    /// Read the upstream tip from this provider.
+    Read(ProviderInstance),
+    /// Nothing to read; this is the answer.
+    Known(Upstream),
+}
+
+/// Read the upstream tip of `branch` for [`upstream_check`]'s `Read`.
+async fn observe_upstream(
+    provider: &ProviderInstance,
+    repo_path: &str,
+    branch: &str,
+    upstream_token: Option<&str>,
+    requested: VerifyUpstream,
+) -> Result<Upstream> {
     let mut upstream_tip: Option<String> = None;
     match requested {
         VerifyUpstream::Always => {}
@@ -1162,21 +1212,19 @@ async fn observe_upstream_for_verification(
                 provider: provider.id.clone(),
                 path: repo_path.to_string(),
             };
-            upstream_tip = match ripclone::git::ls_remote_commit_async(
-                &provider, &repo_id, branch, None,
-            )
-            .await
-            {
-                Ok(Some(sha)) => Some(sha),
-                Ok(None) => {
-                    return Ok(Upstream::Skipped(
-                        "private upstream without credential".to_string(),
-                    ));
-                }
-                Err(e) => {
-                    return Ok(Upstream::Skipped(format!("upstream probe failed: {e:#}")));
-                }
-            };
+            upstream_tip =
+                match ripclone::git::ls_remote_commit_async(provider, &repo_id, branch, None).await
+                {
+                    Ok(Some(sha)) => Some(sha),
+                    Ok(None) => {
+                        return Ok(Upstream::Skipped(
+                            "private upstream without credential".to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(Upstream::Skipped(format!("upstream probe failed: {e:#}")));
+                    }
+                };
         }
         VerifyUpstream::Never => return Ok(Upstream::Unchecked),
     }
@@ -1190,7 +1238,7 @@ async fn observe_upstream_for_verification(
             };
             let credential = upstream_token.map(|t| SecretString::new(t.to_owned().into()));
             match ripclone::git::ls_remote_commit_async(
-                &provider,
+                provider,
                 &repo_id,
                 branch,
                 credential.as_ref(),
@@ -1218,7 +1266,7 @@ async fn observe_upstream_for_verification(
     Ok(Upstream::Tip(upstream_tip))
 }
 
-/// What `--verify-upstream` found before the clone.
+/// What `--verify-upstream` found.
 enum Upstream {
     /// The upstream tip the installed commit must equal.
     Tip(String),
