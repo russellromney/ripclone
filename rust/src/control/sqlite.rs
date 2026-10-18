@@ -25,7 +25,7 @@ use std::time::Duration;
 const SCHEMA: &str = include_str!("schema/sqlite.sql");
 const SCHEMA_VERSION: i64 = 6;
 
-const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, \
+const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, seq, \
     head_state, head_output, head_error, files_state, files_output, files_error, \
     full_state, full_output, full_error, head_attempts, head_lease_until, \
     files_attempts, files_lease_until, full_attempts, full_lease_until";
@@ -279,6 +279,7 @@ fn decode_build(row: &SqliteRow) -> Result<BuildRow> {
         ref_name: row.try_get("ref_name")?,
         parent: row.try_get("parent")?,
         created_at: row.try_get("created_at")?,
+        seq: row.try_get("seq")?,
         head: decode_out(row, ExactResultKind::Head)?,
         files: decode_out(row, ExactResultKind::Files)?,
         full: decode_out(row, ExactResultKind::Full)?,

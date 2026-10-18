@@ -70,6 +70,8 @@ pub struct BuildRow {
     pub parent: Option<String>,
     /// Admission time, epoch seconds.
     pub created_at: i64,
+    /// Admission order: a later admit has a larger one.
+    pub seq: i64,
     pub head: Out<HeadResult>,
     pub files: Out<FilesResult>,
     pub full: Out<FullResult>,

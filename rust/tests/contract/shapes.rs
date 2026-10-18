@@ -1848,6 +1848,8 @@ impl RefsRepo {
 /// gets, every branch and tag included, and the clone's own tree checked
 /// out, without fetching from the upstream. The user's next steps work as
 /// in a git clone: switching to another branch, and pulling a later push.
+/// A clone of a default-branch commit newer than the published refs
+/// downloads its own history only.
 #[test]
 fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
     let t = RefsRepo::start("g16");
@@ -1918,6 +1920,32 @@ fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
     assert_eq!(git(&at_v1, &["rev-parse", "HEAD"]), d);
     assert_eq!(listing(&at_v1), t.origin.tree(&d));
     git(&at_v1, &["fsck", "--full", "--strict"]);
+
+    // D is built but, with no webhook, the published refs still end at C.
+    // D's own history holds C's, so a clone of D downloads it alone.
+    t.sync(&[]);
+    let (_, body) = api::parse(t.server.get(&api::commit_path(&t.repo, &d, Some("full"))));
+    assert!(body.get("refs_base").is_none(), "{body}");
+    let (_, full_c) = api::parse(t.server.get(&api::commit_path(&t.repo, &t.c, Some("full"))));
+    let c_manifest = full_c["clonepack_manifest"].as_str().unwrap().to_string();
+    let proxy = FaultProxy::start(&t.server);
+    let fetches = t.http.fetches();
+    let (latest, out) = t.clone_via(&proxy, "latest", &[], &[]);
+    out.ok();
+    assert_eq!(git(&latest, &["rev-parse", "HEAD"]), d);
+    t.assert_git_clone(&latest, &[]);
+    assert_eq!(
+        t.http.fetches(),
+        fetches,
+        "the clone fetched from the upstream"
+    );
+    assert!(
+        !proxy
+            .artifact_gets()
+            .iter()
+            .any(|get| get.path.contains(&c_manifest)),
+        "the clone downloaded C's Full too"
+    );
 }
 
 /// G17: when the default branch's tip has no ready Full, a clone of another

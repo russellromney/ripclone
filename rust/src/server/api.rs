@@ -683,7 +683,13 @@ async fn ready_body(
         .filter(|base| kind == ExactResultKind::Full && *base != row.commit);
     if let Some(base) = base {
         let base = state.control.status(repo_id, base).await.map_err(control)?;
-        if let Some(base) = base.filter(|base| base.full.ready().is_some()) {
+        // A later admit from the base's branch descends from it, but for a
+        // force-push, so its own history holds the base's: a refresh not
+        // yet published is behind it.
+        let newer = |base: &BuildRow| {
+            row.ref_name.is_some() && row.ref_name == base.ref_name && row.seq > base.seq
+        };
+        if let Some(base) = base.filter(|base| base.full.ready().is_some() && !newer(base)) {
             result.refs_base = Some(Box::new(respond(&base)));
         }
     }
@@ -1224,6 +1230,7 @@ mod tests {
             ref_name: None,
             parent,
             created_at: 0,
+            seq: 0,
             head: out(info.head),
             files: out(info.files),
             full: out(info.full),
