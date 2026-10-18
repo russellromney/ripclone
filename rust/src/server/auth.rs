@@ -100,19 +100,10 @@ impl RateLimiter {
     }
 }
 
-pub(super) fn parse_rate_limit_settings(
-    burst: Option<&str>,
-    restore_rate_per_sec: Option<&str>,
-) -> Result<(u32, f64)> {
-    let burst = burst
-        .map(|value| {
-            value
-                .parse()
-                .context("RIPCLONE_RATE_LIMIT_BURST must be an unsigned integer")
-        })
-        .transpose()?
-        .unwrap_or(60);
-    let restore_rate_per_sec: f64 = restore_rate_per_sec
+/// The rate limit from `RIPCLONE_RATE_LIMIT_PER_SEC` (default 10): requests
+/// per second per client, with a burst of six seconds' worth (at least 1).
+pub(super) fn parse_rate_limit(per_sec: Option<&str>) -> Result<(u32, f64)> {
+    let per_sec: f64 = per_sec
         .map(|value| {
             value
                 .parse()
@@ -121,10 +112,12 @@ pub(super) fn parse_rate_limit_settings(
         .transpose()?
         .unwrap_or(10.0);
     anyhow::ensure!(
-        restore_rate_per_sec.is_finite() && restore_rate_per_sec >= 0.0,
+        per_sec.is_finite() && per_sec >= 0.0,
         "RIPCLONE_RATE_LIMIT_PER_SEC must be finite and non-negative"
     );
-    Ok((burst, restore_rate_per_sec))
+    // A float-to-int `as` saturates, so a huge rate gives u32::MAX.
+    let burst = ((per_sec * 6.0).ceil() as u32).max(1);
+    Ok((burst, per_sec))
 }
 
 /// Reject explicit declarations that do not match the sole current wire
@@ -304,17 +297,8 @@ fn is_authenticated_artifact_get(
         .unwrap_or(false)
 }
 
-/// The server auth token hash.
-///
-/// Precedence:
-///   1. RIPCLONE_SERVER_TOKEN_HASH (already hashed)
-///   2. RIPCLONE_SERVER_TOKEN (raw, hashed here)
-///
-/// Fails when neither is set and non-empty.
-fn server_auth_token_hash(hash: Option<String>, raw: Option<String>) -> Result<String> {
-    if let Some(hash) = hash.filter(|t| !t.is_empty()) {
-        return Ok(hash);
-    }
+/// The hash of `raw`, the server token; fails when it is unset or empty.
+fn server_auth_token_hash(raw: Option<String>) -> Result<String> {
     raw.filter(|t| !t.is_empty())
         .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
         .ok_or_else(|| {
@@ -324,12 +308,9 @@ fn server_auth_token_hash(hash: Option<String>, raw: Option<String>) -> Result<S
         })
 }
 
-/// [`server_auth_token_hash`] from the environment.
+/// [`server_auth_token_hash`] of `RIPCLONE_SERVER_TOKEN`.
 pub(super) fn read_server_auth_token() -> Result<String> {
-    server_auth_token_hash(
-        env::var("RIPCLONE_SERVER_TOKEN_HASH").ok(),
-        env::var("RIPCLONE_SERVER_TOKEN").ok(),
-    )
+    server_auth_token_hash(env::var("RIPCLONE_SERVER_TOKEN").ok())
 }
 
 #[cfg(test)]
@@ -341,19 +322,14 @@ mod tests {
     use tower::util::ServiceExt;
 
     #[test]
-    fn server_auth_token_hash_prefers_the_hash_and_requires_a_token() {
-        let s = |v: &str| Some(v.to_string());
-        let secret = Some(hex::encode(Sha256::digest("secret")));
-        for (hash, raw, want) in [
-            (None, None, None),
-            (s(""), s(""), None),
-            (None, s("secret"), secret.clone()),
-            (s(""), s("secret"), secret),
-            (s("given-hash"), s("secret"), s("given-hash")),
-            (s("given-hash"), None, s("given-hash")),
-        ] {
-            let case = format!("{hash:?} {raw:?}");
-            assert_eq!(server_auth_token_hash(hash, raw).ok(), want, "{case}");
+    fn server_auth_token_hash_requires_a_token() {
+        let secret = hex::encode(Sha256::digest("secret"));
+        assert_eq!(
+            server_auth_token_hash(Some("secret".into())).unwrap(),
+            secret
+        );
+        for raw in [None, Some(String::new())] {
+            assert!(server_auth_token_hash(raw).is_err());
         }
     }
 
@@ -489,7 +465,7 @@ mod tests {
     #[test]
     fn rate_limit_config_rejects_invalid_values() {
         for rate in ["NaN", "inf", "-inf", "-1"] {
-            let error = parse_rate_limit_settings(None, Some(rate)).unwrap_err();
+            let error = parse_rate_limit(Some(rate)).unwrap_err();
             assert!(
                 error
                     .to_string()
@@ -497,18 +473,17 @@ mod tests {
                 "got: {error:#}"
             );
         }
-
-        let error = parse_rate_limit_settings(Some("not-a-number"), None).unwrap_err();
+        let error = parse_rate_limit(Some("many")).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("RIPCLONE_RATE_LIMIT_BURST must be an unsigned integer"),
+                .contains("RIPCLONE_RATE_LIMIT_PER_SEC must be a number"),
             "got: {error:#}"
         );
-        assert_eq!(
-            parse_rate_limit_settings(Some("0"), Some("0")).unwrap(),
-            (0, 0.0)
-        );
+        assert_eq!(parse_rate_limit(None).unwrap(), (60, 10.0));
+        assert_eq!(parse_rate_limit(Some("0")).unwrap(), (1, 0.0));
+        assert_eq!(parse_rate_limit(Some("0.5")).unwrap(), (3, 0.5));
+        assert_eq!(parse_rate_limit(Some("1e12")).unwrap(), (u32::MAX, 1e12));
     }
 
     #[test]

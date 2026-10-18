@@ -114,26 +114,15 @@ impl GitHubAppConfig {
     }
 }
 
-/// Read the app private key from `RIPCLONE_GITHUB_APP_PRIVATE_KEY` (inline PEM)
-/// or `RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH` (a file). The key is wrapped in a
-/// `SecretString` and never logged.
+/// Read the app private key (inline PEM) from `RIPCLONE_GITHUB_APP_PRIVATE_KEY`.
+/// The key is wrapped in a `SecretString` and never logged.
 fn load_app_private_key(var: impl Fn(&str) -> Option<String>) -> Result<SecretString> {
-    if let Some(pem) = var("RIPCLONE_GITHUB_APP_PRIVATE_KEY")
-        && !pem.trim().is_empty()
-    {
-        return Ok(SecretString::from(pem));
+    match var("RIPCLONE_GITHUB_APP_PRIVATE_KEY") {
+        Some(pem) if !pem.trim().is_empty() => Ok(SecretString::from(pem)),
+        _ => anyhow::bail!(
+            "RIPCLONE_GITHUB_APP_ID is set but RIPCLONE_GITHUB_APP_PRIVATE_KEY is not"
+        ),
     }
-    if let Some(path) = var("RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH")
-        && !path.trim().is_empty()
-    {
-        let pem = std::fs::read_to_string(path.trim())
-            .context("read RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH")?;
-        return Ok(SecretString::from(pem));
-    }
-    anyhow::bail!(
-        "RIPCLONE_GITHUB_APP_ID is set but no private key was provided \
-         (set RIPCLONE_GITHUB_APP_PRIVATE_KEY or RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH)"
-    )
 }
 
 /// A cached installation access token and the instant it stops being valid.
@@ -531,10 +520,6 @@ RwIDAQAB
 
     #[test]
     fn config_from_env_selects_and_validates() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("app.pem");
-        std::fs::write(&key_path, TEST_PRIVATE_KEY).unwrap();
-        let key_path = key_path.to_str().unwrap();
         let load = |vars: &[(&str, &str)]| {
             let vars: std::collections::HashMap<String, String> = vars
                 .iter()
@@ -545,7 +530,6 @@ RwIDAQAB
         const ID: (&str, &str) = ("RIPCLONE_GITHUB_APP_ID", "12345");
         const INSTALL: (&str, &str) = ("RIPCLONE_GITHUB_APP_INSTALLATION_ID", "67890");
         const KEY: (&str, &str) = ("RIPCLONE_GITHUB_APP_PRIVATE_KEY", TEST_PRIVATE_KEY);
-        let key_file = ("RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH", key_path);
 
         // Nothing configured: no GitHub App broker.
         assert!(load(&[]).unwrap().is_none());
@@ -565,14 +549,7 @@ RwIDAQAB
                 KEY,
                 ("RIPCLONE_GITHUB_API_BASE", "http://ghe.example.com"),
             ],
-            &[
-                ID,
-                INSTALL,
-                (
-                    "RIPCLONE_GITHUB_APP_PRIVATE_KEY_PATH",
-                    "/nonexistent/app.pem",
-                ),
-            ],
+            &[ID, INSTALL, ("RIPCLONE_GITHUB_APP_PRIVATE_KEY", " ")],
         ] {
             assert!(
                 load(vars).is_err(),
@@ -580,14 +557,14 @@ RwIDAQAB
                 vars.iter().map(|v| v.0).collect::<Vec<_>>()
             );
         }
-        // Inline key with the default API base, or a key file with an override.
+        // The default API base, or an override.
         for (vars, api_base) in [
             (vec![ID, INSTALL, KEY], DEFAULT_GITHUB_API_BASE),
             (
                 vec![
                     ID,
                     INSTALL,
-                    key_file,
+                    KEY,
                     (
                         "RIPCLONE_GITHUB_API_BASE",
                         "https://ghe.example.com/api/v3/",

@@ -207,7 +207,6 @@ impl World {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             unset: opts.unset.iter().map(|k| k.to_string()).collect(),
-            control_flag: !opts.no_control_flag,
         }
     }
 
@@ -290,7 +289,7 @@ impl World {
             .env("HOME", &home)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("RIPCLONE_CONFIG", home.join("ripclone.toml"))
+            .env("RIPCLONE_CONFIG", home.join("config.toml"))
             .env("RIPCLONE_SERVER", server.url())
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .env("RIPCLONE_ORIGIN_BASE", self.origin_base())
@@ -658,9 +657,6 @@ pub struct ServerOpts<'a> {
     pub env: &'a [(&'a str, &'a str)],
     /// Harness env vars this server must not see.
     pub unset: &'a [&'a str],
-    /// Leave out `--control-db`, so the server picks its control path from
-    /// env, config, or its default.
-    pub no_control_flag: bool,
 }
 
 struct ServerConfig {
@@ -668,21 +664,15 @@ struct ServerConfig {
     origin_base: String,
     env: Vec<(String, String)>,
     unset: Vec<String>,
-    control_flag: bool,
 }
 
 impl ServerConfig {
     fn command(&self) -> Command {
         let state = &self.state;
         let mut cmd = Command::new(bin("ripclone-server"));
-        cmd.arg("--cas-dir")
-            .arg(state.join("cache"))
-            .arg("--repo-root")
-            .arg(state.join("repos"));
-        if self.control_flag {
-            cmd.arg("--control-db").arg(state.join("control.db"));
-        }
-        cmd.args(["--host", "127.0.0.1", "--port", "0"])
+        cmd.arg("--data-dir")
+            .arg(state)
+            .args(["--host", "127.0.0.1", "--port", "0"])
             .current_dir(state)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -691,11 +681,10 @@ impl ServerConfig {
             .env("RUST_LOG", "info")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("RIPCLONE_CONFIG", state.join("ripclone.toml"))
+            .env("RIPCLONE_CONFIG", state.join("config.toml"))
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .env("RIPCLONE_ORIGIN_BASE", &self.origin_base)
             .env("RIPCLONE_POLL_INTERVAL_SECS", "0")
-            .env("RIPCLONE_RATE_LIMIT_BURST", "1000000")
             .env("RIPCLONE_RATE_LIMIT_PER_SEC", "1000000")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

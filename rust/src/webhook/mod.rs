@@ -3,8 +3,8 @@
 //! A webhook is a thin **front door**. Everything heavy already exists — the
 //! control store, the build workers, storage. The receiver does three things:
 //! **verify → normalize → admit**. This module owns the normalize step
-//! (per-provider parsing) and the config (per-provider secret + optional
-//! allowlist); `server/webhooks.rs` wires it into the router and the admission path.
+//! (per-provider parsing) and the config (a secret per provider);
+//! `server/webhooks.rs` wires it into the router and the admission path.
 //!
 //! GitHub, GitLab and Gitea have `WebhookProvider` impls behind the same
 //! trait — adding a provider is implementing this one trait, nothing else.
@@ -12,8 +12,8 @@
 use crate::provider::{ProviderKind, ProviderRegistry};
 use axum::http::HeaderMap;
 use secrecy::SecretString;
-use std::collections::{HashMap, HashSet};
-use tracing::{info, warn};
+use std::collections::HashMap;
+use tracing::info;
 
 mod gitea;
 mod github;
@@ -85,16 +85,13 @@ pub fn provider_for(kind: ProviderKind) -> Option<Box<dyn WebhookProvider + Send
     }
 }
 
-/// Webhook receiver configuration: a secret per provider instance and an
-/// optional repo allowlist. Built once at startup from the environment.
+/// Webhook receiver configuration: a secret per provider instance. Built once
+/// at startup from the environment. A push builds only an added repo.
 #[derive(Debug, Clone, Default)]
 pub struct WebhookConfig {
     /// Per-provider-instance webhook secret, keyed by instance id. A provider
     /// with no entry here has no configured secret ⇒ its endpoint returns 503.
     secrets: HashMap<String, SecretString>,
-    /// Allowlist of repo storage keys that may be warmed. `None` ⇒ allow all
-    /// (single-tenant trust); `Some` ⇒ only listed repos.
-    allowlist: Option<HashSet<String>>,
 }
 
 impl WebhookConfig {
@@ -103,11 +100,6 @@ impl WebhookConfig {
     /// Secret per provider instance: `RIPCLONE_WEBHOOK_SECRET_<ID>`, where
     /// `<ID>` is the instance id upper-cased with every non-alphanumeric byte
     /// replaced by `_` (e.g. instance `company-gitea` → `..._COMPANY_GITEA`).
-    ///
-    /// Allowlist: `RIPCLONE_WEBHOOK_ALLOWLIST`, a comma-separated list of repo
-    /// storage keys (e.g. `owner/repo,other/repo`). Unset or empty ⇒ allow all,
-    /// with a loud startup log so the operator knows every added repository is
-    /// eligible for default-branch push admission.
     pub fn from_env(registry: &ProviderRegistry) -> Self {
         let mut secrets = HashMap::new();
         for instance in registry.iter() {
@@ -119,8 +111,6 @@ impl WebhookConfig {
             }
         }
 
-        let allowlist = parse_allowlist(std::env::var("RIPCLONE_WEBHOOK_ALLOWLIST").ok());
-        // Resolve the open questions with the recommended defaults, loudly.
         if secrets.is_empty() {
             info!(
                 "webhooks: no RIPCLONE_WEBHOOK_SECRET_<provider> configured — \
@@ -129,19 +119,9 @@ impl WebhookConfig {
         } else {
             let ids: Vec<&str> = secrets.keys().map(|s| s.as_str()).collect();
             info!("webhooks: enabled for provider(s): {}", ids.join(", "));
-            match &allowlist {
-                Some(set) => info!(
-                    "webhooks: repo allowlist active ({} repo(s)); pushes to other repos are ignored",
-                    set.len()
-                ),
-                None => warn!(
-                    "webhooks: NO allowlist (RIPCLONE_WEBHOOK_ALLOWLIST unset) — \
-                     every added repo is eligible for default-branch push admission"
-                ),
-            }
         }
 
-        Self { secrets, allowlist }
+        Self { secrets }
     }
 
     /// The configured secret for a provider instance, if any. No secret ⇒ the
@@ -149,39 +129,18 @@ impl WebhookConfig {
     pub fn secret(&self, provider_id: &str) -> Option<&SecretString> {
         self.secrets.get(provider_id)
     }
-
-    /// Whether a repo (by its natural key — see [`RepoId::natural_key`]) may
-    /// admit a signed default-branch push. Allow-all when no allowlist is configured.
-    ///
-    /// [`RepoId::natural_key`]: crate::provider::RepoId::natural_key
-    pub fn allows(&self, repo_key: &str) -> bool {
-        match &self.allowlist {
-            Some(set) => set.contains(repo_key),
-            None => true,
-        }
-    }
 }
 
 #[cfg(test)]
 impl WebhookConfig {
-    /// A config with a single provider secret and allow-all.
+    /// A config with a single provider secret.
     pub(crate) fn with_secret(provider_id: &str, secret: &str) -> Self {
         let mut secrets = HashMap::new();
         secrets.insert(
             provider_id.to_string(),
             SecretString::new(secret.to_string().into()),
         );
-        Self {
-            secrets,
-            allowlist: None,
-        }
-    }
-
-    /// Set the repo allowlist (chainable). Entries use the operator-facing
-    /// natural key (`owner/repo` for github, `provider/path` otherwise).
-    pub(crate) fn with_allowlist(mut self, repos: impl IntoIterator<Item = String>) -> Self {
-        self.allowlist = Some(repos.into_iter().collect());
-        self
+        Self { secrets }
     }
 }
 
@@ -194,20 +153,6 @@ impl WebhookConfig {
 fn parse_secret(raw: Option<String>) -> Option<SecretString> {
     raw.filter(|s| !s.trim().is_empty())
         .map(|s| SecretString::new(s.into()))
-}
-
-/// Parse the comma-separated `RIPCLONE_WEBHOOK_ALLOWLIST` into a set of repo
-/// natural keys. Entries are trimmed; empty entries are dropped. An absent value
-/// or one that yields no entries returns `None` (allow-all).
-fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
-    raw.map(|raw| {
-        raw.split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect::<HashSet<_>>()
-    })
-    .filter(|set| !set.is_empty())
 }
 
 /// Normalize a provider instance id into the `RIPCLONE_WEBHOOK_SECRET_<...>`
@@ -246,19 +191,5 @@ mod tests {
         // A real value is kept verbatim (not trimmed).
         let s = parse_secret(Some(" hunter2 ".to_string())).expect("non-blank secret");
         assert_eq!(s.expose_secret(), " hunter2 ");
-    }
-
-    #[test]
-    fn parse_allowlist_trims_and_drops_empties() {
-        // Absent ⇒ allow-all.
-        assert!(parse_allowlist(None).is_none());
-        // A value with only separators/whitespace yields no entries ⇒ allow-all.
-        assert!(parse_allowlist(Some("  , ,".to_string())).is_none());
-        // Entries are trimmed and empties dropped.
-        let set = parse_allowlist(Some(" a/b , c/d ,, ".to_string())).expect("non-empty set");
-        assert_eq!(set.len(), 2);
-        assert!(set.contains("a/b"));
-        assert!(set.contains("c/d"));
-        assert!(!set.contains(" a/b "), "entries must be trimmed");
     }
 }

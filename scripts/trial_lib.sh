@@ -56,13 +56,13 @@ start_server() {
   shift
   mkdir -p "$dir/home"
   # Local storage only. S3 settings in the environment (soup sets them) would
-  # upload the trial's private repo content to a real bucket; the config's
-  # backend = "local" wins over them.
-  printf '[storage]\nbackend = "local"\n' >"$dir/config.toml"
-  env HOME="$dir/home" RIPCLONE_CONFIG="$dir/config.toml" GIT_CONFIG_GLOBAL=/dev/null \
+  # upload the trial's private repo content to a real bucket, so they are
+  # removed; without RIPCLONE_S3_BUCKET the server stores locally.
+  env -u RIPCLONE_S3_BUCKET -u RIPCLONE_S3_ENDPOINT -u RIPCLONE_S3_REGION -u RIPCLONE_S3_PREFIX \
+    -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u RIPCLONE_CONFIG \
+    HOME="$dir/home" GIT_CONFIG_GLOBAL=/dev/null \
     RIPCLONE_POLL_INTERVAL_SECS=0 RUST_LOG=info "$@" \
-    "$BIN/ripclone-server" --host 127.0.0.1 --port 0 --cas-dir "$dir/cas" \
-    --repo-root "$dir/repos" --control-db "$dir/control.db" >"$log" 2>&1 &
+    "$BIN/ripclone-server" --host 127.0.0.1 --port 0 --data-dir "$dir" >"$log" 2>&1 &
   PIDS+=($!)
   SERVER_URL=""
   for _ in $(seq 1 100); do

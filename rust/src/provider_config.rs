@@ -1,8 +1,7 @@
 //! Provider configuration and token resolution.
 //!
-//! Custom/self-hosted providers are declared in the unified TOML config
-//! (`~/.config/ripclone/config.toml` and optional project `ripclone.toml`) or
-//! the `RIPCLONE_PROVIDERS` JSON environment variable.
+//! Custom/self-hosted providers are declared in the config file (see
+//! [`crate::config`]) or the `RIPCLONE_PROVIDERS` JSON environment variable.
 
 use crate::provider::{ProviderConfig, ProviderRegistry};
 use anyhow::{Context, Result};

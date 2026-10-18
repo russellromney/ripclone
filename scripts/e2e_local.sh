@@ -34,7 +34,6 @@ BASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ripclone-e2e-local.XXXXXX")"
 # exercise startup validation instead of the scenarios below.
 export RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml"
 ORIGIN_ROOT="$BASE_DIR/origins"
-CAS_DIR="$BASE_DIR/cas"
 REPO_ROOT="$BASE_DIR/repos"
 WORK="$BASE_DIR/work"
 mkdir -p "$ORIGIN_ROOT" "$WORK"
@@ -101,7 +100,7 @@ start_server() {
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
   fi
-  RUST_LOG=warn,ripclone::server=info "$SERVER_BIN" --cas-dir "$CAS_DIR" --repo-root "$REPO_ROOT" \
+  RUST_LOG=warn,ripclone::server=info "$SERVER_BIN" --data-dir "$BASE_DIR" \
     --host 127.0.0.1 --port 0 >"$BASE_DIR/server.log" 2>&1 &
   SERVER_PID=$!
   SERVER_URL="$(server_url "$BASE_DIR/server.log" "$SERVER_PID")" ||
@@ -109,10 +108,10 @@ start_server() {
   curl -fsS -o /dev/null "$SERVER_URL/readyz" || { cat "$BASE_DIR/server.log"; fail "server not ready"; }
 }
 
-add_repo() { "$CLI_BIN" --server "$SERVER_URL" add "$1/$2" >/dev/null; }
+add_repo() { RIPCLONE_SERVER="$SERVER_URL" "$CLI_BIN" add "$1/$2" >/dev/null; }
 sync_repo() {
   add_repo "$1" "$2"
-  "$CLI_BIN" --server "$SERVER_URL" sync "$1/$2" >/dev/null
+  RIPCLONE_SERVER="$SERVER_URL" "$CLI_BIN" sync "$1/$2" >/dev/null
 }
 # Head can be ready as soon as `sync` returns, while Full and Files finish in
 # the background. Retry the clone until its requested result succeeds.
@@ -120,14 +119,14 @@ clone_repo() { # owner repo dir [extra cli args...]
   local i
   for i in $(seq 1 80); do
     rm -rf "$3"
-    if "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" "$3" "${@:4}" >/dev/null 2>&1; then
+    if RIPCLONE_SERVER="$SERVER_URL" "$CLI_BIN" clone "$1/$2" "$3" "${@:4}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5
   done
   # Final attempt without suppression so the real error surfaces under `set -e`.
   rm -rf "$3"
-  "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" "$3" "${@:4}" >/dev/null
+  RIPCLONE_SERVER="$SERVER_URL" "$CLI_BIN" clone "$1/$2" "$3" "${@:4}" >/dev/null
 }
 # Like clone_repo but also waits out the background full build / brief stale
 # serving on a re-sync: retry until the clone reaches exactly `$4` commits.
@@ -135,7 +134,7 @@ clone_until_count() { # owner repo dir count [extra cli args...]
   local i
   for i in $(seq 1 80); do
     rm -rf "$3"
-    if "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" "$3" "${@:5}" >/dev/null 2>&1 \
+    if RIPCLONE_SERVER="$SERVER_URL" "$CLI_BIN" clone "$1/$2" "$3" "${@:5}" >/dev/null 2>&1 \
       && [ "$(gitc "$3" rev-list --count HEAD 2>/dev/null)" = "$4" ]; then
       return 0
     fi

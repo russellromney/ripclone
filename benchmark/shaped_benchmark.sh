@@ -75,7 +75,8 @@ if [ -z "$TOKEN" ]; then
   echo "warning: RIPCLONE_SERVER_TOKEN not set; server auth may fail" >&2
 fi
 export RIPCLONE_SERVER_TOKEN="$TOKEN"
-export RIPCLONE_NO_CACHE=1
+export RIPCLONE_SERVER="$SERVER_URL"
+unset RIPCLONE_CACHE_DIR
 
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
 
@@ -431,23 +432,23 @@ bench_cmd() {
 
 rc_full()  {
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 0
+    "$RIPCLONE" clone "$PROVIDER:$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 0
   else
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --depth 0
+    "$RIPCLONE" clone "$PROVIDER:$REPO" "$1" --branch "$CLONE_REF" --depth 0
   fi
 }
 rc_depth1(){
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 1
+    "$RIPCLONE" clone "$PROVIDER:$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 1
   else
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --depth 1
+    "$RIPCLONE" clone "$PROVIDER:$REPO" "$1" --branch "$CLONE_REF" --depth 1
   fi
 }
 rc_files() {
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --mode files
+    "$RIPCLONE" clone "$PROVIDER:$REPO" "$1" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --mode files
   else
-    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" "$1" --branch "$CLONE_REF" --depth 1 --mode files
+    "$RIPCLONE" clone "$PROVIDER:$REPO" "$1" --branch "$CLONE_REF" --depth 1 --mode files
   fi
 }
 

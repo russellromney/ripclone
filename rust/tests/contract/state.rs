@@ -48,57 +48,27 @@ fn state_entries(world: &World) -> Vec<String> {
     names
 }
 
-/// H4: each invalid storage, control, or numeric setting stops the server
-/// before it creates anything: no control database, cache, or mirror
-/// directory. A number that does not parse is an error naming the variable,
-/// never a silent default.
+/// H4: each invalid storage or numeric setting stops the server before it
+/// creates anything: no control database, cache, or mirror directory. A
+/// number that does not parse is an error naming the variable, never a
+/// silent default.
 #[test]
 fn h4_invalid_config_fails_before_side_effects() {
     type Env<'a> = &'a [(&'a str, &'a str)];
     // (case, config.toml, env, text the error must contain)
     let cases: &[(&str, &str, Env, &str)] = &[
         (
-            "unknown backend",
-            "[storage]\nbackend = \"gcs\"\n",
-            &[],
-            "unknown storage backend",
-        ),
-        (
             "s3 without endpoint",
-            "[storage]\nbackend = \"s3\"\nbucket = \"b\"\n",
-            &[],
+            "",
+            &[("RIPCLONE_S3_BUCKET", "b")],
             "RIPCLONE_S3_ENDPOINT",
         ),
-        (
-            "s3 without bucket",
-            "",
-            &[("RIPCLONE_S3_ENDPOINT", "http://127.0.0.1:9")],
-            "RIPCLONE_S3_BUCKET",
-        ),
-        ("malformed file", "[storage\n", &[], "parse config"),
-        (
-            "removed [queue]",
-            "[queue]\nurl = \"sqlite:///q.db\"\n",
-            &[],
-            "removed [queue]",
-        ),
-        (
-            "empty control path",
-            "[control]\npath = \"\"\n",
-            &[],
-            "control.path must not be empty",
-        ),
-        (
-            "empty control env",
-            "",
-            &[("RIPCLONE_CONTROL_DB_PATH", " ")],
-            "RIPCLONE_CONTROL_DB_PATH must not be empty",
-        ),
+        ("malformed file", "[providers\n", &[], "parse config"),
         (
             "bad rate limit",
             "",
-            &[("RIPCLONE_RATE_LIMIT_BURST", "many")],
-            "RIPCLONE_RATE_LIMIT_BURST",
+            &[("RIPCLONE_RATE_LIMIT_PER_SEC", "many")],
+            "RIPCLONE_RATE_LIMIT_PER_SEC",
         ),
         (
             "no head slots",
@@ -123,12 +93,6 @@ fn h4_invalid_config_fails_before_side_effects() {
             "",
             &[("RIPCLONE_RETENTION_INTERVAL_SECS", "soon")],
             "RIPCLONE_RETENTION_INTERVAL_SECS must be a non-negative integer",
-        ),
-        (
-            "bad retention age",
-            "",
-            &[("RIPCLONE_RETENTION_MAX_AGE_DAYS", "week")],
-            "RIPCLONE_RETENTION_MAX_AGE_DAYS must be a non-negative integer",
         ),
         (
             "bad retention size",
@@ -172,63 +136,21 @@ fn h4_invalid_config_fails_before_side_effects() {
             &[("RIPCLONE_HEAD_REBASE_BYTES", "128M")],
             "RIPCLONE_HEAD_REBASE_BYTES must be a non-negative integer",
         ),
-        (
-            "bad Files tail percent",
-            "",
-            &[("RIPCLONE_FILES_TAIL_PERCENT", "25%")],
-            "RIPCLONE_FILES_TAIL_PERCENT must be a non-negative integer",
-        ),
-        (
-            "bad S3 timeout",
-            "",
-            &[
-                ("RIPCLONE_S3_ENDPOINT", "http://127.0.0.1:9"),
-                ("RIPCLONE_S3_BUCKET", "b"),
-                ("AWS_ACCESS_KEY_ID", "test"),
-                ("AWS_SECRET_ACCESS_KEY", "test"),
-                ("RIPCLONE_S3_REQUEST_TIMEOUT_SECS", "ten"),
-            ],
-            "RIPCLONE_S3_REQUEST_TIMEOUT_SECS must be a non-negative integer",
-        ),
-        (
-            "bad S3 attempts",
-            "",
-            &[
-                ("RIPCLONE_S3_ENDPOINT", "http://127.0.0.1:9"),
-                ("RIPCLONE_S3_BUCKET", "b"),
-                ("AWS_ACCESS_KEY_ID", "test"),
-                ("AWS_SECRET_ACCESS_KEY", "test"),
-                ("RIPCLONE_S3_MAX_ATTEMPTS", "4294967296"),
-            ],
-            "RIPCLONE_S3_MAX_ATTEMPTS must be a non-negative integer",
-        ),
-        (
-            "bad S3 retry delay",
-            "",
-            &[
-                ("RIPCLONE_S3_ENDPOINT", "http://127.0.0.1:9"),
-                ("RIPCLONE_S3_BUCKET", "b"),
-                ("AWS_ACCESS_KEY_ID", "test"),
-                ("AWS_SECRET_ACCESS_KEY", "test"),
-                ("RIPCLONE_S3_MAX_RETRY_DELAY_MS", "2e3"),
-            ],
-            "RIPCLONE_S3_MAX_RETRY_DELAY_MS must be a non-negative integer",
-        ),
     ];
     let world = World::new();
-    let config = world.path("server").join("ripclone.toml");
+    let config = world.path("server").join("config.toml");
     for (case, file, env, text) in cases {
         std::fs::write(&config, file).unwrap();
         let failure = world.server_must_fail(env);
         assert!(failure.contains(text), "{case}:\n{failure}");
-        assert_eq!(state_entries(&world), ["ripclone.toml"], "{case}");
+        assert_eq!(state_entries(&world), ["config.toml"], "{case}");
     }
 }
 
 /// H5: on local disk the artifact store is the durable copy, so retention
-/// never trims it. With retention set to run every second and keep nothing
-/// older than a day, the server reports retention off, and artifacts last
-/// written a month ago still clone.
+/// never trims it. With retention set to run every second and keep at most
+/// 1 GB, the server reports retention off, and artifacts last written a
+/// month ago, past the week retention keeps, still clone.
 #[test]
 fn h5_local_retention_never_trims_artifacts() {
     let world = World::new();
@@ -237,7 +159,6 @@ fn h5_local_retention_never_trims_artifacts() {
     origin.publish();
     let server = world.server(&[
         ("RIPCLONE_RETENTION_INTERVAL_SECS", "1"),
-        ("RIPCLONE_RETENTION_MAX_AGE_DAYS", "1"),
         ("RIPCLONE_RETENTION_MAX_GB", "1"),
     ]);
     world.cli(&server, &["add", "acme/h5", "--wait"]).ok();

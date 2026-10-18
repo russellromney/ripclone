@@ -1,16 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use ripclone::server::{run_server, run_server_with_control};
+use ripclone::server::run_server;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
-
-fn default_cas_dir() -> PathBuf {
-    default_data_dir().join("cache")
-}
-
-fn default_repo_root() -> PathBuf {
-    default_data_dir().join("repos")
-}
 
 fn default_data_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -24,19 +16,10 @@ fn default_data_dir() -> PathBuf {
 #[command(about = "CAS-based git clone helper server")]
 #[command(version)]
 struct Args {
-    /// Local CAS cache directory. Defaults to ~/.local/share/ripclone/cache.
+    /// Server state: artifacts in `cache/`, git mirrors in `repos/`, and the
+    /// control database `control.db`. Defaults to ~/.local/share/ripclone.
     #[arg(long)]
-    cas_dir: Option<PathBuf>,
-
-    /// Directory for bare git mirrors. Defaults to ~/.local/share/ripclone/repos.
-    #[arg(long)]
-    repo_root: Option<PathBuf>,
-
-    /// Server-owned SQLite control database. Defaults beside cache/repos in the
-    /// data directory. `RIPCLONE_CONTROL_DB_PATH` and `[control].path` are used
-    /// when this flag is absent.
-    #[arg(long)]
-    control_db: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
 
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
@@ -52,18 +35,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    for (name, removal) in ripclone::control::removed_environment() {
-        if removal == ripclone::control::Removal::Warn {
-            tracing::warn!("{name} is set but was removed; it has no effect");
-        }
-    }
     ripclone::git::require_system_git()?;
-    let cas_dir = args.cas_dir.unwrap_or_else(default_cas_dir);
-    let repo_root = args.repo_root.unwrap_or_else(default_repo_root);
-    match args.control_db {
-        Some(control_db) => {
-            run_server_with_control(&cas_dir, &repo_root, &control_db, &args.host, args.port).await
-        }
-        None => run_server(&cas_dir, &repo_root, &args.host, args.port).await,
-    }
+    let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
+    run_server(&data_dir, &args.host, args.port).await
 }

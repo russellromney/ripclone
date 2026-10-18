@@ -47,7 +47,6 @@ SERVER_URL="http://127.0.0.1:$SERVER_PORT"
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
 BASE_DIR="$(mktemp -d /tmp/ripclone-latency-bench.XXXXXX)"
 CAS_DIR="$BASE_DIR/cache"
-REPO_ROOT="$BASE_DIR/repos"
 
 SERVER_PID=""
 PROXY_PID=""
@@ -73,8 +72,7 @@ fi
 
 # Start server (no proxy; sync talks directly to GitHub).
 "$SERVER" \
-  --cas-dir "$CAS_DIR" \
-  --repo-root "$REPO_ROOT" \
+  --data-dir "$BASE_DIR" \
   --host 127.0.0.1 \
   --port "$SERVER_PORT" \
   > "$BASE_DIR/server.log" 2>&1 &
@@ -114,9 +112,9 @@ fi
 echo ""
 echo "==> Syncing mirror and building artifacts (one-time, no proxy)..."
 sync_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" add "$REPO"
+RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" add "$REPO"
 # `sync --wait` gives up after about 70 s; run it again while the build runs.
-until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+until out=$(RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" sync "$REPO" --wait 2>&1); do
   case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
 done
 echo "$out"
@@ -158,7 +156,7 @@ total=0
 for n in $(seq 1 "$ITER"); do
   install_dir="$BASE_DIR/install-$n"
   install_start=$(now_ms)
-  "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$install_dir"
+  RIPCLONE_SERVER="$PROXY_URL" "$RIPCLONE" clone "$REPO" "$install_dir"
   install_end=$(now_ms)
   elapsed=$((install_end - install_start))
   total=$((total + elapsed))

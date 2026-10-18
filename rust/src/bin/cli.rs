@@ -5,7 +5,7 @@ use ripclone::auth::token_store::{FileBackedTokenStore, TokenStore};
 use ripclone::bench::Benchmark;
 use ripclone::client::{Client, CloneRequest, Stderr};
 use ripclone::config::ProviderEntry;
-use ripclone::mode::{CloneMode, resolve_mode};
+use ripclone::mode::CloneMode;
 use ripclone::provider::{ProviderInstance, ProviderKind, ProviderRegistry, RepoId};
 use ripclone::validation::Selector;
 use secrecy::ExposeSecret;
@@ -39,25 +39,6 @@ fn parse_verify_upstream(s: &str) -> Result<VerifyUpstream, String> {
 #[command(about = "Fast git clones from artifacts a ripclone server prebuilds")]
 #[command(version)]
 struct Args {
-    /// ripclone server. Defaults to the built-in default server; set
-    /// RIPCLONE_SERVER or pass --server http://localhost:8000 to point at your
-    /// own backend. When unset, falls back to the server saved by
-    /// `ripclone login`, then the built-in default. (Resolution: --server >
-    /// RIPCLONE_SERVER > config > default.)
-    #[arg(short, long, env = "RIPCLONE_SERVER")]
-    server: Option<String>,
-
-    /// Upstream git provider instance id (e.g. "github", "gitlab", "my-gitea").
-    /// Defaults to the built-in "github" instance unless overridden by config
-    /// or a provider prefix in the repo argument (`gitlab:owner/repo`).
-    #[arg(short, long)]
-    provider: Option<String>,
-
-    /// Upstream credential token for `--verify-upstream`. Overrides any
-    /// configured provider token. Never sent to the ripclone server.
-    #[arg(short, long, env = "RIPCLONE_UPSTREAM_TOKEN")]
-    token: Option<String>,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -112,13 +93,12 @@ enum Commands {
         /// --at, the name of the local branch to check out.
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
-        /// Clone mode: editable (default) or files.
-        #[arg(long)]
-        mode: Option<CloneMode>,
-        /// History depth: 0 = full history (default), 1 = HEAD only. Defaults
-        /// to the value in `ripclone.toml` or 0.
-        #[arg(long)]
-        depth: Option<usize>,
+        /// Clone mode: editable or files.
+        #[arg(long, value_enum, default_value_t)]
+        mode: CloneMode,
+        /// History depth: 0 = full history, 1 = HEAD only.
+        #[arg(long, default_value_t = 0)]
+        depth: usize,
         /// Clone this full commit SHA, branch or tag instead of the branch tip.
         #[arg(long)]
         at: Option<String>,
@@ -138,14 +118,11 @@ enum Commands {
         /// Show progress on stderr even when it is not a terminal.
         #[arg(long)]
         progress: bool,
-        /// Suppress the fire-and-forget clone metrics report.
-        #[arg(long)]
-        no_metrics: bool,
         /// Cross-check the installed tip against the upstream git host.
         /// `auto` (default) enables verification for public repos and whenever an
         /// upstream credential is available; `always` requires verification;
-        /// `never` disables it. See also `RIPCLONE_VERIFY_UPSTREAM`.
-        #[arg(long, env = "RIPCLONE_VERIFY_UPSTREAM", default_value = "auto", default_missing_value = "always", value_parser = parse_verify_upstream, num_args = 0..=1)]
+        /// `never` disables it.
+        #[arg(long, default_value = "auto", default_missing_value = "always", value_parser = parse_verify_upstream, num_args = 0..=1)]
         verify_upstream: VerifyUpstream,
     },
     /// Manage configured git providers (GitHub, GitLab, Gitea, …).
@@ -559,7 +536,7 @@ async fn run_login(server: &str) -> Result<()> {
         }
     };
 
-    let mut cfg = ripclone::config::load_global();
+    let mut cfg = ripclone::config::load();
     cfg.server = Some(server.to_string());
     ripclone::config::save(&cfg)?;
     token_store()?.set("server", &token)?;
@@ -568,9 +545,9 @@ async fn run_login(server: &str) -> Result<()> {
 }
 
 /// Best-effort: open the verification URL in the user's browser. Never fails.
-/// Skipped when `RIPCLONE_NO_BROWSER` is set so tests don't launch browsers.
+/// Skipped without a terminal, so scripts and tests don't launch browsers.
 fn open_browser(url: &str) {
-    if std::env::var_os("RIPCLONE_NO_BROWSER").is_some() {
+    if !std::io::stdin().is_terminal() {
         return;
     }
     #[cfg(target_os = "macos")]
@@ -588,14 +565,6 @@ fn token_store() -> Result<FileBackedTokenStore> {
     FileBackedTokenStore::new().context("initialize token store")
 }
 
-/// Prompt for a provider token only on a real TTY and never in agent-fleet mode.
-/// A fleet VM must never block on an interactive prompt, even if it somehow has
-/// a TTY attached — and agent mode is agent mode however it was turned on, env
-/// var or `agent = true` in config.
-fn should_prompt_for_token(is_tty: bool, agent: bool) -> bool {
-    is_tty && !agent
-}
-
 /// Add a provider to the CLI's config, or update one: flags left out keep
 /// the entry's current values. The kind defaults to the id when the id names
 /// a kind (`gitlab`).
@@ -606,12 +575,11 @@ async fn run_provider_add(
     auth_template: Option<String>,
     auth_header_name: Option<String>,
     token: Option<String>,
-    agent: bool,
 ) -> Result<()> {
     if id.is_empty() {
         return Err(usage("provider id cannot be empty"));
     }
-    let mut cfg = ripclone::config::load_global();
+    let mut cfg = ripclone::config::load();
     let existing = cfg.providers.remove(id);
     let kind = kind
         .or_else(|| existing.as_ref().map(|e| e.kind.clone()))
@@ -626,9 +594,9 @@ async fn run_provider_add(
     }
     let token = match token {
         Some(t) => Some(t),
-        None if should_prompt_for_token(std::io::stdin().is_terminal(), agent) => Some(
-            rpassword::prompt_password(format!("Token for provider '{id}' (empty for none): "))?,
-        ),
+        None if std::io::stdin().is_terminal() => Some(rpassword::prompt_password(format!(
+            "Token for provider '{id}' (empty for none): "
+        ))?),
         None => None,
     }
     .filter(|t| !t.is_empty())
@@ -678,7 +646,7 @@ async fn run_provider_rm(id: &str) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("provider id cannot be empty");
     }
-    let mut cfg = ripclone::config::load_global();
+    let mut cfg = ripclone::config::load();
     if cfg.providers.remove(id).is_none() {
         anyhow::bail!("provider '{id}' is not in the CLI's config");
     }
@@ -755,23 +723,16 @@ async fn run() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    for (name, _) in ripclone::control::removed_environment() {
-        eprintln!("ripclone: warning: {name} is set but was removed; it has no effect");
-    }
     let config = ripclone::config::load();
 
-    // Server precedence: --server / RIPCLONE_SERVER (both land in args.server) >
-    // the configured server > the built-in default server.
-    let server = args
-        .server
-        .clone()
+    // Server precedence: RIPCLONE_SERVER > the configured server > the
+    // built-in default server.
+    let server = env::var("RIPCLONE_SERVER")
+        .ok()
+        .filter(|s| !s.is_empty())
         .or_else(|| config.server.clone())
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-    let default_provider = args
-        .provider
-        .clone()
-        .or_else(|| config.default_provider.clone())
-        .unwrap_or_else(|| "github".to_string());
+    let default_provider = "github";
 
     // login/logout/version don't need an authenticated client.
     match &args.command {
@@ -801,18 +762,12 @@ async fn run() -> Result<()> {
     let provider_registry =
         ripclone::provider_config::load_registry().context("load provider registry")?;
 
-    // Server-token precedence:
-    //   RIPCLONE_SERVER_TOKEN_HASH > RIPCLONE_SERVER_TOKEN > saved login token.
+    // Server-token precedence: RIPCLONE_SERVER_TOKEN > saved login token.
     // Raw tokens are hashed before being sent.
-    let server_token_hash = env::var("RIPCLONE_SERVER_TOKEN_HASH")
+    let server_token_hash = env::var("RIPCLONE_SERVER_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
-        .or_else(|| {
-            env::var("RIPCLONE_SERVER_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
-        })
+        .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
         .or_else(|| {
             token_store()
                 .ok()
@@ -824,7 +779,7 @@ async fn run() -> Result<()> {
         Some(token) => Client::new_with_token(server.clone(), Some(token)),
         None => Client::new(server.clone()),
     }
-    .with_provider(&default_provider);
+    .with_provider(default_provider);
 
     match args.command {
         // Handled before the client is built.
@@ -840,16 +795,7 @@ async fn run() -> Result<()> {
                 auth_header_name,
                 token,
             } => {
-                run_provider_add(
-                    &id,
-                    kind,
-                    host,
-                    auth_template,
-                    auth_header_name,
-                    token,
-                    ripclone::config::agent_mode(config.agent),
-                )
-                .await?;
+                run_provider_add(&id, kind, host, auth_template, auth_header_name, token).await?;
             }
             ProviderAction::List => {
                 run_provider_list(&provider_registry)?;
@@ -867,9 +813,8 @@ async fn run() -> Result<()> {
                 };
                 ripclone::validation::validate_repo_path(&provider, &repo_id)
                     .map_err(|e| usage(format!("{e:#}")))?;
-                let token = resolve_upstream_token(&id, args.token.as_deref(), &provider_registry)
-                    .await?
-                    .map(|t| SecretString::new(t.into()));
+                let token =
+                    upstream_token(&id, &provider_registry).map(|t| SecretString::new(t.into()));
                 let url = ripclone::git::upstream_url(&provider, &repo_id);
                 match ripclone::git::ls_remote_commit_async(
                     &provider,
@@ -886,7 +831,7 @@ async fn run() -> Result<()> {
             }
         },
         Commands::Add { repo, wait } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let (provider, repo_path) = resolve_repo(&repo, default_provider, &provider_registry)?;
             let client = (client.with_provider(&provider)).with_stderr(stderr_mode(false, false));
             let summary = client.add_repo(&repo_path).await?;
             if wait {
@@ -903,7 +848,7 @@ async fn run() -> Result<()> {
                 .list_repos()
                 .await?
                 .into_iter()
-                .map(|repo_id| repo_id.cli_name(&default_provider))
+                .map(|repo_id| repo_id.cli_name(default_provider))
                 .collect::<Vec<_>>();
             names.sort();
             for name in names {
@@ -912,12 +857,12 @@ async fn run() -> Result<()> {
         }
         Commands::Rm { repo } => {
             let (provider, repo_path) =
-                resolve_control_repo(&repo, &default_provider, &provider_registry)?;
+                resolve_control_repo(&repo, default_provider, &provider_registry)?;
             let repo_id = RepoId {
                 provider: ripclone::provider::ProviderInstanceId::new(&provider),
                 path: repo_path.clone(),
             };
-            let cli_name = repo_id.cli_name(&default_provider);
+            let cli_name = repo_id.cli_name(default_provider);
             client
                 .with_provider(provider)
                 .remove_repo(&repo_path)
@@ -928,7 +873,7 @@ async fn run() -> Result<()> {
             if let Some(at) = at.as_deref() {
                 Selector::parse(at).map_err(|e| usage(format!("--at {at}: {e:#}")))?;
             }
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let (provider, repo_path) = resolve_repo(&repo, default_provider, &provider_registry)?;
             let client = (client.with_provider(&provider)).with_stderr(stderr_mode(false, false));
             if wait || at.is_some() {
                 let selector = at.as_deref().unwrap_or("HEAD");
@@ -953,49 +898,30 @@ async fn run() -> Result<()> {
             bench,
             quiet,
             progress,
-            no_metrics,
             verify_upstream,
             wait,
         } => {
             if let Some(at) = at.as_deref() {
                 Selector::parse(at).map_err(|e| usage(format!("--at {at}: {e:#}")))?;
             }
-            let mode = resolve_mode(mode, config.clone.mode.as_deref())?;
             if mode.needs_prebuilt_blob_pack() {
                 ripclone::git::require_system_git()?;
             }
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let upstream_token =
-                resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
-                    .await?;
+            let (provider, repo_path) = resolve_repo(&repo, default_provider, &provider_registry)?;
+            let upstream_token = upstream_token(&provider, &provider_registry);
             // A top-up fetches from the URL this provider config gives, never
             // from one the server names.
             let local_provider = provider_instance(&provider, &provider_registry)
                 .with_context(|| format!("provider '{provider}' is not configured locally"))?;
-            let mut client = client.with_provider_instance(local_provider);
-            if no_metrics {
-                client = client.with_metrics_disabled();
-            }
-            client = client.with_stderr(stderr_mode(quiet, progress));
+            let client = client
+                .with_provider_instance(local_provider)
+                .with_stderr(stderr_mode(quiet, progress));
             let target_name = repo_path
                 .rsplit('/')
                 .next()
                 .unwrap_or(&repo_path)
                 .to_string();
             let target = dir.unwrap_or_else(|| PathBuf::from(target_name));
-            // Agent-fleet mode (RIPCLONE_AGENT or the config default) flips the
-            // history default to depth-1: agents on giant repos don't want the
-            // full 1.3M-commit history that the human default (D8) ships. An
-            // explicit --depth or a `[clone] depth` config value still wins over
-            // this. Never a silent size-based switch — see `config::agent_mode`.
-            let agent = ripclone::config::agent_mode(config.agent);
-            let default_depth = if agent { 1 } else { 0 };
-            if agent && !quiet {
-                eprintln!(
-                    "ripclone: agent-fleet mode — fleet defaults on (depth-1 unless overridden, no prompts)"
-                );
-            }
-            let depth = depth.or(config.clone.depth).unwrap_or(default_depth);
             // Only depth 1 (shallow) and depth 0 (full history) are implemented.
             // Reject an arbitrary depth-N request instead of silently serving
             // full history that git would record as a complete, non-shallow clone
@@ -1006,7 +932,6 @@ async fn run() -> Result<()> {
                      not --depth {depth}"
                 )));
             }
-            let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
             let kind = if mode == CloneMode::Files {
                 ExactResultKind::Files
@@ -1053,7 +978,7 @@ async fn run() -> Result<()> {
             };
             let (upstream, outcome) = tokio::join!(
                 observe,
-                client.clone_repo(&request, &target, enable_bench.then_some(&mut benchmark))
+                client.clone_repo(&request, &target, bench.then_some(&mut benchmark))
             );
             let outcome = outcome?;
             let total_ms = u64::try_from(clone_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1073,14 +998,13 @@ async fn run() -> Result<()> {
                     })?;
                 return Err(error);
             }
-            if enable_bench {
+            if bench {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
             // Fire-and-forget: report metrics to the configured server AFTER printing
             // success. Best-effort — skipped if the server didn't mint a clone id
-            // (self-host), the user passed --no-metrics, or the RIPCLONE_NO_METRICS
-            // env var is set. Never able to affect the clone's exit status.
+            // (self-host) or the RIPCLONE_NO_METRICS env var is set. Never able to affect the clone's exit status.
             client.report_clone_metrics(&outcome, total_ms).await;
         }
     }
@@ -1088,24 +1012,11 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Resolve an upstream credential for `provider`/`repo_path`.
-///
-/// Precedence:
-///   1. Explicit `--token` / `RIPCLONE_UPSTREAM_TOKEN` override.
-///   2. Any configured provider token.
-///   3. Anonymous (public repos).
-async fn resolve_upstream_token(
-    provider_id: &str,
-    override_token: Option<&str>,
-    registry: &ProviderRegistry,
-) -> Result<Option<String>> {
-    if let Some(token) = override_token {
-        return Ok(Some(token.to_string()));
-    }
-
-    Ok(registry
+/// The provider's configured upstream credential; `None` reads anonymously.
+fn upstream_token(provider_id: &str, registry: &ProviderRegistry) -> Option<String> {
+    registry
         .token(provider_id)
-        .map(|token| token.expose_secret().to_string()))
+        .map(|token| token.expose_secret().to_string())
 }
 
 /// Strip scheme and trailing slashes from a provider host so it can be used

@@ -233,84 +233,19 @@ pub(super) fn check_target(target: &Path) -> Result<Option<std::fs::Permissions>
 
 /// Rename the finished staging tree onto `target`, which is missing or an
 /// empty directory (`rename` replaces an empty directory; `keep` carries its
-/// permissions over). With `RIPCLONE_FSYNC` set, flush the tree first and the
-/// parent directory after, so a crash cannot leave a torn tree that
-/// `git status` calls clean. Off by default: the rename alone is already
-/// crash-consistent.
+/// permissions over). Like `git checkout`, nothing is fsynced.
 pub(super) fn publish(
     root: &Path,
     target: &Path,
     keep: Option<std::fs::Permissions>,
 ) -> Result<()> {
-    let fsync = fsync_requested();
     if let Some(permissions) = keep {
         std::fs::set_permissions(root, permissions)
             .with_context(|| format!("set permissions of {}", root.display()))?;
     }
-    if fsync {
-        fsync_tree(root).context("fsync staged clone before publish")?;
-    }
     std::fs::rename(root, target)
         .with_context(|| format!("rename {} to {}", root.display(), target.display()))?;
-    if fsync {
-        fsync_dir(container(target)).context("fsync parent directory after publish")?;
-    }
     Ok(())
-}
-
-fn fsync_requested() -> bool {
-    std::env::var("RIPCLONE_FSYNC")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// fsync one directory so its newly created entries survive a crash. On Unix
-/// this opens the directory and syncs it; elsewhere it is a best-effort no-op.
-#[cfg(unix)]
-fn fsync_dir(path: &Path) -> Result<()> {
-    let dir = std::fs::File::open(path)
-        .with_context(|| format!("open dir for fsync {}", path.display()))?;
-    dir.sync_all()
-        .with_context(|| format!("fsync dir {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-/// Walk `root` and collect every regular file into `files` and every directory
-/// into `dirs`. A symlink is persisted by syncing its parent directory, not by
-/// following the link, so it needs no entry of its own. The `.git/index` written
-/// during extraction is a regular file under `root`, so this picks it up — the
-/// index stat cache is flushed alongside the working-tree files it describes.
-fn collect_fsync_targets(
-    root: &Path,
-    files: &mut Vec<PathBuf>,
-    dirs: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let meta = std::fs::symlink_metadata(root)
-        .with_context(|| format!("stat for fsync {}", root.display()))?;
-    if meta.is_dir() {
-        for entry in
-            std::fs::read_dir(root).with_context(|| format!("read dir {}", root.display()))?
-        {
-            collect_fsync_targets(&entry?.path(), files, dirs)?;
-        }
-        dirs.push(root.to_path_buf());
-    } else if meta.is_file() {
-        files.push(root.to_path_buf());
-    }
-    Ok(())
-}
-
-/// Flush the whole materialized tree under `root`: every file (including the
-/// `.git/index` stat cache) and every directory that holds one.
-fn fsync_tree(root: &Path) -> Result<()> {
-    let mut files = Vec::new();
-    let mut dirs = Vec::new();
-    collect_fsync_targets(root, &mut files, &mut dirs)?;
-    crate::worktree_writer::fsync_paths_durable(&files, &dirs)
 }
 
 type CleanupFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -623,46 +558,8 @@ mod tests {
     }
 
     #[test]
-    fn collect_fsync_targets_covers_files_dirs_and_index() {
-        // The durability barrier must flush the working-tree files, every
-        // directory that holds one, AND the `.git/index` stat cache that git
-        // consults to decide clean vs dirty. Missing the index is the exact way
-        // a crash leaves a torn tree that `git status` calls clean.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join(".git/index"), b"INDEX").unwrap();
-        std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("src/main.rs", root.join("link")).unwrap();
-
-        let mut files = Vec::new();
-        let mut dirs = Vec::new();
-        collect_fsync_targets(root, &mut files, &mut dirs).expect("collect targets");
-
-        assert!(
-            files.iter().any(|p| p.ends_with(".git/index")),
-            "index stat cache must be in the fsync set: {files:?}"
-        );
-        assert!(files.iter().any(|p| p.ends_with("src/main.rs")));
-        // The symlink is persisted via its parent dir, so it is not fsynced
-        // directly.
-        assert!(!files.iter().any(|p| p.ends_with("link")));
-        // Every directory that holds a materialized entry is flushed.
-        assert!(dirs.iter().any(|p| p.ends_with(".git")));
-        assert!(dirs.iter().any(|p| p.ends_with("src")));
-        assert!(dirs.iter().any(|p| p == root));
-
-        // The barrier itself must run cleanly over the collected set.
-        crate::worktree_writer::fsync_paths_durable(&files, &dirs)
-            .expect("durable fsync over collected tree");
-    }
-
-    #[test]
     fn container_of_a_relative_target_is_the_cwd() {
-        // The post-rename fsync and the staging directory both use the
-        // target's container. A bare relative target (`bun`) has an empty
+        // The staging directory uses the target's container. A bare relative target (`bun`) has an empty
         // parent; it must resolve to `.`, never be skipped.
         for (target, parent) in [
             ("bun", "."),

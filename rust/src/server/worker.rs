@@ -27,10 +27,9 @@
 //! newest commit of the repo with that output ready that is an ancestor of
 //! the commit being built (see [`ancestor_base`]). Without one it builds cold.
 
-use super::api::row_info;
 use super::builder::{
     BuildPhases, SyncPhases, build_files_result, build_full_result, build_head_result,
-    report_sync_bench, report_sync_phases,
+    report_sync_phases,
 };
 use super::{RepoLock, ServerState, duration_ms};
 use crate::cancel::{self, Cancel};
@@ -445,16 +444,6 @@ async fn record_published(
     state
         .metrics
         .record_build_completed(Duration::from_secs(age));
-    if std::env::var_os("RIPCLONE_BENCH").is_some()
-        && let Ok(Some(row)) = state.control.status(repo_id, commit).await
-    {
-        let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-        let (storage, repo_id, commit) = (state.storage.clone(), repo_id.clone(), commit.clone());
-        let _ = tokio::task::spawn_blocking(move || {
-            report_sync_bench(&repo_id, &commit, &storage, &row_info(&row), &mirror_dir);
-        })
-        .await;
-    }
 }
 
 async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {
@@ -1013,5 +1002,173 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// A control store whose first `failures` releases fail; everything else,
+    /// and every later release, goes to `inner`.
+    struct FailingReleases {
+        inner: std::sync::Arc<dyn crate::control::ControlStore>,
+        failures: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::control::ControlStore for FailingReleases {
+        async fn admit(
+            &self,
+            repo: &RepoId,
+            commit: &str,
+            ref_name: Option<&str>,
+        ) -> Result<(BuildRow, bool)> {
+            self.inner.admit(repo, commit, ref_name).await
+        }
+        async fn retry(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>> {
+            self.inner.retry(repo, commit).await
+        }
+        async fn claim(&self, owner: &str, pool: Pool, lease: Duration) -> Result<Option<Claim>> {
+            self.inner.claim(owner, pool, lease).await
+        }
+        async fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool> {
+            self.inner.renew(claim, lease).await
+        }
+        async fn publish(&self, claim: &Claim, output: Output) -> Result<Published> {
+            self.inner.publish(claim, output).await
+        }
+        async fn fail(
+            &self,
+            claim: &Claim,
+            error: &str,
+            retry_after: Option<Duration>,
+        ) -> Result<()> {
+            self.inner.fail(claim, error, retry_after).await
+        }
+        async fn release(&self, claim: &Claim) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.attempts.fetch_add(1, SeqCst);
+            let failing = self
+                .failures
+                .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                .is_ok();
+            if failing {
+                anyhow::bail!("control database is locked");
+            }
+            self.inner.release(claim).await
+        }
+        async fn reset_leases(&self) -> Result<u64> {
+            self.inner.reset_leases().await
+        }
+        async fn status(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>> {
+            self.inner.status(repo, commit).await
+        }
+        async fn list_builds(&self, repo: &RepoId) -> Result<Vec<BuildRow>> {
+            self.inner.list_builds(repo).await
+        }
+        async fn latest_ready_full(
+            &self,
+            repo: &RepoId,
+            ref_name: &str,
+        ) -> Result<Option<(String, crate::FullResult)>> {
+            self.inner.latest_ready_full(repo, ref_name).await
+        }
+        async fn ready_commits(
+            &self,
+            repo: &RepoId,
+            kind: ExactResultKind,
+            prefer_ref: Option<&str>,
+            except: &str,
+            limit: usize,
+        ) -> Result<Vec<String>> {
+            self.inner
+                .ready_commits(repo, kind, prefer_ref, except, limit)
+                .await
+        }
+        async fn add_repo(&self, repo: &RepoId) -> Result<bool> {
+            self.inner.add_repo(repo).await
+        }
+        async fn remove_repo(&self, repo: &RepoId) -> Result<bool> {
+            self.inner.remove_repo(repo).await
+        }
+        async fn get_repo(&self, repo: &RepoId) -> Result<Option<crate::control::AddedRepo>> {
+            self.inner.get_repo(repo).await
+        }
+        async fn list_repos(&self) -> Result<Vec<crate::control::AddedRepo>> {
+            self.inner.list_repos().await
+        }
+        async fn get_config(
+            &self,
+            repo: &RepoId,
+        ) -> Result<Option<crate::repo_config::RepoConfig>> {
+            self.inner.get_config(repo).await
+        }
+        async fn set_config(
+            &self,
+            repo: &RepoId,
+            config: &crate::repo_config::RepoConfig,
+        ) -> Result<()> {
+            self.inner.set_config(repo, config).await
+        }
+        async fn health(&self) -> Result<()> {
+            self.inner.health().await
+        }
+    }
+
+    /// A release the store refuses is retried until it lands: the lease
+    /// stays held while the store refuses, and the output can be claimed
+    /// again once the release goes through.
+    #[tokio::test]
+    async fn a_refused_release_is_retried_until_the_lease_is_free() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = crate::server::tests::test_state(&tmp).await;
+        let store = std::sync::Arc::new(FailingReleases {
+            inner: state.control.clone(),
+            failures: AtomicUsize::new(2),
+            attempts: AtomicUsize::new(0),
+        });
+        state.control = store.clone();
+        let repo = RepoId::github("acme/api");
+        let commit = "a".repeat(40);
+        let lease = Duration::from_secs(60);
+        state.control.admit(&repo, &commit, None).await.unwrap();
+        let claim = state
+            .control
+            .claim("test-head", Pool::Head, lease)
+            .await
+            .unwrap()
+            .expect("the new row's Head is claimable");
+
+        let releasing = tokio::spawn({
+            let state = state.clone();
+            async move { release(&state, &claim).await }
+        });
+        // The first refusal comes at once; the retry waits 100 ms.
+        while store.attempts.load(SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state
+                .control
+                .claim("test-head", Pool::Head, lease)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused release leaves the lease held"
+        );
+        tokio::time::timeout(Duration::from_secs(5), releasing)
+            .await
+            .expect("the release retried until it landed")
+            .unwrap();
+        assert_eq!(
+            store.attempts.load(SeqCst),
+            3,
+            "two refusals, then the release"
+        );
+        let again = state
+            .control
+            .claim("test-head", Pool::Head, lease)
+            .await
+            .unwrap()
+            .expect("a released Head is claimable again");
+        assert_eq!(again.build.commit, commit);
     }
 }
