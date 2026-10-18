@@ -52,17 +52,17 @@ pub fn build(repo: &Path, tags: &[(String, String)]) -> Result<Vec<u8>> {
     let mut objects = BTreeMap::new();
     let mut out = Vec::with_capacity(tags.len());
     for (name, id) in tags {
-        let mut peeled = String::new();
         let mut current = gix::hash::ObjectId::from_hex(id.as_bytes())
             .with_context(|| format!("tag {name}: invalid object id {id}"))?;
-        for _ in 0..MAX_CHAIN {
+        let mut chain = Vec::new();
+        let mut target = None;
+        // Up to MAX_CHAIN tag objects, then the target.
+        for _ in 0..=MAX_CHAIN {
             let object = repo
                 .find_object(current)
                 .with_context(|| format!("tag {name}: find {current}"))?;
             if object.kind != gix::object::Kind::Tag {
-                if current.to_string() != *id {
-                    peeled = current.to_string();
-                }
+                target = Some(current);
                 break;
             }
             let data = object.data.clone();
@@ -73,17 +73,21 @@ pub fn build(repo: &Path, tags: &[(String, String)]) -> Result<Vec<u8>> {
                 .decode()
                 .with_context(|| format!("tag {name}: decode {current}"))?
                 .target();
-            objects.insert(current.to_string(), data);
+            chain.push((current.to_string(), data));
             current = next;
         }
-        ensure!(
-            peeled.is_empty() || !objects.contains_key(&peeled),
-            "tag {name}: chain longer than {MAX_CHAIN}"
-        );
+        // A clone would refuse it, so it is left out rather than failing
+        // every clone, as a name a clone would refuse is.
+        let Some(target) = target else {
+            tracing::warn!("tag {name}: more than {MAX_CHAIN} tag objects deep, left out");
+            continue;
+        };
+        objects.extend(chain);
+        let target = target.to_string();
         out.push(Tag {
             name: name.clone(),
             object: id.clone(),
-            peeled,
+            peeled: if target == *id { String::new() } else { target },
         });
     }
     let artifact = TagsArtifact {
@@ -220,6 +224,10 @@ pub fn check(artifact: TagsArtifact) -> Result<Kept> {
         });
     }
     tags.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    ensure!(
+        tags.windows(2).all(|pair| pair[0].name != pair[1].name),
+        "{integrity}: a tag is listed twice"
+    );
     Ok(Kept { tags, objects })
 }
 

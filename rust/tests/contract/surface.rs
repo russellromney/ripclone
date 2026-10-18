@@ -89,6 +89,72 @@ fn i5_poller_builds_a_push() {
     );
 }
 
+/// I15: an upstream whose `HEAD` names no branch, as a detached `HEAD`
+/// leaves it. The poller still refreshes on a pushed branch, and keeps the
+/// default branch the server last saw; it does not refresh again while
+/// nothing changes.
+#[test]
+fn i15_poller_with_no_upstream_default_branch_refreshes_once() {
+    let world = World::new();
+    let origin = world.origin("acme", "i15");
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let wrapper = GitWrapper::new(
+        &world,
+        "server",
+        r#"case " $* " in
+            *" ls-remote "*) note listing ;;
+            *" fetch --atomic --prune "*) note refresh ;;
+        esac"#,
+    );
+    let server = world.server(&[
+        ("RIPCLONE_POLL_INTERVAL_SECS", "1"),
+        ("PATH", &wrapper.path),
+    ]);
+    world.cli(&server, &["add", "acme/i15", "--wait"]).ok();
+    wait_first_refs(&server, "acme/i15", &a);
+
+    git(&origin.bare, &["update-ref", "--no-deref", "HEAD", &a]);
+    let listed = git(&origin.bare, &["ls-remote", "--symref", ".", "HEAD"]);
+    assert!(!listed.contains("ref:"), "{listed}");
+    let before = api::branches_artifact(&server, "acme/i15", &a);
+    git(
+        &origin.work,
+        &[
+            "push",
+            "-q",
+            origin.bare.to_str().unwrap(),
+            &format!("{a}:refs/heads/side"),
+        ],
+    );
+    wait_for("the poller to publish the branch", || {
+        (api::branches_artifact(&server, "acme/i15", &a) != before).then_some(())
+    });
+    let full = world.target("full");
+    world
+        .cli_env(
+            &server,
+            &["clone", "acme/i15", full.to_str().unwrap()],
+            &[NO_UPSTREAM],
+        )
+        .ok();
+    assert_eq!(
+        remote_refs(&full),
+        format!("origin/HEAD {a} origin/main\norigin/main {a} \norigin/side {a}")
+    );
+
+    let refreshes = wrapper.notes("refresh");
+    let listings = wrapper.notes("listing");
+    wait_for("four more listings", || {
+        (wrapper.notes("listing") >= listings + 4).then_some(())
+    });
+    assert_eq!(
+        wrapper.notes("refresh"),
+        refreshes,
+        "the poller refreshed again"
+    );
+}
+
 /// I8: only the probe routes answer without the server token: health,
 /// readiness, metrics and version. Webhooks check their own signature and
 /// fail closed without a secret. Every other route, the artifact route

@@ -1064,6 +1064,75 @@ pub fn mirror_dir(world: &World) -> PathBuf {
     panic!("no mirror under {}", root.display());
 }
 
+/// A `git` on a `PATH` of its own that runs a shell fragment before the
+/// real git, for a server or CLI to run. The fragment sees git's arguments
+/// as `"$@"` and may `exit` to fail git; `await_mark NAME` waits, up to
+/// 30 s, for [`GitWrapper::mark`]; `mark NAME` sets one for the test;
+/// `note NAME` counts one more for [`GitWrapper::notes`].
+pub struct GitWrapper {
+    /// The `PATH` to give the binary.
+    pub path: String,
+    marks: PathBuf,
+}
+
+impl GitWrapper {
+    pub fn new(world: &World, name: &str, fragment: &str) -> Self {
+        let dir = world.path(&format!("wrappers/{name}"));
+        let marks = dir.join("marks");
+        std::fs::create_dir_all(&marks).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let real = std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|git| git.is_file())
+            .expect("git on PATH");
+        let script = format!(
+            "#!/bin/sh\n\
+             MARKS='{marks}'\n\
+             await_mark() {{ n=0; while [ ! -e \"$MARKS/$1\" ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done; }}\n\
+             mark() {{ : > \"$MARKS/$1\"; }}\n\
+             note() {{ echo >> \"$MARKS/$1.notes\"; }}\n\
+             {fragment}\n\
+             exec '{real}' \"$@\"\n",
+            marks = marks.display(),
+            real = real.display(),
+        );
+        let git = dir.join("git");
+        std::fs::write(&git, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut dirs = vec![dir];
+        dirs.extend(std::env::split_paths(&path));
+        Self {
+            path: std::env::join_paths(dirs).unwrap().into_string().unwrap(),
+            marks,
+        }
+    }
+
+    pub fn mark(&self, name: &str) {
+        std::fs::write(self.marks.join(name), "").unwrap();
+    }
+
+    pub fn marked(&self, name: &str) -> bool {
+        self.marks.join(name).exists()
+    }
+
+    /// How many times the wrapper ran `note name`.
+    pub fn notes(&self, name: &str) -> usize {
+        std::fs::read_to_string(self.marks.join(format!("{name}.notes")))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+}
+
+/// Send `server` GitHub's signed push webhook for `ref_` of `repo` moving
+/// to `after`.
+pub fn github_push(server: &Server, secret: &str, repo: &str, ref_: &str, after: &str) {
+    let (headers, body) = push_hook("github", secret, repo, ref_, after);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let resp = server.post("/webhooks/github", &headers, &body);
+    assert_eq!(resp.status, 200, "{}", resp.body);
+}
+
 /// Poll `check` until it returns `Some`, failing after [`WAIT`].
 pub fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + WAIT;

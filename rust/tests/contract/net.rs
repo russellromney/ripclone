@@ -95,6 +95,8 @@ pub struct OriginRequest {
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
+    /// A fetch, as [`GitHttp::fetches`] counts them.
+    pub fetch: bool,
 }
 
 impl OriginRequest {
@@ -234,9 +236,16 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
         .await
         .unwrap_or_default();
     let path = parts.uri.path().to_string();
+    // A v2 fetch and a v0 negotiation are both POSTs to git-upload-pack; a v2
+    // `ls-refs` is too, but it only lists refs. Large request bodies may be
+    // gzipped, and only fetches are large.
+    let is_fetch = parts.method == Method::POST
+        && path.ends_with("/git-upload-pack")
+        && !contains(&body, b"command=ls-refs");
     let request = OriginRequest {
         method: parts.method.to_string(),
         path: path.clone(),
+        fetch: is_fetch,
         headers: parts
             .headers
             .iter()
@@ -264,12 +273,6 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
     if !allowed {
         return plain(StatusCode::FORBIDDEN, "missing required header".into());
     }
-    // A v2 fetch and a v0 negotiation are both POSTs to git-upload-pack; a v2
-    // `ls-refs` is too, but it only lists refs. Large request bodies may be
-    // gzipped, and only fetches are large.
-    let is_fetch = parts.method == Method::POST
-        && path.ends_with("/git-upload-pack")
-        && !contains(&body, b"command=ls-refs");
     if parts.method == Method::GET && path.ends_with("/info/refs") {
         state.listing_gate.pass().await;
     }
@@ -423,6 +426,9 @@ struct ProxyState {
     http: reqwest::Client,
     rules: Mutex<Vec<Rule>>,
     rewrites: Mutex<Vec<Rewrite>>,
+    /// `(from, to)` replaced in each request's path and query before it is
+    /// forwarded.
+    forwards: Mutex<Vec<(String, String)>>,
     /// Request headers set (replaced) before forwarding.
     set_headers: Mutex<Vec<(header::HeaderName, header::HeaderValue)>>,
     ignore_range: AtomicBool,
@@ -449,6 +455,7 @@ impl FaultProxy {
                 .unwrap(),
             rules: Mutex::new(Vec::new()),
             rewrites: Mutex::new(Vec::new()),
+            forwards: Mutex::new(Vec::new()),
             set_headers: Mutex::new(Vec::new()),
             ignore_range: AtomicBool::new(false),
             preserve_host: AtomicBool::new(false),
@@ -557,6 +564,12 @@ impl FaultProxy {
         });
     }
 
+    /// Forward requests with `from` in their path and query replaced by
+    /// `to`.
+    pub fn forward_as(&self, from: &str, to: &str) {
+        (self.state.forwards.lock().unwrap()).push((from.to_string(), to.to_string()));
+    }
+
     pub fn seen(&self) -> Vec<Seen> {
         self.state.seen.lock().unwrap().clone()
     }
@@ -626,7 +639,11 @@ async fn proxy(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     for (name, value) in state.set_headers.lock().unwrap().iter() {
         headers.insert(name.clone(), value.clone());
     }
-    let target = format!("{}{}", state.upstream, parts.uri);
+    let mut uri = parts.uri.to_string();
+    for (from, to) in state.forwards.lock().unwrap().iter() {
+        uri = uri.replace(from, to);
+    }
+    let target = format!("{}{uri}", state.upstream);
     let upstream = state
         .http
         .request(parts.method.clone(), target)

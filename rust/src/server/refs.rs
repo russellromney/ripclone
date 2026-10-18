@@ -26,33 +26,51 @@ use std::sync::atomic::Ordering;
 use tracing::warn;
 
 /// Whether the poller should refresh: upstream's refs differ from the ones
-/// the last refresh published.
+/// the last refresh published. A listing that names no default branch
+/// leaves the mirror's `HEAD` where it was, so it compares with the last
+/// refresh's default branch.
 pub(super) async fn changed(
     state: &ServerState,
     repo_id: &RepoId,
     upstream: &UpstreamRefs,
 ) -> Result<bool> {
     let stored = state.control.get_refs(repo_id).await?;
-    Ok(stored
-        .and_then(|row| row.branches)
-        .is_none_or(|branches| branches.refs_hash != upstream.hash()))
+    let Some(branches) = stored.and_then(|row| row.branches) else {
+        return Ok(true);
+    };
+    let kept = (branches.default_branch.as_deref())
+        .filter(|kept| upstream.branches.iter().any(|(name, _)| name == kept));
+    let default_branch = upstream.default_branch.as_deref().or(kept);
+    let hash = crate::branches::refs_hash(default_branch, &upstream.branches, &upstream.tags);
+    Ok(branches.refs_hash != hash)
 }
 
 /// Refresh the repo's refs. Requests that arrive while one runs are folded
-/// into one more pass of it.
+/// into one more pass of it, which runs after a failed pass too. The error
+/// returned is the last pass's: a pass fetches every ref, so a later
+/// success covers an earlier failure.
 pub(super) async fn refresh(state: &ServerState, repo_id: &RepoId) -> Result<()> {
     let lock = repo_lock(state, repo_id).await;
     lock.refresh_wanted.store(true, Ordering::SeqCst);
+    let mut last = Ok(());
     loop {
         let Ok(running) = lock.refresh.try_lock() else {
-            return Ok(());
+            return last;
         };
         while lock.refresh_wanted.swap(false, Ordering::SeqCst) {
-            refresh_once(state, repo_id).await?;
+            last = refresh_once(state, repo_id).await;
+            if let Err(error) = &last
+                && lock.refresh_wanted.load(Ordering::SeqCst)
+            {
+                warn!(
+                    "refs refresh of {} failed, and runs again for a later request: {error:#}",
+                    repo_id.storage_key()
+                );
+            }
         }
         drop(running);
         if !lock.refresh_wanted.load(Ordering::SeqCst) {
-            return Ok(());
+            return last;
         }
     }
 }
@@ -127,7 +145,8 @@ async fn refresh_once(state: &ServerState, repo_id: &RepoId) -> Result<()> {
 /// What a publish rebuilds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Scope {
-    /// The tags only, after a build's fetch. Cheap, so a Head waits on it.
+    /// The tags only, after a build's fetch. A Head waits on it, so it
+    /// waits on nothing but another publish's tags.
     Tags,
     /// The tags, the branches and the side pack, after a refresh.
     All,
@@ -135,14 +154,31 @@ pub(super) enum Scope {
 
 /// Publish the mirror's refs unless the control store already points at
 /// them. A tags publish before the repo's first refresh starts one.
+///
+/// The branches and side pack are built before taking `lock.refs`, which
+/// a Head's tags publish waits on. Only a refresh builds them, and
+/// refreshes run one at a time, so no other publish writes them meanwhile.
 pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope) -> Result<()> {
     let lock = repo_lock(state, repo_id).await;
-    let _publishing = lock.refs.lock().await;
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let dir = mirror_dir.clone();
-    let refs = cancel::spawn_blocking(move || MirrorRefs::read(&dir))
-        .await
-        .context("refs listing task")??;
+    let branches = match scope {
+        Scope::Tags => None,
+        Scope::All => {
+            let refs = read_refs(&mirror_dir).await?;
+            let previous = state
+                .control
+                .get_refs(repo_id)
+                .await?
+                .and_then(|row| row.branches);
+            match previous {
+                Some(previous) if previous.refs_hash == refs.hash() => Some(previous),
+                previous => Some(publish_branches(state, &mirror_dir, refs, previous).await?),
+            }
+        }
+    };
+    let _publishing = lock.refs.lock().await;
+    // Read again under the lock: a build's fetch may have added tags since.
+    let refs = read_refs(&mirror_dir).await?;
     let stored = state.control.get_refs(repo_id).await?;
     let mut row = stored.clone().unwrap_or_default();
     if stored.is_none() || row.tags_hash != refs.tags_hash {
@@ -155,14 +191,8 @@ pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope)
         row.tags_count = refs.tags.len() as u64;
         row.tags_hash = refs.tags_hash.clone();
     }
-    let refs_hash = refs.hash();
-    if scope == Scope::All
-        && row
-            .branches
-            .as_ref()
-            .is_none_or(|branches| branches.refs_hash != refs_hash)
-    {
-        row.branches = Some(publish_branches(state, &mirror_dir, refs, refs_hash).await?);
+    if branches.is_some() {
+        row.branches = branches;
     }
     if stored.as_ref() != Some(&row) {
         state.control.set_refs(repo_id, &row).await?;
@@ -173,41 +203,90 @@ pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope)
     Ok(())
 }
 
-/// Build and store the branches artifact and side pack of `refs`.
+async fn read_refs(mirror_dir: &Path) -> Result<MirrorRefs> {
+    let dir = mirror_dir.to_path_buf();
+    cancel::spawn_blocking(move || MirrorRefs::read(&dir))
+        .await
+        .context("refs listing task")?
+}
+
+/// Build and store the branches artifact and side pack of `refs`. The
+/// previous refresh's side pack is kept when the refs it completes are the
+/// same and the default branch only moved forward: what it leaves out is
+/// still in the default branch's history.
 async fn publish_branches(
     state: &ServerState,
     mirror_dir: &Path,
     refs: MirrorRefs,
-    refs_hash: String,
+    previous: Option<RepoBranches>,
 ) -> Result<RepoBranches> {
     let built = refs.build()?;
     let (artifact, len) = put_bytes(state, move || Ok(built))
         .await
         .context("branches artifact")?;
-    let scratch = tempfile::tempdir_in(&state.repo_root).context("create side pack dir")?;
-    let (dir, out) = (mirror_dir.to_path_buf(), scratch.path().to_path_buf());
-    let files = cancel::spawn_blocking(move || refs.side_pack(&dir, &out))
-        .await
-        .context("side pack task")??;
-    let side_pack = match files {
-        None => None,
-        Some((pack, idx)) => {
-            let (pack, pack_len) = put_file(state, pack).await.context("side pack")?;
-            let (idx, idx_len) = put_file(state, idx).await.context("side pack idx")?;
-            Some(SidePack {
-                pack,
-                pack_len,
-                idx,
-                idx_len,
-            })
+    let refs_hash = refs.hash();
+    let base = refs.base().map(str::to_string);
+    let side_tips = refs.side_tips_hash();
+    let default_branch = refs.default_branch.clone();
+    let kept = match (previous, &base) {
+        (Some(previous), Some(base)) if previous.side_tips == side_tips => {
+            match previous.side_base.clone() {
+                Some(side_base) if moved_forward(mirror_dir, &side_base, base).await? => {
+                    Some((Some(side_base), previous.side_pack))
+                }
+                _ => None,
+            }
         }
+        _ => None,
+    };
+    let (side_base, side_pack) = match kept {
+        Some(kept) => kept,
+        None => (
+            base.clone(),
+            build_side_pack(state, mirror_dir, refs).await?,
+        ),
     };
     Ok(RepoBranches {
         artifact,
         len,
         refs_hash,
+        default_branch,
+        base,
+        side_base,
+        side_tips,
         side_pack,
     })
+}
+/// Whether `old` is in `new`'s history.
+async fn moved_forward(mirror_dir: &Path, old: &str, new: &str) -> Result<bool> {
+    let (dir, old, new) = (mirror_dir.to_path_buf(), old.to_string(), new.to_string());
+    cancel::spawn_blocking(move || git::is_ancestor(&dir, &old, &new))
+        .await
+        .context("ancestry task")?
+}
+
+/// Build and store the side pack of `refs`.
+async fn build_side_pack(
+    state: &ServerState,
+    mirror_dir: &Path,
+    refs: MirrorRefs,
+) -> Result<Option<SidePack>> {
+    let scratch = tempfile::tempdir_in(&state.repo_root).context("create side pack dir")?;
+    let (dir, out) = (mirror_dir.to_path_buf(), scratch.path().to_path_buf());
+    let files = cancel::spawn_blocking(move || refs.side_pack(&dir, &out))
+        .await
+        .context("side pack task")??;
+    let Some((pack, idx)) = files else {
+        return Ok(None);
+    };
+    let (pack, pack_len) = put_file(state, pack).await.context("side pack")?;
+    let (idx, idx_len) = put_file(state, idx).await.context("side pack idx")?;
+    Ok(Some(SidePack {
+        pack,
+        pack_len,
+        idx,
+        idx_len,
+    }))
 }
 
 /// Store the bytes `build` makes in the CAS and the artifact store.

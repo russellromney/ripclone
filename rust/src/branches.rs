@@ -116,6 +116,27 @@ impl MirrorRefs {
             .map(|(_, id)| id.as_str())
     }
 
+    /// The ids the side pack completes: every branch's but the default
+    /// branch's, and every tag's, sorted and deduplicated.
+    fn side_tips(&self) -> Vec<&str> {
+        let default = self.default_branch.as_deref();
+        let mut tips: Vec<&str> = (self.branches.iter())
+            .filter(|(name, _)| Some(name.as_str()) != default)
+            .chain(&self.tags)
+            .map(|(_, id)| id.as_str())
+            .collect();
+        tips.sort_unstable();
+        tips.dedup();
+        tips
+    }
+
+    /// The hash of [`Self::side_tips`]: a side pack built for refs of the
+    /// same hash, against a commit in the default branch's history, still
+    /// completes every ref.
+    pub fn side_tips_hash(&self) -> String {
+        crate::cas::hash(self.side_tips().join("\n").as_bytes())
+    }
+
     /// The zstd-compressed artifact for these branches. The same refs
     /// always give the same bytes.
     pub fn build(&self) -> Result<Vec<u8>> {
@@ -139,8 +160,7 @@ impl MirrorRefs {
         let Some(base) = self.base() else {
             return Ok(None);
         };
-        let tips: Vec<&str> = (self.branches.iter().chain(&self.tags))
-            .map(|(_, id)| id.as_str())
+        let tips: Vec<&str> = (self.side_tips().into_iter())
             .filter(|id| *id != base)
             .collect();
         if tips.is_empty() {

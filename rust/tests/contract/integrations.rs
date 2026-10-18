@@ -435,3 +435,58 @@ fn i10_verify_upstream_in_files_mode() {
         }
     }
 }
+
+/// I16: `--verify-upstream=always` also walks the clone from its commit.
+/// A server that answers a full clone with its Head called a Full
+/// installs a clone missing the tip's parent, with no shallow boundary:
+/// `always` fails it and removes it, naming the walk; `auto` compares only
+/// the commit and keeps it.
+#[test]
+fn i16_verify_upstream_always_walks_the_clone() {
+    let world = World::new();
+    let origin = world.origin("acme", "i16");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    let b = origin.commit(&[("b.txt", "b\n")], "B");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/i16", "--wait"]).ok();
+    let proxy = FaultProxy::start(&server);
+    proxy.forward_as("kind=full", "kind=head");
+    proxy.rewrite(api::COMMIT_READS, "\"kind\":\"head\"", "\"kind\":\"full\"");
+
+    let always = world.target("always");
+    let err = world
+        .cli(
+            &proxy,
+            &[
+                "clone",
+                "acme/i16",
+                always.to_str().unwrap(),
+                "--verify-upstream=always",
+            ],
+        )
+        .err();
+    assert!(err.contains("do not connect from commit"), "{err}");
+    assert!(!always.exists(), "the failed clone left its target");
+
+    let auto = world.target("auto");
+    world
+        .cli(
+            &proxy,
+            &[
+                "clone",
+                "acme/i16",
+                auto.to_str().unwrap(),
+                "--verify-upstream=auto",
+            ],
+        )
+        .ok();
+    assert_eq!(git(&auto, &["rev-parse", "HEAD"]), b);
+    assert!(!auto.join(".git").join("shallow").exists());
+    assert!(
+        !git_output(&auto, &["fsck", "--connectivity-only", &b])
+            .status
+            .success()
+    );
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
+}

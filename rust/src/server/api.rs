@@ -634,7 +634,9 @@ struct ReadyBody {
     result: RefResponse,
 }
 
-/// A ready output's body, with the repository's refs as of now.
+/// A ready output's body, with the repository's refs as of now. Refs that
+/// cannot be read are left out, as before the first publish: the clone
+/// still comes, and fetches its refs from upstream.
 async fn ready_body(
     state: &ServerState,
     repo_id: &RepoId,
@@ -642,10 +644,18 @@ async fn ready_body(
     row: &BuildRow,
     kind: ExactResultKind,
 ) -> Result<serde_json::Value, ApiError> {
-    let refs = state.control.get_refs(repo_id).await.map_err(|error| {
-        state.metrics.record_error();
-        ApiError::control(error)
-    })?;
+    let refs = state
+        .control
+        .get_refs(repo_id)
+        .await
+        .unwrap_or_else(|error| {
+            state.metrics.record_error();
+            tracing::warn!(
+                "read refs of {}: {error:#}; the response has none",
+                repo_id.storage_key()
+            );
+            None
+        });
     Ok(serde_json::json!(ReadyBody {
         state: "ready",
         result: ref_response(

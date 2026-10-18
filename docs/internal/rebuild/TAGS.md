@@ -22,9 +22,12 @@ the upstream's.
 
 All of these come down to one rule, git's auto-follow: **a tag is
 included when its fully peeled target is an object in the clone**. A
-tag-of-tag chain comes along whole. For Ready and depth-1 clones, "an
-object in the clone" is the same as "reachable from the commit", because
-the installed packs hold exactly that set.
+tag-of-tag chain comes along whole. For Ready clones, "an object in the
+clone" is the same as "reachable from the commit", because the installed
+packs hold exactly that set. A depth-1 clone's packs can hold more: Head
+of a commit keeps the packs of the Head it was built on, with that older
+commit and its tree. So a depth-1 clone keeps only the tags on its tip
+and on the objects of its tip's tree, as `git clone --depth 1` does (G23).
 
 What #235 misses, and this plan fixes:
 
@@ -499,9 +502,9 @@ branch.
    `--single-branch`.
 
 **Cost.** No new round trip on the common path. The server builds one
-pack per refs change, and each push to the default branch changes D. If
-that is too slow on big repos, the side pack can grow by levels as Full
-does.
+pack per change of a branch or tag other than the default branch. A push
+that only moves the default branch forward keeps the side pack (see "As
+built").
 
 **Tests.** A new G test: a repo with side branches, a tag on a side
 commit and one on a blob, compared with `git clone` for `branch -r`,
@@ -514,13 +517,24 @@ The trial scripts compare `git branch -r` with `git clone`'s.
 - **Two artifacts, not one.** The tags artifact stays as it was. A
   separate branches artifact (`BranchesArtifact`: default branch, base D,
   and each branch's commit) and the side pack with its idx sit next to it
-  in the `repo_refs` row (schema 5). Only a Full response carries the
+  in the `repo_refs` row (schema 6). Only a Full response carries the
   branches artifact and side pack URLs.
+- **The side pack is kept while only the default branch moves on.** The
+  row stores the commit the side pack leaves out (`side_base`) and a hash
+  of the tips it completes: every branch but the default branch, and every
+  tag. A refresh with the same tips, whose new D has `side_base` in its
+  history, publishes the new branches with the old side pack: what that
+  pack leaves out is still in D's history. A changed tip, or a force-push
+  of the default branch, builds a new one (G24).
 - **Who publishes what.** Head publishes the tags only, as before, so a
   ready Head still never points at older tags and pays no side pack
-  build. The refresh publishes everything. A tags publish on a repo with
-  no branches row yet starts a refresh, so a new repo gets its branches
-  after its first build.
+  build. The refresh publishes everything. It builds and uploads the
+  branches artifact and side pack before it takes the publish lock, which
+  a Head's tags publish waits on, so a Head never waits on a side pack
+  (K6); refreshes of one repo run one at a time, so nothing else writes
+  the branches meanwhile. A tags publish on a repo with no branches row
+  yet starts a refresh, so a new repo gets its branches after its first
+  build.
 - **Refresh.** One `ls-remote` of `HEAD` names the default branch, then
   `git fetch --atomic --prune --no-tags origin +refs/heads/*:refs/heads/*
   +refs/tags/*:refs/tags/*` and `symbolic-ref HEAD`, under the mirror read
@@ -529,15 +543,29 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   or delete of a branch or tag starts one; a default-branch push still
   admits its build first. The poller lists `HEAD`, `refs/heads/*` and
   `refs/tags/*` in its one `ls-remote` and refreshes when the hash of that
-  listing differs from the published one. The tags-only `fetch --stdin`
-  and `update-ref` steps and the fetch counter are gone.
+  listing differs from the published one. An upstream whose `HEAD` names
+  no branch, such as a detached `HEAD`, leaves the mirror's `HEAD` alone,
+  so the poller hashes its listing with the last published default branch
+  and does not refresh on every pass (I15). Requests that arrive while a
+  refresh runs fold into one more pass, which runs after a failed pass
+  too; the failure is logged (K7). The tags-only `fetch --stdin` and
+  `update-ref` steps and the fetch counter are gone.
+- **Refs the store cannot read** are left out of a ready response, as
+  before the first refresh, with a warning in the server log; the clone
+  still comes, and fetches its refs from the upstream (H15).
+- **Tag limits.** A tag more than 32 tag objects deep is left out of the
+  artifact with a warning, where it once failed every clone (G21). The
+  client refuses an artifact that lists a name twice (G22).
 - **Client completeness check.** After the packs, any top-up and the side
   pack are installed, the refs come from the server when the clone holds
   D and every branch commit and tag target. Since the clone's objects are
   whole histories, that proves every ref complete. Otherwise one `git
   fetch` from the upstream of `+refs/heads/*:refs/remotes/origin/*
-  +refs/tags/*:refs/tags/*` writes them. If that fails too, the clone
-  warns and keeps only its own branch and the tags it holds.
+  +refs/tags/*:refs/tags/*` writes them. If the upstream or the network
+  fails that fetch, the clone warns and keeps only its own branch and the
+  tags it holds. If it fails on the user's machine (git does not start, a
+  full disk, refs it cannot write), the clone fails and leaves nothing
+  (G25).
 - **The checked-out branch's remote-tracking ref** is the installed
   commit, even when the branches artifact is older.
 - **Cost of `--at` an older commit:** it does not hold D, so it always

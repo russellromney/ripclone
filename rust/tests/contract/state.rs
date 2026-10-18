@@ -439,3 +439,53 @@ fn h13_purge_removes_only_what_no_other_repo_uses() {
         origin.count(&b)
     );
 }
+
+/// H15: the control store fails to read a repo's refs, here because their
+/// table was renamed under the running server. A ready build still
+/// answers, without the server's refs, and a full clone fetches them from
+/// the upstream as `git clone` has them.
+#[test]
+fn h15_unreadable_refs_leave_ready_builds_cloning() {
+    let world = World::new();
+    let origin = world.origin("acme", "h15");
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    git(&origin.work, &["tag", "-a", "-m", "v1", "v1"]);
+    origin.publish();
+    git(
+        &origin.work,
+        &["push", "-q", origin.bare.to_str().unwrap(), "--tags"],
+    );
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/h15", "--wait"]).ok();
+    wait_first_refs(&server, "acme/h15", &a);
+
+    let db = world.path("server").join("control.db");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use sqlx::Connection;
+            let url = format!("sqlite://{}", db.display());
+            let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            sqlx::query("ALTER TABLE repo_refs RENAME TO repo_refs_moved")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        });
+    let (status, body) = api::read_commit(&server, "acme/h15", &a, Some("full"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "ready", "{body}");
+    assert!(body["branches"].is_null(), "{body}");
+    assert!(body["tags_artifact"].is_null(), "{body}");
+    assert!(server.log().contains("read refs of"), "{}", server.log());
+
+    let full = world.target("full");
+    let out = world.cli(&server, &["clone", "acme/h15", full.to_str().unwrap()]);
+    out.ok();
+    assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    assert_eq!(git(&full, &["rev-parse", "HEAD"]), a);
+    assert_eq!(remote_refs(&full), git_clone_remotes(&origin.bare, &[]));
+    assert_eq!(tag_refs(&full), git_clone_tags(&origin.bare, &[]).0);
+    git(&full, &["fsck", "--strict"]);
+}

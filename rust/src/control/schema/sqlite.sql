@@ -25,6 +25,10 @@ CREATE TABLE repo_refs (
   branches_artifact TEXT,              -- CAS id of the BranchesArtifact
   branches_len      INTEGER,
   refs_hash         TEXT,              -- hash of the mirror's refs it was built from
+  default_branch    TEXT,              -- the branch the mirror's HEAD named
+  branches_base     TEXT,              -- the default branch's commit
+  side_base         TEXT,              -- the commit the side pack leaves out
+  side_tips         TEXT,              -- hash of the tips the side pack holds
   side_pack         TEXT,              -- CAS id of the side pack
   side_pack_len     INTEGER,
   side_idx          TEXT,              -- CAS id of its idx

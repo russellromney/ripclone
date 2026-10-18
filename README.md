@@ -178,8 +178,10 @@ secrets. The CLI reads the upstream (top-up, `--verify-upstream`) with your
 own git credentials.
 
 **Checking the server.** `--verify-upstream` (`auto` by default) cross-checks an
-editable clone's commit against the git host when it can. A Files clone has no
-git objects to check, so `--verify-upstream=always` fails for one.
+editable clone's commit against the git host when it can. `always` also checks
+that the clone's objects connect from that commit (`git fsck
+--connectivity-only`), which adds seconds to a large full clone. A Files clone
+has no git objects to check, so `--verify-upstream=always` fails for one.
 
 ## Architecture
 

@@ -134,13 +134,13 @@ impl TopUp {
         if self.held {
             self.http.wait_held(1);
         }
+        // One fetch of the user's: the top-up. The other refs are the
+        // server's, so no fetch of every branch and tag follows.
         let requests = self.http.requests();
-        assert!(
-            requests
-                .iter()
-                .any(|r| r.header("authorization") == Some(self.user_auth.as_str())),
-            "the user's git never reached the origin"
-        );
+        let user_fetches = (requests.iter())
+            .filter(|r| r.fetch && r.header("authorization") == Some(self.user_auth.as_str()))
+            .count();
+        assert_eq!(user_fetches, 1, "the user's git fetches");
         for request in &requests {
             for (name, value) in &request.headers {
                 assert!(

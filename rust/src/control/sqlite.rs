@@ -899,7 +899,8 @@ impl ControlStore for SqliteControlStore {
         let key = repo.storage_key();
         let row = sqlx::query(
             "SELECT tags_artifact, tags_len, tags_count, tags_hash, branches_artifact,
-               branches_len, refs_hash, side_pack, side_pack_len, side_idx, side_idx_len
+               branches_len, refs_hash, default_branch, branches_base, side_base, side_tips,
+               side_pack, side_pack_len, side_idx, side_idx_len
              FROM repo_refs WHERE repo = $1",
         )
         .bind(&key)
@@ -918,6 +919,10 @@ impl ControlStore for SqliteControlStore {
                     artifact,
                     len: number("branches_len")?,
                     refs_hash: row.try_get("refs_hash")?,
+                    default_branch: text("default_branch")?,
+                    base: text("branches_base")?,
+                    side_base: text("side_base")?,
+                    side_tips: text("side_tips")?.unwrap_or_default(),
                     side_pack: match (text("side_pack")?, text("side_idx")?) {
                         (Some(pack), Some(idx)) => Some(SidePack {
                             pack,
@@ -947,13 +952,15 @@ impl ControlStore for SqliteControlStore {
         let side = branches.and_then(|branches| branches.side_pack.as_ref());
         sqlx::query(
             "INSERT INTO repo_refs (repo, tags_artifact, tags_len, tags_count, tags_hash,
-               branches_artifact, branches_len, refs_hash, side_pack, side_pack_len, side_idx,
-               side_idx_len)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               branches_artifact, branches_len, refs_hash, default_branch, branches_base,
+               side_base, side_tips, side_pack, side_pack_len, side_idx, side_idx_len)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              ON CONFLICT (repo) DO UPDATE SET tags_artifact = excluded.tags_artifact,
                tags_len = excluded.tags_len, tags_count = excluded.tags_count,
                tags_hash = excluded.tags_hash, branches_artifact = excluded.branches_artifact,
                branches_len = excluded.branches_len, refs_hash = excluded.refs_hash,
+               default_branch = excluded.default_branch, branches_base = excluded.branches_base,
+               side_base = excluded.side_base, side_tips = excluded.side_tips,
                side_pack = excluded.side_pack, side_pack_len = excluded.side_pack_len,
                side_idx = excluded.side_idx, side_idx_len = excluded.side_idx_len",
         )
@@ -965,6 +972,10 @@ impl ControlStore for SqliteControlStore {
         .bind(branches.map(|branches| branches.artifact.clone()))
         .bind(branches.map(|branches| number(branches.len)).transpose()?)
         .bind(branches.map(|branches| branches.refs_hash.clone()))
+        .bind(branches.and_then(|branches| branches.default_branch.clone()))
+        .bind(branches.and_then(|branches| branches.base.clone()))
+        .bind(branches.and_then(|branches| branches.side_base.clone()))
+        .bind(branches.map(|branches| branches.side_tips.clone()))
         .bind(side.map(|side| side.pack.clone()))
         .bind(side.map(|side| number(side.pack_len)).transpose()?)
         .bind(side.map(|side| side.idx.clone()))

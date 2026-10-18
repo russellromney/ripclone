@@ -1586,6 +1586,10 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
             artifact: crate::cas::hash(b"branches"),
             len: 40,
             refs_hash: crate::cas::hash(b"refs 1"),
+            default_branch: Some("main".into()),
+            base: Some("1".repeat(40)),
+            side_base: Some("2".repeat(40)),
+            side_tips: crate::cas::hash(b"tips 1"),
             side_pack: Some(SidePack {
                 pack: crate::cas::hash(b"pack"),
                 pack_len: 1 << 40,
@@ -1606,6 +1610,10 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
             artifact: crate::cas::hash(b"branches 2"),
             len: 30,
             refs_hash: crate::cas::hash(b"refs 2"),
+            default_branch: None,
+            base: None,
+            side_base: None,
+            side_tips: crate::cas::hash(b"tips 2"),
             side_pack: None,
         }),
     };

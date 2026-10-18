@@ -196,6 +196,17 @@ pub struct RepoBranches {
     /// `branches::refs_hash` of the mirror's refs it was built from, which
     /// the poller compares with upstream's.
     pub refs_hash: String,
+    /// The branch the mirror's `HEAD` named; `None` when it named none.
+    pub default_branch: Option<String>,
+    /// The default branch's commit.
+    pub base: Option<String>,
+    /// The commit the side pack leaves out the history of: `base`, or an
+    /// older default branch commit in its history when the side pack was
+    /// kept from an earlier refresh.
+    pub side_base: Option<String>,
+    /// `branches::MirrorRefs::side_tips_hash` of the refs the side pack
+    /// was built from.
+    pub side_tips: String,
     /// `None` when every ref is in the default branch's history.
     pub side_pack: Option<SidePack>,
 }

@@ -500,7 +500,8 @@ impl Client {
                 .await?
         } else {
             if let Some(kept) = tags {
-                install_tags(&root, kept, reaches, cleanup).await?;
+                let tip = (output.result == ExactResultKind::Head).then_some(pin.commit.as_str());
+                install_tags(&root, kept, reaches, tip, cleanup).await?;
             }
             pin.default_branch
                 .then(|| (pin.checkout.clone(), pin.commit.clone()))
@@ -1238,7 +1239,7 @@ impl Client {
             Some(url) => {
                 self.progress
                     .phase("fetching branches and tags from upstream");
-                fetch_refs(root, url, cleanup).await
+                fetch_refs(root, url, cleanup).await?
             }
             None => Err(anyhow::anyhow!(
                 "the provider has no local client configuration"
@@ -1249,7 +1250,7 @@ impl Client {
                 "the clone has only its own branch and the tags it holds: \
                  the other branches and tags could not be fetched: {error:#}"
             ));
-            install_tags(root, tags, reaches, cleanup).await?;
+            install_tags(root, tags, reaches, None, cleanup).await?;
             return Ok(pin
                 .default_branch
                 .then(|| (pin.checkout.clone(), pin.commit.clone())));
@@ -1518,14 +1519,16 @@ async fn run_git_with(
 
 /// Keep the tags whose target the clone holds, as `git clone --depth 1`
 /// gets them, and write them: the tag objects as one indexed pack, the refs
-/// as `packed-refs`. After a force-pushed top-up the base's objects are no
-/// part of the target's history, so only the tags `reaches` reaches stay;
-/// git answers that from refs straight to each target, written for the
-/// purpose.
+/// as `packed-refs`. A depth-1 clone of `tip` keeps only the tags on `tip`
+/// and the objects of its tree, though older builds' packs bring more.
+/// After a force-pushed top-up the base's objects are no part of the
+/// target's history, so only the tags `reaches` reaches stay; git answers
+/// that from refs straight to each target, written for the purpose.
 async fn install_tags(
     root: &Path,
     mut kept: crate::tags::Kept,
     reaches: Option<&str>,
+    tip: Option<&str>,
     cleanup: &Cleanup,
 ) -> Result<()> {
     let git_dir = root.join(".git");
@@ -1537,6 +1540,19 @@ async fn install_tags(
     })
     .await
     .context("tags task")??;
+    if let Some(tip) = tip
+        && kept.tags.iter().any(|tag| tag.target != tip)
+    {
+        let tree = format!("{tip}^{{tree}}");
+        let root_tree = git_stdout(root, &["rev-parse", "--verify", &tree], cleanup).await?;
+        let listed =
+            git_stdout(root, &["ls-tree", "-r", "-t", "--full-tree", tip], cleanup).await?;
+        let held: std::collections::HashSet<&str> = (listed.lines())
+            .filter_map(|line| line.split_once('\t')?.0.split(' ').nth(2))
+            .chain([tip, root_tree.trim()])
+            .collect();
+        kept.retain(|tag| held.contains(tag.target.as_str()));
+    }
     if let Some(commit) = reaches
         && !kept.tags.is_empty()
     {
@@ -1599,8 +1615,11 @@ fn install_side_pack(git_dir: &Path, side: SidePackFiles) -> Result<()> {
 }
 
 /// Fetch every upstream branch and tag with the user's git, as `git clone`
-/// does, and pack the refs as it leaves them.
-async fn fetch_refs(root: &Path, upstream_url: &str, cleanup: &Cleanup) -> Result<()> {
+/// does, and pack the refs as it leaves them. A failure on this machine,
+/// such as git that cannot start, a full disk or refs it cannot write,
+/// fails the clone as the outer error; one of the upstream or the network
+/// is the inner error, and leaves the clone with its own branch.
+async fn fetch_refs(root: &Path, upstream_url: &str, cleanup: &Cleanup) -> Result<Result<()>> {
     let fetch = [
         "fetch",
         "--no-write-fetch-head",
@@ -1612,12 +1631,35 @@ async fn fetch_refs(root: &Path, upstream_url: &str, cleanup: &Cleanup) -> Resul
         "+refs/heads/*:refs/remotes/origin/*",
         "+refs/tags/*:refs/tags/*",
     ];
-    run_git(root, &fetch, cleanup)
-        .await
-        .with_context(|| format!("fetch branches and tags from {upstream_url}"))?;
+    if let Err(error) = run_git(root, &fetch, cleanup).await {
+        let error = error.context(format!("fetch branches and tags from {upstream_url}"));
+        return if local_failure(&error) {
+            Err(error)
+        } else {
+            Ok(Err(error))
+        };
+    }
     run_git(root, &["pack-refs", "--all"], cleanup)
         .await
-        .context("pack refs")
+        .context("pack refs")?;
+    Ok(Ok(()))
+}
+
+/// Whether git failed on this machine rather than at the upstream: it
+/// could not run, or its message names a local write failure.
+fn local_failure(error: &anyhow::Error) -> bool {
+    const LOCAL: [&str; 5] = [
+        "No space left on device",
+        "Disk quota exceeded",
+        "Read-only file system",
+        "unable to write",
+        "unable to create",
+    ];
+    let text = format!("{error:#}");
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        || LOCAL.iter().any(|local| text.contains(local))
 }
 
 /// Create the clone's staging directory and hand it to the reaper.

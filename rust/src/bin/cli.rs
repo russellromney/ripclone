@@ -870,7 +870,10 @@ async fn run() -> Result<()> {
             let total_ms = u64::try_from(clone_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             println!("installed {} into {}", repo_path, target.display());
             let verified = match upstream {
-                Ok(upstream) => verify_upstream_snapshot(&outcome.commit, &upstream),
+                Ok(upstream) => {
+                    verify_upstream_snapshot(&target, &outcome.commit, &upstream, verify_upstream)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = verified {
@@ -1036,10 +1039,15 @@ async fn remove_clone(target: &std::path::Path, was_dir: bool) -> Result<()> {
 }
 
 /// Check the installed commit against the upstream tip read beside the
-/// clone. Only the commit is compared: the objects come from the server
-/// with its idx files and are not hashed again, so a walk of them would
-/// prove only that they connect, at most of a full clone's time.
-fn verify_upstream_snapshot(installed_commit: &str, upstream: &Upstream) -> Result<()> {
+/// clone. `always` also walks the clone from that commit: the objects come
+/// from the server with its idx files and are not hashed again, so the walk
+/// proves only that they connect, at a large part of a full clone's time.
+async fn verify_upstream_snapshot(
+    target: &std::path::Path,
+    installed_commit: &str,
+    upstream: &Upstream,
+    requested: VerifyUpstream,
+) -> Result<()> {
     let upstream_tip = match upstream {
         Upstream::Tip(tip) => tip,
         Upstream::Unchecked => return Ok(()),
@@ -1054,6 +1062,29 @@ fn verify_upstream_snapshot(installed_commit: &str, upstream: &Upstream) -> Resu
     if upstream_tip != installed_commit {
         anyhow::bail!(
             "upstream verification failed: installed commit {installed_commit} does not match upstream tip {upstream_tip}"
+        );
+    }
+    if requested != VerifyUpstream::Always {
+        return Ok(());
+    }
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(target)
+        .args([
+            "fsck",
+            "--connectivity-only",
+            "--no-dangling",
+            "--no-progress",
+        ])
+        .arg(installed_commit)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("run git fsck")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "upstream verification failed: the installed objects do not connect from commit {installed_commit}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(())
