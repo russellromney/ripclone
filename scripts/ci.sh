@@ -26,21 +26,47 @@ lint() {
 #
 # This job self-compiles (ci profile + sccache/rust-cache). Fan-out jobs
 # (gitea/e2e/s3/…) use prebuilt binaries from ci-build instead.
+#
+# The tests run with a fresh TMPDIR that must be empty afterwards: a test that
+# leaves a temp dir behind fails the stage. Each suite is compiled first so
+# the compiler's own temp files stay out of it.
 run_tests() {
-  ( cd "$ROOT/rust" && cargo test --profile ci --locked --lib --bins )
-  s3_unit_test
-  ( cd "$ROOT/rust" && cargo test --profile ci --locked --test contract )
+  local tmp
+  tmp="$(mktemp -d)"
+  ( cd "$ROOT/rust"
+    cargo test --profile ci --locked --lib --bins --no-run
+    TMPDIR="$tmp" cargo test --profile ci --locked --lib --bins )
+  s3_unit_test "$tmp"
+  ( cd "$ROOT/rust"
+    cargo test --profile ci --locked --test contract --no-run
+    TMPDIR="$tmp" cargo test --profile ci --locked --test contract )
+  no_temp_left "$tmp"
+}
+
+# Fail if anything is left in `tmp`, a TMPDIR only the tests used.
+no_temp_left() {
+  local tmp="$1" left
+  left="$(find "$tmp" -mindepth 1 -maxdepth 1)"
+  if [ -n "$left" ]; then
+    echo "tests left temp files behind:" >&2
+    while IFS= read -r path; do
+      du -sh "$path" >&2
+    done <<<"$left"
+    return 1
+  fi
+  rmdir "$tmp"
 }
 
 # The one unit test that needs real S3 (multipart upload), against the
-# emulator. It reuses the lib test binary built just above.
+# emulator. It reuses the lib test binary built just above, and runs with
+# TMPDIR `$1`.
 s3_unit_test() {
-  local data env status=0
+  local test_tmp="$1" data env status=0
   data="$(mktemp -d)"
   env="$(bash "$ROOT/scripts/s3_emulator.sh" "$data" ripclone-unit)"
   ( cd "$ROOT/rust"
     while IFS= read -r line; do export "$line"; done <<<"$env"
-    cargo test --profile ci --locked --lib -- --ignored --exact \
+    TMPDIR="$test_tmp" cargo test --profile ci --locked --lib -- --ignored --exact \
       storage::s3_storage::tests::multipart_file_upload_roundtrips_exact_bytes
   ) 2>&1 | tee "$data/test.log" || status=$?
   kill "$(sed -n 's/^S3_EMULATOR_PID=//p' <<<"$env")" 2>/dev/null || true
