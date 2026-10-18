@@ -104,20 +104,17 @@ fn gitea_private_repo_with_server_side_token() {
         "the repo is readable anonymously"
     );
 
-    let server_providers = providers_json(
+    world.server_providers(
         &gitea.url,
         &[("gitea", "gitea", Some(&gitea.token), serde_json::json!({}))],
     );
-    let server = world.server(&[("RIPCLONE_PROVIDERS", &server_providers)]);
-    let cli_providers = providers_json(
+    let server = world.server(&[]);
+    world.cli_providers(
         &gitea.url,
         &[("gitea", "gitea", None, serde_json::json!({}))],
     );
-    let cli_env = [("RIPCLONE_PROVIDERS", cli_providers.as_str())];
     let arg = format!("gitea:{}/{repo}", gitea.user);
-    world
-        .cli_env(&server, &["add", &arg, "--wait"], &cli_env)
-        .ok();
+    world.cli(&server, &["add", &arg, "--wait"]).ok();
 
     let first = world.target("first");
     let clone = [
@@ -127,14 +124,12 @@ fn gitea_private_repo_with_server_side_token() {
         "--verify-upstream",
         "never",
     ];
-    world.cli_env(&server, &clone, &cli_env).ok();
+    world.cli(&server, &clone).ok();
     assert_eq!(git(&first, &["rev-parse", "HEAD"]), tip);
     assert_eq!(listing(&first), tree);
 
     let (tip, tree) = push(&world, &gitea, &repo, "update.txt", "second\n");
-    world
-        .cli_env(&server, &["sync", &arg, "--wait"], &cli_env)
-        .ok();
+    world.cli(&server, &["sync", &arg, "--wait"]).ok();
     let second = world.target("second");
     let clone = [
         "clone",
@@ -143,7 +138,7 @@ fn gitea_private_repo_with_server_side_token() {
         "--verify-upstream",
         "never",
     ];
-    world.cli_env(&server, &clone, &cli_env).ok();
+    world.cli(&server, &clone).ok();
     assert_eq!(git(&second, &["rev-parse", "HEAD"]), tip);
     assert_eq!(listing(&second), tree);
 

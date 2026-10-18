@@ -1,6 +1,5 @@
 use ripclone::cas::{Cas, hash as cas_hash};
 use ripclone::manifest::MetadataChunk;
-use ripclone::server::RateLimiter;
 use ripclone::validation;
 use std::path::Path;
 use std::time::Instant;
@@ -158,21 +157,6 @@ fn bench_git_rev_validation(count: usize) {
     );
 }
 
-fn bench_rate_limiter(count: usize) {
-    let limiter = RateLimiter::new(count as u32 + 1_000, 1_000_000.0);
-    let key = "192.0.2.1";
-    let start = now();
-    for _ in 0..count {
-        assert!(limiter.check(key));
-    }
-    let elapsed = start.elapsed();
-    println!(
-        "rate limiter check            count={:<8}  {:>8.2} ns/op",
-        count,
-        elapsed.as_nanos() as f64 / count as f64
-    );
-}
-
 fn main() {
     println!("Ripclone security-fix performance micro-benchmarks\n");
 
@@ -185,7 +169,6 @@ fn main() {
     bench_artifact_id_validation(1_000_000);
     bench_git_rev_validation(1_000_000);
     bench_path_validation(1_000_000);
-    bench_rate_limiter(1_000_000);
 
     println!("\n--- Manifest geometry validation overhead ---");
     bench_manifest_validation(10_000);

@@ -134,7 +134,6 @@ ripclone clone owner/repo --at <ref>        # a full commit SHA, branch, or tag
 ripclone clone owner/repo --wait            # wait for the exact full build, no top-up
 ripclone clone gitlab:group/project         # another provider
 ripclone clone https://github.com/owner/repo.git  # a pasted clone URL works anywhere owner/repo does
-ripclone clone owner/repo --bench           # print a per-phase timing report
 ripclone clone owner/repo --quiet           # no progress or notes on stderr
 ripclone clone owner/repo --progress        # progress on stderr even when it is not a terminal
 ripclone sync owner/repo                    # build the default branch tip
@@ -144,7 +143,6 @@ ripclone list
 ripclone rm owner/repo
 ripclone provider add|list|rm|test          # provider instances in this CLI's config; test runs git ls-remote
 ripclone version                            # CLI and server versions, with a compatibility check
-ripclone update                             # check GitHub for a newer release
 ripclone login | logout                     # sign in to https://ripclone.com
 ```
 

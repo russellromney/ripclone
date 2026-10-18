@@ -27,8 +27,7 @@ done
 step "server with the GitHub token"
 export RIPCLONE_SERVER_TOKEN="$(openssl rand -hex 32)"
 SECRETS+=("$RIPCLONE_SERVER_TOKEN")
-start_server server \
-  RIPCLONE_PROVIDERS="{\"providers\":[{\"id\":\"github\",\"kind\":\"github\",\"host\":\"github.com\",\"token\":\"$RIPCLONE_GITHUB_TOKEN\"}]}"
+start_server server "$(printf '[providers.github]\nkind = "github"\ntoken = "%s"' "$RIPCLONE_GITHUB_TOKEN")"
 export RIPCLONE_SERVER="$SERVER_URL"
 ok "$SERVER_URL"
 
@@ -72,7 +71,7 @@ done
 
 step "refusals"
 expect_failure rc add "$1-no-such-repo" --wait
-start_server no-token
+start_server no-token ""
 expect_failure env RIPCLONE_SERVER="$SERVER_URL" "$BIN/ripclone" add "$1" --wait
 expect_failure env RIPCLONE_SERVER="$SERVER_URL" "$BIN/ripclone" clone "$1" no-token
 [ ! -e no-token ] && ok "no directory from a server without a token" || bad "no-token written"

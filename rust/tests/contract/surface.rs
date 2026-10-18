@@ -101,8 +101,6 @@ fn i8_only_probe_routes_are_public() {
         (Method::POST, format!("{repo}/add")),
         (Method::DELETE, format!("{repo}/add")),
         (Method::GET, format!("/v1/artifacts/{artifact}")),
-        (Method::GET, "/v1/admin/config/github/acme/i8".to_string()),
-        (Method::POST, "/v1/admin/config/github/acme/i8".to_string()),
         (Method::POST, "/v1/clones/some-clone/metrics".to_string()),
     ];
     for (method, path) in &protected {

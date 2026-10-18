@@ -203,8 +203,6 @@ mod tests {
     use crate::server::build_app;
     use crate::server::tests::{mark_added, test_state};
     use crate::webhook::WebhookConfig;
-    use axum::extract::ConnectInfo;
-    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
     use tower::util::ServiceExt;
@@ -228,7 +226,6 @@ mod tests {
         let mut b = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/webhooks/{provider}"))
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
             .header("X-GitHub-Event", event);
         if let Some(sig) = signature {
             b = b.header("X-Hub-Signature-256", sig);
@@ -514,7 +511,6 @@ mod tests {
         let req = axum::http::Request::builder()
             .method("POST")
             .uri("/webhooks/gitlab")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
             .header("X-Gitlab-Event", "Push Hook")
             .header("X-Gitlab-Token", WEBHOOK_SECRET)
             .body(axum::body::Body::from(body))

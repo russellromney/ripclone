@@ -48,13 +48,14 @@ trial_cleanup() {
   [ -n "${KEEP_TRIAL:-}" ] && echo "kept $WORK" || rm -rf "$WORK"
 }
 
-# start_server <name> [env assignments...]: start a ripclone server with its
-# own data, home, empty git config and local storage, on a port the OS
-# picks. Sets SERVER_URL.
+# start_server <name> <config.toml> [env assignments...]: start a ripclone
+# server with its own data, home, config file, empty git config and local
+# storage, on a port the OS picks. Sets SERVER_URL.
 start_server() {
-  local name="$1" log="$WORK/$1.log" dir="$WORK/$1"
-  shift
-  mkdir -p "$dir/home"
+  local name="$1" log="$WORK/$1.log" dir="$WORK/$1" config="$2"
+  shift 2
+  mkdir -p "$dir/home/.config/ripclone"
+  (umask 077 && printf '%s\n' "$config" >"$dir/home/.config/ripclone/config.toml")
   # Local storage only. S3 settings in the environment (soup sets them) would
   # upload the trial's private repo content to a real bucket, so they are
   # removed; without RIPCLONE_S3_BUCKET the server stores locally.

@@ -5,7 +5,6 @@
 //! [`sqlite::SqliteControlStore`] implements [`ControlStore`].
 
 use crate::provider::RepoId;
-use crate::repo_config::RepoConfig;
 use crate::{ExactResultKind, FilesResult, FullResult, HeadResult};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -244,9 +243,6 @@ pub trait ControlStore: Send + Sync {
     async fn remove_repo(&self, repo: &RepoId) -> Result<bool>;
     async fn get_repo(&self, repo: &RepoId) -> Result<Option<AddedRepo>>;
     async fn list_repos(&self) -> Result<Vec<AddedRepo>>;
-    /// The stored config; `None` when none is stored (builds use the default).
-    async fn get_config(&self, repo: &RepoId) -> Result<Option<RepoConfig>>;
-    async fn set_config(&self, repo: &RepoId, config: &RepoConfig) -> Result<()>;
     async fn health(&self) -> Result<()>;
 }
 

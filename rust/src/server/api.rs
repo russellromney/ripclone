@@ -1,5 +1,4 @@
-//! The `/v1/repos` and `/v1/admin/config` routes: add and remove
-//! repositories, admit builds, read commits and repository status.
+//! The `/v1/repos` routes: add and remove repositories, admit builds, read commits and repository status.
 
 use super::{ErrorResponse, ServerState, ls_remote_semaphore};
 use crate::clonepack::{
@@ -1055,55 +1054,6 @@ pub(super) async fn admit_build(
     Ok((row, inserted))
 }
 
-/// `GET /v1/admin/config/{provider}/{path}`: the stored repository config,
-/// or 404 `config_not_found`.
-pub(super) async fn admin_get_config(
-    Path(path): Path<String>,
-    State(state): State<ServerState>,
-) -> Response {
-    let repo_id = match repo_from_path(&state, &path) {
-        Ok((repo_id, _)) => repo_id,
-        Err(error) => return error.into_response(),
-    };
-    match state.control.get_config(&repo_id).await {
-        Ok(Some(config)) => (StatusCode::OK, Json(config)).into_response(),
-        Ok(None) => ApiError::new(
-            StatusCode::NOT_FOUND,
-            "config_not_found",
-            "no config stored for this repository",
-        )
-        .into_response(),
-        Err(e) => {
-            state.metrics.record_error();
-            ApiError::control(e).into_response()
-        }
-    }
-}
-
-/// `POST /v1/admin/config/{provider}/{path}`: store the repository config.
-/// The body is validated before the control database is written; builds read
-/// it when they start.
-pub(super) async fn admin_put_config(
-    Path(path): Path<String>,
-    State(state): State<ServerState>,
-    Json(config): Json<crate::repo_config::RepoConfig>,
-) -> Response {
-    let repo_id = match repo_from_path(&state, &path) {
-        Ok((repo_id, _)) => repo_id,
-        Err(error) => return error.into_response(),
-    };
-    if let Err(e) = config.validate() {
-        return ApiError::invalid_request(format!("invalid config: {e:#}")).into_response();
-    }
-    match state.control.set_config(&repo_id, &config).await {
-        Ok(()) => (StatusCode::OK, Json(config)).into_response(),
-        Err(e) => {
-            state.metrics.record_error();
-            ApiError::control(e).into_response()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1956,32 +1906,5 @@ mod tests {
         assert!(!exact.files);
         assert_eq!(exact.job, "failed");
         assert_eq!(exact.job_error.as_deref(), Some("archive broke"));
-    }
-
-    #[tokio::test]
-    async fn admin_config_is_addressed_by_provider_and_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp).await;
-        let control = Arc::clone(&state.control);
-        let app = build_app(state);
-        let uri = "/v1/admin/config/github/acme/configured";
-
-        let (status, _, body) = call(&app, "GET", uri, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["code"], "config_not_found");
-        let (status, _, _) = call(&app, "POST", uri, Some(serde_json::json!({}))).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            control
-                .get_config(&RepoId::github("acme/configured"))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        let (status, _, _) = call(&app, "GET", uri, None).await;
-        assert_eq!(status, StatusCode::OK);
-        let (status, _, body) = call(&app, "GET", "/v1/admin/config/nowhere/acme/x", None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["code"], "unknown_provider");
     }
 }

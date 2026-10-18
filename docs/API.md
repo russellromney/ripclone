@@ -20,11 +20,6 @@ A client may send `x-ripclone-protocol: <n>`. If `n` is not the server's wire
 protocol (see `GET /v1/version`), the server answers `426`. Callers that leave
 the header out are not checked.
 
-Requests are rate limited per client IP (see `RIPCLONE_RATE_LIMIT_PER_SEC` in
-[Configuration](CONFIG.md)); over the limit is `429`. `/healthz`,
-`/v1/version`, and token-authenticated `GET /v1/artifacts/{hash}` are not
-limited.
-
 ## Repositories
 
 A repository is addressed as `{provider}/{path}`, where `provider` is a
@@ -163,12 +158,11 @@ Repo routes answer errors as `{"error": "<message>", "code": "<code>"}`:
 | 404 | `repo_not_found` | The upstream has no such repo, or the server's credential cannot read it. |
 | 404 | `ref_not_found` | The upstream has no such branch or tag. |
 | 404 | `build_not_found` | No build was admitted for that commit. |
-| 404 | `config_not_found` | No settings are stored for the repo. |
 | 500 | `credential_unavailable` | The server could not get an upstream credential. |
 | 502 | `upstream_unavailable` | The upstream did not answer, or answered with a retryable error. |
 | 503 | `control_unavailable` | The control database could not be read or written. |
 
-Other errors (`401`, `426`, `429`, an unknown route, an artifact that does not
+Other errors (`401`, `426`, an unknown route, an artifact that does not
 exist) are `{"error": "<message>"}` with no `code`.
 
 ## Artifacts
@@ -177,11 +171,6 @@ exist) are `{"error": "<message>"}` with no `code`.
 hex characters). With S3 storage it redirects (`307`) to a signed URL. With
 local storage it streams the bytes and honors a single `Range: bytes=a-b`.
 Check every artifact against its hash before using it.
-
-## Repository settings
-
-`GET` and `POST /v1/admin/config/{provider}/{path}` read and replace a repo's
-build settings. See [Server state and storage](BACKENDS.md#per-repo-build-settings).
 
 ## Webhooks
 

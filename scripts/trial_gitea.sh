@@ -61,8 +61,7 @@ git ls-remote "$URL" >/dev/null 2>&1 && bad "ci/app is readable anonymously" || 
 step "server with ci's token"
 export RIPCLONE_SERVER_TOKEN="$(openssl rand -hex 32)"
 SECRETS+=("$RIPCLONE_SERVER_TOKEN")
-start_server server \
-  RIPCLONE_PROVIDERS="{\"providers\":[{\"id\":\"gitea\",\"kind\":\"gitea\",\"host\":\"$GITEA\",\"token\":\"$CI_TOKEN\"}]}"
+start_server server "$(printf '[providers.gitea]\nkind = "gitea"\nhost = "%s"\ntoken = "%s"' "$GITEA" "$CI_TOKEN")"
 export RIPCLONE_SERVER="$SERVER_URL"
 ok "$SERVER_URL"
 
@@ -121,7 +120,7 @@ expect_failure rc clone gitea:other/secret secret
 expect_failure rc clone "$URL" app
 expect_failure env RIPCLONE_SERVER_TOKEN=wrong-token "$BIN/ripclone" clone "$URL" wrong-token
 [ ! -e wrong-token ] && ok "no directory with a wrong server token" || bad "wrong-token written"
-start_server no-token RIPCLONE_PROVIDERS="{\"providers\":[{\"id\":\"gitea\",\"kind\":\"gitea\",\"host\":\"$GITEA\"}]}"
+start_server no-token "$(printf '[providers.gitea]\nkind = "gitea"\nhost = "%s"' "$GITEA")"
 expect_failure env RIPCLONE_SERVER="$SERVER_URL" "$BIN/ripclone" add "$URL" --wait
 expect_failure env RIPCLONE_SERVER="$SERVER_URL" "$BIN/ripclone" clone "$URL" no-token
 [ ! -e no-token ] && ok "no directory from a server without a token" || bad "no-token written"

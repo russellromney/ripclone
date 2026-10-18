@@ -55,20 +55,16 @@ fn i3_provider_auth_header_reaches_origin() {
         let tip = origin.commit(&[("a.txt", "a\n")], "A");
         origin.publish();
 
-        let server_providers =
-            providers_json(http.url(), &[(id, kind, Some(token), extra.clone())]);
-        let server = world.server(&[("RIPCLONE_PROVIDERS", &server_providers)]);
+        world.server_providers(http.url(), &[(id, kind, Some(token), extra.clone())]);
+        let server = world.server(&[]);
         // The CLI must know the provider id, but holds no upstream token, so
         // only the server's credential can reach the origin.
-        let cli_providers = providers_json(http.url(), &[(id, kind, None, extra)]);
+        world.cli_providers(http.url(), &[(id, kind, None, extra)]);
         let target = world.target(&name);
         let repo = format!("{id}:acme/{name}");
-        let cli_env = [("RIPCLONE_PROVIDERS", cli_providers.as_str())];
+        world.cli(&server, &["add", &repo, "--wait"]).ok();
         world
-            .cli_env(&server, &["add", &repo, "--wait"], &cli_env)
-            .ok();
-        world
-            .cli_env(
+            .cli(
                 &server,
                 &[
                     "clone",
@@ -79,7 +75,6 @@ fn i3_provider_auth_header_reaches_origin() {
                     "--verify-upstream",
                     "never",
                 ],
-                &cli_env,
             )
             .ok();
 
@@ -121,24 +116,16 @@ fn i2_server_credential_builds_a_private_repo() {
         "the origin must refuse an unauthenticated read: {anonymous:?}"
     );
 
-    let server_providers = providers_json(
+    world.server_providers(
         http.url(),
         &[("gh", "github", Some("i2-secret"), serde_json::json!({}))],
     );
-    let server = world.server(&[("RIPCLONE_PROVIDERS", &server_providers)]);
-    let cli_providers =
-        providers_json(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
-    let cli_env = [("RIPCLONE_PROVIDERS", cli_providers.as_str())];
-    world
-        .cli_env(&server, &["add", "gh:acme/i2", "--wait"], &cli_env)
-        .ok();
+    let server = world.server(&[]);
+    world.cli_providers(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
+    world.cli(&server, &["add", "gh:acme/i2", "--wait"]).ok();
     let target = world.target("i2");
     world
-        .cli_env(
-            &server,
-            &["clone", "gh:acme/i2", target.to_str().unwrap()],
-            &cli_env,
-        )
+        .cli(&server, &["clone", "gh:acme/i2", target.to_str().unwrap()])
         .ok();
 
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
@@ -250,13 +237,12 @@ fn i4_signed_webhook_builds_before_clone() {
             "RIPCLONE_WEBHOOK_SECRET_{}",
             id.to_uppercase().replace('-', "_")
         );
-        let providers = providers_json(http.url(), &[(id, kind, None, serde_json::json!({}))]);
-        let server = world.server(&[("RIPCLONE_PROVIDERS", &providers), (&secret_var, &secret)]);
-        let cli_env = [("RIPCLONE_PROVIDERS", providers.as_str())];
+        let providers = [(id, kind, None, serde_json::json!({}))];
+        world.server_providers(http.url(), &providers);
+        world.cli_providers(http.url(), &providers);
+        let server = world.server(&[(&secret_var, &secret)]);
         let repo = format!("{id}:{slug}");
-        world
-            .cli_env(&server, &["add", &repo, "--wait"], &cli_env)
-            .ok();
+        world.cli(&server, &["add", &repo, "--wait"]).ok();
         assert_eq!(server.metric("ripclone_builds_queued_total"), 1);
 
         let tip = origin.commit(&[("a.txt", "b\n")], "B");
@@ -280,11 +266,7 @@ fn i4_signed_webhook_builds_before_clone() {
 
         let target = world.target(&name);
         world
-            .cli_env(
-                &server,
-                &["clone", &repo, target.to_str().unwrap()],
-                &cli_env,
-            )
+            .cli(&server, &["clone", &repo, target.to_str().unwrap()])
             .ok();
         assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "{kind}");
         assert_eq!(listing(&target), origin.tree(&tip), "{kind}");
