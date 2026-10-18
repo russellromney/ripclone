@@ -138,7 +138,7 @@ Ripclone token reaches the origin.
 | F11 | A proxy that ignores Range: the ranged download falls back to one whole GET of that artifact, and the clone is exact. | |
 | F12 | A flipped byte in one range fails the clone on the hash check and leaves nothing. | |
 
-### G. Clone shapes produce correct trees (26)
+### G. Clone shapes produce correct trees (28)
 
 | # | Test | Added |
 |---|---|---|
@@ -161,6 +161,8 @@ Ripclone token reaches the origin.
 | G16 | Full clones of other commits, `--at v1`, `--branch side` and `--at` a built commit on no ref, make no upstream fetch (counted at the HTTP origin) and equal `git clone --branch` in checkout, remote refs, tags, `git describe`, reachable object count and `fsck --full --strict`, with their own tree checked out; the orphan has its own history too. The user then switches to `main` and `side` and pulls a later push fast-forward. A default-branch commit newer than the published refs, built by branch or by its sha alone, gets no `refs_base` and its clone downloads no other Full; later reads of it run no more `merge-base --is-ancestor` on the server. | |
 | G17 | After D and tag v2 are pushed with no Full slots, the Full of A carries the refs published before the push (tags and branches artifacts unchanged) with `refs_base` C. `--at v1`, `--branch side` and `--at C` clones make no upstream fetch and equal `git clone` of the origin as it was before the push (refs, tags, reachable objects, `fsck`); the user's `git fetch` then brings D and v2. | |
 | G18 | A server that names a refs base its manifest does not match, or serves a corrupt side pack, fails the `--at v1` clone with an integrity error, leaving no target and no staging; the same clone straight from the server succeeds. | |
+| G19 | `--single-branch` clones of the default branch, `--branch side` and `--at v1` equal `git clone --single-branch [--branch]` in checkout, local and remote-tracking refs, tags, fetch refspec, branch upstream, `git describe` and reachable objects, hold no unreachable object, make no upstream fetch and download no branches artifact or side pack. After pushes to main, side and a new branch with tags, `git pull` and `git fetch` in each give what they give in a git single-branch clone made at the same time; `git switch side` fails in the main clone. | |
+| G20 | With the branch's Full not ready (no Full slots), a `--single-branch --branch side` clone tops up from the upstream and equals `git clone --single-branch --branch side`, downloading no branches artifact or side pack. | |
 | G21 | Tags of tags up to 32 tag objects deep come as `git clone` gets them; one 33 deep is left out of the server's refs with a log line, and the full clone has every other tag from the server's refs, `fsck --strict` clean. | |
 | G22 | A tags artifact (served through a proxy) that lists one name twice fails full and depth-1 clones, which leave no target or staging; the same artifact with distinct names clones. | |
 | G23 | Head(X2) built on Head(X1), which held tagged X1, its tree and a blob X2 drops: the depth-1 clone of X2 holds X1 but has only the tags on X2 and its tree's objects, equal to `git clone --depth 1`. With the tree and blob tags deleted, a clone whose `git ls-tree` fails still drops X1's tags: commit tags never need the tree listed. | |

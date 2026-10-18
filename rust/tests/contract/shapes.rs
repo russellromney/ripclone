@@ -2330,3 +2330,163 @@ fn g18_a_bad_refs_base_or_side_pack_fails_the_clone_cleanly() {
     let good = t.clone("good", &["--at", "v1"]);
     t.assert_git_clone(&good, &["--branch", "v1"]);
 }
+
+/// The hashes of the branches artifact and side pack a Full read of
+/// `commit` names, which only a clone of every branch downloads.
+fn every_branch_artifacts(t: &RefsRepo, commit: &str) -> [String; 2] {
+    let (_, full) = api::parse(
+        t.server
+            .get(&api::commit_path(&t.repo, commit, Some("full"))),
+    );
+    let branches = &full["branches"];
+    [&branches["artifact"], &branches["side_pack"]["pack"]].map(|hash| {
+        hash.as_str()
+            .expect("published branches and side pack")
+            .to_string()
+    })
+}
+
+/// No artifact GET through `proxy` named one of `hashes`.
+fn assert_not_downloaded(proxy: &FaultProxy, hashes: &[String]) {
+    let gets = proxy.artifact_gets();
+    for hash in hashes {
+        assert!(
+            !gets.iter().any(|get| get.path.contains(hash.as_str())),
+            "a single-branch clone downloaded {hash}"
+        );
+    }
+}
+
+/// G19: a `--single-branch` clone of the default branch, another branch or
+/// a tag has what `git clone --single-branch` gets: that branch or tag, the
+/// tags in its history and a fetch refspec for it alone. It downloads no
+/// other branch's objects or refs and fetches nothing from the upstream.
+/// The user's later pull and fetch stay on that branch, as in the git clone.
+#[test]
+fn g19_a_single_branch_clone_has_what_git_clone_single_branch_gets() {
+    let t = RefsRepo::start("g19");
+    t.sync(&["--at", "side"]);
+    t.sync(&["--at", "v1"]);
+    let skipped = every_branch_artifacts(&t, &t.c);
+    let proxy = FaultProxy::start(&t.server);
+    let fetches = t.http.fetches();
+    let clone = |name: &str, args: &[&str]| {
+        let (target, out) = t.clone_via(&proxy, name, args, &[]);
+        out.ok();
+        assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+        target
+    };
+    // Every object the clone holds, reachable or not.
+    let held = |dir: &std::path::Path| {
+        git(dir, &["cat-file", "--batch-all-objects", "--batch-check"])
+            .lines()
+            .count()
+    };
+
+    let main = clone("main", &["--single-branch"]);
+    t.assert_git_clone(&main, &["--single-branch"]);
+    assert_eq!(listing(&main), t.origin.tree(&t.c));
+    assert_eq!(held(&main), reachable_objects(&main));
+    let names = |dir: &std::path::Path| git(dir, &["tag", "--list"]);
+    assert_eq!(names(&main), "light\nv1");
+
+    let side = clone("side", &["--single-branch", "--branch", "side"]);
+    t.assert_git_clone(&side, &["--single-branch", "--branch", "side"]);
+    assert_eq!(listing(&side), t.origin.tree(&t.s));
+    assert_eq!(held(&side), reachable_objects(&side));
+    assert_eq!(names(&side), "side-v1\nv1");
+    assert_eq!(remote_refs(&side), format!("origin/side {}", t.s));
+
+    let tag = clone("tag", &["--single-branch", "--at", "v1"]);
+    t.assert_git_clone(&tag, &["--single-branch", "--branch", "v1"]);
+    assert_eq!(listing(&tag), t.origin.tree(&t.a));
+    assert_eq!(held(&tag), reachable_objects(&tag));
+    assert_eq!(names(&tag), "v1");
+
+    assert_eq!(
+        t.http.fetches(),
+        fetches,
+        "a clone fetched from the upstream"
+    );
+    assert_not_downloaded(&proxy, &skipped);
+
+    // The user goes on as in a git clone made at the same time: the other
+    // branch is not there, and a pull takes the new commits and tags of the
+    // clone's own branch only.
+    let url = format!("file://{}", t.origin.bare.display());
+    let git_clone = |name: &str, args: &[&str]| {
+        let target = t.world.target(name);
+        let mut argv = vec!["clone", "-q"];
+        argv.extend_from_slice(args);
+        argv.extend([url.as_str(), target.to_str().unwrap()]);
+        git(&t.origin.work, &argv);
+        target
+    };
+    let git_main = git_clone("git-main", &["--single-branch"]);
+    let git_side = git_clone("git-side", &["--single-branch", "--branch", "side"]);
+    let switch = git_output(&main, &["switch", "-q", "side"]);
+    assert!(!switch.status.success(), "switched to a branch not cloned");
+
+    let (work, bare) = (&t.origin.work, t.origin.bare.to_str().unwrap());
+    let d = t.origin.commit(&[("d.txt", "d\n")], "D");
+    git(work, &["tag", "-a", "-m", "release 2", "v2"]);
+    git(work, &["checkout", "-q", "-b", "feature"]);
+    t.origin.commit(&[("f.txt", "f\n")], "F");
+    git(work, &["tag", "feature-v1"]);
+    git(work, &["checkout", "-q", "side"]);
+    let e = t.origin.commit(&[("e.txt", "e\n")], "E");
+    git(work, &["tag", "side-v2"]);
+    git(work, &["checkout", "-q", "main"]);
+    t.origin.publish();
+    t.origin.publish_branch("feature");
+    t.origin.publish_branch("side");
+    git(work, &["push", "-q", bare, "--tags"]);
+
+    for (dir, mirror, tip) in [(&main, &git_main, &d), (&side, &git_side, &e)] {
+        git(dir, &["pull", "-q", "--ff-only"]);
+        git(mirror, &["pull", "-q", "--ff-only"]);
+        assert_eq!(git(dir, &["rev-parse", "HEAD"]), *tip);
+        assert_eq!(user_refs(dir), user_refs(mirror));
+        assert_eq!(reachable_objects(dir), reachable_objects(mirror));
+        git(dir, &["fetch", "-q"]);
+        assert!(!remote_refs(dir).contains("origin/feature"));
+        git(dir, &["fsck", "--full", "--strict"]);
+    }
+    assert_eq!(names(&main), "light\nv1\nv2");
+    assert_eq!(names(&side), "side-v1\nside-v2\nv1");
+}
+
+/// G20: while the branch's Full is still building, a `--single-branch`
+/// clone installs an older Full and fetches the rest from the upstream, and
+/// still has what `git clone --single-branch --branch` gets: no other branch,
+/// and no tag of another branch's history that the older Full holds.
+#[test]
+fn g20_a_single_branch_top_up_has_only_its_branch() {
+    let mut t = RefsRepo::start("g20");
+    t.sync(&["--at", "side"]);
+    // E's Full cannot build.
+    t.server.restart_with(&[("RIPCLONE_FULL_SLOTS", "0")]);
+    let work = &t.origin.work;
+    git(work, &["checkout", "-q", "side"]);
+    let e = t.origin.commit(&[("e.txt", "e\n")], "E");
+    git(work, &["checkout", "-q", "main"]);
+    t.origin.publish_branch("side");
+    t.hook("refs/heads/side", &e);
+    let skipped = every_branch_artifacts(&t, &t.c);
+
+    let proxy = FaultProxy::start(&t.server);
+    let fetches = t.http.fetches();
+    let (side, out) = t.clone_via(
+        &proxy,
+        "side",
+        &["--single-branch", "--branch", "side"],
+        &[],
+    );
+    out.ok();
+    assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    assert!(t.http.fetches() > fetches, "the clone did not top up");
+    assert_eq!(git(&side, &["rev-parse", "HEAD"]), e);
+    assert_eq!(listing(&side), t.origin.tree(&e));
+    t.assert_git_clone(&side, &["--single-branch", "--branch", "side"]);
+    assert_not_downloaded(&proxy, &skipped);
+}

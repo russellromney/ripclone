@@ -12,12 +12,13 @@ matching `git clone` would have at the same moment:
 |---|---|---|
 | full (Ready) | `git clone` | every tag (see "Every branch and tag" below) |
 | `--at <tag>` | `git clone --branch <tag>` | same |
+| `--single-branch` | `git clone --single-branch [--branch]` | tags whose target is in the clone |
 | depth 1 | `git clone --depth 1` | tags whose target is in the clone: the tip, its tree or blobs, and tag chains on those |
 | top-up | `git clone` of the target | same as full |
 
 The full rows first matched `git clone --single-branch`, with the rule
 below; "Every branch and tag" replaced them. The rule still applies to
-depth 1, and to a full clone that could get neither the server's refs nor
+`--single-branch` and depth 1, and to a full clone that could get neither the server's refs nor
 the upstream's.
 
 All of these come down to one rule, git's auto-follow: **a tag is

@@ -673,16 +673,34 @@ pub fn git_clone_remotes(bare: &Path, args: &[&str]) -> String {
 }
 
 /// What a user sees of the refs of the repo at `dir`: the branch checked out
-/// (`HEAD` when detached) and the commit, every remote-tracking ref and tag,
-/// and both `git describe` forms.
-fn user_refs(dir: &Path) -> String {
+/// (`HEAD` when detached) and the commit, every local branch,
+/// remote-tracking ref and tag, the fetch refspecs and branch upstreams that
+/// later fetches follow, and both `git describe` forms.
+pub fn user_refs(dir: &Path) -> String {
     let (all, tags) = describe(dir);
+    let config = git_output(
+        dir,
+        &[
+            "config",
+            "--get-regexp",
+            r"^(remote\.origin\.fetch|branch\.)",
+        ],
+    );
     format!(
-        "{}\n{}\n{}\n{}\n{all}\n{tags}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{all}\n{tags}",
         git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
         git(dir, &["rev-parse", "HEAD"]),
+        git(
+            dir,
+            &[
+                "for-each-ref",
+                "--format=%(refname:lstrip=2) %(objectname)",
+                "refs/heads/"
+            ]
+        ),
         remote_refs(dir),
         tag_refs(dir),
+        String::from_utf8_lossy(&config.stdout).trim(),
     )
 }
 

@@ -38,6 +38,9 @@ pub struct CloneRequest<'a> {
     /// `--wait`: install the exact output, waiting for it, never a top-up
     /// and never a files clone from Head.
     pub wait: bool,
+    /// `--single-branch`: only the branch or tag checked out and the tags
+    /// in its history. A depth-1 clone is always single-branch.
+    pub single_branch: bool,
 }
 
 /// The commit a clone resolved to. Every later read names this commit.
@@ -50,9 +53,12 @@ struct Pin {
     tracks: bool,
     /// The checkout is the upstream's default branch.
     default_branch: bool,
-    /// The tag the selector named, which a shallow clone fetches as
-    /// `git clone --depth 1 --branch <tag>` does.
+    /// The tag the selector named, which a single-branch clone fetches as
+    /// `git clone --single-branch --branch <tag>` does.
     tag: Option<String>,
+    /// Only the checked out branch or tag, as `git clone --single-branch`
+    /// and `git clone --depth` fetch.
+    single_branch: bool,
     /// The hosted server's per-clone id, for the metrics report.
     clone_id: Option<String>,
 }
@@ -250,6 +256,7 @@ impl Client {
             tracks,
             default_branch: tracks && request.at.is_none() && request.branch == "HEAD",
             tag: summary.tag,
+            single_branch: request.single_branch || request.kind == ExactResultKind::Head,
             clone_id,
         })
     }
@@ -388,8 +395,9 @@ impl Client {
         }
         // The refs download and are checked alongside the packs, and are
         // written once the clone's objects are in place. Only a Full takes
-        // every branch, as `git clone --depth` takes one.
-        let full = output.result == ExactResultKind::Full;
+        // every branch, unless it is single-branch, as `git clone --depth`
+        // takes one.
+        let full = output.result == ExactResultKind::Full && !pin.single_branch;
         let root = stage(target, staging)?;
         let tags_download = output.tags_artifact.clone().map(|hash| {
             let (client, urls) = (self.clone(), urls.clone());
@@ -581,8 +589,7 @@ impl Client {
             Err(_) => output.origin_url.clone(),
         };
         let git_dir = root.join(".git");
-        let shallow = output.result == ExactResultKind::Head;
-        write_git_config(&git_dir, &origin_url, pin, shallow, origin_head.as_ref())?;
+        write_git_config(&git_dir, &origin_url, pin, origin_head.as_ref())?;
         let ident = match ident {
             Some(ident) => Some(ident),
             None => reflog_ident(&root, &pin.commit, cleanup).await?,
@@ -1882,24 +1889,23 @@ fn write_git_dir(
 
 /// Add to the `.git/config` that `git init` wrote what `git clone` adds:
 /// the origin remote, and the checked out branch tracking its upstream
-/// branch with a remote-tracking ref at the installed commit. A `shallow`
-/// clone fetches only that branch, as `git clone --depth` sets up. `git pull`
+/// branch with a remote-tracking ref at the installed commit. A
+/// single-branch clone fetches only that branch or tag. `git pull`
 /// then works in the clone. `checkStat = minimal` lets git trust the
 /// prebuilt index's stat data, so the first `git status` reads no file.
 fn write_git_config(
     git_dir: &Path,
     origin_url: &str,
     pin: &Pin,
-    shallow: bool,
     origin_head: Option<&(String, String)>,
 ) -> Result<()> {
     let path = git_dir.join("config");
     let mut config = std::fs::read_to_string(&path).context("read the config git init wrote")?;
     config.push_str("[core]\n\tcheckStat = minimal\n");
-    let refspec = if shallow && pin.tracks {
+    let refspec = if pin.single_branch && pin.tracks {
         let branch = &pin.checkout;
         format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
-    } else if let Some(tag) = pin.tag.as_deref().filter(|_| shallow) {
+    } else if let Some(tag) = pin.tag.as_deref().filter(|_| pin.single_branch) {
         format!("+refs/tags/{tag}:refs/tags/{tag}")
     } else {
         "+refs/heads/*:refs/remotes/origin/*".to_string()
