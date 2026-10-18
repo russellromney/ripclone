@@ -1568,6 +1568,8 @@ async fn an_unapplied_publish_references_nothing(backend: &dyn Backend) {
     for hash in &unreferenced {
         assert!(store.deletable(hash, START + 1).await.unwrap(), "{hash}");
     }
+}
+
 async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
     let (clock, store) = open(backend).await;
     let missing = RepoId::github("acme/missing");

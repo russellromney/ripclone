@@ -1186,6 +1186,7 @@ mod tests {
         }
         async fn known_repos(&self) -> Result<Vec<RepoId>> {
             self.inner.known_repos().await
+        }
         async fn get_refs(&self, repo: &RepoId) -> Result<Option<crate::control::RepoRefs>> {
             self.inner.get_refs(repo).await
         }
