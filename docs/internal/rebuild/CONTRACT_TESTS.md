@@ -49,7 +49,7 @@ a unit test or it is not needed.
 "Added" names the PR that added the row's test. Each row's test is named
 after the row (`a1_...`, `s3_c2_...`).
 
-### A. Resolve and admit (7)
+### A. Resolve and admit (8)
 
 | # | Test | Added |
 |---|---|---|
@@ -60,6 +60,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | A5 | `--at HEAD~1` (a rev expression) is rejected with a clear error and no build. | #203 |
 | A6 | Table: repo not added (clone and sync), unknown ref, missing upstream repo. Each gives its own error code and no build. | #186 |
 | A7 | After `add`, the origin is deleted (`repo_not_found`, exit 5) or accepts and never answers (`RIPCLONE_LS_REMOTE_TIMEOUT_SECS=1`: `upstream_unavailable`, exit 6). Clone, sync and the API fail with no build; the built commit still clones by SHA. | #208 |
+| A8 | An upstream with no commits: `add` fails with `ref_not_found` (exit 5), `sync` and `clone` say the repo isn't added, and nothing builds or is installed. After the first push, `add` builds it and a clone is exact. | #234 |
 
 ### B. Coalescing (3)
 
@@ -69,7 +70,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | B2 | Branch name, full SHA, and default branch for the same B: one build; each clone keeps its own checkout name. | #188 |
 | B3 | Origin moves B to C while B builds: B and C build independently; a clone pinned to B gets B's tree. | #188 |
 
-### C. Outputs are independent and immutable (8)
+### C. Outputs are independent and immutable (10)
 
 | # | Test | Added |
 |---|---|---|
@@ -81,6 +82,8 @@ after the row (`a1_...`, `s3_c2_...`).
 | C7 | S3 only: the bucket holds Full(B)'s first write while push C arrives. Head(C) and Files(C) become ready while Full(B) is still pending; after release, Full(B) publishes before Full(C). | Hetzner benchmark |
 | C8 | S3 only: the bucket holds one of Head's writes and refuses the next. Head fails with the storage error and publishes nothing; a depth-1 clone fails and leaves no target. With the fault gone, `sync --at` builds every output and each shape clones exactly. | #220 (S3 job) |
 | C9 | Every output of A is ready; the origin holds B's fetch, so nothing of B is. A files clone and a depth-1 clone of B each report B pending, download nothing, and install nothing: neither falls back to A. After release both install B. | #221 |
+| C10 | The mirror holds B's objects but no refs, as a fetch stopped between storing its pack and writing refs leaves it. After a restart, B builds with no failures, and its full and Files clones are exact. | #234 |
+| C11 | The mirror holds B's commit but not its tree, as a fetch that failed after writing part of B leaves it. B is fetched again, builds with no failures, and its full and Files clones are exact. | #234 |
 
 A SIGKILLed server's `git` children run until their command ends, on every
 OS. #209 killed them on Linux with a parent-death signal (row C6), but
@@ -104,7 +107,7 @@ whole server for every git spawn. C6 is retired. The unit test
 
 | # | Test | Added |
 |---|---|---|
-| E1 | Full(A) ready; restart with `files_slots = 0` and `full_slots = 0`; push B; full clone: installs B by top-up without waiting on any server build. Tree and `rev-list --count` equal origin at B, `git fsck` clean. | #205 |
+| E1 | Full(A) ready; restart with `files_slots = 0` and `full_slots = 0`; push B; full clone: installs B by top-up without waiting on any server build. Tree and `rev-list --count` equal origin at B, `git fsck` clean. The reflog starts with `clone: from <url>` at B and there is no ORIG_HEAD. | #205 |
 | E2 | Same with a push of several commits including a merge (A is an ancestor, not the parent). | #205 |
 | E3 | Same after a force-push (A is not an ancestor): clone still equals origin at B. | #205 |
 | E4 | No ready Full exists for the ref: full clone waits for Full(B) instead of failing. | #205 |
@@ -126,8 +129,11 @@ Ripclone token reaches the origin.
 | F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes. | #191 (S3 job) |
 | F8 | SIGINT during the download: exit 130, no target, staging directory, or marker left; the next clone succeeds. | #188 |
 | F9 | An artifact that answers 503 every time: exactly 3 attempts, then exit 6; no target, no staging. | #208 |
+| F10 | With 256 KiB parts, the 2 MiB history pack downloads as parallel ranges whose 206 answers tile it exactly once; one 503 retries only that range; the clone is exact. | |
+| F11 | A proxy that ignores Range: the ranged download falls back to one whole GET of that artifact, and the clone is exact. | |
+| F12 | A flipped byte in one range fails the clone on the hash check and leaves nothing. | |
 
-### G. Clone shapes produce correct trees (10)
+### G. Clone shapes produce correct trees (13)
 
 | # | Test | Added |
 |---|---|---|
@@ -136,13 +142,17 @@ Ripclone token reaches the origin.
 | G3 | Files mode: tree equals `git archive` of B, including symlinks and exec bits. | #186 |
 | G4 | Push, rewind force-push, and non-ancestor force-push in sequence: each new full clone equals the new tip. | #186 |
 | G5 | Enough pushes to seal and compact history levels: full clone stays complete. | #186 |
-| G6 | Small push after a 12 MiB tree: B's Files clone reuses chunks A's Files clone downloaded, the store grows by under half the tree, and B's tree is exact. Two more pushes, each Files built on the last (an edit inside a large file and a new file beside it; then a delete, a move, an exec bit, a symlink and 50 small files): each Files clone equals the origin's tree. | #208, #221 |
+| G6 | Small push after a 12 MiB tree: B's Files clone reuses chunks A's Files clone downloaded, the store grows by under half the tree, and B's tree is exact. | #208, #221 |
+| G6b | Two pushes after the same 12 MiB tree, each Files built on the last (an edit inside a large file and a new file beside it; then a delete, a move, an exec bit, a symlink and 50 small files): each Files clone equals the origin's tree. Split from G6 so the two run in parallel. | #221 |
 | G7 | Delete a file, then re-add the same bytes (same blob id): depth-1, full and Files clones of the tip all have it. | #208 |
 | G8 | Empty trees: a root commit with no files, and a later commit that deletes every file. Every shape installs an empty tree. | #208 |
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | #208 |
 | G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | #208 |
+| G11 | Pushes add tails to the Files archive: a small push stores only its new files and keeps the bundles a clone of its parent downloaded, until a build past `RIPCLONE_FILES_TAIL_PERCENT` compacts the archive to about the tree's size. Files clones of the tip and an older commit are exact. | #233 |
+| G12 | Editable clones work with the user's later git: the branch tracks its upstream, `origin` is the configured upstream, `git pull` and `git push` work, a tag or `--at` commit tracks nothing, and a branch named with `#`, `;` and `"` tracks correctly. | #234 |
+| G13 | With a global git config naming a template dir and an identity, full and depth-1 clones have the local config, reflog (`clone: from <url>`) and template hooks of `git clone` and `git clone --depth 1`, apart from `core.checkstat`. The hook runs on the user's commit; `HEAD@{1}` is the cloned commit. A depth-1 clone's `git fetch` takes only its branch, a full clone's every branch. A SHA-256 default in the environment still gives a SHA-1 clone. With `user.useConfigOnly` and no identity, the clone has the reflogs `git clone` writes under git's fallback committer. | #234 |
 
-### H. Storage and server state (10)
+### H. Storage and server state (11)
 
 | # | Test | Added |
 |---|---|---|
@@ -156,6 +166,7 @@ Ripclone token reaches the origin.
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | #209 |
 | H9 | Build scratch goes under `<cache>/tmp`, which startup empties: with a read-only `TMPDIR`, a stale scratch entry is removed and a full build and clone succeed. | #211 |
 | H10 | S3 emulator: after a one-line push, B uploads no object of 1 MiB or more that the bucket already holds (its Files reuses A's bundles). A second repository with the same files builds the same large objects: the bucket proxy sees a HEAD and no PUT for each. A bucket copy cut short is uploaded again when a third repository with the same files makes it; that repository's clones and the Files clones of B and the second repository are exact. | #220 (S3 job), #221 |
+| H11 | A scratch leftover the server cannot remove, as when a killed server's git child is still writing it, doesn't stop the next start: the server logs it, builds and clones in its own scratch dir, and once the leftover can go, the next start removes it. | #234 |
 
 ### I. Auth, integrations, CLI (14)
 
@@ -167,7 +178,7 @@ Ripclone token reaches the origin.
 | I4 | Table across GitHub, GitLab, Gitea webhooks: a signed push builds before any clone; a bad signature gets 401 and no build. | #191 |
 | I5 | Poller: with no webhook, a push is built within one poll interval. | #186 |
 | I6 | Every documented CLI verb exists (keep `docs_cli_surface`). | #193 |
-| I7 | `--verify-upstream` auto, always, never (table). A clone that fails verification is removed; a target that was an empty directory is left empty. | #191 |
+| I7 | `--verify-upstream` auto, always, never (table). A clone that fails verification is removed; a target that was an empty directory is left empty. The upstream check runs while the clone downloads: with the upstream listing held, an artifact download still starts. | #191 |
 | I8 | Only `/healthz`, `/readyz`, `/metrics` and `/v1/version` answer without the token; unsigned webhooks fail closed (503 without a secret); every other route, `/v1/artifacts/{hash}` included, gives 401 to a missing or wrong token. | #208 |
 | I9 | A client declaring another protocol gets 426; the CLI names the mismatch and says to run `ripclone version`; nothing builds. | #208 |
 | I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | #208 |
@@ -194,7 +205,7 @@ origin, and runs `git fsck` and `rev-list --count` on the editable clones.
 | J4 | The mirror directory is deleted between restarts: a push of two commits on A fetches A again and builds on it. After the origin force-pushes unrelated history and prunes A and C, the mirror is deleted again and the next build is cold. | #217 |
 | J5 | A branch with no history in common with the built main builds cold, and its full clone lacks main's commit. | #217 |
 
-### K. Scheduling and the mirror (4)
+### K. Scheduling and the mirror (5)
 
 A repository runs at most one build of each kind at a time, and its Fulls
 build in admission order. One repository's slow upstream never holds
@@ -203,9 +214,10 @@ another's builds or the API, and the mirror stays compact.
 | # | Test | Added |
 |---|---|---|
 | K1 | The origin holds every fetch of X, and a second push of X is admitted, with two Head slots. X fetches once: its second build waits for the first. Meanwhile Y is added, built and cloned at depth 1, and `/add`, `POST /builds` and `/status` each answer within 2 s. After the release both X commits clone. | #218 |
-| K2 | `RIPCLONE_FETCH_TIMEOUT_SECS=1`. The origin holds the fetch until the build retries, then answers: the build completes and clones. With the origin held throughout, Head fails after its 3 attempts (3 fetches) with a `timed out after` error, and nothing publishes. | #218 |
+| K2 | `RIPCLONE_FETCH_TIMEOUT_SECS=1`. The origin holds the fetch until the build retries, then answers: the build completes and clones. With the origin held throughout, with 2 attempts, Head and Files each fail after both (4 fetches) with a `timed out after` error, and nothing publishes. | #218 |
 | K3 | The tip of a repo is admitted, then three older commits by SHA in one burst, out of history order, with four Full slots. Fulls publish in admission order (server log), and each commit's full clone equals the origin, with `rev-list --count` and `git fsck` checked. | #218 |
-| K4 | While the server is down, its mirror gains 20 packs and 70 loose refs from outside. The next Full compacts it first: the log reports a repack and packed refs, under 16 packs remain, and full clones of the built commit and of a later push are exact. | #218 |
+| K4 | While the server is down, its mirror gains 20 packs and 70 loose refs from outside. The next commit's Files and Full run together, and the later of them to finish compacts it after publishing: the log reports a repack and packed refs, under 16 packs remain, and full clones of the built commit and of a later push are exact. | #218 |
+| K5 | `RIPCLONE_BUILD_LEASE_SECS=3`. The origin holds the first fetch while the server is stopped (SIGSTOP) for 4 s, then resumed. No lease is lost, Head starts once, the origin sees one fetch, nothing fails, and full and Files clones are exact. | #234 |
 
 ### L. Any tree git allows (4)
 
@@ -222,7 +234,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 81 tests. Several are table-driven.
+Total: 89 tests. Several are table-driven.
 
 ## What it replaced
 
@@ -238,11 +250,36 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
   after compile. The one S3 unit test (multipart upload) runs here against
   `scripts/s3_emulator.sh`, reusing the unit-test binary.
 - `s3`: C2, C3, C7, C8, F7, H2, H6 and H10 against the S3 emulator (`scripts/s3_emulator.sh`, versitygw).
-- `gitea`: the live Gitea provider row.
+- `gitea`: the live Gitea provider row, then `scripts/trial_gitea.sh`.
 - `lint`, `musl`, `docker`, `cargo-deny`.
 - `e2e`: `scripts/e2e_local.sh` against prebuilt binaries.
 - `benchmark`: a smoke run of `benchmark/shaped_benchmark.sh` when benchmark
   files change.
+
+## User trials
+
+Two scripts run the release binaries the way a user would, against private
+repos, and exit non-zero on any failed check. Both start their own servers on
+OS-picked ports on local storage (even under soup, whose S3 settings would
+send private content to a real bucket), keep the machine's git config and
+keychain out, never print a token, and delete their work directory
+(`KEEP_TRIAL=1` keeps it).
+`RIPCLONE_BIN_DIR` names the binaries, default `rust/target/release`.
+
+- `scripts/trial_gitea.sh`: a digest-pinned Gitea in Docker, with this
+  checkout's history pushed as a private repo. Covers `provider add` and
+  `provider test`, add by URL, a full clone into the default directory, depth
+  1, files and `--branch`, push from a clone and pull in another, and a clone
+  right after a push. Refusals: a missing repo, a repo the server's token cannot
+  read, a non-empty target, a wrong server token, a server without an upstream
+  token. Runs in the `gitea` CI job.
+- `scripts/trial_github.sh owner/repo...`: read-only, against private GitHub
+  repos. The server reads with `RIPCLONE_GITHUB_TOKEN`; the user's git uses
+  their gh login, or `RIPCLONE_TRIAL_GIT_TOKEN`. Full, depth-1 and files clones
+  are compared with `git clone` (history, tree, local config, reflog), then
+  pulled and fetched. Refusals: a missing repo and a server without a token.
+  Manual: it needs a token and private repos. For this repo's owner: `soup run
+  -p ripclone -e development -- scripts/trial_github.sh <private repos>`.
 
 ## Current state
 

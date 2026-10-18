@@ -6,8 +6,7 @@ package ripclone;
 message ChunkRef {
   // Raw hash bytes. SHA-256 (32 bytes) by default.
   bytes hash = 1;
-  // Byte length of the chunk as stored. For archive chunks this is the
-  // compressed size; for the metadata chunk it is the protobuf size.
+  // Byte length of the chunk as stored, compressed.
   uint64 len = 2;
 }
 
@@ -21,8 +20,8 @@ message ClonepackManifest {
   optional string parent_commit = 2;
   reserved 3;
 
-  // Metadata chunk holds the small .git artifacts (skeleton pack + idx,
-  // prebuilt index) and the file/frame tables needed to decode archive chunks.
+  // Metadata chunk holds the prebuilt .git/index and the file/frame tables
+  // needed to decode archive chunks.
   ChunkRef metadata_chunk = 4;
 
   // Archive chunks contain working-tree zstd frames. They are shared across
@@ -51,12 +50,15 @@ message ClonepackManifest {
   // omit it when base packs are no longer local; the client builds that MIDX.
   ChunkRef midx = 12;
 
-  // All pack idx files concatenated into one content-addressed blob. The idx
-  // for `packs[i]` lives at `[packs[i].idx_bundle_offset, +packs[i].idx.len)`.
-  // The client fetches this ONCE and slices each idx out locally, instead of a
-  // separate GET per pack idx — cutting per-pack round-trips from 2 to 1 (a big
-  // win on high-latency links). Each slice is still verified against
-  // `packs[i].idx.hash`. Every current manifest carries this bundle.
+  // A Head's pack idx files concatenated into one content-addressed blob.
+  // The idx for `packs[i]` lives at `[packs[i].idx_bundle_offset,
+  // +packs[i].idx.len)`. The client fetches this ONCE and slices each idx out
+  // locally, instead of a separate GET per small pack idx (a big win on
+  // high-latency links). Each slice is still verified against
+  // `packs[i].idx.hash`. A Full has none: its history packs hold every
+  // object, so a full clone installs only them, fetching each idx by
+  // `packs[i].idx` next to its pack, and reads the HEAD packs only for the
+  // working tree.
   ChunkRef idx_bundle = 13;
 }
 
@@ -78,11 +80,11 @@ message PackEntry {
 }
 
 // Per-commit metadata chunk. This is the only chunk that changes on every
-// commit; archive chunks are shared and immutable.
+// commit; archive chunks are shared and immutable. Stored zstd-compressed.
 message MetadataChunk {
-  // Git objects needed to make HEAD usable (commit, tree, and symlink blobs).
-  bytes skeleton_pack = 1;
-  bytes skeleton_idx = 2;
+  // Fields 1 and 2 held a skeleton pack and idx (commit, trees, symlink
+  // blobs). The packs already hold those objects.
+  reserved 1, 2;
 
   // Prebuilt .git/index with skip-worktree set on every tracked path.
   bytes prebuilt_index = 3;
@@ -119,7 +121,7 @@ message FileEntry {
   bytes path = 1;
   // Git mode, e.g. 0o100644 or 0o120000.
   uint32 mode = 2;
-  // 20-byte SHA-1 of the git blob.
+  // The blob's 20-byte git object id.
   bytes blob_sha1 = 3;
   // Fragments making up this file, in order.
   repeated Fragment fragments = 4;

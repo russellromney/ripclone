@@ -5,12 +5,17 @@ use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
+/// A zstd frame's first bytes. A protobuf metadata chunk cannot start with
+/// them: 0x28 would be field 5 as a varint, and field 5 is a message.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+const METADATA_ZSTD_LEVEL: i32 = 3;
+/// Largest decompressed metadata chunk a reader accepts.
+const MAX_METADATA_BYTES: u64 = 1 << 30;
+
 impl MetadataChunk {
     /// Create an empty metadata chunk.
     pub fn new() -> Self {
         Self {
-            skeleton_pack: Vec::new(),
-            skeleton_idx: Vec::new(),
             prebuilt_index: Vec::new(),
             frames: Vec::new(),
             files: Vec::new(),
@@ -34,9 +39,35 @@ impl MetadataChunk {
         Self::decode_and_validate(&bytes)
     }
 
-    /// Decode a metadata chunk and validate all geometry before any caller uses
-    /// its offsets or file paths.
+    /// The stored form: the protobuf, zstd-compressed. Paths and hashes
+    /// compress about 3x, and every clone downloads this before its files.
+    pub fn encode_stored(&self) -> Result<Vec<u8>> {
+        zstd::encode_all(self.encode_to_vec().as_slice(), METADATA_ZSTD_LEVEL)
+            .context("compress metadata chunk")
+    }
+
+    /// Decode a metadata chunk, stored compressed or as plain protobuf, and
+    /// validate all geometry before any caller uses its offsets or file paths.
+    /// Plain protobuf never starts with the zstd magic: every field here is
+    /// length-delimited, so its first byte is never 0x28.
     pub fn decode_and_validate(bytes: &[u8]) -> Result<Self> {
+        let plain;
+        let bytes = if bytes.starts_with(&ZSTD_MAGIC) {
+            let mut out = Vec::new();
+            zstd::stream::Decoder::new(bytes)
+                .context("open metadata chunk")?
+                .take(MAX_METADATA_BYTES + 1)
+                .read_to_end(&mut out)
+                .context("decompress metadata chunk")?;
+            anyhow::ensure!(
+                out.len() as u64 <= MAX_METADATA_BYTES,
+                "metadata chunk is larger than {MAX_METADATA_BYTES} bytes"
+            );
+            plain = out;
+            plain.as_slice()
+        } else {
+            bytes
+        };
         let manifest = Self::decode(bytes).context("decode metadata chunk")?;
         manifest.validate_geometry()?;
         Ok(manifest)
@@ -227,6 +258,16 @@ mod tests {
                 raw_len: 5,
             }],
         });
+
+        let stored = manifest.encode_stored().unwrap();
+        assert!(stored.starts_with(&ZSTD_MAGIC));
+        assert_eq!(
+            MetadataChunk::decode_and_validate(&stored).unwrap(),
+            manifest
+        );
+        let mut corrupt = stored.clone();
+        corrupt.truncate(ZSTD_MAGIC.len() + 2);
+        assert!(MetadataChunk::decode_and_validate(&corrupt).is_err());
 
         let mut buf = Vec::new();
         manifest.write(&mut buf).unwrap();

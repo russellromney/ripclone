@@ -7,7 +7,7 @@ use std::time::Instant;
 ///
 /// * `resolve_ms` — ref request sent to ref response received.
 /// * `manifest_ms` — manifest downloaded + decoded.
-/// * `metadata_ms` — metadata chunk downloaded + decoded + skeleton/index written.
+/// * `metadata_ms` — metadata chunk downloaded + decoded + `.git` and index written.
 /// * `archive_download_ms` — first archive chunk request sent to last byte received.
 /// * `write_ms` — working-tree extraction + local blob pack build.
 /// * `total_ms` — wall clock from CLI start to exit.

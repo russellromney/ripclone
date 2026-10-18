@@ -91,14 +91,13 @@ built after it. A ready output never changes. See [Design](DESIGN.md).
   "clonepack_manifest_url": "https://s3.example.com/ripclone/<key>?X-Amz-...",
   "commit": "9f2c1e4b7a0d3c5e8f1a2b4c6d8e0f1a3b5c7d9e",
   "host": "github.com",
-  "idx_bundle_url": "https://s3.example.com/ripclone/<key>?X-Amz-...",
   "kind": "full",
   "metadata_chunk": "<sha256>",
   "metadata_chunk_url": "https://s3.example.com/ripclone/<key>?X-Amz-...",
-  "midx_url": "https://s3.example.com/ripclone/<key>?X-Amz-...",
   "origin_url": "https://github.com/acme/app.git",
   "owner": "acme",
   "pack_chunk_urls": ["https://s3.example.com/ripclone/<key>?X-Amz-..."],
+  "pack_idx_urls": [null, "https://s3.example.com/ripclone/<key>?X-Amz-..."],
   "parent_commit": "4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c",
   "provider": "github",
   "repo": "app",
@@ -107,8 +106,12 @@ built after it. A ready output never changes. See [Design](DESIGN.md).
 ```
 
 The `*_url` fields are left out when storage cannot sign URLs (local disk).
-Fetch those artifacts from `GET /v1/artifacts/{hash}` instead. A Files output
-has `archive_chunk_urls` instead of `pack_chunk_urls`. Signed URLs last
+Fetch those artifacts from `GET /v1/artifacts/{hash}` instead. In a Full,
+`pack_idx_urls` has the idx of each history pack, in manifest order, and
+`null` for the Head packs, which a full clone reads only for the working
+tree. A Head output has `idx_bundle_url`, all its pack idx files in one
+object, instead, and `midx_url` when it has a pre-built multi-pack-index. A
+Files output has `archive_chunk_urls` instead of `pack_chunk_urls`. Signed URLs last
 `RIPCLONE_SIGNED_URL_TTL_SECS`. Read the commit again to get fresh ones.
 
 **Pending.** The output is not built yet:
@@ -126,7 +129,7 @@ has `archive_chunk_urls` instead of `pack_chunk_urls`. Signed URLs last
 }
 ```
 
-`attempts` counts build attempts so far. After a failed attempt that will be
+`attempts` counts this output's build attempts so far. After a failed attempt that will be
 retried, `error` holds that attempt's error. `top_up` appears only for a
 pending Full when an earlier Full is ready: the newest ready Full admitted from
 the same branch, else the parent commit's. A full clone installs `base`, then

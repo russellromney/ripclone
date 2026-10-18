@@ -1,11 +1,16 @@
 //! Build workers: three capped pools of slots that lease rows from the
 //! control store.
 //!
-//! A Head slot fetches the admitted commit, builds Head and publishes it. A
-//! Files slot builds Files of a row whose Head is ready. A Full slot builds
-//! Full of a row whose Files is ready or failed, so a new push's Files never
-//! waits behind another commit's Full. A slot holds a 60 s lease and renews it
-//! every 20 s. A lost lease cancels the build: its git children are stopped,
+//! A Head slot and a Files slot build an admitted commit's Head and Files at
+//! the same time; both need only the commit. Once Head is ready, a Full slot
+//! builds the row's Full, which reuses Head's packs. Each output kind has its
+//! own lease, so a Full never waits for its commit's Files, and a new push's
+//! Files never waits behind another commit's Full or Head. A slot holds a
+//! lease (`RIPCLONE_BUILD_LEASE_SECS`, 60 s) and renews it every third of
+//! that. A process never claims its own leases again, even expired ones, so a
+//! process that stalls (a sleeping laptop, a long pause) carries on with its
+//! builds when it resumes. A lease is lost only when it expired and another
+//! process took it; that cancels the build: its git children are stopped,
 //! it stops at its next step, and it never publishes. Failures record a retry
 //! time instead of sleeping, so no slot waits while holding a lease. A repo
 //! holds at most one lease per pool, so one repo's builds never fill a pool.
@@ -14,8 +19,9 @@
 //! Builds read it under a shared lock. A build fetches its commit only when
 //! the mirror lacks it, under the repo's write lock, so a Files or Full whose
 //! commit Head already fetched never waits on another commit's fetch. Full
-//! keeps the mirror small: it writes the commit-graph and compacts the mirror
-//! when no build reads it.
+//! writes the commit-graph before it builds. After a Files or Full has
+//! published, it compacts the mirror if no other build reads it, so the
+//! later of a commit's Files and Full usually finds the mirror free.
 //!
 //! Each output builds incrementally from the same output of its base: the
 //! newest commit of the repo with that output ready that is an ancestor of
@@ -36,16 +42,14 @@ use axum::http::StatusCode;
 use std::env;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
-const LEASE: Duration = Duration::from_secs(60);
-const RENEW_EVERY: Duration = Duration::from_secs(20);
 const IDLE_POLL: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(300);
-/// Cap on each mirror upkeep step (commit-graph, compaction) run before a
-/// Full. They hold the repo's write lock, which a build waits on only when
-/// it must fetch.
+/// Cap on each mirror upkeep step: the commit-graph before a Full, and
+/// compaction after a Files or Full. They hold the repo's write lock, which
+/// a build waits on only when it must fetch.
 const UPKEEP_TIMEOUT: Duration = Duration::from_secs(120);
 /// After a failed compaction, a repo's Fulls skip compaction this long.
 const COMPACT_BACKOFF: Duration = Duration::from_secs(3600);
@@ -54,14 +58,17 @@ const COMPACT_BACKOFF: Duration = Duration::from_secs(3600);
 pub(super) struct WorkerSettings {
     /// Concurrent Head builds. At least 1.
     pub head_slots: usize,
-    /// Concurrent Files builds. 0 pauses Files, and so Full.
+    /// Concurrent Files builds. 0 pauses them.
     pub files_slots: usize,
     /// Concurrent Full builds. 0 pauses them.
     pub full_slots: usize,
     /// First retry delay; doubles per attempt up to `RETRY_CAP`.
     pub retry_base: Duration,
-    /// Claims per phase before an output fails.
+    /// Claims of one output kind before it fails.
     pub max_attempts: i64,
+    /// How long a claim holds its output without renewing. Renewed every
+    /// third of it.
+    pub lease: Duration,
 }
 
 impl WorkerSettings {
@@ -93,6 +100,8 @@ impl WorkerSettings {
             max_attempts >= 1,
             "RIPCLONE_BUILD_MAX_ATTEMPTS must be at least 1"
         );
+        let lease = number("RIPCLONE_BUILD_LEASE_SECS", 60)?;
+        anyhow::ensure!(lease >= 3, "RIPCLONE_BUILD_LEASE_SECS must be at least 3");
         Ok(Self {
             head_slots: usize::try_from(head_slots).context("RIPCLONE_HEAD_SLOTS is too large")?,
             files_slots: usize::try_from(files_slots)
@@ -101,6 +110,7 @@ impl WorkerSettings {
             retry_base: Duration::from_millis(retry_base),
             max_attempts: i64::try_from(max_attempts)
                 .context("RIPCLONE_BUILD_MAX_ATTEMPTS is too large")?,
+            lease: Duration::from_secs(lease),
         })
     }
 }
@@ -209,14 +219,9 @@ fn is_retryable_io_error(error: &std::io::Error) -> bool {
     )
 }
 
-/// Start every slot. Lease owners are `{pid}-{boot nanos}-{pool}-{slot}-{seq}`,
-/// unique across restarts.
+/// Start every slot. Lease owners are `{pool}-{slot}-{seq}`; the store adds
+/// its instance, so they are unique across restarts.
 pub(super) fn spawn_workers(state: &ServerState, settings: &WorkerSettings) {
-    let boot_nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let boot = format!("{}-{boot_nanos:x}", std::process::id());
     for (pool, slots, name) in [
         (Pool::Head, settings.head_slots, "head"),
         (Pool::Files, settings.files_slots, "files"),
@@ -227,7 +232,7 @@ pub(super) fn spawn_workers(state: &ServerState, settings: &WorkerSettings) {
                 state.clone(),
                 *settings,
                 pool,
-                format!("{boot}-{name}-{slot}"),
+                format!("{name}-{slot}"),
             ));
         }
     }
@@ -250,7 +255,7 @@ async fn run_slot(state: ServerState, settings: WorkerSettings, pool: Pool, slot
         notified.as_mut().enable();
         sequence = sequence.wrapping_add(1);
         let owner = format!("{slot}-{sequence}");
-        match state.control.claim(&owner, pool, LEASE).await {
+        match state.control.claim(&owner, pool, settings.lease).await {
             Ok(Some(claim)) => {
                 run_claim(&state, settings, pool, claim).await;
                 continue;
@@ -267,7 +272,7 @@ async fn run_slot(state: ServerState, settings: WorkerSettings, pool: Pool, slot
 
 /// Run one leased build, renewing the lease until it finishes. A lost lease
 /// cancels the build, and the slot waits for it to stop before it claims
-/// again; another worker owns the row now.
+/// again; another process owns the output now.
 async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, claim: Claim) {
     let claim = Arc::new(claim);
     let cancel = Cancel::new();
@@ -285,19 +290,19 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
             })
             .await
     });
-    let mut renew =
-        tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
+    let every = settings.lease / 3;
+    let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             joined = &mut task => {
                 if let Err(error) = joined {
                     let failure = BuildError::retryable(format!("build task panicked: {error}"));
-                    record_failure(state, settings, &claim, pool_kind(pool), &failure).await;
+                    record_failure(state, settings, &claim, &failure).await;
                 }
                 break;
             }
-            _ = renew.tick() => match state.control.renew(&claim, LEASE).await {
+            _ = renew.tick() => match state.control.renew(&claim, settings.lease).await {
                 Ok(true) => {}
                 Ok(false) => {
                     warn!(
@@ -317,27 +322,26 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
             },
         }
     }
-    if let Err(error) = state.control.release(&claim).await {
-        error!(
-            "release lease for {}@{} failed: {error:#}",
-            claim.repo.storage_key(),
-            claim.build.commit
-        );
-    }
-    // The row is claimable by the next pool only once released.
-    match pool {
-        Pool::Head => state.wake(Pool::Files).notify_one(),
-        Pool::Files => state.wake(Pool::Full).notify_one(),
-        Pool::Full => {}
+    release(state, &claim).await;
+    // A ready Head makes the row's Full claimable.
+    if pool == Pool::Head {
+        state.wake(Pool::Full).notify_one();
     }
 }
 
-/// The output a pool builds.
-fn pool_kind(pool: Pool) -> ExactResultKind {
-    match pool {
-        Pool::Head => ExactResultKind::Head,
-        Pool::Files => ExactResultKind::Files,
-        Pool::Full => ExactResultKind::Full,
+/// Give up the claim's lease, retrying until the store takes it. This process
+/// never claims its own leases again, so one left behind would keep the
+/// output from building until a restart.
+async fn release(state: &ServerState, claim: &Claim) {
+    let mut delay = Duration::from_millis(100);
+    while let Err(error) = state.control.release(claim).await {
+        error!(
+            "release lease for {}@{} failed, retrying in {delay:?}: {error:#}",
+            claim.repo.storage_key(),
+            claim.build.commit
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -347,17 +351,18 @@ async fn record_failure(
     state: &ServerState,
     settings: WorkerSettings,
     claim: &Claim,
-    kind: ExactResultKind,
     error: &BuildError,
 ) {
+    let kind = claim.kind();
+    let attempts = claim.attempts();
     let retry_after = error
         .is_retryable()
-        .then(|| retry_delay(settings.retry_base, claim.build.attempts));
-    let gives_up = retry_after.is_none() || claim.build.attempts >= settings.max_attempts;
+        .then(|| retry_delay(settings.retry_base, attempts));
+    let gives_up = retry_after.is_none() || attempts >= settings.max_attempts;
     let target = format!("{}@{}", claim.repo.storage_key(), claim.build.commit);
     if let Err(write_error) = state
         .control
-        .fail(claim, kind, error.message(), retry_after)
+        .fail(claim, error.message(), retry_after)
         .await
     {
         error!("record {kind} failure for {target} failed: {write_error:#}");
@@ -368,8 +373,7 @@ async fn record_failure(
         warn!("{kind} build failed for {target}: {error}");
     } else {
         warn!(
-            "{kind} build attempt {} failed for {target}, retrying in {:?}: {error}",
-            claim.build.attempts,
+            "{kind} build attempt {attempts} failed for {target}, retrying in {:?}: {error}",
             retry_after.unwrap_or_default()
         );
     }
@@ -381,9 +385,9 @@ async fn settle(
     state: &ServerState,
     settings: WorkerSettings,
     claim: &Claim,
-    kind: ExactResultKind,
     built: Result<Output>,
 ) -> Option<Published> {
+    let kind = claim.kind();
     if Cancel::current().is_some_and(|cancel| cancel.is_cancelled()) {
         warn!(
             "{kind} build for {}@{} stopped: the lease was lost",
@@ -406,7 +410,7 @@ async fn settle(
             Some(published)
         }
         Err(error) => {
-            record_failure(state, settings, claim, kind, &classify_build_error(&error)).await;
+            record_failure(state, settings, claim, &classify_build_error(&error)).await;
             None
         }
     }
@@ -458,9 +462,17 @@ async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {
     map.entry(repo_id.storage_key()).or_default().clone()
 }
 
-/// Make the mirror hold `commit`. When it already does (Files and Full after
+/// Make the mirror hold `commit`. When it already does (Full after
 /// Head, a retry) the write lock is not taken, so a slow fetch of another
-/// commit of the repo does not hold this build. The caller holds `lock.read`.
+/// commit of the repo does not hold this build. Head and Files of a new
+/// commit start together: the one that waited for the write lock finds the
+/// commit fetched and does not fetch again. The caller holds `lock.read`.
+///
+/// Without the write lock, a fetch may still be running, so the check is the
+/// fetch's ref, which git writes only once the commit's history is in place
+/// and connected. The commit object alone is not enough: it may be in a pack
+/// whose fetch has not finished or failed. Such a commit is fetched again
+/// under the write lock; git skips the transfer when the history is there.
 async fn ensure_commit(
     state: &ServerState,
     repo_id: &RepoId,
@@ -468,15 +480,22 @@ async fn ensure_commit(
     mirror_dir: &std::path::Path,
     lock: &RepoLock,
 ) -> Result<()> {
-    let (dir, wanted) = (mirror_dir.to_path_buf(), commit.to_string());
-    if cancel::spawn_blocking(move || git::mirror_has_commit(&dir, &wanted))
-        .await
-        .context("mirror check task")?
-    {
+    let has_commit = || {
+        let (dir, wanted) = (mirror_dir.to_path_buf(), commit.to_string());
+        async move {
+            cancel::spawn_blocking(move || git::mirror_fetched_commit(&dir, &wanted))
+                .await
+                .context("mirror check task")
+        }
+    };
+    if has_commit().await? {
         return Ok(());
     }
     let _writing = lock.write.lock().await;
     Cancel::check_current()?;
+    if has_commit().await? {
+        return Ok(());
+    }
     fetch_commit(state, repo_id, commit, mirror_dir).await
 }
 
@@ -521,7 +540,7 @@ async fn build_head(state: &ServerState, settings: WorkerSettings, claim: &Claim
     let mut phases = SyncPhases::default();
     let built = head_output(state, claim, &mut phases).await;
     let publish_start = Instant::now();
-    let Some(published) = settle(state, settings, claim, ExactResultKind::Head, built).await else {
+    let Some(published) = settle(state, settings, claim, built).await else {
         return;
     };
     if !published.applied {
@@ -550,10 +569,6 @@ async fn head_output(
     phases.mirror_fetch_ms = Some(duration_ms(t.elapsed()));
     let (prep_dir, prep_commit) = (mirror_dir.clone(), commit.to_string());
     let parent = cancel::spawn_blocking(move || -> Result<Option<String>> {
-        // An empty upstream mirrors fine but has nothing to build.
-        if git::is_empty_repo(&prep_dir).unwrap_or(false) {
-            anyhow::bail!("repository has no commits (nothing to clone)");
-        }
         let resolved = git::resolve_commit(&prep_dir, &prep_commit)
             .with_context(|| format!("resolve admitted commit {prep_commit}"))?;
         anyhow::ensure!(
@@ -565,9 +580,8 @@ async fn head_output(
     .await
     .context("mirror prep task")??;
 
-    // Head packs are a delta against an immutable base: the compacted base
-    // recorded by Full of the base commit, else the base its Head used, else
-    // none. The base commit's files table also seeds this one.
+    // Head packs are a base plus levels: the new base Full of the base
+    // commit packed, else the base commit's Head packs, else none.
     let base_row = ancestor_base(state, claim, ExactResultKind::Head, &mirror_dir).await?;
     let base_head = base_row.as_ref().and_then(|row| row.head.ready());
     let base = base_row
@@ -578,6 +592,7 @@ async fn head_output(
             base_head.map(|head| crate::HeadBase {
                 commit: head.base_commit.clone(),
                 packs: head.base_packs.clone(),
+                levels: head.levels.clone(),
             })
         });
     Cancel::check_current()?;
@@ -586,7 +601,6 @@ async fn head_output(
         &mirror_dir,
         commit,
         parent.clone(),
-        base_head,
         base,
         &state.storage,
         phases,
@@ -598,16 +612,20 @@ async fn head_output(
 async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
     let started = Instant::now();
     let mut phases = BuildPhases::default();
+    let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
+    let lock = repo_lock(state, &claim.repo).await;
     let built = async {
-        let head = ready_head(claim)?;
-        let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
-        let lock = repo_lock(state, &claim.repo).await;
         let start = Instant::now();
         let _reading = lock.read.read().await;
         phases.record("lock_wait", start);
         let start = Instant::now();
         ensure_commit(state, &claim.repo, &claim.build.commit, &mirror_dir, &lock).await?;
         phases.record("fetch", start);
+        let (dir, commit) = (mirror_dir.clone(), claim.build.commit.clone());
+        let parent =
+            cancel::spawn_blocking(move || git::parent_commit(&dir, &commit).ok().flatten())
+                .await
+                .context("parent lookup task")?;
         let config = state
             .control
             .get_config(&claim.repo)
@@ -624,7 +642,7 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
             &state.cas,
             &mirror_dir,
             &claim.build.commit,
-            &head,
+            parent,
             base_files,
             &state.storage,
             config.compression_level(),
@@ -636,17 +654,18 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
     .await;
     let ready = built.is_ok();
     phases.report("files", &claim.repo, &claim.build.commit, ready, started);
-    settle(state, settings, claim, ExactResultKind::Files, built).await;
+    settle(state, settings, claim, built).await;
+    compact_mirror(&claim.repo, &mirror_dir, &lock).await;
 }
 
 async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
     let started = Instant::now();
     let mut phases = BuildPhases::default();
+    let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
+    let lock = repo_lock(state, &claim.repo).await;
     let built = async {
         let head = ready_head(claim)?;
-        let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
-        let lock = repo_lock(state, &claim.repo).await;
-        upkeep_mirror(&claim.repo, &mirror_dir, &lock, &mut phases).await;
+        write_commit_graph(&claim.repo, &mirror_dir, &lock, &mut phases).await;
         let start = Instant::now();
         let _reading = lock.read.read().await;
         phases.record("lock_wait", start);
@@ -680,7 +699,8 @@ async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim
     .await;
     let ready = built.is_ok();
     phases.report("full", &claim.repo, &claim.build.commit, ready, started);
-    settle(state, settings, claim, ExactResultKind::Full, built).await;
+    settle(state, settings, claim, built).await;
+    compact_mirror(&claim.repo, &mirror_dir, &lock).await;
 }
 
 /// The Head result Files and Full build on.
@@ -693,24 +713,22 @@ fn ready_head(claim: &Claim) -> Result<crate::HeadResult> {
         .context("Head result is not ready")
 }
 
-/// Upkeep before a Full, best-effort and bounded by [`UPKEEP_TIMEOUT`] per
-/// step: the commit-graph, then compaction (see [`git::compact_mirror`]).
-/// Both need the write lock and are skipped while another build holds it.
-/// Compaction deletes packs, so it also needs the mirror to itself and is
-/// skipped while any build reads it; a later Full tries again.
-async fn upkeep_mirror(
+/// Before a Full, write the commit-graph, best-effort and bounded by
+/// [`UPKEEP_TIMEOUT`]. It needs the write lock and is skipped while another
+/// build holds it.
+async fn write_commit_graph(
     repo_id: &RepoId,
     mirror_dir: &std::path::Path,
     lock: &RepoLock,
     phases: &mut BuildPhases,
 ) {
-    let target = repo_id.storage_key();
     let Ok(_writing) = lock.write.try_lock() else {
         return;
     };
     if !mirror_dir.exists() {
         return;
     }
+    let target = repo_id.storage_key();
     let dir = mirror_dir.to_path_buf();
     let start = Instant::now();
     match cancel::spawn_blocking(move || git::write_commit_graph(&dir, UPKEEP_TIMEOUT)).await {
@@ -719,27 +737,43 @@ async fn upkeep_mirror(
         Err(error) => warn!("commit-graph task for {target} failed: {error}"),
     }
     phases.record("commit_graph", start);
+}
+
+/// After a Files or Full, compact the mirror (see [`git::compact_mirror`]),
+/// best-effort and bounded by [`UPKEEP_TIMEOUT`]. Compaction deletes packs,
+/// so it needs the mirror to itself: it runs only after the build has
+/// stopped reading the mirror and is skipped while any other build reads it
+/// or holds the write lock. A commit's Files and Full run together, so the
+/// later of the two usually finds the mirror free; a later build tries again
+/// otherwise.
+async fn compact_mirror(repo_id: &RepoId, mirror_dir: &std::path::Path, lock: &RepoLock) {
     let backing_off = lock
         .compact_failed
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some_and(|failed| failed.elapsed() < COMPACT_BACKOFF);
-    if backing_off {
+    if backing_off || !mirror_dir.exists() {
         return;
     }
     let Ok(_alone) = lock.read.try_write() else {
         return;
     };
+    let Ok(_writing) = lock.write.try_lock() else {
+        return;
+    };
+    let target = repo_id.storage_key();
     let dir = mirror_dir.to_path_buf();
     let start = Instant::now();
     let compacted = cancel::spawn_blocking(move || git::compact_mirror(&dir, UPKEEP_TIMEOUT))
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
-    phases.record("mirror_compact", start);
     match compacted {
         Ok(done) if done != git::MirrorCompaction::default() => {
-            info!("compacted mirror of {target}: {done:?}");
+            info!(
+                "compacted mirror of {target} in {} ms: {done:?}",
+                duration_ms(start.elapsed())
+            );
         }
         Ok(_) => {}
         Err(error) => {
@@ -848,6 +882,7 @@ mod tests {
                 full_slots: 2,
                 retry_base: Duration::from_millis(2000),
                 max_attempts: 5,
+                lease: Duration::from_secs(60),
             }
         );
         for (cores, slots) in [(1, 2), (16, 4), (64, 16)] {
@@ -867,6 +902,7 @@ mod tests {
                         "RIPCLONE_FULL_SLOTS" => "4",
                         "RIPCLONE_BUILD_RETRY_BASE_MS" => "50",
                         "RIPCLONE_BUILD_MAX_ATTEMPTS" => "2",
+                        "RIPCLONE_BUILD_LEASE_SECS" => "6",
                         _ => return None,
                     }
                     .to_string(),
@@ -880,6 +916,7 @@ mod tests {
         assert_eq!(set.full_slots, 4);
         assert_eq!(set.retry_base, Duration::from_millis(50));
         assert_eq!(set.max_attempts, 2);
+        assert_eq!(set.lease, Duration::from_secs(6));
         for (key, value) in [
             ("RIPCLONE_HEAD_SLOTS", "0"),
             ("RIPCLONE_HEAD_SLOTS", "two"),
@@ -887,6 +924,7 @@ mod tests {
             ("RIPCLONE_FULL_SLOTS", "many"),
             ("RIPCLONE_BUILD_RETRY_BASE_MS", "soon"),
             ("RIPCLONE_BUILD_MAX_ATTEMPTS", "0"),
+            ("RIPCLONE_BUILD_LEASE_SECS", "2"),
         ] {
             let error = WorkerSettings::from_lookup(|k| (k == key).then(|| value.to_string()), 8)
                 .unwrap_err();

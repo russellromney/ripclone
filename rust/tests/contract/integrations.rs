@@ -456,6 +456,35 @@ fn i7_verify_upstream_moved_tip() {
     assert_eq!(entries, 0, "the failed clone left files in the target");
 }
 
+/// I7: the upstream check runs beside the clone. While the CLI's upstream
+/// holds its ref listing, the clone already downloads its artifacts; once the
+/// listing answers, the check passes.
+#[test]
+fn i7_verify_upstream_runs_beside_the_clone() {
+    let (world, server, _origin, tip) = i7_world("i7-beside");
+    let upstream = GitHttp::start(world.path("origins"));
+    upstream.hold_listings();
+    let proxy = FaultProxy::start(&server);
+    let target = world.target("i7-beside");
+    let running = world.cli_spawn_env(
+        &proxy,
+        &[
+            "clone",
+            "acme/i7-beside",
+            target.to_str().unwrap(),
+            "--verify-upstream=always",
+        ],
+        &[("RIPCLONE_ORIGIN_BASE", upstream.url())],
+    );
+    upstream.wait_listings_held(1);
+    proxy.wait_seen("an artifact download", |seen| {
+        seen.iter().any(|s| s.path.starts_with("/v1/artifacts/"))
+    });
+    upstream.release_listings();
+    running.wait().ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
+}
+
 /// I10: a Files clone has no git objects to check against the upstream.
 /// `never` and `auto` clone without contacting the upstream (here a host that
 /// hangs up, which `auto` would warn about); `always` fails before any
@@ -492,7 +521,7 @@ fn i10_verify_upstream_in_files_mode() {
             assert_eq!(listing(&target), origin.tree(&tip), "{mode}");
         } else {
             let err = out.err();
-            assert_eq!(out.code(), Some(1), "{mode}: {err}");
+            assert_eq!(out.code(), Some(2), "{mode}: {err}");
             assert!(
                 err.contains("cannot verify a files-mode clone"),
                 "{mode}: {err}"

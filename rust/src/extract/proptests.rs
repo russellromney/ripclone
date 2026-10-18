@@ -38,7 +38,10 @@ struct Plan {
 }
 
 fn sha1_bytes(data: &[u8]) -> Vec<u8> {
-    Sha1::digest(data).to_vec()
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", data.len()).as_bytes());
+    hasher.update(data);
+    hasher.finalize().to_vec()
 }
 
 /// Candidate paths that never collide on a case-insensitive filesystem and never

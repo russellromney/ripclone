@@ -38,47 +38,16 @@ impl<'a> PackBuilder<'a> {
         }
     }
 
-    /// Build a skeleton pack limited to `max_depth` commits. `max_depth = None`
-    /// is the full history; `Some(1)` produces a depth=1 skeleton.
-    pub fn build_skeleton_pack_with_depth(
-        &self,
-        commit: &str,
-        max_depth: Option<usize>,
-    ) -> Result<(String, String)> {
-        let shas = git::list_object_shas_with_depth(&self.repo, commit, max_depth)?;
-        let types = git::classify_objects(&self.repo, &shas.iter().cloned().collect())?;
-        let mut skeleton_shas: Vec<String> = shas
-            .into_iter()
-            .filter(|sha| {
-                matches!(
-                    types.get(sha).map(|s| s.as_str()),
-                    Some("commit") | Some("tree")
-                )
-            })
-            .collect();
-
-        let symlink_shas = git::symlink_blob_shas(&self.repo, commit)?;
-        skeleton_shas.extend(symlink_shas);
-
-        self.pack_and_index(&skeleton_shas)
-    }
-
-    /// Build a depth=1 skeleton pack (single commit + HEAD trees + symlinks).
-    pub fn build_shallow_skeleton_pack(&self, commit: &str) -> Result<(String, String)> {
-        self.build_skeleton_pack_with_depth(commit, Some(1))
-    }
-
-    /// Build a ready-to-use `.git/index` for `commit` and store it in the CAS.
+    /// Build a ready-to-use `.git/index` for `commit`.
     ///
     /// The index contains every tracked path with `skip-worktree` set and
     /// accurate cached blob sizes. After the client materializes files it must
     /// clear skip-worktree for those paths.
-    pub fn build_prebuilt_index(&self, commit: &str) -> Result<String> {
+    pub fn build_prebuilt_index(&self, commit: &str) -> Result<Vec<u8>> {
         let tmp = tempfile::TempDir::new()?;
         let index_path = tmp.path().join("index");
         git::write_prebuilt_index(&self.repo, commit, &index_path)?;
-        let (hash, _) = self.cas.install_file(&index_path)?;
-        Ok(hash)
+        Ok(std::fs::read(&index_path)?)
     }
 
     /// Build just the HEAD closure (undeltified small packs) — the depth=1
@@ -88,60 +57,90 @@ impl<'a> PackBuilder<'a> {
         commit: &str,
         head_target_raw_bytes: u64,
     ) -> Result<Vec<(String, u64, String, u64)>> {
-        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        let head_oids = git::list_head_objects(&self.repo, commit)?;
         if head_oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
         self.build_packs_from_oids(&head_oids, head_target_raw_bytes)
     }
 
-    /// Build a HEAD-closure *delta* pack against a base commit: only the depth-1
-    /// objects present at `commit` but not at `base_commit`. The base packs
-    /// (closure of `base_commit`) stay immutable; this packs just the difference
-    /// (for a few changed files, the changed blobs + the trees from root to leaf —
-    /// a handful of objects), so the depth=1 payload becomes O(diff-from-base)
-    /// instead of O(worktree).
+    /// Build a Head *level*: the depth-1 objects of `commit` that are not in
+    /// `have`, the objects of the Head packs it builds on (from their idx
+    /// files, see [`idx_object_ids`]). Each push adds one small level, its
+    /// changed blobs and the trees from root to leaf, instead of packing again
+    /// everything new since the base.
     ///
-    /// The delta is the **set difference of the two depth-1 closures**, NOT a
-    /// reachability exclude (`rev-list HEAD ^base`). Two properties matter:
-    /// - **Disjoint:** `delta ∩ closure(base) = ∅` by construction, so no object
-    ///   is ever in both the base and the delta. The client materializes the
-    ///   worktree by writing each blob it finds in a HEAD pack, so a blob present
-    ///   in two packs would be written (and counted) twice.
-    /// - **Re-add safe:** a blob removed after `base_commit` and re-added
-    ///   identically at `commit` is reachable from `base_commit`'s tip tree, so it
-    ///   is already in the base and correctly excluded from the delta — present
-    ///   exactly once. A reachability-exclude (`^base`) would instead drop a blob
-    ///   reachable only from `base`'s history, corrupting the worktree.
+    /// - **Disjoint:** no object of the level is in `have`, so no object is
+    ///   in two Head packs. The client materializes the worktree by writing
+    ///   each blob it finds in a Head pack, so a blob in two packs would be
+    ///   written twice.
+    /// - **Complete:** `have ∪ level ⊇ closure(commit)`, whatever `have` holds:
+    ///   a blob deleted and re-added identically is still in an earlier pack.
     ///
-    /// `base ∪ delta = closure(base) ∪ (closure(HEAD) − closure(base)) ⊇
-    /// closure(HEAD)`, so every object the worktree needs is present. Listing each
-    /// closure is cheap (`rev-list --objects`, no content); only the small
-    /// difference is packed (undeltified, so the client hand-parses blobs).
-    /// Returns the freshly built delta packs (manifest order); these are also the
-    /// only packs to upload.
-    pub fn build_head_delta_pack(
+    /// Objects in `have` that `commit` no longer uses stay in their packs
+    /// until a rebase packs a new base. Listing the closure is cheap
+    /// (`rev-list --objects`, no content); only the level is packed,
+    /// undeltified, so the client hand-parses blobs. Returns the new packs in
+    /// manifest order; these are the only packs to upload.
+    pub fn build_head_level(
         &self,
         commit: &str,
-        base_commit: &str,
+        have: &HashSet<String>,
         head_target_raw_bytes: u64,
     ) -> Result<Vec<(String, u64, String, u64)>> {
-        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        let head_oids = git::list_head_objects(&self.repo, commit)?;
         if head_oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
-        let base_oids: HashSet<String> =
-            git::list_object_shas_with_depth(&self.repo, base_commit, Some(1))?
-                .into_iter()
-                .collect();
-        let delta_oids: Vec<String> = head_oids
+        let level: Vec<String> = head_oids
             .into_iter()
-            .filter(|o| !base_oids.contains(o))
+            .filter(|o| !have.contains(o))
             .collect();
-        if delta_oids.is_empty() {
-            return Ok(Vec::new());
+        self.build_packs_from_oids(&level, head_target_raw_bytes)
+    }
+
+    /// Pack a new Head base for `commit` from the current base and levels,
+    /// each given with its idx bytes. A base pack in which objects `commit`
+    /// no longer uses take at most a tenth of the bytes is kept as it is.
+    /// The rest of the closure (the live objects of the other base packs
+    /// and of every level) is packed again, so a rebase uploads the packs
+    /// that changed, not the whole base. Levels are never kept: they are
+    /// small and folding them keeps the pack count bounded.
+    ///
+    /// Returns the new base's packs in manifest order (kept packs first)
+    /// and the number of kept packs; the packs after them are new.
+    pub fn rebase_head_packs(
+        &self,
+        commit: &str,
+        base: &[((String, u64, String, u64), Vec<u8>)],
+        head_target_raw_bytes: u64,
+    ) -> Result<(Vec<(String, u64, String, u64)>, usize)> {
+        let closure = git::list_head_objects(&self.repo, commit)?;
+        if closure.is_empty() {
+            bail!("no objects to pack for {}", commit);
         }
-        self.build_packs_from_oids(&delta_oids, head_target_raw_bytes)
+        let live: HashSet<&str> = closure.iter().map(String::as_str).collect();
+        let mut kept = Vec::new();
+        let mut kept_ids = HashSet::new();
+        for (pack, idx) in base {
+            let objects = idx_object_sizes(idx, pack.1)?;
+            let dead: u64 = objects
+                .iter()
+                .filter(|(id, _)| !live.contains(id.as_str()))
+                .map(|(_, len)| len)
+                .sum();
+            if dead * 10 <= pack.1 {
+                kept.push(pack.clone());
+                kept_ids.extend(objects.into_iter().map(|(id, _)| id));
+            }
+        }
+        let rest: Vec<String> = closure
+            .into_iter()
+            .filter(|id| !kept_ids.contains(id))
+            .collect();
+        let count = kept.len();
+        kept.extend(self.build_packs_from_oids(&rest, head_target_raw_bytes)?);
+        Ok((kept, count))
     }
 
     /// Build only the deltified *tail*: objects introduced in `(sealed_tip,
@@ -164,12 +163,31 @@ impl<'a> PackBuilder<'a> {
 
     /// Pack the objects of `(exclude, tip]` with git's own walk and delta
     /// reuse (see `git::pack_objects_range_to_prefix`) and store the pack.
+    /// `tip`'s whole history is the pack the mirror's first fetch wrote, when
+    /// that fetch was of `tip`: that pack is stored as it is.
     fn build_history_range(&self, tip: &str, exclude: Option<&str>) -> Result<HistoryBuild> {
         crate::cancel::Cancel::check_current()?;
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
         let start = std::time::Instant::now();
-        git::pack_objects_range_to_prefix(&self.repo, tip, exclude, &prefix)?;
+        let fetched = exclude
+            .is_none()
+            .then(|| git::fetched_history_pack(&self.repo, tip))
+            .flatten();
+        if let Some((pack, idx)) = fetched {
+            for (from, ext) in [(&pack, "pack"), (&idx, "idx")] {
+                let to = tmp.path().join(format!("fetched.{ext}"));
+                if std::fs::hard_link(from, &to).is_err() {
+                    std::fs::copy(from, &to).with_context(|| format!("copy {}", from.display()))?;
+                }
+            }
+            tracing::info!(
+                "history of {}: stored the mirror's fetched pack",
+                &tip[..7.min(tip.len())]
+            );
+        } else {
+            git::pack_objects_range_to_prefix(&self.repo, tip, exclude, &prefix)?;
+        }
         let pack_ms = elapsed_ms(start);
         let start = std::time::Instant::now();
         let packs = self.store_packs_from_dir(tmp.path())?;
@@ -320,23 +338,14 @@ impl<'a> PackBuilder<'a> {
         let cancel = crate::cancel::Cancel::current().unwrap_or_default();
         batches
             .par_iter()
-            .map(|batch| cancel.enter(|| self.pack_and_index_inner(batch, true)))
+            .map(|batch| cancel.enter(|| self.pack_undeltified(batch)))
             .collect()
-    }
-
-    fn pack_and_index(&self, object_shas: &[String]) -> Result<(String, String)> {
-        let (ph, _, ih, _) = self.pack_and_index_inner(object_shas, false)?;
-        Ok((ph, ih))
     }
 
     /// Pack `object_shas` and store the pack + idx in the CAS. Returns
     /// `(pack_hash, pack_len, idx_hash, idx_len)` — the lengths come straight
     /// from the bytes we already read, so callers never re-`get` from the CAS.
-    fn pack_and_index_inner(
-        &self,
-        object_shas: &[String],
-        undeltified: bool,
-    ) -> Result<(String, u64, String, u64)> {
+    fn pack_undeltified(&self, object_shas: &[String]) -> Result<(String, u64, String, u64)> {
         if object_shas.is_empty() {
             bail!("no objects to pack");
         }
@@ -344,15 +353,66 @@ impl<'a> PackBuilder<'a> {
 
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
-        if undeltified {
-            git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
-        } else {
-            git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;
-        }
+        git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
         let mut packs = self.store_packs_from_dir(tmp.path())?;
         anyhow::ensure!(packs.len() == 1, "pack-objects wrote {} packs", packs.len());
         Ok(packs.remove(0))
     }
+}
+
+/// The object ids of a version 2 pack idx with the bytes each object takes
+/// in its pack, `pack_len` long: the distance to the next object's offset,
+/// or to the pack's trailing checksum.
+pub fn idx_object_sizes(idx: &[u8], pack_len: u64) -> Result<Vec<(String, u64)>> {
+    let ids = idx_object_ids(idx)?;
+    let count = ids.len();
+    let offsets_at = 8 + 256 * 4 + count * (20 + 4);
+    let large_at = offsets_at + count * 4;
+    let offsets = (0..count)
+        .map(|i| {
+            let at = offsets_at + i * 4;
+            let word = idx
+                .get(at..at + 4)
+                .context("pack idx is shorter than its offsets")?;
+            let word = u32::from_be_bytes(word.try_into()?);
+            if word & 0x8000_0000 == 0 {
+                return Ok(u64::from(word));
+            }
+            let at = large_at + (word & 0x7fff_ffff) as usize * 8;
+            let large = idx
+                .get(at..at + 8)
+                .context("pack idx is shorter than its large offsets")?;
+            Ok(u64::from_be_bytes(large.try_into()?))
+        })
+        .collect::<Result<Vec<u64>>>()?;
+    let end = pack_len
+        .checked_sub(20)
+        .context("pack is shorter than its checksum")?;
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|&i| offsets[i]);
+    let mut sizes = vec![0; count];
+    for (k, &i) in order.iter().enumerate() {
+        let next = order.get(k + 1).map_or(end, |&j| offsets[j]);
+        sizes[i] = next
+            .checked_sub(offsets[i])
+            .context("pack idx offset is past the end of its pack")?;
+    }
+    Ok(ids.into_iter().zip(sizes).collect())
+}
+
+/// The object ids, in hex, of a version 2 pack idx.
+pub fn idx_object_ids(idx: &[u8]) -> Result<Vec<String>> {
+    const HEADER: usize = 8;
+    const FANOUT: usize = 256 * 4;
+    anyhow::ensure!(
+        idx.len() >= HEADER + FANOUT && idx[..HEADER] == [0xff, b't', b'O', b'c', 0, 0, 0, 2],
+        "not a version 2 pack idx"
+    );
+    let count = u32::from_be_bytes(idx[HEADER + FANOUT - 4..HEADER + FANOUT].try_into()?) as usize;
+    let names = idx
+        .get(HEADER + FANOUT..HEADER + FANOUT + count * 20)
+        .context("pack idx is shorter than its object count")?;
+    Ok(names.chunks_exact(20).map(hex::encode).collect())
 }
 
 #[cfg(test)]
@@ -413,7 +473,7 @@ mod tests {
     /// already has (here a blob restored to its base content) is not packed
     /// again.
     #[test]
-    fn head_delta_pack_is_minimal() {
+    fn head_levels_hold_only_new_objects() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = crate::test_fixture::init_bare(tmp.path());
         let cas_dir = tempfile::tempdir().unwrap();
@@ -434,23 +494,225 @@ mod tests {
         c1_objects.extend(base_files.iter().map(|(name, _)| format!("{c1}:{name}")));
         assert_eq!(base, rev_parse(tmp.path(), &c1_objects));
 
-        // c2 changes b: the delta is c2, its root tree, and the new blob.
+        // Each level is the objects of its commit's closure that no earlier
+        // pack has, and the idx parser lists exactly a pack's objects.
+        let mut packs = pb.build_head_packs(&c1, target).unwrap();
+        let mut level = |files: &[(&str, &[u8])]| {
+            let commit = commit_onto(&repo, files);
+            let mut have = HashSet::new();
+            for (_, _, idx, _) in &packs {
+                let ids = idx_object_ids(&cas.get(idx).unwrap()).unwrap();
+                assert_eq!(
+                    ids.iter().cloned().collect::<BTreeSet<_>>(),
+                    packed_objects(&cas, &[("".into(), 0, idx.clone(), 0)])
+                );
+                have.extend(ids);
+            }
+            let built = pb.build_head_level(&commit, &have, target).unwrap();
+            packs.extend(built.iter().cloned());
+            (commit, packed_objects(&cas, &built))
+        };
+
+        // c2 changes b: the level is c2, its root tree, and the new blob.
         let mut c2_files = base_files.clone();
         c2_files[1] = ("b", b"bbb-CHANGED");
-        let c2 = commit_onto(&repo, &c2_files);
-        let delta = pb.build_head_delta_pack(&c2, &c1, target).unwrap();
+        let (c2, got) = level(&c2_files);
         let want = [c2.clone(), format!("{c2}^{{tree}}"), format!("{c2}:b")];
-        assert_eq!(packed_objects(&cas, &delta), rev_parse(tmp.path(), &want));
+        assert_eq!(got, rev_parse(tmp.path(), &want));
 
-        // c3 restores b to its base content and adds g. Against the base c1,
-        // the delta is c3, its root tree, and g; the restored blob is in the
-        // base packs only.
+        // c3 restores b to its base content and adds g: the restored blob is
+        // in the base packs only.
         let mut c3_files = base_files.clone();
         c3_files.push(("g", b"ggg"));
-        let c3 = commit_onto(&repo, &c3_files);
-        let delta = packed_objects(&cas, &pb.build_head_delta_pack(&c3, &c1, target).unwrap());
+        let (c3, got) = level(&c3_files);
         let want = [c3.clone(), format!("{c3}^{{tree}}"), format!("{c3}:g")];
-        assert_eq!(delta, rev_parse(tmp.path(), &want));
-        assert!(delta.is_disjoint(&base));
+        assert_eq!(got, rev_parse(tmp.path(), &want));
+        assert!(got.is_disjoint(&base));
+
+        // c4 brings back c2's b: that blob is in c2's level, not packed again.
+        let mut c4_files = c3_files.clone();
+        c4_files[1] = ("b", b"bbb-CHANGED");
+        let (c4, got) = level(&c4_files);
+        assert_eq!(
+            got,
+            rev_parse(tmp.path(), &[c4.clone(), format!("{c4}^{{tree}}")])
+        );
+
+        // A corrupt idx is refused.
+        assert!(idx_object_ids(b"not an idx").is_err());
+    }
+
+    #[test]
+    fn head_packs_follow_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let pb = PackBuilder::new(tmp.path(), &cas);
+        let noise = |seed: u32| -> Vec<u8> {
+            let mut x = seed.wrapping_mul(2_654_435_761) | 1;
+            (0..8192)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect()
+        };
+        // 8 KiB blobs, two per 16 KiB pack: [commit, trees, a/1], [a/2, a/3],
+        // [b/1, b/2], [b/3, b/4].
+        let names = ["a/1", "a/2", "a/3", "b/1", "b/2", "b/3", "b/4"];
+        let old: Vec<Vec<u8>> = (0..7).map(noise).collect();
+        let new: Vec<Vec<u8>> = (7..14).map(noise).collect();
+        let files = |blobs: &[Vec<u8>]| -> Vec<(&str, Vec<u8>)> {
+            names.iter().copied().zip(blobs.iter().cloned()).collect()
+        };
+        let c1_files = files(&old);
+        let c1_refs: Vec<(&str, &[u8])> = c1_files.iter().map(|(n, b)| (*n, &b[..])).collect();
+        let c1 = commit_onto(&repo, &c1_refs);
+
+        // The listing is the depth-1 closure: commit, then trees, then blobs
+        // in path order.
+        let listed = git::list_head_objects(tmp.path(), &c1).unwrap();
+        let mut sorted = listed.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            git::list_object_shas_with_depth(tmp.path(), &c1, Some(1)).unwrap()
+        );
+        let blob_at = |commit: &str, name: &str| {
+            rev_parse(tmp.path(), &[format!("{commit}:{name}")])
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        let mut want = vec![c1.clone()];
+        want.extend(["", "a", "b"].iter().map(|dir| blob_at(&c1, dir)));
+        want.extend(names.iter().map(|name| blob_at(&c1, name)));
+        assert_eq!(listed, want);
+
+        // c2 rewrites every file under b/: the packs of a/ stay in the base,
+        // and the b/ packs are packed again.
+        let mut c2_blobs = old.clone();
+        c2_blobs[3..].clone_from_slice(&new[3..]);
+        let c2_files = files(&c2_blobs);
+        let c2_refs: Vec<(&str, &[u8])> = c2_files.iter().map(|(n, b)| (*n, &b[..])).collect();
+        let c2 = commit_onto(&repo, &c2_refs);
+        let target = 16 * 1024;
+        let base = pb.build_head_packs(&c1, target).unwrap();
+        let with_idx: Vec<_> = base
+            .iter()
+            .map(|pack| (pack.clone(), cas.get(&pack.2).unwrap()))
+            .collect();
+        let (rebased, kept) = pb.rebase_head_packs(&c2, &with_idx, target).unwrap();
+        let a_blobs: BTreeSet<String> = names[..3].iter().map(|name| blob_at(&c1, name)).collect();
+        assert!(a_blobs.is_subset(&packed_objects(&cas, &rebased[..kept])));
+        assert!(a_blobs.is_disjoint(&packed_objects(&cas, &rebased[kept..])));
+        assert_eq!(kept, 2);
+    }
+
+    #[test]
+    fn rebase_keeps_base_packs_that_stay_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let pb = PackBuilder::new(tmp.path(), &cas);
+        // Incompressible 8 KiB blobs, two per 16 KiB pack (and the commit
+        // and root tree with one of them): five packs.
+        let noise = |seed: u8| -> Vec<u8> {
+            let mut x = u32::from(seed).wrapping_mul(2_654_435_761) | 1;
+            (0..8192)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect()
+        };
+        let blobs: Vec<Vec<u8>> = (0..9).map(noise).collect();
+        let names = ["f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7"];
+        let files: Vec<(&str, &[u8])> = names
+            .iter()
+            .zip(&blobs)
+            .map(|(n, b)| (*n, &b[..]))
+            .collect();
+        let c1 = commit_onto(&repo, &files);
+        let target = 16 * 1024;
+        let base = pb.build_head_packs(&c1, target).unwrap();
+        assert_eq!(base.len(), 5);
+
+        // The idx sizes are what git reports for each object in its pack.
+        let dir = tempfile::tempdir().unwrap();
+        for (pack, pack_len, idx, _) in &base {
+            let idx_bytes = cas.get(idx).unwrap();
+            std::fs::write(dir.path().join("p.pack"), cas.get(pack).unwrap()).unwrap();
+            std::fs::write(dir.path().join("p.idx"), &idx_bytes).unwrap();
+            let out = std::process::Command::new("git")
+                .args(["verify-pack", "-v"])
+                .arg(dir.path().join("p.idx"))
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let want: BTreeSet<(String, u64)> = String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| {
+                    let f: Vec<&str> = line.split_whitespace().collect();
+                    (f.len() >= 5 && f[0].len() == 40)
+                        .then(|| (f[0].to_string(), f[3].parse().unwrap()))
+                })
+                .collect();
+            let got = idx_object_sizes(&idx_bytes, *pack_len).unwrap();
+            assert_eq!(got.iter().cloned().collect::<BTreeSet<_>>(), want);
+            assert_eq!(
+                got.iter().map(|(_, len)| len).sum::<u64>(),
+                pack_len - 12 - 20
+            );
+        }
+        assert!(idx_object_sizes(&cas.get(&base[0].2).unwrap(), 10).is_err());
+
+        // c2 changes f7. The pack with the commit and root tree loses only
+        // a small part of its bytes, so it is kept with the packs f7 is not
+        // in. The pack that held f7 is half dead, so it is dropped: the new
+        // commit, tree and f7 are packed with that pack's live blob.
+        let mut c2_files = files.clone();
+        c2_files[7] = ("f7", &blobs[8]);
+        let c2 = commit_onto(&repo, &c2_files);
+        let with_idx: Vec<_> = base
+            .iter()
+            .map(|pack| (pack.clone(), cas.get(&pack.2).unwrap()))
+            .collect();
+        let (rebased, kept) = pb.rebase_head_packs(&c2, &with_idx, target).unwrap();
+        let old_f7 = rev_parse(tmp.path(), &[format!("{c1}:f7")]);
+        let stays: Vec<_> = base
+            .iter()
+            .filter(|pack| packed_objects(&cas, &[(*pack).clone()]).is_disjoint(&old_f7))
+            .cloned()
+            .collect();
+        assert_eq!(kept, 4);
+        assert_eq!(rebased[..kept], stays[..]);
+        let built = packed_objects(&cas, &rebased[kept..]);
+        let mut want = rev_parse(
+            tmp.path(),
+            &[c2.clone(), format!("{c2}^{{tree}}"), format!("{c2}:f7")],
+        );
+        let dropped: Vec<_> = base
+            .iter()
+            .filter(|pack| !stays.contains(pack))
+            .cloned()
+            .collect();
+        want.extend(packed_objects(&cas, &dropped).difference(&old_f7).cloned());
+        assert_eq!(built, want);
+
+        // Disjoint and complete: every pack is read for the worktree.
+        let kept_objects = packed_objects(&cas, &rebased[..kept]);
+        assert!(built.is_disjoint(&kept_objects));
+        let mut closure: Vec<String> = vec![c2.clone(), format!("{c2}^{{tree}}")];
+        closure.extend(names.iter().map(|name| format!("{c2}:{name}")));
+        let all: BTreeSet<String> = built.union(&kept_objects).cloned().collect();
+        assert!(rev_parse(tmp.path(), &closure).is_subset(&all));
     }
 }

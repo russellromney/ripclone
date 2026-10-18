@@ -9,6 +9,7 @@ use crate::cas::Cas;
 use crate::storage::StorageRef;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -31,6 +32,7 @@ pub(super) struct Uploads {
     runtime: tokio::runtime::Handle,
     cancel: Option<Cancel>,
     state: Mutex<State>,
+    bytes: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -49,6 +51,7 @@ impl Uploads {
             runtime: tokio::runtime::Handle::current(),
             cancel: Cancel::current(),
             state: Mutex::default(),
+            bytes: Arc::default(),
         })
     }
 
@@ -74,7 +77,7 @@ impl Uploads {
         }
         state.started.push(hash.to_string());
         let (storage, path, hash) = (self.storage.clone(), self.cas.path(hash), hash.to_string());
-        let cancel = self.cancel.clone();
+        let (cancel, bytes) = (self.cancel.clone(), self.bytes.clone());
         state.tasks.spawn_on(
             async move {
                 let _slot = upload_slots()
@@ -91,6 +94,7 @@ impl Uploads {
                     .with_context(|| format!("upload artifact {hash}"))?;
                 let len = tokio::fs::metadata(&path).await.map_or(0, |m| m.len());
                 crate::perf::record_storage_upload(start.elapsed(), len);
+                bytes.fetch_add(len, Ordering::Relaxed);
                 Ok(())
             },
             &self.runtime,
@@ -102,6 +106,11 @@ impl Uploads {
         for hash in hashes {
             self.start(hash);
         }
+    }
+
+    /// Bytes of the uploads finished so far.
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
     }
 
     /// Wait for every upload. The first failure is returned and stops the

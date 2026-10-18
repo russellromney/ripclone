@@ -122,11 +122,7 @@ pub(super) fn unknown_provider() -> ApiError {
 }
 
 fn repo_not_added() -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_FOUND,
-        "repo_not_added",
-        "repo not added; run `ripclone add <repo>`",
-    )
+    ApiError::new(StatusCode::NOT_FOUND, "repo_not_added", "repo not added")
 }
 
 pub(super) async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, ApiError> {
@@ -170,6 +166,11 @@ pub struct RefResponse {
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pack_chunk_urls: Option<Vec<Option<String>>>,
+    /// Signed URL for each history pack's idx, ordered to match
+    /// `manifest.packs`. HEAD-closure packs read theirs from the idx bundle
+    /// and have `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub midx_url: Option<String>,
@@ -644,37 +645,56 @@ async fn get_commit(
             "kind": kind,
             "error": error,
         }),
-        Out::Pending { error } => {
-            let mut body = serde_json::json!({
-                "state": "pending",
-                "commit": row.commit,
-                "kind": kind,
-                "attempts": row.attempts,
-            });
-            if let Some(error) = error {
-                body["error"] = serde_json::json!(error);
-            }
-            if kind == ExactResultKind::Full
-                && let Some(top_up) = top_up_plan(state, repo_id, provider, &row).await?
-            {
-                body["top_up"] = top_up;
-            }
-            body
-        }
+        Out::Pending { error } => pending_body(state, repo_id, provider, &row, kind, error).await?,
     };
     Ok(Json(body).into_response())
+}
+
+/// The answer for `row`'s pending `kind` output. A pending Full names its
+/// top-up base, read after `row`: when that base is the commit itself, its
+/// Full was published in between, and the answer is that ready Full.
+async fn pending_body(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    row: &BuildRow,
+    kind: ExactResultKind,
+    error: Option<String>,
+) -> Result<serde_json::Value, ApiError> {
+    let base = match kind {
+        ExactResultKind::Full => top_up_base(state, repo_id, row).await?,
+        _ => None,
+    };
+    if let Some(base) = base.as_ref().filter(|base| base.commit == row.commit) {
+        return Ok(ready_body(state, repo_id, provider, base, kind));
+    }
+    let mut body = serde_json::json!({
+        "state": "pending",
+        "commit": row.commit,
+        "kind": kind,
+        "attempts": row.lease(kind).attempts,
+    });
+    if let Some(error) = error {
+        body["error"] = serde_json::json!(error);
+    }
+    if let Some(base) = base {
+        body["top_up"] = serde_json::json!({
+            "base_commit": base.commit,
+            "base": ready_body(state, repo_id, provider, &base, ExactResultKind::Full),
+        });
+    }
+    Ok(body)
 }
 
 /// While Full(B) is pending, a full clone can install a ready Full of an
 /// older commit and fetch the rest from the upstream. The base is the newest
 /// ready Full admitted from B's ref, else B's parent's Full. Head(B) need not
 /// be ready: a full clone never waits on the server.
-async fn top_up_plan(
+async fn top_up_base(
     state: &ServerState,
     repo_id: &RepoId,
-    provider: &ProviderInstance,
     row: &BuildRow,
-) -> Result<Option<serde_json::Value>, ApiError> {
+) -> Result<Option<BuildRow>, ApiError> {
     let control = |error: anyhow::Error| {
         state.metrics.record_error();
         ApiError::control(error)
@@ -691,19 +711,12 @@ async fn top_up_plan(
     let Some(base_commit) = base_commit.or_else(|| row.parent.clone()) else {
         return Ok(None);
     };
-    let Some(base) = state
+    Ok(state
         .control
         .status(repo_id, &base_commit)
         .await
         .map_err(control)?
-        .filter(|base| base.full.ready().is_some())
-    else {
-        return Ok(None);
-    };
-    Ok(Some(serde_json::json!({
-        "base_commit": base_commit,
-        "base": ready_body(state, repo_id, provider, &base, ExactResultKind::Full),
-    })))
+        .filter(|base| base.full.ready().is_some()))
 }
 
 pub(super) const DEFAULT_SIGNED_URL_TTL: Duration = Duration::from_secs(1200);
@@ -737,16 +750,37 @@ fn ref_response(
         .filter(|_| kind == ExactResultKind::Files)
         .map(|files| files.archive_chunks.clone())
         .unwrap_or_default();
-    let packs: Vec<String> = match kind {
+    let pack_artifacts = match kind {
         ExactResultKind::Head => info.head.as_ref().map(|head| head.packs.as_slice()),
         ExactResultKind::Full => info.full.as_ref().map(|full| full.packs.as_slice()),
         ExactResultKind::Files => None,
     }
-    .unwrap_or_default()
-    .iter()
-    .map(|p| p.pack.clone())
-    .collect();
+    .unwrap_or_default();
+    let packs: Vec<String> = pack_artifacts.iter().map(|p| p.pack.clone()).collect();
+    // A history pack's idx is fetched on its own; the rest are in the bundle.
+    let history_idx: std::collections::HashSet<&str> = info
+        .full
+        .as_ref()
+        .filter(|_| kind == ExactResultKind::Full)
+        .map(|full| {
+            full.history_levels
+                .iter()
+                .flat_map(|level| level.packs.iter().map(|p| p.idx.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
     let signed = |hash: &str| signed_url(storage, ttl, hash);
+    let pack_idx_urls: Option<Vec<Option<String>>> = (!history_idx.is_empty()).then(|| {
+        pack_artifacts
+            .iter()
+            .map(|p| {
+                history_idx
+                    .contains(p.idx.as_str())
+                    .then(|| signed(&p.idx))
+                    .flatten()
+            })
+            .collect()
+    });
     // Ordered to match the manifest's own chunk and pack lists.
     let signed_list = |hashes: &[String]| -> Option<Vec<Option<String>>> {
         if hashes.is_empty() {
@@ -773,6 +807,7 @@ fn ref_response(
         metadata_chunk_url: signed(&artifacts.metadata_chunk),
         archive_chunk_urls: signed_list(&archive_chunks),
         pack_chunk_urls: signed_list(&packs),
+        pack_idx_urls: pack_idx_urls.filter(|urls| urls.iter().any(Option::is_some)),
         // The pre-built MIDX lets the client skip `git multi-pack-index
         // write`; the idx bundle fetches every idx in one GET.
         midx_url: signed(&artifacts.midx),
@@ -1007,11 +1042,15 @@ pub(super) async fn admit_build(
     {
         row = retried;
     }
-    match (&row.head, &row.files, &row.full) {
-        (Out::Pending { .. }, _, _) => state.head_wake.notify_one(),
-        (Out::Ready(_), Out::Pending { .. }, _) => state.files_wake.notify_one(),
-        (Out::Ready(_), _, Out::Pending { .. }) => state.full_wake.notify_one(),
-        _ => {}
+    // Head and Files build from the commit alone; Full once Head is ready.
+    if matches!(row.head, Out::Pending { .. }) {
+        state.head_wake.notify_one();
+    }
+    if matches!(row.files, Out::Pending { .. }) {
+        state.files_wake.notify_one();
+    }
+    if matches!(row.head, Out::Ready(_)) && matches!(row.full, Out::Pending { .. }) {
+        state.full_wake.notify_one();
     }
     Ok((row, inserted))
 }
@@ -1082,9 +1121,6 @@ mod tests {
         crate::ClonepackArtifacts {
             manifest: hash("manifest"),
             metadata_chunk: hash("metadata"),
-            skeleton_pack: hash("skeleton-pack"),
-            skeleton_idx: hash("skeleton-idx"),
-            prebuilt_index: hash("index"),
             idx_bundle: hash("idx-bundle"),
             commit: commit.to_string(),
             ..Default::default()
@@ -1125,8 +1161,9 @@ mod tests {
             head: out(info.head),
             files: out(info.files),
             full: out(info.full),
-            attempts: 0,
-            lease_until: None,
+            head_lease: Default::default(),
+            files_lease: Default::default(),
+            full_lease: Default::default(),
         }
     }
 
@@ -1181,7 +1218,7 @@ mod tests {
             .unwrap();
         state
             .control
-            .fail(&files, ExactResultKind::Files, "archive broke", None)
+            .fail(&files, "archive broke", None)
             .await
             .unwrap();
         state.control.release(&files).await.unwrap();
@@ -1300,6 +1337,43 @@ mod tests {
             call(&app, "GET", &format!("{commits}/main?kind=full"), None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(invalid["code"], "invalid_commit");
+    }
+
+    #[tokio::test]
+    async fn a_full_built_after_its_row_was_read_answers_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let repo_id = RepoId::github("acme/api");
+        let commit = "c".repeat(40);
+        state
+            .control
+            .admit(&repo_id, &commit, Some("refs/tags/v1"))
+            .await
+            .unwrap();
+        let stale = state
+            .control
+            .status(&repo_id, &commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stale.full.ready().is_none());
+        publish_head_and_full(&state, &repo_id, &commit, Some("refs/tags/v1"), None).await;
+        let (_, provider) = repo_from_path(&state, "github/acme/api").unwrap();
+        let provider = provider.clone();
+
+        let body = pending_body(
+            &state,
+            &repo_id,
+            &provider,
+            &stale,
+            ExactResultKind::Full,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["state"], "ready");
+        assert_eq!(body["commit"], commit);
+        assert!(body.get("top_up").is_none());
     }
 
     #[tokio::test]
@@ -1570,12 +1644,7 @@ mod tests {
         );
         state
             .control
-            .fail(
-                &claimed,
-                ExactResultKind::Head,
-                "retry later",
-                Some(Duration::from_secs(600)),
-            )
+            .fail(&claimed, "retry later", Some(Duration::from_secs(600)))
             .await
             .unwrap();
         state.control.release(&claimed).await.unwrap();
@@ -1676,6 +1745,17 @@ mod tests {
                     ..ready_artifacts(&commit, "full")
                 },
                 packs: vec![pack("f1"), pack("f2"), pack("f3")],
+                // f2 and f3 are history packs; f1 is the Head closure.
+                history_levels: ["f2", "f3"]
+                    .map(|name| crate::HistoryLevel {
+                        tip_commit: commit.clone(),
+                        packs: vec![crate::SizedPack {
+                            pack: format!("{name}-pack"),
+                            idx: format!("{name}-idx"),
+                            ..Default::default()
+                        }],
+                    })
+                    .to_vec(),
                 ..Default::default()
             }),
             files: Some(crate::FilesResult {
@@ -1718,6 +1798,10 @@ mod tests {
                 signed(1200, "f3-pack"),
             ])
         );
+        assert_eq!(
+            full.pack_idx_urls,
+            Some(vec![None, signed(1200, "f2-idx"), signed(1200, "f3-idx")])
+        );
         assert_eq!(full.midx_url, signed(1200, "full-midx"));
         assert_eq!(
             full.idx_bundle_url,
@@ -1755,6 +1839,7 @@ mod tests {
             ExactResultKind::Head,
         );
         assert_eq!(head.pack_chunk_urls, Some(vec![signed(1200, "h1-pack")]));
+        assert!(head.pack_idx_urls.is_none());
     }
 
     #[tokio::test]
@@ -1821,11 +1906,16 @@ mod tests {
                 .applied
         );
         state.control.release(&head_claim).await.unwrap();
-        // Full ready while Files is pending, as after a retry of a failed
-        // Files.
+        // Full ready while Files is still building.
         let background = state
             .control
             .claim("status-files", crate::control::Pool::Files, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        let full_claim = state
+            .control
+            .claim("status-full", crate::control::Pool::Full, lease)
             .await
             .unwrap()
             .unwrap();
@@ -1836,11 +1926,12 @@ mod tests {
         assert!(
             state
                 .control
-                .publish(&background, full)
+                .publish(&full_claim, full)
                 .await
                 .unwrap()
                 .applied
         );
+        state.control.release(&full_claim).await.unwrap();
 
         let status = build_repo_status(&state, &repo_id, false, None)
             .await
@@ -1855,7 +1946,7 @@ mod tests {
 
         state
             .control
-            .fail(&background, ExactResultKind::Files, "archive broke", None)
+            .fail(&background, "archive broke", None)
             .await
             .unwrap();
         let status = build_repo_status(&state, &repo_id, false, None)

@@ -173,6 +173,12 @@ fn h4_invalid_config_fails_before_side_effects() {
             "RIPCLONE_HEAD_REBASE_BYTES must be a non-negative integer",
         ),
         (
+            "bad Files tail percent",
+            "",
+            &[("RIPCLONE_FILES_TAIL_PERCENT", "25%")],
+            "RIPCLONE_FILES_TAIL_PERCENT must be a non-negative integer",
+        ),
+        (
             "bad S3 timeout",
             "",
             &[
@@ -334,4 +340,45 @@ fn h9_build_scratch_is_under_the_cache_and_cleared_at_start() {
         .ok();
     assert_eq!(listing(&target), origin.tree(&tip));
     assert_eq!(std::fs::read_dir(&system_tmp).unwrap().count(), 0);
+}
+
+/// H11: a scratch leftover the server cannot remove, as when a killed
+/// server's git child is still writing into it, does not stop the next start.
+/// The server logs it, starts, and builds in a scratch directory of its own;
+/// once the leftover can go, the next start removes it.
+#[test]
+fn h11_a_scratch_leftover_in_use_does_not_stop_startup() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new();
+    let origin = world.origin("acme", "h11");
+    let tip = origin.commit(&[("a.txt", "a\n"), ("b/c.txt", "c\n")], "A");
+    origin.publish();
+    let scratch = world.path("server").join("cache").join("tmp");
+    let stuck = scratch.join(".tmpkilled");
+    std::fs::create_dir_all(stuck.join("pack")).unwrap();
+    std::fs::write(stuck.join("pack").join("pack-x.pack"), b"x").unwrap();
+    let mode = |mode| {
+        std::fs::set_permissions(stuck.join("pack"), std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    mode(0o555);
+
+    let mut server = world.server(&[]);
+    assert!(
+        server.log().contains("left stale scratch"),
+        "{}",
+        server.log()
+    );
+    assert!(stuck.join("pack").join("pack-x.pack").exists());
+    world.cli(&server, &["add", "acme/h11", "--wait"]).ok();
+    let target = world.target("h11");
+    world
+        .cli(&server, &["clone", "acme/h11", target.to_str().unwrap()])
+        .ok();
+    assert_eq!(listing(&target), origin.tree(&tip));
+
+    mode(0o755);
+    server.restart();
+    assert!(!stuck.exists(), "leftover kept after it could go");
+    let runs: Vec<_> = std::fs::read_dir(&scratch).unwrap().flatten().collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
 }

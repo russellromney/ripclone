@@ -9,7 +9,8 @@
 //! add `FOR UPDATE SKIP LOCKED` to the claim subquery.
 
 use super::{
-    AddedRepo, BuildRow, Claim, Clock, ControlPathLock, ControlStore, Out, Output, Pool, Published,
+    AddedRepo, BuildRow, Claim, Clock, ControlPathLock, ControlStore, Lease, Out, Output, Pool,
+    Published,
 };
 use crate::provider::RepoId;
 use crate::repo_config::RepoConfig;
@@ -23,11 +24,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema/sqlite.sql");
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, \
     head_state, head_output, head_error, files_state, files_output, files_error, \
-    full_state, full_output, full_error, attempts, lease_until";
+    full_state, full_output, full_error, head_attempts, head_lease_until, \
+    files_attempts, files_lease_until, full_attempts, full_lease_until";
+
+const KINDS: [ExactResultKind; 3] = [
+    ExactResultKind::Head,
+    ExactResultKind::Files,
+    ExactResultKind::Full,
+];
 
 pub struct SqliteControlStore {
     pool: SqlitePool,
@@ -38,6 +46,13 @@ pub struct SqliteControlStore {
     /// compares the two.
     path: PathBuf,
     file: FileId,
+    /// Prefix of every lease owner this store writes, unique to this open
+    /// (`{pid}-{nanos}:`, digits and hex only, so it is safe inline in SQL).
+    /// A lease with this prefix stays this store's until it is released,
+    /// even past its expiry: a process that stalled longer than a lease
+    /// still runs those builds, so it must not claim them again. Another
+    /// store, a later or concurrent process, may take an expired one.
+    instance: String,
     _ownership: ControlPathLock,
 }
 
@@ -91,7 +106,10 @@ impl SqliteControlStore {
             .close()
             .await
             .context("close control database setup connection")?;
-        let pool = SqlitePool::connect_with(options)
+        // The file exists now. A pool connection opened after it is deleted
+        // must fail, not create an empty database that readiness would then
+        // report as a replacement.
+        let pool = SqlitePool::connect_with(options.create_if_missing(false))
             .await
             .with_context(|| format!("open control database {}", path.display()))?;
         let file =
@@ -102,14 +120,39 @@ impl SqliteControlStore {
             clock,
             path: path.to_path_buf(),
             file,
+            instance: instance_id(),
             _ownership: ownership,
         })
+    }
+
+    /// SQL true when `{alias}{k}`'s lease is held: it has not expired, or
+    /// this store holds it. `$1` is now.
+    fn lease_held(&self, alias: &str, k: &str) -> String {
+        let owner = format!("{alias}{k}_lease_owner");
+        let instance = &self.instance;
+        format!(
+            "({owner} IS NOT NULL AND ({alias}{k}_lease_until > $1
+               OR substr({owner}, 1, {len}) = '{instance}'))",
+            len = instance.len()
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+/// `{pid}-{nanos}:`, distinct for every store opened, in this process or
+/// another.
+fn instance_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static OPENED: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let opened = OPENED.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos:x}-{opened}:", std::process::id())
 }
 
 async fn initialize(connection: &mut SqliteConnection, path: &Path) -> Result<()> {
@@ -191,6 +234,27 @@ fn decode_out<T: serde::de::DeserializeOwned>(
     })
 }
 
+fn decode_lease(row: &SqliteRow, kind: ExactResultKind) -> Result<Lease> {
+    let prefix = column_prefix(kind);
+    Ok(Lease {
+        attempts: row.try_get(format!("{prefix}_attempts").as_str())?,
+        until: row.try_get(format!("{prefix}_lease_until").as_str())?,
+    })
+}
+
+/// SET clauses that fail a row's pending Full with `error` (an SQL
+/// expression) when `when` (an SQL condition) holds: Full is built from
+/// Head, so a failed Head takes it along. Files does not need Head. SET
+/// expressions read the row as it was before the update.
+fn head_failure_cascade(when: &str, error: &str) -> String {
+    format!(
+        ", full_state = CASE WHEN {when} AND full_state = 'pending'
+             THEN 'failed' ELSE full_state END,
+           full_error = CASE WHEN {when} AND full_state = 'pending'
+             THEN {error} ELSE full_error END"
+    )
+}
+
 fn decode_build(row: &SqliteRow) -> Result<BuildRow> {
     Ok(BuildRow {
         commit: row.try_get("commit_id")?,
@@ -200,8 +264,9 @@ fn decode_build(row: &SqliteRow) -> Result<BuildRow> {
         head: decode_out(row, ExactResultKind::Head)?,
         files: decode_out(row, ExactResultKind::Files)?,
         full: decode_out(row, ExactResultKind::Full)?,
-        attempts: row.try_get("attempts")?,
-        lease_until: row.try_get("lease_until")?,
+        head_lease: decode_lease(row, ExactResultKind::Head)?,
+        files_lease: decode_lease(row, ExactResultKind::Files)?,
+        full_lease: decode_lease(row, ExactResultKind::Full)?,
     })
 }
 
@@ -289,16 +354,21 @@ impl ControlStore for SqliteControlStore {
     }
 
     async fn retry(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>> {
+        // Each failed kind returns to pending with fresh attempts.
+        let reset = KINDS
+            .map(|kind| {
+                let k = column_prefix(kind);
+                format!(
+                    "{k}_state = CASE WHEN {k}_state = 'failed' THEN 'pending' ELSE {k}_state END,
+                     {k}_error = CASE WHEN {k}_state = 'failed' THEN NULL ELSE {k}_error END,
+                     {k}_attempts = CASE WHEN {k}_state = 'failed' THEN 0 ELSE {k}_attempts END,
+                     {k}_retry_after = CASE WHEN {k}_state = 'failed'
+                       THEN 0 ELSE {k}_retry_after END"
+                )
+            })
+            .join(",\n");
         let row = sqlx::query(&format!(
-            "UPDATE builds SET
-               head_state = CASE WHEN head_state = 'failed' THEN 'pending' ELSE head_state END,
-               head_error = CASE WHEN head_state = 'failed' THEN NULL ELSE head_error END,
-               files_state = CASE WHEN files_state = 'failed' THEN 'pending' ELSE files_state END,
-               files_error = CASE WHEN files_state = 'failed' THEN NULL ELSE files_error END,
-               full_state = CASE WHEN full_state = 'failed' THEN 'pending' ELSE full_state END,
-               full_error = CASE WHEN full_state = 'failed' THEN NULL ELSE full_error END,
-               attempts = 0,
-               retry_after = 0
+            "UPDATE builds SET {reset}
              WHERE repo = $1 AND commit_id = $2
                AND (head_state = 'failed' OR files_state = 'failed' OR full_state = 'failed')
              RETURNING {COLUMNS}"
@@ -316,43 +386,44 @@ impl ControlStore for SqliteControlStore {
 
     async fn claim(&self, owner: &str, pool: Pool, lease: Duration) -> Result<Option<Claim>> {
         let now = self.clock.now();
-        // A Full waits for every older Full of its repo, so Fulls publish in
-        // admission order and each can build on the history before it.
-        let (kind, predicate) = match pool {
-            Pool::Head => ("head", "head_state = 'pending'"),
-            Pool::Files => ("files", "head_state = 'ready' AND files_state = 'pending'"),
-            Pool::Full => (
-                "full",
-                "head_state = 'ready' AND full_state = 'pending' AND files_state <> 'pending'
+        let owner = format!("{}{owner}", self.instance);
+        let k = column_prefix(pool.kind());
+        // Head and Files build from the commit alone. Full is built from
+        // Head, and waits for every older Full of its repo, so Fulls publish
+        // in admission order and each can build on the history before it.
+        let needs = match pool {
+            Pool::Head | Pool::Files => "",
+            Pool::Full => {
+                "AND head_state = 'ready'
                  AND NOT EXISTS (
                    SELECT 1 FROM builds AS older
                    WHERE older.repo = b.repo AND older.full_state = 'pending'
-                     AND older.seq < b.seq)",
-            ),
+                     AND older.seq < b.seq)"
+            }
         };
-        // The oldest claimable row. A repo that already holds a live lease
-        // of this kind is skipped, so one repo cannot take every slot of a
+        let held = self.lease_held("", k);
+        let busy_held = self.lease_held("busy.", k);
+        // The oldest claimable row. A repo that already holds a lease of
+        // this kind is skipped, so one repo cannot take every slot of a
         // pool. `$1` is now, `$2` the attempt limit.
         let candidate = format!(
             "SELECT repo, commit_id FROM builds AS b
-             WHERE {predicate}
-               AND (lease_until IS NULL OR lease_until <= $1)
-               AND retry_after <= $1
-               AND attempts < $2
+             WHERE {k}_state = 'pending' {needs}
+               AND NOT {held}
+               AND {k}_retry_after <= $1
+               AND {k}_attempts < $2
                AND NOT EXISTS (
                  SELECT 1 FROM builds AS busy
-                 WHERE busy.repo = b.repo AND busy.lease_kind = '{kind}'
-                   AND busy.lease_until > $1)
+                 WHERE busy.repo = b.repo AND {busy_held})
              ORDER BY seq
              LIMIT 1"
         );
-        // Rows whose last allowed attempt ended without a result.
-        const EXHAUSTED: &str = "attempts >= $2
-            AND (lease_until IS NULL OR lease_until <= $1)
-            AND (head_state = 'pending' OR files_state = 'pending' OR full_state = 'pending')";
+        // Outputs of this kind whose last allowed attempt ended without a
+        // result.
+        let exhausted = format!("{k}_state = 'pending' AND {k}_attempts >= $2 AND NOT {held}");
         // Idle polls stop here, on a read, without taking the write lock.
         let work: bool = sqlx::query_scalar(&format!(
-            "SELECT EXISTS (SELECT 1 FROM builds WHERE {EXHAUSTED}) OR EXISTS ({candidate})"
+            "SELECT EXISTS (SELECT 1 FROM builds WHERE {exhausted}) OR EXISTS ({candidate})"
         ))
         .bind(now)
         .bind(self.max_attempts)
@@ -367,36 +438,24 @@ impl ControlStore for SqliteControlStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .context("begin claim")?;
-        // Give up on exhausted rows. The current phase's output fails: a
-        // pending Head takes Files and Full with it; a pending Files fails
-        // alone and the Full phase starts with fresh attempts. The lease is
-        // cleared so a late publish cannot land. (SET expressions read the
-        // row as it was before the update.)
+        // Give up on exhausted outputs of this kind. A Head takes the
+        // pending Full with it; a Files or Full fails alone. The
+        // lease is cleared so a late publish cannot land.
+        let cascade = if pool == Pool::Head {
+            head_failure_cascade(
+                "1",
+                "'head failed: ' || $3 || COALESCE(': ' || head_error, '')",
+            )
+        } else {
+            String::new()
+        };
         sqlx::query(&format!(
             "UPDATE builds SET
-               head_state = CASE WHEN head_state = 'pending' THEN 'failed' ELSE head_state END,
-               head_error = CASE WHEN head_state = 'pending'
-                 THEN $3 || COALESCE(': ' || head_error, '') ELSE head_error END,
-               files_state = CASE WHEN files_state = 'pending' THEN 'failed' ELSE files_state END,
-               files_error = CASE
-                 WHEN files_state <> 'pending' THEN files_error
-                 WHEN head_state = 'pending' THEN 'head failed: ' || $3 || COALESCE(': ' || head_error, '')
-                 ELSE $3 || COALESCE(': ' || files_error, '') END,
-               full_state = CASE
-                 WHEN full_state <> 'pending' THEN full_state
-                 WHEN head_state = 'ready' AND files_state = 'pending' THEN full_state
-                 ELSE 'failed' END,
-               full_error = CASE
-                 WHEN full_state <> 'pending' THEN full_error
-                 WHEN head_state = 'pending' THEN 'head failed: ' || $3 || COALESCE(': ' || head_error, '')
-                 WHEN files_state = 'pending' THEN full_error
-                 ELSE $3 || COALESCE(': ' || full_error, '') END,
-               attempts = CASE WHEN head_state = 'ready' AND files_state = 'pending'
-                 THEN 0 ELSE attempts END,
-               lease_owner = NULL,
-               lease_until = NULL,
-               lease_kind = NULL
-             WHERE {EXHAUSTED}"
+               {k}_state = 'failed',
+               {k}_error = $3 || COALESCE(': ' || {k}_error, ''),
+               {k}_lease_owner = NULL,
+               {k}_lease_until = NULL{cascade}
+             WHERE {exhausted}"
         ))
         .bind(now)
         .bind(self.max_attempts)
@@ -405,14 +464,14 @@ impl ControlStore for SqliteControlStore {
         .await
         .context("give up exhausted builds")?;
         let row = sqlx::query(&format!(
-            "UPDATE builds SET lease_owner = $3, lease_until = $4, lease_kind = '{kind}',
-               attempts = attempts + 1
+            "UPDATE builds SET {k}_lease_owner = $3, {k}_lease_until = $4,
+               {k}_attempts = {k}_attempts + 1
              WHERE (repo, commit_id) = ({candidate})
              RETURNING {COLUMNS}"
         ))
         .bind(now)
         .bind(self.max_attempts)
-        .bind(owner)
+        .bind(&owner)
         .bind(now.saturating_add(duration_secs(lease)))
         .fetch_optional(&mut *tx)
         .await
@@ -423,21 +482,22 @@ impl ControlStore for SqliteControlStore {
         };
         Ok(Some(Claim {
             repo: RepoId::from_storage_key(&row.try_get::<String, _>("repo")?)?,
-            owner: owner.to_string(),
+            owner,
+            pool,
             build: decode_build(&row)?,
         }))
     }
 
     async fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool> {
-        let renewed = sqlx::query(
-            "UPDATE builds SET lease_until = $1
-             WHERE repo = $2 AND commit_id = $3 AND lease_owner = $4 AND lease_until > $5",
-        )
+        let k = column_prefix(claim.kind());
+        let renewed = sqlx::query(&format!(
+            "UPDATE builds SET {k}_lease_until = $1
+             WHERE repo = $2 AND commit_id = $3 AND {k}_lease_owner = $4"
+        ))
         .bind(self.clock.now().saturating_add(duration_secs(lease)))
         .bind(claim.repo.storage_key())
         .bind(&claim.build.commit)
         .bind(&claim.owner)
-        .bind(self.clock.now())
         .execute(&self.pool)
         .await
         .context("renew build lease")?
@@ -472,28 +532,34 @@ impl ControlStore for SqliteControlStore {
             "invalid {kind} result for {commit}"
         );
         let data = data.with_context(|| format!("encode {kind} output"))?;
-        let prefix = column_prefix(kind);
-        // Head and Files end their phase; the next phase starts its own
-        // attempts. An expired lease publishes nothing, even before another
-        // worker claims the row.
-        let next_phase = match kind {
-            ExactResultKind::Head => ", parent = $6, attempts = 0",
-            ExactResultKind::Files => ", attempts = 0",
-            ExactResultKind::Full => "",
+        let not_applied = Published {
+            applied: false,
+            row_complete: false,
         };
+        // A claim holds only its own kind's lease.
+        if kind != claim.kind() {
+            return Ok(not_applied);
+        }
+        let k = column_prefix(kind);
+        let parent_column = if kind == ExactResultKind::Head {
+            ", parent = $5"
+        } else {
+            ""
+        };
+        // The owner fences a lost lease. An expired one nobody took publishes:
+        // the output is the same whoever builds it.
         let sql = format!(
-            "UPDATE builds SET {prefix}_state = 'ready', {prefix}_output = $1,
-               {prefix}_error = NULL{next_phase}
-             WHERE repo = $2 AND commit_id = $3 AND lease_owner = $4
-               AND lease_until > $5 AND {prefix}_state <> 'ready'
+            "UPDATE builds SET {k}_state = 'ready', {k}_output = $1,
+               {k}_error = NULL{parent_column}
+             WHERE repo = $2 AND commit_id = $3 AND {k}_lease_owner = $4
+               AND {k}_state = 'pending'
              RETURNING head_state, files_state, full_state"
         );
         let mut query = sqlx::query_as::<_, (String, String, String)>(&sql)
             .bind(data)
             .bind(claim.repo.storage_key())
             .bind(commit)
-            .bind(&claim.owner)
-            .bind(self.clock.now());
+            .bind(&claim.owner);
         if kind == ExactResultKind::Head {
             query = query.bind(parent);
         }
@@ -506,49 +572,29 @@ impl ControlStore for SqliteControlStore {
                 applied: true,
                 row_complete: head == "ready" && files == "ready" && full == "ready",
             },
-            None => Published {
-                applied: false,
-                row_complete: false,
-            },
+            None => not_applied,
         })
     }
 
-    async fn fail(
-        &self,
-        claim: &Claim,
-        kind: ExactResultKind,
-        error: &str,
-        retry_after: Option<Duration>,
-    ) -> Result<()> {
-        let prefix = column_prefix(kind);
+    async fn fail(&self, claim: &Claim, error: &str, retry_after: Option<Duration>) -> Result<()> {
+        let kind = claim.kind();
+        let k = column_prefix(kind);
         // `$4` is the retry time, NULL for a permanent failure. The output
         // fails when there is no retry or no attempt left.
-        let gives_up = "($4 IS NULL OR attempts >= $5)";
-        // A Head that fails takes the pending Files and Full with it. A Files
-        // that fails ends its phase: Full starts with fresh attempts.
-        let cascade = match kind {
-            ExactResultKind::Head => format!(
-                ", files_state = CASE WHEN {gives_up} AND files_state = 'pending'
-                     THEN 'failed' ELSE files_state END,
-                   files_error = CASE WHEN {gives_up} AND files_state = 'pending'
-                     THEN $8 ELSE files_error END,
-                   full_state = CASE WHEN {gives_up} AND full_state = 'pending'
-                     THEN 'failed' ELSE full_state END,
-                   full_error = CASE WHEN {gives_up} AND full_state = 'pending'
-                     THEN $8 ELSE full_error END"
-            ),
-            ExactResultKind::Files => {
-                format!(", attempts = CASE WHEN {gives_up} THEN 0 ELSE attempts END")
-            }
-            ExactResultKind::Full => String::new(),
+        let gives_up = format!("($4 IS NULL OR {k}_attempts >= $5)");
+        // A Head that fails takes the pending Full with it.
+        let cascade = if kind == ExactResultKind::Head {
+            head_failure_cascade(&gives_up, "$7")
+        } else {
+            String::new()
         };
         let sql = format!(
             "UPDATE builds SET
-               {prefix}_state = CASE WHEN {gives_up} THEN 'failed' ELSE 'pending' END,
-               {prefix}_error = $1,
-               retry_after = CASE WHEN {gives_up} THEN retry_after ELSE $4 END{cascade}
-             WHERE repo = $2 AND commit_id = $3 AND lease_owner = $6
-               AND lease_until > $7 AND {prefix}_state = 'pending'"
+               {k}_state = CASE WHEN {gives_up} THEN 'failed' ELSE 'pending' END,
+               {k}_error = $1,
+               {k}_retry_after = CASE WHEN {gives_up} THEN {k}_retry_after ELSE $4 END{cascade}
+             WHERE repo = $2 AND commit_id = $3 AND {k}_lease_owner = $6
+               AND {k}_state = 'pending'"
         );
         let mut query = sqlx::query(&sql)
             .bind(error)
@@ -556,8 +602,7 @@ impl ControlStore for SqliteControlStore {
             .bind(&claim.build.commit)
             .bind(retry_after.map(|delay| self.clock.now().saturating_add(duration_secs(delay))))
             .bind(self.max_attempts)
-            .bind(&claim.owner)
-            .bind(self.clock.now());
+            .bind(&claim.owner);
         if kind == ExactResultKind::Head {
             query = query.bind(format!("head failed: {error}"));
         }
@@ -569,10 +614,11 @@ impl ControlStore for SqliteControlStore {
     }
 
     async fn release(&self, claim: &Claim) -> Result<()> {
-        sqlx::query(
-            "UPDATE builds SET lease_owner = NULL, lease_until = NULL, lease_kind = NULL
-             WHERE repo = $1 AND commit_id = $2 AND lease_owner = $3",
-        )
+        let k = column_prefix(claim.kind());
+        sqlx::query(&format!(
+            "UPDATE builds SET {k}_lease_owner = NULL, {k}_lease_until = NULL
+             WHERE repo = $1 AND commit_id = $2 AND {k}_lease_owner = $3"
+        ))
         .bind(claim.repo.storage_key())
         .bind(&claim.build.commit)
         .bind(&claim.owner)
@@ -584,8 +630,12 @@ impl ControlStore for SqliteControlStore {
 
     async fn reset_leases(&self) -> Result<u64> {
         Ok(sqlx::query(
-            "UPDATE builds SET lease_owner = NULL, lease_until = NULL, lease_kind = NULL
-             WHERE lease_owner IS NOT NULL",
+            "UPDATE builds SET
+               head_lease_owner = NULL, head_lease_until = NULL,
+               files_lease_owner = NULL, files_lease_until = NULL,
+               full_lease_owner = NULL, full_lease_until = NULL
+             WHERE head_lease_owner IS NOT NULL OR files_lease_owner IS NOT NULL
+               OR full_lease_owner IS NOT NULL",
         )
         .execute(&self.pool)
         .await
@@ -820,6 +870,25 @@ mod tests {
 
         std::fs::rename(&moved, &path).unwrap();
         store.health().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_pool_never_recreates_a_deleted_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let store = open(&path).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // Hold more connections than the pool has open, so it opens new ones.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            if let Ok(connection) = store.pool().acquire().await {
+                held.push(connection);
+            }
+        }
+        assert!(!path.exists(), "the pool created a fresh control database");
+        drop(held);
+        let error = store.health().await.unwrap_err().to_string();
+        assert!(error.contains("was deleted"), "{error}");
     }
 
     #[tokio::test]

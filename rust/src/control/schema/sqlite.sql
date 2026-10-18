@@ -17,46 +17,60 @@ CREATE TABLE repo_config (
   data TEXT NOT NULL                   -- serde JSON of RepoConfig
 );
 
--- One row per (repo, commit). Each output kind is pending | ready | failed;
--- "building" means lease_until is in the future. A ready output is never
--- rewritten. attempts counts claims in the current phase (Head, Files, then
--- Full); publishing Head and settling Files reset it. seq is the admission
--- order: strictly increasing, assigned once at admit, never reused. Claims
--- and the per-repo Full order use it, so same-second admits keep their order.
+-- One row per (repo, commit). Each output kind (head, files, full) is
+-- pending | ready | failed and has its own lease, attempts and retry time,
+-- so one row's outputs build at the same time. A kind is building
+-- while its lease_until is in the future. A ready output is never
+-- rewritten. A kind's attempts counts its claims since admission or the
+-- last retry. seq is the admission order: strictly increasing, assigned
+-- once at admit, never reused. Claims and the per-repo Full order use it,
+-- so same-second admits keep their order.
 CREATE TABLE builds (
-  repo         TEXT NOT NULL,          -- RepoId::storage_key()
-  commit_id    TEXT NOT NULL,
-  seq          INTEGER NOT NULL,       -- admission order (MAX(seq) + 1 at admit)
-  ref_name     TEXT,                   -- full ref (refs/heads/main); NULL for SHA-only admits
-  parent       TEXT,                   -- written by publish(Head)
-  created_at   INTEGER NOT NULL,       -- epoch seconds
-  head_state   TEXT NOT NULL DEFAULT 'pending',
-  head_output  TEXT,
-  head_error   TEXT,
-  files_state  TEXT NOT NULL DEFAULT 'pending',
-  files_output TEXT,
-  files_error  TEXT,
-  full_state   TEXT NOT NULL DEFAULT 'pending',
-  full_output  TEXT,
-  full_error   TEXT,
-  attempts     INTEGER NOT NULL DEFAULT 0,
-  lease_owner  TEXT,
-  lease_until  INTEGER,
-  lease_kind   TEXT,                   -- head | files | full: the pool that holds the lease
-  retry_after  INTEGER NOT NULL DEFAULT 0,
+  repo               TEXT NOT NULL,    -- RepoId::storage_key()
+  commit_id          TEXT NOT NULL,
+  seq                INTEGER NOT NULL, -- admission order (MAX(seq) + 1 at admit)
+  ref_name           TEXT,             -- full ref (refs/heads/main); NULL for SHA-only admits
+  parent             TEXT,             -- written by publish(Head)
+  created_at         INTEGER NOT NULL, -- epoch seconds
+  head_state         TEXT NOT NULL DEFAULT 'pending',
+  head_output        TEXT,
+  head_error         TEXT,
+  head_attempts      INTEGER NOT NULL DEFAULT 0,
+  head_retry_after   INTEGER NOT NULL DEFAULT 0,
+  head_lease_owner   TEXT,
+  head_lease_until   INTEGER,
+  files_state        TEXT NOT NULL DEFAULT 'pending',
+  files_output       TEXT,
+  files_error        TEXT,
+  files_attempts     INTEGER NOT NULL DEFAULT 0,
+  files_retry_after  INTEGER NOT NULL DEFAULT 0,
+  files_lease_owner  TEXT,
+  files_lease_until  INTEGER,
+  full_state         TEXT NOT NULL DEFAULT 'pending',
+  full_output        TEXT,
+  full_error         TEXT,
+  full_attempts      INTEGER NOT NULL DEFAULT 0,
+  full_retry_after   INTEGER NOT NULL DEFAULT 0,
+  full_lease_owner   TEXT,
+  full_lease_until   INTEGER,
   PRIMARY KEY (repo, commit_id)
 );
 
 CREATE UNIQUE INDEX builds_seq ON builds (seq);
 CREATE INDEX builds_by_ref ON builds (repo, ref_name, seq);
 
--- Claims and the give-up pass read only unfinished rows: every pool's
--- predicate implies this index's WHERE, so finished rows never enter a
--- claim's scan however many accumulate.
-CREATE INDEX builds_unfinished ON builds (attempts)
-  WHERE head_state = 'pending' OR files_state = 'pending' OR full_state = 'pending';
+-- A kind's claims and give-up pass read only rows where that kind is
+-- pending: each predicate implies its index's WHERE, so finished rows never
+-- enter a scan however many accumulate.
+CREATE INDEX builds_head_pending ON builds (seq) WHERE head_state = 'pending';
+CREATE INDEX builds_files_pending ON builds (seq) WHERE files_state = 'pending';
+CREATE INDEX builds_full_pending ON builds (seq) WHERE full_state = 'pending';
 -- A Full's wait for older pending Fulls of its repo.
-CREATE INDEX builds_full_pending ON builds (repo, seq) WHERE full_state = 'pending';
+CREATE INDEX builds_full_order ON builds (repo, seq) WHERE full_state = 'pending';
 -- A claim skips a repo that already holds a live lease of the same kind.
-CREATE INDEX builds_leased ON builds (repo, lease_kind, lease_until)
-  WHERE lease_until IS NOT NULL;
+CREATE INDEX builds_head_leased ON builds (repo, head_lease_until)
+  WHERE head_lease_until IS NOT NULL;
+CREATE INDEX builds_files_leased ON builds (repo, files_lease_until)
+  WHERE files_lease_until IS NOT NULL;
+CREATE INDEX builds_full_leased ON builds (repo, full_lease_until)
+  WHERE full_lease_until IS NOT NULL;

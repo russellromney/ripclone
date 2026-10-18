@@ -174,12 +174,10 @@ pub struct ArchiveFrame {
 pub struct ClonepackArtifacts {
     pub manifest: String,
     pub metadata_chunk: String,
-    pub skeleton_pack: String,
-    pub skeleton_idx: String,
-    pub prebuilt_index: String,
     /// CAS hash of the pre-built multi-pack-index over this variant's packs.
     pub midx: String,
-    /// CAS hash of the required concatenated idx bundle for this variant's packs.
+    /// CAS hash of the concatenated idx bundle of a Head's packs. Empty for
+    /// Full, whose history packs carry their own idx, and for Files.
     pub idx_bundle: String,
     /// The commit this variant's clonepack is built for. Complete artifacts
     /// always carry this identity explicitly.
@@ -197,6 +195,10 @@ pub struct HeadResult {
     pub base_commit: String,
     #[serde(default)]
     pub base_packs: Vec<SizedPack>,
+    /// The packs after the base: one level per Head since the base, each
+    /// holding only the objects no earlier Head pack has.
+    #[serde(default)]
+    pub levels: Vec<SizedPack>,
 }
 
 /// Published Full artifacts for one exact commit.
@@ -207,19 +209,22 @@ pub struct FullResult {
     pub packs: Vec<PackArtifact>,
     #[serde(default)]
     pub history_levels: Vec<HistoryLevel>,
-    /// Compacted Head packs for this commit, written when its Head delta grew
-    /// past `RIPCLONE_HEAD_REBASE_BYTES`. A child's Head builds its delta
-    /// against these instead of the parent Head's base.
+    /// Compacted Head packs for this commit, written when its Head levels grew
+    /// past `RIPCLONE_HEAD_REBASE_BYTES`. A child's Head adds its level on
+    /// these instead of the parent Head's packs.
     #[serde(default)]
     pub head_base: Option<HeadBase>,
 }
 
-/// A Head pack set that later Heads build deltas against. Lengths are kept so
+/// A Head pack set that later Heads add levels on. Lengths are kept so
 /// a manifest can list the packs without reading them.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HeadBase {
     pub commit: String,
     pub packs: Vec<SizedPack>,
+    /// Levels on top of `packs`, which a child's Head keeps and adds one to.
+    #[serde(default)]
+    pub levels: Vec<SizedPack>,
 }
 
 /// Published Files artifacts for one exact commit.
@@ -230,6 +235,11 @@ pub struct FilesResult {
     pub archive_chunks: Vec<String>,
     #[serde(default)]
     pub archive_frames: Vec<ArchiveFrame>,
+    /// The packed archive this one is a tail on, when it is one: see
+    /// `ArchiveBuilder::build_tail_into_cas`. A later build that compacts
+    /// the tails builds on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<Box<FilesResult>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -258,15 +268,7 @@ pub(crate) fn exact_output_artifacts_ready(
         return false;
     }
 
-    match result {
-        ExactResultKind::Head | ExactResultKind::Full => {
-            valid_hash(&artifacts.skeleton_pack)
-                && valid_hash(&artifacts.skeleton_idx)
-                && valid_hash(&artifacts.prebuilt_index)
-                && valid_hash(&artifacts.idx_bundle)
-        }
-        ExactResultKind::Files => true,
-    }
+    result != ExactResultKind::Head || valid_hash(&artifacts.idx_bundle)
 }
 
 pub(crate) fn exact_output_ready(info: &RefInfo, result: ExactResultKind, commit: &str) -> bool {

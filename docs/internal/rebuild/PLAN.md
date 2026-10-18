@@ -63,13 +63,15 @@ replaced, so several half-models now run at once:
    builds(repo, commit, seq, parent, ref_name, created_at,   -- ref_name: the ref that admitted it, for top-up
           head_state, head_manifest, files_state, files_manifest,
           full_state, full_manifest,          -- state: pending | ready | failed
-          attempts, error, lease_owner, lease_until, lease_kind, retry_after)
+          {head,files,full}_{attempts, error, lease_owner, lease_until, retry_after})
+                                              -- each output kind has its own lease
    ```
    - admit: `INSERT OR IGNORE` with `seq`, a strictly increasing admission
      number; an explicit retry resets failed outputs to pending.
-   - claim: one `UPDATE ... RETURNING` on the lowest-`seq` row with pending
-     outputs whose lease is empty or expired and whose `retry_after` has
-     passed, skipping repos that already hold a live lease of that kind.
+   - claim(kind): one `UPDATE ... RETURNING` on the lowest-`seq` row with
+     that kind pending, whose lease of that kind is empty or expired and whose
+     `retry_after` of that kind has passed, skipping repos that already hold a
+     live lease of that kind.
    - renew: extend `lease_until` (short lease, for example 60 s). An expired
      lease is lost: renew, publish and fail refuse it, and the worker cancels
      the build.
@@ -80,8 +82,8 @@ replaced, so several half-models now run at once:
    - status: read the row. One place.
    No jobs table, no workers table, no size classes, no key strings, no stored
    credentials.
-5. **Bounded sequencing.** Each commit's build runs Head, then Files, then
-   Full. Three process-wide caps: Head, Files and Full slots, one pool each, so
+5. **Bounded sequencing.** Each commit's Head and Files build at the same
+   time, and Full starts once Head is ready. Three process-wide caps: Head, Files and Full slots, one pool each, so
    a long Full never holds back another commit's Files. Each pool claims in
    admission order, and a repo holds at most one lease per pool.
 6. **Published outputs are immutable.** Head compaction, if kept, applies to the
@@ -95,7 +97,9 @@ replaced, so several half-models now run at once:
    it runs only while no build reads. No reachability bitmap is written: a
    cold Full packs history with a plain `pack-objects --revs` walk. The
    mirror's `attr.tree` names the empty tree, so that walk does not resolve
-   the mirror's missing `HEAD` once per object.
+   the mirror's missing `HEAD` once per object. When the cold Full's commit
+   was the first fetch into an empty mirror, the pack that fetch wrote is
+   exactly its history, and the Full stores that pack instead.
 
 ## Keep (reuse with little change)
 
@@ -251,7 +255,10 @@ Each step is a separate PR with green CI. No step mixes a cut with a redo.
    migration (there are no users). The Head republish after Full compaction
    is replaced here by an immutable scheme: Full(A) records a compacted Head
    base that the next Head(B) builds its delta against, because cutting the
-   republish alone lets the Head delta grow without bound.
+   republish alone lets the Head delta grow without bound. (2026-10-16: each
+   Head now adds one level of only new objects instead of a cumulative delta,
+   and Files adds tail chunks instead of rewriting bundles; both compact past
+   a quarter of their compact size.)
    **Done:** #202 (`ControlStore` and `builds`), #203 (`POST builds`, `GET
    commits`), #207 (bitmap writes off the request lock).
 4. **Client.** Resolver, download layer, install plan.

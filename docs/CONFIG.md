@@ -39,6 +39,7 @@ the token. Hashing gives no protection if the hash leaks.
 | `--no-metrics`, `RIPCLONE_NO_METRICS` | Never send the post-clone metrics report. |
 | `RIPCLONE_POLL_MS` | Longest wait between polls while an output the CLI needs is pending, default 2000. Polls start at 100 ms and double up to this cap. A command stops after 40 polls. |
 | `RIPCLONE_FETCH_MAX_ATTEMPTS`, `RIPCLONE_FETCH_BACKOFF_MS` | Attempts per artifact download and the first retry delay, defaults 3 and 100 ms. |
+| `RIPCLONE_DOWNLOAD_PART_BYTES` | Size of each range when a large artifact is downloaded as 16 parallel ranges, default 16 MiB. Artifacts of at least four parts download this way. |
 | `RIPCLONE_FSYNC` | `1` or `true`: flush the tree, index, and rename before reporting success. Off by default, like `git checkout`. |
 | `--bench`, `RIPCLONE_BENCH` | Print a per-phase timing report after a clone. |
 | `--quiet`, `-q` | No progress line or notes on stderr during a clone; warnings and errors still print. |
@@ -88,9 +89,11 @@ the token `ripclone login` saved in `~/.config/ripclone/tokens.json`.
 | `RIPCLONE_FILES_SLOTS` | Builds that run Files at once. Default: a quarter of the CPU cores, at least 2. `0` pauses Files; Head and Full still build. |
 | `RIPCLONE_FULL_SLOTS` | Builds that run Full at once. Default: a quarter of the CPU cores, at least 2. `0` pauses Full; Head and Files still build. A long Full never holds back another commit's Files. |
 | `RIPCLONE_BUILD_RETRY_BASE_MS` | First retry delay after a retryable build failure, default 2000. Each retry doubles it, up to 300 seconds. |
-| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per phase (Head, then Files, then Full) before the output fails, default 5. At least 1. |
+| `RIPCLONE_BUILD_MAX_ATTEMPTS` | Build attempts per output before it fails, default 5. Head, Files and Full each count their own. At least 1. |
+| `RIPCLONE_BUILD_LEASE_SECS` | How long a build holds its output without renewing, default 60, at least 3. A build renews every third of it. A server never takes back its own builds, so one that stalls (a sleeping laptop, a stopped process) carries on when it resumes. Only another server may take a lease that expired. |
 | `RIPCLONE_LSM_MAX_LEVELS` | Most history levels a Full keeps before merging the smallest neighbors, default 16. |
-| `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head packs past their base reach this size, its Full build compacts them into a new base for later Heads. Default 128 MiB. |
+| `RIPCLONE_HEAD_REBASE_BYTES` | When a commit's Head levels past their base reach this size, a quarter of the base, or 64 packs, its Full build rebases: base packs that are still at least 90% live are kept, and the rest is packed into the new base for later Heads. Default 128 MiB. |
+| `RIPCLONE_FILES_TAIL_PERCENT` | How far, in percent, a Files archive with tail chunks may grow past its compact form before a push builds it compact again. Default 25. |
 | `RIPCLONE_ORIGIN_BASE` | Fetch repos of the built-in `github` provider from `<base>/<owner>/<repo>.git` instead of `github.com`. For mirrors and tests. |
 | `RIPCLONE_BENCH` | Log a JSON timing report for each build. |
 
@@ -99,7 +102,8 @@ per kind only help when several repositories build at once. After a
 repository's first build, each kind builds only what changed since its base
 and spends much of its time waiting on uploads, so every pool defaults to a
 quarter of the cores, at least 2: 2 each on 8 cores, 4 on 16, 16 on 64. A
-repository's Fulls build in the order its commits were admitted.
+commit's Head and Files build at the same time, and its Full once Head is
+ready. A repository's Fulls build in the order its commits were admitted.
 
 Every numeric server setting is a non-negative integer, except
 `RIPCLONE_RATE_LIMIT_PER_SEC`, which may be a decimal. A value that is set but
