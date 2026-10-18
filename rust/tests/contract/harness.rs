@@ -861,6 +861,15 @@ impl Server {
         self.log.lock().unwrap().join("\n")
     }
 
+    /// Wait for a log line containing `needle`. A thread copies the log
+    /// from the server's output, so a line logged while answering a
+    /// request can land after the response.
+    pub fn wait_log(&self, needle: &str) {
+        wait_for(&format!("a log line with {needle:?}"), || {
+            self.log().contains(needle).then_some(())
+        });
+    }
+
     /// SIGKILL the server, then start it again on the same state.
     pub fn restart(&mut self) {
         self.kill();

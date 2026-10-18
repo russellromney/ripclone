@@ -219,7 +219,7 @@ fn h8_readyz_fails_when_the_control_db_file_goes() {
         let readyz = server.get("/readyz");
         assert_eq!(readyz.status, 503, "{case}: {}", readyz.body);
         let line = format!("was {case} after the server opened it");
-        assert!(server.log().contains(&line), "{case}:\n{}", server.log());
+        server.wait_log(&line);
     }
 }
 
@@ -491,7 +491,7 @@ fn h15_unreadable_refs_leave_ready_builds_cloning() {
     assert_eq!(body["state"], "ready", "{body}");
     assert!(body["branches"].is_null(), "{body}");
     assert!(body["tags_artifact"].is_null(), "{body}");
-    assert!(server.log().contains("read refs of"), "{}", server.log());
+    server.wait_log("read refs of");
 
     let full = world.target("full");
     let out = world.cli(&server, &["clone", "acme/h15", full.to_str().unwrap()]);
