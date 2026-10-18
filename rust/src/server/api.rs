@@ -711,6 +711,15 @@ async fn ready_body(
                 .status(repo_id, &base)
                 .await
                 .map_err(control)?;
+            // A later admit of the base's branch that does not descend from
+            // it was force-pushed: these refs are behind the upstream, so
+            // the clone, lacking the base, fetches them from there.
+            let newer = |base: &BuildRow| {
+                row.ref_name.is_some() && row.ref_name == base.ref_name && row.seq > base.seq
+            };
+            if base.as_ref().is_some_and(newer) {
+                break;
+            }
             if let Some(base) = base.filter(|base| base.full.ready().is_some()) {
                 result = respond(row, Some(served));
                 result.refs_base = Some(Box::new(respond(&base, Some(served))));
@@ -1279,6 +1288,7 @@ mod tests {
             ref_name: None,
             parent,
             created_at: 0,
+            seq: 0,
             head: out(info.head),
             files: out(info.files),
             full: out(info.full),

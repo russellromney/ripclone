@@ -593,6 +593,10 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   `refs_base`. The server keeps each answer, since ancestry never
   changes, so a pinned commit's reads and a top-up's polls ask git once
   (G16 counts the runs); concurrent reads of one pair wait for one run.
+- **A force-pushed later admit of D's branch gets no `refs_base`.** The
+  published refs are behind the upstream there, so the clone, which lacks
+  D, fetches the refs from the upstream and holds none of D's objects
+  (J3).
 - **The last refs with a ready base serve while Full(D) builds.** A
   refresh that replaces branches whose base has a ready Full keeps them as
   `ready`, with the tags artifact built from the same listing, not the
