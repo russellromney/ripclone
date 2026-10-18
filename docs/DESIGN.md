@@ -24,7 +24,7 @@ ripclone builds the content three ways so each clone takes only what it needs:
 
 ***History packs.*** Every commit, tree, and blob, delta-compressed into at most 16 immutable levels, each one pack. A push adds a small level and merges the smallest neighbors, so earlier levels are reused. A full editable clone installs only these, each with its stored idx; it reads the HEAD packs only to write the working tree.
 
-***Archive.*** The same `HEAD` file bytes, zstd-compressed and split into chunks. Each chunk is made of independent frames, so the client can download many at once and start writing files as the first bytes land. It's the fastest path to a working tree, but the files don't go into `.git`, so git content commands don't work. This is what **files** mode uses. A push keeps the earlier archive's chunks and adds the changed files as new tail chunks; a file that changed again leaves dead bytes behind. When the archive grows 25% past its compact form (`RIPCLONE_FILES_TAIL_PERCENT`), or after 32 tails, the next push builds it compact again.
+***Archive.*** The same `HEAD` file bytes, zstd-compressed and split into chunks. Each chunk is made of independent frames, so the client can download many at once and start writing files as the first bytes land. It's the fastest path to a working tree, but the files don't go into `.git`, so git content commands don't work. This is what **files** mode uses. A push keeps the earlier archive's chunks and adds the changed files as new tail chunks; a file that changed again leaves dead bytes behind. When the archive grows 25% past its compact form, or after 32 tails, the next push builds it compact again.
 
 ### Separate exact results
 

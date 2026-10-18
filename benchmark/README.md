@@ -70,7 +70,8 @@ cargo build --release --example ripclone-proxy
 - `RIPCLONE_BENCH_READY_RESULTS` - required `head`, `full`, and/or `files`
   results before timing.
 - `SHAPED=0` - disable traffic shaping for a local smoke run.
-- `RIPCLONE_NO_CACHE=1` - disable the client artifact cache.
+- `RIPCLONE_CACHE_DIR` - client artifact cache; the harness unsets it so the
+  cache stays off.
 - `RIPCLONE_ORIGIN_BASE` - local/offline `file://` origin root containing
   `<owner>/<repo>.git`.
 - `BENCH_SOURCE_URL` - native Git and tree-correctness source URL.

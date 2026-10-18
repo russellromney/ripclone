@@ -22,8 +22,7 @@ build load is from 2026-10-15. To reproduce, see
 - **Link:** shaped on the client with an `nftables` policer. iperf3 measured
   1.12 Gbit/s at the 1000 Mbps setting, 277 Mbit/s at 250, and 9.1 Gbit/s
   unshaped.
-- **Runs:** each cell is the median of 3 runs with the client cache off
-  (`RIPCLONE_NO_CACHE=1`). Every run checked the exact commit, a clean status
+- **Runs:** each cell is the median of 3 runs with the client cache off. Every run checked the exact commit, a clean status
   and the shallow flag; the first run of each cell also compared a full tree
   digest and ran `git fsck --connectivity-only`.
 - **git baselines:** `git clone` and `git clone --depth 1` from GitHub, from the

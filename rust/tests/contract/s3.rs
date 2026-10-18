@@ -294,7 +294,6 @@ fn s3_h6_retention_trims_only_the_local_cache() {
     origin.publish();
     let mut env = s3.server_env(&s3.endpoint);
     env.push(("RIPCLONE_RETENTION_INTERVAL_SECS".into(), "1".into()));
-    env.push(("RIPCLONE_RETENTION_MAX_AGE_DAYS".into(), "1".into()));
     let server = world.server(&env_refs(&env));
     world.cli(&server, &["add", "acme/h6", "--wait"]).ok();
     let objects = s3.objects();

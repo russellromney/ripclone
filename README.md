@@ -37,11 +37,14 @@ downloading a file from object storage.
 
 ## Clone modes
 
-| Command | You get | Use it when |
-|---|---|---|
-| `ripclone clone owner/repo` | A full editable git repo with complete history | You want a drop-in `git clone`. |
-| `ripclone clone owner/repo --depth 1` | An editable git repo with only `HEAD` | CI and agents that run git but don't walk history. |
-| `ripclone clone owner/repo --mode files` | The working tree only, no `.git` | You only need the files. Fastest. |
+| Command | Same as | You get | Use it when |
+|---|---|---|---|
+| `ripclone clone owner/repo` | `git clone` | A full editable git repo with complete history | Coding: you or an agent will switch branches, read history, push. |
+| `ripclone clone owner/repo --depth 1` | `git clone --depth 1` | An editable git repo with only `HEAD` | CI and agents that run git but don't walk history. |
+| `ripclone clone owner/repo --mode files` | `git archive` of the tip | The working tree only, no `.git` | Builds that never run git. Fastest. |
+
+A full clone installs the branch you clone. The other branches arrive with
+your first `git fetch`, which is set up to fetch them, as in `git clone`.
 
 **Git LFS:** ripclone stores LFS pointer files, never the blobs. Run
 `git lfs pull` after cloning.
@@ -88,10 +91,9 @@ export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
 ```
 
 The server keeps its artifacts, mirrors, and `control.db` under
-`~/.local/share/ripclone/` by default (`--cas-dir`, `--repo-root`,
-`--control-db` override them; `--host` and `--port` set the listen address,
-default `0.0.0.0:8000`). With local storage, `cache` is the durable artifact
-store. For object storage see [Server state and storage](docs/BACKENDS.md).
+`~/.local/share/ripclone/` by default (`--data-dir` moves them; `--host` and
+`--port` set the listen address, default `0.0.0.0:8000`). With local storage,
+`cache` is the durable artifact store. For object storage see [Server state and storage](docs/BACKENDS.md).
 
 Add a repo, then clone it:
 
@@ -104,8 +106,7 @@ ripclone clone oven-sh/bun bun
 `add` returns once the build is accepted; `--wait` waits for it to finish.
 `ripclone list` and `ripclone rm owner/repo` manage registrations. Removing a
 registration keeps the published artifacts. Without `RIPCLONE_SERVER` (or
-`--server`, or `server` in the config file) the CLI talks to
-`https://ripclone.com`.
+`server` in the config file) the CLI talks to `https://ripclone.com`.
 
 ## Keeping repos fresh
 
@@ -134,7 +135,6 @@ ripclone clone owner/repo --wait            # wait for the exact full build, no 
 ripclone clone gitlab:group/project         # another provider
 ripclone clone https://github.com/owner/repo.git  # a pasted clone URL works anywhere owner/repo does
 ripclone clone owner/repo --bench           # print a per-phase timing report
-ripclone clone owner/repo --no-metrics      # never send the metrics report
 ripclone sync owner/repo                    # build the default branch tip
 ripclone sync owner/repo --at <ref> [--wait]
 ripclone add owner/repo [--wait]
@@ -155,14 +155,10 @@ clone; with `--at` it names the local branch instead. `--depth` takes `0`
 again; with `--at` it also waits. `--wait` on `sync`, `add`, or `clone` polls
 at most 40 times, about 70 seconds; run the command again to keep waiting.
 
-Global flags go before the subcommand: `--server` (or `RIPCLONE_SERVER`),
-`--provider` (default `github`), and `--token` (an upstream token for
-`--verify-upstream`, never sent to the ripclone server). All settings:
-**[Configuration](docs/CONFIG.md)**.
+All settings: **[Configuration](docs/CONFIG.md)**.
 
-**Agents and CI.** `RIPCLONE_AGENT=1` makes depth 1 the default and disables
-interactive prompts. Explicit `--depth` still wins. Use `--mode files` when the
-agent never runs git. Server errors are JSON `{ "error", "code" }`
+**Agents and CI.** Use `--depth 1` when the agent runs git but doesn't walk
+history, and `--mode files` when it never runs git. Server errors are JSON `{ "error", "code" }`
 ([API](docs/API.md#errors)). The CLI's exit code says what kind of failure it
 was:
 
@@ -215,7 +211,7 @@ sends it, so a self-hosted server gets no reports. When asked, the CLI sends
 one fire-and-forget POST to that server after a successful clone: clone id,
 repo, commit, mode, whether it waited for a build, wall time,
 bytes, and client OS/arch/version. It never affects the clone's result.
-`--no-metrics` or `RIPCLONE_NO_METRICS=1` turns it off.
+`RIPCLONE_NO_METRICS=1` turns it off.
 
 ## Self-hosted and hosted
 

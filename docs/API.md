@@ -20,7 +20,7 @@ A client may send `x-ripclone-protocol: <n>`. If `n` is not the server's wire
 protocol (see `GET /v1/version`), the server answers `426`. Callers that leave
 the header out are not checked.
 
-Requests are rate limited per client IP (see `RIPCLONE_RATE_LIMIT_*` in
+Requests are rate limited per client IP (see `RIPCLONE_RATE_LIMIT_PER_SEC` in
 [Configuration](CONFIG.md)); over the limit is `429`. `/healthz`,
 `/v1/version`, and token-authenticated `GET /v1/artifacts/{hash}` are not
 limited.
@@ -112,7 +112,7 @@ Fetch those artifacts from `GET /v1/artifacts/{hash}` instead. In a Full,
 tree. A Head output has `idx_bundle_url`, all its pack idx files in one
 object, instead, and `midx_url` when it has a pre-built multi-pack-index. A
 Files output has `archive_chunk_urls` instead of `pack_chunk_urls`. Signed URLs last
-`RIPCLONE_SIGNED_URL_TTL_SECS`. Read the commit again to get fresh ones.
+20 minutes. Read the commit again to get fresh ones.
 
 **Pending.** The output is not built yet:
 
@@ -137,7 +137,7 @@ fetches the target commit from the upstream with the user's own git (see
 [Freshness](FRESHNESS.md)).
 
 **Failed.** The output failed for good: the error is not retryable, or it
-failed `RIPCLONE_BUILD_MAX_ATTEMPTS` times. It builds again only when the
+failed 5 times. It builds again only when the
 commit is admitted with `retry: true` (or through `/add`):
 
 ```json

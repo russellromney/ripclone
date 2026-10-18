@@ -23,31 +23,27 @@ pub struct LocalCacheRetention {
 /// Retention settings from the environment, read once at startup.
 #[derive(Clone, Copy, Debug)]
 pub struct RetentionSettings {
-    /// Time between passes (`RIPCLONE_RETENTION_INTERVAL_SECS`); zero turns
-    /// retention off.
+    /// Time between passes, 5 minutes. Tests shorten it with
+    /// `RIPCLONE_RETENTION_INTERVAL_SECS`.
     pub interval: Duration,
-    /// `RIPCLONE_RETENTION_MAX_AGE_DAYS`; `None` (set to 0) keeps any age.
+    /// Objects older than 7 days are trimmed.
     pub max_age: Option<Duration>,
-    /// `RIPCLONE_RETENTION_MAX_GB`; `None` (set to 0) keeps any size.
+    /// `RIPCLONE_RETENTION_MAX_GB`, default 100; `None` (set to 0) keeps any
+    /// size.
     pub max_size_bytes: Option<u64>,
 }
 
 impl RetentionSettings {
     pub fn from_env() -> Result<Self> {
-        const DAY_SECS: u64 = 24 * 60 * 60;
         const GB: u64 = 1024 * 1024 * 1024;
         let interval = crate::env::number("RIPCLONE_RETENTION_INTERVAL_SECS", 300)?;
-        let days: u64 = crate::env::number("RIPCLONE_RETENTION_MAX_AGE_DAYS", 7)?;
         let gb: u64 = crate::env::number("RIPCLONE_RETENTION_MAX_GB", 100)?;
-        let max_age = days
-            .checked_mul(DAY_SECS)
-            .context("RIPCLONE_RETENTION_MAX_AGE_DAYS is too large")?;
         let max_size_bytes = gb
             .checked_mul(GB)
             .context("RIPCLONE_RETENTION_MAX_GB is too large")?;
         Ok(Self {
             interval: Duration::from_secs(interval),
-            max_age: (max_age > 0).then(|| Duration::from_secs(max_age)),
+            max_age: Some(Duration::from_secs(7 * 24 * 60 * 60)),
             max_size_bytes: (max_size_bytes > 0).then_some(max_size_bytes),
         })
     }

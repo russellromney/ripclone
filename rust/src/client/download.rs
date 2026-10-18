@@ -380,20 +380,10 @@ impl Received {
     }
 }
 
-/// `(max_attempts, base_backoff_ms)` for artifact downloads, from the
-/// environment. Defaults: 3 attempts, 100 ms base backoff.
-fn fetch_retry_config() -> (u32, u64) {
-    let attempts = std::env::var("RIPCLONE_FETCH_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(3)
-        .max(1);
-    let backoff_ms = std::env::var("RIPCLONE_FETCH_BACKOFF_MS")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(100);
-    (attempts, backoff_ms)
-}
+/// Attempts per artifact download.
+const FETCH_MAX_ATTEMPTS: u32 = 3;
+/// The first retry delay of an artifact download, doubled per attempt.
+const FETCH_BACKOFF_MS: u64 = 100;
 
 /// Exponential backoff with jitter for retry `attempt` (1-based), capped at 5 s.
 /// Jitter (in `[capped/2, capped]`) decorrelates the retries of concurrent
@@ -466,7 +456,7 @@ impl Client {
             received.restart().await?;
         }
         let (mut generation, mut url) = urls.current(artifact.slot);
-        let (max_attempts, base_backoff_ms) = fetch_retry_config();
+        let (max_attempts, base_backoff_ms) = (FETCH_MAX_ATTEMPTS, FETCH_BACKOFF_MS);
         for attempt in 1..=max_attempts {
             // A connection cut after the last byte leaves nothing to resume.
             if received.len > 0 && Some(received.len) == artifact.len {
@@ -548,7 +538,7 @@ impl Client {
         end: u64,
     ) -> Result<Option<bytes::Bytes>> {
         let (mut generation, mut url) = urls.current(artifact.slot);
-        let (max_attempts, base_backoff_ms) = fetch_retry_config();
+        let (max_attempts, base_backoff_ms) = (FETCH_MAX_ATTEMPTS, FETCH_BACKOFF_MS);
         let mut attempt = 1;
         loop {
             match self

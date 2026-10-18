@@ -444,25 +444,8 @@ impl RepoId {
         })
     }
 
-    /// Human-readable key for operator-facing config (the webhook allowlist).
-    ///
-    /// Unlike [`storage_key`](Self::storage_key) this does NOT slash-escape the
-    /// path, so it matches what an operator naturally writes. The `github`
-    /// default renders to the bare `owner/repo`; other providers are prefixed
-    /// with the instance id: `gitlab/group/sub/proj`.
-    pub fn natural_key(&self) -> String {
-        if self.is_github_default() {
-            self.path.clone()
-        } else {
-            format!("{}/{}", self.provider.as_str(), self.path)
-        }
-    }
-
-    /// Repository name accepted by the CLI for the selected default provider.
-    ///
-    /// This is deliberately distinct from [`natural_key`](Self::natural_key):
-    /// CLI provider qualification uses `provider:path`, while webhook
-    /// allowlists use the slash-prefixed `provider/path` natural key.
+    /// Repository name accepted by the CLI for the selected default provider:
+    /// bare `path` for it, `provider:path` for any other.
     pub fn cli_name(&self, default_provider: &str) -> String {
         if self.provider.as_str() == default_provider {
             self.path.clone()
@@ -572,63 +555,42 @@ mod tests {
         }
     }
 
-    /// Storage keys and mirror dirs escape the path and carry the provider;
-    /// the natural key is unescaped, and bare for the github default.
+    /// Storage keys and mirror dirs escape the path and carry the provider.
     #[test]
     fn repo_id_keys() {
         let id = |provider: &str, path: &str| RepoId {
             provider: ProviderInstanceId::new(provider),
             path: path.to_string(),
         };
-        // (repo, storage key, mirror dir, natural key)
+        // (repo, storage key, mirror dir)
         let rows = [
             (
                 RepoId::github("ripclone/test"),
                 "github/ripclone%2Ftest",
                 "github_ripclone%2Ftest.git",
-                "ripclone/test",
             ),
             (
                 id("gitlab", "g/sub/proj"),
                 "gitlab/g%2Fsub%2Fproj",
                 "gitlab_g%2Fsub%2Fproj.git",
-                "gitlab/g/sub/proj",
             ),
             (
                 id("sourcehut", "~user/repo"),
                 "sourcehut/~user%2Frepo",
                 "sourcehut_~user%2Frepo.git",
-                "sourcehut/~user/repo",
             ),
             (
                 id("launchpad", "~owner/project/+git/repo"),
                 "launchpad/~owner%2Fproject%2F+git%2Frepo",
                 "launchpad_~owner%2Fproject%2F+git%2Frepo.git",
-                "launchpad/~owner/project/+git/repo",
             ),
-            (
-                id("gitea", "a/b"),
-                "gitea/a%2Fb",
-                "gitea_a%2Fb.git",
-                "gitea/a/b",
-            ),
-            (
-                id("gitea", "a%2Fb"),
-                "gitea/a%252Fb",
-                "gitea_a%252Fb.git",
-                "gitea/a%2Fb",
-            ),
-            (
-                id("gitea", "a\\b"),
-                "gitea/a%5Cb",
-                "gitea_a%5Cb.git",
-                "gitea/a\\b",
-            ),
+            (id("gitea", "a/b"), "gitea/a%2Fb", "gitea_a%2Fb.git"),
+            (id("gitea", "a%2Fb"), "gitea/a%252Fb", "gitea_a%252Fb.git"),
+            (id("gitea", "a\\b"), "gitea/a%5Cb", "gitea_a%5Cb.git"),
         ];
-        for (repo, storage, mirror, natural) in &rows {
+        for (repo, storage, mirror) in &rows {
             assert_eq!(repo.storage_key(), *storage);
             assert_eq!(repo.mirror_dir_name(), *mirror);
-            assert_eq!(repo.natural_key(), *natural);
             assert_eq!(&RepoId::from_storage_key(storage).unwrap(), repo);
         }
         for bad in ["noslash", "/path", "github/", "github/a%2", "github/a%41"] {

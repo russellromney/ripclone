@@ -156,17 +156,16 @@ fn i9_protocol_mismatch_fails_clearly() {
     assert_eq!(server.metric("ripclone_builds_queued_total"), queued);
 }
 
-/// I11: the CLI and the server read `config.toml` from
-/// `~/.config/ripclone/config.toml` or from `RIPCLONE_CONFIG`. A flag beats
-/// env, and env beats the file.
+/// I11: the CLI reads `config.toml` from `~/.config/ripclone/config.toml` or
+/// from `RIPCLONE_CONFIG`, and `RIPCLONE_SERVER` beats the file.
 #[test]
 fn i11_config_file_discovery_and_precedence() {
     let world = World::new();
     let server = world.server(&[]);
 
-    // CLI: which server `list` talks to. Four proxies in front of the one
-    // server tell the sources apart.
-    let proxies: Vec<FaultProxy> = (0..4).map(|_| FaultProxy::start(&server)).collect();
+    // Which server `list` talks to. Three proxies in front of the one server
+    // tell the sources apart.
+    let proxies: Vec<FaultProxy> = (0..3).map(|_| FaultProxy::start(&server)).collect();
     let home = world.path("home");
     let default_file = home.join(".config/ripclone/config.toml");
     std::fs::create_dir_all(default_file.parent().unwrap()).unwrap();
@@ -179,46 +178,30 @@ fn i11_config_file_discovery_and_precedence() {
     std::fs::write(&explicit, format!("server = \"{}\"\n", proxies[1].url())).unwrap();
     let explicit = explicit.to_str().unwrap();
     let env_server = proxies[2].url();
-    let flag_server = proxies[3].url();
-    // (case, env, unset env, `--server` flag, the proxy that must see the
-    // request)
-    let cli_cases: [(&str, Env, Unset, Option<&str>, usize); 4] = [
+    // (case, env, unset env, the proxy that must see the request)
+    let cases: [(&str, Env, Unset, usize); 3] = [
         (
             "default file",
             vec![],
             &["RIPCLONE_CONFIG", "RIPCLONE_SERVER"],
-            None,
             0,
         ),
         (
             "RIPCLONE_CONFIG",
             vec![("RIPCLONE_CONFIG", explicit)],
             &["RIPCLONE_SERVER"],
-            None,
             1,
         ),
         (
             "env beats file",
             vec![("RIPCLONE_SERVER", env_server.as_str())],
             &["RIPCLONE_CONFIG"],
-            None,
             2,
         ),
-        (
-            "flag beats env",
-            vec![("RIPCLONE_SERVER", env_server.as_str())],
-            &["RIPCLONE_CONFIG"],
-            Some(flag_server.as_str()),
-            3,
-        ),
     ];
-    for (case, env, unset, flag, want) in cli_cases {
-        let mut args = vec!["list"];
-        if let Some(flag) = flag {
-            args = vec!["--server", flag, "list"];
-        }
+    for (case, env, unset, want) in cases {
         let before: Vec<usize> = proxies.iter().map(|p| p.seen().len()).collect();
-        world.cli_unset(&server, &args, &env, unset).ok();
+        world.cli_unset(&server, &["list"], &env, unset).ok();
         let used: Vec<usize> = proxies
             .iter()
             .enumerate()
@@ -226,92 +209,5 @@ fn i11_config_file_discovery_and_precedence() {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(used, [want], "{case}");
-    }
-    drop(server);
-
-    // Server: which control database it opens. Each case is a fresh server
-    // without `--control-db` unless the case passes it.
-    let state = world.path("server");
-    let db = |name: &str| state.join(name).to_str().unwrap().to_string();
-    let default_file = state.join(".config/ripclone/config.toml");
-    std::fs::create_dir_all(default_file.parent().unwrap()).unwrap();
-    let control = |path: String| format!("[control]\npath = \"{path}\"\n");
-    std::fs::write(&default_file, control(db("from-default.db"))).unwrap();
-    let explicit = state.join("explicit.toml");
-    std::fs::write(&explicit, control(db("from-explicit.db"))).unwrap();
-    let explicit = explicit.to_str().unwrap().to_string();
-    let from_env = db("from-env.db");
-    // (case, env, unset env, pass --control-db, database the server opens)
-    let server_cases: [(&str, Env, Unset, bool, &str); 4] = [
-        (
-            "default file",
-            vec![],
-            &["RIPCLONE_CONFIG"],
-            false,
-            "from-default.db",
-        ),
-        (
-            "RIPCLONE_CONFIG",
-            vec![("RIPCLONE_CONFIG", explicit.as_str())],
-            &[],
-            false,
-            "from-explicit.db",
-        ),
-        (
-            "env beats file",
-            vec![("RIPCLONE_CONTROL_DB_PATH", from_env.as_str())],
-            &["RIPCLONE_CONFIG"],
-            false,
-            "from-env.db",
-        ),
-        (
-            "flag beats env",
-            vec![("RIPCLONE_CONTROL_DB_PATH", from_env.as_str())],
-            &["RIPCLONE_CONFIG"],
-            true,
-            "control.db",
-        ),
-    ];
-    for (case, env, unset, flag, want) in server_cases {
-        let _ = std::fs::remove_file(state.join(want));
-        let server = world.server_with(ServerOpts {
-            env: &env,
-            unset,
-            no_control_flag: !flag,
-        });
-        assert!(state.join(want).is_file(), "{case}: no {want}");
-        assert!(
-            server
-                .log()
-                .contains(&format!("{}", state.join(want).display())),
-            "{case}: the server did not report {want}:\n{}",
-            server.log()
-        );
-    }
-}
-
-/// I12: removed environment variables are not silently ignored. The server
-/// and the CLI each warn once per removed variable that is set, and still run.
-#[test]
-fn i12_removed_env_vars_warn_once() {
-    let world = World::new();
-    let removed = [
-        ("RIPCLONE_QUEUE_STALE_SECS", "5"),
-        ("RIPCLONE_TEST_REF_POLL_MS", "1"),
-        ("RIPCLONE_JWT_TTL_SECS", "60"),
-    ];
-    let server = world.server(&removed);
-    let cli = world.cli_env(&server, &["version"], &removed);
-    cli.ok();
-    let stderr = cli.stderr();
-    for (name, _) in removed {
-        let line = format!("{name} is set but was removed; it has no effect");
-        assert_eq!(
-            server.log().matches(&line).count(),
-            1,
-            "server:\n{}",
-            server.log()
-        );
-        assert_eq!(stderr.matches(&line).count(), 1, "cli:\n{stderr}");
     }
 }

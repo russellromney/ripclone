@@ -147,11 +147,8 @@ fn head_rebase_bytes() -> Result<u64> {
 }
 
 /// How much larger than its compact archive, in percent, a Files archive
-/// with tails may grow before the next build compacts it. Zero never adds
-/// a tail.
-fn files_tail_percent() -> Result<u64> {
-    crate::env::number("RIPCLONE_FILES_TAIL_PERCENT", 25)
-}
+/// with tails may grow before the next build compacts it.
+const FILES_TAIL_PERCENT: u64 = 25;
 
 /// Head level packs past which Full packs a new base.
 const MAX_HEAD_LEVEL_PACKS: usize = 64;
@@ -163,7 +160,6 @@ const MAX_FILES_TAILS: usize = 32;
 pub(super) fn check_environment() -> Result<()> {
     lsm_max_levels()?;
     head_rebase_bytes()?;
-    files_tail_percent()?;
     Ok(())
 }
 
@@ -792,153 +788,12 @@ pub(super) async fn build_head_result(
     Ok(head)
 }
 
-/// Storage amplification for one ref: durable bytes in object storage divided by
-/// the upstream bare-mirror size, split by artifact class. Content-addressed
-/// storage may be shared across refs, so this attributes every hash reachable
-/// from the given ref to that ref.
-#[derive(Debug, Clone, serde::Serialize)]
-struct StorageAmplification {
-    repo_size_bytes: u64,
-    head_pack_bytes: u64,
-    history_pack_bytes: u64,
-    archive_chunk_bytes: u64,
-    metadata_bytes: u64,
-    total_storage_bytes: u64,
-    amplification: f64,
-}
-
-/// Recursively sum file sizes under `dir`.
-fn dir_size(dir: &std::path::Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    total += meta.len();
-                } else if meta.is_dir() {
-                    total += dir_size(&path);
-                }
-            }
-        }
-    }
-    total
-}
-
-/// Classify every hash reachable from `info` by artifact class and sum its
-/// bytes in `storage`.
-fn measure_storage_amplification(
-    storage: &crate::storage::StorageRef,
-    info: &crate::RefInfo,
-    mirror_dir: &std::path::Path,
-) -> Option<StorageAmplification> {
-    let repo_size = dir_size(mirror_dir);
-    let mut head_pack_bytes = 0u64;
-    let mut history_pack_bytes = 0u64;
-    let mut archive_chunk_bytes = 0u64;
-    let mut metadata_bytes = 0u64;
-
-    let add = |hash: &str, bucket: &mut u64| {
-        if hash.is_empty() {
-            return;
-        }
-        if let Ok(size) = storage.size(hash) {
-            *bucket += size;
-        }
-    };
-
-    // Head closure packs (base + delta) and their idx files.
-    if let Some(head) = &info.head {
-        for pack in &head.packs {
-            add(&pack.pack, &mut head_pack_bytes);
-            add(&pack.idx, &mut head_pack_bytes);
-        }
-    }
-
-    // Full-history / LSM sealed levels.
-    if let Some(full) = &info.full {
-        for level in &full.history_levels {
-            for pack in &level.packs {
-                add(&pack.pack, &mut history_pack_bytes);
-                add(&pack.idx, &mut history_pack_bytes);
-            }
-        }
-    }
-
-    // Archive chunks referenced directly from the ref.
-    if let Some(files) = &info.files {
-        for hash in &files.archive_chunks {
-            add(hash, &mut archive_chunk_bytes);
-        }
-    }
-
-    // Metadata: manifests, metadata chunks, idx bundle, and MIDX.
-    for artifacts in [
-        info.head.as_ref().map(|result| &result.clonepack),
-        info.full.as_ref().map(|result| &result.clonepack),
-        info.files.as_ref().map(|result| &result.clonepack),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for hash in [
-            &artifacts.manifest,
-            &artifacts.metadata_chunk,
-            &artifacts.idx_bundle,
-            &artifacts.midx,
-        ] {
-            add(hash, &mut metadata_bytes);
-        }
-    }
-
-    let total_storage_bytes = head_pack_bytes
-        .saturating_add(history_pack_bytes)
-        .saturating_add(archive_chunk_bytes)
-        .saturating_add(metadata_bytes);
-    let amplification = if repo_size == 0 {
-        0.0
-    } else {
-        total_storage_bytes as f64 / repo_size as f64
-    };
-
-    Some(StorageAmplification {
-        repo_size_bytes: repo_size,
-        head_pack_bytes,
-        history_pack_bytes,
-        archive_chunk_bytes,
-        metadata_bytes,
-        total_storage_bytes,
-        amplification,
-    })
-}
-
 pub(super) fn report_sync_phases(repo_id: &RepoId, commit: &str, phases: &SyncPhases) {
     let report = serde_json::json!({
         "kind": "sync-phases",
         "repo": repo_id.storage_key(),
         "commit": &commit[..7.min(commit.len())],
         "phases": phases,
-    });
-    info!("{}", report.to_string());
-}
-
-/// Print a JSON benchmark report when `RIPCLONE_BENCH` is set. Mirrors the
-/// client-side `--bench` report style: one structured object per completed
-/// build, emitted at INFO so it can be scraped from logs. Phase timings are in
-/// the `sync-phases` report written when Head publishes.
-pub(super) fn report_sync_bench(
-    repo_id: &RepoId,
-    commit: &str,
-    storage: &crate::storage::StorageRef,
-    info: &crate::RefInfo,
-    mirror_dir: &std::path::Path,
-) {
-    let amplification = measure_storage_amplification(storage, info, mirror_dir);
-    let report = serde_json::json!({
-        "kind": "sync-bench",
-        "repo": repo_id.storage_key(),
-        "commit": &commit[..7.min(commit.len())],
-        "storage_amplification": amplification,
     });
     info!("{}", report.to_string());
 }
@@ -1201,7 +1056,7 @@ pub(super) async fn build_full_result(
 /// Build and upload the Files result. `parent_files`, a ready Files result of
 /// an ancestor and its commit, lets the archive read only changed bytes: a
 /// tail on it holds only the blobs it lacks, and a compaction (once the
-/// tails grow past `RIPCLONE_FILES_TAIL_PERCENT`) reuses the unchanged frames
+/// tails grow past [`FILES_TAIL_PERCENT`]) reuses the unchanged frames
 /// and bundles of its compact archive.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_files_result(
@@ -1220,9 +1075,7 @@ pub(super) async fn build_files_result(
     let previous = parent_files.map(|(_, files)| files);
     let compact = previous.map(|files| files.compact.as_deref().unwrap_or(files).clone());
     let tail = match (previous, &compact) {
-        (Some(previous), Some(compact)) => {
-            files_tail_fits(previous, compact, files_tail_percent()?)
-        }
+        (Some(previous), Some(compact)) => files_tail_fits(previous, compact, FILES_TAIL_PERCENT),
         _ => false,
     };
     let base_files = if tail {

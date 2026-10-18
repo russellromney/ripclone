@@ -31,8 +31,5 @@ Per provider:
 - The signature is checked over the raw body, in constant time, before parsing.
 - The payload is used only to identify the repo and commit. It never selects a
   credential, and the server never fetches a URL from it.
-- `RIPCLONE_WEBHOOK_ALLOWLIST` (comma-separated) can further restrict which
-  added repos webhooks may build. GitHub entries are `owner/repo`; other
-  providers are prefixed, such as `gitlab/group/sub/proj`.
 
 Private repos build with the server's configured credential for that provider.

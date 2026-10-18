@@ -49,8 +49,7 @@ branch (or the parent commit's Full) as a base A. A full clone then:
 1. installs Full(A) exactly as it would install Full(B);
 2. runs `git fetch <upstream> <B>` with your own git, so your git config and
    credential helpers apply. The upstream URL comes from your own provider
-   config (the provider's host, or `RIPCLONE_ORIGIN_BASE` for the default
-   GitHub provider), never from the server;
+   config (the provider's host), never from the server;
 3. checks out B.
 
 The clone ends up with B's tree and B's full history. The fetch carries only
@@ -64,7 +63,7 @@ Depth-1 and files clones never top up.
 ## Waiting
 
 A clone polls the server for the result it needs. Polls start 100 ms apart
-and double up to 2 s (`RIPCLONE_POLL_MS` sets the cap). After 40 polls,
+and double up to 2 s. After 40 polls,
 about 70 s at the default cap, it stops with an error that names the commit
 and says the result is still pending; run the same clone with `--at <commit>`
 to keep waiting for that commit.

@@ -33,14 +33,14 @@ a unit test or it is not needed.
      drop Range support, expire a signed URL, fail PUTs.
    - **Process control.** SIGKILL and restart the server; restart it with
      different config.
-   - **Real config.** `files_slots = 0` and `full_slots = 0` pause Files and Full builds.
-     This is an operator setting (Head-only server), not a test seam, and it
-     makes "Full is pending" deterministic.
+   - **Test settings.** `RIPCLONE_FILES_SLOTS=0` and `RIPCLONE_FULL_SLOTS=0`
+     pause Files and Full builds, which makes "Full is pending"
+     deterministic. See [Test settings](#test-settings).
 4. **Parallel.** Each test gets its own tempdir, server process, and port (the
    server binds `:0` and prints the bound address). No shared statics, no
    `--test-threads=1`, no `lsm_on_`/`lsm_off_` passes.
-5. **No 2 s floor.** One documented setting, `RIPCLONE_POLL_MS`, shortens client
-   and server polling for every test.
+5. **No 2 s floor.** `RIPCLONE_POLL_MS` shortens client polling for every
+   test.
 6. **No proving a negative by sleeping.** Wait on an observable event (a
    counter, a status, an origin request log) with a timeout of 10 s or less.
 
@@ -148,7 +148,7 @@ Ripclone token reaches the origin.
 | G8 | Empty trees: a root commit with no files, and a later commit that deletes every file. Every shape installs an empty tree. | #208 |
 | G9 | Two branches admitted while the origin holds the fetch, then built together: each branch's clones equal its own tip in every shape. | #208 |
 | G10 | Paths with spaces and non-ASCII characters, a symlink to one, an executable; a branch named `feature/new-ui`; an annotated tag via `--at`. Every shape equals its commit; the tag is detached, the branch checked out by name. | #208 |
-| G11 | Pushes add tails to the Files archive: a small push stores only its new files and keeps the bundles a clone of its parent downloaded, until a build past `RIPCLONE_FILES_TAIL_PERCENT` compacts the archive to about the tree's size. Files clones of the tip and an older commit are exact. | #233 |
+| G11 | Pushes add tails to the Files archive: a small push stores only its new files and keeps the bundles a clone of its parent downloaded, until a build 25% past the compact size compacts the archive to about the tree's size. Files clones of the tip and an older commit are exact. | #233 |
 | G12 | Editable clones work with the user's later git: the branch tracks its upstream, `origin` is the configured upstream, `git pull` and `git push` work, a tag or `--at` commit tracks nothing, and a branch named with `#`, `;` and `"` tracks correctly. | #234 |
 | G13 | With a global git config naming a template dir and an identity, full and depth-1 clones have the local config, reflog (`clone: from <url>`) and template hooks of `git clone` and `git clone --depth 1`, apart from `core.checkstat`. The hook runs on the user's commit; `HEAD@{1}` is the cloned commit. A depth-1 clone's `git fetch` takes only its branch, a full clone's every branch. A SHA-256 default in the environment still gives a SHA-1 clone. With `user.useConfigOnly` and no identity, the clone has the reflogs `git clone` writes under git's fallback committer. | #234 |
 
@@ -159,8 +159,8 @@ Ripclone token reaches the origin.
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | #186 |
 | H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | #191 (S3 job) |
 | H3 | A second server on the same control database is rejected before it binds. | #186 |
-| H4 | Table: invalid storage, control, rate-limit and worker config (file or env, malformed file, removed `[queue]` section) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention age and size, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size, S3 timeout, attempts and retry delay), with an error naming it. | #208 |
-| H5 | Local disk with retention every second and a 1-day limit: the server reports retention off; month-old artifacts stay and clone. | #208 |
+| H4 | Table: invalid storage, rate-limit and worker config (an S3 bucket without an endpoint, a malformed config file) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention size, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size), with an error naming it. | #208 |
+| H5 | Local disk with retention every second and a 1 GB limit: the server reports retention off; month-old artifacts, past the 7-day limit, stay and clone. | #208 |
 | H6 | S3 emulator, same settings: retention trims month-old local cache objects, the bucket is unchanged, published artifacts clone without a rebuild, and the next push builds. | #208 (S3 job) |
 | H7 | A repository's config (`/v1/admin/config`) survives a server restart. | #208 |
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | #209 |
@@ -168,7 +168,7 @@ Ripclone token reaches the origin.
 | H10 | S3 emulator: after a one-line push, B uploads no object of 1 MiB or more that the bucket already holds (its Files reuses A's bundles). A second repository with the same files builds the same large objects: the bucket proxy sees a HEAD and no PUT for each. A bucket copy cut short is uploaded again when a third repository with the same files makes it; that repository's clones and the Files clones of B and the second repository are exact. | #220 (S3 job), #221 |
 | H11 | A scratch leftover the server cannot remove, as when a killed server's git child is still writing it, doesn't stop the next start: the server logs it, builds and clones in its own scratch dir, and once the leftover can go, the next start removes it. | #234 |
 
-### I. Auth, integrations, CLI (12)
+### I. Auth, integrations, CLI (11)
 
 | # | Test | Added |
 |---|---|---|
@@ -182,8 +182,7 @@ Ripclone token reaches the origin.
 | I8 | Only `/healthz`, `/readyz`, `/metrics` and `/v1/version` answer without the token; unsigned webhooks fail closed (503 without a secret); every other route, `/v1/artifacts/{hash}` included, gives 401 to a missing or wrong token. | #208 |
 | I9 | A client declaring another protocol gets 426; the CLI names the mismatch and says to run `ripclone version`; nothing builds. | #208 |
 | I10 | `--verify-upstream` in Files mode: `never` and `auto` clone without contacting the upstream; `always` fails before any download. | #208 |
-| I11 | Config discovery: CLI and server read `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; a flag beats env, env beats the file (CLI server URL, server control path). | #208 |
-| I12 | Removed environment variables (queue, test, JWT families) set for the server and the CLI: each warns once and still runs. | #209 |
+| I11 | Config discovery: the CLI reads `~/.config/ripclone/config.toml` and `RIPCLONE_CONFIG`; `RIPCLONE_SERVER` beats the file. | #208 |
 
 ### J. Builds start from the newest ready ancestor (5)
 
@@ -232,7 +231,29 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 89 tests. Several are table-driven.
+Total: 88 tests. Several are table-driven.
+
+## Test settings
+
+The code reads these variables so tests and benchmarks can shorten waits,
+shrink thresholds or pause outputs. They are not in the user docs and are not
+a stable interface. Every one is used by a contract test.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RIPCLONE_POLL_MS` | 2000 | Longest wait between CLI polls for a pending output. Polls start at 100 ms and double; a command stops after 40. |
+| `RIPCLONE_DOWNLOAD_PART_BYTES` | 16 MiB | Range size when a large artifact downloads as 16 parallel ranges. |
+| `RIPCLONE_ORIGIN_BASE` | unset | Fetch, top up and verify built-in `github` repos from `<base>/<owner>/<repo>.git`. |
+| `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` | 30 | Timeout of each upstream `ls-remote`. |
+| `RIPCLONE_FETCH_TIMEOUT_SECS` | 3600 | Longest one mirror fetch may run. A fetch under 1000 B/s for 60 s stops sooner. |
+| `RIPCLONE_BUILD_RETRY_BASE_MS` | 2000 | First retry delay after a retryable build failure; doubles up to 300 s. |
+| `RIPCLONE_BUILD_MAX_ATTEMPTS` | 5 | Attempts per output before it fails. At least 1. |
+| `RIPCLONE_BUILD_LEASE_SECS` | 60 | Build lease, renewed every third. At least 3. |
+| `RIPCLONE_HEAD_SLOTS`, `RIPCLONE_FILES_SLOTS`, `RIPCLONE_FULL_SLOTS` | cores/4, at least 2 | Builds of each kind at once. Head needs at least 1; `0` pauses Files or Full. |
+| `RIPCLONE_LSM_MAX_LEVELS` | 16 | History levels a Full keeps before merging the smallest neighbors. |
+| `RIPCLONE_HEAD_REBASE_BYTES` | 128 MiB | Head levels past their base at which Full rebases them. |
+| `RIPCLONE_SIGNED_URL_TTL_SECS` | 1200 | Lifetime of signed artifact URLs. |
+| `RIPCLONE_RETENTION_INTERVAL_SECS` | 300 | How often S3-mode retention trims the local cache; `0` turns it off. |
 
 ## What it replaced
 
