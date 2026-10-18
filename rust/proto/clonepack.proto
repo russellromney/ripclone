@@ -18,7 +18,7 @@ message ChunkRef {
 message ClonepackManifest {
   string commit = 1;
   optional string parent_commit = 2;
-  reserved 3;
+  reserved 3, 6, 7, 8;
 
   // Metadata chunk holds the prebuilt .git/index and the file/frame tables
   // needed to decode archive chunks.
@@ -27,13 +27,6 @@ message ClonepackManifest {
   // Archive chunks contain working-tree zstd frames. They are shared across
   // commits and immutable.
   repeated ChunkRef archive_chunks = 5;
-
-  // No build writes these two fields. The status route still counts the
-  // chunks they name in a stored manifest.
-  repeated ChunkRef head_blobs_chunks = 8;
-  ChunkRef head_blobs_idx = 7;
-
-  reserved 6;
 
   // The editable clone payload: many small, self-contained git packs (each
   // ~1-2 MB with its own idx). The client downloads them in parallel and, as

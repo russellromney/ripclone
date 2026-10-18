@@ -195,15 +195,11 @@ pub struct ClonepackArtifacts {
 pub struct HeadResult {
     pub clonepack: ClonepackArtifacts,
     pub parent_commit: Option<String>,
-    #[serde(default)]
     pub packs: Vec<PackArtifact>,
-    #[serde(default)]
     pub base_commit: String,
-    #[serde(default)]
     pub base_packs: Vec<SizedPack>,
     /// The packs after the base: one level per Head since the base, each
     /// holding only the objects no earlier Head pack has.
-    #[serde(default)]
     pub levels: Vec<SizedPack>,
 }
 
@@ -211,14 +207,11 @@ pub struct HeadResult {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FullResult {
     pub clonepack: ClonepackArtifacts,
-    #[serde(default)]
     pub packs: Vec<PackArtifact>,
-    #[serde(default)]
     pub history_levels: Vec<HistoryLevel>,
     /// Compacted Head packs for this commit, written when its Head levels grew
     /// past `RIPCLONE_HEAD_REBASE_BYTES`. A child's Head adds its level on
     /// these instead of the parent Head's packs.
-    #[serde(default)]
     pub head_base: Option<HeadBase>,
 }
 
@@ -229,7 +222,6 @@ pub struct HeadBase {
     pub commit: String,
     pub packs: Vec<SizedPack>,
     /// Levels on top of `packs`, which a child's Head keeps and adds one to.
-    #[serde(default)]
     pub levels: Vec<SizedPack>,
 }
 
@@ -237,14 +229,11 @@ pub struct HeadBase {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FilesResult {
     pub clonepack: ClonepackArtifacts,
-    #[serde(default)]
     pub archive_chunks: Vec<String>,
-    #[serde(default)]
     pub archive_frames: Vec<ArchiveFrame>,
     /// The packed archive this one is a tail on, when it is one: see
     /// `ArchiveBuilder::build_tail_into_cas`. A later build that compacts
     /// the tails builds on it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact: Option<Box<FilesResult>>,
 }
 

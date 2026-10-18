@@ -15,11 +15,9 @@ use std::path::{Path, PathBuf};
 pub struct BranchesRef {
     /// CAS id of the zstd-compressed `BranchesArtifact`.
     pub artifact: String,
-    #[serde(default)]
     pub artifact_url: Option<String>,
     /// The side pack's layers, oldest first. Empty when every branch and
     /// tag is in the default branch's history.
-    #[serde(default)]
     pub side_packs: Vec<SidePackRef>,
 }
 
@@ -28,11 +26,9 @@ pub struct BranchesRef {
 pub struct SidePackRef {
     pub pack: String,
     pub pack_len: u64,
-    #[serde(default)]
     pub pack_url: Option<String>,
     pub idx: String,
     pub idx_len: u64,
-    #[serde(default)]
     pub idx_url: Option<String>,
 }
 

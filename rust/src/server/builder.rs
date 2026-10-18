@@ -455,7 +455,6 @@ pub(super) fn make_manifest(
         packs,
         midx,
         idx_bundle,
-        ..Default::default()
     })
 }
 
