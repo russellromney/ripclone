@@ -794,8 +794,9 @@ fn g12_editable_clones_pull_and_push_like_git_clone() {
     git(&branch, &["pull", "-q", "--ff-only"]);
 
     // A tag is detached; an `--at` commit on a named local branch tracks
-    // nothing. Its remote-tracking refs are a plain `git clone`'s: none
-    // claims the upstream has the local branch.
+    // nothing. Its remote-tracking refs are the server's, published before
+    // the pushes above, which sent no webhook: none claims the upstream has
+    // the local branch.
     let tag = clone("tag", &["--at", "v1"]);
     assert_eq!(git(&tag, &["rev-parse", "HEAD"]), a);
     assert!(
@@ -807,7 +808,10 @@ fn g12_editable_clones_pull_and_push_like_git_clone() {
     let local = clone("local", &["--at", &a, "--branch", "mine"]);
     assert_eq!(git(&local, &["symbolic-ref", "HEAD"]), "refs/heads/mine");
     assert_eq!(upstream(&local), None);
-    assert_eq!(remote_refs(&local), git_clone_remotes(&origin.bare, &[]));
+    assert_eq!(
+        remote_refs(&local),
+        format!("origin/HEAD {b} origin/main\norigin/{odd} {o} \norigin/main {b}")
+    );
     assert!(!remote_refs(&local).contains("origin/mine"));
 }
 
