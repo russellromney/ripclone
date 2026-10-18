@@ -3,10 +3,11 @@
 //! `StaticBroker` is Tier-B passthrough: the per-instance configured token.
 //!
 //! `GitHubAppBroker` is a Tier-A broker that mints short-lived scoped tokens: it
-//! signs an app JWT (RS256) with the app's private key and exchanges it for an
-//! installation access token via the GitHub API, cached per installation until
-//! shortly before it expires. Select it by setting the `RIPCLONE_GITHUB_APP_*`
-//! environment (see [`broker_from_env`]).
+//! signs an app JWT (RS256) with the app's private key, looks up the app's
+//! installation on each repository, and exchanges the JWT for that
+//! installation's access token. One app serves every account that installed
+//! it. Select it by setting the `RIPCLONE_GITHUB_APP_*` environment (see
+//! [`broker_from_env`]).
 
 use crate::provider::{ProviderRegistry, RepoId};
 use std::collections::HashMap;
@@ -56,13 +57,14 @@ const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
 const JWT_TTL_SECS: u64 = 540;
 /// Backdate the JWT `iat` to tolerate minor clock skew against GitHub.
 const JWT_BACKDATE_SECS: u64 = 60;
+/// How long a repository's installation, or the app's absence from it, is
+/// reused. An app installed on a new account serves it within this time.
+const INSTALLATION_TTL: Duration = Duration::from_secs(600);
 
-/// Static configuration for a GitHub App installation broker.
+/// Static configuration for a GitHub App broker.
 pub struct GitHubAppConfig {
     /// The GitHub App id (the numeric app id, used as the JWT issuer).
     pub app_id: String,
-    /// The installation whose repositories this broker serves.
-    pub installation_id: u64,
     /// The app's RSA private key, in PEM form. Kept secret; parsed once.
     pub private_key_pem: SecretString,
     /// REST API base (no trailing slash needed); defaults to api.github.com.
@@ -72,7 +74,7 @@ pub struct GitHubAppConfig {
 impl GitHubAppConfig {
     /// Load config from the environment, returning `Ok(None)` when no GitHub App
     /// is configured (`RIPCLONE_GITHUB_APP_ID` unset). Errors if the app id is
-    /// set but the installation id or private key is missing or malformed, so a
+    /// set but the private key is missing or the API base is not https, so a
     /// misconfigured deployment fails fast instead of silently falling back to
     /// anonymous mirroring.
     pub fn from_env() -> Result<Option<Self>> {
@@ -85,14 +87,6 @@ impl GitHubAppConfig {
             Some(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => return Ok(None),
         };
-        let installation_id = var("RIPCLONE_GITHUB_APP_INSTALLATION_ID")
-            .filter(|s| !s.trim().is_empty())
-            .context(
-                "RIPCLONE_GITHUB_APP_ID is set but RIPCLONE_GITHUB_APP_INSTALLATION_ID is missing",
-            )?
-            .trim()
-            .parse::<u64>()
-            .context("RIPCLONE_GITHUB_APP_INSTALLATION_ID must be a positive integer")?;
         let private_key_pem = load_app_private_key(&var)?;
         let api_base = var("RIPCLONE_GITHUB_API_BASE")
             .map(|s| s.trim().trim_end_matches('/').to_string())
@@ -107,7 +101,6 @@ impl GitHubAppConfig {
         }
         Ok(Some(Self {
             app_id,
-            installation_id,
             private_key_pem,
             api_base,
         }))
@@ -115,9 +108,13 @@ impl GitHubAppConfig {
 }
 
 /// Read the app private key (inline PEM) from `RIPCLONE_GITHUB_APP_PRIVATE_KEY`.
-/// The key is wrapped in a `SecretString` and never logged.
+/// A one-line value with literal `\n` escapes, as secret stores often keep a
+/// PEM, is unescaped. The key is wrapped in a `SecretString` and never logged.
 fn load_app_private_key(var: impl Fn(&str) -> Option<String>) -> Result<SecretString> {
     match var("RIPCLONE_GITHUB_APP_PRIVATE_KEY") {
+        Some(pem) if !pem.trim().is_empty() && !pem.contains('\n') => {
+            Ok(SecretString::from(pem.replace("\\n", "\n")))
+        }
         Some(pem) if !pem.trim().is_empty() => Ok(SecretString::from(pem)),
         _ => anyhow::bail!(
             "RIPCLONE_GITHUB_APP_ID is set but RIPCLONE_GITHUB_APP_PRIVATE_KEY is not"
@@ -150,6 +147,12 @@ struct AppJwtClaims {
     iss: String,
 }
 
+/// GitHub's repository-installation response (subset we use).
+#[derive(Deserialize)]
+struct InstallationResponse {
+    id: u64,
+}
+
 /// GitHub's installation-token response (subset we use).
 #[derive(Deserialize)]
 struct InstallationTokenResponse {
@@ -161,20 +164,23 @@ struct InstallationTokenResponse {
 /// Tier-A broker: mints short-lived GitHub App installation access tokens.
 ///
 /// The RSA private key is parsed once into a [`jsonwebtoken::EncodingKey`] (the
-/// raw PEM is dropped afterward) and never logged. Tokens are cached per
-/// installation and reused until just before they expire.
+/// raw PEM is dropped afterward) and never logged. Each repository's
+/// installation is looked up once per [`INSTALLATION_TTL`], and tokens are
+/// cached per installation and reused until just before they expire.
 ///
 /// `fetch_credential` is synchronous (per the trait); on a cache miss it blocks
-/// the caller for the GitHub round-trip. Because installation tokens last ~1h
-/// and are cached, a miss happens at most about once an hour per installation,
-/// so the rare stall on an async worker is an acceptable trade-off for keeping
-/// the broker trait simple.
+/// the caller for the GitHub round-trips. Lookups last ten minutes and tokens
+/// about an hour, so the rare stall on an async worker is an acceptable
+/// trade-off for keeping the broker trait simple.
 pub struct GitHubAppBroker {
     app_id: String,
-    installation_id: u64,
     encoding_key: EncodingKey,
     api_base: String,
-    cache: Mutex<HashMap<u64, CachedToken>>,
+    /// By repository path (`owner/name`): its installation, or `None` when
+    /// the app is not installed on it, and when that was looked up.
+    installations: Mutex<HashMap<String, (Option<u64>, SystemTime)>>,
+    /// Access tokens by installation id.
+    tokens: Mutex<HashMap<u64, CachedToken>>,
 }
 
 impl GitHubAppBroker {
@@ -185,44 +191,84 @@ impl GitHubAppBroker {
                 .context("parse GitHub App private key (expected an RSA PEM)")?;
         Ok(Self {
             app_id: config.app_id,
-            installation_id: config.installation_id,
             encoding_key,
             api_base: config.api_base,
-            cache: Mutex::new(HashMap::new()),
+            installations: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The app's installation on `repo` (`owner/name`), or `None` when the
+    /// app is not installed on it.
+    fn installation(&self, repo: &str) -> Result<Option<u64>> {
+        let now = SystemTime::now();
+        if let Some((installation, looked_up)) = self
+            .installations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(repo)
+            && now < *looked_up + INSTALLATION_TTL
+        {
+            return Ok(*installation);
+        }
+        let url = format!("{}/repos/{repo}/installation", self.api_base);
+        let (status, body) = app_request(reqwest::Method::GET, &url, &self.build_app_jwt()?)?;
+        let installation = match status {
+            reqwest::StatusCode::NOT_FOUND => None,
+            status if status.is_success() => Some(
+                serde_json::from_str::<InstallationResponse>(&body)
+                    .context("parse repository installation response")?
+                    .id,
+            ),
+            status => {
+                let snippet: String = body.chars().take(300).collect();
+                anyhow::bail!("GitHub App installation lookup returned {status}: {snippet}");
+            }
+        };
+        self.installations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(repo.to_string(), (installation, now));
+        Ok(installation)
     }
 
     /// Return a cached installation token if still fresh, otherwise mint a new
     /// one and cache it.
-    fn installation_token(&self) -> Result<SecretString> {
+    fn installation_token(&self, installation: u64) -> Result<SecretString> {
         let now = SystemTime::now();
         if let Some(cached) = self
-            .cache
+            .tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&self.installation_id)
+            .get(&installation)
             && cached.is_fresh(now)
         {
             return Ok(cached.token.clone());
         }
 
-        let fresh = self.mint_installation_token()?;
+        let fresh = self.mint_installation_token(installation)?;
         let token = fresh.token.clone();
-        self.cache
+        self.tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(self.installation_id, fresh);
+            .insert(installation, fresh);
         Ok(token)
     }
 
     /// Sign an app JWT and exchange it for an installation access token.
-    fn mint_installation_token(&self) -> Result<CachedToken> {
-        let jwt = self.build_app_jwt()?;
+    fn mint_installation_token(&self, installation: u64) -> Result<CachedToken> {
         let url = format!(
-            "{}/app/installations/{}/access_tokens",
-            self.api_base, self.installation_id
+            "{}/app/installations/{installation}/access_tokens",
+            self.api_base
         );
-        let body = post_installation_token(&url, &jwt)?;
+        let (status, body) = app_request(reqwest::Method::POST, &url, &self.build_app_jwt()?)?;
+        if !status.is_success() {
+            // Truncate the upstream body: it carries GitHub's error message,
+            // which is plenty for debugging without dumping an unbounded
+            // response into the logs.
+            let snippet: String = body.chars().take(300).collect();
+            anyhow::bail!("GitHub App token endpoint returned {status}: {snippet}");
+        }
         let parsed: InstallationTokenResponse =
             serde_json::from_str(&body).context("parse installation token response")?;
         let expires_at = parse_rfc3339(&parsed.expires_at)
@@ -253,50 +299,51 @@ impl GitHubAppBroker {
 }
 
 impl CredentialBroker for GitHubAppBroker {
+    /// The installation token for the repo's account, or `None` (anonymous)
+    /// when the app is not installed on the repo or it is not on `github`.
     fn fetch_credential(&self, repo_id: &RepoId) -> Result<Option<SecretString>> {
-        // This broker only authenticates against the github default instance;
-        // other providers fall through to anonymous mirroring.
         if !repo_id.is_github_default() {
             return Ok(None);
         }
-        self.installation_token().map(Some)
+        let Some((owner, name)) = repo_id.github_owner_repo() else {
+            return Ok(None);
+        };
+        match self.installation(&format!("{owner}/{name}"))? {
+            Some(installation) => self.installation_token(installation).map(Some),
+            None => Ok(None),
+        }
     }
 }
 
-/// POST the app JWT to GitHub's installation-token endpoint and return the
-/// response body. Runs the blocking HTTP request on a scoped thread so it is
-/// safe to call from inside an async (tokio) context without nesting runtimes.
-fn post_installation_token(url: &str, jwt: &str) -> Result<String> {
+/// Send a request to the GitHub API as the app and return the status and
+/// body. Runs the blocking HTTP request on a scoped thread so it is safe to
+/// call from inside an async (tokio) context without nesting runtimes.
+fn app_request(
+    method: reqwest::Method,
+    url: &str,
+    jwt: &str,
+) -> Result<(reqwest::StatusCode, String)> {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| -> Result<String> {
+            .spawn(|| -> Result<(reqwest::StatusCode, String)> {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(15))
                     .build()
                     .context("build GitHub App http client")?;
                 let resp = client
-                    .post(url)
+                    .request(method, url)
                     .header(reqwest::header::USER_AGENT, "ripclone")
                     .header(reqwest::header::ACCEPT, "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
                     .bearer_auth(jwt)
                     .send()
-                    .context("request GitHub App installation token")?;
+                    .context("request the GitHub API as the app")?;
                 let status = resp.status();
-                let text = resp
-                    .text()
-                    .context("read GitHub App installation token response")?;
-                if !status.is_success() {
-                    // Truncate the upstream body: it carries GitHub's error
-                    // message, which is plenty for debugging without dumping an
-                    // unbounded response into the logs.
-                    let snippet: String = text.chars().take(300).collect();
-                    anyhow::bail!("GitHub App token endpoint returned {status}: {snippet}");
-                }
-                Ok(text)
+                let text = resp.text().context("read the GitHub API response")?;
+                Ok((status, text))
             })
             .join()
-            .map_err(|_| anyhow::anyhow!("GitHub App token request thread panicked"))?
+            .map_err(|_| anyhow::anyhow!("GitHub App request thread panicked"))?
     })
 }
 
@@ -363,12 +410,9 @@ pub fn broker_from_env(registry: ProviderRegistry) -> Result<Arc<dyn CredentialB
     let mut broker = ProviderAwareBroker::new(registry);
     if let Some(config) = GitHubAppConfig::from_env()? {
         let app_id = config.app_id.clone();
-        let installation_id = config.installation_id;
         let gh_broker = Arc::new(GitHubAppBroker::new(config)?);
         broker = broker.register("github", gh_broker);
-        info!(
-            "using GitHub App credential broker (app_id={app_id}, installation_id={installation_id})"
-        );
+        info!("using GitHub App credential broker (app_id={app_id})");
     }
     Ok(Arc::new(broker))
 }
@@ -419,13 +463,116 @@ RwIDAQAB
 -----END PUBLIC KEY-----";
 
     fn test_broker() -> GitHubAppBroker {
+        broker_at(DEFAULT_GITHUB_API_BASE)
+    }
+
+    fn broker_at(api_base: &str) -> GitHubAppBroker {
         GitHubAppBroker::new(GitHubAppConfig {
             app_id: "12345".to_string(),
-            installation_id: 67890,
             private_key_pem: SecretString::from(TEST_PRIVATE_KEY),
-            api_base: DEFAULT_GITHUB_API_BASE.to_string(),
+            api_base: api_base.to_string(),
         })
         .expect("build test broker from test key")
+    }
+
+    /// A GitHub API stand-in: answers each `METHOD /path` with its canned
+    /// status and body, 500 for anything else, and records what it was asked.
+    fn fake_github(
+        routes: &'static [(&'static str, u16, &'static str)],
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let line: Vec<&str> = text.lines().next().unwrap_or("").split(' ').collect();
+                let asked_for = format!("{} {}", line[0], line.get(1).unwrap_or(&""));
+                let (status, body) = routes
+                    .iter()
+                    .find(|(route, _, _)| *route == asked_for)
+                    .map_or((500, ""), |(_, status, body)| (*status, *body));
+                log.lock().unwrap().push(asked_for);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (base, asked)
+    }
+
+    #[test]
+    fn github_app_broker_mints_per_installation_and_caches() {
+        let (base, asked) = fake_github(&[
+            ("GET /repos/acme/app/installation", 200, r#"{"id":7}"#),
+            ("GET /repos/acme/lib/installation", 200, r#"{"id":7}"#),
+            (
+                "GET /repos/other/x/installation",
+                404,
+                r#"{"message":"Not Found"}"#,
+            ),
+            (
+                "POST /app/installations/7/access_tokens",
+                201,
+                r#"{"token":"ghs_seven","expires_at":"2999-01-01T00:00:00Z"}"#,
+            ),
+        ]);
+        let broker = broker_at(&base);
+        let token = |repo: &str| {
+            broker
+                .fetch_credential(&RepoId::github(repo))
+                .unwrap()
+                .map(|t| t.expose_secret().to_string())
+        };
+        assert_eq!(token("acme/app").as_deref(), Some("ghs_seven"));
+        assert_eq!(token("acme/lib").as_deref(), Some("ghs_seven"));
+        // Not installed on the repo: anonymous.
+        assert_eq!(token("other/x"), None);
+        // Every answer is cached: no more requests.
+        assert_eq!(token("acme/app").as_deref(), Some("ghs_seven"));
+        assert_eq!(token("other/x"), None);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                "GET /repos/acme/app/installation",
+                "POST /app/installations/7/access_tokens",
+                "GET /repos/acme/lib/installation",
+                "GET /repos/other/x/installation",
+            ]
+        );
+    }
+
+    #[test]
+    fn github_app_broker_fails_on_api_errors_without_caching() {
+        let (base, asked) =
+            fake_github(&[("GET /repos/acme/app/installation", 200, r#"{"id":7}"#)]);
+        let broker = broker_at(&base);
+        // The token endpoint answers 500, and a lookup that fails is retried.
+        for repo in ["acme/app", "broken/repo", "broken/repo"] {
+            let error = broker
+                .fetch_credential(&RepoId::github(repo))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("returned 500"), "{repo}: {error}");
+        }
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            4,
+            "{:?}",
+            asked.lock().unwrap()
+        );
     }
 
     #[test]
@@ -437,25 +584,6 @@ RwIDAQAB
         };
         // Non-github provider → anonymous (no network call).
         assert!(broker.fetch_credential(&repo).unwrap().is_none());
-    }
-
-    #[test]
-    fn github_app_broker_serves_cached_token_without_minting() {
-        let broker = test_broker();
-        // Seed a still-fresh token; fetch_credential must return it rather than
-        // hitting the network.
-        broker.cache.lock().unwrap().insert(
-            broker.installation_id,
-            CachedToken {
-                token: SecretString::from("ghs_cached"),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            },
-        );
-        let token = broker
-            .fetch_credential(&RepoId::github("o/r"))
-            .unwrap()
-            .expect("cached token");
-        assert_eq!(token.expose_secret(), "ghs_cached");
     }
 
     #[test]
@@ -528,7 +656,6 @@ RwIDAQAB
             GitHubAppConfig::from_lookup(|key| vars.get(key).cloned())
         };
         const ID: (&str, &str) = ("RIPCLONE_GITHUB_APP_ID", "12345");
-        const INSTALL: (&str, &str) = ("RIPCLONE_GITHUB_APP_INSTALLATION_ID", "67890");
         const KEY: (&str, &str) = ("RIPCLONE_GITHUB_APP_PRIVATE_KEY", TEST_PRIVATE_KEY);
 
         // Nothing configured: no GitHub App broker.
@@ -537,19 +664,12 @@ RwIDAQAB
         // App id set but incomplete or malformed: fail fast.
         for vars in [
             &[ID][..],
-            &[ID, INSTALL],
             &[
                 ID,
-                ("RIPCLONE_GITHUB_APP_INSTALLATION_ID", "not-a-number"),
-                KEY,
-            ],
-            &[
-                ID,
-                INSTALL,
                 KEY,
                 ("RIPCLONE_GITHUB_API_BASE", "http://ghe.example.com"),
             ],
-            &[ID, INSTALL, ("RIPCLONE_GITHUB_APP_PRIVATE_KEY", " ")],
+            &[ID, ("RIPCLONE_GITHUB_APP_PRIVATE_KEY", " ")],
         ] {
             assert!(
                 load(vars).is_err(),
@@ -559,11 +679,10 @@ RwIDAQAB
         }
         // The default API base, or an override.
         for (vars, api_base) in [
-            (vec![ID, INSTALL, KEY], DEFAULT_GITHUB_API_BASE),
+            (vec![ID, KEY], DEFAULT_GITHUB_API_BASE),
             (
                 vec![
                     ID,
-                    INSTALL,
                     KEY,
                     (
                         "RIPCLONE_GITHUB_API_BASE",
@@ -575,9 +694,15 @@ RwIDAQAB
         ] {
             let cfg = load(&vars).unwrap().expect("configured");
             assert_eq!(cfg.app_id, "12345");
-            assert_eq!(cfg.installation_id, 67890);
             assert_eq!(cfg.api_base, api_base);
             GitHubAppBroker::new(cfg).expect("broker from the parsed key");
         }
+        // A one-line key with `\n` escapes is the same key.
+        let one_line = TEST_PRIVATE_KEY.replace('\n', "\\n");
+        let cfg = load(&[ID, ("RIPCLONE_GITHUB_APP_PRIVATE_KEY", &one_line)])
+            .unwrap()
+            .expect("configured");
+        assert_eq!(cfg.private_key_pem.expose_secret(), TEST_PRIVATE_KEY);
+        GitHubAppBroker::new(cfg).expect("broker from the unescaped key");
     }
 }

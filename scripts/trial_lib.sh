@@ -61,6 +61,7 @@ start_server() {
   # removed; without RIPCLONE_S3_BUCKET the server stores locally.
   env -u RIPCLONE_S3_BUCKET -u RIPCLONE_S3_ENDPOINT -u RIPCLONE_S3_REGION -u RIPCLONE_S3_PREFIX \
     -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u RIPCLONE_CONFIG \
+    -u RIPCLONE_GITHUB_APP_ID -u RIPCLONE_GITHUB_APP_PRIVATE_KEY -u RIPCLONE_GITHUB_API_BASE \
     HOME="$dir/home" GIT_CONFIG_GLOBAL=/dev/null \
     RIPCLONE_POLL_INTERVAL_SECS=0 RUST_LOG=info "$@" \
     "$BIN/ripclone-server" --host 127.0.0.1 --port 0 --data-dir "$dir" >"$log" 2>&1 &
