@@ -32,6 +32,7 @@ mod auth;
 mod builder;
 mod poller;
 mod purge;
+mod refs;
 mod uploads;
 mod webhooks;
 mod worker;
@@ -95,6 +96,13 @@ pub struct RepoLock {
     pub write: tokio::sync::Mutex<()>,
     /// Shared by every build while it reads the mirror.
     pub read: tokio::sync::RwLock<()>,
+    /// Held while the repo's refs are published, so publishes never
+    /// interleave and the control store's pointer only moves forward.
+    pub refs: tokio::sync::Mutex<()>,
+    /// Held by the repo's one running refs refresh; `refresh_wanted` asks
+    /// it for another pass.
+    pub refresh: tokio::sync::Mutex<()>,
+    pub refresh_wanted: std::sync::atomic::AtomicBool,
     /// When compaction last failed, so a failing one is not retried by every
     /// Full.
     pub compact_failed: std::sync::Mutex<Option<Instant>>,

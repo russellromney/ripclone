@@ -2,7 +2,6 @@
 //! upstream verification.
 
 use crate::harness::*;
-use hmac::{KeyInit, Mac};
 
 /// I3: for each provider kind, the server sends that provider's auth header
 /// on every request to the origin, and the origin accepts nothing else.
@@ -137,82 +136,6 @@ fn i2_server_credential_builds_a_private_repo() {
     }
 }
 
-fn hmac_hex(secret: &str, body: &str) -> String {
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(body.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
-}
-
-/// A signed push webhook for `kind`: (headers, body).
-fn push_hook(
-    kind: &str,
-    secret: &str,
-    repo: &str,
-    after: &str,
-) -> (Vec<(&'static str, String)>, String) {
-    let (owner, name) = repo.split_once('/').unwrap();
-    match kind {
-        "github" => {
-            let body = serde_json::json!({
-                "ref": "refs/heads/main",
-                "after": after,
-                "repository": {
-                    "name": name,
-                    "owner": { "login": owner },
-                    "default_branch": "main",
-                    "private": false,
-                },
-            })
-            .to_string();
-            let sig = format!("sha256={}", hmac_hex(secret, &body));
-            (
-                vec![
-                    ("X-GitHub-Event", "push".into()),
-                    ("X-Hub-Signature-256", sig),
-                ],
-                body,
-            )
-        }
-        "gitlab" => {
-            let body = serde_json::json!({
-                "ref": "refs/heads/main",
-                "after": after,
-                "project": {
-                    "path_with_namespace": repo,
-                    "default_branch": "main",
-                    "visibility_level": 20,
-                },
-            })
-            .to_string();
-            (
-                vec![
-                    ("X-Gitlab-Event", "Push Hook".into()),
-                    ("X-Gitlab-Token", secret.into()),
-                ],
-                body,
-            )
-        }
-        "gitea" => {
-            let body = serde_json::json!({
-                "ref": "refs/heads/main",
-                "after": after,
-                "repository": {
-                    "full_name": repo,
-                    "default_branch": "main",
-                    "private": false,
-                },
-            })
-            .to_string();
-            let sig = hmac_hex(secret, &body);
-            (
-                vec![("X-Gitea-Event", "push".into()), ("X-Gitea-Signature", sig)],
-                body,
-            )
-        }
-        other => panic!("no webhook format for {other}"),
-    }
-}
-
 /// I4: for each provider's webhook, a bad signature gets 401 and builds
 /// nothing; a signed push builds the new tip before any clone asks for it.
 #[test]
@@ -247,13 +170,13 @@ fn i4_signed_webhook_builds_before_clone() {
         origin.publish();
         let hook = format!("/webhooks/{id}");
 
-        let (headers, body) = push_hook(kind, "wrong-secret", &slug, &tip);
+        let (headers, body) = push_hook(kind, "wrong-secret", &slug, "refs/heads/main", &tip);
         let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let bad = server.post(&hook, &headers, &body);
         assert_eq!(bad.status, 401, "{kind}: {}", bad.body);
         assert_eq!(server.metric("ripclone_builds_queued_total"), 1, "{kind}");
 
-        let (headers, body) = push_hook(kind, &secret, &slug, &tip);
+        let (headers, body) = push_hook(kind, &secret, &slug, "refs/heads/main", &tip);
         let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let good = server.post(&hook, &headers, &body);
         assert_eq!(good.status, 200, "{kind}: {}", good.body);

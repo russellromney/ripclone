@@ -12,6 +12,25 @@ CREATE TABLE added_repos (
   added_at INTEGER NOT NULL            -- epoch seconds
 );
 
+-- The repository's published refs (see docs/internal/rebuild/TAGS.md): the
+-- newest tags artifact, and the branches artifact and side pack of the last
+-- refresh. The branch columns are NULL before the first refresh, the side
+-- pack's when every ref is in the default branch's history.
+CREATE TABLE repo_refs (
+  repo              TEXT PRIMARY KEY,  -- RepoId::storage_key()
+  tags_artifact     TEXT NOT NULL,     -- CAS id of the TagsArtifact
+  tags_len          INTEGER NOT NULL,
+  tags_count        INTEGER NOT NULL,  -- tags in the artifact
+  tags_hash         TEXT NOT NULL,     -- hash of the mirror's refs/tags listing
+  branches_artifact TEXT,              -- CAS id of the BranchesArtifact
+  branches_len      INTEGER,
+  refs_hash         TEXT,              -- hash of the mirror's refs it was built from
+  side_pack         TEXT,              -- CAS id of the side pack
+  side_pack_len     INTEGER,
+  side_idx          TEXT,              -- CAS id of its idx
+  side_idx_len      INTEGER
+);
+
 -- One row per (repo, commit). Each output kind (head, files, full) is
 -- pending | ready | failed and has its own lease, attempts and retry time,
 -- so one row's outputs build at the same time. A kind is building

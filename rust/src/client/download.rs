@@ -19,6 +19,10 @@ pub(super) enum UrlSlot {
     PackIdx(usize),
     Midx,
     IdxBundle,
+    Tags,
+    Branches,
+    SidePack,
+    SideIdx,
 }
 
 impl UrlSlot {
@@ -37,6 +41,10 @@ impl UrlSlot {
             Self::PackIdx(index) => indexed(&info.pack_idx_urls, index),
             Self::Midx => info.midx_url.clone(),
             Self::IdxBundle => info.idx_bundle_url.clone(),
+            Self::Tags => info.tags_artifact_url.clone(),
+            Self::Branches => info.branches.as_ref()?.artifact_url.clone(),
+            Self::SidePack => info.branches.as_ref()?.side_pack.as_ref()?.pack_url.clone(),
+            Self::SideIdx => info.branches.as_ref()?.side_pack.as_ref()?.idx_url.clone(),
         }
     }
 
@@ -49,6 +57,10 @@ impl UrlSlot {
             Self::PackIdx(index) => format!("pack idx {index}"),
             Self::Midx => "multi-pack-index".to_string(),
             Self::IdxBundle => "idx bundle".to_string(),
+            Self::Tags => "tags".to_string(),
+            Self::Branches => "branches".to_string(),
+            Self::SidePack => "side pack".to_string(),
+            Self::SideIdx => "side pack idx".to_string(),
         }
     }
 }

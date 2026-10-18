@@ -1,7 +1,7 @@
 //! Behavior every [`ControlStore`] must have. A backend passes by running
 //! [`run_all`] with a factory for empty backends.
 
-use super::{Clock, ControlStore, Lease, Out, Output, Pool};
+use super::{Clock, ControlStore, Lease, Out, Output, Pool, RepoBranches, RepoRefs, SidePack};
 use crate::provider::{ProviderInstanceId, RepoId};
 use crate::{ClonepackArtifacts, ExactResultKind, FilesResult, FullResult, HeadResult};
 use anyhow::Result;
@@ -80,6 +80,7 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
         a_referenced_artifact_is_never_deletable,
         an_artifact_queued_again_during_a_sweep_stays_queued,
         an_unapplied_publish_references_nothing,
+        refs_are_absent_until_written_and_replaced,
     );
 }
 
@@ -1567,4 +1568,49 @@ async fn an_unapplied_publish_references_nothing(backend: &dyn Backend) {
     for hash in &unreferenced {
         assert!(store.deletable(hash, START + 1).await.unwrap(), "{hash}");
     }
+async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
+    let (clock, store) = open(backend).await;
+    let missing = RepoId::github("acme/missing");
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), None);
+    let first = RepoRefs {
+        tags_artifact: crate::cas::hash(b"first"),
+        tags_len: 120,
+        tags_count: 3,
+        tags_hash: crate::cas::hash(b"tags 1"),
+        branches: None,
+    };
+    store.set_refs(&repo(), &first).await.unwrap();
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), Some(first.clone()));
+    let with_side = RepoRefs {
+        branches: Some(RepoBranches {
+            artifact: crate::cas::hash(b"branches"),
+            len: 40,
+            refs_hash: crate::cas::hash(b"refs 1"),
+            side_pack: Some(SidePack {
+                pack: crate::cas::hash(b"pack"),
+                pack_len: 1 << 40,
+                idx: crate::cas::hash(b"idx"),
+                idx_len: 1100,
+            }),
+        }),
+        ..first.clone()
+    };
+    store.set_refs(&repo(), &with_side).await.unwrap();
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), Some(with_side));
+    let second = RepoRefs {
+        tags_artifact: crate::cas::hash(b"second"),
+        tags_len: 0,
+        tags_count: 0,
+        tags_hash: crate::cas::hash(b"tags 2"),
+        branches: Some(RepoBranches {
+            artifact: crate::cas::hash(b"branches 2"),
+            len: 30,
+            refs_hash: crate::cas::hash(b"refs 2"),
+            side_pack: None,
+        }),
+    };
+    store.set_refs(&repo(), &second).await.unwrap();
+    let store = reopen(backend, &clock, store).await;
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), Some(second));
+    assert_eq!(store.get_refs(&missing).await.unwrap(), None);
 }

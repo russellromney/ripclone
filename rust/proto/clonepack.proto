@@ -136,3 +136,45 @@ message Fragment {
   // Uncompressed length of the slice.
   uint32 raw_len = 3;
 }
+
+// A repository's tags: every upstream tag whose target the server's mirror
+// holds, as the mirror's `refs/tags/` lists them. One per tag state,
+// addressed by content hash and stored zstd-compressed. A clone keeps the
+// tags whose peeled target is among its objects, as `git clone` gets them.
+message TagsArtifact {
+  // Sorted by name.
+  repeated Tag tags = 1;
+  // The raw content of every annotated tag object the tags name, each tag
+  // of a tag included, sorted by object id.
+  repeated bytes objects = 2;
+}
+
+// One tag: its name under `refs/tags/`, the object the ref names, and that
+// object fully peeled. `peeled` is empty for a lightweight tag, whose
+// object is its target.
+message Tag {
+  string name = 1;
+  string object = 2;
+  string peeled = 3;
+}
+
+// A repository's branches, for full clones: every upstream branch as a
+// refresh left the mirror's `refs/heads/`, and the default branch. Beside
+// it the server stores one pack of every object reachable from a branch or
+// tag but not from `base`, so a full clone holding `base` gets every ref
+// complete.
+message BranchesArtifact {
+  // Empty when upstream named none.
+  string default_branch = 1;
+  // The default branch's commit, whose history the side pack leaves out.
+  // Empty when there is no default branch, and then there is no side pack.
+  string base = 2;
+  // Sorted by name.
+  repeated Branch branches = 3;
+}
+
+// One branch: its name under `refs/heads/` and its commit.
+message Branch {
+  string name = 1;
+  string commit = 2;
+}

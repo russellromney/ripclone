@@ -107,14 +107,15 @@ whole server for every git spawn. C6 is retired. The unit test
 | D5 | 401, 403, 404, 5xx, and an unreachable server give distinct CLI errors and exit codes (3, 4, 5, 6, 6; see the README). | #189 |
 | D6 | Client-side failures: target exists and is not empty (exit 1, its files untouched), server unreachable (exit 6), no `git` on PATH for an editable clone (exit 1, before any request). Nothing left behind; a Files clone works without git. An existing empty directory is a valid target, as for `git clone`: the clone lands in it and keeps its mode; an unreachable server, no git, or artifacts failing mid-clone leave it in place, empty, with its mode. | #208 |
 
-### E. Top-up (4)
+### E. Top-up (5)
 
 | # | Test | Added |
 |---|---|---|
-| E1 | Full(A) ready; restart with `files_slots = 0` and `full_slots = 0`; push B; full clone: installs B by top-up without waiting on any server build. Tree and `rev-list --count` equal origin at B, `git fsck` clean. The reflog starts with `clone: from <url>` at B and there is no ORIG_HEAD. | #205 |
+| E1 | Full(A), with a tagged parent P, ready; restart with `files_slots = 0` and `full_slots = 0`; push B; full clone: installs B by top-up without waiting on any server build. Tree and `rev-list --count` equal origin at B, `git fsck` clean. The reflog starts with `clone: from <url>` at B and there is no ORIG_HEAD. Its tags, remote-tracking branches and `git describe` equal a `git clone`. | #205 |
 | E2 | Same with a push of several commits including a merge (A is an ancestor, not the parent). | #205 |
-| E3 | Same after a force-push (A is not an ancestor): clone still equals origin at B. | #205 |
+| E3 | Same after a force-push onto P (A is not an ancestor): clone still equals origin at B, and has P's and A's tags, as git's does. | #205 |
 | E4 | No ready Full exists for the ref: full clone waits for Full(B) instead of failing. | #205 |
+| E5 | Head(B) is built while Full(B) has no slot; a tag pushed with B is in the top-up clone of B, although the top-up fetch takes no tags. | |
 
 Top-up uses the user's git credentials. E1-E3 run against an auth-checking
 origin to prove the clone works with only git's own credential and that no
@@ -137,7 +138,7 @@ Ripclone token reaches the origin.
 | F11 | A proxy that ignores Range: the ranged download falls back to one whole GET of that artifact, and the clone is exact. | |
 | F12 | A flipped byte in one range fails the clone on the hash check and leaves nothing. | |
 
-### G. Clone shapes produce correct trees (14)
+### G. Clone shapes produce correct trees (16)
 
 | # | Test | Added |
 |---|---|---|
@@ -155,6 +156,8 @@ Ripclone token reaches the origin.
 | G11 | Pushes add tails to the Files archive: a small push stores only its new files and keeps the bundles a clone of its parent downloaded, until a build 25% past the compact size compacts the archive to about the tree's size. Files clones of the tip and an older commit are exact. | #233 |
 | G12 | Editable clones work with the user's later git: the branch tracks its upstream, `origin` is the configured upstream, `git pull` and `git push` work, a tag or `--at` commit tracks nothing, and a branch named with `#`, `;` and `"` tracks correctly. | #234 |
 | G13 | With a global git config naming a template dir and an identity, full and depth-1 clones have the local config, reflog (`clone: from <url>`) and template hooks of `git clone` and `git clone --depth 1`, apart from `core.checkstat`. The hook runs on the user's commit; `HEAD@{1}` is the cloned commit. A depth-1 clone's `git fetch` takes only its branch, a full clone's every branch. A SHA-256 default in the environment still gives a SHA-1 clone. With `user.useConfigOnly` and no identity, the clone has the reflogs `git clone` writes under git's fallback committer. | #234 |
+| G14 | A full clone has every branch and tag of a plain `git clone`, from the server's refs (the CLI's upstream does not exist, so a fallback fetch fails the test): `refs/remotes/origin/*` with `origin/HEAD`, annotated, nested and lightweight tags, a side branch never built and its tags, both `git describe` forms; `fsck --full --strict` clean; `git switch side` checks out the side branch tracking `origin/side`. `--at v1` has them too. `--at v1 --depth 1` fetches `+refs/tags/v1:refs/tags/v1` as git's does. After webhooks and no build: a tag on an old commit, a new branch, a deleted branch and tag and a moved tag each reach the next clone of the same commit. A depth-1 clone has only its branch and its tip's tags, equal to `git clone --depth 1`: none for an untagged tip; lightweight, annotated and a tag of a tag on a tagged one, `fsck --strict` clean. | |
+| G15 | Tags on trees and blobs, lightweight and annotated, and remote-tracking branches equal `git clone`'s in full and depth-1 clones: tags on the tip's tree, a subtree and blobs in both; one on an older tree and one on a blob no commit holds only in the full clone, which gets them from the server's refs. | |
 
 ### H. Storage and server state (13)
 
@@ -181,8 +184,8 @@ Ripclone token reaches the origin.
 | I1 | Missing or wrong server token: 401; a valid token works. | #186 |
 | I2 | Private repo with a token for the provider in the server's environment: the server builds it; the CLI holds no upstream token. | #202 |
 | I3 | Table across GitHub, GitLab, Gitea, generic: the provider's auth header reaches the origin. | #191 |
-| I4 | Table across GitHub, GitLab, Gitea webhooks: a signed push builds before any clone; a bad signature gets 401 and no build. | #191 |
-| I5 | Poller: with no webhook, a push is built within one poll interval. | #186 |
+| I4 | Table across GitHub, GitLab, Gitea webhooks: a signed push builds before any clone; a bad signature gets 401 and no build. (Tag webhooks are G14.) | #191 |
+| I5 | Poller: with no webhook, a push is built within one poll interval, and a tag pushed with no commit reaches clones of the same commit with no build. | #186 |
 | I6 | Every documented CLI verb exists (keep `docs_cli_surface`). | #193 |
 | I7 | `--verify-upstream` auto, always, never (table). A clone that fails verification is removed; a target that was an empty directory is left empty. The upstream check runs while the clone downloads: with the upstream listing held, an artifact download still starts. | #191 |
 | I8 | Only `/healthz`, `/readyz`, `/metrics` and `/v1/version` answer without the token; unsigned webhooks fail closed (503 without a secret); every other route, `/v1/artifacts/{hash}` included, gives 401 to a missing or wrong token. | #208 |
@@ -239,7 +242,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 97 tests. Several are table-driven.
+Total: 100 tests. Several are table-driven.
 
 ## Test settings
 

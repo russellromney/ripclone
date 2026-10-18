@@ -1,4 +1,5 @@
-//! `POST /webhooks/{provider}`: verify a push event and admit its commit.
+//! `POST /webhooks/{provider}`: verify a push event and admit its commit, or
+//! refresh the repo's tags after a tag push or delete.
 
 use super::api::{admit_build, repo_is_added, unknown_provider};
 use super::{ErrorResponse, ServerState};
@@ -121,18 +122,25 @@ async fn handle_webhook(
     };
     match event.kind {
         EventKind::Ping => (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response(),
-        EventKind::Push => webhook_dispatch_push(&state, &provider, event).await,
-        EventKind::BranchDelete => webhook_ignored("exact results outlive branch deletion"),
+        EventKind::Push if event.ref_.starts_with("refs/heads/") => {
+            webhook_dispatch_push(&state, &provider, event).await
+        }
+        EventKind::Push | EventKind::Delete
+            if event.ref_.starts_with("refs/heads/") || event.ref_.starts_with("refs/tags/") =>
+        {
+            webhook_refresh_refs(&state, &provider, &event).await
+        }
+        EventKind::Push | EventKind::Delete => webhook_ignored("not a branch or tag"),
     }
 }
 
-/// Default-branch push → exact admission. Applies the added-repo gate, then
-/// triggers the shared fire-and-forget path and returns immediately.
-async fn webhook_dispatch_push(
+/// The repo an event names, once the path and added-repo gates
+/// pass; otherwise the response to send.
+async fn webhook_repo(
     state: &ServerState,
     provider: &ProviderInstance,
-    event: crate::webhook::CanonicalEvent,
-) -> Response {
+    event: &crate::webhook::CanonicalEvent,
+) -> Result<RepoId, Response> {
     let repo_id = RepoId {
         provider: provider.id.clone(),
         path: event.repo.clone(),
@@ -140,23 +148,47 @@ async fn webhook_dispatch_push(
     // Validate the payload-supplied path so a hostile push can't escape storage
     // keys. We trust the payload only for routing.
     if validation::validate_repo_path(provider, &repo_id).is_err() {
-        return webhook_ignored("invalid repo path");
+        return Err(webhook_ignored("invalid repo path"));
     }
     match repo_is_added(state, &repo_id).await {
-        Ok(true) => {}
-        Ok(false) => return webhook_ignored("repo not added"),
-        Err(error) => return error.into_response(),
+        Ok(true) => Ok(repo_id),
+        Ok(false) => Err(webhook_ignored("repo not added")),
+        Err(error) => Err(error.into_response()),
     }
-    // Only branch pushes can identify the admitted default-branch commit; tags
-    // and other refs are ignored.
-    let Some(branch) = event
+}
+
+/// Tag push, or branch or tag delete → a refs refresh in the background.
+/// It lists upstream itself, so nothing in the payload but the repo is used.
+async fn webhook_refresh_refs(
+    state: &ServerState,
+    provider: &ProviderInstance,
+    event: &crate::webhook::CanonicalEvent,
+) -> Response {
+    let repo_id = match webhook_repo(state, provider, event).await {
+        Ok(repo_id) => repo_id,
+        Err(response) => return response,
+    };
+    super::refs::spawn_refresh(state, &repo_id, "webhook");
+    (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response()
+}
+
+/// Branch push → a refs refresh in the background, after an exact admission
+/// when it is the default branch. Applies the added-repo gate, then
+/// triggers the shared fire-and-forget path and returns immediately.
+async fn webhook_dispatch_push(
+    state: &ServerState,
+    provider: &ProviderInstance,
+    event: crate::webhook::CanonicalEvent,
+) -> Response {
+    let repo_id = match webhook_repo(state, provider, &event).await {
+        Ok(repo_id) => repo_id,
+        Err(response) => return response,
+    };
+    let branch = event
         .ref_
         .strip_prefix("refs/heads/")
-        .filter(|b| !b.is_empty())
-    else {
-        return webhook_ignored("non-branch ref");
-    };
-    let branch = branch.to_string();
+        .unwrap_or_default()
+        .to_string();
     // Validate the payload-derived branch before it reaches the queue / git.
     if validation::validate_checkout_name(&branch).is_err() {
         return webhook_ignored("invalid branch");
@@ -168,9 +200,10 @@ async fn webhook_dispatch_push(
         return webhook_ignored("push event has invalid after commit");
     }
     // Only a signed event that names its default branch may admit a commit.
-    // Missing identity and non-default pushes are acknowledged without work.
+    // Missing identity and non-default pushes only refresh the refs.
     if event.default_branch.as_deref() != Some(branch.as_str()) {
-        return webhook_ignored("push is not identified as the default branch");
+        super::refs::spawn_refresh(state, &repo_id, "webhook");
+        return (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response();
     }
     // The signed, validated `after` is the admission target. No second
     // upstream probe is permitted on this path.
@@ -181,6 +214,9 @@ async fn webhook_dispatch_push(
                 "webhook: triggered build for {}@{branch}",
                 repo_id.storage_key()
             );
+            // After the admission, so the build's fetch brings the pushed
+            // commit's tags rather than this refresh.
+            super::refs::spawn_refresh(state, &repo_id, "webhook");
             (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response()
         }
         Err(error) => {
@@ -330,9 +366,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_non_default_branch_is_ignored() {
+    async fn webhook_non_default_branch_refreshes_and_admits_no_build() {
         let tmp = tempfile::tempdir().unwrap();
         let state = webhook_state(&tmp).await;
+        mark_added(&state, RepoId::github("acme/widget")).await;
         let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
@@ -348,6 +385,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"ok":true}"#, "a branch push refreshes");
         assert!(
             claim_admitted_job(&state).await.is_none(),
             "non-default push must not admit a build"
@@ -355,9 +396,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_tag_push_is_ignored() {
+    async fn webhook_tag_push_refreshes_and_admits_no_build() {
         let tmp = tempfile::tempdir().unwrap();
         let state = webhook_state(&tmp).await;
+        mark_added(&state, RepoId::github("acme/widget")).await;
         let app = build_app(state.clone());
         let body = gh_push_body(
             "acme",
@@ -373,6 +415,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"ok":true}"#, "a tag push is acted on");
         assert!(
             claim_admitted_job(&state).await.is_none(),
             "a tag push must not admit a build"
@@ -528,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_missing_default_identity_is_ignored() {
+    async fn webhook_missing_default_identity_admits_no_build() {
         let tmp = tempfile::tempdir().unwrap();
         let state = webhook_state(&tmp).await;
         let app = build_app(state.clone());
@@ -542,7 +588,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             claim_admitted_job(&state).await.is_none(),
-            "missing default-branch identity is ignored"
+            "missing default-branch identity admits no build"
         );
     }
 }

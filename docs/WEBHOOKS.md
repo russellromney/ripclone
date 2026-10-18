@@ -23,8 +23,12 @@ Per provider:
 ## Behavior
 
 - A signed push to the repo's **default branch** builds the pushed commit
-  (`after`). Other branches, tag pushes, deletes, and pings are acknowledged
-  without a build.
+  (`after`). Other branches and pings are acknowledged without a build.
+- Any branch or tag push or delete, the default branch's included, refreshes
+  the repo's branches and tags: the server fetches them from the upstream
+  and publishes them (see [Freshness](FRESHNESS.md#branches-and-tags)). On
+  GitLab, enable **Tag push events**; on Gitea, the **Delete** event covers
+  branch and tag deletes.
 - The response is fast: `200` means accepted, not built.
 - No secret configured for the provider: `503`. Bad signature: `401`. A
   `generic` provider has no webhooks: `501`.

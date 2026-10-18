@@ -621,6 +621,88 @@ impl Origin {
     }
 }
 
+/// The tags of the repo at `dir`, one `<name> <type> <object>` line each.
+pub fn tag_refs(dir: &Path) -> String {
+    git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=2) %(objecttype) %(objectname)",
+            "refs/tags/",
+        ],
+    )
+}
+
+/// The remote-tracking refs of the repo at `dir`, one `<name> <commit>
+/// <symref target>` line each.
+pub fn remote_refs(dir: &Path) -> String {
+    git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=2) %(objectname) %(symref:lstrip=2)",
+            "refs/remotes/",
+        ],
+    )
+}
+
+/// `git clone <args>` of `bare` into a scratch dir, passed to `read`.
+fn git_clone<T>(bare: &Path, args: &[&str], read: impl FnOnce(&Path) -> T) -> T {
+    let scratch = tempfile::tempdir().unwrap();
+    let target = scratch.path().join("clone");
+    let url = format!("file://{}", bare.display());
+    let mut argv = vec!["clone", "-q"];
+    argv.extend_from_slice(args);
+    argv.extend([url.as_str(), target.to_str().unwrap()]);
+    git(scratch.path(), &argv);
+    read(&target)
+}
+
+/// [`tag_refs`] of what `git clone <args>` of `bare` gets, with `git
+/// describe` and `git describe --tags` of its HEAD (empty when it fails).
+pub fn git_clone_tags(bare: &Path, args: &[&str]) -> (String, String, String) {
+    git_clone(bare, args, |target| {
+        let (all, tags) = describe(target);
+        (tag_refs(target), all, tags)
+    })
+}
+
+/// [`remote_refs`] of what `git clone <args>` of `bare` gets.
+pub fn git_clone_remotes(bare: &Path, args: &[&str]) -> String {
+    git_clone(bare, args, remote_refs)
+}
+
+/// A provider origin base with no repos, so a clone that fetches from the
+/// upstream fails where the server's refs would do.
+pub const NO_UPSTREAM: (&str, &str) = (
+    "RIPCLONE_ORIGIN_BASE",
+    "file:///nonexistent-ripclone-origin",
+);
+
+/// What a full clone's stderr says when it could get neither the server's
+/// refs nor the upstream's.
+pub const NO_REFS: &str = "the other branches and tags could not be fetched";
+
+/// Wait until the refs refresh that a repo's first build starts has
+/// published the branches, read through `commit`'s Full. The refresh
+/// fetches every upstream branch into the mirror, so a test that holds the
+/// origin's fetches to keep a later push from building waits for it first.
+pub fn wait_first_refs(server: &Server, repo: &str, commit: &str) {
+    wait_for("the first refs publish", || {
+        api::branches_artifact(server, repo, commit)
+    });
+}
+
+/// `git describe` and `git describe --tags` of HEAD at `dir`, each empty
+/// when it fails.
+pub fn describe(dir: &Path) -> (String, String) {
+    let run = |args: &[&str]| {
+        let out = git_output(dir, args);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    (run(&["describe"]), run(&["describe", "--tags"]))
+}
+
 /// The files on disk under `dir` as `ls-tree -r` lines, hashed through a
 /// throwaway repo so the clone itself is untouched. Git never adds a `.git`
 /// entry, so this works for editable and Files clones alike.
@@ -1120,6 +1202,92 @@ pub fn env_refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
 }
 
+/// Hex HMAC-SHA256 of `body` under `secret`.
+fn hmac_hex(secret: &str, body: &str) -> String {
+    use hmac::{KeyInit, Mac};
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// A signed push webhook of `ref_` for `kind`: (headers, body).
+pub fn push_hook(
+    kind: &str,
+    secret: &str,
+    repo: &str,
+    ref_: &str,
+    after: &str,
+) -> (Vec<(&'static str, String)>, String) {
+    let (owner, name) = repo.split_once('/').unwrap();
+    match kind {
+        "github" => {
+            let body = serde_json::json!({
+                "ref": ref_,
+                "after": after,
+                "repository": {
+                    "name": name,
+                    "owner": { "login": owner },
+                    "default_branch": "main",
+                    "private": false,
+                },
+            })
+            .to_string();
+            let sig = format!("sha256={}", hmac_hex(secret, &body));
+            (
+                vec![
+                    ("X-GitHub-Event", "push".into()),
+                    ("X-Hub-Signature-256", sig),
+                ],
+                body,
+            )
+        }
+        "gitlab" => {
+            let body = serde_json::json!({
+                "ref": ref_,
+                "after": after,
+                "project": {
+                    "path_with_namespace": repo,
+                    "default_branch": "main",
+                    "visibility_level": 20,
+                },
+            })
+            .to_string();
+            (
+                vec![
+                    (
+                        "X-Gitlab-Event",
+                        if ref_.starts_with("refs/tags/") {
+                            "Tag Push Hook".into()
+                        } else {
+                            "Push Hook".into()
+                        },
+                    ),
+                    ("X-Gitlab-Token", secret.into()),
+                ],
+                body,
+            )
+        }
+        "gitea" => {
+            let body = serde_json::json!({
+                "ref": ref_,
+                "after": after,
+                "repository": {
+                    "full_name": repo,
+                    "default_branch": "main",
+                    "private": false,
+                },
+            })
+            .to_string();
+            let sig = hmac_hex(secret, &body);
+            (
+                vec![("X-Gitea-Event", "push".into()), ("X-Gitea-Signature", sig)],
+                body,
+            )
+        }
+        other => panic!("no webhook format for {other}"),
+    }
+}
+
 /// The build API's wire format, kept in one place: `POST .../builds` admits a
 /// selector, `GET .../commits/{sha}[?kind=]` reads one commit's outputs.
 pub mod api {
@@ -1157,6 +1325,18 @@ pub mod api {
 
     /// Text in a commit read's URL, for a proxy rule that matches only those.
     pub const COMMIT_READS: &str = "/commits/";
+
+    /// The tags artifact a read of `commit`'s Full points at.
+    pub fn tags_artifact(server: &Server, repo: &str, commit: &str) -> Option<String> {
+        let (_, body) = parse(server.get(&commit_path(repo, commit, Some("full"))));
+        body["tags_artifact"].as_str().map(str::to_string)
+    }
+
+    /// The branches artifact a read of `commit`'s Full points at.
+    pub fn branches_artifact(server: &Server, repo: &str, commit: &str) -> Option<String> {
+        let (_, body) = parse(server.get(&commit_path(repo, commit, Some("full"))));
+        body["branches"]["artifact"].as_str().map(str::to_string)
+    }
 
     /// Status and parsed body (Null if not JSON).
     pub fn parse(resp: HttpResponse) -> (u16, serde_json::Value) {

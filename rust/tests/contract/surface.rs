@@ -35,7 +35,8 @@ fn i1_server_token_is_required() {
 }
 
 /// I5: with no webhook and no sync, the poller builds a push within one poll
-/// interval.
+/// interval, and a tag pushed with no commit reaches clones of the same
+/// commit.
 #[test]
 fn i5_poller_builds_a_push() {
     let world = World::new();
@@ -62,6 +63,29 @@ fn i5_poller_builds_a_push() {
         server.metric("ripclone_builds_queued_total"),
         queued,
         "the clone should find C already built"
+    );
+
+    let before = api::tags_artifact(&server, "acme/i5", &c);
+    git(&origin.work, &["tag", "-a", "-m", "v1", "v1"]);
+    git(
+        &origin.work,
+        &["push", "-q", origin.bare.to_str().unwrap(), "v1"],
+    );
+    wait_for("the poller to publish the tag", || {
+        (api::tags_artifact(&server, "acme/i5", &c) != before).then_some(())
+    });
+    let tagged = world.target("i5-tagged");
+    world
+        .cli(&server, &["clone", "acme/i5", tagged.to_str().unwrap()])
+        .ok();
+    let (refs, all, tags) = git_clone_tags(&origin.bare, &[]);
+    assert!(refs.starts_with("v1 tag "), "{refs}");
+    assert_eq!(tag_refs(&tagged), refs);
+    assert_eq!(describe(&tagged), (all, tags));
+    assert_eq!(
+        server.metric("ripclone_builds_queued_total"),
+        queued,
+        "a tag admits no build"
     );
 }
 

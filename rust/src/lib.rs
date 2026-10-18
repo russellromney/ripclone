@@ -70,6 +70,8 @@ pub mod backends;
 #[doc(hidden)]
 pub mod bench;
 #[doc(hidden)]
+pub mod branches;
+#[doc(hidden)]
 pub mod cancel;
 pub mod cas;
 pub mod client;
@@ -106,6 +108,8 @@ pub mod retention;
 pub mod secure_file;
 pub mod server;
 pub mod storage;
+#[doc(hidden)]
+pub mod tags;
 
 #[cfg(test)]
 pub mod test_fixture;

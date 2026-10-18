@@ -54,11 +54,40 @@ branch (or the parent commit's Full) as a base A. A full clone then:
 
 The clone ends up with B's tree and B's full history. The fetch carries only
 what your git sends: no ripclone token and no server provider credential. If
-B does not descend from A (a force-push), the fetch just transfers more. If
-the fetch fails, the clone fails with git's error and installs nothing; retry
+B does not descend from A (a force-push), the fetch just transfers more. The
+clone has the branches and tags `git clone` would have, as of the server's
+last publish (below), with B as `origin/<branch>`.
+If the fetch fails, the clone fails with git's error and installs nothing; retry
 with `--wait` to clone the exact build instead.
 
 Depth-1 and files clones never top up.
+
+## Branches and tags
+
+A full clone gets what `git clone` gets: every upstream branch as
+`refs/remotes/origin/<branch>` and every tag, with all the history they
+reach. A depth-1 clone gets what `git clone --depth 1` gets: its own branch
+and the tags whose target it holds.
+
+The server keeps the repository's refs and publishes them:
+
+- tags, when it fetches a commit, so tags pushed with a commit are there by
+  the time the commit's Head is ready;
+- branches and tags, after any branch or tag push or delete webhook;
+- branches and tags, after a poll that sees the upstream's refs changed
+  (every 5 minutes by default).
+
+A branch or tag added, moved or deleted upstream since the last publish is
+missing or stale in a clone; your checked-out branch is always the commit
+you cloned. A later `git fetch` brings branches up to date, but, like git
+with any clone, never moves or deletes a tag you have.
+
+A full clone writes the server's refs only when it holds the default
+branch's tip, which it does when it clones that tip or tops up past it.
+Otherwise, as for `--at` an older commit, or before the server's first
+publish, it fetches the branches and tags from the upstream with your own
+git, as top-up does. If that fetch fails, the clone warns and keeps only its
+own branch and the tags it holds.
 
 ## Waiting
 

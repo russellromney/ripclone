@@ -10,7 +10,7 @@
 
 use super::{
     AddedRepo, BuildRow, Claim, Clock, ControlPathLock, ControlStore, Lease, Out, Output, Pool,
-    Published, Purged,
+    Published, Purged, RepoBranches, RepoRefs, SidePack,
 };
 use crate::provider::RepoId;
 use crate::{ExactResultKind, FullResult};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema/sqlite.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, \
     head_state, head_output, head_error, files_state, files_output, files_error, \
@@ -893,6 +893,86 @@ impl ControlStore for SqliteControlStore {
         keys.iter()
             .map(|key| RepoId::from_storage_key(key))
             .collect()
+    }
+
+    async fn get_refs(&self, repo: &RepoId) -> Result<Option<RepoRefs>> {
+        let key = repo.storage_key();
+        let row = sqlx::query(
+            "SELECT tags_artifact, tags_len, tags_count, tags_hash, branches_artifact,
+               branches_len, refs_hash, side_pack, side_pack_len, side_idx, side_idx_len
+             FROM repo_refs WHERE repo = $1",
+        )
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("read refs of {key}"))?;
+        row.map(|row| {
+            let number = |column: &str| -> Result<u64> {
+                u64::try_from(row.try_get::<i64, _>(column)?)
+                    .with_context(|| format!("negative {column} in refs of {key}"))
+            };
+            let text = |column: &str| row.try_get::<Option<String>, _>(column);
+            let branches = match text("branches_artifact")? {
+                None => None,
+                Some(artifact) => Some(RepoBranches {
+                    artifact,
+                    len: number("branches_len")?,
+                    refs_hash: row.try_get("refs_hash")?,
+                    side_pack: match (text("side_pack")?, text("side_idx")?) {
+                        (Some(pack), Some(idx)) => Some(SidePack {
+                            pack,
+                            pack_len: number("side_pack_len")?,
+                            idx,
+                            idx_len: number("side_idx_len")?,
+                        }),
+                        _ => None,
+                    },
+                }),
+            };
+            Ok(RepoRefs {
+                tags_artifact: row.try_get("tags_artifact")?,
+                tags_len: number("tags_len")?,
+                tags_count: number("tags_count")?,
+                tags_hash: row.try_get("tags_hash")?,
+                branches,
+            })
+        })
+        .transpose()
+    }
+
+    async fn set_refs(&self, repo: &RepoId, refs: &RepoRefs) -> Result<()> {
+        let key = repo.storage_key();
+        let number = |n: u64| i64::try_from(n).context("refs number too large");
+        let branches = refs.branches.as_ref();
+        let side = branches.and_then(|branches| branches.side_pack.as_ref());
+        sqlx::query(
+            "INSERT INTO repo_refs (repo, tags_artifact, tags_len, tags_count, tags_hash,
+               branches_artifact, branches_len, refs_hash, side_pack, side_pack_len, side_idx,
+               side_idx_len)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             ON CONFLICT (repo) DO UPDATE SET tags_artifact = excluded.tags_artifact,
+               tags_len = excluded.tags_len, tags_count = excluded.tags_count,
+               tags_hash = excluded.tags_hash, branches_artifact = excluded.branches_artifact,
+               branches_len = excluded.branches_len, refs_hash = excluded.refs_hash,
+               side_pack = excluded.side_pack, side_pack_len = excluded.side_pack_len,
+               side_idx = excluded.side_idx, side_idx_len = excluded.side_idx_len",
+        )
+        .bind(&key)
+        .bind(&refs.tags_artifact)
+        .bind(number(refs.tags_len)?)
+        .bind(number(refs.tags_count)?)
+        .bind(&refs.tags_hash)
+        .bind(branches.map(|branches| branches.artifact.clone()))
+        .bind(branches.map(|branches| number(branches.len)).transpose()?)
+        .bind(branches.map(|branches| branches.refs_hash.clone()))
+        .bind(side.map(|side| side.pack.clone()))
+        .bind(side.map(|side| number(side.pack_len)).transpose()?)
+        .bind(side.map(|side| side.idx.clone()))
+        .bind(side.map(|side| number(side.idx_len)).transpose()?)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("write refs of {key}"))?;
+        Ok(())
     }
 
     async fn health(&self) -> Result<()> {

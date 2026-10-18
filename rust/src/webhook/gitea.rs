@@ -54,7 +54,7 @@ impl WebhookProvider for Gitea {
                 let deleted = p.after.as_deref().map(is_zero_sha).unwrap_or(true);
                 Some(CanonicalEvent {
                     kind: if deleted {
-                        EventKind::BranchDelete
+                        EventKind::Delete
                     } else {
                         EventKind::Push
                     },
@@ -67,16 +67,17 @@ impl WebhookProvider for Gitea {
             }
             "delete" => {
                 let p: DeletePayload = serde_json::from_slice(raw).ok()?;
-                // Only branch deletions; tag deletions are out of scope.
-                if p.ref_type.as_deref() != Some("branch") {
-                    return None;
-                }
+                let prefix = match p.ref_type.as_deref() {
+                    Some("branch") => "refs/heads",
+                    Some("tag") => "refs/tags",
+                    _ => return None,
+                };
                 Some(CanonicalEvent {
-                    kind: EventKind::BranchDelete,
+                    kind: EventKind::Delete,
                     repo: p.repository.full_name,
-                    // The `delete` event's `ref` is the bare branch name;
-                    // normalize to a full ref so the handler treats it uniformly.
-                    ref_: format!("refs/heads/{}", p.r#ref),
+                    // The `delete` event's `ref` is the bare name; normalize
+                    // to a full ref so the handler treats it uniformly.
+                    ref_: format!("{prefix}/{}", p.r#ref),
                     after: None,
                     default_branch: p.repository.default_branch,
                     private: p.repository.private,
@@ -174,7 +175,7 @@ mod tests {
         let body =
             br#"{"ref":"feature","ref_type":"branch","repository":{"full_name":"acme/widget"}}"#;
         let ev = Gitea.parse(&headers("delete", None), body).unwrap();
-        assert_eq!(ev.kind, EventKind::BranchDelete);
+        assert_eq!(ev.kind, EventKind::Delete);
         assert_eq!(ev.repo, "acme/widget");
         assert_eq!(
             ev.ref_, "refs/heads/feature",
@@ -183,16 +184,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_tag_delete_is_ignored() {
+    fn parse_tag_delete_names_the_tag() {
         let body = br#"{"ref":"v1.0","ref_type":"tag","repository":{"full_name":"acme/widget"}}"#;
-        assert!(Gitea.parse(&headers("delete", None), body).is_none());
+        let ev = Gitea.parse(&headers("delete", None), body).unwrap();
+        assert_eq!(ev.kind, EventKind::Delete);
+        assert_eq!(ev.ref_, "refs/tags/v1.0");
     }
 
     #[test]
     fn parse_push_with_zero_after_is_a_branch_delete() {
         let body = br#"{"ref":"refs/heads/dead","after":"0000000000000000000000000000000000000000","repository":{"full_name":"acme/widget"}}"#;
         let ev = Gitea.parse(&headers("push", None), body).unwrap();
-        assert_eq!(ev.kind, EventKind::BranchDelete);
+        assert_eq!(ev.kind, EventKind::Delete);
         assert_eq!(ev.after, None);
     }
 

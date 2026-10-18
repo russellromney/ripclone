@@ -106,10 +106,11 @@ fn c9_files_and_depth_1_clones_never_fall_back_to_another_commit() {
     let world = World::new();
     let http = world.serve_origins_over_http();
     let origin = world.origin("acme", "c9");
-    origin.commit(&[("f.txt", "a\n")], "A");
+    let a = origin.commit(&[("f.txt", "a\n")], "A");
     origin.publish();
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/c9", "--wait"]).ok();
+    wait_first_refs(&server, "acme/c9", &a);
     let b = origin.commit(&[("f.txt", "b\n"), ("g.txt", "g\n")], "B");
     origin.publish();
     http.hold_fetches();

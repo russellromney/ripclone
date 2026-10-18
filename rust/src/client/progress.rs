@@ -90,6 +90,15 @@ impl Progress {
         }
     }
 
+    /// Print a warning on its own line, even with `--quiet`.
+    pub(super) fn warn(&self, message: &str) {
+        let mut err = std::io::stderr().lock();
+        if self.mode == Stderr::Progress {
+            self.line().clear(&mut err);
+        }
+        let _ = writeln!(err, "warning: {message}");
+    }
+
     pub(super) fn phase(&self, phase: impl Into<String>) {
         if self.mode == Stderr::Progress {
             self.line().enter(phase.into());

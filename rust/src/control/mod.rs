@@ -171,6 +171,44 @@ pub struct AddedRepo {
     pub added_at: u64,
 }
 
+/// A repository's published refs: the newest tags artifact, and the
+/// branches artifact and side pack of the last refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoRefs {
+    /// CAS id of the zstd-compressed `TagsArtifact`.
+    pub tags_artifact: String,
+    pub tags_len: u64,
+    /// Tags in the artifact; a clone downloads nothing when there are none.
+    pub tags_count: u64,
+    /// Hash of the mirror's `refs/tags/` listing the tags artifact was
+    /// built from.
+    pub tags_hash: String,
+    /// What the last refresh published; `None` before the first.
+    pub branches: Option<RepoBranches>,
+}
+
+/// The branches a refresh published, for full clones.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoBranches {
+    /// CAS id of the zstd-compressed `BranchesArtifact`.
+    pub artifact: String,
+    pub len: u64,
+    /// `branches::refs_hash` of the mirror's refs it was built from, which
+    /// the poller compares with upstream's.
+    pub refs_hash: String,
+    /// `None` when every ref is in the default branch's history.
+    pub side_pack: Option<SidePack>,
+}
+
+/// The CAS ids and lengths of a side pack and its idx.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SidePack {
+    pub pack: String,
+    pub pack_len: u64,
+    pub idx: String,
+    pub idx_len: u64,
+}
+
 /// Epoch-seconds time source. Tests use a manual clock.
 pub trait Clock: Send + Sync {
     fn now(&self) -> i64;
@@ -287,6 +325,10 @@ pub trait ControlStore: Send + Sync {
     async fn knows_repo(&self, repo: &RepoId) -> Result<bool>;
     /// Every repository that is added or has build rows.
     async fn known_repos(&self) -> Result<Vec<RepoId>>;
+    /// The repository's published refs; `None` before its first publish.
+    async fn get_refs(&self, repo: &RepoId) -> Result<Option<RepoRefs>>;
+    /// Replace the repository's published refs.
+    async fn set_refs(&self, repo: &RepoId, refs: &RepoRefs) -> Result<()>;
     async fn health(&self) -> Result<()>;
 }
 

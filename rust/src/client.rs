@@ -44,6 +44,10 @@ pub struct BuildSummary {
     /// a POST answer carries it.
     #[serde(default)]
     pub checkout_name: Option<String>,
+    /// The tag the selector named, if it named one. Only a POST answer
+    /// carries it.
+    #[serde(default)]
+    pub tag: Option<String>,
     pub head: OutputState,
     pub files: OutputState,
     pub full: OutputState,
@@ -123,6 +127,10 @@ fn validate_summary(summary: &BuildSummary, repo_path: &str) -> Result<()> {
     if let Some(name) = summary.checkout_name.as_deref() {
         crate::validation::validate_checkout_name(name)
             .with_context(|| format!("invalid checkout name for {repo_path}"))?;
+    }
+    if let Some(name) = summary.tag.as_deref() {
+        crate::validation::validate_tag_name(name)
+            .with_context(|| format!("invalid tag for {repo_path}"))?;
     }
     Ok(())
 }
@@ -333,6 +341,17 @@ pub struct RefResponse {
     /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
     #[serde(default)]
     pub idx_bundle_url: Option<String>,
+    /// The repository's tags artifact (`TagsArtifact`, zstd), absent when
+    /// it has no tags. A clone keeps the tags whose target it holds.
+    #[serde(default)]
+    pub tags_artifact: Option<String>,
+    #[serde(default)]
+    pub tags_artifact_url: Option<String>,
+    /// A Full's branches artifact and side pack, absent before the
+    /// repository's first refresh. A full clone holding the default
+    /// branch's commit writes every branch and tag from them.
+    #[serde(default)]
+    pub branches: Option<crate::branches::BranchesRef>,
     #[serde(rename = "kind")]
     pub result: ExactResultKind,
 }
@@ -652,9 +671,10 @@ impl Client {
             }
             tokio::time::sleep(poll_delay(attempt)).await;
             attempt += 1;
-            let checkout_name = summary.checkout_name.take();
+            let (checkout_name, tag) = (summary.checkout_name.take(), summary.tag.take());
             summary = BuildSummary {
                 checkout_name,
+                tag,
                 ..self.build_summary(repo_path, &summary.commit).await?
             };
         }
