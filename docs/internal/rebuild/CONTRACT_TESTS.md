@@ -130,7 +130,7 @@ Ripclone token reaches the origin.
 | F4 | One 503: retried, clone succeeds. | #188 |
 | F5 | Connection cut after N bytes: resumes with Range from the saved offset (proxy counts Range requests). | #188 |
 | F6 | Proxy without Range support: restarts only that artifact. | #188 |
-| F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes. | #191 (S3 job) |
+| F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes, with `/v1/artifacts/` refused. | #191 (S3 job) |
 | F8 | SIGINT during the download: exit 130, no target, staging directory, or marker left; the next clone succeeds. | #188 |
 | F9 | An artifact that answers 503 every time: exactly 3 attempts, then exit 6; no target, no staging. | #208 |
 | F10 | With 256 KiB parts, the 2 MiB history pack downloads as parallel ranges whose 206 answers tile it exactly once; one 503 retries only that range; the clone is exact. | |
@@ -156,7 +156,7 @@ Ripclone token reaches the origin.
 | G12 | Editable clones work with the user's later git: the branch tracks its upstream, `origin` is the configured upstream, `git pull` and `git push` work, a tag or `--at` commit tracks nothing, and a branch named with `#`, `;` and `"` tracks correctly. | #234 |
 | G13 | With a global git config naming a template dir and an identity, full and depth-1 clones have the local config, reflog (`clone: from <url>`) and template hooks of `git clone` and `git clone --depth 1`, apart from `core.checkstat`. The hook runs on the user's commit; `HEAD@{1}` is the cloned commit. A depth-1 clone's `git fetch` takes only its branch, a full clone's every branch. A SHA-256 default in the environment still gives a SHA-1 clone. With `user.useConfigOnly` and no identity, the clone has the reflogs `git clone` writes under git's fallback committer. | #234 |
 
-### H. Storage and server state (11)
+### H. Storage and server state (12)
 
 | # | Test | Added |
 |---|---|---|
@@ -170,6 +170,7 @@ Ripclone token reaches the origin.
 | H9 | Build scratch goes under `<cache>/tmp`, which startup empties: with a read-only `TMPDIR`, a stale scratch entry is removed and a full build and clone succeed. | #211 |
 | H10 | S3 emulator: after a one-line push, B uploads no object of 1 MiB or more that the bucket already holds (its Files reuses A's bundles). A second repository with the same files builds the same large objects: the bucket proxy sees a HEAD and no PUT for each. A bucket copy cut short is uploaded again when a third repository with the same files makes it; that repository's clones and the Files clones of B and the second repository are exact. | #220 (S3 job), #221 |
 | H11 | A scratch leftover the server cannot remove, as when a killed server's git child is still writing it, doesn't stop the next start: the server logs it, builds and clones in its own scratch dir, and once the leftover can go, the next start removes it. | #234 |
+| H12 | S3 emulator, through a proxy that refuses `/v1/artifacts/`: depth-1, full, files, `--at` an older commit, `--branch` and top-up clones are exact, and none asks for the hash route. |  |
 
 ### I. Auth, integrations, CLI (13)
 
