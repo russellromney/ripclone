@@ -304,7 +304,9 @@ fn s3_c7_new_push_files_skip_a_running_full() {
         (output_states(&server, "acme/c7", &b) == ["ready", "pending", "ready"]).then_some(())
     });
 
-    // Nothing else writes while Full(B) starts, so the held PUT is Full's.
+    // Head(B) starts a refs refresh, which writes too. Once it has published,
+    // nothing else writes while Full(B) starts, so the held PUT is Full's.
+    server.wait_log("published refs of github/acme%2Fc7");
     s3_proxy.hold_puts(&format!("/{}/", s3.bucket), 1);
     server.restart_with(&[("RIPCLONE_FULL_SLOTS", "1")]);
     s3_proxy.wait_held(1);
