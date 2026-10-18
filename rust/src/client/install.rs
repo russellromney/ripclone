@@ -1533,13 +1533,34 @@ async fn install_tags(
 ) -> Result<()> {
     let git_dir = root.join(".git");
     let dir = git_dir.clone();
+    let tip_owned = tip.map(str::to_string);
     let (mut kept, present) = tokio::task::spawn_blocking(move || {
         let present = crate::tags::Present::scan(&dir)?;
         kept.retain(|tag| present.contains(tag.target_id()));
+        // A depth-1 clone holds one commit, the tip: a tag on any other
+        // commit goes from its object's kind, with no tree listing.
+        if let Some(tip) = tip_owned
+            && kept.tags.iter().any(|tag| tag.target != tip)
+        {
+            let repo = crate::gix_util::open_repo(&dir)?;
+            let mut kinds = std::collections::HashMap::new();
+            for tag in &kept.tags {
+                if tag.target != tip && !kinds.contains_key(tag.target_id()) {
+                    let id = gix::oid::from_bytes_unchecked(tag.target_id());
+                    let header = (repo.find_header(id))
+                        .with_context(|| format!("tag {}: find {}", tag.name, tag.target))?;
+                    kinds.insert(*tag.target_id(), header.kind());
+                }
+            }
+            kept.retain(|tag| {
+                tag.target == tip || kinds[tag.target_id()] != gix::object::Kind::Commit
+            });
+        }
         anyhow::Ok((kept, present))
     })
     .await
     .context("tags task")??;
+    // A tag on a tree or blob stays only when the tip's tree holds it.
     if let Some(tip) = tip
         && kept.tags.iter().any(|tag| tag.target != tip)
     {

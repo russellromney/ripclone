@@ -58,13 +58,17 @@ pub fn build(repo: &Path, tags: &[(String, String)]) -> Result<Vec<u8>> {
         let mut target = None;
         // Up to MAX_CHAIN tag objects, then the target.
         for _ in 0..=MAX_CHAIN {
-            let object = repo
-                .find_object(current)
+            // The header only: a target's kind needs no inflating.
+            let header = repo
+                .find_header(current)
                 .with_context(|| format!("tag {name}: find {current}"))?;
-            if object.kind != gix::object::Kind::Tag {
+            if header.kind() != gix::object::Kind::Tag {
                 target = Some(current);
                 break;
             }
+            let object = repo
+                .find_object(current)
+                .with_context(|| format!("tag {name}: find {current}"))?;
             let data = object.data.clone();
             let tag = object
                 .try_into_tag()

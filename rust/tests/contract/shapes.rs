@@ -1472,7 +1472,8 @@ fn g23_depth_one_clones_keep_only_the_tips_tags() {
     );
     origin.publish();
     git(work, &["push", "-q", bare, "--tags"]);
-    let server = world.server(&[]);
+    let secret = "g23-secret";
+    let server = world.server(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", secret)]);
     world.cli(&server, &["add", "acme/g23", "--wait"]).ok();
 
     let x2 = origin.commit(&[("old.txt", "new\n")], "X2");
@@ -1513,6 +1514,60 @@ fn g23_depth_one_clones_keep_only_the_tips_tags() {
         git_clone_remotes(&origin.bare, &["--depth", "1"])
     );
     git(&shallow, &["fsck", "--strict"]);
+
+    // With no tag on a tree or blob, the tags on X1 go by their target's
+    // kind: the clone never lists X2's tree, which a wrapper fails.
+    let before = api::tags_artifact(&server, "acme/g23", &x2);
+    for tag in ["tree-x1", "blob-old", "blob-keep"] {
+        git(work, &["tag", "-d", tag]);
+        git(work, &["push", "-q", bare, &format!(":refs/tags/{tag}")]);
+    }
+    let (headers, body) = push_hook(
+        "github",
+        secret,
+        "acme/g23",
+        "refs/tags/tree-x1",
+        &"0".repeat(40),
+    );
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let resp = server.post("/webhooks/github", &headers, &body);
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    wait_for("the tags publish", || {
+        (api::tags_artifact(&server, "acme/g23", &x2) != before).then_some(())
+    });
+    let wrapper = GitWrapper::new(
+        &world,
+        "client",
+        r#"case " $* " in *" ls-tree "*) echo "ls-tree run" >&2; exit 1 ;; esac"#,
+    );
+    let listless = world.target("listless");
+    let out = world.cli_env(
+        &server,
+        &[
+            "clone",
+            "acme/g23",
+            listless.to_str().unwrap(),
+            "--depth",
+            "1",
+        ],
+        &[NO_UPSTREAM, ("PATH", &wrapper.path)],
+    );
+    out.ok();
+    assert!(
+        git_output(&listless, &["cat-file", "-e", &x1])
+            .status
+            .success(),
+        "Head(X2) is not built on Head(X1)"
+    );
+    let (refs, _, _) = git_clone_tags(&origin.bare, &["--depth", "1"]);
+    assert_eq!(
+        refs.lines()
+            .filter_map(|t| t.split(' ').next())
+            .collect::<Vec<_>>(),
+        ["v-x2"]
+    );
+    assert_eq!(tag_refs(&listless), refs);
+    git(&listless, &["fsck", "--strict"]);
 }
 
 /// The side pack a read of `commit`'s Full points at.

@@ -28,6 +28,9 @@ packs hold exactly that set. A depth-1 clone's packs can hold more: Head
 of a commit keeps the packs of the Head it was built on, with that older
 commit and its tree. So a depth-1 clone keeps only the tags on its tip
 and on the objects of its tip's tree, as `git clone --depth 1` does (G23).
+A tag on any other commit drops by its target's kind, read from the
+object header; the clone lists the tip's tree only when a tag on a tree
+or blob is left, since that listing grows with the tree.
 
 What #235 misses, and this plan fixes:
 
