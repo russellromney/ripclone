@@ -432,7 +432,8 @@ pub(super) async fn resolve(
         Selector::Name(name) => name.as_str(),
     };
     let credential = state
-        .fetch_credential(repo_id)
+        .credentials
+        .get(repo_id)
         .await
         .map_err(credential_error)?;
     let tip = {

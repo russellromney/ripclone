@@ -55,11 +55,12 @@ fn i3_provider_auth_header_reaches_origin() {
         let tip = origin.commit(&[("a.txt", "a\n")], "A");
         origin.publish();
 
-        world.server_providers(http.url(), &[(id, kind, Some(token), extra.clone())]);
-        let server = world.server(&[]);
+        world.server_providers(http.url(), &[(id, kind, extra.clone())]);
+        let token_var = format!("RIPCLONE_TOKEN_{}", id.to_uppercase().replace('-', "_"));
+        let server = world.server(&[(&token_var, token)]);
         // The CLI must know the provider id, but holds no upstream token, so
         // only the server's credential can reach the origin.
-        world.cli_providers(http.url(), &[(id, kind, None, extra)]);
+        world.cli_providers(http.url(), &[(id, kind, extra)]);
         let target = world.target(&name);
         let repo = format!("{id}:acme/{name}");
         world.cli(&server, &["add", &repo, "--wait"]).ok();
@@ -116,12 +117,9 @@ fn i2_server_credential_builds_a_private_repo() {
         "the origin must refuse an unauthenticated read: {anonymous:?}"
     );
 
-    world.server_providers(
-        http.url(),
-        &[("gh", "github", Some("i2-secret"), serde_json::json!({}))],
-    );
-    let server = world.server(&[]);
-    world.cli_providers(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
+    world.server_providers(http.url(), &[("gh", "github", serde_json::json!({}))]);
+    let server = world.server(&[("RIPCLONE_TOKEN_GH", "i2-secret")]);
+    world.cli_providers(http.url(), &[("gh", "github", serde_json::json!({}))]);
     world.cli(&server, &["add", "gh:acme/i2", "--wait"]).ok();
     let target = world.target("i2");
     world
@@ -237,7 +235,7 @@ fn i4_signed_webhook_builds_before_clone() {
             "RIPCLONE_WEBHOOK_SECRET_{}",
             id.to_uppercase().replace('-', "_")
         );
-        let providers = [(id, kind, None, serde_json::json!({}))];
+        let providers = [(id, kind, serde_json::json!({}))];
         world.server_providers(http.url(), &providers);
         world.cli_providers(http.url(), &providers);
         let server = world.server(&[(&secret_var, &secret)]);

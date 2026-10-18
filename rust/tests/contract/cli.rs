@@ -130,8 +130,8 @@ fn k2_bad_command_lines_exit_2_and_touch_nothing() {
 }
 
 /// K3: the provider commands manage the CLI's own config. A user adds a
-/// private Gitea host, checks it with `provider test`, fixes the token,
-/// then adds and clones a repo by pasting its URL.
+/// private Gitea host and checks it with `provider test`, which reads with
+/// their own git credentials, then adds and clones a repo by pasting its URL.
 #[test]
 fn k3_provider_commands_manage_the_cli_config() {
     let world = World::new();
@@ -140,19 +140,22 @@ fn k3_provider_commands_manage_the_cli_config() {
     let origin = world.origin("acme", "k3");
     let tip = origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
-    world.server_providers(
-        http.url(),
-        &[("forge", "gitea", Some("k3-secret"), serde_json::json!({}))],
-    );
-    let server = world.server(&[]);
+    world.server_providers(http.url(), &[("forge", "gitea", serde_json::json!({}))]);
+    let server = world.server(&[("RIPCLONE_TOKEN_FORGE", "k3-secret")]);
     let host = http.url();
     let url = format!("{host}/acme/k3.git");
+    // The user's git sends the credential, as a credential helper would.
+    let git_auth = [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "http.extraHeader"),
+        ("GIT_CONFIG_VALUE_0", "Authorization: token k3-secret"),
+    ];
 
     let list = world.cli(&server, &["provider", "list"]).ok();
     assert!(
         list.lines()
             .any(|l| l.split_whitespace().collect::<Vec<_>>()
-                == ["github", "github", "github.com", "none"]),
+                == ["github", "github", "github.com"]),
         "{list}"
     );
 
@@ -162,10 +165,11 @@ fn k3_provider_commands_manage_the_cli_config() {
     let out = world.cli(
         &server,
         &[
-            "provider", "add", "forge", "--kind", "gitea", "--host", host, "--token", "wrong",
+            "provider", "add", "forge", "--kind", "gitea", "--host", host,
         ],
     );
     assert_eq!(out.ok(), "added provider 'forge'\n");
+    // Without a git credential for the host, the read is refused.
     let out = world.cli(&server, &["provider", "test", "forge", "acme/k3"]);
     assert_eq!(out.code(), Some(1));
     assert!(
@@ -177,24 +181,34 @@ fn k3_provider_commands_manage_the_cli_config() {
     // Updating keeps the kind and host.
     let out = world.cli(
         &server,
-        &["provider", "add", "forge", "--token", "k3-secret"],
+        &[
+            "provider",
+            "add",
+            "forge",
+            "--auth-header-name",
+            "Authorization",
+        ],
     );
     assert_eq!(out.ok(), "updated provider 'forge'\n");
     let out = world
-        .cli(&server, &["provider", "test", "forge", "acme/k3"])
+        .cli_env(
+            &server,
+            &["provider", "test", "forge", "acme/k3"],
+            &git_auth,
+        )
         .ok();
     assert_eq!(out, format!("{url} HEAD is {tip}\n"));
-    let out = world.cli(
+    let out = world.cli_env(
         &server,
         &["provider", "test", "forge", "acme/k3", "-b", "nope"],
+        &git_auth,
     );
     assert!(out.err().contains("has no ref 'nope'"), "{}", out.stderr());
     let list = world.cli(&server, &["provider", "list"]).ok();
     let clean = host.trim_start_matches("http://");
     assert!(
         list.lines()
-            .any(|l| l.split_whitespace().collect::<Vec<_>>()
-                == ["forge", "gitea", clean, "configured"]),
+            .any(|l| l.split_whitespace().collect::<Vec<_>>() == ["forge", "gitea", clean]),
         "{list}"
     );
 
@@ -400,7 +414,7 @@ fn i14_terminal_top_up_shows_its_phase_and_seconds() {
     let origin = world.origin("acme", "i14t");
     origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
-    let gh = [("gh", "github", None, serde_json::json!({}))];
+    let gh = [("gh", "github", serde_json::json!({}))];
     world.server_providers(http.url(), &gh);
     world.cli_providers(http.url(), &gh);
     let mut server = world.server(&[]);
@@ -438,7 +452,7 @@ fn i14_terminal_add_wait_shows_output_states_within_its_width() {
     let origin = world.origin("acme", "i14w");
     let a = origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
-    let gh = [("gh", "github", None, serde_json::json!({}))];
+    let gh = [("gh", "github", serde_json::json!({}))];
     world.server_providers(http.url(), &gh);
     world.cli_providers(http.url(), &gh);
     let server = world.server(&[]);

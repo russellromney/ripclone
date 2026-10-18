@@ -88,8 +88,8 @@ replaced, so several half-models now run at once:
    admission order, and a repo holds at most one lease per pool.
 6. **Published outputs are immutable.** Head compaction, if kept, applies to the
    next commit's Head, never by republishing this one.
-7. **Credentials come from the server's broker at build time** (GitHub App,
-   configured token). They are never copied into the database or sent to
+7. **Credentials come from the server's environment at build time** (GitHub
+   App key or token, per provider). They are never copied into the database or sent to
    workers in job payloads.
 8. **One mirror shape, one fetch function, mirror writes under the mirror
    lock** (fetch, commit-graph, compaction). Builds read the mirror under a
@@ -111,7 +111,7 @@ replaced, so several half-models now run at once:
 | Extract and worktree writer (POSIX path) | Core install path. The io_uring writer was deleted (decision 7). |
 | Provider registry | Data only; all providers share one git transport. |
 | Webhook verification (GitHub, GitLab, Gitea) and the poller | Isolated; both become callers of `admit`. |
-| GitHub App credential broker | Isolated behind a trait; the server-side credential source. |
+| Upstream credentials (token or GitHub App per provider) | One module; the server-side credential source. |
 | Parent reuse rule (use the parent's output only when it is ready) | Gives incremental builds. |
 
 ## Cut
@@ -143,7 +143,7 @@ replaced, so several half-models now run at once:
 | Ref API | `GET /refs` that resolves, fetches, admits, and reports; two 202 shapes for sync | `POST builds` plus pure `GET commits/{sha}`. One response shape per state. |
 | Commit resolution | 3 mechanisms in 6 entry points | One `resolve` function. |
 | Embedded worker loop and sequencing | Foreground release, unbounded background work, PID worker IDs, 30-minute recovery | Three capped pools (Head, Files, Full), short leases, claim order by admission. |
-| Remote worker protocol (if kept) | ~2,200 lines, 6 endpoints, credential shipping, local ref cache | 4 endpoints mapping 1:1 to claim, renew, publish, fail. Credentials from the broker. |
+| Remote worker protocol (if kept) | ~2,200 lines, 6 endpoints, credential shipping, local ref cache | 4 endpoints mapping 1:1 to claim, renew, publish, fail. Credentials from the server. |
 | Client resolver | Polling loop with pin, top-up branch, mixed 503 handling | POST once, poll the pure GET, same GET for URL refresh. |
 | Top-up | Needs Head(B) built first (reads its parent from storage), B must be a single-parent child of the base, local provider config on every clone, test env reads in production | Base is the newest ready Full for the ref, known as soon as B is admitted. Client installs it, runs one `git fetch <upstream> B` with the user's git credentials, then checks out B. The upstream URL comes from the client's own provider config, never from the server, so a server cannot point the user's git at another host. `git fetch` guarantees B is complete; if the base is not an ancestor (force-push), the fetch just sends more. Full(B) still builds in the background for later clones. |
 | Client download layer | Two refresh-aware loops plus a test-only third; duplicated cache lookup | One `download(artifact, sink)` with Range resume and URL refresh; sinks: memory or temp file. |

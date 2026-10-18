@@ -1001,18 +1001,15 @@ pub fn basic(user: &str, token: &str) -> String {
     )
 }
 
-/// One provider instance on a test host: `(id, kind, token, extra fields)`.
-/// A `None` token is left out.
-pub type ProviderSpec<'a> = (&'a str, &'a str, Option<&'a str>, serde_json::Value);
+/// One provider instance on a test host: `(id, kind, extra fields)`. Its
+/// upstream token, if any, goes in the server's environment.
+pub type ProviderSpec<'a> = (&'a str, &'a str, serde_json::Value);
 
 /// A config file's `[providers]` tables for instances on `host`.
 fn providers_toml(host: &str, entries: &[ProviderSpec]) -> String {
     let mut providers = serde_json::Map::new();
-    for (id, kind, token, extra) in entries {
+    for (id, kind, extra) in entries {
         let mut entry = serde_json::json!({ "kind": kind, "host": host });
-        if let Some(token) = token {
-            entry["token"] = (*token).into();
-        }
         if let Some(extra) = extra.as_object() {
             for (k, v) in extra {
                 entry[k] = v.clone();

@@ -2,8 +2,8 @@
 
 Settings come from flags, environment variables, and one TOML file:
 `~/.config/ripclone/config.toml`, or the path in `RIPCLONE_CONFIG`. The file
-holds the CLI's server URL and provider instances. The environment beats the
-file. A file that does not parse stops the command.
+holds the CLI's server URL and provider instances, and no secrets: tokens and
+keys come from the environment. The environment beats the file. A file that does not parse stops the command.
 
 ## Server token
 
@@ -37,7 +37,8 @@ errors.
 | Variable | Meaning |
 |---|---|
 | `RIPCLONE_SERVER_TOKEN` | The token clients must present. |
-| `RIPCLONE_CONFIG`, config `[providers.<id>]` | The config file path, and the provider instances and their tokens in it. See [Providers](PROVIDERS.md). |
+| `RIPCLONE_CONFIG`, config `[providers.<id>]` | The config file path, and the provider instances in it. See [Providers](PROVIDERS.md). |
+| `RIPCLONE_TOKEN_<PROVIDER>`, `RIPCLONE_APP_KEY_<PROVIDER>` | The upstream read token, or GitHub App private key, per provider instance. See [Providers](PROVIDERS.md#credentials). |
 | `RIPCLONE_S3_BUCKET` | Bucket. Setting it turns S3 storage on. See [Server state and storage](BACKENDS.md). |
 | `RIPCLONE_S3_ENDPOINT` | S3-compatible endpoint. Required with a bucket. |
 | `RIPCLONE_S3_REGION` | Region, default `us-east-1`. |
@@ -50,20 +51,6 @@ errors.
 
 A value that is set but does not parse, including an empty one, stops the
 server at startup with an error that names the variable.
-
-### GitHub App credentials
-
-Instead of a static token, the server can mint short-lived installation tokens
-for GitHub repos. It looks up the app's installation on each repo, so one app
-serves every account that installed it; a repo the app is not installed on is
-read anonymously. A lookup is reused for ten minutes, so a new installation
-takes effect within that time.
-
-| Variable | Meaning |
-|---|---|
-| `RIPCLONE_GITHUB_APP_ID` | App id. Setting it turns the GitHub App broker on. |
-| `RIPCLONE_GITHUB_APP_PRIVATE_KEY` | The app's PEM private key. One line with literal `\n` escapes also works. |
-| `RIPCLONE_GITHUB_API_BASE` | GitHub API base URL for GitHub Enterprise, `https://` only. Default `https://api.github.com`. |
 
 ## Build scheduling
 

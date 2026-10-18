@@ -1165,6 +1165,10 @@ async fn ls_remote_tip_async_with(
         .args(LOW_SPEED_ARGS)
         .args(["ls-remote", "--symref", "--", &url])
         .args(&candidates)
+        // A credential helper may answer, but never a terminal prompt: the
+        // CLI reads the upstream beside a clone, and the server has no one
+        // to ask.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr));
     // Its own process group, so a timeout can kill git's HTTP helper too.

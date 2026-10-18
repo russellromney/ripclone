@@ -61,7 +61,8 @@ git ls-remote "$URL" >/dev/null 2>&1 && bad "ci/app is readable anonymously" || 
 step "server with ci's token"
 export RIPCLONE_SERVER_TOKEN="$(openssl rand -hex 32)"
 SECRETS+=("$RIPCLONE_SERVER_TOKEN")
-start_server server "$(printf '[providers.gitea]\nkind = "gitea"\nhost = "%s"\ntoken = "%s"' "$GITEA" "$CI_TOKEN")"
+export RIPCLONE_TOKEN_GITEA="$CI_TOKEN"
+start_server server "$(printf '[providers.gitea]\nkind = "gitea"\nhost = "%s"' "$GITEA")" RIPCLONE_TOKEN_GITEA
 export RIPCLONE_SERVER="$SERVER_URL"
 ok "$SERVER_URL"
 

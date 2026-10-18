@@ -1,6 +1,6 @@
 //! The ripclone server: app state, router assembly and startup.
 
-use crate::auth::broker::{CredentialBroker, broker_from_env};
+use crate::auth::credential::Credentials;
 use crate::backends;
 use crate::cas::Cas;
 use crate::control::ControlStore;
@@ -56,7 +56,7 @@ pub struct ServerState {
     /// on the control database.
     pub control: Arc<dyn ControlStore>,
     pub provider_registry: ProviderRegistry,
-    pub broker: Arc<dyn CredentialBroker>,
+    pub credentials: Arc<Credentials>,
     pub token_hash: Option<String>,
     pub metrics: Arc<Metrics>,
     /// Wakes a Head slot after an admission that left Head pending.
@@ -98,18 +98,6 @@ pub struct RepoLock {
 }
 
 impl ServerState {
-    /// The broker's credential for `repo_id`, read on a blocking thread: a
-    /// broker cache miss makes a blocking HTTP call.
-    pub async fn fetch_credential(
-        &self,
-        repo_id: &crate::provider::RepoId,
-    ) -> Result<Option<secrecy::SecretString>> {
-        let (broker, repo_id) = (self.broker.clone(), repo_id.clone());
-        tokio::task::spawn_blocking(move || broker.fetch_credential(&repo_id))
-            .await
-            .context("credential task")?
-    }
-
     /// The wake-up for `pool`'s idle slots.
     pub fn wake(&self, pool: crate::control::Pool) -> &Arc<tokio::sync::Notify> {
         match pool {
@@ -321,7 +309,7 @@ pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Re
         "provider registry loaded with {} instance(s)",
         provider_registry.iter().count()
     );
-    let broker = broker_from_env(provider_registry.clone())?;
+    let credentials = Arc::new(Credentials::from_env(&provider_registry)?);
 
     backends::Backends::validate_environment()?;
     let worker_settings = worker::WorkerSettings::from_env()?;
@@ -374,7 +362,7 @@ pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Re
         files_wake: Arc::new(tokio::sync::Notify::new()),
         full_wake: Arc::new(tokio::sync::Notify::new()),
         provider_registry,
-        broker,
+        credentials,
         token_hash: Some(token_hash),
         metrics,
         webhook_config,
@@ -428,9 +416,6 @@ mod tests {
             .unwrap(),
         );
         let provider_registry = ProviderRegistry::new();
-        let broker: Arc<dyn CredentialBroker> = Arc::new(crate::auth::broker::StaticBroker::new(
-            provider_registry.clone(),
-        ));
         ServerState {
             cas,
             storage,
@@ -440,7 +425,7 @@ mod tests {
             files_wake: Arc::new(tokio::sync::Notify::new()),
             full_wake: Arc::new(tokio::sync::Notify::new()),
             provider_registry,
-            broker,
+            credentials: Arc::default(),
             token_hash: Some(hex::encode(Sha256::digest("secret"))),
             metrics: Metrics::new(),
             // No webhook secret here; webhook tests install their own.
