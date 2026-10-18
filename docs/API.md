@@ -116,8 +116,10 @@ The `*_url` fields are left out when storage cannot sign URLs (local disk).
 Fetch those artifacts from `GET /v1/artifacts/{hash}` instead. In a Full,
 `pack_idx_urls` has the idx of each history pack, in manifest order, and
 `null` for the Head packs, which a full clone reads only for the working
-tree. A Head output has `idx_bundle_url`, all its pack idx files in one
-object, instead, and `midx_url` when it has a pre-built multi-pack-index. A
+tree. In a Head, `idx_bundle_url` is one object with the idx files of the
+base packs, which every Head on that base shares. `pack_idx_urls` has the
+idx of each level pack and `null` for the base packs. A Head also has
+`midx_url` when it has a pre-built multi-pack-index. A
 Files output has `archive_chunk_urls` instead of `pack_chunk_urls`. Signed URLs last
 20 minutes. Read the commit again to get fresh ones.
 
