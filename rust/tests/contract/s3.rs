@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// F7: a signed URL expires mid-download. The CLI refreshes URLs for the same
-/// commit and resumes from the saved offset.
+/// commit and resumes from the saved offset, without the hash route, which
+/// the server proxy refuses.
 #[test]
 #[ignore = "needs the S3 emulator; run by the s3 CI job"]
 fn s3_f7_expired_url_refreshes_and_resumes() {
@@ -36,6 +37,7 @@ fn s3_f7_expired_url_refreshes_and_resumes() {
         1,
     );
     let server_proxy = FaultProxy::start(&server);
+    server_proxy.fault_requests(ARTIFACTS, Fault::Status(403), usize::MAX);
     let target = world.target("f7");
     world
         .cli(
@@ -76,6 +78,96 @@ fn s3_f7_expired_url_refreshes_and_resumes() {
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
     git(&target, &["fsck", "--full"]);
     assert_eq!(listing(&target), origin.tree(&tip));
+    assert_no_hash_route(&server_proxy);
+}
+
+/// The server's by-hash artifact route, which names no repository.
+const ARTIFACTS: &str = "/v1/artifacts/";
+
+/// No request through `proxy` used the by-hash artifact route.
+fn assert_no_hash_route(proxy: &FaultProxy) {
+    let used: Vec<Seen> = proxy
+        .seen()
+        .into_iter()
+        .filter(|s| s.path.starts_with(ARTIFACTS))
+        .collect();
+    assert!(used.is_empty(), "a clone used the hash route: {used:#?}");
+}
+
+/// H12: with S3 storage every clone reads its artifacts through the signed
+/// URLs of a commit read, so a gateway can refuse `/v1/artifacts/{hash}`,
+/// which names no repository. Through a proxy that refuses that route,
+/// depth-1, full, files, `--at` an older commit, `--branch` and a top-up
+/// clone are each exact, and none of them asks for it.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_h12_clones_never_need_the_hash_route() {
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let http = world.serve_origins_over_http();
+    let origin = world.origin("acme", "h12");
+    let a = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "A");
+    origin.publish();
+    git(&origin.work, &["checkout", "-q", "-b", "other"]);
+    let o = origin.commit(&[("o.txt", "o\n")], "O");
+    origin.publish_branch("other");
+    git(&origin.work, &["checkout", "-q", "main"]);
+    let providers = [("gh", "github", serde_json::json!({}))];
+    world.server_providers(http.url(), &providers);
+    world.cli_providers(http.url(), &providers);
+    let repo = "gh:acme/h12";
+    let env = s3.server_env(&s3.endpoint);
+    let mut server = world.server(&env_refs(&env));
+    world.cli(&server, &["add", repo, "--wait"]).ok();
+    world
+        .cli(&server, &["sync", repo, "--at", "other", "--wait"])
+        .ok();
+    let b = origin.commit(&[("a.txt", "b\n")], "B");
+    origin.publish();
+    world.cli(&server, &["sync", repo, "--wait"]).ok();
+
+    // With no Full slots, a later push's full clone tops up from Full(B).
+    server.restart_with(&[("RIPCLONE_FULL_SLOTS", "0")]);
+    let proxy = FaultProxy::start(&server);
+    proxy.fault_requests(ARTIFACTS, Fault::Status(403), usize::MAX);
+    let clone = |name: &str, args: &[&str]| {
+        let target = world.target(&format!("h12-{name}"));
+        let mut argv = vec!["clone", repo, target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&proxy, &argv).ok();
+        target
+    };
+    let exact = |target: &std::path::Path, commit: &str| {
+        assert_eq!(git(target, &["rev-parse", "HEAD"]), commit);
+        assert_eq!(listing(target), origin.tree(commit));
+    };
+    let complete = |target: &std::path::Path, commit: &str| {
+        exact(target, commit);
+        assert_eq!(
+            git(target, &["rev-list", "--count", "HEAD"]),
+            origin.count(commit)
+        );
+        git(target, &["fsck", "--full"]);
+    };
+
+    exact(&clone("depth1", &["--depth", "1"]), &b);
+    complete(&clone("full", &[]), &b);
+    assert_eq!(
+        listing(&clone("files", &["--mode", "files"])),
+        origin.tree(&b)
+    );
+    complete(&clone("at", &["--at", &a]), &a);
+    complete(&clone("branch", &["--branch", "other"]), &o);
+
+    let c = origin.commit(&[("c.txt", "c\n")], "C");
+    origin.publish();
+    complete(&clone("top-up", &[]), &c);
+    assert_eq!(
+        output_states(&server, repo, &c)[1],
+        "pending",
+        "Full(C) was built, so the clone did not top up"
+    );
+    assert_no_hash_route(&proxy);
 }
 
 /// H2: artifacts are in the bucket. With the server's local cache deleted and

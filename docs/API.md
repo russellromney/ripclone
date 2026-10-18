@@ -172,6 +172,13 @@ hex characters). With S3 storage it redirects (`307`) to a signed URL. With
 local storage it streams the bytes and honors a single `Range: bytes=a-b`.
 Check every artifact against its hash before using it.
 
+This route names no repository, so a proxy in front of the server cannot
+check repository access on it. With S3 storage the CLI never uses it: every
+artifact a commit read names comes with a signed URL, and when one expires
+the CLI reads the commit again. A proxy that serves private repositories
+can refuse this route when storage is S3, and must keep it with local
+storage.
+
 ## Webhooks
 
 `POST /webhooks/{provider}` takes a provider's push webhook. It is

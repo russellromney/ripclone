@@ -1123,14 +1123,22 @@ pub mod api {
     use super::{HttpResponse, Server};
     use crate::net::Seen;
 
+    /// The API path of `repo`, as the CLI names it: `owner/name` on the
+    /// default `github` provider, or `<provider>:<path>`.
+    fn repo_path(repo: &str) -> String {
+        let (provider, path) = repo.split_once(':').unwrap_or(("github", repo));
+        format!("/v1/repos/{provider}/{path}")
+    }
+
     pub fn builds_path(repo: &str) -> String {
-        format!("/v1/repos/github/{repo}/builds")
+        format!("{}/builds", repo_path(repo))
     }
 
     pub fn commit_path(repo: &str, commit: &str, kind: Option<&str>) -> String {
+        let commit = format!("{}/commits/{commit}", repo_path(repo));
         match kind {
-            Some(kind) => format!("/v1/repos/github/{repo}/commits/{commit}?kind={kind}"),
-            None => format!("/v1/repos/github/{repo}/commits/{commit}"),
+            Some(kind) => format!("{commit}?kind={kind}"),
+            None => commit,
         }
     }
 
@@ -1169,7 +1177,7 @@ pub mod api {
     pub fn add(server: &Server, repo: &str) -> (u16, serde_json::Value) {
         parse(server.request(
             reqwest::Method::POST,
-            &format!("/v1/repos/github/{repo}/add"),
+            &format!("{}/add", repo_path(repo)),
             Some(super::TOKEN),
         ))
     }
