@@ -258,8 +258,10 @@ and `tests/common`. Pure-logic tests moved next to their code as unit tests.
 
 Two scripts run the release binaries the way a user would, against private
 repos, and exit non-zero on any failed check. Both start their own servers on
-OS-picked ports, keep the machine's git config and keychain out, never print a
-token, and delete their work directory (`KEEP_TRIAL=1` keeps it).
+OS-picked ports on local storage (even under soup, whose S3 settings would
+send private content to a real bucket), keep the machine's git config and
+keychain out, never print a token, and delete their work directory
+(`KEEP_TRIAL=1` keeps it).
 `RIPCLONE_BIN_DIR` names the binaries, default `rust/target/release`.
 
 - `scripts/trial_gitea.sh`: a digest-pinned Gitea in Docker, with this
