@@ -651,9 +651,11 @@ async fn head_output(
         .await?;
         Ok(Output::Head { result, parent })
     };
-    let (output, ()) = tokio::try_join!(
+    // The tags store through the build's pins, so what they stored is
+    // queued with the build's artifacts if the build fails and drops them.
+    let (output, _) = tokio::try_join!(
         build,
-        super::refs::publish(state, repo_id, super::refs::Scope::Tags)
+        super::refs::publish_pinned(state, repo_id, super::refs::Scope::Tags, cas)
     )?;
     Ok(output)
 }

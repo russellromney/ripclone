@@ -163,7 +163,9 @@ pub(super) enum Scope {
 /// refreshes run one at a time, so no other publish writes them meanwhile.
 ///
 /// What it stores is pinned until the refs that name it are written, and
-/// whatever it stored that they do not name is queued for deletion.
+/// whatever it stored that they do not name is queued for deletion. A Head
+/// publishes with [`publish_pinned`] instead, pinning into its build, whose
+/// end queues what it stored even when the build's failure cancels this.
 pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope) -> Result<()> {
     let pins = PinSet::new(&state.pins);
     let published = publish_pinned(state, repo_id, scope, &state.cas.with_pins(&pins)).await;
@@ -179,9 +181,9 @@ pub(super) async fn publish(state: &ServerState, repo_id: &RepoId, scope: Scope)
     published.map(|_| ())
 }
 
-/// Publish, returning the artifacts the repo's refs name afterwards: none
-/// when the repo was purged meanwhile.
-async fn publish_pinned(
+/// Publish, storing through `cas`, and return the artifacts the repo's refs
+/// name afterwards: none when the repo was purged meanwhile.
+pub(super) async fn publish_pinned(
     state: &ServerState,
     repo_id: &RepoId,
     scope: Scope,
