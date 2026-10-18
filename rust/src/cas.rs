@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::pins::PinSet;
+
 enum ObjectHasher {
     Sha1(sha1::Sha1),
     Sha256(Sha256),
@@ -53,6 +55,9 @@ pub struct Cas {
     /// crash. Off for a cache, whose lost entry is only a miss.
     durable: bool,
     on_store: Option<OnStore>,
+    /// The build's pins: each object is pinned before the store relies on
+    /// finding it or installs it (see [`crate::pins`]).
+    pins: Option<Arc<PinSet>>,
 }
 
 impl Cas {
@@ -75,6 +80,7 @@ impl Cas {
             root,
             durable,
             on_store: None,
+            pins: None,
         })
     }
 
@@ -84,6 +90,21 @@ impl Cas {
         Self {
             on_store: Some(on_store),
             ..self.clone()
+        }
+    }
+
+    /// The same store, pinning each object for the build that owns `pins`.
+    pub fn with_pins(&self, pins: &Arc<PinSet>) -> Self {
+        Self {
+            pins: Some(Arc::clone(pins)),
+            ..self.clone()
+        }
+    }
+
+    /// Pin `hash` for this store's build, if it has pins.
+    pub fn pin(&self, hash: &str) {
+        if let Some(pins) = &self.pins {
+            pins.pin(hash);
         }
     }
 
@@ -180,6 +201,7 @@ impl Cas {
             anyhow::bail!("hash mismatch: expected {}, actual {}", hash, actual);
         }
         let path = self.object_path(hash)?;
+        self.pin(hash);
         if path.exists() && self.verify_object(hash).is_ok() {
             return Ok(());
         }
@@ -261,6 +283,7 @@ impl Cas {
     /// a cache that skips syncs is repaired by the next write.
     fn install(&self, hash: &str, source: &Path) -> Result<()> {
         let path = self.object_path(hash)?;
+        self.pin(hash);
         self.create_object_dir(&path)?;
         match std::fs::rename(source, &path) {
             Ok(()) => {}

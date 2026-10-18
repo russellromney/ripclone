@@ -702,6 +702,9 @@ impl ServerConfig {
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .env("RIPCLONE_ORIGIN_BASE", &self.origin_base)
             .env("RIPCLONE_POLL_INTERVAL_SECS", "0")
+            // Deletion sweeps every second, so every test also checks that it
+            // removes nothing a build or clone still needs.
+            .env("RIPCLONE_RETENTION_INTERVAL_SECS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

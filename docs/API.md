@@ -30,6 +30,7 @@ example `github/oven-sh/bun` or `gitlab/group/sub/project`.
 |---|---|
 | `POST /v1/repos/{provider}/{path}/add` | Resolve the default branch, add the repo, and admit a build of its tip. Answers with a build summary. |
 | `DELETE /v1/repos/{provider}/{path}/add` | Remove the repo from the added set: `204`. Published artifacts stay. |
+| `DELETE /v1/repos/{provider}/{path}` | Purge the repo: `204`, also for a repo the server does not know. |
 | `GET /v1/repos` | The added repos, as `[{"provider": "github", "path": "acme/app"}]`. |
 | `POST /v1/repos/{provider}/{path}/builds` | Resolve a selector to one commit and admit a build. |
 | `GET /v1/repos/{provider}/{path}/commits/{sha}` | Read one commit's build. Never builds. |
@@ -37,6 +38,14 @@ example `github/oven-sh/bun` or `gitlab/group/sub/project`.
 
 Only added repos build: `POST .../builds` for a repo that was not added
 answers `404 repo_not_added`.
+
+A purge removes the repo from the added set and deletes its builds at once,
+so its commits read `404` and its running builds stop. Its mirror goes once
+no build holds it. Each artifact that no other repo's build names is deleted
+from storage after twice the signed URL lifetime, so a clone that read the
+repo before the purge finishes. Two repos at the same commits share their
+artifacts, so purging one leaves the other whole. Deletion runs every 5
+minutes.
 
 ### Admit a build
 

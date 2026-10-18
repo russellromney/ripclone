@@ -532,6 +532,17 @@ impl StorageBackend for S3Storage {
         Ok(())
     }
 
+    async fn delete(&self, hash: &str) -> Result<()> {
+        let key = self.key(hash)?;
+        self.client
+            .objects()
+            .delete(&self.bucket, &key)
+            .send()
+            .await
+            .with_context(|| format!("S3 delete_object {key}"))?;
+        Ok(())
+    }
+
     fn size(&self, hash: &str) -> Result<u64> {
         self.remote_size(hash)
     }

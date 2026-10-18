@@ -84,7 +84,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | C4 | SIGKILL the server while the origin holds its fetch; restart; release: the build completes once, every output ready. Then SIGKILL as soon as a push's first artifact is in the store: every stored object hashes to its name, and after a restart the push builds and its full and Files clones are exact. | #202, #220 |
 | C5 | After B is fully ready, a later build of C never changes B's published manifests (byte-compare B's API responses before and after). Over the three builds, every server log line is the server's own: no git output. | #202 |
 | C7 | S3 only: the bucket holds Full(B)'s first write while push C arrives. Head(C) and Files(C) become ready while Full(B) is still pending; after release, Full(B) publishes before Full(C). | Hetzner benchmark |
-| C8 | S3 only: the bucket holds one of Head's writes and refuses the next. Head fails with the storage error and publishes nothing; a depth-1 clone fails and leaves no target. With the fault gone, `sync --at` builds every output and each shape clones exactly. | #220 (S3 job) |
+| C8 | S3 only: the bucket holds one of Head's writes and refuses the next. Head fails with the storage error and publishes nothing; a depth-1 clone fails and leaves no target; the write that landed is deleted, since no output names it. With the fault gone, `sync --at` builds every output and each shape clones exactly. | #220 (S3 job) |
 | C9 | Every output of A is ready; the origin holds B's fetch, so nothing of B is. A files clone and a depth-1 clone of B each report B pending, download nothing, and install nothing: neither falls back to A. After release both install B. | #221 |
 | C10 | The mirror holds B's objects but no refs, as a fetch stopped between storing its pack and writing refs leaves it. After a restart, B builds with no failures, and its full and Files clones are exact. | #234 |
 | C11 | The mirror holds B's commit but not its tree, as a fetch that failed after writing part of B leaves it. B is fetched again, builds with no failures, and its full and Files clones are exact. | #234 |
@@ -120,7 +120,7 @@ Top-up uses the user's git credentials. E1-E3 run against an auth-checking
 origin to prove the clone works with only git's own credential and that no
 Ripclone token reaches the origin.
 
-### F. Downloads (9)
+### F. Downloads (12)
 
 | # | Test | Added |
 |---|---|---|
@@ -137,7 +137,7 @@ Ripclone token reaches the origin.
 | F11 | A proxy that ignores Range: the ranged download falls back to one whole GET of that artifact, and the clone is exact. | |
 | F12 | A flipped byte in one range fails the clone on the hash check and leaves nothing. | |
 
-### G. Clone shapes produce correct trees (13)
+### G. Clone shapes produce correct trees (14)
 
 | # | Test | Added |
 |---|---|---|
@@ -156,7 +156,7 @@ Ripclone token reaches the origin.
 | G12 | Editable clones work with the user's later git: the branch tracks its upstream, `origin` is the configured upstream, `git pull` and `git push` work, a tag or `--at` commit tracks nothing, and a branch named with `#`, `;` and `"` tracks correctly. | #234 |
 | G13 | With a global git config naming a template dir and an identity, full and depth-1 clones have the local config, reflog (`clone: from <url>`) and template hooks of `git clone` and `git clone --depth 1`, apart from `core.checkstat`. The hook runs on the user's commit; `HEAD@{1}` is the cloned commit. A depth-1 clone's `git fetch` takes only its branch, a full clone's every branch. A SHA-256 default in the environment still gives a SHA-1 clone. With `user.useConfigOnly` and no identity, the clone has the reflogs `git clone` writes under git's fallback committer. | #234 |
 
-### H. Storage and server state (12)
+### H. Storage and server state (13)
 
 | # | Test | Added |
 |---|---|---|
@@ -171,6 +171,8 @@ Ripclone token reaches the origin.
 | H10 | S3 emulator: after a one-line push, B uploads no object of 1 MiB or more that the bucket already holds (its Files reuses A's bundles). A second repository with the same files builds the same large objects: the bucket proxy sees a HEAD and no PUT for each. A bucket copy cut short is uploaded again when a third repository with the same files makes it; that repository's clones and the Files clones of B and the second repository are exact. | #220 (S3 job), #221 |
 | H11 | A scratch leftover the server cannot remove, as when a killed server's git child is still writing it, doesn't stop the next start: the server logs it, builds and clones in its own scratch dir, and once the leftover can go, the next start removes it. | #234 |
 | H12 | S3 emulator, through a proxy that refuses `/v1/artifacts/`: depth-1, full, files, `--at` an older commit, `--branch` and top-up clones are exact, and none asks for the hash route. |  |
+| H13 | Local disk, signed-URL TTL 3 s, deletion every second. A fork builds the same commit A as the repo, which also builds B: the same artifacts for A. A clone of B is held at its first download while `rm --purge` runs: B's commit reads `404` and `list` drops the repo, and 2 s of sweeps delete nothing. Released, the clone is exact. Then the artifacts only the repo named are deleted, the fork's stay, only the fork's mirror is left, and its depth-1, full and Files clones are exact. A second purge succeeds, and the repo added again builds and clones. |  |
+| H14 | S3 emulator, same settings, the bucket's downloads held while the purge runs: the clone holding signed URLs from before it is exact; then the purged repo's own artifacts leave the bucket and the local cache, the fork's stay, and its full and Files clones are exact. | (S3 job) |
 
 ### I. Auth, integrations, CLI (13)
 
@@ -237,7 +239,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 89 tests. Several are table-driven.
+Total: 97 tests. Several are table-driven.
 
 ## Test settings
 
@@ -258,8 +260,8 @@ a stable interface. Every one is used by a contract test.
 | `RIPCLONE_HEAD_SLOTS`, `RIPCLONE_FILES_SLOTS`, `RIPCLONE_FULL_SLOTS` | cores/4, at least 2 | Builds of each kind at once. Head needs at least 1; `0` pauses Files or Full. |
 | `RIPCLONE_LSM_MAX_LEVELS` | 16 | History levels a Full keeps before merging the smallest neighbors. |
 | `RIPCLONE_HEAD_REBASE_BYTES` | 128 MiB | Head levels past their base at which Full rebases them. |
-| `RIPCLONE_SIGNED_URL_TTL_SECS` | 1200 | Lifetime of signed artifact URLs. |
-| `RIPCLONE_RETENTION_INTERVAL_SECS` | 300 | How often S3-mode retention trims the local cache; `0` turns it off. |
+| `RIPCLONE_SIGNED_URL_TTL_SECS` | 1200 | Lifetime of signed artifact URLs. A purge deletes artifacts after twice this. |
+| `RIPCLONE_RETENTION_INTERVAL_SECS` | 300 | How often S3-mode retention trims the local cache and purged artifacts are deleted; `0` turns both off. |
 
 ## What it replaced
 

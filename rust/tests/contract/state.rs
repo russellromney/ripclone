@@ -1,6 +1,7 @@
 //! H. Storage and server state.
 
 use crate::harness::*;
+use std::collections::BTreeSet;
 
 /// H1: published artifacts survive a server crash; the restarted server serves
 /// them without rebuilding.
@@ -163,10 +164,8 @@ fn h5_local_retention_never_trims_artifacts() {
     let origin = world.origin("acme", "h5");
     let tip = origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
-    let server = world.server(&[
-        ("RIPCLONE_RETENTION_INTERVAL_SECS", "1"),
-        ("RIPCLONE_RETENTION_MAX_GB", "1"),
-    ]);
+    // Retention runs every second, the harness default.
+    let server = world.server(&[("RIPCLONE_RETENTION_MAX_GB", "1")]);
     world.cli(&server, &["add", "acme/h5", "--wait"]).ok();
     let stored = server.storage_listing();
     backdate(&world.path("server").join("cache"), 30);
@@ -291,4 +290,138 @@ fn h11_a_scratch_leftover_in_use_does_not_stop_startup() {
     assert!(!stuck.exists(), "leftover kept after it could go");
     let runs: Vec<_> = std::fs::read_dir(&scratch).unwrap().flatten().collect();
     assert_eq!(runs.len(), 1, "{runs:?}");
+}
+
+/// Every artifact hash (64 hex digits) in a JSON value.
+fn hashes_in(value: &serde_json::Value, out: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(s)
+            if s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            out.insert(s.clone());
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|v| hashes_in(v, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| hashes_in(v, out)),
+        _ => {}
+    }
+}
+
+/// The artifacts every output of `commit` names.
+pub(crate) fn commit_artifacts(server: &Server, repo: &str, commit: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for kind in ["head", "full", "files"] {
+        let (status, body) = api::read_commit(server, repo, commit, Some(kind));
+        assert_eq!(status, 200, "{repo}@{commit} {kind}: {body}");
+        hashes_in(&body, &mut out);
+    }
+    assert!(!out.is_empty(), "{repo}@{commit} names no artifacts");
+    out
+}
+
+fn stored(server: &Server, hash: &str) -> bool {
+    match server.get_bytes(&format!("/v1/artifacts/{hash}")).0 {
+        200 => true,
+        404 => false,
+        status => panic!("artifact {hash}: {status}"),
+    }
+}
+
+/// The mirror directory names under the server's repo root.
+pub(crate) fn mirrors(world: &World) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(world.path("server").join("repos"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".git"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// H13: purging a repository deletes its builds, its mirror, and the
+/// artifacts no other repository uses, after twice the signed URL lifetime.
+/// A fork that built the same commit keeps the shared artifacts and clones
+/// in every shape. A clone of the purged repository that started before the
+/// purge finishes. Added again, the repository builds and clones.
+#[test]
+fn h13_purge_removes_only_what_no_other_repo_uses() {
+    let world = World::new();
+    let origin = world.origin("acme", "h13");
+    let a = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "A");
+    origin.publish();
+    let fork = world.origin("acme", "h13-fork");
+    git(
+        &origin.work,
+        &["push", "-q", fork.bare.to_str().unwrap(), "main"],
+    );
+    // Grace of 6 s; the harness sweeps every second.
+    let server = world.server(&[("RIPCLONE_SIGNED_URL_TTL_SECS", "3")]);
+    world.cli(&server, &["add", "acme/h13-fork", "--wait"]).ok();
+    world.cli(&server, &["add", "acme/h13", "--wait"]).ok();
+    let b = origin.commit(&[("c.txt", "c\n")], "B");
+    origin.publish();
+    world.cli(&server, &["sync", "acme/h13", "--at", &b]).ok();
+
+    let forked = commit_artifacts(&server, "acme/h13-fork", &a);
+    let mut mine = commit_artifacts(&server, "acme/h13", &a);
+    assert_eq!(mine, forked, "the same commit builds the same artifacts");
+    mine.extend(commit_artifacts(&server, "acme/h13", &b));
+    let unique: BTreeSet<&String> = mine.difference(&forked).collect();
+    assert!(!unique.is_empty(), "B builds artifacts the fork lacks");
+    assert_eq!(mirrors(&world).len(), 2);
+
+    // Every download of a clone of B waits until the purge has happened.
+    let proxy = FaultProxy::start(&server);
+    proxy.fault_artifacts(Fault::Hold, 0, usize::MAX);
+    let target = world.target("h13-during");
+    let during = world.cli_spawn(&proxy, &["clone", "acme/h13", target.to_str().unwrap()]);
+    proxy.wait_held(1);
+    world.cli(&server, &["rm", "--purge", "acme/h13"]).ok();
+    let (status, _) = api::read_commit(&server, "acme/h13", &b, Some("head"));
+    assert_eq!(status, 404, "the purged builds are gone");
+    let listed = world.cli(&server, &["list"]).ok();
+    assert!(!listed.lines().any(|line| line == "acme/h13"), "{listed}");
+    // Sweeps run while the clone is held; nothing is due yet.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(unique.iter().all(|hash| stored(&server, hash)));
+    proxy.release();
+    during.wait().ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
+    assert_eq!(listing(&target), origin.tree(&b));
+
+    wait_for("the purged repository's artifacts to be deleted", || {
+        unique
+            .iter()
+            .all(|hash| !stored(&server, hash))
+            .then_some(())
+    });
+    assert!(forked.iter().all(|hash| stored(&server, hash)));
+    assert_eq!(mirrors(&world), ["github_acme%2Fh13-fork.git"]);
+    for (name, args) in [
+        ("depth1", &["--depth", "1"][..]),
+        ("full", &[][..]),
+        ("files", &["--mode", "files"][..]),
+    ] {
+        let target = world.target(&format!("h13-fork-{name}"));
+        let mut argv = vec!["clone", "acme/h13-fork", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&server, &argv).ok();
+        assert_eq!(listing(&target), origin.tree(&a), "{name}");
+    }
+    let full = world.target("h13-fork-full");
+    git(&full, &["fsck", "--full"]);
+
+    // The purge is idempotent, and the repository can come back.
+    world.cli(&server, &["rm", "--purge", "acme/h13"]).ok();
+    world.cli(&server, &["add", "acme/h13", "--wait"]).ok();
+    let again = world.target("h13-again");
+    world
+        .cli(&server, &["clone", "acme/h13", again.to_str().unwrap()])
+        .ok();
+    assert_eq!(git(&again, &["rev-parse", "HEAD"]), b);
+    assert_eq!(listing(&again), origin.tree(&b));
+    assert_eq!(
+        git(&again, &["rev-list", "--count", "HEAD"]),
+        origin.count(&b)
+    );
 }

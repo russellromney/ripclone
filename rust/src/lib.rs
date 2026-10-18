@@ -96,6 +96,8 @@ pub mod mode;
 #[doc(hidden)]
 pub mod pack;
 pub mod perf;
+#[doc(hidden)]
+pub mod pins;
 pub mod provider;
 #[doc(hidden)]
 #[doc(hidden)]
@@ -240,6 +242,85 @@ pub struct FilesResult {
     /// the tails builds on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact: Option<Box<FilesResult>>,
+}
+
+impl ClonepackArtifacts {
+    fn artifacts(&self) -> impl Iterator<Item = &str> {
+        [
+            &self.manifest,
+            &self.metadata_chunk,
+            &self.midx,
+            &self.idx_bundle,
+        ]
+        .into_iter()
+        .map(String::as_str)
+    }
+}
+
+fn sized_artifacts(packs: &[SizedPack]) -> impl Iterator<Item = &str> {
+    packs.iter().flat_map(|p| [p.pack.as_str(), p.idx.as_str()])
+}
+
+fn pack_artifacts(packs: &[PackArtifact]) -> impl Iterator<Item = &str> {
+    packs.iter().flat_map(|p| [p.pack.as_str(), p.idx.as_str()])
+}
+
+/// Every stored artifact an output names, so storage can tell what a
+/// repository still uses.
+pub trait Artifacts {
+    /// The artifact hashes, each once, no empty ones.
+    fn artifacts(&self) -> std::collections::BTreeSet<&str>;
+}
+
+fn named<'a>(hashes: impl Iterator<Item = &'a str>) -> std::collections::BTreeSet<&'a str> {
+    hashes.filter(|hash| !hash.is_empty()).collect()
+}
+
+impl Artifacts for HeadResult {
+    fn artifacts(&self) -> std::collections::BTreeSet<&str> {
+        named(
+            self.clonepack
+                .artifacts()
+                .chain(pack_artifacts(&self.packs))
+                .chain(sized_artifacts(&self.base_packs))
+                .chain(sized_artifacts(&self.levels)),
+        )
+    }
+}
+
+impl Artifacts for FullResult {
+    fn artifacts(&self) -> std::collections::BTreeSet<&str> {
+        let head_base = self
+            .head_base
+            .iter()
+            .flat_map(|base| sized_artifacts(&base.packs).chain(sized_artifacts(&base.levels)));
+        named(
+            self.clonepack
+                .artifacts()
+                .chain(pack_artifacts(&self.packs))
+                .chain(
+                    self.history_levels
+                        .iter()
+                        .flat_map(|level| sized_artifacts(&level.packs)),
+                )
+                .chain(head_base),
+        )
+    }
+}
+
+impl Artifacts for FilesResult {
+    fn artifacts(&self) -> std::collections::BTreeSet<&str> {
+        let mut hashes = named(
+            self.clonepack
+                .artifacts()
+                .chain(self.archive_chunks.iter().map(String::as_str))
+                .chain(self.archive_frames.iter().map(|f| f.chunk_hash.as_str())),
+        );
+        if let Some(compact) = &self.compact {
+            hashes.extend(compact.artifacts());
+        }
+        hashes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

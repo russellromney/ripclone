@@ -1914,6 +1914,10 @@ mod tests {
             anyhow::bail!("unsupported")
         }
 
+        async fn delete(&self, _hash: &str) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
+
         fn size(&self, _hash: &str) -> Result<u64> {
             anyhow::bail!("unsupported")
         }

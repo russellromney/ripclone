@@ -514,6 +514,19 @@ impl Client {
         Ok(())
     }
 
+    /// Remove one repository and everything the server holds for it: its
+    /// builds, its mirror, and the artifacts no other repository uses.
+    pub async fn purge_repo(&self, repo_path: &str) -> Result<()> {
+        let url = self.repo_url(repo_path, "");
+        let resp = self
+            .send(self.http.request(reqwest::Method::DELETE, &url))
+            .await?;
+        if !resp.status().is_success() {
+            return Err(server_error(&self.progress, "rm --purge failed", resp).await);
+        }
+        Ok(())
+    }
+
     /// `POST .../builds`: resolve `selector` on the server and admit its
     /// commit. `retry` puts failed outputs back to pending.
     pub async fn post_build(

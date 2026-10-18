@@ -51,6 +51,9 @@ pub trait StorageBackend: Send + Sync {
         self.put_async(hash, &data).await
     }
 
+    /// Delete the object. Deleting one that is not there succeeds.
+    async fn delete(&self, hash: &str) -> Result<()>;
+
     /// Return the object size in bytes, if the backend can determine it
     /// without downloading the whole object.
     fn size(&self, hash: &str) -> Result<u64>;
@@ -135,6 +138,10 @@ impl StorageBackend for LocalStorage {
             .await
             .context("local storage put_file task")??;
         Ok(())
+    }
+
+    async fn delete(&self, hash: &str) -> Result<()> {
+        self.cas.remove(hash)
     }
 
     fn size(&self, hash: &str) -> Result<u64> {

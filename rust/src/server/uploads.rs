@@ -75,6 +75,8 @@ impl Uploads {
         if !state.seen.insert(hash.to_string()) {
             return;
         }
+        // Before the upload checks whether storage already has it.
+        self.cas.pin(hash);
         state.started.push(hash.to_string());
         let (storage, path, hash) = (self.storage.clone(), self.cas.path(hash), hash.to_string());
         let (cancel, bytes) = (self.cancel.clone(), self.bytes.clone());

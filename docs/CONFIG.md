@@ -44,7 +44,7 @@ errors.
 | `RIPCLONE_S3_REGION` | Region, default `us-east-1`. |
 | `RIPCLONE_S3_PREFIX` | Key prefix. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | S3 credentials. |
-| `RIPCLONE_RETENTION_MAX_GB` | With S3 storage, the local artifact cache keeps at most this many GB and nothing older than 7 days. Default 100; `0` keeps any size. It never deletes S3 objects. With local storage, nothing is trimmed. |
+| `RIPCLONE_RETENTION_MAX_GB` | With S3 storage, the local artifact cache keeps at most this many GB and nothing older than 7 days. Default 100; `0` keeps any size. It never deletes S3 objects; only a purge does (see [API](API.md#repositories)). With local storage, nothing is trimmed. |
 | `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>` | Webhook secret per provider instance. See [Webhooks](WEBHOOKS.md). |
 | `RIPCLONE_POLL_INTERVAL_SECS` | How often the server checks added repos for new commits, default 300; `0` turns polling off. |
 | `RUST_LOG` | Tracing filter. Default `info`. |
