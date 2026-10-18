@@ -301,7 +301,9 @@ impl Terminal {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                // macOS takes `*mut winsize`, Linux `*const`; a raw `*mut`
+                // suits both.
+                &raw mut size,
             )
         };
         assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
