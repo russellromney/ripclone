@@ -40,10 +40,6 @@ pub fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&ChunkRef> {
         refs.push(meta);
     }
     refs.extend(&manifest.archive_chunks);
-    refs.extend(&manifest.head_blobs_chunks);
-    if let Some(ref idx) = manifest.head_blobs_idx {
-        refs.push(idx);
-    }
     for pack in &manifest.packs {
         if let Some(ref pack_chunk) = pack.pack {
             refs.push(pack_chunk);
