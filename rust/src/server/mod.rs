@@ -38,19 +38,12 @@ mod worker;
 pub use api::{
     BuildRequest, ExactStatusEntry, RefResponse, RegionStorageEntry, RepoStatusResponse,
 };
-pub use auth::RateLimiter;
 pub use builder::SyncPhases;
 pub use poller::poll_once;
 
-use api::{
-    admin_get_config, admin_put_config, dispatch_repos_delete, dispatch_repos_get,
-    dispatch_repos_post, list_added_repos,
-};
+use api::{dispatch_repos_delete, dispatch_repos_get, dispatch_repos_post, list_added_repos};
 use artifacts::get_artifact;
-use auth::{
-    auth_middleware, parse_rate_limit, protocol_guard, rate_limit_middleware,
-    read_server_auth_token,
-};
+use auth::{auth_middleware, protocol_guard, read_server_auth_token};
 use poller::spawn_poll_loop;
 use webhooks::webhook_handler;
 
@@ -59,14 +52,13 @@ pub struct ServerState {
     pub cas: Cas,
     pub storage: StorageRef,
     pub repo_root: PathBuf,
-    /// Builds, added repositories and repository config. Also holds the
-    /// server's ownership lock on the control database.
+    /// Builds and added repositories. Also holds the server's ownership lock
+    /// on the control database.
     pub control: Arc<dyn ControlStore>,
     pub provider_registry: ProviderRegistry,
     pub broker: Arc<dyn CredentialBroker>,
     pub token_hash: Option<String>,
     pub metrics: Arc<Metrics>,
-    pub rate_limiter: RateLimiter,
     /// Wakes a Head slot after an admission that left Head pending.
     pub head_wake: Arc<tokio::sync::Notify>,
     /// Wakes a Files slot after a Head build releases its row.
@@ -146,10 +138,6 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/v1/repos/{*path}", delete(dispatch_repos_delete))
         .route("/v1/artifacts/{hash}", get(get_artifact))
         // Repository build settings, addressed like `/v1/repos`.
-        .route(
-            "/v1/admin/config/{*path}",
-            get(admin_get_config).post(admin_put_config),
-        )
         // Clone metrics sink. The cloud consumes these for analytics; the OSS
         // server accepts and drops them so a self-hosted CLI never spams 404s.
         .route(
@@ -163,7 +151,9 @@ pub fn build_app(state: ServerState) -> Router {
         .route_layer(middleware::from_fn(protocol_guard))
         .with_state(state.clone());
 
-    let rate_limited = Router::new()
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/version", get(version_handler))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
         // Provider-agnostic push-webhook receiver: authenticated by the provider
@@ -171,16 +161,6 @@ pub fn build_app(state: ServerState) -> Router {
         // outside the `protected` layer.
         .route("/webhooks/{provider}", post(webhook_handler))
         .merge(protected)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
-        .with_state(state.clone());
-
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/version", get(version_handler))
-        .merge(rate_limited)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -343,14 +323,6 @@ pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Re
     );
     let broker = broker_from_env(provider_registry.clone())?;
 
-    let (rate_burst, rate_per_sec) =
-        parse_rate_limit(env::var("RIPCLONE_RATE_LIMIT_PER_SEC").ok().as_deref())?;
-    let rate_limiter = RateLimiter::new(rate_burst, rate_per_sec);
-    info!(
-        "rate limiter enabled: burst={}, restore={}/s",
-        rate_burst, rate_per_sec
-    );
-
     backends::Backends::validate_environment()?;
     let worker_settings = worker::WorkerSettings::from_env()?;
     let retention = crate::retention::RetentionSettings::from_env()?;
@@ -405,7 +377,6 @@ pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Re
         broker,
         token_hash: Some(token_hash),
         metrics,
-        rate_limiter,
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
@@ -428,11 +399,7 @@ pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Re
         "ripclone server listening on http://{}",
         listener.local_addr()?
     );
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
@@ -441,7 +408,6 @@ mod tests {
     use super::*;
     use crate::provider::RepoId;
     use axum::body::Body;
-    use axum::extract::ConnectInfo;
     use sha2::{Digest, Sha256};
     use tower::util::ServiceExt;
 
@@ -477,7 +443,6 @@ mod tests {
             broker,
             token_hash: Some(hex::encode(Sha256::digest("secret"))),
             metrics: Metrics::new(),
-            rate_limiter: RateLimiter::new(100, 100.0),
             // No webhook secret here; webhook tests install their own.
             webhook_config: Arc::new(WebhookConfig::default()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -494,7 +459,6 @@ mod tests {
         axum::http::Request::builder()
             .method(method)
             .uri(uri)
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
             .header("Authorization", auth_header())
             .header("x-ripclone-protocol", crate::PROTOCOL_VERSION)
             .body(Body::empty())
@@ -511,7 +475,6 @@ mod tests {
         let mut b = axum::http::Request::builder()
             .method(method)
             .uri(uri)
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
             .header("x-ripclone-protocol", crate::PROTOCOL_VERSION);
         if let Some(a) = auth {
             b = b.header("Authorization", a);

@@ -13,7 +13,6 @@ use super::{
     Published,
 };
 use crate::provider::RepoId;
-use crate::repo_config::RepoConfig;
 use crate::{ExactResultKind, FullResult};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -24,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema/sqlite.sql");
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, \
     head_state, head_output, head_error, files_state, files_output, files_error, \
@@ -754,43 +753,6 @@ impl ControlStore for SqliteControlStore {
             .collect()
     }
 
-    async fn get_config(&self, repo: &RepoId) -> Result<Option<RepoConfig>> {
-        let key = repo.storage_key();
-        let data: Option<String> =
-            sqlx::query_scalar("SELECT data FROM repo_config WHERE repo = $1")
-                .bind(&key)
-                .fetch_optional(&self.pool)
-                .await
-                .with_context(|| format!("read repository config {key}"))?;
-        let Some(data) = data else {
-            return Ok(None);
-        };
-        let config: RepoConfig = serde_json::from_str(&data)
-            .with_context(|| format!("decode repository config {key}"))?;
-        config
-            .validate()
-            .with_context(|| format!("validate repository config {key}"))?;
-        Ok(Some(config))
-    }
-
-    async fn set_config(&self, repo: &RepoId, config: &RepoConfig) -> Result<()> {
-        let key = repo.storage_key();
-        config
-            .validate()
-            .with_context(|| format!("validate repository config {key}"))?;
-        let data = serde_json::to_string(config).context("encode repository config")?;
-        sqlx::query(
-            "INSERT INTO repo_config (repo, data) VALUES ($1, $2)
-             ON CONFLICT (repo) DO UPDATE SET data = excluded.data",
-        )
-        .bind(&key)
-        .bind(data)
-        .execute(&self.pool)
-        .await
-        .with_context(|| format!("write repository config {key}"))?;
-        Ok(())
-    }
-
     async fn health(&self) -> Result<()> {
         match file_id(&self.path) {
             Ok(file) => ensure!(
@@ -892,23 +854,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_config_with_removed_keys_still_loads() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = open(&dir.path().join("control.db")).await.unwrap();
-        let repo = RepoId::github("acme/old");
-        sqlx::query("INSERT INTO repo_config (repo, data) VALUES ($1, $2)")
-            .bind(repo.storage_key())
-            .bind(
-                r#"{"compression_level":9,"clonepack_depths":[{"name":"full"}],"archive_chunk_size":1024,"head_blobs_chunk_size":4194304}"#,
-            )
-            .execute(store.pool())
-            .await
-            .unwrap();
-        let config = store.get_config(&repo).await.unwrap().unwrap();
-        assert_eq!(config.compression_level(), 9);
-    }
-
-    #[tokio::test]
     async fn second_owner_is_rejected_while_first_is_alive() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control.db");
@@ -978,28 +923,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-    }
-
-    #[tokio::test]
-    async fn corrupt_or_invalid_config_fails_instead_of_defaulting() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = open(&dir.path().join("control.db")).await.unwrap();
-        let repo = RepoId::github("acme/corrupt");
-        for (data, expected) in [
-            ("not-json", "decode repository config"),
-            (r#"{"compression_level":99}"#, "validate repository config"),
-        ] {
-            sqlx::query(
-                "INSERT INTO repo_config (repo, data) VALUES ($1, $2)
-                 ON CONFLICT (repo) DO UPDATE SET data = excluded.data",
-            )
-            .bind(repo.storage_key())
-            .bind(data)
-            .execute(store.pool())
-            .await
-            .unwrap();
-            let error = store.get_config(&repo).await.unwrap_err().to_string();
-            assert!(error.contains(expected), "{data}: {error}");
-        }
     }
 }

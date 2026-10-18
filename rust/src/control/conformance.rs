@@ -3,7 +3,6 @@
 
 use super::{Clock, ControlStore, Lease, Out, Output, Pool};
 use crate::provider::{ProviderInstanceId, RepoId};
-use crate::repo_config::RepoConfig;
 use crate::{ClonepackArtifacts, ExactResultKind, FilesResult, FullResult, HeadResult};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -75,7 +74,6 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
         concurrent_claims_never_share_a_row,
         state_survives_restart,
         repos_are_added_listed_and_removed,
-        config_is_absent_until_written,
     );
 }
 
@@ -1268,12 +1266,7 @@ async fn concurrent_claims_never_share_a_row(backend: &dyn Backend) {
 async fn state_survives_restart(backend: &dyn Backend) {
     let (clock, store) = open(backend).await;
     let commit = sha(1);
-    let config = RepoConfig {
-        compression_level: Some(3),
-        ..Default::default()
-    };
     store.add_repo(&repo()).await.unwrap();
-    store.set_config(&repo(), &config).await.unwrap();
     store.admit(&repo(), &commit, Some(MAIN)).await.unwrap();
     publish_head(store.as_ref(), &commit).await;
     let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
@@ -1303,10 +1296,6 @@ async fn state_survives_restart(backend: &dyn Backend) {
     assert_eq!(
         store.get_repo(&repo()).await.unwrap().unwrap().added_at,
         START as u64
-    );
-    assert_eq!(
-        store.get_config(&repo()).await.unwrap(),
-        Some(config.clone())
     );
     // The dead process's lease survives until reset at startup.
     assert_eq!(store.reset_leases().await.unwrap(), 1);
@@ -1370,35 +1359,4 @@ async fn repos_are_added_listed_and_removed(backend: &dyn Backend) {
         store.get_repo(&nested).await.unwrap().unwrap().added_at,
         (START + 10) as u64
     );
-}
-
-async fn config_is_absent_until_written(backend: &dyn Backend) {
-    let (_, store) = open(backend).await;
-    let missing = RepoId::github("acme/missing");
-    assert_eq!(store.get_config(&missing).await.unwrap(), None);
-    let config = RepoConfig {
-        compression_level: Some(3),
-        ..Default::default()
-    };
-    store.set_config(&repo(), &config).await.unwrap();
-    assert_eq!(
-        store.get_config(&repo()).await.unwrap(),
-        Some(config.clone())
-    );
-    let invalid = RepoConfig {
-        compression_level: Some(99),
-        ..Default::default()
-    };
-    assert!(store.set_config(&repo(), &invalid).await.is_err());
-    assert_eq!(
-        store.get_config(&repo()).await.unwrap(),
-        Some(config.clone())
-    );
-    let updated = RepoConfig {
-        compression_level: Some(19),
-        ..Default::default()
-    };
-    store.set_config(&repo(), &updated).await.unwrap();
-    assert_eq!(store.get_config(&repo()).await.unwrap(), Some(updated));
-    assert_eq!(store.get_config(&missing).await.unwrap(), None);
 }

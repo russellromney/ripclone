@@ -16,7 +16,6 @@ struct TopUp {
     /// Where the CLI's provider config says the repo lives.
     upstream: String,
     a: String,
-    cli_providers: String,
     user_auth: String,
 }
 
@@ -32,22 +31,15 @@ impl TopUp {
         let a = origin.commit(&[("a.txt", "a\n"), ("d/b.txt", "b\n")], "A");
         origin.publish();
 
-        let server_providers = providers_json(
+        world.server_providers(
             http.url(),
             &[("gh", "github", Some("server-secret"), serde_json::json!({}))],
         );
-        let mut server = world.server(&[("RIPCLONE_PROVIDERS", &server_providers)]);
-        let cli_providers =
-            providers_json(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
+        let mut server = world.server(&[]);
+        world.cli_providers(http.url(), &[("gh", "github", None, serde_json::json!({}))]);
         let repo = format!("gh:acme/{name}");
         let upstream = format!("{}/acme/{name}.git", http.url());
-        world
-            .cli_env(
-                &server,
-                &["add", &repo, "--wait"],
-                &[("RIPCLONE_PROVIDERS", &cli_providers)],
-            )
-            .ok();
+        world.cli(&server, &["add", &repo, "--wait"]).ok();
         server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
         http.hold_fetches_without("authorization", &user_auth);
         Self {
@@ -58,7 +50,6 @@ impl TopUp {
             repo,
             upstream,
             a,
-            cli_providers,
             user_auth,
         }
     }
@@ -69,7 +60,6 @@ impl TopUp {
         let target = self.world.target("clone");
         let header = format!("Authorization: {}", self.user_auth);
         let env = [
-            ("RIPCLONE_PROVIDERS", self.cli_providers.as_str()),
             ("GIT_CONFIG_COUNT", "1"),
             ("GIT_CONFIG_KEY_0", "http.extraHeader"),
             ("GIT_CONFIG_VALUE_0", header.as_str()),

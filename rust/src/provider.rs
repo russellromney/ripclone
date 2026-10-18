@@ -244,9 +244,8 @@ fn validate_provider_host(id: &str, host: &str) -> Result<()> {
     Ok(())
 }
 
-/// Raw configuration for one provider instance, as loaded from config or env.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+/// Raw configuration for one provider instance, from the config file.
+#[derive(Debug, Clone, Default)]
 pub struct ProviderConfig {
     pub id: String,
     /// Preset kind. Defaults to `"generic"`.
@@ -294,13 +293,19 @@ impl ProviderRegistry {
         }
     }
 
-    /// Load from configuration.
-    ///
-    /// Reads `RIPCLONE_PROVIDERS` as JSON first, then merges the unified TOML
-    /// config. The built-in `github` default is always present and can be
-    /// overridden by config (host, token, template).
+    /// The built-in `github` instance plus the config file's `[providers]`
+    /// entries. An entry named `github` overrides the built-in one.
+    pub fn from_config(config: &crate::config::Config) -> Result<Self> {
+        let mut registry = Self::new();
+        for entry in config.provider_configs() {
+            registry.merge_one(entry)?;
+        }
+        Ok(registry)
+    }
+
+    /// [`Self::from_config`] of the config file.
     pub fn load() -> Result<Self> {
-        crate::provider_config::load_registry()
+        Self::from_config(&crate::config::load())
     }
 
     /// Merge a single provider config into the registry.
@@ -619,6 +624,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn registry_is_github_plus_config_entries() {
+        use crate::config::{Config, ProviderEntry};
+        use secrecy::ExposeSecret;
+        let entry = |kind: &str, host: &str, token: &str| ProviderEntry {
+            kind: kind.into(),
+            host: Some(host.into()),
+            token: Some(token.into()),
+            auth_template: None,
+            auth_header_name: None,
+        };
+        let config = Config {
+            providers: HashMap::from([
+                (
+                    "my-gitea".to_string(),
+                    entry("gitea", "https://gitea.example.com", "gitea-secret"),
+                ),
+                (
+                    "github".to_string(),
+                    entry("github", "github.com", "gh-token"),
+                ),
+            ]),
+            ..Config::default()
+        };
+        let registry = ProviderRegistry::from_config(&config).unwrap();
+        for (id, host, token) in [
+            ("github", "github.com", "gh-token"),
+            ("my-gitea", "https://gitea.example.com", "gitea-secret"),
+        ] {
+            assert_eq!(
+                registry.get(id).map(|p| p.host.as_str()),
+                Some(host),
+                "{id}"
+            );
+            assert_eq!(registry.token(id).unwrap().expose_secret(), token, "{id}");
+        }
+        assert_eq!(registry.iter().count(), 2);
+    }
+
     fn gitlab_cfg(token: Option<&str>) -> ProviderConfig {
         ProviderConfig {
             id: "gitlab".to_string(),
@@ -630,10 +674,8 @@ mod tests {
         }
     }
 
-    /// A blank token is never stored, and never overwrites a real one from an
-    /// earlier layer (e.g. `provider add gitlab --token ""` after
-    /// RIPCLONE_PROVIDERS set one). An empty token would surface as
-    /// `Basic oauth2:` and be rejected by GitLab.
+    /// A blank token is never stored, and never overwrites a real one. An
+    /// empty token would surface as `Basic oauth2:` and be rejected by GitLab.
     #[test]
     fn blank_token_is_never_stored() {
         use secrecy::ExposeSecret;

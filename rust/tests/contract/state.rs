@@ -65,12 +65,6 @@ fn h4_invalid_config_fails_before_side_effects() {
         ),
         ("malformed file", "[providers\n", &[], "parse config"),
         (
-            "bad rate limit",
-            "",
-            &[("RIPCLONE_RATE_LIMIT_PER_SEC", "many")],
-            "RIPCLONE_RATE_LIMIT_PER_SEC",
-        ),
-        (
             "no head slots",
             "",
             &[("RIPCLONE_HEAD_SLOTS", "0")],
@@ -191,23 +185,6 @@ pub fn backdate(dir: &std::path::Path, days: u64) {
             filetime::set_file_mtime(&path, when).unwrap();
         }
     }
-}
-
-/// H7: a repository's build config survives a server restart.
-#[test]
-fn h7_repo_config_survives_restart() {
-    let world = World::new();
-    let mut server = world.server(&[]);
-    let path = "/v1/admin/config/github/acme/h7";
-    let config = serde_json::json!({ "compression_level": 9 });
-    let (status, stored) = api::parse(server.post_json(path, &config));
-    assert_eq!(status, 200, "{stored}");
-    assert_eq!(stored, config);
-
-    server.restart();
-    let (status, read) = api::parse(server.get(path));
-    assert_eq!(status, 200, "{read}");
-    assert_eq!(read, stored);
 }
 
 /// H8: `/readyz` fails once the control database file is deleted or replaced

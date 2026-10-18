@@ -149,6 +149,8 @@ fn head_rebase_bytes() -> Result<u64> {
 /// How much larger than its compact archive, in percent, a Files archive
 /// with tails may grow before the next build compacts it.
 const FILES_TAIL_PERCENT: u64 = 25;
+/// The zstd level of the Files archive.
+const FILES_COMPRESSION_LEVEL: i32 = 6;
 
 /// Head level packs past which Full packs a new base.
 const MAX_HEAD_LEVEL_PACKS: usize = 64;
@@ -1066,7 +1068,6 @@ pub(super) async fn build_files_result(
     parent: Option<String>,
     parent_files: Option<(&str, &crate::FilesResult)>,
     storage: &crate::storage::StorageRef,
-    compression_level: i32,
     phases: &mut BuildPhases,
 ) -> Result<crate::FilesResult> {
     let uploads = Uploads::new(cas, storage);
@@ -1110,7 +1111,7 @@ pub(super) async fn build_files_result(
             match builder.build_tail_into_cas(
                 &archive_commit,
                 &archive_cas,
-                compression_level,
+                FILES_COMPRESSION_LEVEL,
                 base,
                 crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
             ) {
@@ -1121,7 +1122,7 @@ pub(super) async fn build_files_result(
                 &archive_commit,
                 &archive_cas,
                 Some(&archive_storage),
-                compression_level,
+                FILES_COMPRESSION_LEVEL,
                 None,
                 crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
             );
@@ -1130,7 +1131,7 @@ pub(super) async fn build_files_result(
             &archive_commit,
             &archive_cas,
             Some(&archive_storage),
-            compression_level,
+            FILES_COMPRESSION_LEVEL,
             base.as_ref(),
             crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
         )

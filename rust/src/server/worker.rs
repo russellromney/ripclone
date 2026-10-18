@@ -615,11 +615,6 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
             cancel::spawn_blocking(move || git::parent_commit(&dir, &commit).ok().flatten())
                 .await
                 .context("parent lookup task")?;
-        let config = state
-            .control
-            .get_config(&claim.repo)
-            .await?
-            .unwrap_or_default();
         let start = Instant::now();
         let base_row = ancestor_base(state, claim, ExactResultKind::Files, &mirror_dir).await?;
         let base_files = base_row
@@ -634,7 +629,6 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
             parent,
             base_files,
             &state.storage,
-            config.compression_level(),
             &mut phases,
         )
         .await
@@ -1093,19 +1087,6 @@ mod tests {
         }
         async fn list_repos(&self) -> Result<Vec<crate::control::AddedRepo>> {
             self.inner.list_repos().await
-        }
-        async fn get_config(
-            &self,
-            repo: &RepoId,
-        ) -> Result<Option<crate::repo_config::RepoConfig>> {
-            self.inner.get_config(repo).await
-        }
-        async fn set_config(
-            &self,
-            repo: &RepoId,
-            config: &crate::repo_config::RepoConfig,
-        ) -> Result<()> {
-            self.inner.set_config(repo, config).await
         }
         async fn health(&self) -> Result<()> {
             self.inner.health().await

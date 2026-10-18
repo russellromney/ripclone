@@ -138,6 +138,23 @@ impl World {
         self.dir.join(sub)
     }
 
+    /// Write the server's config file with these provider instances on
+    /// `host`. Start servers after calling this.
+    pub fn server_providers(&self, host: &str, entries: &[ProviderSpec]) {
+        self.write_config("server", host, entries);
+    }
+
+    /// Write the CLI's config file with these provider instances on `host`.
+    pub fn cli_providers(&self, host: &str, entries: &[ProviderSpec]) {
+        self.write_config("home", host, entries);
+    }
+
+    fn write_config(&self, dir: &str, host: &str, entries: &[ProviderSpec]) {
+        let dir = self.path(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), providers_toml(host, entries)).unwrap();
+    }
+
     /// A git origin served to the server at `github:<owner>/<name>`.
     pub fn origin(&self, owner: &str, name: &str) -> Origin {
         let work = self.path("work").join(format!("{owner}-{name}"));
@@ -685,7 +702,6 @@ impl ServerConfig {
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .env("RIPCLONE_ORIGIN_BASE", &self.origin_base)
             .env("RIPCLONE_POLL_INTERVAL_SECS", "0")
-            .env("RIPCLONE_RATE_LIMIT_PER_SEC", "1000000")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -985,28 +1001,26 @@ pub fn basic(user: &str, token: &str) -> String {
     )
 }
 
-/// `RIPCLONE_PROVIDERS` JSON for provider instances on `host`. Each entry is
-/// `(id, kind, token, extra fields)`; a `None` token is left out.
-pub fn providers_json(
-    host: &str,
-    entries: &[(&str, &str, Option<&str>, serde_json::Value)],
-) -> String {
-    let providers: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|(id, kind, token, extra)| {
-            let mut entry = serde_json::json!({ "id": id, "kind": kind, "host": host });
-            if let Some(token) = token {
-                entry["token"] = (*token).into();
+/// One provider instance on a test host: `(id, kind, token, extra fields)`.
+/// A `None` token is left out.
+pub type ProviderSpec<'a> = (&'a str, &'a str, Option<&'a str>, serde_json::Value);
+
+/// A config file's `[providers]` tables for instances on `host`.
+fn providers_toml(host: &str, entries: &[ProviderSpec]) -> String {
+    let mut providers = serde_json::Map::new();
+    for (id, kind, token, extra) in entries {
+        let mut entry = serde_json::json!({ "kind": kind, "host": host });
+        if let Some(token) = token {
+            entry["token"] = (*token).into();
+        }
+        if let Some(extra) = extra.as_object() {
+            for (k, v) in extra {
+                entry[k] = v.clone();
             }
-            if let Some(extra) = extra.as_object() {
-                for (k, v) in extra {
-                    entry[k] = v.clone();
-                }
-            }
-            entry
-        })
-        .collect();
-    serde_json::json!({ "providers": providers }).to_string()
+        }
+        providers.insert(id.to_string(), entry);
+    }
+    toml::to_string(&serde_json::json!({ "providers": providers })).unwrap()
 }
 
 /// A versitygw S3 emulator started by `scripts/s3_emulator.sh` for one test,
