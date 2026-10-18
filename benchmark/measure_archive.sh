@@ -13,8 +13,7 @@ SERVER_PID=""
 trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$WORKDIR"' EXIT
 
 ./rust/target/release/ripclone-server \
-  --cas-dir "$WORKDIR/cas" \
-  --repo-root "$WORKDIR/repos" \
+  --data-dir "$WORKDIR" \
   --port "$PORT" \
   > "$WORKDIR/server.log" 2>&1 &
 SERVER_PID=$!
@@ -42,10 +41,10 @@ done
 [ "$state" = "ready" ] || { echo "Files output $state"; cat "$WORKDIR/sync.json"; exit 1; }
 
 echo "==> CAS total"
-du -sh "$WORKDIR/cas"
+du -sh "$WORKDIR/cache"
 
 echo "==> Clonepack artifact sizes"
-python3 - "$WORKDIR/sync.json" "$WORKDIR/cas" <<'PY'
+python3 - "$WORKDIR/sync.json" "$WORKDIR/cache" <<'PY'
 import json, sys, os
 sync = json.load(open(sys.argv[1]))
 cas = sys.argv[2]
@@ -98,4 +97,4 @@ for i, ref_bytes in enumerate(cpm.get(5, [])):
 PY
 
 echo "==> Top 10 largest CAS objects"
-find "$WORKDIR/cas" -type f -exec ls -l {} \; | sort -k5 -n | tail -10
+find "$WORKDIR/cache" -type f -exec ls -l {} \; | sort -k5 -n | tail -10

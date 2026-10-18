@@ -385,43 +385,6 @@ fn write_symlink_entry(target: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Durability barrier for an opt-in (`RIPCLONE_FSYNC`) clone. fsyncs every file
-/// in `files` and every directory in `dirs` so a crash right after the clone
-/// cannot leave a torn tree that `git status` would call clean. The caller is
-/// expected to pass the whole materialized set — every written file (including
-/// the freshly written `.git/index` stat cache), every directory that holds one,
-/// and, before the atomic publish, the staging root — with `dirs` already
-/// deduplicated.
-///
-/// Each file and directory is opened read-only and flushed with `fsync`. Off
-/// by default (see `RIPCLONE_FSYNC` in `docs/CONFIG.md`); enabling it trades
-/// clone latency for durability.
-pub fn fsync_paths_durable(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
-    for path in files {
-        let f = std::fs::File::open(path)
-            .with_context(|| format!("open file for fsync {}", path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync file {}", path.display()))?;
-    }
-    for path in dirs {
-        fsync_one_dir(path)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn fsync_one_dir(path: &Path) -> Result<()> {
-    let dir = std::fs::File::open(path)
-        .with_context(|| format!("open dir for fsync {}", path.display()))?;
-    dir.sync_all()
-        .with_context(|| format!("fsync dir {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn fsync_one_dir(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,19 +67,8 @@ fn documented_verbs(markdown: &str) -> BTreeSet<String> {
         if words.next() != Some("ripclone") {
             continue;
         }
-        // Skip global flags that sit before the subcommand.
-        while let Some(w) = words.peek().copied() {
-            if !w.starts_with('-') {
-                break;
-            }
-            words.next();
-            if matches!(
-                w,
-                "--server" | "--token" | "--provider" | "-s" | "-t" | "-p"
-            ) {
-                words.next();
-            }
-        }
+        // Skip flags before the subcommand, such as `--version`.
+        while words.next_if(|w| w.starts_with('-')).is_some() {}
         if let Some(verb) = words.next()
             && !verb.is_empty()
             && verb.chars().all(|c| c.is_ascii_lowercase() || c == '-')

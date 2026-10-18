@@ -40,7 +40,6 @@ now_ms() {
 SERVER_PORT=$(( 10000 + RANDOM % 50000 ))
 BASE_DIR="$(mktemp -d /tmp/ripclone-matrix-bench.XXXXXX)"
 CAS_DIR="$BASE_DIR/cache"
-REPO_ROOT="$BASE_DIR/repos"
 
 SERVER_PID=""
 PROXY_PID=""
@@ -65,8 +64,7 @@ echo "==> iterations per cell: $ITER"
 echo "==> data dir: $BASE_DIR"
 
 "$SERVER" \
-  --cas-dir "$CAS_DIR" \
-  --repo-root "$REPO_ROOT" \
+  --data-dir "$BASE_DIR" \
   --host 127.0.0.1 \
   --port "$SERVER_PORT" \
   > "$BASE_DIR/server.log" 2>&1 &
@@ -86,9 +84,9 @@ fi
 echo ""
 echo "==> Syncing mirror and building artifacts (one-time, no proxy)..."
 sync_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" add "$REPO"
+RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" add "$REPO"
 # `sync --wait` gives up after about 70 s; run it again while the build runs.
-until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+until out=$(RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" sync "$REPO" --wait 2>&1); do
   case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
 done
 echo "$out"
@@ -126,7 +124,7 @@ fi
 echo ""
 echo "==> Warm-up clone (unmeasured, direct server)..."
 warmup_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$BASE_DIR/warmup" --mode "$MODE" 2>&1 || true
+RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" clone "$REPO" "$BASE_DIR/warmup" --mode "$MODE" 2>&1 || true
 warmup_end=$(now_ms)
 printf "warmup=%d ms\n" $((warmup_end - warmup_start))
 rm -rf "$BASE_DIR/warmup"
@@ -166,7 +164,7 @@ for rtt_ms in $RTTS; do
   for n in $(seq 1 "$ITER"); do
     install_dir="$BASE_DIR/install-${rtt_ms}-${n}"
     install_start=$(now_ms)
-    "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" "$install_dir" --mode "$MODE" 2>&1
+    RIPCLONE_SERVER="$PROXY_URL" "$RIPCLONE" clone "$REPO" "$install_dir" --mode "$MODE" 2>&1
     install_end=$(now_ms)
     elapsed=$((install_end - install_start))
     total_ms=$((total_ms + elapsed))

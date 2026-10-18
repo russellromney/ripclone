@@ -27,10 +27,9 @@
 //! newest commit of the repo with that output ready that is an ancestor of
 //! the commit being built (see [`ancestor_base`]). Without one it builds cold.
 
-use super::api::row_info;
 use super::builder::{
     BuildPhases, SyncPhases, build_files_result, build_full_result, build_head_result,
-    report_sync_bench, report_sync_phases,
+    report_sync_phases,
 };
 use super::{RepoLock, ServerState, duration_ms};
 use crate::cancel::{self, Cancel};
@@ -445,16 +444,6 @@ async fn record_published(
     state
         .metrics
         .record_build_completed(Duration::from_secs(age));
-    if std::env::var_os("RIPCLONE_BENCH").is_some()
-        && let Ok(Some(row)) = state.control.status(repo_id, commit).await
-    {
-        let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-        let (storage, repo_id, commit) = (state.storage.clone(), repo_id.clone(), commit.clone());
-        let _ = tokio::task::spawn_blocking(move || {
-            report_sync_bench(&repo_id, &commit, &storage, &row_info(&row), &mirror_dir);
-        })
-        .await;
-    }
 }
 
 async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {

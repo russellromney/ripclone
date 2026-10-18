@@ -266,9 +266,7 @@ async fn server_error(
 fn error_hint(status: u16, code: Option<&str>, is_cloud: bool) -> &'static str {
     match (status, code, is_cloud) {
         (401, _, true) => "\n  → run `ripclone login`",
-        (401, _, false) => {
-            "\n  → run `ripclone login --server <server>` or set RIPCLONE_SERVER_TOKEN"
-        }
+        (401, _, false) => "\n  → set RIPCLONE_SERVER_TOKEN to the server's token",
         (402, _, _) => "\n  → the server returned 402 (payment required) for this repo",
         (403, Some("no_access"), _) => "\n  → you don't have access to this repo",
         (403, _, _) => "\n  → access denied by the configured server",
@@ -385,8 +383,6 @@ pub struct Client {
     /// The locally configured provider a top-up fetches from. Its URL comes
     /// from the client's own registry, never from the server.
     provider_instance: Option<ProviderInstance>,
-    /// When true, suppress the post-clone metrics report regardless of env.
-    skip_metrics: bool,
     /// What a clone writes to stderr, and the running clone's counts.
     progress: progress::Progress,
 }
@@ -401,14 +397,11 @@ impl Client {
     /// want the hashed ripclone token format should hash it before calling.
     ///
     /// Caching is opt-in. Set `RIPCLONE_CACHE_DIR=/path/to/cache` to enable a
-    /// local artifact cache; otherwise no cache is used. `RIPCLONE_NO_CACHE=1`
-    /// forcibly disables caching even when `RIPCLONE_CACHE_DIR` is set.
+    /// local artifact cache; otherwise no cache is used.
     pub fn new_with_token(server: String, token: Option<String>) -> Self {
-        let cache_dir = if std::env::var_os("RIPCLONE_NO_CACHE").is_some() {
-            None
-        } else {
-            std::env::var_os("RIPCLONE_CACHE_DIR").map(PathBuf::from)
-        };
+        let cache_dir = std::env::var_os("RIPCLONE_CACHE_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
         Self::new_with_token_and_cache(server, token, cache_dir.as_deref())
     }
 
@@ -443,7 +436,6 @@ impl Client {
             cache,
             provider: "github".to_string(),
             provider_instance: None,
-            skip_metrics: false,
             progress: progress::Progress::new(Stderr::default()),
         }
     }
@@ -458,14 +450,6 @@ impl Client {
     pub fn with_provider_instance(mut self, provider: ProviderInstance) -> Self {
         self.provider = provider.id.as_str().to_string();
         self.provider_instance = Some(provider);
-        self
-    }
-
-    /// Suppress the fire-and-forget metrics report for clones made through this
-    /// client. This is the `--no-metrics` path; `RIPCLONE_NO_METRICS` is still
-    /// honored via `clone_metrics::opted_out`.
-    pub fn with_metrics_disabled(mut self) -> Self {
-        self.skip_metrics = true;
         self
     }
 
@@ -486,13 +470,13 @@ impl Client {
     /// Send a request, turning a transport-level failure — server unreachable,
     /// connection refused, DNS failure, timeout — into an actionable message that
     /// names the server. The most common first-run mistake is pointing at a
-    /// server that isn't running (or a wrong `--server` / `RIPCLONE_SERVER`), and
+    /// server that isn't running (or a wrong `RIPCLONE_SERVER`), and
     /// the bare reqwest chain ("connection refused (os error 61)") hides that.
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         req.send().await.map_err(|e| {
             if e.is_connect() || e.is_timeout() {
                 HttpFailure::unreachable(format!(
-                    "could not reach ripclone server at {}: {}\n  → is the server running? check --server / RIPCLONE_SERVER",
+                    "could not reach ripclone server at {}: {}\n  → is the server running? check RIPCLONE_SERVER",
                     self.server,
                     transport_cause(&e),
                 ))
@@ -695,7 +679,7 @@ impl Client {
     /// short timeout so a slow endpoint can't stall the CLI's exit.
     pub async fn report_clone_metrics(&self, outcome: &CloneOutcome, total_ms: u64) {
         use crate::clone_metrics::{ClientInfo, CloneMetric, RepoId, opted_out};
-        if self.skip_metrics || opted_out() {
+        if opted_out() {
             return;
         }
         let Some(clone_id) = outcome.clone_id.clone() else {

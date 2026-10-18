@@ -104,14 +104,6 @@ pub struct S3Storage {
     multipart_upload_slots: tokio::sync::Semaphore,
 }
 
-struct S3Settings {
-    endpoint: String,
-    region: String,
-    bucket: String,
-    prefix: Option<String>,
-    auth: Auth,
-}
-
 impl S3Storage {
     pub fn new(
         endpoint: &str,
@@ -124,16 +116,12 @@ impl S3Storage {
         // (MULTIPART_UPLOAD_PART_BYTES), which takes 8-16 s at the 1-2 MB/s one
         // stream to object storage can drop to. 30 s leaves headroom while
         // still failing fast on a stuck request.
-        //
-        // Override with RIPCLONE_S3_REQUEST_TIMEOUT_SECS (e.g. tighter on
-        // a local S3 emulator in tests). Must stay >0.
-        let request_timeout = env_duration_secs("RIPCLONE_S3_REQUEST_TIMEOUT_SECS", 30)?;
+        let request_timeout = Duration::from_secs(30);
 
         // Retry budget. Transient 5xx / throttling / brief blips still retry;
-        // a dead endpoint must not pin a worker for minutes. Defaults:
-        //   5 attempts, 200ms base, 2s cap  →  worst-case sleep budget ≈ 3.8s
-        // plus per-attempt request_timeout. Override with:
-        //   RIPCLONE_S3_MAX_ATTEMPTS, RIPCLONE_S3_MAX_RETRY_DELAY_MS
+        // a dead endpoint must not pin a worker for minutes: 5 attempts, 200ms
+        // base, 2s cap, so at most about 3.8 s of sleep plus the per-attempt
+        // request timeout.
         //
         // Connect-phase fast-fail: the underlying s3/reqx transport applies a
         // 5s connect timeout by default (reqx::DEFAULT_CONNECT_TIMEOUT). That
@@ -141,8 +129,8 @@ impl S3Storage {
         // handshake fails in ~5s, not after the full request timeout. The s3
         // crate (0.1.36) does not yet expose a connect_timeout builder knob;
         // if that lands upstream we should set it explicitly here.
-        let max_attempts = crate::env::number("RIPCLONE_S3_MAX_ATTEMPTS", 5u32)?.max(1);
-        let max_retry_delay = env_duration_ms("RIPCLONE_S3_MAX_RETRY_DELAY_MS", 2_000)?;
+        let max_attempts = 5;
+        let max_retry_delay = Duration::from_secs(2);
 
         let client = Client::builder(endpoint)
             .context("build S3 client")?
@@ -171,90 +159,24 @@ impl S3Storage {
         })
     }
 
-    /// Construct an S3 client from `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`,
-    /// `RIPCLONE_S3_BUCKET`, and `RIPCLONE_S3_PREFIX`, falling back to the
-    /// `[storage]` section of `config.toml` for those non-secret settings. The
-    /// env vars always win. Credentials
-    /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) are read from the
-    /// environment only — never from config. `backend = "local"` forces local
-    /// storage (returns `None`) even if S3 settings are present.
-    pub fn from_env_or_config(cfg: &crate::config::StorageConfig) -> Result<Option<Self>> {
-        let Some(settings) = Self::settings_from_env_or_config(cfg)? else {
+    /// The S3 storage `RIPCLONE_S3_BUCKET` names, or `None` for local
+    /// storage when it is unset. With a bucket, `RIPCLONE_S3_ENDPOINT` is
+    /// required; `RIPCLONE_S3_REGION` defaults to `us-east-1` and
+    /// `RIPCLONE_S3_PREFIX` to none. Credentials come from
+    /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Building the client
+    /// sends no request but validates every setting, so a bad configuration
+    /// stops the server before it touches any state.
+    pub fn from_env() -> Result<Option<Self>> {
+        let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        let Some(bucket) = var("RIPCLONE_S3_BUCKET") else {
             return Ok(None);
         };
-        Self::new(
-            &settings.endpoint,
-            &settings.region,
-            &settings.bucket,
-            settings.prefix.as_deref(),
-            settings.auth,
-        )
-        .map(Some)
-    }
-
-    pub(crate) fn validate_env_or_config(cfg: &crate::config::StorageConfig) -> Result<()> {
-        // Construct the client as part of preflight. This performs no request,
-        // but it does validate the endpoint and all client-builder settings so
-        // daemons cannot mutate SQLite or local directories before discovering
-        // an invalid S3 configuration.
-        Self::from_env_or_config(cfg).map(|_| ())
-    }
-
-    fn settings_from_env_or_config(
-        cfg: &crate::config::StorageConfig,
-    ) -> Result<Option<S3Settings>> {
-        let pick =
-            |env_key: &str, alt_env: Option<&str>, cfg_val: Option<&str>| -> Option<String> {
-                std::env::var(env_key)
-                    .ok()
-                    .filter(|e| !e.is_empty())
-                    .or_else(|| {
-                        alt_env
-                            .and_then(|k| std::env::var(k).ok())
-                            .filter(|e| !e.is_empty())
-                    })
-                    .or_else(|| cfg_val.map(str::to_string).filter(|e| !e.is_empty()))
-            };
-
-        let backend = cfg.backend.as_deref().map(str::trim);
-        match backend {
-            Some("local") => return Ok(None),
-            Some("s3") | None => {}
-            Some(other) => {
-                anyhow::bail!("unknown storage backend {other:?}; expected \"local\" or \"s3\"")
-            }
-        }
-
-        let endpoint = match pick(
-            "RIPCLONE_S3_ENDPOINT",
-            Some("AWS_ENDPOINT_URL_S3"),
-            cfg.endpoint.as_deref(),
-        ) {
-            Some(e) => e,
-            None if backend == Some("s3") => {
-                anyhow::bail!(
-                    "RIPCLONE_S3_ENDPOINT or AWS_ENDPOINT_URL_S3 (or [storage].endpoint) is required when backend = \"s3\""
-                )
-            }
-            None => return Ok(None),
-        };
-        let region = pick(
-            "RIPCLONE_S3_REGION",
-            Some("AWS_REGION"),
-            cfg.region.as_deref(),
-        )
-        .unwrap_or_else(|| "us-east-1".to_string());
-        let bucket = pick("RIPCLONE_S3_BUCKET", Some("BUCKET_NAME"), cfg.bucket.as_deref())
-            .context("RIPCLONE_S3_BUCKET or BUCKET_NAME (or [storage].bucket) is required when S3 is enabled")?;
-        let prefix = pick("RIPCLONE_S3_PREFIX", None, cfg.prefix.as_deref());
+        let endpoint = var("RIPCLONE_S3_ENDPOINT")
+            .context("RIPCLONE_S3_ENDPOINT is required with RIPCLONE_S3_BUCKET")?;
+        let region = var("RIPCLONE_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
+        let prefix = var("RIPCLONE_S3_PREFIX");
         let auth = Auth::from_env().context("read S3 credentials from environment")?;
-        Ok(Some(S3Settings {
-            endpoint,
-            region,
-            bucket,
-            prefix,
-            auth,
-        }))
+        Self::new(&endpoint, &region, &bucket, prefix.as_deref(), auth).map(Some)
     }
 
     fn key(&self, hash: &str) -> Result<String> {
@@ -656,21 +578,6 @@ impl StorageBackend for S3Storage {
     }
 }
 
-/// Seconds from `key` (default `default_secs`), at least 1: the S3 client
-/// rejects a zero timeout as invalid config.
-fn env_duration_secs(key: &str, default_secs: u64) -> Result<Duration> {
-    Ok(Duration::from_secs(
-        crate::env::number(key, default_secs)?.max(1),
-    ))
-}
-
-/// Milliseconds from `key` (default `default_ms`), at least 1.
-fn env_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
-    Ok(Duration::from_millis(
-        crate::env::number(key, default_ms)?.max(1),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -734,18 +641,14 @@ mod tests {
         assert!(multipart_upload_part_bytes(MULTIPART_UPLOAD_MAX_OBJECT_BYTES + 1).is_err());
     }
 
-    /// Needs an S3 endpoint in `RIPCLONE_S3_*` (see `scripts/s3_emulator.sh`);
+    /// Needs an S3 bucket in `RIPCLONE_S3_*` (see `scripts/s3_emulator.sh`);
     /// the CI `test` job runs it.
     #[tokio::test]
     #[ignore = "needs an S3 endpoint; run by CI with scripts/s3_emulator.sh"]
     async fn multipart_file_upload_roundtrips_exact_bytes() {
-        assert!(
-            std::env::var_os("RIPCLONE_S3_ENDPOINT").is_some(),
-            "RIPCLONE_S3_ENDPOINT is required"
-        );
-        let storage = S3Storage::from_env_or_config(&crate::config::StorageConfig::default())
+        let storage = S3Storage::from_env()
             .expect("construct S3 storage")
-            .expect("RIPCLONE_S3_ENDPOINT must enable S3 storage");
+            .expect("RIPCLONE_S3_BUCKET must enable S3 storage");
         let mut source = tempfile::NamedTempFile::new().expect("create multipart fixture");
         let block: Vec<u8> = (0..1024 * 1024)
             .map(|index| ((index * 31 + index / 251) % 251) as u8)

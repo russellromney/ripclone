@@ -77,7 +77,7 @@ run_current_server() {
 
   RUST_LOG=warn,ripclone::server=info RIPCLONE_CONFIG="$BASE_DIR/missing-config.toml" \
     RIPCLONE_ORIGIN_BASE="file://$ORIGIN_ROOT" \
-    "$SERVER_BIN" --cas-dir "$BASE_DIR/cas" --repo-root "$BASE_DIR/repos" \
+    "$SERVER_BIN" --data-dir "$BASE_DIR" \
     --host 127.0.0.1 --port 0 >"$BASE_DIR/server.log" 2>&1 &
   SERVER_PID=$!
   url="$(server_url "$BASE_DIR/server.log" "$SERVER_PID")" ||

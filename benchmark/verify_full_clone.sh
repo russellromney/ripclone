@@ -12,8 +12,6 @@ RIPCLONE="$ROOT_DIR/rust/target/release/ripclone"
 SERVER="$ROOT_DIR/rust/target/release/ripclone-server"
 
 BASE_DIR="$(mktemp -d /tmp/ripclone-verify.XXXXXX)"
-CAS_DIR="$BASE_DIR/cache"
-REPO_ROOT="$BASE_DIR/repos"
 SERVER_PORT=$(( 10000 + RANDOM % 50000 ))
 SERVER_PID=""
 
@@ -23,7 +21,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$SERVER" --cas-dir "$CAS_DIR" --repo-root "$REPO_ROOT" --host 127.0.0.1 --port "$SERVER_PORT" > "$BASE_DIR/server.log" 2>&1 &
+"$SERVER" --data-dir "$BASE_DIR" --host 127.0.0.1 --port "$SERVER_PORT" > "$BASE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 SERVER_URL="http://127.0.0.1:$SERVER_PORT"
 for i in $(seq 1 30); do
@@ -32,15 +30,15 @@ for i in $(seq 1 30); do
 done
 
 echo "==> syncing $REPO..."
-"$RIPCLONE" --server "$SERVER_URL" add "$REPO" > "$BASE_DIR/sync.log" 2>&1
+RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" add "$REPO" > "$BASE_DIR/sync.log" 2>&1
 # `sync --wait` gives up after about 70 s; run it again while the build runs.
-until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+until out=$(RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" sync "$REPO" --wait 2>&1); do
   case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
 done
 echo "$out" >> "$BASE_DIR/sync.log"
 
 echo "==> cloning $MODE..."
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$BASE_DIR/$MODE" --mode "$MODE" > "$BASE_DIR/clone.log" 2>&1
+RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" clone "$REPO" "$BASE_DIR/$MODE" --mode "$MODE" > "$BASE_DIR/clone.log" 2>&1
 
 cd "$BASE_DIR/$MODE"
 echo "==> git status"

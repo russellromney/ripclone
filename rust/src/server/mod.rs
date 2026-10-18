@@ -48,7 +48,7 @@ use api::{
 };
 use artifacts::get_artifact;
 use auth::{
-    auth_middleware, parse_rate_limit_settings, protocol_guard, rate_limit_middleware,
+    auth_middleware, parse_rate_limit, protocol_guard, rate_limit_middleware,
     read_server_auth_token,
 };
 use poller::spawn_poll_loop;
@@ -73,8 +73,8 @@ pub struct ServerState {
     pub files_wake: Arc<tokio::sync::Notify>,
     /// Wakes a Full slot after a Files build releases its row.
     pub full_wake: Arc<tokio::sync::Notify>,
-    /// Webhook receiver config: per-provider HMAC secret + optional repo
-    /// allowlist. A provider with no configured secret returns 503. Reads
+    /// Webhook receiver config: per-provider HMAC secret. A provider with no
+    /// configured secret returns 503. Reads
     /// `RIPCLONE_WEBHOOK_SECRET_<provider>`.
     pub webhook_config: Arc<WebhookConfig>,
     /// Per-repo mirror locks, so concurrent builds of one repo cannot
@@ -325,18 +325,13 @@ fn use_scratch_dir(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-async fn serve(
-    cas_dir: &std::path::Path,
-    repo_root: &std::path::Path,
-    explicit_control_path: Option<&std::path::Path>,
-    host: &str,
-    port: u16,
-) -> Result<()> {
-    let default_control_path = repo_root.parent().unwrap_or(repo_root).join("control.db");
-    let control_settings = crate::control::ControlSettings::from_sources(
-        explicit_control_path,
-        &default_control_path,
-    )?;
+/// Run the server with its state in `data_dir`: the artifact store (or, with
+/// S3, its local cache) in `cache/`, git mirrors in `repos/`, and the control
+/// database `control.db`.
+pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Result<()> {
+    let cas_dir = &data_dir.join("cache");
+    let repo_root = &data_dir.join("repos");
+    let control_path = data_dir.join("control.db");
 
     let token_hash = read_server_auth_token()?;
     info!("server auth token configured; auth middleware enabled");
@@ -348,10 +343,8 @@ async fn serve(
     );
     let broker = broker_from_env(provider_registry.clone())?;
 
-    let rate_burst_raw = env::var("RIPCLONE_RATE_LIMIT_BURST").ok();
-    let rate_per_sec_raw = env::var("RIPCLONE_RATE_LIMIT_PER_SEC").ok();
     let (rate_burst, rate_per_sec) =
-        parse_rate_limit_settings(rate_burst_raw.as_deref(), rate_per_sec_raw.as_deref())?;
+        parse_rate_limit(env::var("RIPCLONE_RATE_LIMIT_PER_SEC").ok().as_deref())?;
     let rate_limiter = RateLimiter::new(rate_burst, rate_per_sec);
     info!(
         "rate limiter enabled: burst={}, restore={}/s",
@@ -375,7 +368,7 @@ async fn serve(
     let metrics = Metrics::new();
     let control: Arc<dyn ControlStore> = Arc::new(
         crate::control::SqliteControlStore::open(
-            &control_settings.path,
+            &control_path,
             worker_settings.max_attempts,
             Arc::new(crate::control::SystemClock),
         )
@@ -385,7 +378,7 @@ async fn serve(
     // worker holds a lease: every lease is from a previous process.
     let reset = control.reset_leases().await?;
     info!(
-        path = %control_settings.path.display(),
+        path = %control_path.display(),
         reset_leases = reset,
         "server owns control database"
     );
@@ -395,8 +388,8 @@ async fn serve(
     let b = backends::Backends::from_env(cas_dir, &metrics, &retention)?;
     b.cache_retention.clone().spawn(retention.interval);
 
-    // Webhook receiver config: per-provider secret + optional allowlist (built
-    // before the registry is moved into the state). A push to a configured
+    // Webhook receiver config: per-provider secret (built before the registry
+    // is moved into the state). A push to a configured
     // webhook triggers a build before any clone — no per-repo Actions workflow.
     let webhook_config = Arc::new(WebhookConfig::from_env(&provider_registry));
 
@@ -441,25 +434,6 @@ async fn serve(
     )
     .await?;
     Ok(())
-}
-
-pub async fn run_server(
-    cas_dir: &std::path::Path,
-    repo_root: &std::path::Path,
-    host: &str,
-    port: u16,
-) -> Result<()> {
-    serve(cas_dir, repo_root, None, host, port).await
-}
-
-pub async fn run_server_with_control(
-    cas_dir: &std::path::Path,
-    repo_root: &std::path::Path,
-    control_path: &std::path::Path,
-    host: &str,
-    port: u16,
-) -> Result<()> {
-    serve(cas_dir, repo_root, Some(control_path), host, port).await
 }
 
 #[cfg(test)]

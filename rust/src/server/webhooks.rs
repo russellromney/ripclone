@@ -126,19 +126,8 @@ async fn handle_webhook(
     }
 }
 
-/// Whether the webhook allowlist admits this repo. Matches the operator-facing
-/// natural key (`owner/repo` for github, `provider/path` otherwise); for the
-/// github default it ALSO accepts the explicit `github/owner/repo` form, so an
-/// operator generalizing from the `gitlab/...` examples isn't silently bitten by
-/// github's bare-key asymmetry.
-fn webhook_repo_allowed(state: &ServerState, repo_id: &RepoId) -> bool {
-    let cfg = &state.webhook_config;
-    cfg.allows(&repo_id.natural_key())
-        || (repo_id.is_github_default() && cfg.allows(&format!("github/{}", repo_id.path)))
-}
-
-/// Default-branch push → exact admission. Applies the allowlist and added-repo
-/// gates, then triggers the shared fire-and-forget path and returns immediately.
+/// Default-branch push → exact admission. Applies the added-repo gate, then
+/// triggers the shared fire-and-forget path and returns immediately.
 async fn webhook_dispatch_push(
     state: &ServerState,
     provider: &ProviderInstance,
@@ -152,10 +141,6 @@ async fn webhook_dispatch_push(
     // keys. We trust the payload only for routing.
     if validation::validate_repo_path(provider, &repo_id).is_err() {
         return webhook_ignored("invalid repo path");
-    }
-    // Allowlist gate (allow-all when unconfigured).
-    if !webhook_repo_allowed(state, &repo_id) {
-        return webhook_ignored("repo not in webhook allowlist");
     }
     match repo_is_added(state, &repo_id).await {
         Ok(true) => {}
@@ -373,70 +358,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_allowlist_blocks_unlisted_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp).await;
-        state.webhook_config = Arc::new(
-            WebhookConfig::with_secret("github", WEBHOOK_SECRET)
-                .with_allowlist(["acme/allowed".to_string()]),
-        );
-        let app = build_app(state.clone());
-        let body = gh_push_body(
-            "acme",
-            "widget",
-            "refs/heads/main",
-            &"1".repeat(40),
-            "main",
-            false,
-        );
-        let sig = gh_sign(WEBHOOK_SECRET, &body);
-        let resp = app
-            .oneshot(webhook_request("github", "push", Some(&sig), body))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            claim_admitted_job(&state).await.is_none(),
-            "unlisted repo must not admit a build"
-        );
-    }
-
-    #[tokio::test]
-    async fn webhook_github_allowlist_accepts_bare_and_prefixed() {
-        // Both the canonical `owner/repo` and the forgiving `github/owner/repo`
-        // forms admit a github repo, so github's bare-key asymmetry vs the
-        // `gitlab/...` form isn't a silent footgun.
-        for entry in ["acme/widget", "github/acme/widget"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let mut state = test_state(&tmp).await;
-            state.webhook_config = Arc::new(
-                WebhookConfig::with_secret("github", WEBHOOK_SECRET)
-                    .with_allowlist([entry.to_string()]),
-            );
-            mark_added(&state, RepoId::github("acme/widget")).await;
-            let app = build_app(state.clone());
-            let body = gh_push_body(
-                "acme",
-                "widget",
-                "refs/heads/main",
-                &"1".repeat(40),
-                "main",
-                false,
-            );
-            let sig = gh_sign(WEBHOOK_SECRET, &body);
-            let resp = app
-                .oneshot(webhook_request("github", "push", Some(&sig), body))
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "allowlist entry {entry}");
-            assert!(
-                claim_admitted_job(&state).await.is_some(),
-                "entry {entry} must admit the repo"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn webhook_tag_push_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let state = webhook_state(&tmp).await;
@@ -576,15 +497,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_gitlab_allowlist_matches_natural_key() {
+    async fn webhook_gitlab_push_admits_a_nested_project() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com").await;
-        // The allowlist is written in the operator-facing natural form
-        // (provider-prefixed, unescaped) — not the escaped storage key.
-        state.webhook_config = Arc::new(
-            WebhookConfig::with_secret("gitlab", WEBHOOK_SECRET)
-                .with_allowlist(["gitlab/group/sub/proj".to_string()]),
-        );
+        state.webhook_config = Arc::new(WebhookConfig::with_secret("gitlab", WEBHOOK_SECRET));
         mark_added(
             &state,
             RepoId {
@@ -608,7 +524,7 @@ mod tests {
         assert_eq!(
             claim_admitted_job(&state)
                 .await
-                .expect("allowlisted gitlab repo admits a build")
+                .expect("an added gitlab repo admits a build")
                 .repo
                 .path,
             "group/sub/proj"

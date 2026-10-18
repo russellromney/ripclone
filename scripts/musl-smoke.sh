@@ -108,9 +108,7 @@ docker run --rm --platform "$PLATFORM" \
       /b/ripclone-server \
         --host 127.0.0.1 \
         --port 0 \
-        --cas-dir "/tmp/cas-$attempt" \
-        --repo-root "/tmp/repos-$attempt" \
-        --control-db "/tmp/control-$attempt.db" >"$log" 2>&1 &
+        --data-dir "/tmp/data-$attempt" >"$log" 2>&1 &
       srv=$!
       # Port 0: the server logs the address it bound.
       url=""

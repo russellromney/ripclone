@@ -1,33 +1,15 @@
 #!/usr/bin/env bash
-# Fail when removed control/queue/dispatcher support escapes its explicit
-# rejection tests and compatibility documentation.
+# Fail when removed control/queue/dispatcher support comes back. Only
+# internal docs may name it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATTERN='RIPCLONE_(METADATA($|[^A-Z_])|METADATA_DB_|QUEUE($|[^A-Z_])|QUEUE_DB_|DISPATCH($|[^A-Z_])|DISPATCH_|HEARTBEAT_URL|RECHECK_MAX|REF_CACHE_TTL_SECS)|postgres://|mysql://|tokio-postgres|mysql_async|sqlx.*/(postgres|mysql)|branch-level repository configuration|repo-config/.*/branches'
 
-matches="$(cd "$ROOT" && git grep -nE "$PATTERN" -- . ':!scripts/audit_control_support.sh' || true)"
-allowed=0
-unexpected=0
-while IFS= read -r line; do
-  [ -n "$line" ] || continue
-  path="${line%%:*}"
-  case "$path" in
-    rust/src/control/mod.rs|docs/internal/*)
-      allowed=$((allowed + 1))
-      ;;
-    *)
-      echo "unsupported control support outside allowlist: $line" >&2
-      unexpected=$((unexpected + 1))
-      ;;
-  esac
-done <<<"$matches"
-
-if [ "$allowed" -eq 0 ]; then
-  echo "unsupported-control audit matched zero rejection/compatibility rows" >&2
-  exit 1
-fi
-if [ "$unexpected" -ne 0 ]; then
+matches="$(cd "$ROOT" && git grep -nE "$PATTERN" -- . ':!scripts/audit_control_support.sh' ':!docs/internal' || true)"
+if [ -n "$matches" ]; then
+  echo "removed control support is present:" >&2
+  echo "$matches" >&2
   exit 1
 fi
 
@@ -84,4 +66,4 @@ if [ -n "$artifact_config_keys" ]; then
   exit 1
 fi
 
-echo "unsupported-control audit: $allowed allowlisted rejection/compatibility rows; no implementation or dependency escape"
+echo "unsupported-control audit: no removed control support"

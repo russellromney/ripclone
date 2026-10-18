@@ -5,19 +5,13 @@
 //! control state.
 
 use crate::cas::Cas;
-use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::retention::{LocalCacheRetention, RetentionSettings};
 use crate::storage::{S3Storage, StorageRef, local};
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tracing::info;
-
-fn config() -> &'static Config {
-    static CONFIG: OnceLock<Config> = OnceLock::new();
-    CONFIG.get_or_init(crate::config::load_global)
-}
 
 pub struct Backends {
     pub cas: Cas,
@@ -27,7 +21,8 @@ pub struct Backends {
 
 impl Backends {
     pub fn validate_environment() -> Result<()> {
-        S3Storage::validate_env_or_config(&config().storage)
+        S3Storage::from_env()
+            .map(|_| ())
             .context("validate S3 storage configuration")
     }
 
@@ -36,8 +31,7 @@ impl Backends {
         metrics: &Arc<Metrics>,
         retention: &RetentionSettings,
     ) -> Result<Self> {
-        let s3_storage =
-            S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
+        let s3_storage = S3Storage::from_env().context("initialize S3 storage")?;
         // With remote storage the build CAS is a cache of what was uploaded,
         // so it skips directory syncs. Local storage is the CAS directory
         // itself, so every object it reports stored must survive a crash.

@@ -43,7 +43,6 @@ PORT=$(( 10000 + RANDOM % 50000 ))
 SERVER_URL="http://127.0.0.1:$PORT"
 BASE_DIR="$(mktemp -d /tmp/ripclone-install-bench.XXXXXX)"
 CAS_DIR="$BASE_DIR/cache"
-REPO_ROOT="$BASE_DIR/repos"
 
 cleanup() {
   if [ -n "${SERVER_PID:-}" ]; then
@@ -57,8 +56,7 @@ trap cleanup EXIT
 echo "==> data dir: $BASE_DIR"
 
 "$SERVER" \
-  --cas-dir "$CAS_DIR" \
-  --repo-root "$REPO_ROOT" \
+  --data-dir "$BASE_DIR" \
   --host 127.0.0.1 \
   --port "$PORT" \
   > "$BASE_DIR/server.log" 2>&1 &
@@ -77,9 +75,9 @@ fi
 echo ""
 echo "==> Syncing mirror and building artifacts (one-time)..."
 sync_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" add "$REPO"
+RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" add "$REPO"
 # `sync --wait` gives up after about 70 s; run it again while the build runs.
-until out=$("$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --wait 2>&1); do
+until out=$(RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" sync "$REPO" --wait 2>&1); do
   case "$out" in *"still building"*) ;; *) echo "$out" >&2; exit 1 ;; esac
 done
 echo "$out"
@@ -112,7 +110,7 @@ echo ""
 echo "==> Direct-install clone..."
 install_dir="$BASE_DIR/bun-install"
 install_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" "$install_dir"
+RIPCLONE_SERVER="$SERVER_URL" "$RIPCLONE" clone "$REPO" "$install_dir"
 install_end=$(now_ms)
 printf "install=%d ms\n" $((install_end - install_start))
 

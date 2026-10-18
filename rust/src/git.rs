@@ -944,18 +944,16 @@ pub fn origin_base() -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
-/// `RIPCLONE_LS_REMOTE_TIMEOUT_SECS`, default 30 s; zero means the default.
+/// `RIPCLONE_LS_REMOTE_TIMEOUT_SECS`, default 30 s.
 pub fn ls_remote_timeout() -> Result<Duration> {
-    let secs = crate::env::number("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", 30)?;
-    Ok(Duration::from_secs(if secs == 0 { 30 } else { secs }))
+    crate::env::number("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", 30).map(Duration::from_secs)
 }
 
-/// `RIPCLONE_FETCH_TIMEOUT_SECS`, default 3600 s; zero means the default.
-/// The wall-clock cap on one mirror fetch. A stalled transfer fails sooner,
-/// through git's low-speed limit.
+/// `RIPCLONE_FETCH_TIMEOUT_SECS`, default 3600 s. The wall-clock cap on one
+/// mirror fetch. A stalled transfer fails sooner, through git's low-speed
+/// limit.
 pub fn fetch_timeout() -> Result<Duration> {
-    let secs = crate::env::number("RIPCLONE_FETCH_TIMEOUT_SECS", 3600)?;
-    Ok(Duration::from_secs(if secs == 0 { 3600 } else { secs }))
+    crate::env::number("RIPCLONE_FETCH_TIMEOUT_SECS", 3600).map(Duration::from_secs)
 }
 
 fn upstream_auth_header(

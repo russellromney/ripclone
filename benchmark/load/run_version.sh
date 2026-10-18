@@ -9,11 +9,10 @@ cd $R
 nohup env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=$R/home \
   RIPCLONE_SERVER_TOKEN="$(cat /root/bench_token)" RUST_LOG=info \
   RIPCLONE_ORIGIN_BASE=file:///opt/rc/origin RIPCLONE_POLL_INTERVAL_SECS=0 \
-  RIPCLONE_RATE_LIMIT_BURST=1000000 RIPCLONE_RATE_LIMIT_PER_SEC=1000000 \
+  RIPCLONE_RATE_LIMIT_PER_SEC=1000000 \
   RIPCLONE_S3_PREFIX="$prefix" ${EXTRA_ENV:-} ENVFILE=/root/s3.env \
   bash -c 'set -a; . "$ENVFILE"; set +a; unset ENVFILE; exec "$@"' _ \
-  $bindir/ripclone-server --cas-dir $R/cache --repo-root $R/repos \
-    --control-db $R/control.db --host 0.0.0.0 --port $port >> $R/server.log 2>&1 &
+  $bindir/ripclone-server --data-dir $R --host 0.0.0.0 --port $port >> $R/server.log 2>&1 &
 sleep 3; curl -fsS http://127.0.0.1:$port/healthz || { echo SERVER_DOWN; exit 1; }
 python3 /root/sampler.py $R/out/sampler.csv & sp=$!
 python3 /root/driver.py $label $port /root/commits.json $R/out ${STEADY_N:-12} ${GAP_S:-6} ${STORM_N:-4} 2>&1 | tee $R/out/driver.log
