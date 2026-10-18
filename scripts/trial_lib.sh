@@ -49,13 +49,18 @@ trial_cleanup() {
 }
 
 # start_server <name> [env assignments...]: start a ripclone server with its
-# own data, home and empty git config, on a port the OS picks. Sets
-# SERVER_URL.
+# own data, home, empty git config and local storage, on a port the OS
+# picks. Sets SERVER_URL.
 start_server() {
   local name="$1" log="$WORK/$1.log" dir="$WORK/$1"
   shift
   mkdir -p "$dir/home"
-  env HOME="$dir/home" GIT_CONFIG_GLOBAL=/dev/null RIPCLONE_POLL_INTERVAL_SECS=0 RUST_LOG=info "$@" \
+  # Local storage only. S3 settings in the environment (soup sets them) would
+  # upload the trial's private repo content to a real bucket; the config's
+  # backend = "local" wins over them.
+  printf '[storage]\nbackend = "local"\n' >"$dir/config.toml"
+  env HOME="$dir/home" RIPCLONE_CONFIG="$dir/config.toml" GIT_CONFIG_GLOBAL=/dev/null \
+    RIPCLONE_POLL_INTERVAL_SECS=0 RUST_LOG=info "$@" \
     "$BIN/ripclone-server" --host 127.0.0.1 --port 0 --cas-dir "$dir/cas" \
     --repo-root "$dir/repos" --control-db "$dir/control.db" >"$log" 2>&1 &
   PIDS+=($!)
@@ -67,6 +72,7 @@ start_server() {
     sleep 0.1
   done
   [ -n "$SERVER_URL" ] || { bad "server $name did not start"; scrub <"$log" | tail -5; exit 1; }
+  grep -q "using local storage" "$log" || { bad "server $name is not on local storage"; exit 1; }
 }
 
 # The user's shell: their own HOME and global git config.
