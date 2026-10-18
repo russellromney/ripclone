@@ -978,9 +978,7 @@ fn ref_response(
             .map(|branches| crate::branches::BranchesRef {
                 artifact: branches.artifact.clone(),
                 artifact_url: signed(&branches.artifact),
-                side_pack: branches
-                    .side_pack
-                    .as_ref()
+                side_packs: (branches.side_packs.iter())
                     .map(|side| crate::branches::SidePackRef {
                         pack: side.pack.clone(),
                         pack_len: side.pack_len,
@@ -988,7 +986,8 @@ fn ref_response(
                         idx: side.idx.clone(),
                         idx_len: side.idx_len,
                         idx_url: signed(&side.idx),
-                    }),
+                    })
+                    .collect(),
             }),
         refs_base: None,
         kind,

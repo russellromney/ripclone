@@ -1602,12 +1602,12 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
             base: Some("1".repeat(40)),
             side_base: Some("2".repeat(40)),
             side_tips: crate::cas::hash(b"tips 1"),
-            side_pack: Some(SidePack {
+            side_packs: vec![SidePack {
                 pack: crate::cas::hash(b"pack"),
                 pack_len: 1 << 40,
                 idx: crate::cas::hash(b"idx"),
                 idx_len: 1100,
-            }),
+            }],
             tags: PublishedTags {
                 artifact: crate::cas::hash(b"first"),
                 len: 120,
@@ -1635,7 +1635,7 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
             base: None,
             side_base: None,
             side_tips: crate::cas::hash(b"tips 2"),
-            side_pack: None,
+            side_packs: Vec::new(),
             tags: PublishedTags::default(),
         }),
         ready: with_side.branches.clone(),
@@ -1664,12 +1664,12 @@ async fn refs_name_their_artifacts_until_purged(backend: &dyn Backend) {
             base: Some("1".repeat(40)),
             side_base: Some("1".repeat(40)),
             side_tips: crate::cas::hash(b"tips"),
-            side_pack: Some(SidePack {
+            side_packs: vec![SidePack {
                 pack: crate::cas::hash(b"my pack"),
                 pack_len: 100,
                 idx: crate::cas::hash(b"my idx"),
                 idx_len: 10,
-            }),
+            }],
             tags: PublishedTags {
                 artifact: crate::cas::hash(b"shared tags"),
                 len: 10,
@@ -1686,7 +1686,7 @@ async fn refs_name_their_artifacts_until_purged(backend: &dyn Backend) {
             base: Some("2".repeat(40)),
             side_base: Some("2".repeat(40)),
             side_tips: crate::cas::hash(b"older tips"),
-            side_pack: None,
+            side_packs: Vec::new(),
             tags: PublishedTags {
                 artifact: crate::cas::hash(b"my older tags"),
                 len: 5,

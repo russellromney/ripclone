@@ -295,10 +295,24 @@ async fn read_refs(mirror_dir: &Path) -> Result<MirrorRefs> {
         .context("refs listing task")?
 }
 
-/// Build and store the branches artifact and side pack of `refs`. The
-/// previous refresh's side pack is kept when the refs it completes are the
-/// same and the default branch only moved forward: what it leaves out is
-/// still in the default branch's history.
+/// Side pack layers at most: a refresh that would add one more builds the
+/// whole side pack again as one.
+const SIDE_LAYERS: usize = 8;
+
+/// The file in the mirror listing the side tips the published layers
+/// complete, so the next refresh's layer can leave out what they hold.
+const SIDE_TIPS_FILE: &str = "ripclone-side-tips";
+
+/// Build and store the branches artifact and side pack of `refs`.
+///
+/// While the default branch only moves forward, what the previous
+/// refresh's side pack leaves out is still in its history, so the side
+/// pack is kept: as it is when the refs it completes are the same, and with
+/// one more layer when they changed. The layer holds what the new refs
+/// reach that the old refs and the default branch do not, so a push to a
+/// side branch or a new tag stores about what it added. After a force-push
+/// of the default branch, at [`SIDE_LAYERS`], or when the old refs are not
+/// known, the side pack is built whole as one layer.
 async fn publish_branches(
     state: &ServerState,
     cas: &Cas,
@@ -314,25 +328,52 @@ async fn publish_branches(
     let refs_hash = refs.hash();
     let base = refs.base().map(str::to_string);
     let side_tips = refs.side_tips_hash();
+    let tip_ids: Vec<String> = refs.side_tips().into_iter().map(str::to_string).collect();
     let default_branch = refs.default_branch.clone();
-    let kept = match (previous, &base) {
-        (Some(previous), Some(base)) if previous.side_tips == side_tips => {
-            match previous.side_base.clone() {
-                Some(side_base) if moved_forward(mirror_dir, &side_base, base).await? => {
-                    Some((Some(side_base), previous.side_pack))
+    let forward = match (&previous, &base) {
+        (Some(previous), Some(base)) => match &previous.side_base {
+            Some(side_base) => moved_forward(mirror_dir, side_base, base).await?,
+            None => false,
+        },
+        _ => false,
+    };
+    let previous = previous.filter(|_| forward);
+    let (side_base, side_packs) = match previous {
+        Some(previous) if previous.side_tips == side_tips => {
+            (previous.side_base, previous.side_packs)
+        }
+        Some(previous) if previous.side_packs.len() < SIDE_LAYERS => {
+            match read_side_tips(mirror_dir, &previous.side_tips).await {
+                Some(older) => {
+                    let layer = build_side_pack(state, cas, mirror_dir, refs.clone(), older).await;
+                    match layer {
+                        Ok(layer) => {
+                            let mut layers = previous.side_packs;
+                            layers.extend(layer);
+                            (base.clone(), layers)
+                        }
+                        // Such as an old tip a repack dropped.
+                        Err(error) => {
+                            warn!("side pack layer failed, building it whole: {error:#}");
+                            (
+                                base.clone(),
+                                whole_side_pack(state, cas, mirror_dir, refs).await?,
+                            )
+                        }
+                    }
                 }
-                _ => None,
+                None => (
+                    base.clone(),
+                    whole_side_pack(state, cas, mirror_dir, refs).await?,
+                ),
             }
         }
-        _ => None,
-    };
-    let (side_base, side_pack) = match kept {
-        Some(kept) => kept,
-        None => (
+        _ => (
             base.clone(),
-            build_side_pack(state, cas, mirror_dir, refs).await?,
+            whole_side_pack(state, cas, mirror_dir, refs).await?,
         ),
     };
+    write_side_tips(mirror_dir, &tip_ids).await;
     Ok(RepoBranches {
         artifact,
         len,
@@ -341,7 +382,7 @@ async fn publish_branches(
         base,
         side_base,
         side_tips,
-        side_pack,
+        side_packs,
         tags,
     })
 }
@@ -354,16 +395,53 @@ async fn moved_forward(mirror_dir: &Path, old: &str, new: &str) -> Result<bool> 
         .context("ancestry task")?
 }
 
-/// Build and store the side pack of `refs`.
+/// The side tips the mirror's file lists, when they are the ones `hash`
+/// names: the published layers' tips.
+async fn read_side_tips(mirror_dir: &Path, hash: &str) -> Option<Vec<String>> {
+    let listed = tokio::fs::read_to_string(mirror_dir.join(SIDE_TIPS_FILE))
+        .await
+        .ok()?;
+    (crate::cas::hash(listed.as_bytes()) == hash)
+        .then(|| listed.lines().map(str::to_string).collect())
+}
+
+/// List `tips` in the mirror's file. A failed write only costs the next
+/// refresh that adds a layer a whole side pack.
+async fn write_side_tips(mirror_dir: &Path, tips: &[String]) {
+    let (path, listed) = (mirror_dir.join(SIDE_TIPS_FILE), tips.join("\n"));
+    let tmp = path.with_extension("tmp");
+    let written = async {
+        tokio::fs::write(&tmp, listed).await?;
+        tokio::fs::rename(&tmp, &path).await
+    };
+    if let Err(error) = written.await {
+        warn!("write {}: {error}", path.display());
+    }
+}
+
+/// Build and store the side pack of `refs` whole, as one layer.
+async fn whole_side_pack(
+    state: &ServerState,
+    cas: &Cas,
+    mirror_dir: &Path,
+    refs: MirrorRefs,
+) -> Result<Vec<SidePack>> {
+    let layer = build_side_pack(state, cas, mirror_dir, refs, Vec::new()).await?;
+    Ok(layer.into_iter().collect())
+}
+
+/// Build and store the side pack layer of `refs` above layers completing
+/// `older`.
 async fn build_side_pack(
     state: &ServerState,
     cas: &Cas,
     mirror_dir: &Path,
     refs: MirrorRefs,
+    older: Vec<String>,
 ) -> Result<Option<SidePack>> {
     let scratch = tempfile::tempdir_in(&state.repo_root).context("create side pack dir")?;
     let (dir, out) = (mirror_dir.to_path_buf(), scratch.path().to_path_buf());
-    let files = cancel::spawn_blocking(move || refs.side_pack(&dir, &out))
+    let files = cancel::spawn_blocking(move || refs.side_pack(&dir, &out, &older))
         .await
         .context("side pack task")??;
     let Some((pack, idx)) = files else {

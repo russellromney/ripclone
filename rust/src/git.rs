@@ -776,23 +776,22 @@ pub fn pack_objects_range_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     )
 }
 
-/// Pack every object reachable from `tips` but not from `base` into
-/// `<prefix>-<checksum>.pack` and its `.idx`. `tips` are object ids, so tag
-/// objects come along.
+/// Pack every object reachable from `tips` but not from any of `excluded`
+/// into `<prefix>-<checksum>.pack` and its `.idx`. Both are object ids, so
+/// tag objects come along.
 pub fn pack_objects_excluding<P: AsRef<Path>, Q: AsRef<Path>>(
     repo: P,
     tips: &[&str],
-    base: &str,
+    excluded: &[&str],
     prefix: Q,
 ) -> Result<()> {
-    crate::validation::validate_object_id(base)?;
-    for tip in tips {
-        crate::validation::validate_object_id(tip)?;
+    for id in tips.iter().chain(excluded) {
+        crate::validation::validate_object_id(id)?;
     }
     if let Some(parent) = prefix.as_ref().parent() {
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
-    let exclude = format!("^{base}");
+    let excluded: Vec<String> = excluded.iter().map(|id| format!("^{id}")).collect();
     let mut command = command();
     command
         .args(NO_FSYNC)
@@ -803,7 +802,9 @@ pub fn pack_objects_excluding<P: AsRef<Path>, Q: AsRef<Path>>(
     command.arg(prefix.as_ref());
     run_pack_objects(
         command,
-        tips.iter().copied().chain([exclude.as_str()]),
+        tips.iter()
+            .copied()
+            .chain(excluded.iter().map(String::as_str)),
         "pack-objects (side)",
     )
 }

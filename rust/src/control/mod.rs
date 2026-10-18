@@ -201,7 +201,7 @@ impl RepoRefs {
         for branches in self.branches.iter().chain(&self.ready) {
             hashes.insert(&branches.artifact);
             hashes.insert(&branches.tags.artifact);
-            if let Some(side) = &branches.side_pack {
+            for side in &branches.side_packs {
                 hashes.insert(&side.pack);
                 hashes.insert(&side.idx);
             }
@@ -224,15 +224,18 @@ pub struct RepoBranches {
     pub default_branch: Option<String>,
     /// The default branch's commit.
     pub base: Option<String>,
-    /// The commit the side pack leaves out the history of: `base`, or an
-    /// older default branch commit in its history when the side pack was
-    /// kept from an earlier refresh.
+    /// The commit the newest side pack layer leaves out the history of:
+    /// `base`, or an older default branch commit in its history when the
+    /// layers were kept from an earlier refresh. Every older layer leaves
+    /// out the history of a commit in this one's.
     pub side_base: Option<String>,
     /// `branches::MirrorRefs::side_tips_hash` of the refs the side pack
-    /// was built from.
+    /// layers complete.
     pub side_tips: String,
-    /// `None` when every ref is in the default branch's history.
-    pub side_pack: Option<SidePack>,
+    /// The side pack, as layers, oldest first: each holds what the refs of
+    /// its refresh reach that the older layers and its base do not. Empty
+    /// when every ref is in the default branch's history.
+    pub side_packs: Vec<SidePack>,
     /// The tags artifact built from the same listing, so these branches
     /// can be served with the tags of their time once newer ones replace
     /// them.
@@ -249,7 +252,7 @@ pub struct PublishedTags {
     pub hash: String,
 }
 
-/// The CAS ids and lengths of a side pack and its idx.
+/// The CAS ids and lengths of a side pack layer and its idx.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SidePack {
     pub pack: String,

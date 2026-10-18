@@ -450,35 +450,45 @@ impl Client {
             )
         });
         let side_download = branches
-            .and_then(|branches| branches.side_pack)
-            .map(|side| {
-                self.progress.add_total(side.pack_len + side.idx_len);
+            .map(|branches| branches.side_packs)
+            .filter(|layers| !layers.is_empty())
+            .map(|layers| {
+                let total = layers.iter().map(|side| side.pack_len + side.idx_len).sum();
+                self.progress.add_total(total);
                 let (client, urls, dir) = (self.clone(), urls.clone(), root.clone());
                 AbortOnDrop::new(
                     tokio::spawn(async move {
-                        let pack = Artifact {
-                            hash: side.pack.clone(),
-                            len: Some(side.pack_len),
-                            slot: UrlSlot::SidePack,
-                        };
-                        let idx = Artifact {
-                            hash: side.idx.clone(),
-                            len: Some(side.idx_len),
-                            slot: UrlSlot::SideIdx,
-                        };
-                        // Into the staging directory, so it moves into the
-                        // pack directory with a rename.
-                        let (pack, idx) = tokio::join!(
-                            client.download(&urls, &pack, Sink::TempFile(&dir)),
-                            client.download_bytes(&urls, &idx)
-                        );
-                        let Downloaded::TempFile(pack, _) = pack.context("fetch side pack")? else {
-                            unreachable!("temp file sink");
-                        };
-                        anyhow::Ok(PackFiles {
-                            pack,
-                            idx: idx.context("fetch side pack idx")?,
-                        })
+                        let downloads = layers.into_iter().enumerate().map(|(i, side)| {
+                            let (client, urls, dir) = (&client, &urls, &dir);
+                            async move {
+                                let pack = Artifact {
+                                    hash: side.pack.clone(),
+                                    len: Some(side.pack_len),
+                                    slot: UrlSlot::SidePack(i),
+                                };
+                                let idx = Artifact {
+                                    hash: side.idx.clone(),
+                                    len: Some(side.idx_len),
+                                    slot: UrlSlot::SideIdx(i),
+                                };
+                                // Into the staging directory, so it moves into
+                                // the pack directory with a rename.
+                                let (pack, idx) = tokio::join!(
+                                    client.download(urls, &pack, Sink::TempFile(dir)),
+                                    client.download_bytes(urls, &idx)
+                                );
+                                let Downloaded::TempFile(pack, _) =
+                                    pack.with_context(|| format!("fetch side pack {i}"))?
+                                else {
+                                    unreachable!("temp file sink");
+                                };
+                                anyhow::Ok(PackFiles {
+                                    pack,
+                                    idx: idx.with_context(|| format!("fetch side pack idx {i}"))?,
+                                })
+                            }
+                        });
+                        futures::future::try_join_all(downloads).await
                     }),
                     cleanup.clone(),
                 )
@@ -503,17 +513,15 @@ impl Client {
                 )?;
                 let side = match side_download.take() {
                     Some(download) => {
-                        Some(download.join().await.context("side pack download task")??)
+                        download.join().await.context("side pack download task")??
                     }
-                    None => None,
+                    None => Vec::new(),
                 };
                 let commit = pin.commit.clone();
                 let git_dir = root.join(".git");
                 let held = tokio::task::spawn_blocking(move || {
                     install_packs(&git_dir, packs, "history pack")?;
-                    if let Some(side) = side {
-                        install_pack(&git_dir, side, "side pack")?;
-                    }
+                    install_packs(&git_dir, side, "side pack")?;
                     anyhow::Ok(crate::tags::Present::scan(&git_dir)?.contains_hex(&commit))
                 })
                 .await
@@ -562,8 +570,8 @@ impl Client {
                 None => None,
             };
             let side = match side_download {
-                Some(download) => Some(download.join().await.context("side pack download task")??),
-                None => None,
+                Some(download) => download.join().await.context("side pack download task")??,
+                None => Vec::new(),
             };
             let refs = FullRefs {
                 tags: tags.unwrap_or_default(),
@@ -1339,9 +1347,7 @@ impl Client {
                 branches,
                 side,
             } = refs;
-            if let Some(side) = side {
-                install_pack(&dir, side, "side pack")?;
-            }
+            install_packs(&dir, side, "side pack")?;
             let present = crate::tags::Present::scan(&dir)?;
             // The clone's objects are whole histories, so holding a commit
             // is holding its history; the side pack has the rest of each
@@ -1753,7 +1759,8 @@ struct PackFiles {
 struct FullRefs {
     tags: crate::tags::Kept,
     branches: Option<crate::branches::Branches>,
-    side: Option<PackFiles>,
+    /// The side pack's layers.
+    side: Vec<PackFiles>,
 }
 
 /// Move a downloaded pack into the clone's pack directory with its idx, named

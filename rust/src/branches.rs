@@ -17,12 +17,13 @@ pub struct BranchesRef {
     pub artifact: String,
     #[serde(default)]
     pub artifact_url: Option<String>,
-    /// Absent when every branch and tag is in the default branch's history.
+    /// The side pack's layers, oldest first. Empty when every branch and
+    /// tag is in the default branch's history.
     #[serde(default)]
-    pub side_pack: Option<SidePackRef>,
+    pub side_packs: Vec<SidePackRef>,
 }
 
-/// The side pack and its idx, with signed URLs when the backend signs.
+/// A side pack layer and its idx, with signed URLs when the backend signs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidePackRef {
     pub pack: String,
@@ -118,7 +119,7 @@ impl MirrorRefs {
 
     /// The ids the side pack completes: every branch's but the default
     /// branch's, and every tag's, sorted and deduplicated.
-    fn side_tips(&self) -> Vec<&str> {
+    pub fn side_tips(&self) -> Vec<&str> {
         let default = self.default_branch.as_deref();
         let mut tips: Vec<&str> = (self.branches.iter())
             .filter(|(name, _)| Some(name.as_str()) != default)
@@ -154,19 +155,29 @@ impl MirrorRefs {
     }
 
     /// Write into `dir` the pack of every object reachable from a branch
-    /// or tag but not from the default branch, and its idx. `None` when
-    /// there is no default branch or nothing to pack.
-    pub fn side_pack(&self, repo: &Path, dir: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+    /// or tag but not from the default branch or any of `older`, and its
+    /// idx. `older` are the side tips the layers below this one complete,
+    /// empty for a whole side pack. `None` when there is no default branch
+    /// or nothing to pack.
+    pub fn side_pack(
+        &self,
+        repo: &Path,
+        dir: &Path,
+        older: &[String],
+    ) -> Result<Option<(PathBuf, PathBuf)>> {
         let Some(base) = self.base() else {
             return Ok(None);
         };
         let tips: Vec<&str> = (self.side_tips().into_iter())
-            .filter(|id| *id != base)
+            .filter(|id| *id != base && !older.iter().any(|old| old == id))
             .collect();
         if tips.is_empty() {
             return Ok(None);
         }
-        crate::git::pack_objects_excluding(repo, &tips, base, dir.join("side"))?;
+        let excluded: Vec<&str> = (std::iter::once(base))
+            .chain(older.iter().map(String::as_str))
+            .collect();
+        crate::git::pack_objects_excluding(repo, &tips, &excluded, dir.join("side"))?;
         let mut pack = None;
         let mut idx = None;
         for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
@@ -310,7 +321,7 @@ mod tests {
         assert_eq!(branches.branches, refs.branches);
 
         let out = tempfile::tempdir().unwrap();
-        let (_, idx) = refs.side_pack(repo, out.path()).unwrap().unwrap();
+        let (_, idx) = refs.side_pack(repo, out.path(), &[]).unwrap().unwrap();
         let index = gix::odb::pack::index::File::at(&idx, gix::hash::Kind::Sha1).unwrap();
         let mut packed: Vec<String> = (0..index.num_objects())
             .map(|i| index.oid_at_index(i).to_string())
@@ -344,11 +355,11 @@ mod tests {
         let refs = MirrorRefs::read(repo).unwrap();
         let out = tempfile::tempdir().unwrap();
         // The annotated tag `v1` is not in main's history, so it is packed.
-        assert!(refs.side_pack(repo, out.path()).unwrap().is_some());
+        assert!(refs.side_pack(repo, out.path(), &[]).unwrap().is_some());
         git(repo, &["tag", "-d", "v1"]);
         let refs = MirrorRefs::read(repo).unwrap();
         let out = tempfile::tempdir().unwrap();
-        assert_eq!(refs.side_pack(repo, out.path()).unwrap(), None);
+        assert_eq!(refs.side_pack(repo, out.path(), &[]).unwrap(), None);
     }
 
     /// A base that is not the default branch's commit, or an invalid name,

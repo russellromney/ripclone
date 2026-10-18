@@ -6,7 +6,7 @@ use crate::downloads::{BIG, big_history_origin};
 use crate::harness::*;
 use crate::outputs::output_states;
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// F7: a signed URL expires mid-download. The CLI refreshes URLs for the same
 /// commit and resumes from the saved offset, without the hash route, which
@@ -682,7 +682,10 @@ fn s3_h14_purge_deletes_from_the_bucket() {
         &["push", "-q", fork.bare.to_str().unwrap(), "main"],
     );
     let mut env = s3.server_env(&s3_proxy.url());
-    env.push(("RIPCLONE_SIGNED_URL_TTL_SECS".into(), "3".into()));
+    // Signed URLs date to the whole second, so one can expire up to a
+    // second early: 4 s leaves the held clone room to finish, and the 8 s
+    // grace ends within the wait below.
+    env.push(("RIPCLONE_SIGNED_URL_TTL_SECS".into(), "4".into()));
     let server = world.server(&env_refs(&env));
     world.cli(&server, &["add", "acme/h14-fork", "--wait"]).ok();
     world.cli(&server, &["add", "acme/h14", "--wait"]).ok();
@@ -700,21 +703,24 @@ fn s3_h14_purge_deletes_from_the_bucket() {
     assert!(mine.iter().all(in_bucket));
 
     // Every bucket download of a clone of B waits until the purge has
-    // happened; its signed URLs are from before it.
+    // happened; its signed URLs are from before it. They are released at
+    // once, since holding them would only run down the URLs' lifetime.
     s3_proxy.fault_requests(&format!("/{}/", s3.bucket), Fault::Hold, usize::MAX);
     let target = world.target("h14-during");
     let during = world.cli_spawn(&server, &["clone", "acme/h14", target.to_str().unwrap()]);
     s3_proxy.wait_held(1);
     world.cli(&server, &["rm", "--purge", "acme/h14"]).ok();
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(
-        unique.iter().all(in_bucket),
-        "deleted before the grace ended"
-    );
+    let purged = Instant::now();
     s3_proxy.release();
     during.wait().ok();
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
     assert_eq!(listing(&target), origin.tree(&b));
+    // Sweeps run every second; two seconds in, the grace still holds.
+    std::thread::sleep(Duration::from_secs(2).saturating_sub(purged.elapsed()));
+    assert!(
+        unique.iter().all(in_bucket),
+        "deleted before the grace ended"
+    );
 
     wait_for(
         "the purged repository's artifacts to leave the bucket",
