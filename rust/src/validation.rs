@@ -94,14 +94,24 @@ pub fn validate_git_rev(rev: &str) -> Result<()> {
 /// `.git/refs/heads`. This mirrors Git's ref-name restrictions and additionally
 /// rejects the reserved pseudo-ref `HEAD`.
 pub fn validate_checkout_name(name: &str) -> Result<()> {
+    validate_ref_name("checkout branch", name)
+}
+
+/// Validate a tag name before it is written as `refs/tags/<name>`, with the
+/// same rules as [`validate_checkout_name`].
+pub fn validate_tag_name(name: &str) -> Result<()> {
+    validate_ref_name("tag", name)
+}
+
+fn validate_ref_name(what: &str, name: &str) -> Result<()> {
     if name.is_empty() {
-        anyhow::bail!("checkout branch must not be empty");
+        anyhow::bail!("{what} must not be empty");
     }
     if name.len() > MAX_REF_LEN {
-        anyhow::bail!("checkout branch too long: {}", name.len());
+        anyhow::bail!("{what} too long: {}", name.len());
     }
     if name == "HEAD" || name == "@" || name.starts_with('-') || name.starts_with('/') {
-        anyhow::bail!("invalid checkout branch: {name}");
+        anyhow::bail!("invalid {what}: {name}");
     }
     if name.ends_with('/')
         || name.ends_with('.')
@@ -115,7 +125,7 @@ pub fn validate_checkout_name(name: &str) -> Result<()> {
             .split('/')
             .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
     {
-        anyhow::bail!("invalid checkout branch: {name}");
+        anyhow::bail!("invalid {what}: {name}");
     }
     Ok(())
 }

@@ -67,7 +67,7 @@ impl WebhookProvider for GitHub {
                 let deleted =
                     payload.deleted || payload.after.as_deref().map(is_zero_sha).unwrap_or(true);
                 let kind = if deleted {
-                    EventKind::BranchDelete
+                    EventKind::Delete
                 } else {
                     EventKind::Push
                 };
@@ -197,7 +197,7 @@ mod tests {
             "repository": {"name": "widget", "owner": {"login": "acme"}}
         }"#;
         let ev = GitHub.parse(&headers("push", None), body).unwrap();
-        assert_eq!(ev.kind, EventKind::BranchDelete);
+        assert_eq!(ev.kind, EventKind::Delete);
         assert_eq!(ev.repo, "acme/widget");
         assert_eq!(ev.ref_, "refs/heads/feature");
         // The all-zeros tip is normalized away.

@@ -176,6 +176,17 @@ pub struct RefResponse {
     /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idx_bundle_url: Option<String>,
+    /// CAS hash of the repository's tags artifact, absent when it has no
+    /// tags or none is published yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags_artifact: Option<String>,
+    /// Signed URL for `tags_artifact`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags_artifact_url: Option<String>,
+    /// A Full's branches artifact and side pack, absent before the
+    /// repository's first refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branches: Option<crate::branches::BranchesRef>,
     pub kind: ExactResultKind,
 }
 
@@ -422,13 +433,36 @@ pub(super) async fn resolve(
     provider: &ProviderInstance,
     selector: &Selector,
 ) -> Result<Resolved, ApiError> {
+    Ok(resolve_listing(state, repo_id, provider, selector, false)
+        .await?
+        .0)
+}
+
+/// [`resolve`] of `HEAD`, with upstream's branches and tags from the same
+/// `ls-remote`.
+pub(super) async fn resolve_head_and_refs(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+) -> Result<(Resolved, git::UpstreamRefs), ApiError> {
+    resolve_listing(state, repo_id, provider, &Selector::Head, true).await
+}
+
+async fn resolve_listing(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    selector: &Selector,
+    refs: bool,
+) -> Result<(Resolved, git::UpstreamRefs), ApiError> {
     let name = match selector {
         Selector::Commit(commit) => {
-            return Ok(Resolved {
+            let resolved = Resolved {
                 commit: commit.clone(),
                 checkout_name: None,
                 ref_name: None,
-            });
+            };
+            return Ok((resolved, git::UpstreamRefs::default()));
         }
         Selector::Head => "HEAD",
         Selector::Name(name) => name.as_str(),
@@ -443,11 +477,17 @@ pub(super) async fn resolve(
             .acquire()
             .await
             .expect("ls-remote semaphore never closed");
-        git::ls_remote_tip_async(provider, repo_id, name, credential.as_ref()).await
+        if refs && name == "HEAD" {
+            git::ls_remote_refs(provider, repo_id, credential.as_ref()).await
+        } else {
+            git::ls_remote_tip_async(provider, repo_id, name, credential.as_ref())
+                .await
+                .map(|tip| (tip, git::UpstreamRefs::default()))
+        }
     };
-    let tip = match tip {
-        Ok(Some(tip)) => tip,
-        Ok(None) => {
+    let (tip, upstream_refs) = match tip {
+        Ok((Some(tip), upstream_refs)) => (tip, upstream_refs),
+        Ok((None, _)) => {
             return Err(ApiError::new(
                 StatusCode::NOT_FOUND,
                 "ref_not_found",
@@ -489,11 +529,12 @@ pub(super) async fn resolve(
             Some(tip.ref_name),
         ),
     };
-    Ok(Resolved {
+    let resolved = Resolved {
         commit: tip.commit,
         checkout_name,
         ref_name,
-    })
+    };
+    Ok((resolved, upstream_refs))
 }
 
 /// `POST .../builds`: resolve the selector, admit its commit, and answer with
@@ -557,6 +598,11 @@ async fn admit_resolved(
     state.metrics.record_sync(start.elapsed());
     let mut body = build_summary_body(&row);
     body["checkout_name"] = serde_json::json!(resolved.checkout_name);
+    if let Some(tag) =
+        (resolved.ref_name.as_deref()).and_then(|name| name.strip_prefix("refs/tags/"))
+    {
+        body["tag"] = serde_json::json!(tag);
+    }
     Ok(Json(body).into_response())
 }
 
@@ -588,24 +634,40 @@ struct ReadyBody {
     result: RefResponse,
 }
 
-fn ready_body(
+/// A ready output's body, with the repository's refs as of now. Refs that
+/// cannot be read are left out, as before the first publish: the clone
+/// still comes, and fetches its refs from upstream.
+async fn ready_body(
     state: &ServerState,
     repo_id: &RepoId,
     provider: &ProviderInstance,
     row: &BuildRow,
     kind: ExactResultKind,
-) -> serde_json::Value {
-    serde_json::json!(ReadyBody {
+) -> Result<serde_json::Value, ApiError> {
+    let refs = state
+        .control
+        .get_refs(repo_id)
+        .await
+        .unwrap_or_else(|error| {
+            state.metrics.record_error();
+            tracing::warn!(
+                "read refs of {}: {error:#}; the response has none",
+                repo_id.storage_key()
+            );
+            None
+        });
+    Ok(serde_json::json!(ReadyBody {
         state: "ready",
         result: ref_response(
             repo_id,
             provider,
             row,
+            refs.as_ref(),
             &state.storage,
             state.signed_url_ttl,
             kind
         ),
-    })
+    }))
 }
 
 /// `GET .../commits/{sha}[?kind=]`: a pure read of one build. With a kind,
@@ -640,7 +702,7 @@ async fn get_commit(
         return Ok(Json(build_summary_body(&row)).into_response());
     };
     let body = match kind_state(&row, kind) {
-        Out::Ready(()) => ready_body(state, repo_id, provider, &row, kind),
+        Out::Ready(()) => ready_body(state, repo_id, provider, &row, kind).await?,
         Out::Failed(error) => serde_json::json!({
             "state": "failed",
             "commit": row.commit,
@@ -668,7 +730,7 @@ async fn pending_body(
         _ => None,
     };
     if let Some(base) = base.as_ref().filter(|base| base.commit == row.commit) {
-        return Ok(ready_body(state, repo_id, provider, base, kind));
+        return ready_body(state, repo_id, provider, base, kind).await;
     }
     let mut body = serde_json::json!({
         "state": "pending",
@@ -682,7 +744,7 @@ async fn pending_body(
     if let Some(base) = base {
         body["top_up"] = serde_json::json!({
             "base_commit": base.commit,
-            "base": ready_body(state, repo_id, provider, &base, ExactResultKind::Full),
+            "base": ready_body(state, repo_id, provider, &base, ExactResultKind::Full).await?,
         });
     }
     Ok(body)
@@ -739,6 +801,7 @@ fn ref_response(
     repo_id: &RepoId,
     provider: &ProviderInstance,
     row: &BuildRow,
+    refs: Option<&crate::control::RepoRefs>,
     storage: &crate::storage::StorageRef,
     ttl: Duration,
     kind: ExactResultKind,
@@ -814,6 +877,32 @@ fn ref_response(
         // write`; the idx bundle fetches every idx in one GET.
         midx_url: signed(&artifacts.midx),
         idx_bundle_url: signed(&artifacts.idx_bundle),
+        // No tags, no download.
+        tags_artifact: refs
+            .filter(|refs| refs.tags_count > 0)
+            .map(|refs| refs.tags_artifact.clone()),
+        tags_artifact_url: refs
+            .filter(|refs| refs.tags_count > 0)
+            .and_then(|refs| signed(&refs.tags_artifact)),
+        // Only a Full gets every branch, as `git clone --depth` gets one.
+        branches: refs
+            .and_then(|refs| refs.branches.as_ref())
+            .filter(|_| kind == ExactResultKind::Full)
+            .map(|branches| crate::branches::BranchesRef {
+                artifact: branches.artifact.clone(),
+                artifact_url: signed(&branches.artifact),
+                side_pack: branches
+                    .side_pack
+                    .as_ref()
+                    .map(|side| crate::branches::SidePackRef {
+                        pack: side.pack.clone(),
+                        pack_len: side.pack_len,
+                        pack_url: signed(&side.pack),
+                        idx: side.idx.clone(),
+                        idx_len: side.idx_len,
+                        idx_url: signed(&side.idx),
+                    }),
+            }),
         kind,
     }
 }
@@ -1633,6 +1722,7 @@ mod tests {
             &repo_id,
             &provider,
             &row_of(info, None),
+            None,
             &storage,
             DEFAULT_SIGNED_URL_TTL,
             ExactResultKind::Full,
@@ -1731,6 +1821,7 @@ mod tests {
             &repo_id,
             &provider,
             &row,
+            None,
             &storage,
             DEFAULT_SIGNED_URL_TTL,
             ExactResultKind::Full,
@@ -1770,6 +1861,7 @@ mod tests {
             &repo_id,
             &provider,
             &row,
+            None,
             &storage,
             DEFAULT_SIGNED_URL_TTL,
             ExactResultKind::Files,
@@ -1791,6 +1883,7 @@ mod tests {
             &repo_id,
             &provider,
             &row,
+            None,
             &storage,
             DEFAULT_SIGNED_URL_TTL,
             ExactResultKind::Head,

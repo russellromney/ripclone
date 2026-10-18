@@ -2,7 +2,6 @@
 //! upstream verification.
 
 use crate::harness::*;
-use hmac::{KeyInit, Mac};
 
 /// I3: for each provider kind, the server sends that provider's auth header
 /// on every request to the origin, and the origin accepts nothing else.
@@ -137,82 +136,6 @@ fn i2_server_credential_builds_a_private_repo() {
     }
 }
 
-fn hmac_hex(secret: &str, body: &str) -> String {
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(body.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
-}
-
-/// A signed push webhook for `kind`: (headers, body).
-fn push_hook(
-    kind: &str,
-    secret: &str,
-    repo: &str,
-    after: &str,
-) -> (Vec<(&'static str, String)>, String) {
-    let (owner, name) = repo.split_once('/').unwrap();
-    match kind {
-        "github" => {
-            let body = serde_json::json!({
-                "ref": "refs/heads/main",
-                "after": after,
-                "repository": {
-                    "name": name,
-                    "owner": { "login": owner },
-                    "default_branch": "main",
-                    "private": false,
-                },
-            })
-            .to_string();
-            let sig = format!("sha256={}", hmac_hex(secret, &body));
-            (
-                vec![
-                    ("X-GitHub-Event", "push".into()),
-                    ("X-Hub-Signature-256", sig),
-                ],
-                body,
-            )
-        }
-        "gitlab" => {
-            let body = serde_json::json!({
-                "ref": "refs/heads/main",
-                "after": after,
-                "project": {
-                    "path_with_namespace": repo,
-                    "default_branch": "main",
-                    "visibility_level": 20,
-                },
-            })
-            .to_string();
-            (
-                vec![
-                    ("X-Gitlab-Event", "Push Hook".into()),
-                    ("X-Gitlab-Token", secret.into()),
-                ],
-                body,
-            )
-        }
-        "gitea" => {
-            let body = serde_json::json!({
-                "ref": "refs/heads/main",
-                "after": after,
-                "repository": {
-                    "full_name": repo,
-                    "default_branch": "main",
-                    "private": false,
-                },
-            })
-            .to_string();
-            let sig = hmac_hex(secret, &body);
-            (
-                vec![("X-Gitea-Event", "push".into()), ("X-Gitea-Signature", sig)],
-                body,
-            )
-        }
-        other => panic!("no webhook format for {other}"),
-    }
-}
-
 /// I4: for each provider's webhook, a bad signature gets 401 and builds
 /// nothing; a signed push builds the new tip before any clone asks for it.
 #[test]
@@ -247,13 +170,13 @@ fn i4_signed_webhook_builds_before_clone() {
         origin.publish();
         let hook = format!("/webhooks/{id}");
 
-        let (headers, body) = push_hook(kind, "wrong-secret", &slug, &tip);
+        let (headers, body) = push_hook(kind, "wrong-secret", &slug, "refs/heads/main", &tip);
         let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let bad = server.post(&hook, &headers, &body);
         assert_eq!(bad.status, 401, "{kind}: {}", bad.body);
         assert_eq!(server.metric("ripclone_builds_queued_total"), 1, "{kind}");
 
-        let (headers, body) = push_hook(kind, &secret, &slug, &tip);
+        let (headers, body) = push_hook(kind, &secret, &slug, "refs/heads/main", &tip);
         let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let good = server.post(&hook, &headers, &body);
         assert_eq!(good.status, 200, "{kind}: {}", good.body);
@@ -511,4 +434,59 @@ fn i10_verify_upstream_in_files_mode() {
             assert_eq!(world.staging_leftovers(), Vec::<String>::new());
         }
     }
+}
+
+/// I16: `--verify-upstream=always` also walks the clone from its commit.
+/// A server that answers a full clone with its Head called a Full
+/// installs a clone missing the tip's parent, with no shallow boundary:
+/// `always` fails it and removes it, naming the walk; `auto` compares only
+/// the commit and keeps it.
+#[test]
+fn i16_verify_upstream_always_walks_the_clone() {
+    let world = World::new();
+    let origin = world.origin("acme", "i16");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    let b = origin.commit(&[("b.txt", "b\n")], "B");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/i16", "--wait"]).ok();
+    let proxy = FaultProxy::start(&server);
+    proxy.forward_as("kind=full", "kind=head");
+    proxy.rewrite(api::COMMIT_READS, "\"kind\":\"head\"", "\"kind\":\"full\"");
+
+    let always = world.target("always");
+    let err = world
+        .cli(
+            &proxy,
+            &[
+                "clone",
+                "acme/i16",
+                always.to_str().unwrap(),
+                "--verify-upstream=always",
+            ],
+        )
+        .err();
+    assert!(err.contains("do not connect from commit"), "{err}");
+    assert!(!always.exists(), "the failed clone left its target");
+
+    let auto = world.target("auto");
+    world
+        .cli(
+            &proxy,
+            &[
+                "clone",
+                "acme/i16",
+                auto.to_str().unwrap(),
+                "--verify-upstream=auto",
+            ],
+        )
+        .ok();
+    assert_eq!(git(&auto, &["rev-parse", "HEAD"]), b);
+    assert!(!auto.join(".git").join("shallow").exists());
+    assert!(
+        !git_output(&auto, &["fsck", "--connectivity-only", &b])
+            .status
+            .success()
+    );
+    assert_eq!(world.staging_leftovers(), Vec::<String>::new());
 }

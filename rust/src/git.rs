@@ -49,9 +49,27 @@ struct Tracked {
 /// block the child). The group is killed when the current build is
 /// cancelled or `timeout` passes.
 fn run_tracked(command: &mut Command, timeout: Option<Duration>) -> std::io::Result<Tracked> {
+    run_tracked_with_input(command, timeout, None)
+}
+
+/// [`run_tracked`] with `input`, when given, as the child's stdin.
+fn run_tracked_with_input(
+    command: &mut Command,
+    timeout: Option<Duration>,
+    input: Option<&[u8]>,
+) -> std::io::Result<Tracked> {
+    let stdin = match input {
+        Some(input) => {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(input)?;
+            file.rewind()?;
+            Stdio::from(file)
+        }
+        None => Stdio::null(),
+    };
     let mut stderr = tempfile::tempfile()?;
     command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr.try_clone()?));
     #[cfg(unix)]
@@ -758,6 +776,38 @@ pub fn pack_objects_range_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     )
 }
 
+/// Pack every object reachable from `tips` but not from `base` into
+/// `<prefix>-<checksum>.pack` and its `.idx`. `tips` are object ids, so tag
+/// objects come along.
+pub fn pack_objects_excluding<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    tips: &[&str],
+    base: &str,
+    prefix: Q,
+) -> Result<()> {
+    crate::validation::validate_object_id(base)?;
+    for tip in tips {
+        crate::validation::validate_object_id(tip)?;
+    }
+    if let Some(parent) = prefix.as_ref().parent() {
+        std::fs::create_dir_all(parent).context("create pack prefix directory")?;
+    }
+    let exclude = format!("^{base}");
+    let mut command = command();
+    command
+        .args(NO_FSYNC)
+        .args(["-c", "pack.writeReverseIndex=false"])
+        .arg("-C")
+        .arg(repo.as_ref())
+        .args(["pack-objects", "--delta-base-offset", "--revs"]);
+    command.arg(prefix.as_ref());
+    run_pack_objects(
+        command,
+        tips.iter().copied().chain([exclude.as_str()]),
+        "pack-objects (side)",
+    )
+}
+
 /// Run `pack-objects` with one line per `lines` item on stdin, as a tracked
 /// child: a cancelled build kills it. Stderr goes to a file so a long
 /// diagnostic cannot block the stdin writes.
@@ -1155,16 +1205,112 @@ async fn ls_remote_tip_async_with(
     if url.is_empty() {
         return Ok(None);
     }
+    let stdout = run_ls_remote(&url, &git_args, auth_header, &candidates, timeout).await?;
+    parse_ls_remote_output(&stdout, &candidates)
+}
+
+/// Upstream's branches and tags as one `ls-remote` lists them, each as
+/// `(name, object id)` sorted by name, with the default branch. A name a
+/// clone could not write is left out, as [`crate::branches::MirrorRefs`]
+/// leaves it out of the mirror's, so the two hash alike.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamRefs {
+    /// The branch `HEAD` points at, when it is one of `branches`.
+    pub default_branch: Option<String>,
+    /// Under `refs/heads/`.
+    pub branches: Vec<(String, String)>,
+    /// Under `refs/tags/`: the object the ref names, a tag object for an
+    /// annotated tag.
+    pub tags: Vec<(String, String)>,
+}
+
+impl UpstreamRefs {
+    /// The hash the poller compares with the last refresh's.
+    pub fn hash(&self) -> String {
+        crate::branches::refs_hash(self.default_branch.as_deref(), &self.branches, &self.tags)
+    }
+}
+
+/// Upstream's `HEAD` tip and its branches and tags, from one bounded
+/// `ls-remote`: the poller asks for all of them in the request it already
+/// makes.
+pub async fn ls_remote_refs(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<(Option<RemoteTip>, UpstreamRefs)> {
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
+    let origin_base = origin_base();
+    let (url, git_args) =
+        upstream_url_and_auth(provider, repo_id, credential, origin_base.as_deref());
+    let auth_header = upstream_auth_header(provider, credential);
+    let head = ["HEAD".to_string()];
+    let patterns = ["HEAD", "refs/heads/*", "refs/tags/*"].map(String::from);
+    let stdout = run_ls_remote(
+        &url,
+        &git_args,
+        auth_header,
+        &patterns,
+        ls_remote_timeout()?,
+    )
+    .await?;
+    let tip = parse_ls_remote_output(&stdout, &head)?;
+    Ok((tip, parse_upstream_refs(&stdout)))
+}
+
+/// The branches and tags in an `ls-remote --symref` listing.
+fn parse_upstream_refs(stdout: &[u8]) -> UpstreamRefs {
+    let mut refs = UpstreamRefs::default();
+    let mut head = None;
+    for line in std::str::from_utf8(stdout).unwrap_or_default().lines() {
+        let Some((id, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some(target) = id.strip_prefix("ref: ") {
+            if name == "HEAD" {
+                head = target.strip_prefix("refs/heads/").map(str::to_string);
+            }
+            continue;
+        }
+        if crate::validation::validate_object_id(id).is_err() {
+            continue;
+        }
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            if crate::validation::validate_checkout_name(branch).is_ok() {
+                refs.branches.push((branch.to_string(), id.to_string()));
+            }
+        } else if let Some(tag) = name.strip_prefix("refs/tags/")
+            && !tag.ends_with("^{}")
+            && crate::validation::validate_tag_name(tag).is_ok()
+        {
+            refs.tags.push((tag.to_string(), id.to_string()));
+        }
+    }
+    refs.branches.sort();
+    refs.tags.sort();
+    refs.default_branch = head.filter(|head| refs.branches.iter().any(|(name, _)| name == head));
+    refs
+}
+
+/// Run `git ls-remote --symref <url> <patterns>` and return what it printed.
+async fn run_ls_remote(
+    url: &str,
+    git_args: &[String],
+    auth_header: Option<(String, String)>,
+    patterns: &[String],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let mut stdout = tempfile::tempfile().context("create ls-remote stdout file")?;
     let child_stdout = stdout.try_clone().context("clone ls-remote stdout file")?;
     let mut stderr = tempfile::tempfile().context("create ls-remote stderr file")?;
     let child_stderr = stderr.try_clone().context("clone ls-remote stderr file")?;
     let mut command = tokio::process::Command::from(command());
     command
-        .args(&git_args)
+        .args(git_args)
         .args(LOW_SPEED_ARGS)
-        .args(["ls-remote", "--symref", "--", &url])
-        .args(&candidates)
+        .args(["ls-remote", "--symref", "--", url])
+        .args(patterns)
         // A credential helper may answer, but never a terminal prompt: the
         // CLI reads the upstream beside a clone, and the server has no one
         // to ask.
@@ -1205,12 +1351,12 @@ async fn ls_remote_tip_async_with(
     if !status.success() {
         return Err(upstream_git_error(
             "ls-remote",
-            &url,
+            url,
             auth_header,
             &stderr_bytes,
         ));
     }
-    parse_ls_remote_output(&stdout_bytes, &candidates)
+    Ok(stdout_bytes)
 }
 
 struct ManagedLsRemoteChild {
@@ -1455,6 +1601,70 @@ fn sync_bare_mirror_admitted_from(
     sync_bare_mirror_rev(mirror_dir, &url, &git_args, auth_header, commit, timeout)
 }
 
+/// Bring the mirror's branches and tags to upstream's in one atomic fetch,
+/// deleting the ones upstream no longer has, and point the mirror's `HEAD`
+/// at `default_branch`. False, with nothing fetched, while the mirror is
+/// empty: its first fetch is a build's, whose pack a cold Full reuses. The
+/// caller holds the repo's write lock.
+pub fn refresh_mirror_refs(
+    mirror_dir: &Path,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    credential: Option<&secrecy::SecretString>,
+    default_branch: Option<&str>,
+) -> Result<bool> {
+    use crate::cancel::Ended;
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
+    if let Some(branch) = default_branch {
+        crate::validation::validate_checkout_name(branch)?;
+    }
+    let _mirror_lock = MirrorLock::acquire(mirror_dir)?;
+    if !mirror_dir.exists() || mirror_is_empty(mirror_dir) {
+        return Ok(false);
+    }
+    let (url, git_args) =
+        upstream_url_and_auth(provider, repo_id, credential, origin_base().as_deref());
+    ensure_bare_origin(mirror_dir, &url)?;
+    let timeout = fetch_timeout()?;
+    let run = run_tracked(
+        command()
+            .args(&git_args)
+            .args(LOW_SPEED_ARGS)
+            .arg("-C")
+            .arg(mirror_dir.as_os_str())
+            .args(["fetch", "--atomic", "--prune", "--no-tags", "origin"])
+            .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]),
+        Some(timeout),
+    )
+    .context("git fetch refs")?;
+    match run.ended {
+        Ended::Exited(status) if status.success() => {}
+        Ended::Exited(_) => {
+            let auth_header = upstream_auth_header(provider, credential);
+            return Err(upstream_git_error(
+                "fetch refs",
+                &url,
+                auth_header,
+                &run.stderr,
+            ));
+        }
+        Ended::TimedOut => bail!("git fetch refs timed out after {timeout:?}"),
+        Ended::Cancelled => return Err(anyhow::Error::new(crate::cancel::Cancelled)),
+    }
+    if let Some(branch) = default_branch {
+        run_quiet(
+            command().arg("-C").arg(mirror_dir.as_os_str()).args([
+                "symbolic-ref",
+                "HEAD",
+                &format!("refs/heads/{branch}"),
+            ]),
+            "symbolic-ref HEAD (mirror)",
+        )?;
+    }
+    Ok(true)
+}
+
 /// True when a fetch of `commit` into the mirror completed. git writes the
 /// fetch's ref only after the pack is in place and the commit's history
 /// passed its connectivity check, so the ref proves the mirror holds all of
@@ -1564,10 +1774,24 @@ fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// A refspec no upstream ref matches. Next to a bare object id it makes
+/// git send ref prefixes, so the tag listing is all `ls-refs` returns.
+const NO_REFS_REFSPEC: &str = "refs/ripclone-none/*:refs/ripclone-none/*";
+
 /// Fetch `rev` from upstream, bounded twice: git's low-speed limit fails a
 /// stalled transfer, and `timeout` caps the whole fetch. Either way the
 /// fetch's process group (with its HTTP helper) is killed and the error is
 /// retryable. A cancelled build kills it too.
+///
+/// Git's tag following fetches, in the same request and pack, every
+/// upstream tag whose target the mirror has or is fetching, so the mirror's
+/// `refs/tags/` holds the tags a clone of the commit gets (see
+/// `server::refs`). A tag on another branch's history is not fetched here,
+/// and nor is that history: the refs refresh fetches those.
+/// `--atomic` writes `refs/ripclone/revs/<rev>` and those tags in one ref
+/// transaction, so a build that sees the internal ref sees its tags. The
+/// refspec matching nothing gives git a ref prefix to send, so the upstream
+/// lists only `refs/tags/` instead of every ref.
 fn sync_bare_mirror_rev(
     mirror_dir: &Path,
     url: &str,
@@ -1588,7 +1812,7 @@ fn sync_bare_mirror_rev(
             .args(LOW_SPEED_ARGS)
             .arg("-C")
             .arg(mirror_dir.as_os_str())
-            .args(["fetch", "--no-tags", "origin", &refspec]),
+            .args(["fetch", "--atomic", "origin", &refspec, NO_REFS_REFSPEC]),
         Some(timeout),
     )
     .context("git fetch rev")?;
@@ -1671,6 +1895,26 @@ mod tests {
         );
         assert!(err.starts_with("pack-objects failed: fatal:"), "{err}");
         assert!(err.contains(&missing), "{err}");
+    }
+
+    /// Branches and tags take the id the ref names, never a peeled line;
+    /// other refs and names a clone refuses are left out, and `HEAD` names
+    /// the default branch only when that branch is listed.
+    #[test]
+    fn upstream_refs_parse_from_ls_remote() {
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let listing = format!(
+            "ref: refs/heads/main\tHEAD\n{a}\tHEAD\n{b}\trefs/tags/v1\n{a}\trefs/tags/v1^{{}}\n\
+             {c}\trefs/tags/light\n{c}\trefs/tags/bad..name\n{a}\trefs/heads/main\n\
+             {b}\trefs/heads/next\n{c}\trefs/heads/HEAD\n{c}\trefs/pull/1/head\n"
+        );
+        let refs = parse_upstream_refs(listing.as_bytes());
+        let pair = |name: &str, id: &str| (name.to_string(), id.to_string());
+        assert_eq!(refs.default_branch.as_deref(), Some("main"));
+        assert_eq!(refs.branches, [pair("main", &a), pair("next", &b)]);
+        assert_eq!(refs.tags, [pair("light", &c), pair("v1", &b)]);
+        let listing = format!("ref: refs/heads/gone\tHEAD\n{a}\tHEAD\n{a}\trefs/heads/main\n");
+        assert_eq!(parse_upstream_refs(listing.as_bytes()).default_branch, None);
     }
 
     #[test]

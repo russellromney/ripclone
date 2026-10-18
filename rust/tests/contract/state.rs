@@ -219,7 +219,7 @@ fn h8_readyz_fails_when_the_control_db_file_goes() {
         let readyz = server.get("/readyz");
         assert_eq!(readyz.status, 503, "{case}: {}", readyz.body);
         let line = format!("was {case} after the server opened it");
-        assert!(server.log().contains(&line), "{case}:\n{}", server.log());
+        server.wait_log(&line);
     }
 }
 
@@ -341,7 +341,8 @@ pub(crate) fn mirrors(world: &World) -> Vec<String> {
 /// H13: purging a repository deletes its builds, its mirror, and the
 /// artifacts no other repository uses, after twice the signed URL lifetime.
 /// A fork that built the same commit keeps the shared artifacts and clones
-/// in every shape. A clone of the purged repository that started before the
+/// in every shape. The repository's own refs artifacts go too. A clone of
+/// the purged repository that started before the
 /// purge finishes; one that starts after is refused. Added again, the repository builds and clones.
 #[test]
 fn h13_purge_removes_only_what_no_other_repo_uses() {
@@ -354,20 +355,32 @@ fn h13_purge_removes_only_what_no_other_repo_uses() {
         &origin.work,
         &["push", "-q", fork.bare.to_str().unwrap(), "main"],
     );
+    // Only the repo has the tag, so only its refs artifacts are its own.
+    git(&origin.work, &["tag", "-a", "-m", "v1", "v1"]);
+    git(
+        &origin.work,
+        &["push", "-q", origin.bare.to_str().unwrap(), "--tags"],
+    );
     // Grace of 6 s; the harness sweeps every second.
     let server = world.server(&[("RIPCLONE_SIGNED_URL_TTL_SECS", "3")]);
     world.cli(&server, &["add", "acme/h13-fork", "--wait"]).ok();
     world.cli(&server, &["add", "acme/h13", "--wait"]).ok();
+    wait_first_refs(&server, "acme/h13-fork", &a);
+    wait_first_refs(&server, "acme/h13", &a);
     let b = origin.commit(&[("c.txt", "c\n")], "B");
     origin.publish();
     world.cli(&server, &["sync", "acme/h13", "--at", &b]).ok();
 
     let forked = commit_artifacts(&server, "acme/h13-fork", &a);
     let mut mine = commit_artifacts(&server, "acme/h13", &a);
-    assert_eq!(mine, forked, "the same commit builds the same artifacts");
     mine.extend(commit_artifacts(&server, "acme/h13", &b));
     let unique: BTreeSet<&String> = mine.difference(&forked).collect();
-    assert!(!unique.is_empty(), "B builds artifacts the fork lacks");
+    let tags = api::tags_artifact(&server, "acme/h13", &a).expect("tags published");
+    assert!(unique.contains(&tags), "the repo's tags are its own");
+    assert!(
+        mine.len() > unique.len(),
+        "the fork shares the artifacts of A"
+    );
     assert_eq!(mirrors(&world).len(), 2);
 
     // Every download of a clone of B waits until the purge has happened.
@@ -438,4 +451,54 @@ fn h13_purge_removes_only_what_no_other_repo_uses() {
         git(&again, &["rev-list", "--count", "HEAD"]),
         origin.count(&b)
     );
+}
+
+/// H15: the control store fails to read a repo's refs, here because their
+/// table was renamed under the running server. A ready build still
+/// answers, without the server's refs, and a full clone fetches them from
+/// the upstream as `git clone` has them.
+#[test]
+fn h15_unreadable_refs_leave_ready_builds_cloning() {
+    let world = World::new();
+    let origin = world.origin("acme", "h15");
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    git(&origin.work, &["tag", "-a", "-m", "v1", "v1"]);
+    origin.publish();
+    git(
+        &origin.work,
+        &["push", "-q", origin.bare.to_str().unwrap(), "--tags"],
+    );
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/h15", "--wait"]).ok();
+    wait_first_refs(&server, "acme/h15", &a);
+
+    let db = world.path("server").join("control.db");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use sqlx::Connection;
+            let url = format!("sqlite://{}", db.display());
+            let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            sqlx::query("ALTER TABLE repo_refs RENAME TO repo_refs_moved")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        });
+    let (status, body) = api::read_commit(&server, "acme/h15", &a, Some("full"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "ready", "{body}");
+    assert!(body["branches"].is_null(), "{body}");
+    assert!(body["tags_artifact"].is_null(), "{body}");
+    server.wait_log("read refs of");
+
+    let full = world.target("full");
+    let out = world.cli(&server, &["clone", "acme/h15", full.to_str().unwrap()]);
+    out.ok();
+    assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    assert_eq!(git(&full, &["rev-parse", "HEAD"]), a);
+    assert_eq!(remote_refs(&full), git_clone_remotes(&origin.bare, &[]));
+    assert_eq!(tag_refs(&full), git_clone_tags(&origin.bare, &[]).0);
+    git(&full, &["fsck", "--strict"]);
 }

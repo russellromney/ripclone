@@ -1,7 +1,7 @@
 //! Behavior every [`ControlStore`] must have. A backend passes by running
 //! [`run_all`] with a factory for empty backends.
 
-use super::{Clock, ControlStore, Lease, Out, Output, Pool};
+use super::{Clock, ControlStore, Lease, Out, Output, Pool, RepoBranches, RepoRefs, SidePack};
 use crate::provider::{ProviderInstanceId, RepoId};
 use crate::{ClonepackArtifacts, ExactResultKind, FilesResult, FullResult, HeadResult};
 use anyhow::Result;
@@ -79,7 +79,9 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
         a_queued_artifact_keeps_its_later_due_time,
         a_referenced_artifact_is_never_deletable,
         an_artifact_queued_again_during_a_sweep_stays_queued,
+        refs_name_their_artifacts_until_purged,
         an_unapplied_publish_references_nothing,
+        refs_are_absent_until_written_and_replaced,
     );
 }
 
@@ -1567,4 +1569,128 @@ async fn an_unapplied_publish_references_nothing(backend: &dyn Backend) {
     for hash in &unreferenced {
         assert!(store.deletable(hash, START + 1).await.unwrap(), "{hash}");
     }
+}
+
+async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
+    let (clock, store) = open(backend).await;
+    let missing = RepoId::github("acme/missing");
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), None);
+    let first = RepoRefs {
+        tags_artifact: crate::cas::hash(b"first"),
+        tags_len: 120,
+        tags_count: 3,
+        tags_hash: crate::cas::hash(b"tags 1"),
+        branches: None,
+    };
+    assert!(
+        !store.set_refs(&repo(), &first).await.unwrap(),
+        "the repo is not added"
+    );
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), None);
+    store.add_repo(&repo()).await.unwrap();
+    assert!(store.set_refs(&repo(), &first).await.unwrap());
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), Some(first.clone()));
+    let with_side = RepoRefs {
+        branches: Some(RepoBranches {
+            artifact: crate::cas::hash(b"branches"),
+            len: 40,
+            refs_hash: crate::cas::hash(b"refs 1"),
+            default_branch: Some("main".into()),
+            base: Some("1".repeat(40)),
+            side_base: Some("2".repeat(40)),
+            side_tips: crate::cas::hash(b"tips 1"),
+            side_pack: Some(SidePack {
+                pack: crate::cas::hash(b"pack"),
+                pack_len: 1 << 40,
+                idx: crate::cas::hash(b"idx"),
+                idx_len: 1100,
+            }),
+        }),
+        ..first.clone()
+    };
+    assert!(store.set_refs(&repo(), &with_side).await.unwrap());
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), Some(with_side));
+    let second = RepoRefs {
+        tags_artifact: crate::cas::hash(b"second"),
+        tags_len: 0,
+        tags_count: 0,
+        tags_hash: crate::cas::hash(b"tags 2"),
+        branches: Some(RepoBranches {
+            artifact: crate::cas::hash(b"branches 2"),
+            len: 30,
+            refs_hash: crate::cas::hash(b"refs 2"),
+            default_branch: None,
+            base: None,
+            side_base: None,
+            side_tips: crate::cas::hash(b"tips 2"),
+            side_pack: None,
+        }),
+    };
+    assert!(store.set_refs(&repo(), &second).await.unwrap());
+    let store = reopen(backend, &clock, store).await;
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), Some(second));
+    assert_eq!(store.get_refs(&missing).await.unwrap(), None);
+}
+
+async fn refs_name_their_artifacts_until_purged(backend: &dyn Backend) {
+    let (_, store) = open(backend).await;
+    let other = RepoId::github("acme/fork");
+    store.add_repo(&repo()).await.unwrap();
+    store.add_repo(&other).await.unwrap();
+    let mine = RepoRefs {
+        tags_artifact: crate::cas::hash(b"shared tags"),
+        tags_len: 10,
+        tags_count: 1,
+        tags_hash: crate::cas::hash(b"tags"),
+        branches: Some(RepoBranches {
+            artifact: crate::cas::hash(b"my branches"),
+            len: 40,
+            refs_hash: crate::cas::hash(b"refs"),
+            default_branch: Some("main".into()),
+            base: Some("1".repeat(40)),
+            side_base: Some("1".repeat(40)),
+            side_tips: crate::cas::hash(b"tips"),
+            side_pack: Some(SidePack {
+                pack: crate::cas::hash(b"my pack"),
+                pack_len: 100,
+                idx: crate::cas::hash(b"my idx"),
+                idx_len: 10,
+            }),
+        }),
+    };
+    let theirs = RepoRefs {
+        branches: None,
+        ..mine.clone()
+    };
+    assert!(store.set_refs(&repo(), &mine).await.unwrap());
+    assert!(store.set_refs(&other, &theirs).await.unwrap());
+    let named: Vec<String> = mine.artifacts().into_iter().map(str::to_string).collect();
+    assert_eq!(named.len(), 4);
+    store.queue_deletions(&named, START).await.unwrap();
+    for hash in &named {
+        assert!(!store.deletable(hash, START + 1).await.unwrap(), "{hash}");
+    }
+
+    let purged = store.purge_repo(&repo(), START).await.unwrap();
+    assert_eq!(purged.queued, 3, "the shared tags stay");
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), None);
+    assert_eq!(store.get_refs(&other).await.unwrap(), Some(theirs));
+    for hash in &named {
+        let shared = *hash == mine.tags_artifact;
+        assert_eq!(
+            store.deletable(hash, START + 1).await.unwrap(),
+            !shared,
+            "{hash}"
+        );
+    }
+    assert!(
+        !store.set_refs(&repo(), &mine).await.unwrap(),
+        "a refresh that ends after the purge writes nothing"
+    );
+    assert_eq!(store.get_refs(&repo()).await.unwrap(), None);
+    let branches = &mine.branches.as_ref().unwrap().artifact;
+    assert!(
+        store.deletable(branches, START + 1).await.unwrap(),
+        "the refused write records no references"
+    );
 }

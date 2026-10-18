@@ -39,9 +39,10 @@ example `github/oven-sh/bun` or `gitlab/group/sub/project`.
 Only added repos build: `POST .../builds` for a repo that was not added
 answers `404 repo_not_added`.
 
-A purge removes the repo from the added set and deletes its builds at once,
-so its commits read `404` and its running builds stop. Its mirror goes once
-no build holds it. Each artifact that no other repo's build names is deleted
+A purge removes the repo from the added set and deletes its builds and
+published refs at once, so its commits read `404` and its running builds and
+refreshes stop. Its mirror goes once no build holds it. Each artifact that no
+other repo's builds or refs name is deleted
 from storage after twice the signed URL lifetime, so a clone that read the
 repo before the purge finishes. Two repos at the same commits share their
 artifacts, so purging one leaves the other whole. Deletion runs every 5
@@ -74,13 +75,15 @@ The answer comes at once and never waits for a build:
 ```
 
 `checkout_name` is the branch a clone checks out. It is `null` for a SHA or a
-tag, which give a detached checkout. Admitting a commit that already has a
+tag, which give a detached checkout. `tag` is present when the selector named
+a tag, and gives its name; a depth-1 clone then fetches that tag, as `git
+clone --depth 1 --branch <tag>` does. Admitting a commit that already has a
 build changes nothing.
 
 ### Read a build
 
 `GET /v1/repos/{provider}/{path}/commits/{sha}` without `kind` returns the
-summary above, without `checkout_name`. With `?kind=head`, `full`, or `files`
+summary above, without `checkout_name` or `tag`. With `?kind=head`, `full`, or `files`
 it returns one output. Responses carry `Cache-Control: no-store`.
 
 Each commit has three outputs, built separately. Head is the depth-1 pack. It
@@ -117,6 +120,21 @@ tree. A Head output has `idx_bundle_url`, all its pack idx files in one
 object, instead, and `midx_url` when it has a pre-built multi-pack-index. A
 Files output has `archive_chunk_urls` instead of `pack_chunk_urls`. Signed URLs last
 20 minutes. Read the commit again to get fresh ones.
+
+Head and Full outputs also carry `tags_artifact` and `tags_artifact_url`
+when the repository has tags: the repository's newest tags, the same for
+every commit. A clone keeps the tags whose target it holds, as `git clone`
+does. The artifact can be newer than the output; it changes when tags are
+pushed, moved, or deleted (see [Freshness](FRESHNESS.md#branches-and-tags)).
+
+A Full output also carries `branches` once the repository's refs are
+published: `artifact` and `artifact_url`, the repository's branches and the
+default branch's tip, and `side_pack` (`pack`, `pack_len`, `pack_url`,
+`idx`, `idx_len`, `idx_url`), the objects the other branches and tags reach
+that the default branch's history does not. It is left out when every ref
+is in that history. A full clone that holds the default branch's tip
+installs the side pack and writes every branch as
+`refs/remotes/origin/<branch>`.
 
 **Pending.** The output is not built yet:
 

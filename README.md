@@ -39,12 +39,9 @@ downloading a file from object storage.
 
 | Command | Same as | You get | Use it when |
 |---|---|---|---|
-| `ripclone clone owner/repo` | `git clone` | A full editable git repo with complete history | Coding: you or an agent will switch branches, read history, push. |
-| `ripclone clone owner/repo --depth 1` | `git clone --depth 1` | An editable git repo with only `HEAD` | CI and agents that run git but don't walk history. |
+| `ripclone clone owner/repo` | `git clone` | A full editable git repo with complete history, every branch and every tag | Coding: you or an agent will switch branches, read history, push. |
+| `ripclone clone owner/repo --depth 1` | `git clone --depth 1` | An editable git repo with only `HEAD` and the tags it reaches | CI and agents that run git but don't walk history. |
 | `ripclone clone owner/repo --mode files` | `git archive` of the tip | The working tree only, no `.git` | Builds that never run git. Fastest. |
-
-A full clone installs the branch you clone. The other branches arrive with
-your first `git fetch`, which is set up to fetch them, as in `git clone`.
 
 **Git LFS:** ripclone stores LFS pointer files, never the blobs. Run
 `git lfs pull` after cloning.
@@ -106,7 +103,7 @@ ripclone clone oven-sh/bun bun
 `add` returns once the build is accepted; `--wait` waits for it to finish.
 `ripclone list` and `ripclone rm owner/repo` manage registrations. Removing a
 registration keeps the published artifacts; `rm --purge` also deletes the
-repo's builds, its mirror, and the artifacts no other repo uses. Without `RIPCLONE_SERVER` (or
+repo's builds, its refs, its mirror, and the artifacts no other repo uses. Without `RIPCLONE_SERVER` (or
 `server` in the config file) the CLI talks to `https://ripclone.com`.
 
 ## Keeping repos fresh
@@ -181,8 +178,10 @@ secrets. The CLI reads the upstream (top-up, `--verify-upstream`) with your
 own git credentials.
 
 **Checking the server.** `--verify-upstream` (`auto` by default) cross-checks an
-editable clone's commit against the git host when it can. A Files clone has no
-git objects to check, so `--verify-upstream=always` fails for one.
+editable clone's commit against the git host when it can. `always` also checks
+that the clone's objects connect from that commit (`git fsck
+--connectivity-only`), which adds seconds to a large full clone. A Files clone
+has no git objects to check, so `--verify-upstream=always` fails for one.
 
 ## Architecture
 

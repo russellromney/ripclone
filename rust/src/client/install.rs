@@ -49,6 +49,9 @@ struct Pin {
     tracks: bool,
     /// The checkout is the upstream's default branch.
     default_branch: bool,
+    /// The tag the selector named, which a shallow clone fetches as
+    /// `git clone --depth 1 --branch <tag>` does.
+    tag: Option<String>,
     /// The hosted server's per-clone id, for the metrics report.
     clone_id: Option<String>,
 }
@@ -245,6 +248,7 @@ impl Client {
             checkout,
             tracks,
             default_branch: tracks && request.at.is_none() && request.branch == "HEAD",
+            tag: summary.tag,
             clone_id,
         })
     }
@@ -371,9 +375,91 @@ impl Client {
             }
             _ => {}
         }
-        let (root, ident) = self
-            .materialize_git(&urls, &pin.checkout, target, staging, cleanup, bench)
+        // The refs download and are checked alongside the packs, and are
+        // written once the clone's objects are in place. Only a Full takes
+        // every branch, as `git clone --depth` takes one.
+        let full = output.result == ExactResultKind::Full;
+        let root = stage(target, staging)?;
+        let tags_download = output.tags_artifact.clone().map(|hash| {
+            let (client, urls) = (self.clone(), urls.clone());
+            AbortOnDrop::new(
+                tokio::spawn(async move {
+                    let artifact = Artifact {
+                        hash: hash.clone(),
+                        len: None,
+                        slot: UrlSlot::Tags,
+                    };
+                    let bytes = client
+                        .download_bytes(&urls, &artifact)
+                        .await
+                        .with_context(|| format!("fetch tags artifact {hash}"))?;
+                    tokio::task::spawn_blocking(move || {
+                        crate::tags::check(crate::tags::decode(&bytes)?)
+                    })
+                    .await
+                    .context("tags task")?
+                }),
+                cleanup.clone(),
+            )
+        });
+        let branches = output.branches.clone().filter(|_| full);
+        let branches_download = branches.as_ref().map(|branches| {
+            let (client, urls) = (self.clone(), urls.clone());
+            let hash = branches.artifact.clone();
+            AbortOnDrop::new(
+                tokio::spawn(async move {
+                    let artifact = Artifact {
+                        hash: hash.clone(),
+                        len: None,
+                        slot: UrlSlot::Branches,
+                    };
+                    let bytes = client
+                        .download_bytes(&urls, &artifact)
+                        .await
+                        .with_context(|| format!("fetch branches artifact {hash}"))?;
+                    crate::branches::decode(&bytes)
+                }),
+                cleanup.clone(),
+            )
+        });
+        let side_download = branches
+            .and_then(|branches| branches.side_pack)
+            .map(|side| {
+                self.progress.add_total(side.pack_len + side.idx_len);
+                let (client, urls, dir) = (self.clone(), urls.clone(), root.clone());
+                AbortOnDrop::new(
+                    tokio::spawn(async move {
+                        let pack = Artifact {
+                            hash: side.pack.clone(),
+                            len: Some(side.pack_len),
+                            slot: UrlSlot::SidePack,
+                        };
+                        let idx = Artifact {
+                            hash: side.idx.clone(),
+                            len: Some(side.idx_len),
+                            slot: UrlSlot::SideIdx,
+                        };
+                        // Into the staging directory, so it moves into the
+                        // pack directory with a rename.
+                        let (pack, idx) = tokio::join!(
+                            client.download(&urls, &pack, Sink::TempFile(&dir)),
+                            client.download_bytes(&urls, &idx)
+                        );
+                        let Downloaded::TempFile(pack, _) = pack.context("fetch side pack")? else {
+                            unreachable!("temp file sink");
+                        };
+                        anyhow::Ok(SidePackFiles {
+                            pack,
+                            idx: idx.context("fetch side pack idx")?,
+                        })
+                    }),
+                    cleanup.clone(),
+                )
+            });
+        let ident = self
+            .materialize_git(&urls, &pin.checkout, &root, cleanup, bench)
             .await?;
+        let mut reaches = None;
         if let Plan::TopUp { base, upstream_url } = plan {
             self.progress
                 .phase(format!("fetching {} from upstream", &pin.commit[..7]));
@@ -385,7 +471,41 @@ impl Client {
                         pin.commit, base.commit
                     )
                 })?;
+            // After a force-push the base's objects are no part of the
+            // target's history, so holding a tag's target is not enough.
+            if !is_ancestor(&root, &base.commit, &pin.commit, cleanup).await? {
+                reaches = Some(pin.commit.as_str());
+            }
         }
+        let tags = match tags_download {
+            Some(download) => Some(download.join().await.context("tags download task")??),
+            None => None,
+        };
+        let origin_head = if full {
+            let branches = match branches_download {
+                Some(download) => Some(download.join().await.context("branches download task")??),
+                None => None,
+            };
+            let side = match side_download {
+                Some(download) => Some(download.join().await.context("side pack download task")??),
+                None => None,
+            };
+            let refs = FullRefs {
+                tags: tags.unwrap_or_default(),
+                branches,
+                side,
+            };
+            let upstream_url = self.top_up_url(repo_path).ok();
+            self.install_full_refs(&root, refs, upstream_url.as_deref(), pin, reaches, cleanup)
+                .await?
+        } else {
+            if let Some(kept) = tags {
+                let tip = (output.result == ExactResultKind::Head).then_some(pin.commit.as_str());
+                install_tags(&root, kept, reaches, tip, cleanup).await?;
+            }
+            pin.default_branch
+                .then(|| (pin.checkout.clone(), pin.commit.clone()))
+        };
         // The user's later fetches and pushes go to the locally configured
         // upstream, never to a URL the server names.
         let origin_url = match self.top_up_url(repo_path) {
@@ -395,13 +515,13 @@ impl Client {
         };
         let git_dir = root.join(".git");
         let shallow = output.result == ExactResultKind::Head;
-        write_git_config(&git_dir, &origin_url, pin, shallow)?;
+        write_git_config(&git_dir, &origin_url, pin, shallow, origin_head.as_ref())?;
         let ident = match ident {
             Some(ident) => Some(ident),
             None => reflog_ident(&root, &pin.commit, cleanup).await?,
         };
         if let Some(ident) = ident {
-            write_clone_reflogs(&git_dir, &origin_url, pin, &ident)?;
+            write_clone_reflogs(&git_dir, &origin_url, pin, &ident, origin_head.as_ref())?;
         }
         Ok(root)
     }
@@ -549,18 +669,16 @@ impl Client {
         &self,
         urls: &OutputUrls,
         checkout: &str,
-        target: &Path,
-        staging: &Staging,
+        root: &Path,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
-    ) -> Result<(PathBuf, Option<String>)> {
-        let root = stage(target, staging)?;
+    ) -> Result<Option<String>> {
         let (manifest, metadata, ident) = tokio::try_join!(
             async {
                 tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
                     .context("fetch manifest/metadata")
             },
-            init_git_dir(&root, cleanup),
+            init_git_dir(root, cleanup),
         )
         .map(|((manifest, metadata), ident)| (manifest, metadata, ident))?;
         bench.mark_manifest();
@@ -575,7 +693,7 @@ impl Client {
                 urls,
                 &manifest,
                 Some(&git_dir.join("objects").join("pack")),
-                &root,
+                root,
                 &metadata,
                 cleanup,
             )
@@ -587,7 +705,7 @@ impl Client {
             manifest.packs.len()
         );
         bench.mark_archive_download(bytes);
-        Ok((root, ident))
+        Ok(ident)
     }
 
     /// The clonepack manifest of `urls`' output, checked against its commit.
@@ -1051,6 +1169,112 @@ impl Client {
         Ok(total)
     }
 
+    /// Write a full clone's refs as `git clone` has them: every branch as
+    /// `refs/remotes/origin/*` and every tag, with all their objects. When
+    /// the clone holds the default branch's commit the side pack completes
+    /// every ref; otherwise the user's git fetches them from `upstream_url`.
+    /// Returns `origin/HEAD`'s branch and commit.
+    async fn install_full_refs(
+        &self,
+        root: &Path,
+        refs: FullRefs,
+        upstream_url: Option<&str>,
+        pin: &Pin,
+        reaches: Option<&str>,
+        cleanup: &Cleanup,
+    ) -> Result<Option<(String, String)>> {
+        let git_dir = root.join(".git");
+        let dir = git_dir.clone();
+        let (present, complete, refs) = tokio::task::spawn_blocking(move || {
+            let FullRefs {
+                tags,
+                branches,
+                side,
+            } = refs;
+            if let Some(side) = side {
+                install_side_pack(&dir, side)?;
+            }
+            let present = crate::tags::Present::scan(&dir)?;
+            // The clone's objects are whole histories, so holding a commit
+            // is holding its history; the side pack has the rest of each
+            // ref's history once the clone holds the base.
+            let complete = branches.as_ref().is_some_and(|branches| {
+                branches
+                    .base
+                    .as_deref()
+                    .is_some_and(|base| present.contains_hex(base))
+                    && (branches.branches.iter()).all(|(_, commit)| present.contains_hex(commit))
+            }) && (tags.tags.iter()).all(|tag| present.contains(tag.target_id()));
+            anyhow::Ok((present, complete, (tags, branches)))
+        })
+        .await
+        .context("refs task")??;
+        let (tags, branches) = refs;
+        // The checked out branch's remote-tracking ref is the installed
+        // commit, written over this one.
+        let commit_of = |name: &str, listed: Option<&str>| {
+            if pin.tracks && pin.checkout == name {
+                Some(pin.commit.clone())
+            } else {
+                listed.map(str::to_string)
+            }
+        };
+        if complete {
+            let branches = branches.expect("complete refs have branches");
+            let origin_head = branches.default_branch.clone().and_then(|name| {
+                let listed = (branches.branches.iter())
+                    .find(|(branch, _)| *branch == name)
+                    .map(|(_, commit)| commit.as_str());
+                commit_of(&name, listed).map(|commit| (name, commit))
+            });
+            tokio::task::spawn_blocking(move || {
+                crate::tags::write(&git_dir, &tags, &branches.branches, &present)
+            })
+            .await
+            .context("refs task")??;
+            return Ok(origin_head);
+        }
+        drop(present);
+        let fetched = match upstream_url {
+            Some(url) => {
+                self.progress
+                    .phase("fetching branches and tags from upstream");
+                fetch_refs(root, url, cleanup).await?
+            }
+            None => Err(anyhow::anyhow!(
+                "the provider has no local client configuration"
+            )),
+        };
+        if let Err(error) = fetched {
+            self.progress.warn(&format!(
+                "the clone has only its own branch and the tags it holds: \
+                 the other branches and tags could not be fetched: {error:#}"
+            ));
+            install_tags(root, tags, reaches, None, cleanup).await?;
+            return Ok(pin
+                .default_branch
+                .then(|| (pin.checkout.clone(), pin.commit.clone())));
+        }
+        let name = match branches.and_then(|branches| branches.default_branch) {
+            Some(name) => name,
+            None if pin.default_branch => pin.checkout.clone(),
+            None => return Ok(None),
+        };
+        let listed = git_stdout(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/remotes/origin/{name}"),
+            ],
+            cleanup,
+        )
+        .await
+        .ok();
+        Ok(commit_of(&name, listed.as_deref().map(str::trim)).map(|commit| (name, commit)))
+    }
+
     /// The URL a top-up fetches `repo_path` from: the locally configured
     /// provider's clone URL (`RIPCLONE_ORIGIN_BASE` applies to the default
     /// GitHub provider, as on the server). Never a URL from the server, so a
@@ -1213,9 +1437,52 @@ async fn git_capture(
 /// failure the error carries the end of its stderr. Cancelling the clone
 /// kills it.
 async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
+    run_git_answer(repo, args, cleanup, None).await.map(drop)
+}
+
+/// Whether `ancestor` is an ancestor of `commit`, by the user's git.
+async fn is_ancestor(repo: &Path, ancestor: &str, commit: &str, cleanup: &Cleanup) -> Result<bool> {
+    let args = ["merge-base", "--is-ancestor", ancestor, commit];
+    run_git_answer(repo, &args, cleanup, Some(1)).await
+}
+
+/// [`run_git`] for a git command that answers yes or no: `Ok(false)` when it
+/// exits with `no`.
+async fn run_git_answer(
+    repo: &Path,
+    args: &[&str],
+    cleanup: &Cleanup,
+    no: Option<i32>,
+) -> Result<bool> {
+    run_git_with(repo, args, cleanup, no, None).await
+}
+
+/// [`run_git`], returning what git printed.
+async fn git_stdout(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<String> {
+    use std::io::{Read, Seek};
+    let mut out = tempfile::tempfile().context("create git stdout file")?;
+    run_git_with(repo, args, cleanup, None, Some(&out)).await?;
+    out.rewind().context("rewind git stdout")?;
+    let mut text = String::new();
+    out.read_to_string(&mut text).context("read git stdout")?;
+    Ok(text)
+}
+
+/// Run the user's git in `repo`, with its output to `stdout` when given.
+async fn run_git_with(
+    repo: &Path,
+    args: &[&str],
+    cleanup: &Cleanup,
+    no: Option<i32>,
+    stdout: Option<&std::fs::File>,
+) -> Result<bool> {
     use std::io::{Read, Seek};
     use std::process::Stdio;
 
+    let stdout = match stdout {
+        Some(file) => Stdio::from(file.try_clone().context("clone git stdout file")?),
+        None => Stdio::null(),
+    };
     let mut stderr = tempfile::tempfile().context("create git stderr file")?;
     let child = tokio::process::Command::new("git")
         .args(["-c", "core.fsmonitor=false", "-c", "gc.auto=0"])
@@ -1223,7 +1490,7 @@ async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
         .arg(repo)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::from(
             stderr.try_clone().context("clone git stderr file")?,
         ))
@@ -1232,7 +1499,10 @@ async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
     let mut git = GitChild::new(child, cleanup.clone());
     let status = git.wait().await.context("wait for git")?;
     if status.success() {
-        return Ok(());
+        return Ok(true);
+    }
+    if no.is_some() && status.code() == no {
+        return Ok(false);
     }
     stderr.rewind().context("rewind git stderr")?;
     let mut detail = String::new();
@@ -1245,6 +1515,172 @@ async fn run_git(repo: &Path, args: &[&str], cleanup: &Cleanup) -> Result<()> {
         anyhow::bail!("git {} failed with {status}", args[0]);
     }
     anyhow::bail!("git {} failed: {tail}", args[0]);
+}
+
+/// Keep the tags whose target the clone holds, as `git clone --depth 1`
+/// gets them, and write them: the tag objects as one indexed pack, the refs
+/// as `packed-refs`. A depth-1 clone of `tip` keeps only the tags on `tip`
+/// and the objects of its tree, though older builds' packs bring more.
+/// After a force-pushed top-up the base's objects are no part of the
+/// target's history, so only the tags `reaches` reaches stay; git answers
+/// that from refs straight to each target, written for the purpose.
+async fn install_tags(
+    root: &Path,
+    mut kept: crate::tags::Kept,
+    reaches: Option<&str>,
+    tip: Option<&str>,
+    cleanup: &Cleanup,
+) -> Result<()> {
+    let git_dir = root.join(".git");
+    let dir = git_dir.clone();
+    let tip_owned = tip.map(str::to_string);
+    let (mut kept, present) = tokio::task::spawn_blocking(move || {
+        let present = crate::tags::Present::scan(&dir)?;
+        kept.retain(|tag| present.contains(tag.target_id()));
+        // A depth-1 clone holds one commit, the tip: a tag on any other
+        // commit goes from its object's kind, with no tree listing.
+        if let Some(tip) = tip_owned
+            && kept.tags.iter().any(|tag| tag.target != tip)
+        {
+            let repo = crate::gix_util::open_repo(&dir)?;
+            let mut kinds = std::collections::HashMap::new();
+            for tag in &kept.tags {
+                if tag.target != tip && !kinds.contains_key(tag.target_id()) {
+                    let id = gix::oid::from_bytes_unchecked(tag.target_id());
+                    let header = (repo.find_header(id))
+                        .with_context(|| format!("tag {}: find {}", tag.name, tag.target))?;
+                    kinds.insert(*tag.target_id(), header.kind());
+                }
+            }
+            kept.retain(|tag| {
+                tag.target == tip || kinds[tag.target_id()] != gix::object::Kind::Commit
+            });
+        }
+        anyhow::Ok((kept, present))
+    })
+    .await
+    .context("tags task")??;
+    // A tag on a tree or blob stays only when the tip's tree holds it.
+    if let Some(tip) = tip
+        && kept.tags.iter().any(|tag| tag.target != tip)
+    {
+        let tree = format!("{tip}^{{tree}}");
+        let root_tree = git_stdout(root, &["rev-parse", "--verify", &tree], cleanup).await?;
+        let listed =
+            git_stdout(root, &["ls-tree", "-r", "-t", "--full-tree", tip], cleanup).await?;
+        let held: std::collections::HashSet<&str> = (listed.lines())
+            .filter_map(|line| line.split_once('\t')?.0.split(' ').nth(2))
+            .chain([tip, root_tree.trim()])
+            .collect();
+        kept.retain(|tag| held.contains(tag.target.as_str()));
+    }
+    if let Some(commit) = reaches
+        && !kept.tags.is_empty()
+    {
+        crate::tags::write_target_refs(&git_dir, &kept)?;
+        let merged = format!("--merged={commit}");
+        let args = [
+            "for-each-ref",
+            &merged,
+            "--format=%(refname:lstrip=2)",
+            "refs/tags/",
+        ];
+        let reached = git_stdout(root, &args, cleanup).await?;
+        std::fs::remove_file(git_dir.join("packed-refs")).context("remove target refs")?;
+        let reached: std::collections::HashSet<&str> = reached.lines().collect();
+        kept.retain(|tag| reached.contains(tag.name.as_str()));
+    }
+    tokio::task::spawn_blocking(move || crate::tags::write(&git_dir, &kept, &[], &present))
+        .await
+        .context("tags task")?
+}
+
+/// A downloaded side pack and its idx, checked against their hashes.
+struct SidePackFiles {
+    pack: tempfile::NamedTempFile,
+    idx: bytes::Bytes,
+}
+
+/// What a full clone writes its refs from.
+struct FullRefs {
+    tags: crate::tags::Kept,
+    branches: Option<crate::branches::Branches>,
+    side: Option<SidePackFiles>,
+}
+
+/// Move the side pack into the clone's pack directory with its idx, named
+/// by the checksum both carry, as git names packs.
+fn install_side_pack(git_dir: &Path, side: SidePackFiles) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let integrity = "side pack integrity error";
+    let idx = &side.idx;
+    anyhow::ensure!(idx.len() >= 40, "{integrity}: idx too short");
+    let checksum = &idx[idx.len() - 40..idx.len() - 20];
+    let mut file = side.pack.as_file().try_clone().context("open side pack")?;
+    let mut trailer = [0u8; 20];
+    file.seek(SeekFrom::End(-20))
+        .and_then(|_| file.read_exact(&mut trailer))
+        .context("read side pack trailer")?;
+    anyhow::ensure!(
+        trailer == checksum,
+        "{integrity}: the idx is not the pack's"
+    );
+    let name = hex::encode(trailer);
+    let dir = git_dir.join("objects").join("pack");
+    side.pack
+        .persist(dir.join(format!("pack-{name}.pack")))
+        .with_context(|| format!("install side pack {name}"))?;
+    // The idx last: git ignores a pack until its idx is there.
+    std::fs::write(dir.join(format!("pack-{name}.idx")), idx)
+        .with_context(|| format!("write side pack idx {name}"))
+}
+
+/// Fetch every upstream branch and tag with the user's git, as `git clone`
+/// does, and pack the refs as it leaves them. A failure on this machine,
+/// such as git that cannot start, a full disk or refs it cannot write,
+/// fails the clone as the outer error; one of the upstream or the network
+/// is the inner error, and leaves the clone with its own branch.
+async fn fetch_refs(root: &Path, upstream_url: &str, cleanup: &Cleanup) -> Result<Result<()>> {
+    let fetch = [
+        "fetch",
+        "--no-write-fetch-head",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--refmap=",
+        "--",
+        upstream_url,
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/*:refs/tags/*",
+    ];
+    if let Err(error) = run_git(root, &fetch, cleanup).await {
+        let error = error.context(format!("fetch branches and tags from {upstream_url}"));
+        return if local_failure(&error) {
+            Err(error)
+        } else {
+            Ok(Err(error))
+        };
+    }
+    run_git(root, &["pack-refs", "--all"], cleanup)
+        .await
+        .context("pack refs")?;
+    Ok(Ok(()))
+}
+
+/// Whether git failed on this machine rather than at the upstream: it
+/// could not run, or its message names a local write failure.
+fn local_failure(error: &anyhow::Error) -> bool {
+    const LOCAL: [&str; 5] = [
+        "No space left on device",
+        "Disk quota exceeded",
+        "Read-only file system",
+        "unable to write",
+        "unable to create",
+    ];
+    let text = format!("{error:#}");
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        || LOCAL.iter().any(|local| text.contains(local))
 }
 
 /// Create the clone's staging directory and hand it to the reaper.
@@ -1299,13 +1735,21 @@ fn write_git_dir(
 /// clone fetches only that branch, as `git clone --depth` sets up. `git pull`
 /// then works in the clone. `checkStat = minimal` lets git trust the
 /// prebuilt index's stat data, so the first `git status` reads no file.
-fn write_git_config(git_dir: &Path, origin_url: &str, pin: &Pin, shallow: bool) -> Result<()> {
+fn write_git_config(
+    git_dir: &Path,
+    origin_url: &str,
+    pin: &Pin,
+    shallow: bool,
+    origin_head: Option<&(String, String)>,
+) -> Result<()> {
     let path = git_dir.join("config");
     let mut config = std::fs::read_to_string(&path).context("read the config git init wrote")?;
     config.push_str("[core]\n\tcheckStat = minimal\n");
     let refspec = if shallow && pin.tracks {
         let branch = &pin.checkout;
         format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    } else if let Some(tag) = pin.tag.as_deref().filter(|_| shallow) {
+        format!("+refs/tags/{tag}:refs/tags/{tag}")
     } else {
         "+refs/heads/*:refs/remotes/origin/*".to_string()
     };
@@ -1314,6 +1758,7 @@ fn write_git_config(git_dir: &Path, origin_url: &str, pin: &Pin, shallow: bool) 
         quoted(origin_url),
         quoted(&refspec)
     ));
+    let remote = git_dir.join("refs").join("remotes").join("origin");
     if pin.tracks {
         let branch = &pin.checkout;
         config.push_str(&format!(
@@ -1321,44 +1766,52 @@ fn write_git_config(git_dir: &Path, origin_url: &str, pin: &Pin, shallow: bool) 
             quoted(branch),
             quoted(&format!("refs/heads/{branch}"))
         ));
-        let remote = git_dir.join("refs").join("remotes").join("origin");
         let tracking = remote.join(branch);
         std::fs::create_dir_all(tracking.parent().context("remote-tracking ref")?)?;
         std::fs::write(&tracking, format!("{}\n", pin.commit))?;
-        if pin.default_branch {
-            std::fs::write(
-                remote.join("HEAD"),
-                format!("ref: refs/remotes/origin/{branch}\n"),
-            )?;
-        }
+    }
+    if let Some((branch, _)) = origin_head {
+        std::fs::create_dir_all(&remote)?;
+        std::fs::write(
+            remote.join("HEAD"),
+            format!("ref: refs/remotes/origin/{branch}\n"),
+        )?;
     }
     std::fs::write(&path, config)?;
     Ok(())
 }
 
-/// The reflog entries `git clone` starts with: HEAD, the checked out branch,
-/// and `origin/HEAD`, each created at the installed commit by `ident` (name,
-/// email and time) with `clone: from <url>`. Credentials in the URL are left
-/// out, as git does. Earlier entries, from a top-up's reset, are replaced.
-fn write_clone_reflogs(git_dir: &Path, origin_url: &str, pin: &Pin, ident: &str) -> Result<()> {
-    let entry = format!(
-        "{} {} {ident}\tclone: from {}\n",
-        "0".repeat(pin.commit.len()),
-        pin.commit,
-        without_credentials(origin_url)
-    );
+/// The reflog entries `git clone` starts with: HEAD and the checked out
+/// branch at the installed commit, and `origin/HEAD` at its branch's, each
+/// created by `ident` (name, email and time) with `clone: from <url>`.
+/// Credentials in the URL are left out, as git does. Earlier entries, from
+/// a top-up's reset, are replaced.
+fn write_clone_reflogs(
+    git_dir: &Path,
+    origin_url: &str,
+    pin: &Pin,
+    ident: &str,
+    origin_head: Option<&(String, String)>,
+) -> Result<()> {
+    let url = without_credentials(origin_url);
+    let entry = |commit: &str| {
+        format!(
+            "{} {commit} {ident}\tclone: from {url}\n",
+            "0".repeat(commit.len()),
+        )
+    };
     let logs = git_dir.join("logs");
-    let mut refs = vec![PathBuf::from("HEAD")];
+    let mut refs = vec![(PathBuf::from("HEAD"), pin.commit.as_str())];
     if !pin.checkout.is_empty() {
-        refs.push(Path::new("refs/heads").join(&pin.checkout));
+        refs.push((Path::new("refs/heads").join(&pin.checkout), &pin.commit));
     }
-    if pin.default_branch {
-        refs.push(PathBuf::from("refs/remotes/origin/HEAD"));
+    if let Some((_, commit)) = origin_head {
+        refs.push((PathBuf::from("refs/remotes/origin/HEAD"), commit));
     }
-    for name in refs {
+    for (name, commit) in refs {
         let log = logs.join(name);
         std::fs::create_dir_all(log.parent().context("reflog path")?)?;
-        std::fs::write(&log, &entry).with_context(|| format!("write {}", log.display()))?;
+        std::fs::write(&log, entry(commit)).with_context(|| format!("write {}", log.display()))?;
     }
     Ok(())
 }

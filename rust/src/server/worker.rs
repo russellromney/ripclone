@@ -449,13 +449,7 @@ async fn publish_or_fail(
 /// Queue every artifact the build pinned but `keep` does not name for
 /// deletion now. Deletion keeps those that any published output names.
 async fn discard(state: &ServerState, claim: &Claim, pins: &PinSet, keep: &BTreeSet<String>) {
-    let mut hashes = pins.hashes();
-    hashes.retain(|hash| !keep.contains(hash));
-    if hashes.is_empty() {
-        return;
-    }
-    let now = crate::control::Clock::now(&crate::control::SystemClock);
-    if let Err(error) = state.control.queue_deletions(&hashes, now).await {
+    if let Err(error) = super::purge::queue_unnamed(state, pins, keep).await {
         warn!(
             "queue the unnamed {} artifacts of {}@{} for deletion: {error:#}",
             claim.kind(),
@@ -613,46 +607,57 @@ async fn head_output(
     let t = Instant::now();
     ensure_commit(state, repo_id, commit, &mirror_dir, &lock).await?;
     phases.mirror_fetch_ms = Some(duration_ms(t.elapsed()));
-    let (prep_dir, prep_commit) = (mirror_dir.clone(), commit.to_string());
-    let parent = cancel::spawn_blocking(move || -> Result<Option<String>> {
-        let resolved = git::resolve_commit(&prep_dir, &prep_commit)
-            .with_context(|| format!("resolve admitted commit {prep_commit}"))?;
-        anyhow::ensure!(
-            resolved == prep_commit,
-            "admitted commit resolved unexpectedly: requested {prep_commit}, got {resolved}"
-        );
-        Ok(git::parent_commit(&prep_dir, &prep_commit).ok().flatten())
-    })
-    .await
-    .context("mirror prep task")??;
+    // The tags this fetch brought are in the mirror now (see `tags`); they
+    // publish while Head builds, and before Head is ready.
+    let build = async {
+        let (prep_dir, prep_commit) = (mirror_dir.clone(), commit.to_string());
+        let parent = cancel::spawn_blocking(move || -> Result<Option<String>> {
+            let resolved = git::resolve_commit(&prep_dir, &prep_commit)
+                .with_context(|| format!("resolve admitted commit {prep_commit}"))?;
+            anyhow::ensure!(
+                resolved == prep_commit,
+                "admitted commit resolved unexpectedly: requested {prep_commit}, got {resolved}"
+            );
+            Ok(git::parent_commit(&prep_dir, &prep_commit).ok().flatten())
+        })
+        .await
+        .context("mirror prep task")??;
 
-    // Head packs are a base plus levels: the new base Full of the base
-    // commit packed, else the base commit's Head packs, else none.
-    let base_row = ancestor_base(state, claim, ExactResultKind::Head, &mirror_dir).await?;
-    let base_head = base_row.as_ref().and_then(|row| row.head.ready());
-    let base = base_row
-        .as_ref()
-        .and_then(|row| row.full.ready())
-        .and_then(|full| full.head_base.clone())
-        .or_else(|| {
-            base_head.map(|head| crate::HeadBase {
-                commit: head.base_commit.clone(),
-                packs: head.base_packs.clone(),
-                levels: head.levels.clone(),
-            })
-        });
-    Cancel::check_current()?;
-    let result = build_head_result(
-        cas,
-        &mirror_dir,
-        commit,
-        parent.clone(),
-        base,
-        &state.storage,
-        phases,
-    )
-    .await?;
-    Ok(Output::Head { result, parent })
+        // Head packs are a base plus levels: the new base Full of the base
+        // commit packed, else the base commit's Head packs, else none.
+        let base_row = ancestor_base(state, claim, ExactResultKind::Head, &mirror_dir).await?;
+        let base_head = base_row.as_ref().and_then(|row| row.head.ready());
+        let base = base_row
+            .as_ref()
+            .and_then(|row| row.full.ready())
+            .and_then(|full| full.head_base.clone())
+            .or_else(|| {
+                base_head.map(|head| crate::HeadBase {
+                    commit: head.base_commit.clone(),
+                    packs: head.base_packs.clone(),
+                    levels: head.levels.clone(),
+                })
+            });
+        Cancel::check_current()?;
+        let result = build_head_result(
+            cas,
+            &mirror_dir,
+            commit,
+            parent.clone(),
+            base,
+            &state.storage,
+            phases,
+        )
+        .await?;
+        Ok(Output::Head { result, parent })
+    };
+    // The tags store through the build's pins, so what they stored is
+    // queued with the build's artifacts if the build fails and drops them.
+    let (output, _) = tokio::try_join!(
+        build,
+        super::refs::publish_pinned(state, repo_id, super::refs::Scope::Tags, cas)
+    )?;
+    Ok(output)
 }
 
 async fn build_files(
@@ -1177,6 +1182,12 @@ mod tests {
         }
         async fn known_repos(&self) -> Result<Vec<RepoId>> {
             self.inner.known_repos().await
+        }
+        async fn get_refs(&self, repo: &RepoId) -> Result<Option<crate::control::RepoRefs>> {
+            self.inner.get_refs(repo).await
+        }
+        async fn set_refs(&self, repo: &RepoId, refs: &crate::control::RepoRefs) -> Result<bool> {
+            self.inner.set_refs(repo, refs).await
         }
         async fn health(&self) -> Result<()> {
             self.inner.health().await

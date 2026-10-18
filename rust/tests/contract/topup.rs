@@ -4,9 +4,10 @@
 use crate::harness::*;
 
 /// A private repo on an origin that accepts two credentials: the server's
-/// provider token and the user's own git credential. Full(A) is ready; then
-/// the server restarts with no Files or Full slots and the origin parks every
-/// fetch except the user's, so no build of a later commit can finish.
+/// provider token and the user's own git credential. Full(A) is ready, and A
+/// has a tagged parent P; then the server restarts with no Files or Full
+/// slots and the origin parks every fetch except the user's, so no build of
+/// a later commit can finish.
 struct TopUp {
     world: World,
     http: GitHttp,
@@ -15,12 +16,20 @@ struct TopUp {
     repo: String,
     /// Where the CLI's provider config says the repo lives.
     upstream: String,
+    p: String,
     a: String,
     user_auth: String,
+    /// The origin parks the server's fetches.
+    held: bool,
 }
 
 impl TopUp {
     fn new(name: &str) -> Self {
+        Self::start(name, true)
+    }
+
+    /// [`TopUp::new`], with the server's fetches parked when `held`.
+    fn start(name: &str, held: bool) -> Self {
         let world = World::new();
         let http = world.serve_origins_over_http();
         let server_auth = basic("x-access-token", "server-secret");
@@ -28,8 +37,16 @@ impl TopUp {
         http.require_header("authorization", &server_auth);
         http.require_header("authorization", &user_auth);
         let origin = world.origin("acme", name);
+        let p = origin.commit(&[("p.txt", "p\n")], "P");
+        git(&origin.work, &["tag", "-a", "-m", "release p", "v-p"]);
         let a = origin.commit(&[("a.txt", "a\n"), ("d/b.txt", "b\n")], "A");
+        git(&origin.work, &["tag", "-a", "-m", "release a", "v-a"]);
+        git(&origin.work, &["tag", "light-a"]);
         origin.publish();
+        git(
+            &origin.work,
+            &["push", "-q", origin.bare.to_str().unwrap(), "--tags"],
+        );
 
         world.server_providers(http.url(), &[("gh", "github", serde_json::json!({}))]);
         let mut server = world.server(&[("RIPCLONE_TOKEN_GH", "server-secret")]);
@@ -37,8 +54,14 @@ impl TopUp {
         let repo = format!("gh:acme/{name}");
         let upstream = format!("{}/acme/{name}.git", http.url());
         world.cli(&server, &["add", &repo, "--wait"]).ok();
+        // The first build's refs refresh runs after it, and a restart would
+        // stop it: then no refs name the branches and every clone fetches
+        // them upstream.
+        wait_first_refs(&server, &repo, &a);
         server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
-        http.hold_fetches_without("authorization", &user_auth);
+        if held {
+            http.hold_fetches_without("authorization", &user_auth);
+        }
         Self {
             world,
             http,
@@ -46,13 +69,17 @@ impl TopUp {
             server,
             repo,
             upstream,
+            p,
             a,
             user_auth,
+            held,
         }
     }
 
     /// Full-clone the branch, with the user's credential in their git config,
-    /// and check the clone equals the origin at `b`.
+    /// and check the clone equals the origin at `b`. It has every tag and
+    /// remote-tracking branch, as a `git clone` does: A's tags too when B
+    /// was force-pushed.
     fn clone_equals_origin(&self, b: &str) {
         let target = self.world.target("clone");
         let header = format!("Authorization: {}", self.user_auth);
@@ -89,6 +116,16 @@ impl TopUp {
             git(&target, &["rev-list", "--count", "HEAD"]),
             self.origin.count(b)
         );
+        let (refs, all, tags) = git_clone_tags(&self.origin.bare, &[]);
+        for tag in ["v-a tag", "light-a commit", "v-p tag"] {
+            assert!(refs.contains(tag), "{refs}");
+        }
+        assert_eq!(tag_refs(&target), refs);
+        assert_eq!(describe(&target), (all, tags));
+        assert_eq!(
+            remote_refs(&target),
+            git_clone_remotes(&self.origin.bare, &[])
+        );
         let fsck = git_output(&target, &["fsck", "--no-dangling", "--no-progress"]);
         assert!(
             fsck.status.success() && fsck.stdout.is_empty() && fsck.stderr.is_empty(),
@@ -98,14 +135,16 @@ impl TopUp {
 
         // The server tried to build B and is still parked: the clone did not
         // wait on it.
-        self.http.wait_held(1);
+        if self.held {
+            self.http.wait_held(1);
+        }
+        // One fetch of the user's: the top-up. The other refs are the
+        // server's, so no fetch of every branch and tag follows.
         let requests = self.http.requests();
-        assert!(
-            requests
-                .iter()
-                .any(|r| r.header("authorization") == Some(self.user_auth.as_str())),
-            "the user's git never reached the origin"
-        );
+        let user_fetches = (requests.iter())
+            .filter(|r| r.fetch && r.header("authorization") == Some(self.user_auth.as_str()))
+            .count();
+        assert_eq!(user_fetches, 1, "the user's git fetches");
         for request in &requests {
             for (name, value) in &request.headers {
                 assert!(
@@ -152,13 +191,13 @@ fn e2_top_up_across_a_merge() {
     t.clone_equals_origin(&b);
 }
 
-/// E3: a force-push replaces the history; A is not an ancestor of B.
+/// E3: a force-push replaces the history after P; A is not an ancestor of
+/// B, and P's tag stays while A's go.
 #[test]
 fn e3_top_up_after_a_force_push() {
     let t = TopUp::new("e3");
     let work = &t.origin.work;
-    git(work, &["checkout", "-q", "--orphan", "rewritten"]);
-    git(work, &["rm", "-q", "-r", "-f", "d"]);
+    git(work, &["checkout", "-q", "-b", "rewritten", &t.p]);
     t.origin.commit(&[("a.txt", "r1\n")], "R1");
     t.origin.commit(&[("e.txt", "e\n")], "B");
     git(work, &["branch", "-q", "-M", "main"]);
@@ -169,6 +208,36 @@ fn e3_top_up_after_a_force_push() {
             .status
             .success()
     );
+
+    t.clone_equals_origin(&b);
+}
+
+/// E5: Head(B) is built while Full(B) waits for a slot. A tag pushed with
+/// B comes with Head's fetch, and the top-up clone of B has it although its
+/// own fetch takes no tags.
+#[test]
+fn e5_top_up_has_the_tags_pushed_with_b() {
+    let t = TopUp::start("e5", false);
+    let b = t.origin.commit(&[("a.txt", "a2\n")], "B");
+    git(&t.origin.work, &["tag", "-a", "-m", "release b", "v-b"]);
+    t.origin.publish();
+    git(
+        &t.origin.work,
+        &["push", "-q", t.origin.bare.to_str().unwrap(), "--tags"],
+    );
+    let builds = "/v1/repos/gh/acme/e5/builds";
+    let (status, _) = api::parse(
+        t.server
+            .post_json(builds, &serde_json::json!({ "selector": "main" })),
+    );
+    assert_eq!(status, 200);
+    let head = format!("/v1/repos/gh/acme/e5/commits/{b}?kind=head");
+    wait_for("Head(B)", || {
+        let (_, body) = api::parse(t.server.get(&head));
+        body["clonepack_manifest"].is_string().then_some(())
+    });
+    let (refs, _, _) = git_clone_tags(&t.origin.bare, &[]);
+    assert!(refs.contains("v-b tag"), "{refs}");
 
     t.clone_equals_origin(&b);
 }

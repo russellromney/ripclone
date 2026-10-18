@@ -26,12 +26,12 @@ impl WebhookProvider for GitLab {
     }
 
     fn parse(&self, headers: &HeaderMap, raw: &[u8]) -> Option<CanonicalEvent> {
-        // Only the branch-push event. "Tag Push Hook", "Note Hook", etc. are
-        // ignored (None ⇒ acknowledged without action).
+        // Only the push events, of branches and of tags. "Note Hook", etc.
+        // are ignored (None ⇒ acknowledged without action).
         let event = headers
             .get("X-Gitlab-Event")
             .and_then(|v| v.to_str().ok())?;
-        if event != "Push Hook" {
+        if event != "Push Hook" && event != "Tag Push Hook" {
             return None;
         }
         let payload: PushPayload = serde_json::from_slice(raw).ok()?;
@@ -39,7 +39,7 @@ impl WebhookProvider for GitLab {
         let deleted = payload.after.as_deref().map(is_zero_sha).unwrap_or(true);
         Some(CanonicalEvent {
             kind: if deleted {
-                EventKind::BranchDelete
+                EventKind::Delete
             } else {
                 EventKind::Push
             },
@@ -130,17 +130,22 @@ mod tests {
     fn parse_zero_after_is_a_branch_delete() {
         let body = br#"{"ref":"refs/heads/dead","after":"0000000000000000000000000000000000000000","project":{"path_with_namespace":"g/p"}}"#;
         let ev = GitLab.parse(&headers("Push Hook", None), body).unwrap();
-        assert_eq!(ev.kind, EventKind::BranchDelete);
+        assert_eq!(ev.kind, EventKind::Delete);
         assert_eq!(ev.after, None);
     }
 
     #[test]
     fn parse_ignores_non_push_hooks() {
-        assert!(
-            GitLab
-                .parse(&headers("Tag Push Hook", None), PUSH)
-                .is_none()
-        );
         assert!(GitLab.parse(&headers("Note Hook", None), PUSH).is_none());
+        assert!(GitLab.parse(&headers("Issue Hook", None), PUSH).is_none());
+    }
+
+    #[test]
+    fn parse_tag_push() {
+        let body =
+            br#"{"ref":"refs/tags/v1","after":"abc","project":{"path_with_namespace":"g/p"}}"#;
+        let ev = GitLab.parse(&headers("Tag Push Hook", None), body).unwrap();
+        assert_eq!(ev.kind, EventKind::Push);
+        assert_eq!(ev.ref_, "refs/tags/v1");
     }
 }

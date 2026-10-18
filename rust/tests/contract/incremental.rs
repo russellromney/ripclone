@@ -309,8 +309,9 @@ fn j4_missing_mirror_falls_back_to_a_cold_build() {
     clones_exact(&world, &server, &origin, "j4-u", &[], &u, "main");
 }
 
-/// J5: a branch with no history in common with the built main builds cold,
-/// and its clones have none of main's commits.
+/// J5: a branch with no history in common with the built main builds cold.
+/// Its depth-1 clone has none of main's commits; its full clone has main's
+/// as `git clone --branch` does, main being a branch.
 #[test]
 fn j5_unrelated_branch_builds_cold() {
     let world = World::new();
@@ -335,7 +336,8 @@ fn j5_unrelated_branch_builds_cold() {
         &o,
         "other",
     );
-    assert!(!has_commit(&world.target("j5-full"), &a));
+    assert!(!has_commit(&world.target("j5-depth1"), &a));
+    assert!(has_commit(&world.target("j5-full"), &a));
 }
 
 /// A depth-1 clone of `commit` is exact: HEAD, tree, clean status, fsck.

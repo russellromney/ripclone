@@ -364,3 +364,143 @@ fn k5_a_server_paused_past_its_lease_builds_each_output_once() {
     assert_eq!(http.fetches(), 1, "the origin was fetched again");
     assert_eq!(server.metric("ripclone_builds_failed_total"), 0);
 }
+
+/// K6: a refresh building the side pack holds no build. While the server's
+/// `pack-objects` of the side pack is held, a push to the default branch
+/// with a new tag builds Head(B), and a depth-1 clone of B has the tag.
+/// Once released, a full clone has the side branch and the tag, as
+/// `git clone` does.
+#[test]
+fn k6_a_side_pack_build_holds_no_head() {
+    let world = World::new();
+    let origin = world.origin("acme", "k6");
+    let (work, bare) = (&origin.work, origin.bare.to_str().unwrap());
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let wrapper = GitWrapper::new(
+        &world,
+        "server",
+        r#"case " $* " in *" pack-objects "*"/side "*) mark side-pack; await_mark release ;; esac"#,
+    );
+    let secret = "k6-secret";
+    let server = world.server(&[
+        ("RIPCLONE_WEBHOOK_SECRET_GITHUB", secret),
+        ("PATH", &wrapper.path),
+    ]);
+    world.cli(&server, &["add", "acme/k6", "--wait"]).ok();
+    wait_first_refs(&server, "acme/k6", &a);
+
+    git(work, &["checkout", "-q", "-b", "side"]);
+    let s = origin.commit(&[("s.txt", "s\n")], "S");
+    git(work, &["checkout", "-q", "main"]);
+    origin.publish_branch("side");
+    github_push(&server, secret, "acme/k6", "refs/heads/side", &s);
+    wait_for("the side pack build", || {
+        wrapper.marked("side-pack").then_some(())
+    });
+
+    let b = origin.commit(&[("b.txt", "b\n")], "B");
+    git(work, &["tag", "-a", "-m", "release b", "v-b"]);
+    origin.publish();
+    git(work, &["push", "-q", bare, "v-b"]);
+    github_push(&server, secret, "acme/k6", "refs/heads/main", &b);
+    wait_output(&server, "acme/k6", &b, "head", "ready");
+    let shallow = world.target("shallow");
+    world
+        .cli_env(
+            &server,
+            &[
+                "clone",
+                "acme/k6",
+                shallow.to_str().unwrap(),
+                "--depth",
+                "1",
+            ],
+            &[NO_UPSTREAM],
+        )
+        .ok();
+    assert_eq!(git(&shallow, &["rev-parse", "HEAD"]), b);
+    let tag = git(&origin.bare, &["rev-parse", "refs/tags/v-b"]);
+    assert_eq!(tag_refs(&shallow), format!("v-b tag {tag}"));
+    assert!(
+        !wrapper.marked("release"),
+        "the side pack was released early"
+    );
+
+    wrapper.mark("release");
+    wait_output(&server, "acme/k6", &b, "full", "ready");
+    wait_for("the side branch's publish", || {
+        let (_, body) = api::read_commit(&server, "acme/k6", &b, Some("full"));
+        body["branches"]["side_pack"].is_object().then_some(())
+    });
+    let full = world.target("full");
+    let out = world.cli_env(
+        &server,
+        &["clone", "acme/k6", full.to_str().unwrap()],
+        &[NO_UPSTREAM],
+    );
+    out.ok();
+    assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    assert_eq!(git(&full, &["rev-parse", "HEAD"]), b);
+    assert_eq!(remote_refs(&full), git_clone_remotes(&origin.bare, &[]));
+    assert_eq!(tag_refs(&full), git_clone_tags(&origin.bare, &[]).0);
+    git(&full, &["fsck", "--strict"]);
+}
+
+/// K7: a refs refresh that fails still runs the refresh asked for while it
+/// ran. The first refresh's fetch is held, a side branch is pushed with its
+/// webhook, and the held fetch then fails: the server logs it, refreshes
+/// again, and a full clone has the side branch from the server's refs.
+#[test]
+fn k7_a_failed_refresh_runs_the_one_asked_for_meanwhile() {
+    let world = World::new();
+    let origin = world.origin("acme", "k7");
+    let work = &origin.work;
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let wrapper = GitWrapper::new(
+        &world,
+        "server",
+        r#"case " $* " in *" fetch --atomic --prune "*)
+            if [ ! -e "$MARKS/failed" ]; then
+                mark fetching; await_mark fail; mark failed
+                echo "fatal: k7 refresh failure" >&2; exit 1
+            fi ;;
+        esac"#,
+    );
+    let secret = "k7-secret";
+    let server = world.server(&[
+        ("RIPCLONE_WEBHOOK_SECRET_GITHUB", secret),
+        ("PATH", &wrapper.path),
+    ]);
+    let (status, body) = api::add(&server, "acme/k7");
+    assert!((200..300).contains(&status), "{status} {body}");
+    wait_for("the first refresh's fetch", || {
+        wrapper.marked("fetching").then_some(())
+    });
+
+    git(work, &["checkout", "-q", "-b", "side"]);
+    let s = origin.commit(&[("s.txt", "s\n")], "S");
+    git(work, &["checkout", "-q", "main"]);
+    origin.publish_branch("side");
+    github_push(&server, secret, "acme/k7", "refs/heads/side", &s);
+    wrapper.mark("fail");
+
+    wait_first_refs(&server, "acme/k7", &a);
+    let log = server.log();
+    assert_eq!(log.matches("k7 refresh failure").count(), 1, "{log}");
+    let full = world.target("full");
+    let out = world.cli_env(
+        &server,
+        &["clone", "acme/k7", full.to_str().unwrap()],
+        &[NO_UPSTREAM],
+    );
+    out.ok();
+    assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    assert!(
+        remote_refs(&full).contains(&format!("origin/side {s}")),
+        "{}",
+        remote_refs(&full)
+    );
+    assert_eq!(remote_refs(&full), git_clone_remotes(&origin.bare, &[]));
+}

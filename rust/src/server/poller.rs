@@ -1,9 +1,9 @@
-//! Polling fallback: admit the upstream HEAD of every added repository.
+//! Polling fallback: admit the upstream HEAD of every added repository, and
+//! refresh its refs when upstream's changed.
 
 use super::ServerState;
-use super::api::{admit_build, resolve};
+use super::api::{admit_build, resolve_head_and_refs};
 use crate::provider::RepoId;
-use crate::validation::Selector;
 use futures::StreamExt;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -41,8 +41,9 @@ pub async fn poll_once(state: &ServerState) -> usize {
         .await
 }
 
-/// Resolve one repository's HEAD and admit it. True when a build was
-/// admitted.
+/// Resolve one repository's HEAD and admit it, then refresh its refs if
+/// upstream's differ from the last refresh's: the same `ls-remote` lists
+/// them. True when a build was admitted.
 async fn poll_repo(state: &ServerState, repo_id: RepoId) -> bool {
     let Some(provider) = state
         .provider_registry
@@ -51,8 +52,8 @@ async fn poll_repo(state: &ServerState, repo_id: RepoId) -> bool {
     else {
         return false; // unknown provider; skip
     };
-    let resolved = match resolve(state, &repo_id, &provider, &Selector::Head).await {
-        Ok(resolved) => resolved,
+    let (resolved, refs) = match resolve_head_and_refs(state, &repo_id, &provider).await {
+        Ok(listed) => listed,
         Err(error) => {
             warn!(
                 "poll: resolve HEAD of {} failed: {}",
@@ -62,15 +63,32 @@ async fn poll_repo(state: &ServerState, repo_id: RepoId) -> bool {
             return false;
         }
     };
-    match admit_build(
+    let admitted = admit_build(
         state,
         &repo_id,
         &resolved.commit,
         resolved.ref_name.as_deref(),
         false,
     )
-    .await
-    {
+    .await;
+    // After the admission, so a tag pushed with the new HEAD comes with its
+    // fetch rather than waiting on this refresh.
+    match super::refs::changed(state, &repo_id, &refs).await {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Err(error) = super::refs::refresh(state, &repo_id).await {
+                warn!(
+                    "poll: refs refresh of {} failed: {error:#}",
+                    repo_id.storage_key()
+                );
+            }
+        }
+        Err(error) => warn!(
+            "poll: read refs of {} failed: {error:#}",
+            repo_id.storage_key()
+        ),
+    }
+    match admitted {
         Ok((_, true)) => {
             info!(
                 "poll: admitted HEAD build for {} at {}",

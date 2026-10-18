@@ -52,10 +52,10 @@ pub struct CanonicalEvent {
 /// is not one of these parses to `None` (ignored with a `200`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
-    /// A branch advanced — warm it.
+    /// A branch advanced — warm it — or a tag was pushed.
     Push,
-    /// A branch was deleted — acknowledge without changing durable exact results.
-    BranchDelete,
+    /// A branch or tag was deleted.
+    Delete,
     /// A provider connectivity check — acknowledge with `200`.
     Ping,
 }

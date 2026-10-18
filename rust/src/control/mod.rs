@@ -171,6 +171,71 @@ pub struct AddedRepo {
     pub added_at: u64,
 }
 
+/// A repository's published refs: the newest tags artifact, and the
+/// branches artifact and side pack of the last refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoRefs {
+    /// CAS id of the zstd-compressed `TagsArtifact`.
+    pub tags_artifact: String,
+    pub tags_len: u64,
+    /// Tags in the artifact; a clone downloads nothing when there are none.
+    pub tags_count: u64,
+    /// Hash of the mirror's `refs/tags/` listing the tags artifact was
+    /// built from.
+    pub tags_hash: String,
+    /// What the last refresh published; `None` before the first.
+    pub branches: Option<RepoBranches>,
+}
+
+impl RepoRefs {
+    /// Every stored artifact the refs name.
+    pub fn artifacts(&self) -> std::collections::BTreeSet<&str> {
+        let mut hashes = std::collections::BTreeSet::from([self.tags_artifact.as_str()]);
+        if let Some(branches) = &self.branches {
+            hashes.insert(&branches.artifact);
+            if let Some(side) = &branches.side_pack {
+                hashes.insert(&side.pack);
+                hashes.insert(&side.idx);
+            }
+        }
+        hashes.retain(|hash| !hash.is_empty());
+        hashes
+    }
+}
+
+/// The branches a refresh published, for full clones.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoBranches {
+    /// CAS id of the zstd-compressed `BranchesArtifact`.
+    pub artifact: String,
+    pub len: u64,
+    /// `branches::refs_hash` of the mirror's refs it was built from, which
+    /// the poller compares with upstream's.
+    pub refs_hash: String,
+    /// The branch the mirror's `HEAD` named; `None` when it named none.
+    pub default_branch: Option<String>,
+    /// The default branch's commit.
+    pub base: Option<String>,
+    /// The commit the side pack leaves out the history of: `base`, or an
+    /// older default branch commit in its history when the side pack was
+    /// kept from an earlier refresh.
+    pub side_base: Option<String>,
+    /// `branches::MirrorRefs::side_tips_hash` of the refs the side pack
+    /// was built from.
+    pub side_tips: String,
+    /// `None` when every ref is in the default branch's history.
+    pub side_pack: Option<SidePack>,
+}
+
+/// The CAS ids and lengths of a side pack and its idx.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SidePack {
+    pub pack: String,
+    pub pack_len: u64,
+    pub idx: String,
+    pub idx_len: u64,
+}
+
 /// Epoch-seconds time source. Tests use a manual clock.
 pub trait Clock: Send + Sync {
     fn now(&self) -> i64;
@@ -266,7 +331,7 @@ pub trait ControlStore: Send + Sync {
     async fn get_repo(&self, repo: &RepoId) -> Result<Option<AddedRepo>>;
     async fn list_repos(&self) -> Result<Vec<AddedRepo>>;
     /// Delete the repository, in one transaction: drop it from the added
-    /// set, delete its build rows and artifact references, and queue each
+    /// set, delete its build rows, refs and artifact references, and queue each
     /// artifact it named that no other repository names, due at `due_at`.
     /// A leased build of it can no longer renew, publish or fail.
     async fn purge_repo(&self, repo: &RepoId, due_at: i64) -> Result<Purged>;
@@ -287,6 +352,13 @@ pub trait ControlStore: Send + Sync {
     async fn knows_repo(&self, repo: &RepoId) -> Result<bool>;
     /// Every repository that is added or has build rows.
     async fn known_repos(&self) -> Result<Vec<RepoId>>;
+    /// The repository's published refs; `None` before its first publish.
+    async fn get_refs(&self, repo: &RepoId) -> Result<Option<RepoRefs>>;
+    /// Replace the repository's published refs, and record that the repo
+    /// names each of their artifacts. Nothing is written for a repo that is
+    /// no longer known, such as one purged while its refs were built.
+    /// Returns whether the refs were written.
+    async fn set_refs(&self, repo: &RepoId, refs: &RepoRefs) -> Result<bool>;
     async fn health(&self) -> Result<()>;
 }
 
