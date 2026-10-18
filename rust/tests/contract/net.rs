@@ -85,6 +85,8 @@ struct GitState {
     /// Fetches of these repos wait on `repo_gate`.
     held_repos: Mutex<Vec<String>>,
     repo_gate: Gate,
+    /// Ref advertisements (`GET .../info/refs`) wait on this.
+    listing_gate: Gate,
 }
 
 /// One request the origin received.
@@ -107,7 +109,8 @@ impl OriginRequest {
 
 /// `git http-backend` over HTTP for a directory of bare repos. While held, it
 /// parks every upload-pack fetch; ref listings (v0 `info/refs`, v2 `ls-refs`)
-/// still answer, so a server can resolve a branch but not build it.
+/// still answer, so a server can resolve a branch but not build it. Ref
+/// listings have their own hold.
 pub struct GitHttp {
     url: String,
     state: Arc<GitState>,
@@ -125,6 +128,7 @@ impl GitHttp {
             unheld: Mutex::new(None),
             held_repos: Mutex::new(Vec::new()),
             repo_gate: Gate::new(),
+            listing_gate: Gate::new(),
         });
         let router = Router::new()
             .fallback(git_backend)
@@ -165,6 +169,23 @@ impl GitHttp {
         self.state.held_repos.lock().unwrap().clear();
         self.state.repo_gate.open.send_replace(true);
         self.state.gate.open.send_replace(true);
+    }
+
+    /// Park ref advertisements, the first request of every `ls-remote` and
+    /// fetch, until [`GitHttp::release_listings`].
+    pub fn hold_listings(&self) {
+        self.state.listing_gate.open.send_replace(false);
+    }
+
+    pub fn release_listings(&self) {
+        self.state.listing_gate.open.send_replace(true);
+    }
+
+    /// Wait until at least `n` ref advertisements are parked.
+    pub fn wait_listings_held(&self, n: usize) {
+        crate::harness::wait_for(&format!("{n} held ref listing(s)"), || {
+            (self.state.listing_gate.waiting.load(Ordering::SeqCst) >= n).then_some(())
+        });
     }
 
     /// Wait until at least `n` fetches are parked.
@@ -249,6 +270,9 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
     let is_fetch = parts.method == Method::POST
         && path.ends_with("/git-upload-pack")
         && !contains(&body, b"command=ls-refs");
+    if parts.method == Method::GET && path.ends_with("/info/refs") {
+        state.listing_gate.pass().await;
+    }
     if is_fetch {
         state.fetches.fetch_add(1, Ordering::SeqCst);
         if !unheld {
