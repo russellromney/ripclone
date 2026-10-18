@@ -132,6 +132,18 @@ pub enum Output {
     Full(FullResult),
 }
 
+impl Output {
+    /// Every artifact the output names.
+    pub fn artifacts(&self) -> std::collections::BTreeSet<&str> {
+        use crate::Artifacts;
+        match self {
+            Self::Head { result, .. } => result.artifacts(),
+            Self::Files(result) => result.artifacts(),
+            Self::Full(result) => result.artifacts(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Published {
     /// The output was written. False when the claim no longer owns its
@@ -140,6 +152,15 @@ pub struct Published {
     pub applied: bool,
     /// This publish made every output of the row ready.
     pub row_complete: bool,
+}
+
+/// What a purge removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Purged {
+    /// Build rows deleted.
+    pub builds: u64,
+    /// Artifacts queued for deletion: those no other repository names.
+    pub queued: u64,
 }
 
 /// A repository added to the server.
@@ -203,8 +224,9 @@ pub trait ControlStore: Send + Sync {
     /// expired and another store claimed the output. An expired lease nobody
     /// took renews.
     async fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool>;
-    /// Write a ready output of the claim's kind. Nothing is written for a
-    /// claim whose lease was lost, or for another kind's output.
+    /// Write a ready output of the claim's kind, and record that the repo
+    /// names each of its artifacts. Nothing is written for a claim whose
+    /// lease was lost, or for another kind's output.
     async fn publish(&self, claim: &Claim, output: Output) -> Result<Published>;
     /// Record a failed build of the claim's kind. With `retry_after` and
     /// attempts left the output stays pending and is not claimable until
@@ -243,6 +265,28 @@ pub trait ControlStore: Send + Sync {
     async fn remove_repo(&self, repo: &RepoId) -> Result<bool>;
     async fn get_repo(&self, repo: &RepoId) -> Result<Option<AddedRepo>>;
     async fn list_repos(&self) -> Result<Vec<AddedRepo>>;
+    /// Delete the repository, in one transaction: drop it from the added
+    /// set, delete its build rows and artifact references, and queue each
+    /// artifact it named that no other repository names, due at `due_at`.
+    /// A leased build of it can no longer renew, publish or fail.
+    async fn purge_repo(&self, repo: &RepoId, due_at: i64) -> Result<Purged>;
+    /// Queue artifacts for deletion at `due_at`. An artifact already queued
+    /// keeps the later due time.
+    async fn queue_deletions(&self, hashes: &[String], due_at: i64) -> Result<()>;
+    /// Up to `limit` queued artifacts due before `now`, soonest first. An
+    /// artifact queued during a sweep is due no earlier than the sweep's
+    /// `now`, so the sweep's dequeue leaves it queued.
+    async fn due_deletions(&self, now: i64, limit: usize) -> Result<Vec<String>>;
+    /// Whether `hash` may be deleted now: queued, due before `now`, and
+    /// named by no repository's published output.
+    async fn deletable(&self, hash: &str, now: i64) -> Result<bool>;
+    /// Take each of `hashes` off the queue unless it was queued again for
+    /// `now` or later.
+    async fn dequeue_deletions(&self, hashes: &[String], now: i64) -> Result<()>;
+    /// Whether `repo` is added or has build rows.
+    async fn knows_repo(&self, repo: &RepoId) -> Result<bool>;
+    /// Every repository that is added or has build rows.
+    async fn known_repos(&self) -> Result<Vec<RepoId>>;
     async fn health(&self) -> Result<()>;
 }
 

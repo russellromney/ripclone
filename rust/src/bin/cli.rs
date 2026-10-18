@@ -59,10 +59,15 @@ enum Commands {
     },
     /// List repositories added to the configured server.
     List,
-    /// Remove a repository from the configured server's added set.
+    /// Remove a repository from the configured server's added set. Its
+    /// builds stay and still serve clones.
     Rm {
         /// owner/name, provider:path, or a clone URL.
         repo: String,
+        /// Also delete its builds, its mirror, and the artifacts no other
+        /// repository uses. Clones already running finish.
+        #[arg(long)]
+        purge: bool,
     },
     /// Build the default branch tip, or `--at` a commit, branch or tag.
     /// Returns once the build is accepted, unless --at or --wait is given.
@@ -741,7 +746,7 @@ async fn run() -> Result<()> {
                 println!("{name}");
             }
         }
-        Commands::Rm { repo } => {
+        Commands::Rm { repo, purge } => {
             let (provider, repo_path) =
                 resolve_control_repo(&repo, default_provider, &provider_registry)?;
             let repo_id = RepoId {
@@ -749,11 +754,14 @@ async fn run() -> Result<()> {
                 path: repo_path.clone(),
             };
             let cli_name = repo_id.cli_name(default_provider);
-            client
-                .with_provider(provider)
-                .remove_repo(&repo_path)
-                .await?;
-            println!("removed {cli_name}");
+            let client = client.with_provider(provider);
+            if purge {
+                client.purge_repo(&repo_path).await?;
+                println!("purged {cli_name}");
+            } else {
+                client.remove_repo(&repo_path).await?;
+                println!("removed {cli_name}");
+            }
         }
         Commands::Sync { repo, at, wait } => {
             if let Some(at) = at.as_deref() {

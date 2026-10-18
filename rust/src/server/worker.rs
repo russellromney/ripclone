@@ -33,11 +33,14 @@ use super::builder::{
 };
 use super::{RepoLock, ServerState, duration_ms};
 use crate::cancel::{self, Cancel};
+use crate::cas::Cas;
 use crate::control::{BuildRow, Claim, Output, Pool, Published};
+use crate::pins::PinSet;
 use crate::provider::RepoId;
 use crate::{ExactResultKind, git, validation};
 use anyhow::{Context, Result};
 use axum::http::StatusCode;
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt;
 use std::sync::Arc;
@@ -278,13 +281,18 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
     let task_state = state.clone();
     let task_claim = Arc::clone(&claim);
     let task_cancel = cancel.clone();
+    // Held until the build ends, so nothing it relies on is deleted before
+    // it publishes.
+    let pins = PinSet::new(&state.pins);
+    let task_pins = Arc::clone(&pins);
     let mut task = tokio::spawn(async move {
+        let pins = &task_pins;
         task_cancel
             .scope(async {
                 match pool {
-                    Pool::Head => build_head(&task_state, settings, &task_claim).await,
-                    Pool::Files => build_files(&task_state, settings, &task_claim).await,
-                    Pool::Full => build_full(&task_state, settings, &task_claim).await,
+                    Pool::Head => build_head(&task_state, settings, &task_claim, pins).await,
+                    Pool::Files => build_files(&task_state, settings, &task_claim, pins).await,
+                    Pool::Full => build_full(&task_state, settings, &task_claim, pins).await,
                 }
             })
             .await
@@ -298,6 +306,7 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
                 if let Err(error) = joined {
                     let failure = BuildError::retryable(format!("build task panicked: {error}"));
                     record_failure(state, settings, &claim, &failure).await;
+                    discard(state, &claim, &pins, &BTreeSet::new()).await;
                 }
                 break;
             }
@@ -380,7 +389,29 @@ async fn record_failure(
 
 /// Publish a built output, or record why it could not be built. A cancelled
 /// build records nothing: its lease is gone and another worker owns the row.
+/// Every artifact the build stored or relied on that its published output
+/// does not name, such as a level merged away within the build, or all of
+/// them when nothing was published, is queued for deletion.
 async fn settle(
+    state: &ServerState,
+    settings: WorkerSettings,
+    claim: &Claim,
+    built: Result<Output>,
+    pins: &PinSet,
+) -> Option<Published> {
+    let mut named: BTreeSet<String> = built.as_ref().map_or_else(
+        |_| BTreeSet::new(),
+        |output| output.artifacts().into_iter().map(str::to_string).collect(),
+    );
+    let published = publish_or_fail(state, settings, claim, built).await;
+    if !published.is_some_and(|published| published.applied) {
+        named.clear();
+    }
+    discard(state, claim, pins, &named).await;
+    published
+}
+
+async fn publish_or_fail(
     state: &ServerState,
     settings: WorkerSettings,
     claim: &Claim,
@@ -415,6 +446,25 @@ async fn settle(
     }
 }
 
+/// Queue every artifact the build pinned but `keep` does not name for
+/// deletion now. Deletion keeps those that any published output names.
+async fn discard(state: &ServerState, claim: &Claim, pins: &PinSet, keep: &BTreeSet<String>) {
+    let mut hashes = pins.hashes();
+    hashes.retain(|hash| !keep.contains(hash));
+    if hashes.is_empty() {
+        return;
+    }
+    let now = crate::control::Clock::now(&crate::control::SystemClock);
+    if let Err(error) = state.control.queue_deletions(&hashes, now).await {
+        warn!(
+            "queue the unnamed {} artifacts of {}@{} for deletion: {error:#}",
+            claim.kind(),
+            claim.repo.storage_key(),
+            short(&claim.build.commit)
+        );
+    }
+}
+
 async fn record_published(
     state: &ServerState,
     claim: &Claim,
@@ -446,7 +496,7 @@ async fn record_published(
         .record_build_completed(Duration::from_secs(age));
 }
 
-async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {
+pub(super) async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<RepoLock> {
     let mut map = state.sync_locks.lock().await;
     map.entry(repo_id.storage_key()).or_default().clone()
 }
@@ -525,12 +575,17 @@ async fn fetch_commit(
     .context("mirror fetch task")?
 }
 
-async fn build_head(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
+async fn build_head(
+    state: &ServerState,
+    settings: WorkerSettings,
+    claim: &Claim,
+    pins: &Arc<PinSet>,
+) {
     let started = Instant::now();
     let mut phases = SyncPhases::default();
-    let built = head_output(state, claim, &mut phases).await;
+    let built = head_output(state, claim, &state.cas.with_pins(pins), &mut phases).await;
     let publish_start = Instant::now();
-    let Some(published) = settle(state, settings, claim, built).await else {
+    let Some(published) = settle(state, settings, claim, built, pins).await else {
         return;
     };
     if !published.applied {
@@ -545,6 +600,7 @@ async fn build_head(state: &ServerState, settings: WorkerSettings, claim: &Claim
 async fn head_output(
     state: &ServerState,
     claim: &Claim,
+    cas: &Cas,
     phases: &mut SyncPhases,
 ) -> Result<Output> {
     let repo_id = &claim.repo;
@@ -587,7 +643,7 @@ async fn head_output(
         });
     Cancel::check_current()?;
     let result = build_head_result(
-        &state.cas,
+        cas,
         &mirror_dir,
         commit,
         parent.clone(),
@@ -599,9 +655,15 @@ async fn head_output(
     Ok(Output::Head { result, parent })
 }
 
-async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
+async fn build_files(
+    state: &ServerState,
+    settings: WorkerSettings,
+    claim: &Claim,
+    pins: &Arc<PinSet>,
+) {
     let started = Instant::now();
     let mut phases = BuildPhases::default();
+    let cas = state.cas.with_pins(pins);
     let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
     let lock = repo_lock(state, &claim.repo).await;
     let built = async {
@@ -624,7 +686,7 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
         phases.record("base", start);
         Cancel::check_current()?;
         build_files_result(
-            &state.cas,
+            &cas,
             &mirror_dir,
             &claim.build.commit,
             parent,
@@ -638,13 +700,19 @@ async fn build_files(state: &ServerState, settings: WorkerSettings, claim: &Clai
     .await;
     let ready = built.is_ok();
     phases.report("files", &claim.repo, &claim.build.commit, ready, started);
-    settle(state, settings, claim, built).await;
+    settle(state, settings, claim, built, pins).await;
     compact_mirror(&claim.repo, &mirror_dir, &lock).await;
 }
 
-async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim) {
+async fn build_full(
+    state: &ServerState,
+    settings: WorkerSettings,
+    claim: &Claim,
+    pins: &Arc<PinSet>,
+) {
     let started = Instant::now();
     let mut phases = BuildPhases::default();
+    let cas = state.cas.with_pins(pins);
     let mirror_dir = state.repo_root.join(claim.repo.mirror_dir_name());
     let lock = repo_lock(state, &claim.repo).await;
     let built = async {
@@ -668,7 +736,7 @@ async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim
         phases.record("base", start);
         Cancel::check_current()?;
         build_full_result(
-            &state.cas,
+            &cas,
             &mirror_dir,
             &claim.repo,
             &claim.build.commit,
@@ -683,7 +751,7 @@ async fn build_full(state: &ServerState, settings: WorkerSettings, claim: &Claim
     .await;
     let ready = built.is_ok();
     phases.report("full", &claim.repo, &claim.build.commit, ready, started);
-    settle(state, settings, claim, built).await;
+    settle(state, settings, claim, built, pins).await;
     compact_mirror(&claim.repo, &mirror_dir, &lock).await;
 }
 
@@ -1088,6 +1156,27 @@ mod tests {
         }
         async fn list_repos(&self) -> Result<Vec<crate::control::AddedRepo>> {
             self.inner.list_repos().await
+        }
+        async fn purge_repo(&self, repo: &RepoId, due_at: i64) -> Result<crate::control::Purged> {
+            self.inner.purge_repo(repo, due_at).await
+        }
+        async fn queue_deletions(&self, hashes: &[String], due_at: i64) -> Result<()> {
+            self.inner.queue_deletions(hashes, due_at).await
+        }
+        async fn due_deletions(&self, now: i64, limit: usize) -> Result<Vec<String>> {
+            self.inner.due_deletions(now, limit).await
+        }
+        async fn deletable(&self, hash: &str, now: i64) -> Result<bool> {
+            self.inner.deletable(hash, now).await
+        }
+        async fn dequeue_deletions(&self, hashes: &[String], now: i64) -> Result<()> {
+            self.inner.dequeue_deletions(hashes, now).await
+        }
+        async fn knows_repo(&self, repo: &RepoId) -> Result<bool> {
+            self.inner.knows_repo(repo).await
+        }
+        async fn known_repos(&self) -> Result<Vec<RepoId>> {
+            self.inner.known_repos().await
         }
         async fn health(&self) -> Result<()> {
             self.inner.health().await

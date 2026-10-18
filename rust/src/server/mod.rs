@@ -31,6 +31,7 @@ mod artifacts;
 mod auth;
 mod builder;
 mod poller;
+mod purge;
 mod uploads;
 mod webhooks;
 mod worker;
@@ -78,6 +79,8 @@ pub struct ServerState {
     /// Lifetime of the signed artifact URLs the server hands out
     /// (`RIPCLONE_SIGNED_URL_TTL_SECS`).
     pub signed_url_ttl: Duration,
+    /// Artifacts the running builds rely on, which deletion skips.
+    pub pins: Arc<crate::pins::Pins>,
 }
 
 /// The locks of one repo's bare mirror.
@@ -369,8 +372,14 @@ pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Re
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         signed_url_ttl,
+        pins: crate::pins::Pins::new(),
     };
 
+    // Before the workers start, so no build is fetching into a mirror.
+    if let Err(error) = purge::remove_orphan_mirrors(&state).await {
+        warn!("remove the mirrors of unknown repositories: {error:#}");
+    }
+    purge::spawn_sweeper(state.clone(), retention.interval);
     worker::spawn_workers(&state, &worker_settings);
 
     spawn_poll_loop(state.clone(), poll_interval);
@@ -433,6 +442,7 @@ mod tests {
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
             signed_url_ttl: api::DEFAULT_SIGNED_URL_TTL,
+            pins: crate::pins::Pins::new(),
         }
     }
 

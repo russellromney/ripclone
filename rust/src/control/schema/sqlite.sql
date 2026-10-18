@@ -69,3 +69,23 @@ CREATE INDEX builds_files_leased ON builds (repo, files_lease_until)
   WHERE files_lease_until IS NOT NULL;
 CREATE INDEX builds_full_leased ON builds (repo, full_lease_until)
   WHERE full_lease_until IS NOT NULL;
+
+-- The repositories whose published outputs name each artifact, one row per
+-- (repo, artifact), written in the transaction that publishes the output. A
+-- purge removes the repo's rows and queues the artifacts no repo names.
+CREATE TABLE artifact_refs (
+  repo TEXT NOT NULL,                  -- RepoId::storage_key()
+  hash TEXT NOT NULL,
+  PRIMARY KEY (repo, hash)
+) WITHOUT ROWID;
+
+CREATE INDEX artifact_refs_by_hash ON artifact_refs (hash);
+
+-- Artifacts to delete from storage once due_at passes, if no repository
+-- names them then and no build pins them.
+CREATE TABLE deletions (
+  hash   TEXT PRIMARY KEY,
+  due_at INTEGER NOT NULL              -- epoch seconds
+) WITHOUT ROWID;
+
+CREATE INDEX deletions_by_due ON deletions (due_at);

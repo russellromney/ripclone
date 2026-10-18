@@ -325,14 +325,16 @@ pub(super) async fn dispatch_repos_delete(
             Err(error) => error.into_response(),
         };
     }
-
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "not found".to_string(),
-        }),
-    )
-        .into_response()
+    match repo_from_path(&state, &path) {
+        Ok((repo_id, _)) => match super::purge::purge(&state, &repo_id).await {
+            Ok(_) => (StatusCode::NO_CONTENT, Body::empty()).into_response(),
+            Err(e) => {
+                state.metrics.record_error();
+                ApiError::control(e).into_response()
+            }
+        },
+        Err(error) => error.into_response(),
+    }
 }
 
 pub(super) async fn list_added_repos(State(state): State<ServerState>) -> Response {
@@ -1658,6 +1660,10 @@ mod tests {
         }
 
         fn put(&self, _hash: &str, _data: &[u8]) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
+
+        async fn delete(&self, _hash: &str) -> Result<()> {
             anyhow::bail!("unsupported")
         }
 

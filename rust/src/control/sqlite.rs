@@ -10,7 +10,7 @@
 
 use super::{
     AddedRepo, BuildRow, Claim, Clock, ControlPathLock, ControlStore, Lease, Out, Output, Pool,
-    Published,
+    Published, Purged,
 };
 use crate::provider::RepoId;
 use crate::{ExactResultKind, FullResult};
@@ -23,12 +23,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema/sqlite.sql");
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, \
     head_state, head_output, head_error, files_state, files_output, files_error, \
     full_state, full_output, full_error, head_attempts, head_lease_until, \
     files_attempts, files_lease_until, full_attempts, full_lease_until";
+
+/// `hashes` as a JSON array, for one statement over `json_each`.
+fn json_list<'a>(hashes: impl IntoIterator<Item = &'a str>) -> String {
+    serde_json::Value::from_iter(hashes).to_string()
+}
+
+/// A queued artifact queued again keeps the later of its due times.
+const KEEP_LATER_DUE: &str = "ON CONFLICT (hash) DO UPDATE SET due_at = CASE
+    WHEN excluded.due_at > deletions.due_at THEN excluded.due_at ELSE deletions.due_at END";
 
 const KINDS: [ExactResultKind; 3] = [
     ExactResultKind::Head,
@@ -562,16 +571,33 @@ impl ControlStore for SqliteControlStore {
         if kind == ExactResultKind::Head {
             query = query.bind(parent);
         }
-        let states = query
-            .fetch_optional(&self.pool)
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
-            .with_context(|| format!("publish {kind} output"))?;
-        Ok(match states {
-            Some((head, files, full)) => Published {
-                applied: true,
-                row_complete: head == "ready" && files == "ready" && full == "ready",
-            },
-            None => not_applied,
+            .context("begin publish")?;
+        let Some((head, files, full)) = query
+            .fetch_optional(&mut *tx)
+            .await
+            .with_context(|| format!("publish {kind} output"))?
+        else {
+            return Ok(not_applied);
+        };
+        // `WHERE true` lets SQLite parse the upsert after a SELECT.
+        sqlx::query(
+            "INSERT INTO artifact_refs (repo, hash)
+             SELECT $1, value FROM json_each($2) WHERE true
+             ON CONFLICT (repo, hash) DO NOTHING",
+        )
+        .bind(claim.repo.storage_key())
+        .bind(json_list(output.artifacts()))
+        .execute(&mut *tx)
+        .await
+        .context("record artifact references")?;
+        tx.commit().await.context("commit publish")?;
+        Ok(Published {
+            applied: true,
+            row_complete: head == "ready" && files == "ready" && full == "ready",
         })
     }
 
@@ -750,6 +776,122 @@ impl ControlStore for SqliteControlStore {
             .context("list repositories")?
             .iter()
             .map(decode_added_repo)
+            .collect()
+    }
+
+    async fn purge_repo(&self, repo: &RepoId, due_at: i64) -> Result<Purged> {
+        let key = repo.storage_key();
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("begin purge")?;
+        sqlx::query("DELETE FROM added_repos WHERE repo = $1")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .context("purge added repository")?;
+        let queued = sqlx::query(&format!(
+            "INSERT INTO deletions (hash, due_at)
+             SELECT hash, $2 FROM artifact_refs mine
+             WHERE mine.repo = $1 AND NOT EXISTS (
+               SELECT 1 FROM artifact_refs other
+               WHERE other.hash = mine.hash AND other.repo <> $1)
+             {KEEP_LATER_DUE}"
+        ))
+        .bind(&key)
+        .bind(due_at)
+        .execute(&mut *tx)
+        .await
+        .context("queue purged artifacts")?
+        .rows_affected();
+        sqlx::query("DELETE FROM artifact_refs WHERE repo = $1")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .context("purge artifact references")?;
+        let builds = sqlx::query("DELETE FROM builds WHERE repo = $1")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .context("purge builds")?
+            .rows_affected();
+        tx.commit().await.context("commit purge")?;
+        Ok(Purged { builds, queued })
+    }
+
+    async fn queue_deletions(&self, hashes: &[String], due_at: i64) -> Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO deletions (hash, due_at)
+             SELECT value, $2 FROM json_each($1) WHERE true
+             {KEEP_LATER_DUE}"
+        ))
+        .bind(json_list(hashes.iter().map(String::as_str)))
+        .bind(due_at)
+        .execute(&self.pool)
+        .await
+        .context("queue deletions")?;
+        Ok(())
+    }
+
+    async fn due_deletions(&self, now: i64, limit: usize) -> Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT hash FROM deletions WHERE due_at < $1 ORDER BY due_at, hash LIMIT $2",
+        )
+        .bind(now)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .context("read due deletions")
+    }
+
+    async fn deletable(&self, hash: &str, now: i64) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM deletions queued
+             WHERE queued.hash = $1 AND queued.due_at < $2 AND NOT EXISTS (
+               SELECT 1 FROM artifact_refs WHERE artifact_refs.hash = queued.hash)",
+        )
+        .bind(hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("check deletion")?
+        .is_some())
+    }
+
+    async fn dequeue_deletions(&self, hashes: &[String], now: i64) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM deletions
+             WHERE hash IN (SELECT value FROM json_each($1)) AND due_at < $2",
+        )
+        .bind(json_list(hashes.iter().map(String::as_str)))
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("dequeue deletions")?;
+        Ok(())
+    }
+
+    async fn knows_repo(&self, repo: &RepoId) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM added_repos WHERE repo = $1)
+                 OR EXISTS (SELECT 1 FROM builds WHERE repo = $1)",
+        )
+        .bind(repo.storage_key())
+        .fetch_one(&self.pool)
+        .await
+        .context("check repository")
+    }
+
+    async fn known_repos(&self) -> Result<Vec<RepoId>> {
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT repo FROM added_repos UNION SELECT repo FROM builds ORDER BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list known repositories")?;
+        keys.iter()
+            .map(|key| RepoId::from_storage_key(key))
             .collect()
     }
 

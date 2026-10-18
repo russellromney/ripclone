@@ -26,6 +26,7 @@ pub struct Metrics {
     local_cache_removed_bytes: AtomicU64,
     local_cache_removed_objects: AtomicU64,
     local_cache_cleanup_errors: AtomicU64,
+    artifacts_deleted: AtomicU64,
     builds_queued: AtomicU64,
     builds_completed: AtomicU64,
     builds_failed: AtomicU64,
@@ -86,6 +87,11 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An artifact no output names was deleted from storage.
+    pub fn record_artifact_deleted(&self) {
+        self.artifacts_deleted.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A new build row was admitted.
     pub fn record_build_accepted(&self) {
         self.builds_queued.fetch_add(1, Ordering::Relaxed);
@@ -127,7 +133,7 @@ impl Metrics {
         let s = self.snapshot();
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 21] = [
+        let counters: [(&str, &str, u64); 22] = [
             (
                 "ripclone_ref_lookups_total",
                 "Ref lookups served",
@@ -206,6 +212,11 @@ impl Metrics {
                 s.local_cache_cleanup_errors,
             ),
             (
+                "ripclone_artifacts_deleted_total",
+                "Artifacts no output names, deleted from storage",
+                s.artifacts_deleted,
+            ),
+            (
                 "ripclone_builds_queued_total",
                 "Build rows admitted",
                 s.builds_queued,
@@ -276,6 +287,7 @@ impl Metrics {
             local_cache_removed_bytes: self.local_cache_removed_bytes.load(Ordering::Relaxed),
             local_cache_removed_objects: self.local_cache_removed_objects.load(Ordering::Relaxed),
             local_cache_cleanup_errors: self.local_cache_cleanup_errors.load(Ordering::Relaxed),
+            artifacts_deleted: self.artifacts_deleted.load(Ordering::Relaxed),
             builds_queued: self.builds_queued.load(Ordering::Relaxed),
             builds_completed,
             build_avg_ms: if builds_completed == 0 {
@@ -330,6 +342,7 @@ pub struct MetricsSnapshot {
     pub local_cache_removed_bytes: u64,
     pub local_cache_removed_objects: u64,
     pub local_cache_cleanup_errors: u64,
+    pub artifacts_deleted: u64,
     pub builds_queued: u64,
     pub builds_completed: u64,
     pub build_avg_ms: u64,

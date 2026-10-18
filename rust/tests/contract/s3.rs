@@ -1,4 +1,4 @@
-//! C2, C3, C7, C8, F7, H2, H6 and H10 against S3 storage: a versitygw emulator per test,
+//! C2, C3, C7, C8, F7, H2, H6, H10, H12 and H14 against S3 storage: a versitygw emulator per test,
 //! started by `scripts/s3_emulator.sh`. Ignored by default because the script fetches
 //! the emulator binary; the `s3` CI job runs them with `--ignored`.
 
@@ -384,8 +384,8 @@ fn s3_h6_retention_trims_only_the_local_cache() {
     let origin = world.origin("acme", "h6");
     let a = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "A");
     origin.publish();
-    let mut env = s3.server_env(&s3.endpoint);
-    env.push(("RIPCLONE_RETENTION_INTERVAL_SECS".into(), "1".into()));
+    // Retention runs every second, the harness default.
+    let env = s3.server_env(&s3.endpoint);
     let server = world.server(&env_refs(&env));
     world.cli(&server, &["add", "acme/h6", "--wait"]).ok();
     let objects = s3.objects();
@@ -450,6 +450,7 @@ fn s3_c8_failed_upload_publishes_nothing() {
     s3_proxy.fail_puts(&bucket, Fault::Status(403));
     world.cli(&server, &["add", "acme/c8"]).ok();
     s3_proxy.wait_held(1);
+    assert!(!s3.objects().is_empty(), "the held write is in the bucket");
     wait_for("Head failed", || {
         (output_states(&server, "acme/c8", &tip)[0] == "failed").then_some(())
     });
@@ -473,6 +474,11 @@ fn s3_c8_failed_upload_publishes_nothing() {
     );
     assert!(!out.success(), "a clone of an unpublished Head succeeded");
     assert!(!shallow.exists(), "failed clone left {}", shallow.display());
+    // No output names what the failed build wrote, so it is deleted.
+    wait_for("the failed build's writes to be deleted", || {
+        (s3.objects().is_empty() && server.metric("ripclone_artifacts_deleted_total") > 0)
+            .then_some(())
+    });
 
     s3_proxy.release();
     server.restart_with(&[("RIPCLONE_FILES_SLOTS", "1"), ("RIPCLONE_FULL_SLOTS", "1")]);
@@ -650,5 +656,84 @@ fn s3_h10_existing_objects_are_not_uploaded_again() {
             )
             .ok();
         assert_eq!(listing(&files), origin.tree(&tip), "{repo}");
+    }
+}
+
+/// H14: with S3 storage, purging a repository deletes from the bucket and
+/// the local cache the artifacts no other repository uses, once twice the
+/// signed URL lifetime has passed. A clone holding signed URLs from before
+/// the purge finishes, and the fork that shares the rest still clones.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_h14_purge_deletes_from_the_bucket() {
+    use crate::state::{commit_artifacts, mirrors};
+    use std::collections::BTreeSet;
+
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let s3_proxy = FaultProxy::start(&s3);
+    s3_proxy.preserve_host();
+    let origin = world.origin("acme", "h14");
+    let a = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "A");
+    origin.publish();
+    let fork = world.origin("acme", "h14-fork");
+    git(
+        &origin.work,
+        &["push", "-q", fork.bare.to_str().unwrap(), "main"],
+    );
+    let mut env = s3.server_env(&s3_proxy.url());
+    env.push(("RIPCLONE_SIGNED_URL_TTL_SECS".into(), "3".into()));
+    let server = world.server(&env_refs(&env));
+    world.cli(&server, &["add", "acme/h14-fork", "--wait"]).ok();
+    world.cli(&server, &["add", "acme/h14", "--wait"]).ok();
+    let b = origin.commit(&[("c.txt", "c\n")], "B");
+    origin.publish();
+    world.cli(&server, &["sync", "acme/h14", "--at", &b]).ok();
+
+    let forked = commit_artifacts(&server, "acme/h14-fork", &a);
+    let mut mine = commit_artifacts(&server, "acme/h14", &a);
+    assert_eq!(mine, forked, "the same commit builds the same artifacts");
+    mine.extend(commit_artifacts(&server, "acme/h14", &b));
+    let unique: BTreeSet<String> = mine.difference(&forked).cloned().collect();
+    assert!(!unique.is_empty(), "B builds artifacts the fork lacks");
+    let in_bucket = |hash: &String| s3.objects().iter().any(|key| key.ends_with(hash.as_str()));
+    assert!(mine.iter().all(in_bucket));
+
+    // Every bucket download of a clone of B waits until the purge has
+    // happened; its signed URLs are from before it.
+    s3_proxy.fault_requests(&format!("/{}/", s3.bucket), Fault::Hold, usize::MAX);
+    let target = world.target("h14-during");
+    let during = world.cli_spawn(&server, &["clone", "acme/h14", target.to_str().unwrap()]);
+    s3_proxy.wait_held(1);
+    world.cli(&server, &["rm", "--purge", "acme/h14"]).ok();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        unique.iter().all(in_bucket),
+        "deleted before the grace ended"
+    );
+    s3_proxy.release();
+    during.wait().ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
+    assert_eq!(listing(&target), origin.tree(&b));
+
+    wait_for(
+        "the purged repository's artifacts to leave the bucket",
+        || unique.iter().all(|hash| !in_bucket(hash)).then_some(()),
+    );
+    assert!(forked.iter().all(in_bucket));
+    let cached = server.storage_listing();
+    for hash in &unique {
+        assert!(
+            !cached.iter().any(|path| path.ends_with(hash.as_str())),
+            "{hash} is still in the local cache"
+        );
+    }
+    assert_eq!(mirrors(&world), ["github_acme%2Fh14-fork.git"]);
+    for (name, args) in [("full", &[][..]), ("files", &["--mode", "files"][..])] {
+        let target = world.target(&format!("h14-fork-{name}"));
+        let mut argv = vec!["clone", "acme/h14-fork", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&server, &argv).ok();
+        assert_eq!(listing(&target), origin.tree(&a), "{name}");
     }
 }
