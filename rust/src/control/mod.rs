@@ -273,14 +273,18 @@ pub trait ControlStore: Send + Sync {
     /// Queue artifacts for deletion at `due_at`. An artifact already queued
     /// keeps the later due time.
     async fn queue_deletions(&self, hashes: &[String], due_at: i64) -> Result<()>;
-    /// Up to `limit` queued artifacts due by `now`, soonest first.
+    /// Up to `limit` queued artifacts due before `now`, soonest first. An
+    /// artifact queued during a sweep is due no earlier than the sweep's
+    /// `now`, so the sweep's dequeue leaves it queued.
     async fn due_deletions(&self, now: i64, limit: usize) -> Result<Vec<String>>;
-    /// Whether `hash` may be deleted now: queued, due by `now`, and named by
-    /// no repository's published output.
+    /// Whether `hash` may be deleted now: queued, due before `now`, and
+    /// named by no repository's published output.
     async fn deletable(&self, hash: &str, now: i64) -> Result<bool>;
-    /// Take `hash` off the queue unless it was queued again for later than
-    /// `now`.
-    async fn dequeue_deletion(&self, hash: &str, now: i64) -> Result<()>;
+    /// Take each of `hashes` off the queue unless it was queued again for
+    /// `now` or later.
+    async fn dequeue_deletions(&self, hashes: &[String], now: i64) -> Result<()>;
+    /// Whether `repo` is added or has build rows.
+    async fn knows_repo(&self, repo: &RepoId) -> Result<bool>;
     /// Every repository that is added or has build rows.
     async fn known_repos(&self) -> Result<Vec<RepoId>>;
     async fn health(&self) -> Result<()>;

@@ -53,20 +53,36 @@ impl Pins {
         }
     }
 
-    /// Start deleting `hash` unless a build pins it. Until
-    /// [`end_delete`](Self::end_delete), pins of it wait.
-    pub fn begin_delete(&self, hash: &str) -> bool {
+    /// Start deleting `hash` unless a build pins it or it is already being
+    /// deleted. Pins of it wait until the returned guard is dropped, so a
+    /// deletion that fails or is cancelled still releases them.
+    pub fn begin_delete<'a>(&'a self, hash: &str) -> Option<Deleting<'a>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.pinned.contains_key(hash) {
-            return false;
+        if state.pinned.contains_key(hash) || !state.deleting.insert(hash.to_string()) {
+            return None;
         }
-        state.deleting.insert(hash.to_string())
+        Some(Deleting {
+            pins: self,
+            hash: hash.to_string(),
+        })
     }
+}
 
-    pub fn end_delete(&self, hash: &str) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.deleting.remove(hash);
-        self.deleted.notify_all();
+/// One artifact being deleted; dropping it ends the deletion.
+pub struct Deleting<'a> {
+    pins: &'a Pins,
+    hash: String,
+}
+
+impl Drop for Deleting<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .pins
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.deleting.remove(&self.hash);
+        self.pins.deleted.notify_all();
     }
 }
 
@@ -124,16 +140,18 @@ mod tests {
         a.pin("x");
         b.pin("x");
         drop(a);
-        assert!(!pins.begin_delete("x"), "b still pins it");
+        assert!(pins.begin_delete("x").is_none(), "b still pins it");
         drop(b);
-        assert!(pins.begin_delete("x"));
-        pins.end_delete("x");
+        let deleting = pins.begin_delete("x").expect("unpinned");
+        assert!(pins.begin_delete("x").is_none(), "already being deleted");
+        drop(deleting);
+        assert!(pins.begin_delete("x").is_some());
     }
 
     #[test]
     fn a_pin_waits_for_its_artifact_to_be_deleted() {
         let pins = Pins::new();
-        assert!(pins.begin_delete("x"));
+        let deleting = pins.begin_delete("x").unwrap();
         let build = PinSet::new(&pins);
         let pinning = {
             let build = Arc::clone(&build);
@@ -141,9 +159,9 @@ mod tests {
         };
         std::thread::sleep(Duration::from_millis(50));
         assert!(!pinning.is_finished(), "pinned during the delete");
-        pins.end_delete("x");
+        drop(deleting);
         pinning.join().unwrap();
         assert_eq!(build.hashes(), ["x"]);
-        assert!(!pins.begin_delete("x"));
+        assert!(pins.begin_delete("x").is_none());
     }
 }

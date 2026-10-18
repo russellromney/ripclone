@@ -53,7 +53,7 @@ async fn remove_mirror(state: &ServerState, repo: &RepoId) -> Result<()> {
     let lock = repo_lock(state, repo).await;
     let _read = lock.read.write().await;
     let _write = lock.write.lock().await;
-    if state.control.known_repos().await?.contains(repo) {
+    if state.control.knows_repo(repo).await? {
         return Ok(());
     }
     remove_dir(state.repo_root.join(repo.mirror_dir_name())).await
@@ -108,10 +108,7 @@ pub(super) fn spawn_sweeper(state: ServerState, interval: Duration) {
             ticks.tick().await;
             match sweep(&state).await {
                 Ok(0) => {}
-                Ok(deleted) => {
-                    state.metrics.record_artifacts_deleted(deleted);
-                    info!(deleted, "deleted unreferenced artifacts");
-                }
+                Ok(deleted) => info!(deleted, "deleted unreferenced artifacts"),
                 Err(error) => {
                     state.metrics.record_error();
                     warn!("artifact deletion failed: {error:#}");
@@ -122,28 +119,45 @@ pub(super) fn spawn_sweeper(state: ServerState, interval: Duration) {
 }
 
 /// Delete the due, unreferenced, unpinned artifacts. Returns how many.
+/// Each batch is read and dequeued in one statement; only the checks that
+/// must follow an artifact's deletion mark run per artifact.
 pub(super) async fn sweep(state: &ServerState) -> Result<u64> {
     let mut deleted = 0;
     loop {
         let now = SystemClock.now();
         let due = state.control.due_deletions(now, SWEEP_BATCH).await?;
         let full = due.len() == SWEEP_BATCH;
-        let mut settled = 0;
+        let mut settled = Vec::with_capacity(due.len());
+        let mut failure = None;
         let mut results = futures::stream::iter(due)
-            .map(|hash| sweep_one(state, hash, now))
+            .map(|hash| async move {
+                let swept = sweep_one(state, &hash, now).await;
+                (hash, swept)
+            })
             .buffer_unordered(SWEEP_PARALLEL);
-        while let Some(result) = results.next().await {
-            match result? {
-                Swept::Deleted => {
+        while let Some((hash, swept)) = results.next().await {
+            match swept {
+                Ok(Swept::Deleted) => {
                     deleted += 1;
-                    settled += 1;
+                    settled.push(hash);
                 }
-                Swept::Kept => settled += 1,
-                Swept::Pinned => {}
+                Ok(Swept::Kept) => settled.push(hash),
+                Ok(Swept::Pinned) => {}
+                Err(error) => {
+                    // Stop at the first failure, such as storage being
+                    // down, rather than fail the rest of the batch too.
+                    failure = Some(error);
+                    break;
+                }
             }
         }
+        drop(results);
+        state.control.dequeue_deletions(&settled, now).await?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
         // A full batch of pinned artifacts would be read again forever.
-        if !full || settled == 0 {
+        if !full || settled.is_empty() {
             return Ok(deleted);
         }
     }
@@ -157,27 +171,19 @@ enum Swept {
     Pinned,
 }
 
-async fn sweep_one(state: &ServerState, hash: String, now: i64) -> Result<Swept> {
-    if !state.pins.begin_delete(&hash) {
+/// Delete `hash` if it is still deletable once marked as being deleted: a
+/// build that relied on it may have published since the batch was read.
+async fn sweep_one(state: &ServerState, hash: &str, now: i64) -> Result<Swept> {
+    let Some(_deleting) = state.pins.begin_delete(hash) else {
         return Ok(Swept::Pinned);
+    };
+    if !state.control.deletable(hash, now).await? {
+        return Ok(Swept::Kept);
     }
-    let result = delete_unless_referenced(state, &hash, now).await;
-    state.pins.end_delete(&hash);
-    result
-}
-
-async fn delete_unless_referenced(state: &ServerState, hash: &str, now: i64) -> Result<Swept> {
-    let deletable = state.control.deletable(hash, now).await?;
-    if deletable {
-        state.storage.delete(hash).await?;
-        state.cas.remove(hash)?;
-    }
-    state.control.dequeue_deletion(hash, now).await?;
-    Ok(if deletable {
-        Swept::Deleted
-    } else {
-        Swept::Kept
-    })
+    state.storage.delete(hash).await?;
+    state.cas.remove(hash)?;
+    state.metrics.record_artifact_deleted();
+    Ok(Swept::Deleted)
 }
 
 #[cfg(test)]
@@ -195,7 +201,7 @@ mod tests {
         let later = state.cas.put(b"later").unwrap();
         let now = SystemClock.now();
         let due = [free.clone(), pinned.clone()];
-        state.control.queue_deletions(&due, now).await.unwrap();
+        state.control.queue_deletions(&due, now - 1).await.unwrap();
         state
             .control
             .queue_deletions(std::slice::from_ref(&later), now + 3600)

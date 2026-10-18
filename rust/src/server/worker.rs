@@ -1169,8 +1169,11 @@ mod tests {
         async fn deletable(&self, hash: &str, now: i64) -> Result<bool> {
             self.inner.deletable(hash, now).await
         }
-        async fn dequeue_deletion(&self, hash: &str, now: i64) -> Result<()> {
-            self.inner.dequeue_deletion(hash, now).await
+        async fn dequeue_deletions(&self, hashes: &[String], now: i64) -> Result<()> {
+            self.inner.dequeue_deletions(hashes, now).await
+        }
+        async fn knows_repo(&self, repo: &RepoId) -> Result<bool> {
+            self.inner.knows_repo(repo).await
         }
         async fn known_repos(&self) -> Result<Vec<RepoId>> {
             self.inner.known_repos().await

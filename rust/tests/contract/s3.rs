@@ -476,9 +476,9 @@ fn s3_c8_failed_upload_publishes_nothing() {
     assert!(!shallow.exists(), "failed clone left {}", shallow.display());
     // No output names what the failed build wrote, so it is deleted.
     wait_for("the failed build's writes to be deleted", || {
-        s3.objects().is_empty().then_some(())
+        (s3.objects().is_empty() && server.metric("ripclone_artifacts_deleted_total") > 0)
+            .then_some(())
     });
-    assert!(server.metric("ripclone_artifacts_deleted_total") > 0);
 
     s3_proxy.release();
     server.restart_with(&[("RIPCLONE_FILES_SLOTS", "1"), ("RIPCLONE_FULL_SLOTS", "1")]);

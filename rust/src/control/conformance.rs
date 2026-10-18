@@ -78,6 +78,7 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
         purge_of_an_unknown_repo_does_nothing,
         a_queued_artifact_keeps_its_later_due_time,
         a_referenced_artifact_is_never_deletable,
+        an_artifact_queued_again_during_a_sweep_stays_queued,
         an_unapplied_publish_references_nothing,
     );
 }
@@ -1398,8 +1399,10 @@ async fn purge_queues_only_artifacts_no_other_repo_references(backend: &dyn Back
     let mut known = store.known_repos().await.unwrap();
     known.sort_by_key(RepoId::storage_key);
     assert_eq!(known, vec![other.clone(), repo()]);
+    assert!(store.knows_repo(&repo()).await.unwrap());
 
     let due = START + 100;
+    let after = due + 1;
     let purged = store.purge_repo(&repo(), due).await.unwrap();
     let unique = completed_artifacts(&sha(2));
     assert_eq!(purged.builds, 2);
@@ -1408,46 +1411,48 @@ async fn purge_queues_only_artifacts_no_other_repo_references(backend: &dyn Back
     assert!(store.status(&repo(), &sha(1)).await.unwrap().is_none());
     assert!(store.status(&repo(), &sha(2)).await.unwrap().is_none());
     assert_eq!(store.known_repos().await.unwrap(), vec![other.clone()]);
+    assert!(!store.knows_repo(&repo()).await.unwrap());
+    assert!(store.knows_repo(&other).await.unwrap());
     let still = store.status(&other, &sha(1)).await.unwrap().unwrap();
     assert_eq!(ready_manifest(&still.head), Some(manifest(&sha(1), "head")));
 
-    assert!(store.due_deletions(due - 1, 100).await.unwrap().is_empty());
-    let mut queued = store.due_deletions(due, 100).await.unwrap();
+    assert!(store.due_deletions(due, 100).await.unwrap().is_empty());
+    let mut queued = store.due_deletions(after, 100).await.unwrap();
     queued.sort();
     assert_eq!(queued, unique);
-    assert_eq!(store.due_deletions(due, 2).await.unwrap().len(), 2);
+    assert_eq!(store.due_deletions(after, 2).await.unwrap().len(), 2);
     for hash in &unique {
-        assert!(
-            !store.deletable(hash, due - 1).await.unwrap(),
-            "not yet due"
-        );
-        assert!(store.deletable(hash, due).await.unwrap());
+        assert!(!store.deletable(hash, due).await.unwrap(), "not yet due");
+        assert!(store.deletable(hash, after).await.unwrap());
     }
     for hash in completed_artifacts(&sha(1)) {
         assert!(
-            !store.deletable(&hash, due).await.unwrap(),
+            !store.deletable(&hash, after).await.unwrap(),
             "the fork uses it"
         );
     }
 
     // A dequeue before the due time leaves the artifact queued.
-    store.dequeue_deletion(&unique[0], due - 1).await.unwrap();
-    assert!(store.deletable(&unique[0], due).await.unwrap());
-    for hash in &unique {
-        store.dequeue_deletion(hash, due).await.unwrap();
-    }
-    assert!(store.due_deletions(due, 100).await.unwrap().is_empty());
+    store.dequeue_deletions(&unique[..1], due).await.unwrap();
+    assert!(store.deletable(&unique[0], after).await.unwrap());
+    store.dequeue_deletions(&unique, after).await.unwrap();
+    assert!(store.due_deletions(after, 100).await.unwrap().is_empty());
 }
 
 async fn purge_of_an_unknown_repo_does_nothing(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     complete(store.as_ref(), &repo(), &sha(1), Some(MAIN)).await;
-    let purged = store
-        .purge_repo(&RepoId::github("acme/missing"), START)
-        .await
-        .unwrap();
+    let missing = RepoId::github("acme/missing");
+    assert!(!store.knows_repo(&missing).await.unwrap());
+    let purged = store.purge_repo(&missing, START).await.unwrap();
     assert_eq!(purged, crate::control::Purged::default());
-    assert!(store.due_deletions(START, 100).await.unwrap().is_empty());
+    assert!(
+        store
+            .due_deletions(START + 1, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(store.status(&repo(), &sha(1)).await.unwrap().is_some());
 }
 
@@ -1463,10 +1468,22 @@ async fn a_queued_artifact_keeps_its_later_due_time(backend: &dyn Backend) {
         .queue_deletions(std::slice::from_ref(&hash), START)
         .await
         .unwrap();
-    assert!(store.due_deletions(START, 100).await.unwrap().is_empty());
-    assert!(!store.deletable(&hash, START).await.unwrap());
-    store.dequeue_deletion(&hash, START).await.unwrap();
-    assert!(store.deletable(&hash, later).await.unwrap(), "still queued");
+    assert!(
+        store
+            .due_deletions(START + 1, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!store.deletable(&hash, START + 1).await.unwrap());
+    store
+        .dequeue_deletions(std::slice::from_ref(&hash), START + 1)
+        .await
+        .unwrap();
+    assert!(
+        store.deletable(&hash, later + 1).await.unwrap(),
+        "still queued"
+    );
 
     // A purge that queues it later still moves it later.
     store.add_repo(&repo()).await.unwrap();
@@ -1474,29 +1491,48 @@ async fn a_queued_artifact_keeps_its_later_due_time(backend: &dyn Backend) {
     let shared = completed_artifacts(&sha(1));
     store.queue_deletions(&shared, START).await.unwrap();
     store.purge_repo(&repo(), later).await.unwrap();
-    assert!(!store.deletable(&shared[0], START).await.unwrap());
-    assert!(store.deletable(&shared[0], later).await.unwrap());
+    assert!(!store.deletable(&shared[0], START + 1).await.unwrap());
+    assert!(store.deletable(&shared[0], later + 1).await.unwrap());
 }
 
 async fn a_referenced_artifact_is_never_deletable(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     complete(store.as_ref(), &repo(), &sha(1), Some(MAIN)).await;
     let referenced = completed_artifacts(&sha(1));
+    let now = START + 1;
     store.queue_deletions(&referenced, START).await.unwrap();
     assert_eq!(
-        store.due_deletions(START, 100).await.unwrap().len(),
+        store.due_deletions(now, 100).await.unwrap().len(),
         referenced.len()
     );
     for hash in &referenced {
-        assert!(!store.deletable(hash, START).await.unwrap());
-        store.dequeue_deletion(hash, START).await.unwrap();
+        assert!(!store.deletable(hash, now).await.unwrap());
     }
-    assert!(store.due_deletions(START, 100).await.unwrap().is_empty());
+    store.dequeue_deletions(&referenced, now).await.unwrap();
+    assert!(store.due_deletions(now, 100).await.unwrap().is_empty());
     assert!(
         !store
-            .deletable(&crate::cas::hash(b"never queued"), START)
+            .deletable(&crate::cas::hash(b"never queued"), now)
             .await
             .unwrap()
+    );
+}
+
+/// A build that stores an artifact again just after a sweep deleted it, and
+/// then fails, queues it in the sweep's second: the sweep's dequeue keeps it.
+async fn an_artifact_queued_again_during_a_sweep_stays_queued(backend: &dyn Backend) {
+    let (_, store) = open(backend).await;
+    let hash = crate::cas::hash(b"stored again");
+    let one = std::slice::from_ref(&hash);
+    store.queue_deletions(one, START).await.unwrap();
+    let now = START + 1;
+    assert_eq!(store.due_deletions(now, 100).await.unwrap(), one);
+    store.queue_deletions(one, now).await.unwrap();
+    store.dequeue_deletions(one, now).await.unwrap();
+    assert!(store.due_deletions(now, 100).await.unwrap().is_empty());
+    assert!(
+        store.deletable(&hash, now + 1).await.unwrap(),
+        "still queued"
     );
 }
 
@@ -1529,6 +1565,6 @@ async fn an_unapplied_publish_references_nothing(backend: &dyn Backend) {
         .collect();
     store.queue_deletions(&unreferenced, START).await.unwrap();
     for hash in &unreferenced {
-        assert!(store.deletable(hash, START).await.unwrap(), "{hash}");
+        assert!(store.deletable(hash, START + 1).await.unwrap(), "{hash}");
     }
 }

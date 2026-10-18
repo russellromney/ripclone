@@ -342,7 +342,7 @@ pub(crate) fn mirrors(world: &World) -> Vec<String> {
 /// artifacts no other repository uses, after twice the signed URL lifetime.
 /// A fork that built the same commit keeps the shared artifacts and clones
 /// in every shape. A clone of the purged repository that started before the
-/// purge finishes. Added again, the repository builds and clones.
+/// purge finishes; one that starts after is refused. Added again, the repository builds and clones.
 #[test]
 fn h13_purge_removes_only_what_no_other_repo_uses() {
     let world = World::new();
@@ -381,6 +381,20 @@ fn h13_purge_removes_only_what_no_other_repo_uses() {
     assert_eq!(status, 404, "the purged builds are gone");
     let listed = world.cli(&server, &["list"]).ok();
     assert!(!listed.lines().any(|line| line == "acme/h13"), "{listed}");
+    // A clone that starts after the purge is refused.
+    let refused = world.target("h13-after");
+    for args in [&[][..], &["--at", &b]] {
+        let mut argv = vec!["clone", "acme/h13", refused.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        let out = world.cli(&server, &argv);
+        assert_eq!(out.code(), Some(5), "{args:?}: {}", out.stderr());
+        assert!(out.err().contains("repo not added"), "{}", out.stderr());
+        assert!(
+            !refused.exists(),
+            "a refused clone left {}",
+            refused.display()
+        );
+    }
     // Sweeps run while the clone is held; nothing is due yet.
     std::thread::sleep(std::time::Duration::from_secs(2));
     assert!(unique.iter().all(|hash| stored(&server, hash)));

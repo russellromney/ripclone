@@ -46,25 +46,41 @@ fn k1_repo_arguments_name_one_repo() {
     assert!(out.contains("installed acme/k1"), "{out}");
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);
 
-    for (arg, message) in [
-        ("acme", "expected owner/name or a clone URL, got 'acme'"),
+    // `rm` reaches only the server, so a provider this CLI lacks is the
+    // server's to refuse: a repo of a provider since removed can still go.
+    for (arg, message, rm_code) in [
+        ("acme", "expected owner/name or a clone URL, got 'acme'", 2),
         (
             "https://github.com/acme/k1/tree/main",
             "got 'acme/k1/tree/main'",
+            2,
         ),
-        ("https://github.com/", "expected a clone URL with a path"),
+        ("https://github.com/", "expected a clone URL with a path", 2),
         (
             "https://git.example.com/acme/k1",
             "no provider is configured for git.example.com",
+            2,
         ),
-        ("forge:acme/k1", "unknown provider 'forge'"),
+        ("forge:acme/k1", "unknown provider", 5),
     ] {
-        for command in ["add", "sync", "clone"] {
-            let out = world.cli(&server, &[command, arg]);
-            assert_eq!(out.code(), Some(2), "{command} {arg}: {}", out.stderr());
+        for command in [
+            &["add"][..],
+            &["sync"],
+            &["clone"],
+            &["rm"],
+            &["rm", "--purge"],
+        ] {
+            let out = world.cli(&server, &[command, &[arg]].concat());
+            let code = if command[0] == "rm" { rm_code } else { 2 };
+            assert_eq!(
+                out.code(),
+                Some(code),
+                "{command:?} {arg}: {}",
+                out.stderr()
+            );
             assert!(
                 out.err().contains(message),
-                "{command} {arg}: {}",
+                "{command:?} {arg}: {}",
                 out.stderr()
             );
         }

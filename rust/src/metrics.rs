@@ -87,9 +87,9 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Artifacts no output names were deleted from storage.
-    pub fn record_artifacts_deleted(&self, count: u64) {
-        self.artifacts_deleted.fetch_add(count, Ordering::Relaxed);
+    /// An artifact no output names was deleted from storage.
+    pub fn record_artifact_deleted(&self) {
+        self.artifacts_deleted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A new build row was admitted.
