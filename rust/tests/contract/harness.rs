@@ -311,10 +311,10 @@ impl World {
             .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .env("RIPCLONE_ORIGIN_BASE", self.origin_base())
             .env("RIPCLONE_NO_METRICS", "1")
-            // The CLI gives up after 40 polls. Polls at most 200 ms apart give
-            // it about 8 s, inside WAIT, so a build slowed by a loaded
+            // The CLI gives up after 50 polls. Polls at most 150 ms apart give
+            // it about 7 s, inside WAIT, so a build slowed by a loaded
             // machine still finishes inside the budget.
-            .env("RIPCLONE_POLL_MS", "200")
+            .env("RIPCLONE_POLL_MS", "150")
             .stdin(Stdio::null());
         for (k, v) in env {
             cmd.env(k, v);

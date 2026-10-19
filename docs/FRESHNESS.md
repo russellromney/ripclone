@@ -107,8 +107,9 @@ tags whose targets it holds.
 
 ## Waiting
 
-A clone polls the server for the result it needs. Polls start 100 ms apart
-and double up to 2 s. After 40 polls,
+A clone polls the server for the result it needs. Each wait is a quarter of
+the time already waited, at least 100 ms and at most 2 s, so a result is seen
+within a quarter of its build time. After 50 polls,
 about 70 s at the default cap, it stops with an error that names the commit
 and says the result is still pending; run the same clone with `--at <commit>`
 to keep waiting for that commit.

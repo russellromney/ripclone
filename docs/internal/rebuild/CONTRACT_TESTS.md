@@ -271,7 +271,7 @@ a stable interface. Every one is used by a contract test.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RIPCLONE_POLL_MS` | 2000 | Longest wait between CLI polls for a pending output. Polls start at 100 ms and double; a command stops after 40. |
+| `RIPCLONE_POLL_MS` | 2000 | Longest wait between CLI polls for a pending output. Each wait is a quarter of the time waited, from 100 ms; a command stops after 50. |
 | `RIPCLONE_DOWNLOAD_PART_BYTES` | 16 MiB | Range size when a large artifact downloads as 16 parallel ranges. |
 | `RIPCLONE_ORIGIN_BASE` | unset | Fetch, top up and verify built-in `github` repos from `<base>/<owner>/<repo>.git`. |
 | `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` | 30 | Timeout of each upstream `ls-remote`. |

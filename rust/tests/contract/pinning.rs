@@ -116,7 +116,8 @@ fn d4_wait_reports_pending_without_installing() {
 
     let proxy = FaultProxy::start(&server);
     let target = world.target("d4");
-    // Polls 50 ms apart run the CLI's 40-poll budget out in about 2 s.
+    // Polls at most 50 ms apart run the CLI's 50-poll budget out in about
+    // 2.5 s.
     let out = world.cli_env(
         &proxy,
         &["clone", "acme/d4", target.to_str().unwrap(), "--wait"],
