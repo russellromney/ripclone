@@ -210,7 +210,7 @@ Ripclone token reaches the origin.
 | I15 | Poller, with the upstream's `HEAD` detached so its listing names no default branch: a pushed branch still reaches a full clone, whose `origin/HEAD` stays on `main`, and while nothing changes the poller lists again and again without refreshing. | |
 | I16 | `--verify-upstream=always` walks the clone from its commit: a proxy answering a full clone with the Head called a Full gives a clone without the tip's parent and no shallow file, which `always` fails and removes; `auto` keeps it. | |
 
-### J. Builds start from the newest ready ancestor (5)
+### J. Builds start from the newest ready ancestor (7)
 
 Each output of C builds on the same output of its base: the newest built
 commit that is an ancestor of C. Tests read the published Head and Full
@@ -227,6 +227,8 @@ origin, and runs `git fsck` and `rev-list --count` on the editable clones.
 | J3 | A force push to a sibling X of the built A builds cold, and X's full clone lacks A. A force push of two commits on A then builds on A, not on the newer X, and lacks X. | #217 |
 | J4 | The mirror directory is deleted between restarts: a push of two commits on A fetches A again and builds on it. After the origin force-pushes unrelated history and prunes A and C, the mirror is deleted again and the next build is cold. | #217 |
 | J5 | A branch with no history in common with the built main builds cold, and its full clone lacks main's commit. | #217 |
+| J6 | Each push adds one Head level that holds only objects no earlier pack has. The idx bundle holds only the base's idx files, so every Head on a base shares it, and each level's idx is fetched on its own. Past a quarter of the base, Full packs a new base. A lost parent idx also packs a new base. | #233, #257 |
+| J7 | A rebase keeps the base packs the new commit still uses and repacks the rest. A pack that holds a replaced large file is dropped. | #233 |
 
 ### K. Scheduling and the mirror (7)
 

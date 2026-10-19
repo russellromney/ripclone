@@ -368,11 +368,13 @@ fn depth_one_exact(
 
 /// J6: each push adds one Head level: it keeps every pack of the parent's
 /// Head and adds only what no earlier pack has, so a file restored to
-/// earlier bytes adds no blob. Replaced files stay in earlier levels until
-/// the levels pass a quarter of the base; then Full packs a new base and
-/// the next Head is that base plus one level, about the tree's size. When
-/// a parent pack's idx is lost from storage, the next Head packs a new base
-/// instead. Every depth-1 clone is exact.
+/// earlier bytes adds no blob. The idx bundle holds the base's idx files
+/// only, so it is the same artifact for every Head on a base, and each
+/// level's idx is fetched on its own. Replaced files stay in earlier levels
+/// until the levels pass a quarter of the base; then Full packs a new base
+/// and the next Head is that base plus one level, about the tree's size.
+/// When a parent pack's idx is lost from storage, the next Head packs a new
+/// base instead. Every depth-1 clone is exact.
 #[test]
 fn j6_head_levels_then_rebase() {
     let world = World::new();
@@ -400,6 +402,17 @@ fn j6_head_levels_then_rebase() {
         );
         packs(&server, "acme/j6", &tip)
     };
+    // The Head's idx bundle, and how many of its packs are levels, whose
+    // idx is not in it.
+    let bundle = |built: &Packs| {
+        let head = manifest(&server, "acme/j6", &built.commit, "head");
+        let levels = (head.packs.iter())
+            .filter(|entry| entry.idx_bundle_offset.is_none())
+            .count();
+        (hash_to_hex(&head.idx_bundle.unwrap().hash), levels)
+    };
+    let (base_bundle, levels) = bundle(&prev);
+    assert_eq!(levels, 0, "a cold Head is all base");
     let level_bytes = |prev: &Packs, built: &Packs| -> u64 {
         added(
             &prev.head,
@@ -414,12 +427,22 @@ fn j6_head_levels_then_rebase() {
     write("small.txt", b"b\n");
     let b = push("B: edit");
     assert!(level_bytes(&prev, &b) < 4 << 10, "{:?}", b.head);
+    assert_eq!(
+        bundle(&b),
+        (base_bundle.clone(), 1),
+        "one level on A's base"
+    );
     prev = b;
 
     // Restoring A's bytes adds the commit and its tree, no blob.
     write("small.txt", b"a\n");
     let c = push("C: restore");
     assert!(level_bytes(&prev, &c) < 1 << 10, "{:?}", c.head);
+    assert_eq!(
+        bundle(&c),
+        (base_bundle.clone(), 2),
+        "two levels on A's base"
+    );
     prev = c;
 
     // Replacing files grows the levels until Full packs a new base.
@@ -435,7 +458,9 @@ fn j6_head_levels_then_rebase() {
         if prev.head.keys().all(|h| built.head.contains_key(h)) {
             assert!(level_bytes(&prev, &built) < 80 << 10, "{:?}", built.head);
             assert!(total < base_bytes + base_bytes / 4 + (80 << 10), "{total}");
+            assert_eq!(bundle(&built).0, base_bundle, "the same base");
         } else {
+            assert_ne!(bundle(&built).0, base_bundle, "a new base");
             rebased = Some(total);
             assert!(
                 total < base_bytes + (80 << 10),

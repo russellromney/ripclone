@@ -1004,7 +1004,7 @@ impl Client {
     /// buffered, since extraction reads their bytes directly.
     ///
     /// A Head installs its HEAD packs with idx files sliced from the idx
-    /// bundle. A Full installs only its history packs, each with its own idx:
+    /// bundle, or, for a level's pack, its own idx. A Full installs only its history packs, each with its own idx:
     /// they hold every object, so the HEAD packs only write the working tree,
     /// and a handful of packs needs no multi-pack-index. Without a `pack_dir`
     /// only the working tree is written: history packs are not downloaded, and
@@ -1031,13 +1031,16 @@ impl Client {
         let full = manifest.packs.iter().any(|entry| entry.history_only);
         // Only a Head's `.git` keeps the HEAD packs.
         let head_pack_dir = pack_dir.filter(|_| !full);
-        // The planned download: the packs fetched, each history pack's own
-        // idx, and a Head's idx bundle and multi-pack-index.
+        // The planned download: the packs fetched, each history pack's and
+        // kept level's own idx, and a Head's idx bundle and multi-pack-index.
         let wanted = |entry: &&PackEntry| !entry.history_only || (pack_dir.is_some() && history);
+        let own_idx = |entry: &PackEntry| {
+            entry.history_only || (head_pack_dir.is_some() && entry.idx_bundle_offset.is_none())
+        };
         let pack_bytes: u64 = (manifest.packs.iter().filter(wanted))
             .flat_map(|entry| {
-                let own_idx = entry.idx.as_ref().filter(|_| entry.history_only);
-                entry.pack.iter().chain(own_idx)
+                let own = entry.idx.as_ref().filter(|_| own_idx(entry));
+                entry.pack.iter().chain(own)
             })
             .map(|chunk| chunk.len)
             .sum();
@@ -1056,8 +1059,9 @@ impl Client {
                 cleanup.clone(),
             )
         };
+        let bundled = (manifest.packs.iter()).any(|entry| entry.idx_bundle_offset.is_some());
         let idx_bundle_task = match head_pack_dir {
-            Some(_) => {
+            Some(_) if bundled => {
                 let bundle_ref = manifest
                     .idx_bundle
                     .as_ref()
@@ -1067,7 +1071,7 @@ impl Client {
                     "fetch idx bundle",
                 ))
             }
-            None => None,
+            _ => None,
         };
         let midx_task = manifest
             .midx
@@ -1146,6 +1150,7 @@ impl Client {
                 entry.clone(),
             );
             let pack_dir = pack_dir.map(Path::to_path_buf);
+            let own = own_idx(&entry);
             let task = AbortOnDrop::new(
                 tokio::spawn(async move {
                     let (entry, urls, pack_dir) = (&entry, &urls, pack_dir.as_deref());
@@ -1176,18 +1181,33 @@ impl Client {
                             let idx = idx.with_context(|| format!("fetch history pack idx {i}"))?;
                             (PackBody::TempFile { file, len }, Some(idx))
                         } else {
-                            let idx_bytes = idx_bundle
-                                .map(|bundle| manifest_pack_idx_bytes(entry, i, &bundle))
-                                .transpose()?;
+                            // A level's idx is not in the bundle: fetch it
+                            // alongside the pack.
+                            let own_idx = async {
+                                if !own {
+                                    return anyhow::Ok(None);
+                                }
+                                let idx_ref = (entry.idx.as_ref())
+                                    .with_context(|| format!("pack {i} missing idx ref"))?;
+                                let idx = Artifact::chunk(idx_ref, UrlSlot::PackIdx(i));
+                                let bytes = (client.download_bytes(urls, &idx).await)
+                                    .with_context(|| format!("fetch head pack idx {i}"))?;
+                                Ok(Some(bytes))
+                            };
                             // Hold a process-wide weighted permit from before the
                             // body starts buffering until its blocking parser
                             // exits, so concurrent clones share one byte budget.
                             let memory_permit =
                                 tuning::acquire_editable_pack_memory(pack_ref.len).await;
-                            let bytes = client
-                                .download_bytes(urls, &artifact)
-                                .await
-                                .with_context(|| format!("fetch head pack {i}"))?;
+                            let (bytes, own_idx) =
+                                tokio::join!(client.download_bytes(urls, &artifact), own_idx);
+                            let bytes = bytes.with_context(|| format!("fetch head pack {i}"))?;
+                            let idx_bytes = match own_idx? {
+                                Some(idx) => Some(idx),
+                                None => idx_bundle
+                                    .map(|bundle| manifest_pack_idx_bytes(entry, i, &bundle))
+                                    .transpose()?,
+                            };
                             let body = PackBody::Buffered {
                                 bytes,
                                 _memory_permit: memory_permit,

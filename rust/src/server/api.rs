@@ -909,24 +909,27 @@ fn ref_response(
     }
     .unwrap_or_default();
     let packs: Vec<String> = pack_artifacts.iter().map(|p| p.pack.clone()).collect();
-    // A history pack's idx is fetched on its own; the rest are in the bundle.
-    let history_idx: std::collections::HashSet<&str> = info
-        .full
-        .as_ref()
-        .filter(|_| kind == ExactResultKind::Full)
-        .map(|full| {
-            full.history_levels
-                .iter()
-                .flat_map(|level| level.packs.iter().map(|p| p.idx.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // The idx files fetched on their own: a Full's history packs' and a
+    // Head's levels'. The Head base's are in the idx bundle.
+    let own_idx: std::collections::HashSet<&str> = match kind {
+        ExactResultKind::Full => (info.full.as_ref())
+            .map(|full| {
+                (full.history_levels.iter())
+                    .flat_map(|level| level.packs.iter().map(|p| p.idx.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ExactResultKind::Head => (info.head.as_ref())
+            .map(|head| head.levels.iter().map(|p| p.idx.as_str()).collect())
+            .unwrap_or_default(),
+        ExactResultKind::Files => Default::default(),
+    };
     let signed = |hash: &str| signed_url(storage, ttl, hash);
-    let pack_idx_urls: Option<Vec<Option<String>>> = (!history_idx.is_empty()).then(|| {
+    let pack_idx_urls: Option<Vec<Option<String>>> = (!own_idx.is_empty()).then(|| {
         pack_artifacts
             .iter()
             .map(|p| {
-                history_idx
+                own_idx
                     .contains(p.idx.as_str())
                     .then(|| signed(&p.idx))
                     .flatten()

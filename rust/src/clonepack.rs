@@ -69,8 +69,10 @@ pub fn manifest_pack_idx_bytes(
         .idx
         .as_ref()
         .with_context(|| format!("pack {index} missing idx ref"))?;
-    let off = usize::try_from(entry.idx_bundle_offset)
-        .context("idx bundle offset does not fit in usize")?;
+    let off = entry
+        .idx_bundle_offset
+        .with_context(|| format!("pack {index}'s idx is not in the idx bundle"))?;
+    let off = usize::try_from(off).context("idx bundle offset does not fit in usize")?;
     let len =
         usize::try_from(idx_ref.len).context("idx bundle slice length does not fit in usize")?;
     let end = off.checked_add(len).context("idx bundle offset overflow")?;

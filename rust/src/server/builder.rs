@@ -295,11 +295,11 @@ async fn load_metadata_async(
 }
 
 /// One manifest entry for `pack`, whose idx is at `idx_bundle_offset` in the
-/// idx bundle when the manifest has one.
+/// idx bundle when it is in the bundle.
 fn pack_entry(
     pack: &(String, u64, String, u64),
     history_only: bool,
-    idx_bundle_offset: u64,
+    idx_bundle_offset: Option<u64>,
 ) -> Result<crate::clonepack::PackEntry> {
     Ok(crate::clonepack::PackEntry {
         pack: Some(ChunkRef {
@@ -364,28 +364,37 @@ fn get_all_cached(
         .collect()
 }
 
-/// Build a Head's PackEntry list and the bundle of its packs' idx files.
+/// Build a Head's PackEntry list and the bundle of its first `bundled`
+/// packs' idx files: the base's. The bundle is the same for every Head on a
+/// base, so storage keeps one copy and a push uploads none; each level's idx
+/// is fetched on its own, as it was uploaded with its pack.
 fn assemble_head_packs(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
     packs: &[(String, u64, String, u64)],
+    bundled: usize,
 ) -> Result<(Vec<crate::clonepack::PackEntry>, Option<ChunkRef>, String)> {
-    if packs.is_empty() {
-        return Ok((Vec::new(), None, String::new()));
+    let (base, levels) = packs.split_at(bundled.min(packs.len()));
+    let level_entries = levels.iter().map(|pack| pack_entry(pack, false, None));
+    if base.is_empty() {
+        return Ok((level_entries.collect::<Result<_>>()?, None, String::new()));
     }
     use std::io::Write;
 
-    let idx_hashes: Vec<&str> = packs.iter().map(|pack| pack.2.as_str()).collect();
+    let idx_hashes: Vec<&str> = base.iter().map(|pack| pack.2.as_str()).collect();
     let idxs = get_all_cached(cas, storage, &idx_hashes)?;
     let mut bundle = cas.writer().context("create idx bundle")?;
     let mut entries = Vec::with_capacity(packs.len());
     let mut len = 0u64;
-    for (pack, idx_bytes) in packs.iter().zip(idxs) {
+    for (pack, idx_bytes) in base.iter().zip(idxs) {
         bundle
             .write_all(&idx_bytes)
             .context("write idx bytes to bundle")?;
-        entries.push(pack_entry(pack, false, len)?);
+        entries.push(pack_entry(pack, false, Some(len))?);
         len += idx_bytes.len() as u64;
+    }
+    for entry in level_entries {
+        entries.push(entry?);
     }
     let (hash, stored_len) = bundle.finish()?;
     anyhow::ensure!(
@@ -675,6 +684,7 @@ pub(super) async fn build_head_result(
         parent.clone(),
     );
     let (fpacks, all_built) = (head_packs.clone(), head_built.all_local);
+    let bundled = head_built.base_packs.len();
     let (
         shallow_metadata_hash,
         shallow_clonepack_hash,
@@ -693,7 +703,7 @@ pub(super) async fn build_head_result(
             // Head has no archive frames. Files publishes its own archive result.
             let archive_chunks = archive_chunk_refs(&[], &shallow_meta)?;
             let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
-                assemble_head_packs(cas, storage, &fpacks)?;
+                assemble_head_packs(cas, storage, &fpacks, bundled)?;
             let idx_bundle_len = head_idx_bundle_ref.as_ref().map_or(0, |r| r.len);
             Cancel::check_current()?;
             // Ship the head MIDX only on a cold full base (all pack bytes still
@@ -996,8 +1006,8 @@ pub(super) async fn build_full_result(
         // working tree alone: no idx bundle.
         let entries = vhead
             .iter()
-            .map(|pack| pack_entry(pack, false, 0))
-            .chain(vhistory.iter().map(|pack| pack_entry(pack, true, 0)))
+            .map(|pack| pack_entry(pack, false, None))
+            .chain(vhistory.iter().map(|pack| pack_entry(pack, true, None)))
             .collect::<Result<Vec<_>>>()?;
         let metadata_len = match metadata_len {
             Some(len) => len,

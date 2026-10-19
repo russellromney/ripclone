@@ -66,10 +66,11 @@ message PackEntry {
   // packs).
   bool history_only = 3;
 
-  // Byte offset of this pack's idx within the manifest's `idx_bundle`. The idx
-  // length is `idx.len`. Only meaningful when `idx_bundle` is set. (0 for the
-  // first pack is valid; gate on `idx_bundle` being present, not on offset.)
-  uint64 idx_bundle_offset = 4;
+  // Byte offset of this pack's idx within the manifest's `idx_bundle`, whose
+  // length is `idx.len`. Unset when the idx is not in the bundle: a Head's
+  // levels, and every Full pack. A client that keeps such a pack fetches its
+  // idx on its own.
+  optional uint64 idx_bundle_offset = 4;
 }
 
 // Per-commit metadata chunk. This is the only chunk that changes on every
