@@ -514,16 +514,17 @@ impl Client {
                 )
             });
         let mut side_download = side_download;
-        let ident = match refs_base {
+        let (ident, tree) = match refs_base {
             None => {
-                (self.materialize_git(&urls, &pin.checkout, &root, true, cleanup, bench))
-                    .await?
-                    .0
+                let (ident, _, tree) =
+                    (self.materialize_git(&urls, &pin.checkout, &root, true, cleanup, bench))
+                        .await?;
+                (ident, tree)
             }
             Some(base) => {
                 let base_urls = OutputUrls::new(repo_path, base.clone());
                 let none = HashSet::new();
-                let ((ident, manifest), (packs, base_packs)) = tokio::try_join!(
+                let ((ident, manifest, tree), (packs, base_packs)) = tokio::try_join!(
                     self.materialize_git(&urls, &pin.checkout, &root, false, cleanup, bench),
                     async {
                         let manifest = self.fetch_manifest(&base_urls).await?;
@@ -559,9 +560,11 @@ impl Client {
                     .await
                     .context("pack install task")??;
                 }
-                ident
+                (ident, tree)
             }
         };
+        self.progress.phase("writing index");
+        write_index(&root, &output.commit, tree, cleanup).await?;
         // The tip read while the packs downloaded is the commit the clone
         // installs; the server's commit is only where the download started.
         let moved_from = match upstream_tip {
@@ -792,7 +795,7 @@ impl Client {
 
         let root = stage(target, staging)?;
         bench.mark_metadata();
-        let bytes = self
+        let (bytes, _) = self
             .install_editable_packs(urls, &manifest, None, false, &root, &metadata, cleanup)
             .await
             .context("write the working tree from Head packs")?;
@@ -804,7 +807,8 @@ impl Client {
 
     /// Head or Full: `git init`, `.git` from the metadata chunk, then the
     /// packs, whose blobs are written into the working tree as each pack
-    /// lands. Returns the committer for the reflog and the manifest.
+    /// lands. Returns the committer for the reflog, the manifest, and the
+    /// work tree the index is written from.
     async fn materialize_git(
         &self,
         urls: &OutputUrls,
@@ -813,7 +817,7 @@ impl Client {
         history: bool,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
-    ) -> Result<(Option<String>, ClonepackManifest)> {
+    ) -> Result<(Option<String>, ClonepackManifest, WorkTree)> {
         let (manifest, metadata, ident) = tokio::try_join!(
             async {
                 tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
@@ -826,10 +830,10 @@ impl Client {
         bench.add_bytes(metadata_bytes(&metadata), 0);
 
         let git_dir = root.join(".git");
-        write_git_dir(&git_dir, urls.output(), checkout, &metadata)?;
+        write_git_dir(&git_dir, urls.output(), checkout)?;
         bench.mark_metadata();
 
-        let bytes = self
+        let (bytes, tree) = self
             .install_editable_packs(
                 urls,
                 &manifest,
@@ -847,7 +851,7 @@ impl Client {
             manifest.packs.len()
         );
         bench.mark_archive_download(bytes);
-        Ok((ident, manifest))
+        Ok((ident, manifest, tree))
     }
 
     /// Download the history packs `manifest`, of `urls`' Full, lists but
@@ -1022,7 +1026,7 @@ impl Client {
         work_tree: &Path,
         metadata: &MetadataChunk,
         cleanup: &Cleanup,
-    ) -> Result<u64> {
+    ) -> Result<(u64, WorkTree)> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         if manifest.packs.is_empty() {
@@ -1339,36 +1343,19 @@ impl Client {
             );
         }
 
-        let Some(pack_dir) = pack_dir else {
-            return Ok(total);
+        // The index is written once every pack is in: a full clone's trees
+        // are in history packs installed after these.
+        let tree = WorkTree {
+            paths: (metadata.files.iter().map(|e| e.path.clone()))
+                .chain(metadata.gitlinks.iter().cloned())
+                .collect(),
+            stats: stat_cache,
         };
-        self.progress.phase("writing index");
-
-        // Files are materialized and each gitlink has its empty directory;
-        // clear skip-worktree for every tracked path, as `git clone` leaves it.
-        let path_bytes: Vec<Vec<u8>> = metadata
-            .files
-            .iter()
-            .map(|e| e.path.clone())
-            .chain(metadata.gitlinks.iter().cloned())
-            .collect();
-        let index_tree = work_tree.to_path_buf();
-        AbortOnDrop::new(
-            tokio::task::spawn_blocking(move || {
-                crate::git::clear_skip_worktree_index_with_stats_byte_iter(
-                    &index_tree,
-                    path_bytes.iter().map(Vec::as_slice),
-                    &stat_cache,
-                )
-            }),
-            cleanup.clone(),
-        )
-        .join()
-        .await
-        .context("spawn clear skip-worktree and refresh index stats")??;
-
+        let Some(pack_dir) = pack_dir else {
+            return Ok((total, tree));
+        };
         if full {
-            return Ok(total);
+            return Ok((total, tree));
         }
         // Install the multi-pack-index so git object lookups stay O(log) across
         // the many installed packs. A cold build supplies the prebuilt MIDX;
@@ -1400,7 +1387,7 @@ impl Client {
                 .await;
             }
         }
-        Ok(total)
+        Ok((total, tree))
     }
 
     /// Write a full clone's refs as `git clone` has them: every branch as
@@ -1941,15 +1928,35 @@ fn stage(target: &Path, staging: &Staging) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Lay down `.git` from the metadata chunk over what `git init` wrote: HEAD
-/// and the checked-out branch, and the prebuilt index. The packs bring the
-/// objects.
-fn write_git_dir(
-    git_dir: &Path,
-    output: &RefResponse,
-    checkout: &str,
-    metadata: &MetadataChunk,
-) -> Result<()> {
+/// The paths an editable install wrote, with their stat data.
+struct WorkTree {
+    paths: Vec<Vec<u8>>,
+    stats: Vec<crate::git::MaterializedPathStat>,
+}
+
+/// Write `.git/index` once the installed packs hold `commit`'s trees: git
+/// writes it from them, cache-tree included, and each entry takes its
+/// file's stat data, as `git clone` leaves it.
+async fn write_index(root: &Path, commit: &str, tree: WorkTree, cleanup: &Cleanup) -> Result<()> {
+    run_git(root, &["read-tree", "--end-of-options", commit], cleanup)
+        .await
+        .context("write the index")?;
+    let root = root.to_path_buf();
+    AbortOnDrop::new(
+        tokio::task::spawn_blocking(move || {
+            let paths = tree.paths.iter().map(Vec::as_slice);
+            crate::git::set_index_stats(&root, paths, &tree.stats)
+        }),
+        cleanup.clone(),
+    )
+    .join()
+    .await
+    .context("index stats task")?
+}
+
+/// Lay down over what `git init` wrote HEAD and the checked-out branch. The
+/// packs bring the objects, and the index is written once they are in.
+fn write_git_dir(git_dir: &Path, output: &RefResponse, checkout: &str) -> Result<()> {
     let heads = git_dir.join("refs").join("heads");
     std::fs::create_dir_all(&heads)?;
     std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
@@ -1975,7 +1982,6 @@ fn write_git_dir(
 
     let pack_dir = git_dir.join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)?;
-    std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
     Ok(())
 }
 
@@ -1984,7 +1990,7 @@ fn write_git_dir(
 /// branch with a remote-tracking ref at the installed commit. A
 /// single-branch clone fetches only that branch or tag. `git pull`
 /// then works in the clone. `checkStat = minimal` lets git trust the
-/// prebuilt index's stat data, so the first `git status` reads no file.
+/// index's stat data, so the first `git status` reads no file.
 fn write_git_config(
     git_dir: &Path,
     origin_url: &str,
@@ -2086,9 +2092,9 @@ fn quoted(text: &str) -> String {
 }
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
-    // The metadata chunk is the protobuf encoding of the index, frame table,
-    // and file table: the index bytes plus an estimate per table entry.
-    (metadata.prebuilt_index.len() + metadata.frames.len() * 24 + metadata.files.len() * 64) as u64
+    // The metadata chunk is the protobuf encoding of the frame and file
+    // tables: an estimate per table entry.
+    (metadata.frames.len() * 24 + metadata.files.len() * 64) as u64
 }
 
 /// Log the clone's phase timings and perf counters.

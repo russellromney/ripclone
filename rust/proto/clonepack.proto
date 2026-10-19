@@ -20,8 +20,8 @@ message ClonepackManifest {
   optional string parent_commit = 2;
   reserved 3, 6, 7, 8;
 
-  // Metadata chunk holds the prebuilt .git/index and the file/frame tables
-  // needed to decode archive chunks.
+  // Metadata chunk holds the file and frame tables needed to decode archive
+  // chunks.
   ChunkRef metadata_chunk = 4;
 
   // Archive chunks contain working-tree zstd frames. They are shared across
@@ -77,11 +77,9 @@ message PackEntry {
 // commit; archive chunks are shared and immutable. Stored zstd-compressed.
 message MetadataChunk {
   // Fields 1 and 2 held a skeleton pack and idx (commit, trees, symlink
-  // blobs). The packs already hold those objects.
-  reserved 1, 2;
-
-  // Prebuilt .git/index with skip-worktree set on every tracked path.
-  bytes prebuilt_index = 3;
+  // blobs). The packs already hold those objects. Field 3 held a prebuilt
+  // .git/index; the client writes the index from the packs it installs.
+  reserved 1, 2, 3;
 
   // Frame table. The index into this list is the frame index used by fragments.
   repeated FrameInfo frames = 4;
@@ -91,8 +89,6 @@ message MetadataChunk {
 
   // Paths of submodule gitlinks (mode 160000). A clone creates each as an
   // empty directory, as `git clone` does for a submodule it does not init.
-  // The prebuilt index keeps their entries skip-worktree; a client that
-  // creates the directory clears that bit.
   repeated bytes gitlinks = 6;
 }
 
