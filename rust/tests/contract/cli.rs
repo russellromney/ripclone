@@ -298,7 +298,8 @@ fn i13_piped_clone_prints_no_progress() {
     origin.publish();
     let target = world.target("i13-pending");
     let args = ["clone", "acme/i13", target.to_str().unwrap(), "--wait"];
-    // Polls 50 ms apart run the CLI's 40-poll budget out in about 2 s.
+    // Polls at most 50 ms apart run the CLI's 50-poll budget out in about
+    // 2.5 s.
     let poll = [("RIPCLONE_POLL_MS", "50")];
     let err = world.cli_env(&server, &args, &poll).err();
     assert!(err.contains("warming"), "{err}");

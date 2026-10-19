@@ -291,7 +291,7 @@ impl Client {
         fallback: Fallback,
     ) -> Result<(Plan, bool)> {
         let target = &pin.commit;
-        let mut cold = false;
+        let (mut cold, started) = (false, std::time::Instant::now());
         for attempt in 0..MAX_POLLS {
             match self.commit_output(repo_path, target, kind).await? {
                 CommitOutput::Ready(output) => {
@@ -350,7 +350,7 @@ impl Client {
                         self.progress.phase("waiting for the build");
                     }
                     if attempt + 1 < MAX_POLLS {
-                        tokio::time::sleep(poll_delay(attempt)).await;
+                        tokio::time::sleep(poll_delay(started.elapsed())).await;
                     }
                 }
             }

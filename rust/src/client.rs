@@ -360,19 +360,23 @@ pub struct RefResponse {
     pub result: ExactResultKind,
 }
 
-/// Wait before poll `attempt` (0-based) while an output is pending. Starts at
-/// 100 ms and doubles up to a 2 s cap, so a short build is seen at once and a
-/// long one is not polled hard. `RIPCLONE_POLL_MS` overrides the cap.
-fn poll_delay(attempt: usize) -> std::time::Duration {
+/// Wait before the next poll of an output pending since `waited` ago: a
+/// quarter of that, at least 100 ms and at most 2 s, so a build is seen
+/// within a quarter of its time and a long one is not polled hard.
+/// `RIPCLONE_POLL_MS` overrides the cap.
+fn poll_delay(waited: std::time::Duration) -> std::time::Duration {
     let cap = std::env::var("RIPCLONE_POLL_MS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(2_000u64);
-    std::time::Duration::from_millis((100u64 << attempt.min(5)).min(cap))
+    (waited / 4)
+        .max(std::time::Duration::from_millis(100))
+        .min(std::time::Duration::from_millis(cap))
 }
 
-/// How many times a command polls a pending build before giving up.
-const MAX_POLLS: usize = 40;
+/// How many times a command polls a pending build before giving up: about
+/// 73 s at the default cap.
+const MAX_POLLS: usize = 50;
 
 /// What a finished clone learned, for the best-effort post-clone metrics report.
 /// Carries the hosted server's per-clone id (when one was minted), the resolved
@@ -664,7 +668,7 @@ impl Client {
     async fn poll_build(&self, repo_path: &str, mut summary: BuildSummary) -> Result<BuildSummary> {
         self.progress
             .phase(format!("waiting for {}", &summary.commit[..7]));
-        let mut attempt = 0;
+        let (mut attempt, started) = (0, std::time::Instant::now());
         while summary.pending() {
             self.progress.detail(summary.states());
             if attempt == MAX_POLLS {
@@ -673,7 +677,7 @@ impl Client {
                     summary.commit
                 );
             }
-            tokio::time::sleep(poll_delay(attempt)).await;
+            tokio::time::sleep(poll_delay(started.elapsed())).await;
             attempt += 1;
             let (checkout_name, tag) = (summary.checkout_name.take(), summary.tag.take());
             summary = BuildSummary {
@@ -763,6 +767,16 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pending output is polled at a quarter of the time waited, between
+    /// 100 ms and the 2 s cap.
+    #[test]
+    fn poll_delay_is_a_quarter_of_the_wait() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(poll_delay(ms(0)), ms(100));
+        assert_eq!(poll_delay(ms(2_000)), ms(500));
+        assert_eq!(poll_delay(ms(60_000)), ms(2_000));
+    }
 
     fn ready_body(commit: &str, kind: &str) -> serde_json::Value {
         serde_json::json!({
