@@ -13,12 +13,26 @@ name: release
 # `protobuf-compiler` and `cmake` are build-time only (prost + zlib-ng);
 # cargo-zigbuild supplies the musl C cross-toolchain on the glibc runner.
 #
+# A dry run builds, packages and checks everything a release would, and
+# publishes nothing: run the workflow by hand, or open a PR that changes how
+# a release is built. Each publishing step runs only for a tag push.
+#
 # Required repo secrets:
 #   CARGO_REGISTRY_TOKEN  crates.io API token (for the crates-io job)
 #   (PyPI uses OIDC Trusted Publishing — configure the project on PyPI, no token)
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - install.sh
+      - pyproject.toml
+      - rust/Cargo.toml
+      - rust/Cargo.lock
+      - rust/build.rs
+      - scripts/install-build-deps.sh
 
 permissions:
   contents: write # create the GitHub Release and upload assets
@@ -33,7 +47,8 @@ jobs:
           set -euo pipefail
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n1)"
           test -n "$version"
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+          echo "crate version $version"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "error: tag $GITHUB_REF_NAME does not match rust/Cargo.toml version $version" >&2
             exit 1
           fi
@@ -95,7 +110,22 @@ jobs:
           cp LICENSE-MIT LICENSE-APACHE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      # The installer, from this package, as a user runs it. The arm64 Linux
+      # binary is cross-built and cannot run here: check it is static arm64.
+      - name: Install and run the package
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.platform }}" = linux-arm64 ]; then
+            file "ripclone-linux-arm64/ripclone" | tee /dev/stderr | grep -Eq "ARM aarch64.*(statically|static-pie) linked"
+            exit 0
+          fi
+          RIPCLONE_DOWNLOAD_URL="file://$PWD" RIPCLONE_BIN_DIR="$RUNNER_TEMP/bin" sh install.sh
+          "$RUNNER_TEMP/bin/ripclone-server" --version
+          if [ "$RUNNER_OS" = Linux ]; then
+            file "$RUNNER_TEMP/bin/ripclone" | tee /dev/stderr | grep -Eq "(statically|static-pie) linked"
+          fi
       - uses: softprops/action-gh-release@v3
+        if: github.event_name == 'push'
         with:
           files: |
             ripclone-${{ matrix.platform }}.tar.gz
@@ -110,6 +140,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: softprops/action-gh-release@v3
+        if: github.event_name == 'push'
         with:
           files: install.sh
           fail_on_unmatched_files: true
@@ -125,9 +156,10 @@ jobs:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
+      # A dry run packages the crate and builds it from the package alone.
       - name: cargo publish
         working-directory: rust
-        run: cargo publish --locked
+        run: cargo publish --locked ${{ github.event_name != 'push' && '--dry-run' || '' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -141,9 +173,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, platform: linux-x86_64, args: "--manylinux 2_28" }
-          - { os: macos-14, platform: macos-arm64, args: "" }
-          - { os: macos-15-intel, platform: macos-x86_64, args: "" }
+          - { os: ubuntu-latest, platform: linux-x86_64 }
+          - { os: macos-14, platform: macos-arm64 }
+          - { os: macos-15-intel, platform: macos-x86_64 }
     runs-on: ${{ matrix.os }}
     permissions:
       id-token: write # PyPI Trusted Publishing (OIDC)
@@ -156,11 +188,23 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --manifest-path rust/Cargo.toml ${{ matrix.args }}
+          args: --release --out dist --manifest-path rust/Cargo.toml
           manylinux: ${{ runner.os == 'Linux' && '2_28' || 'auto' }}
+          # The image's protoc (3.5) predates proto3 `optional`: install a
+          # pinned release.
           before-script-linux: |
-            dnf install -y protobuf-compiler cmake || \
-            (apt-get update && apt-get install -y protobuf-compiler cmake pkg-config)
+            set -euo pipefail
+            dnf install -y cmake unzip
+            curl -fsSLo /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip
+            echo "121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278  /tmp/protoc.zip" | sha256sum -c -
+            unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+            protoc --version
+      - name: Install and run the wheel
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet dist/*.whl
+          "$RUNNER_TEMP/venv/bin/ripclone" --version
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.platform }}
@@ -168,6 +212,7 @@ jobs:
 
   pypi-publish:
     needs: pypi
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
