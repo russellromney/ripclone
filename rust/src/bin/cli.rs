@@ -716,7 +716,7 @@ async fn run() -> Result<()> {
                 ripclone::validation::validate_repo_path(&provider, &repo_id)
                     .map_err(|e| usage(format!("{e:#}")))?;
                 let url = ripclone::git::upstream_url(&provider, &repo_id);
-                match ripclone::git::ls_remote_commit_async(&provider, &repo_id, &branch, None)
+                match ripclone::git::git_ls_remote_commit_async(&provider, &repo_id, &branch)
                     .await
                     .with_context(|| format!("read {url}"))?
                 {

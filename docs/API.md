@@ -56,8 +56,10 @@ POST /v1/repos/github/acme/app/builds
 ```
 
 `selector` is `HEAD` (the default branch), a full commit SHA (40 or 64
-lowercase hex), or a branch or tag name. `HEAD` and names cost one
-`ls-remote` of the upstream. A full SHA is trusted as given and admitted
+lowercase hex), or a branch or tag name. `HEAD` and names cost one read of
+the upstream's refs: over HTTP, one protocol v2 `ls-refs` request on a
+connection the server keeps open, or `git ls-remote` when the upstream does
+not answer it. A full SHA is trusted as given and admitted
 without asking the upstream. Anything else, such as `HEAD~1`, is `400
 invalid_selector`. `retry: true` puts failed outputs of the commit back to
 pending.

@@ -592,3 +592,57 @@ fn i16_verify_upstream_always_walks_the_clone() {
     );
     assert_eq!(world.staging_leftovers(), Vec::<String>::new());
 }
+
+/// I17: an upstream read over HTTP is one protocol v2 `ls-refs` POST, for the
+/// server's resolve and for the CLI's `--verify-upstream`. An upstream that
+/// speaks only v0 gets `git ls-remote` instead, and the clone is the same.
+#[test]
+fn i17_upstream_reads_are_one_ls_refs_request() {
+    let world = World::new();
+    let origin = world.origin("acme", "i17");
+    let tip = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let http = world.serve_origins_over_http();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/i17", "--wait"]).ok();
+    let env = [("RIPCLONE_ORIGIN_BASE", http.url())];
+    for v0 in [false, true] {
+        if v0 {
+            http.speak_v0_only();
+        }
+        let before = http.requests().len();
+        let target = world.target(&format!("i17-v0-{v0}"));
+        world
+            .cli_env(
+                &server,
+                &[
+                    "clone",
+                    "acme/i17",
+                    target.to_str().unwrap(),
+                    "--depth",
+                    "1",
+                    "--verify-upstream=always",
+                ],
+                &env,
+            )
+            .ok();
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip, "v0 {v0}");
+        let seen: Vec<String> = http.requests()[before..]
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path.rsplit('/').next().unwrap()))
+            .collect();
+        // The server's read and the CLI's: one POST each, and with a v0
+        // upstream each falls back to git's advertisement.
+        let expected: &[&str] = if v0 {
+            &["POST git-upload-pack", "GET refs"]
+        } else {
+            &["POST git-upload-pack"]
+        };
+        let mut want = expected.to_vec();
+        want.extend(expected);
+        let mut got: Vec<&str> = seen.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want, "v0 {v0}: {seen:?}");
+    }
+}
