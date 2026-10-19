@@ -16,7 +16,6 @@ impl MetadataChunk {
     /// Create an empty metadata chunk.
     pub fn new() -> Self {
         Self {
-            prebuilt_index: Vec::new(),
             frames: Vec::new(),
             files: Vec::new(),
             gitlinks: Vec::new(),

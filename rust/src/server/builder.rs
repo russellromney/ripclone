@@ -87,8 +87,6 @@ pub struct SyncPhases {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files_table_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prebuilt_index_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_head_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_publish_ms: Option<u64>,
@@ -112,7 +110,6 @@ impl From<&SyncPhases> for SyncPhaseMetrics {
             mirror_fetch_ms: phases.mirror_fetch_ms,
             head_packs_ms: phases.head_packs_ms,
             files_table_ms: phases.files_table_ms,
-            prebuilt_index_ms: phases.prebuilt_index_ms,
             upload_head_ms: phases.upload_head_ms,
             ref_publish_ms: phases.ref_publish_ms,
             publish_head_ms: phases.publish_head_ms,
@@ -560,15 +557,9 @@ pub(super) async fn build_head_result(
     let uploads = Uploads::new(cas, storage);
     let cas = &uploads.cas();
 
-    // The prebuilt index, the Head packs and the files table each read the
-    // commit's tree from the mirror, so they build at once.
+    // The Head packs and the files table each read the commit's tree from
+    // the mirror, so they build at once.
     let t = Instant::now();
-    let (md4, c4, cm4) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-    let prebuilt_index_handle = cancel::spawn_blocking(move || {
-        let s = Instant::now();
-        let index = PackBuilder::new(&md4, &c4).build_prebuilt_index(&cm4)?;
-        anyhow::Ok((index, duration_ms(s.elapsed())))
-    });
     // Head packs are a base plus levels. A Head on an earlier Head keeps
     // all its packs and adds one level: the depth-1 objects no earlier pack
     // has, read from their idx files. Packs stay disjoint by construction, so
@@ -670,11 +661,6 @@ pub(super) async fn build_head_result(
     phases.files_table_ms = Some(duration_ms(ft_start.elapsed()));
     info!("Head result: packs+files-table {:?}", t.elapsed());
 
-    let (shallow_prebuilt_index, prebuilt_index_ms) = prebuilt_index_handle
-        .await
-        .context("shallow prebuilt index")??;
-    phases.prebuilt_index_ms = Some(prebuilt_index_ms);
-
     Cancel::check_current()?;
     // Assemble the metadata chunk, idx bundle, MIDX and manifest from CAS.
     let (fc, fs, fcommit, fparent) = (
@@ -695,8 +681,7 @@ pub(super) async fn build_head_result(
     ) = cancel::spawn_blocking(
         move || -> Result<(String, String, String, String, u64, u64)> {
             let (cas, storage) = (&fc, &fs);
-            let mut shallow_meta = metadata_base;
-            shallow_meta.prebuilt_index = shallow_prebuilt_index;
+            let shallow_meta = metadata_base;
             let shallow_meta_data = shallow_meta.encode_stored()?;
             let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
 

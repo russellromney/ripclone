@@ -15,7 +15,6 @@ pub struct Metrics {
     sync_mirror_fetch_ms_total: AtomicU64,
     sync_head_packs_ms_total: AtomicU64,
     sync_files_table_ms_total: AtomicU64,
-    sync_prebuilt_index_ms_total: AtomicU64,
     sync_upload_head_ms_total: AtomicU64,
     sync_ref_publish_ms_total: AtomicU64,
     sync_publish_head_ms_total: AtomicU64,
@@ -57,7 +56,6 @@ impl Metrics {
         Self::add_optional(&self.sync_mirror_fetch_ms_total, phases.mirror_fetch_ms);
         Self::add_optional(&self.sync_head_packs_ms_total, phases.head_packs_ms);
         Self::add_optional(&self.sync_files_table_ms_total, phases.files_table_ms);
-        Self::add_optional(&self.sync_prebuilt_index_ms_total, phases.prebuilt_index_ms);
         Self::add_optional(&self.sync_upload_head_ms_total, phases.upload_head_ms);
         Self::add_optional(&self.sync_ref_publish_ms_total, phases.ref_publish_ms);
         Self::add_optional(&self.sync_publish_head_ms_total, phases.publish_head_ms);
@@ -133,7 +131,7 @@ impl Metrics {
         let s = self.snapshot();
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 22] = [
+        let counters: [(&str, &str, u64); 21] = [
             (
                 "ripclone_ref_lookups_total",
                 "Ref lookups served",
@@ -159,11 +157,6 @@ impl Metrics {
                 "ripclone_sync_files_table_ms_total",
                 "Total files-table phase time in milliseconds",
                 s.sync_files_table_ms_total,
-            ),
-            (
-                "ripclone_sync_prebuilt_index_ms_total",
-                "Total prebuilt-index phase time in milliseconds",
-                s.sync_prebuilt_index_ms_total,
             ),
             (
                 "ripclone_sync_upload_head_ms_total",
@@ -276,7 +269,6 @@ impl Metrics {
             sync_mirror_fetch_ms_total: self.sync_mirror_fetch_ms_total.load(Ordering::Relaxed),
             sync_head_packs_ms_total: self.sync_head_packs_ms_total.load(Ordering::Relaxed),
             sync_files_table_ms_total: self.sync_files_table_ms_total.load(Ordering::Relaxed),
-            sync_prebuilt_index_ms_total: self.sync_prebuilt_index_ms_total.load(Ordering::Relaxed),
             sync_upload_head_ms_total: self.sync_upload_head_ms_total.load(Ordering::Relaxed),
             sync_ref_publish_ms_total: self.sync_ref_publish_ms_total.load(Ordering::Relaxed),
             sync_publish_head_ms_total: self.sync_publish_head_ms_total.load(Ordering::Relaxed),
@@ -316,7 +308,6 @@ pub struct SyncPhaseMetrics {
     pub mirror_fetch_ms: Option<u64>,
     pub head_packs_ms: Option<u64>,
     pub files_table_ms: Option<u64>,
-    pub prebuilt_index_ms: Option<u64>,
     pub upload_head_ms: Option<u64>,
     pub ref_publish_ms: Option<u64>,
     pub publish_head_ms: Option<u64>,
@@ -331,7 +322,6 @@ pub struct MetricsSnapshot {
     pub sync_mirror_fetch_ms_total: u64,
     pub sync_head_packs_ms_total: u64,
     pub sync_files_table_ms_total: u64,
-    pub sync_prebuilt_index_ms_total: u64,
     pub sync_upload_head_ms_total: u64,
     pub sync_ref_publish_ms_total: u64,
     pub sync_publish_head_ms_total: u64,

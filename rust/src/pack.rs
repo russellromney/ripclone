@@ -38,18 +38,6 @@ impl<'a> PackBuilder<'a> {
         }
     }
 
-    /// Build a ready-to-use `.git/index` for `commit`.
-    ///
-    /// The index contains every tracked path with `skip-worktree` set and
-    /// accurate cached blob sizes. After the client materializes files it must
-    /// clear skip-worktree for those paths.
-    pub fn build_prebuilt_index(&self, commit: &str) -> Result<Vec<u8>> {
-        let tmp = tempfile::TempDir::new()?;
-        let index_path = tmp.path().join("index");
-        git::write_prebuilt_index(&self.repo, commit, &index_path)?;
-        Ok(std::fs::read(&index_path)?)
-    }
-
     /// Build just the HEAD closure (undeltified small packs) — the depth=1
     /// payload. Used to publish Head before the slower Full history is built.
     pub fn build_head_packs(

@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const SKIP_WORKTREE_FLAG: gix::index::entry::Flags = gix::index::entry::Flags::SKIP_WORKTREE;
-
 /// `git` for a child of this process. Every git the server runs starts here.
 ///
 /// The command must stay on std's `posix_spawn` path: no `pre_exec`, `uid`,
@@ -143,98 +141,39 @@ fn write_index_file(index: &mut gix::index::File) -> Result<()> {
         .with_context(|| format!("writing index at {}", index.path().display()))
 }
 
-/// Write the index of `commit`'s tree to `index_path`, read from the bare
-/// mirror `repo` (`git read-tree` with `GIT_INDEX_FILE`, no work tree). Every
-/// entry is skip-worktree, so git treats the paths as present before the
-/// client writes them. Each file entry carries the blob's size and fixed stat
-/// times, so `git status` can trust stat(2) once the client has written the
-/// file and cleared the bit. Paths stay raw bytes, as git stores them.
-pub fn write_prebuilt_index(repo: &Path, commit: &str, index_path: &Path) -> Result<()> {
-    crate::validation::validate_git_rev(commit)
-        .with_context(|| format!("invalid commit: {commit}"))?;
-    let mut read_tree = command();
-    read_tree
-        .args(NO_FSYNC)
-        .arg("-C")
-        .arg(repo)
-        .env("GIT_INDEX_FILE", index_path)
-        .args(["read-tree", "--end-of-options", commit]);
-    run_checked(&mut read_tree, "read-tree", None)?;
-
-    let objects = crate::gix_util::open_repo(repo)?;
-    let mut index = open_index_file(index_path)?;
-    for entry in index.entries_mut() {
-        if entry.mode != gix::index::entry::Mode::COMMIT {
-            let size = objects
-                .find_header(entry.id)
-                .with_context(|| format!("find header {}", entry.id))?
-                .size();
-            entry.stat = gix::index::entry::Stat {
-                size: clamp_u64_to_u32(size),
-                ctime: gix::index::entry::stat::Time { secs: 1, nsecs: 0 },
-                mtime: gix::index::entry::stat::Time { secs: 1, nsecs: 0 },
-                ..Default::default()
-            };
-        }
-        entry
-            .flags
-            .insert(SKIP_WORKTREE_FLAG | gix::index::entry::Flags::EXTENDED);
-    }
-    write_index_file(&mut index)
-}
-
-pub fn clear_skip_worktree_index_with_stats_byte_iter<'a, P, I>(
-    repo_dir: P,
+/// Write each materialized path's stat data into the index `git read-tree`
+/// wrote, as `git clone` leaves it, so `git status` trusts stat(2) and
+/// reads no file. A path the stats leave out (a gitlink's empty directory)
+/// is stat'ed here. Every path must be in the index.
+pub fn set_index_stats<'a, I>(
+    repo_dir: &Path,
     paths: I,
     stats: &[MaterializedPathStat],
 ) -> Result<()>
 where
-    P: AsRef<Path>,
     I: IntoIterator<Item = &'a [u8]>,
 {
-    let mut paths = paths.into_iter().peekable();
-    if paths.peek().is_none() {
-        return Ok(());
-    }
-    let repo_dir = repo_dir.as_ref();
-    let index_path = repo_dir.join(".git").join("index");
-    if !index_path.exists() {
-        // No index means no skip-worktree state to clear (e.g. extracting into a
-        // plain directory rather than a git worktree).
-        return Ok(());
-    }
-    let mut index = open_index_file(&index_path)?;
-
+    let mut index = open_index_file(&repo_dir.join(".git").join("index"))?;
     let stats_by_path: HashMap<&[u8], &IndexStat> =
         stats.iter().map(|s| (s.path.as_slice(), &s.stat)).collect();
-    let mut changed = false;
     for path in paths {
         let Some(entry) = index.entry_mut_by_path_and_stage(
             gix::bstr::BStr::new(path),
             gix::index::entry::Stage::Unconflicted,
         ) else {
-            continue;
+            bail!("{} is not in the index", String::from_utf8_lossy(path));
         };
-        let stat = if let Some(stat) = stats_by_path.get(path) {
-            **stat
-        } else {
-            let full_path = repo_dir.join(index_path_from_bytes(path));
-            let metadata = std::fs::symlink_metadata(&full_path)
-                .with_context(|| format!("stat materialized file {}", full_path.display()))?;
-            index_stat_from_metadata(&metadata)
+        entry.stat = match stats_by_path.get(path) {
+            Some(stat) => **stat,
+            None => {
+                let full_path = repo_dir.join(index_path_from_bytes(path));
+                let metadata = std::fs::symlink_metadata(&full_path)
+                    .with_context(|| format!("stat materialized file {}", full_path.display()))?;
+                index_stat_from_metadata(&metadata)
+            }
         };
-        entry.stat = stat;
-        entry.flags.remove(SKIP_WORKTREE_FLAG);
-        if (entry.flags & (gix::index::entry::Flags::INTENT_TO_ADD | SKIP_WORKTREE_FLAG)).is_empty()
-        {
-            entry.flags.remove(gix::index::entry::Flags::EXTENDED);
-        }
-        changed = true;
     }
-    if changed {
-        write_index_file(&mut index)?;
-    }
-    Ok(())
+    write_index_file(&mut index)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2839,64 +2778,36 @@ mod tests {
         assert_eq!(entries[0].1, "100644");
     }
 
-    fn assert_skip_worktree_flag(repo: &Path, path: &str, expected: bool) {
-        let out = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "ls-files", "-v", "--", path])
-            .output()
-            .unwrap();
-        let line = String::from_utf8(out.stdout).unwrap();
-        let flag = line.starts_with('S');
-        assert_eq!(
-            flag, expected,
-            "skip-worktree for {}: expected {}, got {} ({:?})",
-            path, expected, flag, line
-        );
-    }
-
-    /// Clearing skip-worktree and refreshing stats via gix (Phase 5) writes
-    /// real stat metadata back into the index.
+    /// The index `git read-tree` writes takes the materialized files' stat
+    /// data, so `git status` finds them clean.
     #[test]
-    fn gix_index_clear_skip_worktree_with_stats() {
+    fn set_index_stats_after_read_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
-        let _ = Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .arg(repo)
-            .output()
-            .unwrap();
-        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
-            let _ = Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
                 .output()
                 .unwrap();
-        }
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
         std::fs::write(repo.join("a.txt"), "aaaa\n").unwrap();
-        let _ = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
-            .output()
-            .unwrap();
-        let _ = Command::new("git")
-            .args([
-                "-C",
-                repo.to_str().unwrap(),
-                "update-index",
-                "--skip-worktree",
-                "a.txt",
-            ])
-            .output()
-            .unwrap();
-        assert_skip_worktree_flag(repo, "a.txt", true);
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "a"]);
+        std::fs::remove_file(repo.join(".git").join("index")).unwrap();
+        git(&["read-tree", "HEAD"]);
 
         let stats = vec![materialized_path_stat_from_metadata(
             b"a.txt".to_vec(),
             &std::fs::symlink_metadata(repo.join("a.txt")).unwrap(),
         )];
-        clear_skip_worktree_index_with_stats_byte_iter(repo, [b"a.txt".as_slice()], &stats)
-            .unwrap();
-
-        assert_skip_worktree_flag(repo, "a.txt", false);
-
-        // Index should now reflect the real on-disk size.
+        set_index_stats(repo, [b"a.txt".as_slice()], &stats).unwrap();
         let index = open_index_file(&repo.join(".git").join("index")).unwrap();
         let entry = index
             .entry_by_path_and_stage(
@@ -2905,6 +2816,12 @@ mod tests {
             )
             .expect("a.txt in index");
         assert_eq!(entry.stat.size, 5);
+        assert!(
+            index.tree().is_some(),
+            "read-tree writes the TREE extension"
+        );
+        assert_eq!(git(&["diff-files", "--name-only"]), "");
+        assert!(set_index_stats(repo, [b"b.txt".as_slice()], &[]).is_err());
     }
 
     /// Basic metadata queries via gix (Phase 1).
