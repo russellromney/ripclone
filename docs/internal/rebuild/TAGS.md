@@ -599,13 +599,13 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   share in levels built apart, a cold Full or a compaction, still comes
   twice; a pack of only the commit's own objects would need a server
   build per request.
-- **A commit with D in its history gets no `refs_base`** (the mirror's
-  `merge-base --is-ancestor`, about 18 ms on tokio): its own history
-  holds D's, as for a push built before the refresh published it, by
-  branch or by commit (G16). A mirror that cannot answer gets
-  `refs_base`. The server keeps each answer, since ancestry never
-  changes, so a pinned commit's reads and a top-up's polls ask git once
-  (G16 counts the runs); concurrent reads of one pair wait for one run.
+- **A commit with D in its history gets no `refs_base`** (a merge-base
+  walk of the mirror, in process): its own history holds D's, as for a
+  push built before the refresh published it, by branch or by commit
+  (G16). A mirror that cannot answer gets `refs_base`. The server keeps
+  each answer, since ancestry never changes, so a pinned commit's reads
+  and a top-up's polls ask the mirror once (G16 counts the logged
+  answers); concurrent reads of one pair wait for one answer.
 - **A force-pushed later admit of D's branch gets no `refs_base`.** The
   published refs are behind the upstream there, so the clone, which lacks
   D, fetches the refs from the upstream and holds none of D's objects

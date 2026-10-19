@@ -1947,22 +1947,7 @@ impl RefsRepo {
 /// downloads its own history only.
 #[test]
 fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
-    let mut wrapper = None;
-    let t = RefsRepo::start_with(
-        "g16",
-        |world| {
-            let w = GitWrapper::new(
-                world,
-                "server",
-                r#"case " $* " in *" merge-base --is-ancestor "*) note ancestry ;; esac"#,
-            );
-            let path = w.path.clone();
-            wrapper = Some(w);
-            vec![("PATH".into(), path)]
-        },
-        true,
-    );
-    let wrapper = wrapper.unwrap();
+    let t = RefsRepo::start("g16");
     let (work, bare) = (&t.origin.work, t.origin.bare.to_str().unwrap());
     // A commit on a branch that is then deleted: built, but on no ref.
     git(work, &["checkout", "-q", "-b", "gone", &t.a]);
@@ -2067,19 +2052,16 @@ fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
     let fetches = t.http.fetches();
     let (by_sha, out) = t.clone_via(&proxy, "by-sha", &["--at", &e], &[]);
     out.ok();
-    // The server asked git whether D is in E's history once: later reads
-    // of E take the kept answer.
-    let asked = wrapper.notes("ancestry");
-    assert!(asked > 0, "the server never asked git");
+    // The server asked the mirror whether D is in E's history once: later
+    // reads of E take the kept answer.
+    let asked = |t: &RefsRepo| t.server.log().matches("ancestry of ").count();
+    let asked_once = asked(&t);
+    assert!(asked_once > 0, "the server never asked the mirror");
     for _ in 0..3 {
         let (_, body) = api::parse(t.server.get(&api::commit_path(&t.repo, &e, Some("full"))));
         assert!(body.get("refs_base").is_none(), "{body}");
     }
-    assert_eq!(
-        wrapper.notes("ancestry"),
-        asked,
-        "a read of E asked git again"
-    );
+    assert_eq!(asked(&t), asked_once, "a read of E asked the mirror again");
     assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
     assert_eq!(git(&by_sha, &["rev-parse", "HEAD"]), e);
     assert_eq!(

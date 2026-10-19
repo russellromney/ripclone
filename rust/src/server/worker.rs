@@ -874,48 +874,39 @@ async fn ancestor_base(
     let target = format!("{}@{}", repo_id.storage_key(), short(commit));
     let (dir, tip, log_target) = (mirror_dir.to_path_buf(), commit.to_string(), target.clone());
     let found = cancel::spawn_blocking(move || {
-        let ancestors: Vec<String> = candidates
-            .into_iter()
-            .filter(|candidate| match git::is_ancestor(&dir, candidate, &tip) {
-                Ok(is_ancestor) => is_ancestor,
-                Err(error) => {
-                    info!(
-                        "{kind} base candidate {} for {log_target} is not usable: {error:#}",
-                        short(candidate)
-                    );
-                    false
-                }
-            })
-            .collect();
-        // Admission order is not history order (a commit admitted late, a
-        // ref moved back), so the ancestors are ranked by history.
-        let newest = match ancestors.len() {
-            0 | 1 => None,
-            _ => git::independent_commits(&dir, &ancestors).ok(),
-        };
-        let base = ancestors
-            .iter()
-            .find(|ancestor| {
-                newest
-                    .as_ref()
-                    .is_none_or(|newest| newest.contains(*ancestor))
-            })
-            .or(ancestors.first())?
-            .clone();
-        let distance = git::count_commits_since(&dir, &base, &tip).ok();
-        Some((base, distance))
+        crate::gix_util::with_ancestry(&dir, |is_ancestor| {
+            let ancestors: Vec<String> = candidates
+                .into_iter()
+                .filter(|candidate| match is_ancestor(candidate, &tip) {
+                    Ok(is_ancestor) => is_ancestor,
+                    Err(error) => {
+                        info!(
+                            "{kind} base candidate {} for {log_target} is not usable: {error:#}",
+                            short(candidate)
+                        );
+                        false
+                    }
+                })
+                .collect();
+            // Admission order is not history order (a commit admitted late, a
+            // ref moved back), so the base is the first ancestor no other
+            // descends from.
+            let newest = ancestors.iter().find(|ancestor| {
+                !ancestors.iter().any(|other| {
+                    other != *ancestor && is_ancestor(ancestor, other).unwrap_or(false)
+                })
+            });
+            newest.or(ancestors.first()).cloned()
+        })
     })
     .await
-    .context("base lookup task")?;
-    let Some((base, distance)) = found else {
+    .context("base lookup task")?
+    .with_context(|| format!("open mirror for {target}"))?;
+    let Some(base) = found else {
         info!("{kind} base for {target}: none, building cold");
         return Ok(None);
     };
-    let distance = distance.map_or_else(|| "?".to_string(), |n| n.to_string());
-    info!(
-        "{kind} base for {target}: {} ({distance} commits back)",
-        short(&base)
-    );
+    info!("{kind} base for {target}: {}", short(&base));
     // A ready output never changes, so the row still has it.
     state.control.status(repo_id, &base).await
 }

@@ -390,7 +390,7 @@ async fn publish_branches(
 /// Whether `old` is in `new`'s history.
 async fn moved_forward(mirror_dir: &Path, old: &str, new: &str) -> Result<bool> {
     let (dir, old, new) = (mirror_dir.to_path_buf(), old.to_string(), new.to_string());
-    cancel::spawn_blocking(move || git::is_ancestor(&dir, &old, &new))
+    cancel::spawn_blocking(move || crate::gix_util::is_ancestor(&dir, &old, &new))
         .await
         .context("ancestry task")?
 }

@@ -148,6 +148,44 @@ pub fn parent_commit<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<Optio
     })
 }
 
+/// Run `f` with an ancestry question for the repository at `repo_path`:
+/// whether `ancestor` is an ancestor of (or equal to) `commit`. The questions
+/// share one commit graph, so many of them cost one repository open and the
+/// commits walked once. An error means the repository could not answer, for
+/// example because a commit is not in it.
+pub fn with_ancestry<P: AsRef<Path>, R>(
+    repo_path: P,
+    f: impl FnOnce(&mut dyn FnMut(&str, &str) -> Result<bool>) -> R,
+) -> Result<R> {
+    let mut repo = open_repo(repo_path)?;
+    repo.object_cache_size_if_unset(4 * 1024 * 1024);
+    let cache = repo
+        .commit_graph_if_enabled()
+        .context("open commit-graph")?;
+    let mut graph = repo.revision_graph(cache.as_ref());
+    let mut is_ancestor = |ancestor: &str, commit: &str| -> Result<bool> {
+        let (one, two) = (parse_oid(ancestor)?, parse_oid(commit)?);
+        // The walk answers no for a commit it cannot find; git errors.
+        for (id, name) in [(one, ancestor), (two, commit)] {
+            if !repo.has_object(id) {
+                anyhow::bail!("commit {name} is not in the repository");
+            }
+        }
+        match repo.merge_base_with_graph(one, two, &mut graph) {
+            Ok(base) => Ok(base.detach() == one),
+            Err(gix::repository::merge_base_with_graph::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("merge-base {ancestor} {commit}")),
+        }
+    };
+    Ok(f(&mut is_ancestor))
+}
+
+/// Whether `ancestor` is an ancestor of (or equal to) `commit`. See
+/// [`with_ancestry`].
+pub fn is_ancestor<P: AsRef<Path>>(repo_path: P, ancestor: &str, commit: &str) -> Result<bool> {
+    with_ancestry(repo_path, |is_ancestor| is_ancestor(ancestor, commit))?
+}
+
 /// The objects of `commit`'s depth-1 closure in path order: the commit, its
 /// trees, then its blobs, each in depth-first tree order and listed once.
 /// Head packs are cut from this list, so the files of one directory share
@@ -377,6 +415,46 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Ancestry answers as `git merge-base --is-ancestor` gives them: a
+    /// commit is its own ancestor, a side branch is not, unrelated history is
+    /// not, and a commit the repo lacks is an error.
+    #[test]
+    fn ancestry_matches_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path().to_str().unwrap();
+        git(&["init", "-q", w]);
+        let commit = |message: &str| {
+            git(&[
+                "-C",
+                w,
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                message,
+            ]);
+            git(&["-C", w, "rev-parse", "HEAD"])
+        };
+        let a = commit("a");
+        let b = commit("b");
+        git(&["-C", w, "checkout", "-q", "-b", "side", &a]);
+        let s = commit("s");
+        git(&["-C", w, "checkout", "-q", "--orphan", "other"]);
+        let o = commit("o");
+        let missing = "1".repeat(40);
+        let answers = super::with_ancestry(w, |is_ancestor| {
+            [(&a, &b), (&b, &b), (&b, &a), (&s, &b), (&a, &s), (&o, &b)]
+                .map(|(x, y)| is_ancestor(x, y).unwrap())
+        })
+        .unwrap();
+        assert_eq!(answers, [true, true, false, false, true, false]);
+        assert!(super::is_ancestor(w, &missing, &b).is_err());
     }
 
     /// Parallel lookups on a freshly opened repo find every object. Without
