@@ -190,9 +190,15 @@ jobs:
           command: build
           args: --release --out dist --manifest-path rust/Cargo.toml
           manylinux: ${{ runner.os == 'Linux' && '2_28' || 'auto' }}
+          # The image's protoc (3.5) predates proto3 `optional`: install a
+          # pinned release.
           before-script-linux: |
-            dnf install -y protobuf-compiler cmake || \
-            (apt-get update && apt-get install -y protobuf-compiler cmake pkg-config)
+            set -euo pipefail
+            dnf install -y cmake unzip
+            curl -fsSLo /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip
+            echo "121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278  /tmp/protoc.zip" | sha256sum -c -
+            unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+            protoc --version
       - name: Install and run the wheel
         run: |
           set -euo pipefail
