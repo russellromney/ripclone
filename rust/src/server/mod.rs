@@ -83,13 +83,12 @@ pub struct ServerState {
     /// Artifacts the running builds rely on, which deletion skips.
     pub pins: Arc<crate::pins::Pins>,
     /// Answers of whether one commit is in another's history, which never
-    /// change, so a read of a pinned commit asks git once.
+    /// change, so a read of a pinned commit asks the mirror once.
     pub ancestry: Arc<Ancestry>,
 }
 
-/// `git merge-base --is-ancestor` answers by repo, ancestor and commit.
-/// Concurrent reads of one key wait for one git run, and a failed run is
-/// not kept. Past [`Ancestry::MAX`] keys it starts over.
+/// Ancestry answers by repo, ancestor and commit. Concurrent reads of one
+/// key wait for one answer, and a failed one is not kept. Past [`Ancestry::MAX`] keys it starts over.
 #[derive(Default)]
 pub struct Ancestry(std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<bool>>>>);
 

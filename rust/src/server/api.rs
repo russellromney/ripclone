@@ -742,10 +742,19 @@ async fn in_history(state: &ServerState, repo_id: &RepoId, base: &str, commit: &
         .get_or_try_init(|| async {
             let dir = state.repo_root.join(repo_id.mirror_dir_name());
             let (base, commit) = (base.to_string(), commit.to_string());
-            crate::cancel::spawn_blocking(move || crate::git::is_ancestor(&dir, &base, &commit))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|answer| answer)
+            let key = format!(
+                "{} in {}",
+                &base[..7.min(base.len())],
+                &commit[..7.min(commit.len())]
+            );
+            let answer = crate::cancel::spawn_blocking(move || {
+                crate::gix_util::is_ancestor(&dir, &base, &commit)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|answer| answer)?;
+            tracing::info!("ancestry of {key} in {}: {answer}", repo_id.storage_key());
+            anyhow::Ok(answer)
         })
         .await;
     match answer {
