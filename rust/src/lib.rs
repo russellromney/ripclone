@@ -179,7 +179,12 @@ pub struct ArchiveFrame {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClonepackArtifacts {
     pub manifest: String,
+    /// The files table, or with `metadata_delta` the base table it applies to.
     pub metadata_chunk: String,
+    /// CAS hash of a `MetadataDelta` on `metadata_chunk`. Empty when
+    /// `metadata_chunk` is the whole table.
+    #[serde(default)]
+    pub metadata_delta: String,
     /// CAS hash of the pre-built multi-pack-index over this variant's packs.
     pub midx: String,
     /// CAS hash of the concatenated idx bundle of a Head's packs. Empty for
@@ -242,6 +247,7 @@ impl ClonepackArtifacts {
         [
             &self.manifest,
             &self.metadata_chunk,
+            &self.metadata_delta,
             &self.midx,
             &self.idx_bundle,
         ]
@@ -338,6 +344,7 @@ pub(crate) fn exact_output_artifacts_ready(
     if artifacts.commit != commit
         || !valid_hash(&artifacts.manifest)
         || !valid_hash(&artifacts.metadata_chunk)
+        || !(artifacts.metadata_delta.is_empty() || valid_hash(&artifacts.metadata_delta))
     {
         return false;
     }

@@ -262,30 +262,132 @@ async fn seal_and_compact(
     Ok((history_packs, new_tuples, levels))
 }
 
-/// Load and decode a prior build's metadata chunk. Bytes come from local CAS
-/// or object storage (the disposable local cache may have been cleared after
-/// a prior upload). Returns `None` on any failure; callers that only use it
-/// to reuse work then build without it.
+/// Load and decode a prior build's files table: its metadata chunk, with
+/// its delta applied when it has one. Bytes come from local CAS or object
+/// storage (the disposable local cache may have been cleared after a prior
+/// upload). Returns `None` on any failure; callers that only use it to
+/// reuse work then build without it.
 fn load_metadata(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
-    metadata_hash: &str,
+    artifacts: &crate::ClonepackArtifacts,
 ) -> Option<crate::clonepack::MetadataChunk> {
-    let bytes = cas
-        .get(metadata_hash)
-        .or_else(|_| storage.get(metadata_hash))
-        .ok()?;
-    crate::clonepack::MetadataChunk::decode_and_validate(bytes.as_slice()).ok()
+    let base = load_artifact(cas, storage, &artifacts.metadata_chunk)?;
+    let base = crate::clonepack::MetadataChunk::decode_and_validate(&base).ok()?;
+    if artifacts.metadata_delta.is_empty() {
+        return Some(base);
+    }
+    let delta = load_artifact(cas, storage, &artifacts.metadata_delta)?;
+    let delta = crate::clonepack::MetadataDelta::decode_stored(&delta).ok()?;
+    delta.apply(&base).ok()
+}
+
+fn load_artifact(cas: &Cas, storage: &crate::storage::StorageRef, hash: &str) -> Option<Vec<u8>> {
+    cas.get(hash).or_else(|_| storage.get(hash)).ok()
+}
+
+/// A manifest's references to its files table: the metadata chunk, and the
+/// delta on it when the table is stored as one.
+pub(super) type TableRefs = (ChunkRef, Option<ChunkRef>);
+
+/// A files table as a build stores it: see [`store_table`].
+struct StoredTable {
+    metadata_chunk: String,
+    metadata_delta: String,
+    refs: TableRefs,
+    /// Bytes stored for this build: the delta, or the whole table.
+    len: u64,
+}
+
+impl StoredTable {
+    /// The artifact this build stored: the delta, or the whole table.
+    fn stored(&self) -> &str {
+        if self.metadata_delta.is_empty() {
+            &self.metadata_chunk
+        } else {
+            &self.metadata_delta
+        }
+    }
+}
+
+/// Store `table`, whose frames name the bundles `bundles`. With `previous`,
+/// the previous result of the same kind and the bundles its table's frames
+/// name, the table is a delta on the previous result's base table while
+/// the delta is at most a quarter of that base; past it, the whole table,
+/// which later builds take as their base.
+fn store_table(
+    cas: &Cas,
+    storage: &crate::storage::StorageRef,
+    table: &crate::clonepack::MetadataChunk,
+    bundles: &[String],
+    previous: Option<(&crate::ClonepackArtifacts, &[String])>,
+) -> Result<StoredTable> {
+    use crate::clonepack::{MetadataChunk, MetadataDelta};
+    let delta = previous.and_then(|(previous, previous_bundles)| {
+        let base_bytes = load_artifact(cas, storage, &previous.metadata_chunk)?;
+        let base = MetadataChunk::decode_and_validate(&base_bytes).ok()?;
+        // Where the base's frames are in the previous table, then in this one.
+        let (to_previous, previous_frames) = if previous.metadata_delta.is_empty() {
+            let identity = (1..=base.frames.len()).map(|slot| slot as u32).collect();
+            (identity, base.frames.clone())
+        } else {
+            let delta = load_artifact(cas, storage, &previous.metadata_delta)?;
+            let delta = MetadataDelta::decode_stored(&delta).ok()?;
+            (delta.base_frames, delta.frames)
+        };
+        let to_table =
+            crate::manifest::frame_map(&previous_frames, previous_bundles, &table.frames, bundles)
+                .ok()?;
+        let map = crate::manifest::compose_frame_maps(&to_previous, &to_table).ok()?;
+        let delta = (MetadataDelta::between(&base, map, table).ok()?)
+            .encode_stored()
+            .ok()?;
+        (delta.len() * 4 <= base_bytes.len())
+            .then(|| (previous.metadata_chunk.clone(), base_bytes.len(), delta))
+    });
+    Ok(match delta {
+        Some((metadata_chunk, base_len, delta)) => {
+            // The base is the previous result's, already durable.
+            cas.pin(&metadata_chunk);
+            let metadata_delta = cas.put(&delta)?;
+            StoredTable {
+                refs: (
+                    chunk_ref(&metadata_chunk, base_len as u64)?,
+                    Some(chunk_ref(&metadata_delta, delta.len() as u64)?),
+                ),
+                metadata_chunk,
+                metadata_delta,
+                len: delta.len() as u64,
+            }
+        }
+        None => {
+            let bytes = table.encode_stored()?;
+            let metadata_chunk = cas.put(&bytes)?;
+            StoredTable {
+                refs: (chunk_ref(&metadata_chunk, bytes.len() as u64)?, None),
+                metadata_chunk,
+                metadata_delta: String::new(),
+                len: bytes.len() as u64,
+            }
+        }
+    })
+}
+
+pub(super) fn chunk_ref(hash: &str, len: u64) -> Result<ChunkRef> {
+    Ok(ChunkRef {
+        hash: hash_from_hex(hash)?,
+        len,
+    })
 }
 
 /// [`load_metadata`] on the blocking pool.
 async fn load_metadata_async(
     cas: &Cas,
     storage: &crate::storage::StorageRef,
-    metadata_hash: &str,
+    artifacts: &crate::ClonepackArtifacts,
 ) -> Option<crate::clonepack::MetadataChunk> {
-    let (cas, storage, hash) = (cas.clone(), storage.clone(), metadata_hash.to_string());
-    cancel::spawn_blocking(move || load_metadata(&cas, &storage, &hash))
+    let (cas, storage, artifacts) = (cas.clone(), storage.clone(), artifacts.clone());
+    cancel::spawn_blocking(move || load_metadata(&cas, &storage, &artifacts))
         .await
         .ok()
         .flatten()
@@ -444,8 +546,7 @@ pub(super) fn make_manifest(
     commit: &str,
     parent: &Option<String>,
     archive_chunks: &[ChunkRef],
-    metadata_hash: &str,
-    metadata_len: u64,
+    metadata: &TableRefs,
     packs: Vec<crate::clonepack::PackEntry>,
     midx: Option<ChunkRef>,
     idx_bundle: Option<ChunkRef>,
@@ -453,10 +554,8 @@ pub(super) fn make_manifest(
     Ok(ClonepackManifest {
         commit: commit.to_string(),
         parent_commit: parent.clone(),
-        metadata_chunk: Some(ChunkRef {
-            hash: hash_from_hex(metadata_hash)?,
-            len: metadata_len,
-        }),
+        metadata_chunk: Some(metadata.0.clone()),
+        metadata_delta: metadata.1.clone(),
         archive_chunks: archive_chunks.to_vec(),
         packs,
         midx,
@@ -551,6 +650,7 @@ pub(super) async fn build_head_result(
     commit: &str,
     parent: Option<String>,
     base: Option<crate::HeadBase>,
+    previous: Option<crate::ClonepackArtifacts>,
     storage: &crate::storage::StorageRef,
     phases: &mut SyncPhases,
 ) -> Result<crate::HeadResult> {
@@ -657,7 +757,7 @@ pub(super) async fn build_head_result(
     let head_built = head_handle.await.context("head packs")??;
     phases.head_packs_ms = Some(head_built.elapsed_ms);
     let head_packs = head_built.all_packs.clone();
-    let metadata_base = files_table_handle.await.context("files table")??;
+    let files_table = files_table_handle.await.context("files table")??;
     phases.files_table_ms = Some(duration_ms(ft_start.elapsed()));
     info!("Head result: packs+files-table {:?}", t.elapsed());
 
@@ -671,60 +771,57 @@ pub(super) async fn build_head_result(
     );
     let (fpacks, all_built) = (head_packs.clone(), head_built.all_local);
     let bundled = head_built.base_packs.len();
-    let (
-        shallow_metadata_hash,
-        shallow_clonepack_hash,
-        head_idx_bundle_hash,
-        head_midx_hash,
-        head_metadata_len,
-        head_idx_bundle_len,
-    ) = cancel::spawn_blocking(
-        move || -> Result<(String, String, String, String, u64, u64)> {
-            let (cas, storage) = (&fc, &fs);
-            let shallow_meta = metadata_base;
-            let shallow_meta_data = shallow_meta.encode_stored()?;
-            let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
+    let (table, shallow_clonepack_hash, head_idx_bundle_hash, head_midx_hash, head_idx_bundle_len) =
+        cancel::spawn_blocking(
+            move || -> Result<(StoredTable, String, String, String, u64)> {
+                let (cas, storage) = (&fc, &fs);
+                // Head has no archive frames, so its table names no bundles.
+                let table = store_table(
+                    cas,
+                    storage,
+                    &files_table,
+                    &[],
+                    previous.as_ref().map(|previous| (previous, &[][..])),
+                )?;
 
-            // Head has no archive frames. Files publishes its own archive result.
-            let archive_chunks = archive_chunk_refs(&[], &shallow_meta)?;
-            let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
-                assemble_head_packs(cas, storage, &fpacks, bundled)?;
-            let idx_bundle_len = head_idx_bundle_ref.as_ref().map_or(0, |r| r.len);
-            Cancel::check_current()?;
-            // Ship the head MIDX only on a cold full base (all pack bytes still
-            // local). On a delta re-sync the base packs may be absent from local
-            // cache, so omit it — the client builds its own MIDX from the
-            // per-pack idxs.
-            let (head_midx_ref, head_midx_hash) = if all_built {
-                assemble_midx(cas, &fpacks)?
-            } else {
-                (None, String::new())
-            };
+                // Head has no archive frames. Files publishes its own archive result.
+                let archive_chunks = archive_chunk_refs(&[], &files_table)?;
+                let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
+                    assemble_head_packs(cas, storage, &fpacks, bundled)?;
+                let idx_bundle_len = head_idx_bundle_ref.as_ref().map_or(0, |r| r.len);
+                Cancel::check_current()?;
+                // Ship the head MIDX only on a cold full base (all pack bytes still
+                // local). On a delta re-sync the base packs may be absent from local
+                // cache, so omit it — the client builds its own MIDX from the
+                // per-pack idxs.
+                let (head_midx_ref, head_midx_hash) = if all_built {
+                    assemble_midx(cas, &fpacks)?
+                } else {
+                    (None, String::new())
+                };
 
-            let shallow_manifest = make_manifest(
-                &fcommit,
-                &fparent,
-                &archive_chunks,
-                &shallow_metadata_hash,
-                shallow_meta_data.len() as u64,
-                head_entries,
-                head_midx_ref,
-                head_idx_bundle_ref,
-            )?;
-            let shallow_clonepack_hash = cas.put(&shallow_manifest.encode_to_vec())?;
-            Ok((
-                shallow_metadata_hash,
-                shallow_clonepack_hash,
-                head_idx_bundle_hash,
-                head_midx_hash,
-                shallow_meta_data.len() as u64,
-                idx_bundle_len,
-            ))
-        },
-    )
-    .await
-    .context("Head manifest task")??;
-    phases.head_metadata_bytes = Some(head_metadata_len);
+                let shallow_manifest = make_manifest(
+                    &fcommit,
+                    &fparent,
+                    &archive_chunks,
+                    &table.refs,
+                    head_entries,
+                    head_midx_ref,
+                    head_idx_bundle_ref,
+                )?;
+                let shallow_clonepack_hash = cas.put(&shallow_manifest.encode_to_vec())?;
+                Ok((
+                    table,
+                    shallow_clonepack_hash,
+                    head_idx_bundle_hash,
+                    head_midx_hash,
+                    idx_bundle_len,
+                ))
+            },
+        )
+        .await
+        .context("Head manifest task")??;
+    phases.head_metadata_bytes = Some(table.len);
     phases.head_idx_bundle_bytes = Some(head_idx_bundle_len);
     phases.head_packs_bytes = Some(
         head_built
@@ -737,7 +834,8 @@ pub(super) async fn build_head_result(
     let head = crate::HeadResult {
         clonepack: crate::ClonepackArtifacts {
             manifest: shallow_clonepack_hash.clone(),
-            metadata_chunk: shallow_metadata_hash.clone(),
+            metadata_chunk: table.metadata_chunk.clone(),
+            metadata_delta: table.metadata_delta.clone(),
             midx: head_midx_hash.clone(),
             idx_bundle: head_idx_bundle_hash.clone(),
             commit: commit.to_string(),
@@ -753,7 +851,7 @@ pub(super) async fn build_head_result(
     // the freshly built head packs and idx).
     // Reused bucket packs are already durable in storage from a prior sync.
     let mut head_uploads: Vec<String> = vec![
-        shallow_metadata_hash.clone(),
+        table.stored().to_string(),
         shallow_clonepack_hash.clone(),
         head_idx_bundle_hash.clone(),
         head_midx_hash.clone(),
@@ -768,7 +866,8 @@ pub(super) async fn build_head_result(
         .iter()
         .map(|(_, _, ih, _)| ih.clone())
         .chain([
-            shallow_metadata_hash.clone(),
+            table.metadata_chunk.clone(),
+            table.metadata_delta.clone(),
             shallow_clonepack_hash.clone(),
         ])
         .collect();
@@ -975,15 +1074,13 @@ pub(super) async fn build_full_result(
     }
 
     Cancel::check_current()?;
-    let (vc, vs, vcommit, vparent, vmetadata) = (
-        cas.clone(),
-        storage.clone(),
-        commit.to_string(),
-        parent.clone(),
-        head.clonepack.metadata_chunk.clone(),
+    let (vc, vcommit, vparent) = (cas.clone(), commit.to_string(), parent.clone());
+    // A Full's files table is its Head's.
+    let metadata: TableRefs = (
+        (head_manifest.metadata_chunk.clone()).context("Head manifest has no metadata chunk")?,
+        head_manifest.metadata_delta.clone(),
     );
     let (vhead, vhistory) = (head_packs.clone(), history_packs.clone());
-    let metadata_len = head_manifest.metadata_chunk.as_ref().map(|chunk| chunk.len);
     let start = Instant::now();
     let manifest_hash = cancel::spawn_blocking(move || -> Result<_> {
         // The history levels hold every object, so a full clone installs only
@@ -994,20 +1091,7 @@ pub(super) async fn build_full_result(
             .map(|pack| pack_entry(pack, false, None))
             .chain(vhistory.iter().map(|pack| pack_entry(pack, true, None)))
             .collect::<Result<Vec<_>>>()?;
-        let metadata_len = match metadata_len {
-            Some(len) => len,
-            None => vs.size(&vmetadata).context("size Head metadata for Full")?,
-        };
-        let manifest = make_manifest(
-            &vcommit,
-            &vparent,
-            &[],
-            &vmetadata,
-            metadata_len,
-            entries,
-            None,
-            None,
-        )?;
+        let manifest = make_manifest(&vcommit, &vparent, &[], &metadata, entries, None, None)?;
         vc.put(&manifest.encode_to_vec())
     })
     .await
@@ -1039,6 +1123,7 @@ pub(super) async fn build_full_result(
         clonepack: crate::ClonepackArtifacts {
             manifest: manifest_hash,
             metadata_chunk: head.clonepack.metadata_chunk.clone(),
+            metadata_delta: head.clonepack.metadata_delta.clone(),
             midx: String::new(),
             idx_bundle: String::new(),
             commit: commit.to_string(),
@@ -1079,7 +1164,7 @@ pub(super) async fn build_files_result(
         compact.clone()
     };
     let base_metadata = match &base_files {
-        Some(files) => load_metadata_async(cas, storage, &files.clonepack.metadata_chunk).await,
+        Some(files) => load_metadata_async(cas, storage, &files.clonepack).await,
         None => None,
     };
     let base = base_metadata.zip(base_files);
@@ -1149,33 +1234,34 @@ pub(super) async fn build_files_result(
     let start = Instant::now();
     let archive_chunk_hashes = archive_output.download_bundle_hashes;
     let metadata = archive_output.metadata;
-    let (fc, fcommit, fparent) = (cas.clone(), commit.to_string(), parent);
+    let (fc, fs, fcommit, fparent) = (cas.clone(), storage.clone(), commit.to_string(), parent);
     let fchunks = archive_chunk_hashes.clone();
-    let (metadata_hash, manifest_hash, metadata_len) =
-        cancel::spawn_blocking(move || -> Result<_> {
-            let metadata_bytes = metadata.encode_stored()?;
-            let metadata_hash = fc.put(&metadata_bytes)?;
-            let archive_chunks = archive_chunk_refs(&fchunks, &metadata)?;
-            let manifest = make_manifest(
-                &fcommit,
-                &fparent,
-                &archive_chunks,
-                &metadata_hash,
-                metadata_bytes.len() as u64,
-                Vec::new(),
-                None,
-                None,
-            )?;
-            let manifest_hash = fc.put(&manifest.encode_to_vec())?;
-            Ok((metadata_hash, manifest_hash, metadata_bytes.len() as u64))
-        })
-        .await
-        .context("Files manifest task")??;
+    let fprevious = previous.map(|files| (files.clonepack.clone(), files.archive_chunks.clone()));
+    let (table, manifest_hash) = cancel::spawn_blocking(move || -> Result<_> {
+        let previous = fprevious
+            .as_ref()
+            .map(|(p, bundles)| (p, bundles.as_slice()));
+        let table = store_table(&fc, &fs, &metadata, &fchunks, previous)?;
+        let archive_chunks = archive_chunk_refs(&fchunks, &metadata)?;
+        let manifest = make_manifest(
+            &fcommit,
+            &fparent,
+            &archive_chunks,
+            &table.refs,
+            Vec::new(),
+            None,
+            None,
+        )?;
+        let manifest_hash = fc.put(&manifest.encode_to_vec())?;
+        Ok((table, manifest_hash))
+    })
+    .await
+    .context("Files manifest task")??;
     phases.record("manifest", start);
-    phases.size("metadata", metadata_len);
+    phases.size("metadata", table.len);
 
-    // Reused bundles are the base's, already durable.
-    let mut publish_uploads = vec![metadata_hash.clone(), manifest_hash.clone()];
+    // Reused bundles and a delta's base are the base's, already durable.
+    let mut publish_uploads = vec![table.stored().to_string(), manifest_hash.clone()];
     publish_uploads.extend(archive_output.new_bundle_hashes.iter().cloned());
     let start = Instant::now();
     uploads.start_all(&publish_uploads);
@@ -1184,7 +1270,7 @@ pub(super) async fn build_files_result(
     let keep = archive_chunk_hashes
         .iter()
         .cloned()
-        .chain([metadata_hash.clone()])
+        .chain([table.metadata_chunk.clone(), table.metadata_delta.clone()])
         .collect();
     settle_storage(cas, storage, uploaded, keep).await;
     phases.record("upload", start);
@@ -1192,7 +1278,8 @@ pub(super) async fn build_files_result(
     Ok(crate::FilesResult {
         clonepack: crate::ClonepackArtifacts {
             manifest: manifest_hash,
-            metadata_chunk: metadata_hash,
+            metadata_chunk: table.metadata_chunk,
+            metadata_delta: table.metadata_delta,
             midx: String::new(),
             idx_bundle: String::new(),
             commit: commit.to_string(),

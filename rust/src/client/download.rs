@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 pub(super) enum UrlSlot {
     Manifest,
     Metadata,
+    MetadataDelta,
     ArchiveChunk(usize),
     PackChunk(usize),
     PackIdx(usize),
@@ -36,6 +37,7 @@ impl UrlSlot {
         match self {
             Self::Manifest => info.clonepack_manifest_url.clone(),
             Self::Metadata => info.metadata_chunk_url.clone(),
+            Self::MetadataDelta => info.metadata_delta_url.clone(),
             Self::ArchiveChunk(index) => indexed(&info.archive_chunk_urls, index),
             Self::PackChunk(index) => indexed(&info.pack_chunk_urls, index),
             Self::PackIdx(index) => indexed(&info.pack_idx_urls, index),
@@ -52,10 +54,11 @@ impl UrlSlot {
         }
     }
 
-    fn label(self) -> String {
+    pub(super) fn label(self) -> String {
         match self {
             Self::Manifest => "manifest".to_string(),
             Self::Metadata => "metadata".to_string(),
+            Self::MetadataDelta => "metadata delta".to_string(),
             Self::ArchiveChunk(index) => format!("archive chunk {index}"),
             Self::PackChunk(index) => format!("pack {index}"),
             Self::PackIdx(index) => format!("pack idx {index}"),
@@ -133,7 +136,8 @@ impl OutputUrls {
         validate_output(&info, commit, kind, repo_path)?;
         anyhow::ensure!(
             info.clonepack_manifest == output.clonepack_manifest
-                && info.metadata_chunk == output.metadata_chunk,
+                && info.metadata_chunk == output.metadata_chunk
+                && info.metadata_delta == output.metadata_delta,
             "URL refresh changed the {kind} output of {commit}"
         );
         let url = slot
