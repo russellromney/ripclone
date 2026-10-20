@@ -15,7 +15,24 @@ set -euo pipefail
 # RIPCLONE_BENCH_READY_RESULTS=head for a depth-one-only run so readiness does
 # not wait for background Full or Files artifacts.
 #
-# Compared modes (each run uses a fresh dir with the client cache disabled):
+# Readiness: timing starts only after every requested output of the pinned
+# commit is ready. Waiting on `full` also waits until the repo's refs are
+# published (the Full carries `branches`); before that a full clone fetches
+# every branch from upstream and times git, not ripclone.
+#
+# SKIP_ADD=1 makes the harness read-only on the server: it does not add the
+# repo or admit builds. It pins upstream's default-branch tip (or BENCH_REF,
+# which must then be a full commit SHA) and waits for the server to have it.
+# The clones themselves still ask the server for the pinned commit, as any
+# clone does.
+#
+# Set BENCH_RESULTS to a file to append one "repo commit label run ms" TSV
+# row per sample.
+#
+# Samples are taken round-robin: run 1 of every mode, then run 2, and so on,
+# so a slow minute upstream lands on all modes alike.
+#
+# Compared modes (each run uses a fresh dir and HOME, client cache disabled):
 #   * ripclone full (depth=0)
 #   * ripclone depth=1
 #   * ripclone files (mode files, depth=1)
@@ -71,10 +88,14 @@ mkdir -p "$LOG_DIR"
 # sticky-directory ownership rules cannot make a rerun fail to update it.
 RESOLVED_REF_FILE="$REF_STATE_DIR/resolved-ref-$(id -u)"
 
-if [ -z "$TOKEN" ]; then
-  echo "warning: RIPCLONE_SERVER_TOKEN not set; server auth may fail" >&2
+# Without a token, the harness and the clones read the server anonymously,
+# as a user without a token would. Adding a repo needs the token.
+if [ -n "$TOKEN" ]; then
+  export RIPCLONE_SERVER_TOKEN="$TOKEN"
+else
+  echo "warning: RIPCLONE_SERVER_TOKEN not set; reading the server anonymously" >&2
+  unset RIPCLONE_SERVER_TOKEN
 fi
-export RIPCLONE_SERVER_TOKEN="$TOKEN"
 export RIPCLONE_SERVER="$SERVER_URL"
 unset RIPCLONE_CACHE_DIR
 
@@ -126,10 +147,11 @@ sha256_hex() {
   else shasum -a 256 | awk '{print $1}'; fi
 }
 
-auth_header() {
-  printf 'Authorization: Ripclone %s' \
-    "$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | sha256_hex)"
-}
+# curl arguments that authenticate as the server token, if there is one.
+AUTH=()
+if [ -n "$TOKEN" ]; then
+  AUTH=(-H "Authorization: Ripclone $(printf '%s' "$TOKEN" | sha256_hex)")
+fi
 
 repo_owner() { echo "$REPO" | cut -d/ -f1; }
 repo_name()  { echo "$REPO" | cut -d/ -f2; }
@@ -202,7 +224,7 @@ ensure_repo_added() {
   tmp="$(mktemp)"
   for attempt in $(seq 1 5); do
     status="000"
-    status=$(curl --connect-timeout 5 --max-time 30 -s -o "$tmp" -w '%{http_code}' -X POST -H "$(auth_header)" "$(api_repo_url)/add") || status="000"
+    status=$(curl --connect-timeout 5 --max-time 30 -s -o "$tmp" -w '%{http_code}' -X POST ${AUTH[@]+"${AUTH[@]}"} "$(api_repo_url)/add") || status="000"
     case "$status" in
       200)
         fields="$(summary_fields < "$tmp")"
@@ -234,7 +256,7 @@ ensure_repo_added() {
 post_build() {
   local selector="$1" body
   body="$(SELECTOR="$selector" python3 -c 'import json, os; print(json.dumps({"selector": os.environ["SELECTOR"], "retry": True}))')"
-  curl --connect-timeout 5 --max-time 30 -fsS -X POST -H "$(auth_header)" \
+  curl --connect-timeout 5 --max-time 30 -fsS -X POST ${AUTH[@]+"${AUTH[@]}"} \
     -H 'Content-Type: application/json' -d "$body" "$(api_repo_url)/builds" | summary_fields
 }
 
@@ -245,27 +267,40 @@ get_default_branch() {
 }
 
 # Poll one output of an admitted commit until it is ready. A failed output
-# stops the benchmark.
+# stops the benchmark. A ready Full counts only once it carries `branches`:
+# until the repo's refs are published, a full clone fetches every branch
+# from upstream, which made one bun full clone take 146 s instead of 3 s.
 wait_for_one_result_ready() {
   local commit="$1"
   local timeout="$2"
   local kind="$3"
-  local start end out state status tmp
+  local start end out state status tmp why
   start=$(now_ms)
   echo "  waiting for $kind of $commit ..." >&2
   while true; do
     tmp="$(mktemp)"
     status="000"
     status=$(curl --connect-timeout 5 --max-time 30 -sS -o "$tmp" -w '%{http_code}' \
-      -H "$(auth_header)" "$(api_repo_url)/commits/$commit?kind=$kind") || status="000"
+      ${AUTH[@]+"${AUTH[@]}"} "$(api_repo_url)/commits/$commit?kind=$kind") || status="000"
     out="$(cat "$tmp")"
     rm -f "$tmp"
-    if [ "$status" != "200" ]; then
+    state=""
+    if [ "$status" = "404" ] && [ "${SKIP_ADD:-0}" = "1" ]; then
+      # Read-only: the server admits upstream's new tip on its own poll.
+      state="not_admitted"
+    elif [ "$status" != "200" ]; then
       echo "error: commit read returned HTTP $status" >&2
       printf '%s\n' "$out" >&2
       return 1
+    else
+      state="$(printf '%s' "$out" | KIND="$kind" python3 -c '
+import json, os, sys
+value = json.load(sys.stdin)
+state = value.get("state", "")
+if state == "ready" and os.environ["KIND"] == "full" and "branches" not in value:
+    state = "refs_unpublished"
+print(state)' 2>/dev/null || true)"
     fi
-    state="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
     case "$state" in
       ready)
         echo "  artifacts ready for admitted $commit" >&2
@@ -274,15 +309,37 @@ wait_for_one_result_ready() {
         echo "error: $kind of $commit failed" >&2
         printf '%s\n' "$out" >&2
         return 1 ;;
+      refs_unpublished) why="full is ready but the repo's refs are not published" ;;
+      not_admitted) why="the server has not admitted it" ;;
+      *) why="${state:-unknown state}" ;;
     esac
     end=$(now_ms)
     if [ $((end - start)) -ge $((timeout * 1000)) ]; then
-      echo "error: artifacts not ready after ${timeout}s" >&2
+      echo "error: $kind of $commit not ready after ${timeout}s: $why" >&2
       return 1
     fi
-    echo "    not ready yet, retrying in 10s ..." >&2
+    echo "    not ready yet ($why), retrying in 10s ..." >&2
     sleep 10
   done
+}
+
+# Read-only pin: upstream's default-branch tip, or BENCH_REF as a full SHA.
+pin_upstream() {
+  local listing
+  if [ -n "${BENCH_REF:-}" ]; then
+    if [[ ! "$BENCH_REF" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "error: with SKIP_ADD=1, BENCH_REF must be a full commit SHA" >&2
+      return 1
+    fi
+    REF="$BENCH_REF"
+    CLONE_REF="HEAD"
+    return 0
+  fi
+  listing="$(git ls-remote --symref "$SOURCE_URL" HEAD)" || return 1
+  REF="$(printf '%s\n' "$listing" | awk '$2 == "HEAD" && $1 ~ /^[0-9a-f]{40}$/ { print $1; exit }')"
+  CLONE_REF="$(printf '%s\n' "$listing" | awk '$1 == "ref:" && $3 == "HEAD" { sub("^refs/heads/", "", $2); print $2; exit }')"
+  CLONE_REF="${CLONE_REF:-HEAD}"
+  [ -n "$REF" ] || { echo "error: could not read upstream HEAD of $SOURCE_URL" >&2; return 1; }
 }
 
 wait_for_commit_ready() {
@@ -315,7 +372,10 @@ warm_server() {
     return 0
   fi
 
-  if [ -n "${BENCH_REF:-}" ]; then
+  if [ "${SKIP_ADD:-0}" = "1" ]; then
+    pin_upstream || return 1
+    echo "  pinned upstream $CLONE_REF -> $REF (read-only, no admission)"
+  elif [ -n "${BENCH_REF:-}" ]; then
     # A full SHA, branch or tag: admit it and wait on the commit it names.
     branch_or_ref="${BENCH_REF#refs/heads/}"
     branch_or_ref="${branch_or_ref#refs/tags/}"
@@ -378,10 +438,18 @@ run_one() {
   local label="$1" cmd_log="$2" deep_verify="$3"; shift 3
   local dir="$TARGET/bench-${label// /_}-${RATE_MBPS}Mbps.$$"
   rm -rf "$dir"
-  local s e elapsed
+  local s e elapsed status=0
+  # A fresh, empty HOME per sample: no saved login, git config or cache.
+  rm -rf "$dir.home"
+  mkdir -p "$dir.home"
   s=$(now_ms)
-  if "$@" "$dir" >"$cmd_log" 2>&1; then
-    e=$(now_ms)
+  (
+    export HOME="$dir.home" XDG_CONFIG_HOME="$dir.home/.config" XDG_CACHE_HOME="$dir.home/.cache"
+    "$@" "$dir"
+  ) >"$cmd_log" 2>&1 || status=$?
+  e=$(now_ms)
+  rm -rf "$dir.home"
+  if [ "$status" = "0" ]; then
     elapsed=$((e - s))
     # Correctness is load-bearing, but it is not part of clone latency. In
     # particular, `git status` can scan or refresh thousands of paths and used
@@ -399,35 +467,67 @@ run_one() {
   fi
 }
 
-bench_cmd() {
-  local label="$1"; shift
-  local times=()
-  local i sample_count="$RUNS"
-  case "$label" in
-    "ripclone "*) sample_count="${RIPCLONE_RUNS:-$RUNS}" ;;
-    *) sample_count="${NATIVE_RUNS:-$RUNS}" ;;
+# Queue one mode. run_cases samples the queued modes round-robin.
+CASE_LABELS=()
+CASE_FUNCS=()
+CASE_TIMES=()
+CASE_FAILED=()
+add_case() {
+  CASE_LABELS+=("$1")
+  CASE_FUNCS+=("$2")
+  CASE_TIMES+=("")
+  CASE_FAILED+=(0)
+}
+
+case_runs() {
+  case "$1" in
+    "ripclone "*) echo "${RIPCLONE_RUNS:-$RUNS}" ;;
+    *) echo "${NATIVE_RUNS:-$RUNS}" ;;
   esac
-  for i in $(seq 1 "$sample_count"); do
-    local log="$LOG_DIR/${label}-run${i}.log"
-    local t
-    # Exact revision/shape checks run after every sample. The first sample also
-    # performs the expensive whole-tree digest and object connectivity proof;
-    # repeating those full reads does not strengthen the latency distribution.
-    local deep_verify=0
-    if [ "$i" -eq 1 ] || [ "${VERIFY_EVERY_RUN:-0}" = "1" ]; then
-      deep_verify=1
-    fi
-    t=$(run_one "$label" "$log" "$deep_verify" "$@")
-    if [ "$t" = "FAILED" ]; then
-      echo "  $label: FAILED (run $i) — see $log"
-      return 1
-    fi
-    times+=("$t")
+}
+
+run_cases() {
+  local i idx label count max_runs=0 log t deep_verify failed=0
+  for label in "${CASE_LABELS[@]}"; do
+    count="$(case_runs "$label")"
+    if [ "$count" -gt "$max_runs" ]; then max_runs="$count"; fi
   done
-  local med tail90
-  med=$(printf '%s\n' "${times[@]}" | median)
-  tail90=$(printf '%s\n' "${times[@]}" | p90)
-  printf '  %-26s p50=%5dms p90=%5dms   runs=[%s]\n' "$label" "$med" "$tail90" "$(IFS=,; echo "${times[*]}")"
+  for i in $(seq 1 "$max_runs"); do
+    for idx in "${!CASE_LABELS[@]}"; do
+      label="${CASE_LABELS[$idx]}"
+      [ "${CASE_FAILED[$idx]}" = "0" ] || continue
+      [ "$i" -le "$(case_runs "$label")" ] || continue
+      log="$LOG_DIR/${label}-run${i}.log"
+      # Exact revision/shape checks run after every sample. The first sample
+      # also performs the expensive whole-tree digest and object connectivity
+      # proof; repeating those full reads does not strengthen the latency
+      # distribution.
+      deep_verify=0
+      if [ "$i" -eq 1 ] || [ "${VERIFY_EVERY_RUN:-0}" = "1" ]; then
+        deep_verify=1
+      fi
+      t=$(run_one "$label" "$log" "$deep_verify" "${CASE_FUNCS[$idx]}")
+      if [ "$t" = "FAILED" ]; then
+        echo "  $label: FAILED (run $i) — see $log"
+        CASE_FAILED[idx]=1
+        failed=1
+        continue
+      fi
+      CASE_TIMES[idx]="${CASE_TIMES[$idx]} $t"
+      if [ -n "${BENCH_RESULTS:-}" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$REPO" "$REF" "$label" "$i" "$t" >> "$BENCH_RESULTS"
+      fi
+    done
+  done
+  local med tail90 times
+  for idx in "${!CASE_LABELS[@]}"; do
+    [ "${CASE_FAILED[$idx]}" = "0" ] || continue
+    read -r -a times <<< "${CASE_TIMES[$idx]}"
+    med=$(printf '%s\n' "${times[@]}" | median)
+    tail90=$(printf '%s\n' "${times[@]}" | p90)
+    printf '  %-26s p50=%5dms p90=%5dms   runs=[%s]\n' "${CASE_LABELS[$idx]}" "$med" "$tail90" "$(IFS=,; echo "${times[*]}")"
+  done
+  return "$failed"
 }
 
 rc_full()  {
@@ -587,6 +687,14 @@ trap cleanup EXIT
 ensure_repo_added
 
 warm_server
+if [ -z "$TOKEN" ]; then
+  # A server may require sign-in for a clone that names a commit or branch.
+  # Without a token, clone the default branch, as `ripclone clone owner/repo`
+  # does; every sample still checks that it got $REF.
+  echo "  no token: cloning the default branch without --at; samples must still be $REF"
+  CLONE_REF="HEAD"
+  AT_REF=""
+fi
 prepare_expected_tree
 
 echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps ripclone_runs=${RIPCLONE_RUNS:-$RUNS} native_runs=${NATIVE_RUNS:-$RUNS} modes=[$BENCH_MODES] ready=[$READY_RESULTS] shaped=${SHAPED:-1} host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
@@ -597,23 +705,18 @@ else
 fi
 
 echo "--- rate=${RATE_MBPS}Mbps ---"
+if [ "${SKIP_RIPCLONE:-0}" != "1" ]; then
+  if mode_enabled full;   then add_case "ripclone full (depth=0)" rc_full; fi
+  if mode_enabled depth1; then add_case "ripclone depth=1"        rc_depth1; fi
+  if mode_enabled files;  then add_case "ripclone files"          rc_files; fi
+fi
+if [ "${SKIP_GIT:-0}" != "1" ]; then
+  if mode_enabled git-full;     then add_case "git clone full"       git_full; fi
+  if mode_enabled git-depth1;   then add_case "git clone --depth 1"  git_depth1; fi
+  if mode_enabled github-files; then add_case "github archive files" github_files; fi
+fi
 BENCH_FAILED=0
-if [ "${SKIP_RIPCLONE:-0}" != "1" ] && mode_enabled full; then
-  bench_cmd "ripclone full (depth=0)" rc_full || BENCH_FAILED=1
-fi
-if [ "${SKIP_RIPCLONE:-0}" != "1" ] && mode_enabled depth1; then
-  bench_cmd "ripclone depth=1"        rc_depth1 || BENCH_FAILED=1
-fi
-if [ "${SKIP_RIPCLONE:-0}" != "1" ] && mode_enabled files; then
-  bench_cmd "ripclone files"          rc_files || BENCH_FAILED=1
-fi
-if [ "${SKIP_GIT:-0}" != "1" ] && mode_enabled git-full; then
-  bench_cmd "git clone full"          git_full || BENCH_FAILED=1
-fi
-if [ "${SKIP_GIT:-0}" != "1" ] && mode_enabled git-depth1; then
-  bench_cmd "git clone --depth 1"     git_depth1 || BENCH_FAILED=1
-fi
-if [ "${SKIP_GIT:-0}" != "1" ] && mode_enabled github-files; then
-  bench_cmd "github archive files"   github_files || BENCH_FAILED=1
+if [ "${#CASE_LABELS[@]}" -gt 0 ]; then
+  run_cases || BENCH_FAILED=1
 fi
 exit "$BENCH_FAILED"

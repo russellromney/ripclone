@@ -65,6 +65,42 @@ policer drops cost one TCP retransmit timeout.
 The previous release (`ddae2ab`) measured within noise of these numbers in
 every cell; the largest gap was 30 ms, on pandas files.
 
+## Over the real network
+
+The same race without shaping, against GitHub over the public internet, from
+`benchmark/real_network.sh` on 2026-10-20:
+
+- **Client:** Hetzner cpx31 (4 shared vCPU, 8 GB), Hillsboro, Ubuntu 24.04,
+  public DNS resolvers, CLI built from `0a604c6`.
+- **Server:** Hetzner cpx21 (3 shared vCPU, 4 GB), Hillsboro, Tigris storage,
+  reached over HTTPS by its public name.
+- **Pins:** `sharkdp/fd` @ `dbfe46bd`, `pandas-dev/pandas` @ `bb4297c4`, the
+  default-branch tips. Every output was ready and the refs were published
+  before the first sample.
+- **Runs:** 3 per mode, round-robin, client cache off, fresh `HOME` per run,
+  no server token.
+
+Median seconds, then every run:
+
+| repo | mode | git | ripclone | speedup | git runs | ripclone runs |
+|---|---|---|---|---|---|---|
+| `pandas-dev/pandas` | full | 23.29 | 2.41 | **9.7×** | 21.91, 23.40, 23.29 | 3.25, 2.41, 2.31 |
+| `pandas-dev/pandas` | depth1 | 2.90 | 0.64 | **4.5×** | 2.88, 3.24, 2.90 | 0.70, 0.64, 0.64 |
+| `pandas-dev/pandas` | files | 2.90 | 0.46 | **6.3×** | 2.88, 3.24, 2.90 | 0.55, 0.44, 0.46 |
+| `sharkdp/fd` | full | 0.58 | 0.54 | 1.1× | 0.56, 0.60, 0.58 | 0.55, 0.54, 0.32 |
+| `sharkdp/fd` | depth1 | 0.37 | 0.40 | 0.9× | 0.37, 0.38, 0.37 | 0.45, 0.36, 0.40 |
+| `sharkdp/fd` | files | 0.37 | 0.36 | 1.0× | 0.37, 0.38, 0.37 | 0.36, 0.28, 0.66 |
+
+depth1 and files are compared with `git clone --depth 1`. A small repository
+like fd clones from GitHub in about a third of a second; Ripclone matches it
+but does not beat it. The gap opens with history and worktree size.
+
+Times only count once the repository's first build has finished: Head, Files
+and Full ready, and the refs published (the Full carries `branches`). In an
+earlier one-off run, a bun full clone started while the refs were still
+unpublished took 146 s instead of 3 s, because it fetched every branch from
+GitHub. The harness now waits for the refs.
+
 ## S3 storage
 
 The same server with Tigris as storage; clients download signed URLs directly
