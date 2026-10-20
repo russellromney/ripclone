@@ -9,8 +9,8 @@
 //! add `FOR UPDATE SKIP LOCKED` to the claim subquery.
 
 use super::{
-    AddedRepo, BuildRow, Claim, Clock, ControlPathLock, ControlStore, Lease, Out, Output, Pool,
-    Published, Purged, RepoBranches, RepoRefs,
+    AddedRepo, BuildRow, Claim, Clock, ControlPathLock, ControlStore, KindUsage, Lease, Out,
+    Output, Pool, Published, Purged, RepoBranches, RepoRefs, RepoUsage,
 };
 use crate::provider::RepoId;
 use crate::{ExactResultKind, FullResult};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema/sqlite.sql");
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, seq, \
     head_state, head_output, head_error, files_state, files_output, files_error, \
@@ -851,6 +851,11 @@ impl ControlStore for SqliteControlStore {
             .execute(&mut *tx)
             .await
             .context("purge refs")?;
+        sqlx::query("DELETE FROM build_usage WHERE repo = $1")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .context("purge usage")?;
         sqlx::query("DELETE FROM artifact_refs WHERE repo = $1")
             .bind(&key)
             .execute(&mut *tx)
@@ -906,16 +911,30 @@ impl ControlStore for SqliteControlStore {
     }
 
     async fn dequeue_deletions(&self, hashes: &[String], now: i64) -> Result<()> {
+        let hashes = json_list(hashes.iter().map(String::as_str));
+        let mut tx = self.pool.begin().await.context("begin dequeue")?;
         sqlx::query(
             "DELETE FROM deletions
              WHERE hash IN (SELECT value FROM json_each($1)) AND due_at < $2",
         )
-        .bind(json_list(hashes.iter().map(String::as_str)))
+        .bind(&hashes)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .context("dequeue deletions")?;
-        Ok(())
+        sqlx::query(
+            "DELETE FROM artifact_sizes
+             WHERE hash IN (SELECT value FROM json_each($1))
+               AND NOT EXISTS (SELECT 1 FROM artifact_refs
+                 WHERE artifact_refs.hash = artifact_sizes.hash)
+               AND NOT EXISTS (SELECT 1 FROM deletions
+                 WHERE deletions.hash = artifact_sizes.hash)",
+        )
+        .bind(&hashes)
+        .execute(&mut *tx)
+        .await
+        .context("forget deleted sizes")?;
+        tx.commit().await.context("commit dequeue")
     }
 
     async fn knows_repo(&self, repo: &RepoId) -> Result<bool> {
@@ -1020,6 +1039,121 @@ impl ControlStore for SqliteControlStore {
             .context("record refs artifact references")?;
         tx.commit().await.context("commit refs write")?;
         Ok(true)
+    }
+
+    async fn unsized_artifacts(&self, hashes: &[&str]) -> Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT value FROM json_each($1)
+             WHERE value NOT IN (SELECT hash FROM artifact_sizes)",
+        )
+        .bind(json_list(hashes.iter().copied()))
+        .fetch_all(&self.pool)
+        .await
+        .context("find unsized artifacts")
+    }
+
+    async fn record_sizes(&self, sizes: &[(String, u64)]) -> Result<()> {
+        if sizes.is_empty() {
+            return Ok(());
+        }
+        let sizes: serde_json::Map<String, serde_json::Value> = sizes
+            .iter()
+            .map(|(hash, len)| (hash.clone(), (*len).into()))
+            .collect();
+        sqlx::query(
+            "INSERT INTO artifact_sizes (hash, len)
+             SELECT key, value FROM json_each($1) WHERE true
+             ON CONFLICT (hash) DO NOTHING",
+        )
+        .bind(serde_json::Value::Object(sizes).to_string())
+        .execute(&self.pool)
+        .await
+        .context("record artifact sizes")?;
+        Ok(())
+    }
+
+    async fn add_build_time(
+        &self,
+        repo: &RepoId,
+        kind: ExactResultKind,
+        elapsed: Duration,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO build_usage (repo, kind, attempts, build_ms) VALUES ($1, $2, 1, $3)
+             ON CONFLICT (repo, kind) DO UPDATE SET attempts = attempts + 1,
+               build_ms = build_ms + excluded.build_ms",
+        )
+        .bind(repo.storage_key())
+        .bind(column_prefix(kind))
+        .bind(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .context("add build time")?;
+        Ok(())
+    }
+
+    async fn usage(&self, repo: &RepoId) -> Result<Option<RepoUsage>> {
+        let key = repo.storage_key();
+        let count = |n: i64| u64::try_from(n).unwrap_or(0);
+        // One read transaction, so the counts agree with each other.
+        let mut tx = self.pool.begin().await.context("begin usage read")?;
+        let known: bool = sqlx::query_scalar(KNOWN_REPO)
+            .bind(&key)
+            .fetch_one(&mut *tx)
+            .await
+            .context("check repository")?;
+        if !known {
+            return Ok(None);
+        }
+        let mut usage = RepoUsage {
+            commits_admitted: count(
+                sqlx::query_scalar("SELECT COUNT(*) FROM builds WHERE repo = $1")
+                    .bind(&key)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context("count admitted commits")?,
+            ),
+            ..RepoUsage::default()
+        };
+        let kinds = sqlx::query("SELECT kind, attempts, build_ms FROM build_usage WHERE repo = $1")
+            .bind(&key)
+            .fetch_all(&mut *tx)
+            .await
+            .context("read build usage")?;
+        for row in kinds {
+            let kind: String = row.get("kind");
+            let slot = match kind.as_str() {
+                "head" => &mut usage.head,
+                "files" => &mut usage.files,
+                "full" => &mut usage.full,
+                other => bail!("unknown output kind {other} in build usage"),
+            };
+            *slot = KindUsage {
+                attempts: count(row.get("attempts")),
+                build_ms: count(row.get("build_ms")),
+            };
+        }
+        let stored = sqlx::query(
+            "SELECT COUNT(*) AS artifacts,
+               COALESCE(SUM(CASE WHEN NOT shared THEN len END), 0) AS unique_bytes,
+               COALESCE(SUM(CASE WHEN shared THEN len END), 0) AS shared_bytes,
+               COALESCE(SUM(len IS NULL), 0) AS unsized
+             FROM (SELECT sizes.len AS len, EXISTS (SELECT 1 FROM artifact_refs other
+                     WHERE other.hash = mine.hash AND other.repo <> mine.repo) AS shared
+                   FROM artifact_refs mine
+                   LEFT JOIN artifact_sizes sizes ON sizes.hash = mine.hash
+                   WHERE mine.repo = $1)",
+        )
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await
+        .context("read stored bytes")?;
+        usage.artifacts = count(stored.get("artifacts"));
+        usage.unique_bytes = count(stored.get("unique_bytes"));
+        usage.shared_bytes = count(stored.get("shared_bytes"));
+        usage.unsized_artifacts = count(stored.get("unsized"));
+        tx.commit().await.context("end usage read")?;
+        Ok(Some(usage))
     }
 
     async fn health(&self) -> Result<()> {

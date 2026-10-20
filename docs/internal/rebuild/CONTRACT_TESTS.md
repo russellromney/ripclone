@@ -174,7 +174,7 @@ Ripclone token reaches the origin.
 | G28 | After main is force-pushed from A to B off A0, a pull-request commit X built on A gets no `own_history` with `refs_base` B: the `--at X` clone asks for X's Full history packs B's lacks while B's are held, makes no upstream fetch, and has X checked out, `git clone`'s remote refs, `fsck` clean. | |
 | G29 | As G27 for a pull request built while every refs refresh fails (a server `git` wrapper), before the first publish: X's `own_history`, packed against A, holds exactly X1's commit and tree, and the clone after the refresh recovers and main moves to C downloads it and none of X's Full history packs C's lacks. | |
 
-### H. Storage and server state (15)
+### H. Storage and server state (16)
 
 | # | Test | Added |
 |---|---|---|
@@ -193,6 +193,7 @@ Ripclone token reaches the origin.
 | H14 | S3 emulator, same settings, the bucket's downloads held while the purge runs: the clone holding signed URLs from before it is exact; then the purged repo's own artifacts leave the bucket and the local cache, the fork's stay, and its full and Files clones are exact. | (S3 job) |
 | H15 | The refs table is renamed under a running server: a ready Full still answers, without refs, the log names the read, and a full clone fetches the refs from the upstream, equal to `git clone`'s. | |
 | H16 | S3 emulator behind a proxy that answers 503 to the first 12 PUTs: the server logs the throttling and retries, no build fails, and depth-1, full and files clones are exact. | |
+| H17 | `GET .../usage` of a repo at two commits and of a fork at the first: commits admitted, one attempt per kind per commit with its time, and no unsized artifacts. Both count the same shared bytes; once the fork is purged they are the repo's own and the fork answers `404 repo_unknown`, as does a repo never added. | |
 
 ### I. Auth, integrations, CLI (16)
 
@@ -271,7 +272,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 128 tests. Several are table-driven.
+Total: 129 tests. Several are table-driven.
 
 ## Test settings
 

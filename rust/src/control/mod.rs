@@ -165,6 +165,33 @@ pub struct Purged {
     pub queued: u64,
 }
 
+/// What one repository has used, from [`ControlStore::usage`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoUsage {
+    /// Commits admitted: each builds Head, Files and Full.
+    pub commits_admitted: u64,
+    pub head: KindUsage,
+    pub files: KindUsage,
+    pub full: KindUsage,
+    /// Stored artifacts the repository's outputs and refs name.
+    pub artifacts: u64,
+    /// Bytes of those that no other repository names.
+    pub unique_bytes: u64,
+    /// Bytes of those that another repository names too.
+    pub shared_bytes: u64,
+    /// Artifacts whose size was not recorded, left out of both byte counts.
+    pub unsized_artifacts: u64,
+}
+
+/// Build time of one output kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindUsage {
+    /// Claims that ended, whatever their outcome.
+    pub attempts: u64,
+    /// Their wall time from claim to release.
+    pub build_ms: u64,
+}
+
 /// A repository added to the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddedRepo {
@@ -360,7 +387,7 @@ pub trait ControlStore: Send + Sync {
     async fn get_repo(&self, repo: &RepoId) -> Result<Option<AddedRepo>>;
     async fn list_repos(&self) -> Result<Vec<AddedRepo>>;
     /// Delete the repository, in one transaction: drop it from the added
-    /// set, delete its build rows, refs and artifact references, and queue each
+    /// set, delete its build rows, usage, refs and artifact references, and queue each
     /// artifact it named that no other repository names, due at `due_at`.
     /// A leased build of it can no longer renew, publish or fail.
     async fn purge_repo(&self, repo: &RepoId, due_at: i64) -> Result<Purged>;
@@ -375,7 +402,7 @@ pub trait ControlStore: Send + Sync {
     /// named by no repository's published output.
     async fn deletable(&self, hash: &str, now: i64) -> Result<bool>;
     /// Take each of `hashes` off the queue unless it was queued again for
-    /// `now` or later.
+    /// `now` or later, and forget the size of each one no repository names.
     async fn dequeue_deletions(&self, hashes: &[String], now: i64) -> Result<()>;
     /// Whether `repo` is added or has build rows.
     async fn knows_repo(&self, repo: &RepoId) -> Result<bool>;
@@ -388,6 +415,19 @@ pub trait ControlStore: Send + Sync {
     /// no longer known, such as one purged while its refs were built.
     /// Returns whether the refs were written.
     async fn set_refs(&self, repo: &RepoId, refs: &RepoRefs) -> Result<bool>;
+    /// Those of `hashes` whose size is not recorded.
+    async fn unsized_artifacts(&self, hashes: &[&str]) -> Result<Vec<String>>;
+    /// Record each artifact's size. A recorded size is kept.
+    async fn record_sizes(&self, sizes: &[(String, u64)]) -> Result<()>;
+    /// Add one ended claim of `kind` and its wall time to `repo`'s usage.
+    async fn add_build_time(
+        &self,
+        repo: &RepoId,
+        kind: ExactResultKind,
+        elapsed: Duration,
+    ) -> Result<()>;
+    /// What `repo` has used; `None` for a repository it does not know.
+    async fn usage(&self, repo: &RepoId) -> Result<Option<RepoUsage>>;
     async fn health(&self) -> Result<()>;
 }
 

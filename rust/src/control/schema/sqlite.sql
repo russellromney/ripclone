@@ -106,6 +106,24 @@ CREATE TABLE artifact_refs (
 
 CREATE INDEX artifact_refs_by_hash ON artifact_refs (hash);
 
+-- Each artifact's size in bytes, recorded before an output or refs naming
+-- it publish. A hash's size never changes; the row goes when the sweep
+-- takes the artifact off the deletion queue and no repository names it.
+CREATE TABLE artifact_sizes (
+  hash TEXT PRIMARY KEY,
+  len  INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- Build time per repository and output kind: each claim's wall time from
+-- claim to release, added when it ends, whatever its outcome.
+CREATE TABLE build_usage (
+  repo     TEXT NOT NULL,              -- RepoId::storage_key()
+  kind     TEXT NOT NULL,              -- head | files | full
+  attempts INTEGER NOT NULL,
+  build_ms INTEGER NOT NULL,
+  PRIMARY KEY (repo, kind)
+) WITHOUT ROWID;
+
 -- Artifacts to delete from storage once due_at passes, if no repository
 -- names them then and no build pins them.
 CREATE TABLE deletions (

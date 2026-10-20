@@ -85,6 +85,7 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
         refs_name_their_artifacts_until_purged,
         an_unapplied_publish_references_nothing,
         refs_are_absent_until_written_and_replaced,
+        usage_counts_build_time_and_stored_bytes,
     );
 }
 
@@ -1782,4 +1783,93 @@ async fn refs_name_their_artifacts_until_purged(backend: &dyn Backend) {
         store.deletable(branches, START + 1).await.unwrap(),
         "the refused write records no references"
     );
+}
+
+async fn usage_counts_build_time_and_stored_bytes(backend: &dyn Backend) {
+    use crate::control::{KindUsage, RepoUsage};
+    let (_, store) = open(backend).await;
+    assert_eq!(store.usage(&repo()).await.unwrap(), None);
+    let other = RepoId::github("acme/fork");
+    store.add_repo(&repo(), None).await.unwrap();
+    store.add_repo(&other, None).await.unwrap();
+    // sha(1)'s artifacts are in both repos, sha(2)'s only in repo().
+    complete(store.as_ref(), &repo(), &sha(1), Some(MAIN)).await;
+    complete(store.as_ref(), &other, &sha(1), Some(MAIN)).await;
+    complete(store.as_ref(), &repo(), &sha(2), Some(MAIN)).await;
+    let (shared, mine) = (completed_artifacts(&sha(1)), completed_artifacts(&sha(2)));
+    let all: Vec<&str> = shared.iter().chain(&mine).map(String::as_str).collect();
+    assert_eq!(
+        store.unsized_artifacts(&all).await.unwrap().len(),
+        all.len()
+    );
+
+    // One of sha(2)'s artifacts goes unsized.
+    let (no_size, sized) = mine.split_first().unwrap();
+    let sizes: Vec<(String, u64)> = (shared.iter().map(|hash| (hash.clone(), 10)))
+        .chain(sized.iter().map(|hash| (hash.clone(), 100)))
+        .collect();
+    store.record_sizes(&sizes).await.unwrap();
+    store
+        .record_sizes(&[(shared[0].clone(), 999)])
+        .await
+        .unwrap();
+    let twice = [no_size.as_str(), no_size.as_str(), shared[0].as_str()];
+    assert_eq!(
+        store.unsized_artifacts(&twice).await.unwrap(),
+        vec![no_size.clone()]
+    );
+
+    let head = ExactResultKind::Head;
+    store
+        .add_build_time(&repo(), head, Duration::from_millis(1500))
+        .await
+        .unwrap();
+    store
+        .add_build_time(&repo(), head, Duration::from_millis(1500))
+        .await
+        .unwrap();
+    store
+        .add_build_time(&repo(), ExactResultKind::Files, Duration::from_millis(250))
+        .await
+        .unwrap();
+    store
+        .add_build_time(&other, head, Duration::from_millis(7))
+        .await
+        .unwrap();
+    let n = |hashes: &[String]| hashes.len() as u64;
+    assert_eq!(
+        store.usage(&repo()).await.unwrap().unwrap(),
+        RepoUsage {
+            commits_admitted: 2,
+            head: KindUsage {
+                attempts: 2,
+                build_ms: 3000
+            },
+            files: KindUsage {
+                attempts: 1,
+                build_ms: 250
+            },
+            full: KindUsage::default(),
+            artifacts: n(&shared) + n(&mine),
+            unique_bytes: 100 * n(sized),
+            shared_bytes: 10 * n(&shared),
+            unsized_artifacts: 1,
+        }
+    );
+    let fork = store.usage(&other).await.unwrap().unwrap();
+    assert_eq!((fork.commits_admitted, fork.head.build_ms), (1, 7));
+    assert_eq!((fork.unique_bytes, fork.shared_bytes), (0, 10 * n(&shared)));
+
+    // After a purge the fork holds sha(1)'s artifacts alone, and once the
+    // sweep dequeues sha(2)'s their sizes go; sha(1)'s stay.
+    store.purge_repo(&repo(), START).await.unwrap();
+    assert_eq!(store.usage(&repo()).await.unwrap(), None);
+    let fork = store.usage(&other).await.unwrap().unwrap();
+    assert_eq!((fork.unique_bytes, fork.shared_bytes), (10 * n(&shared), 0));
+    let all: Vec<String> = shared.iter().chain(&mine).cloned().collect();
+    store.dequeue_deletions(&all, START + 1).await.unwrap();
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    let mut gone = store.unsized_artifacts(&all).await.unwrap();
+    gone.sort();
+    assert_eq!(gone, mine);
 }

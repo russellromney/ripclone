@@ -307,6 +307,15 @@ pub(super) async fn dispatch_repos_get(
         return response;
     }
 
+    if let Some(repo_path) = path.strip_suffix("/usage") {
+        return match repo_from_path(&state, repo_path) {
+            Ok((repo_id, _)) => repo_usage(&state, &repo_id)
+                .await
+                .unwrap_or_else(IntoResponse::into_response),
+            Err(error) => error.into_response(),
+        };
+    }
+
     if let Some(repo_path) = path.strip_suffix("/status") {
         let repo_id = match repo_from_path(&state, repo_path) {
             Ok((repo_id, _)) => repo_id,
@@ -1187,6 +1196,38 @@ struct RepoStatusQuery {
     public: bool,
     #[serde(default)]
     fork_of: Option<String>,
+}
+
+/// `GET .../usage`: what the repository has used, from the control store.
+/// A repository the server does not know, never added or purged, is `404`.
+async fn repo_usage(state: &ServerState, repo_id: &RepoId) -> Result<Response, ApiError> {
+    let usage = state.control.usage(repo_id).await.map_err(|error| {
+        state.metrics.record_error();
+        ApiError::control(error)
+    })?;
+    let Some(usage) = usage else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "repo_unknown",
+            "repo not known to this server",
+        ));
+    };
+    let kind = |kind: crate::control::KindUsage| serde_json::json!({"attempts": kind.attempts, "build_ms": kind.build_ms});
+    Ok(Json(serde_json::json!({
+        "commits_admitted": usage.commits_admitted,
+        "builds": {
+            "head": kind(usage.head),
+            "files": kind(usage.files),
+            "full": kind(usage.full),
+        },
+        "stored": {
+            "artifacts": usage.artifacts,
+            "unique_bytes": usage.unique_bytes,
+            "shared_bytes": usage.shared_bytes,
+            "unsized_artifacts": usage.unsized_artifacts,
+        },
+    }))
+    .into_response())
 }
 
 async fn repo_status_inner(
