@@ -35,6 +35,7 @@ example `github/oven-sh/bun` or `gitlab/group/sub/project`.
 | `POST /v1/repos/{provider}/{path}/builds` | Resolve a selector to one commit and admit a build. |
 | `GET /v1/repos/{provider}/{path}/commits/{sha}` | Read one commit's build. Never builds. |
 | `GET /v1/repos/{provider}/{path}/status` | Every build of the repo, with output states and stored bytes. |
+| `GET /v1/repos/{provider}/{path}/usage` | What the repo has used: commits admitted, build time per kind, and stored bytes (see below). |
 
 Only added repos build: `POST .../builds` for a repo that was not added
 answers `404 repo_not_added`.
@@ -55,6 +56,41 @@ from storage after twice the signed URL lifetime, so a clone that read the
 repo before the purge finishes. Two repos at the same commits share their
 artifacts, so purging one leaves the other whole. Deletion runs every 5
 minutes.
+
+### Usage
+
+`GET .../usage` reads the control database only:
+
+```json
+{
+  "commits_admitted": 2,
+  "builds": {
+    "head": {"attempts": 2, "build_ms": 1840},
+    "files": {"attempts": 2, "build_ms": 960},
+    "full": {"attempts": 3, "build_ms": 5210}
+  },
+  "stored": {
+    "artifacts": 41,
+    "unique_bytes": 1048576,
+    "shared_bytes": 524288,
+    "unsized_artifacts": 0
+  }
+}
+```
+
+- `commits_admitted`: commits admitted for the repo; each builds Head, Files
+  and Full.
+- `builds`: per kind, the claims that ended, whatever their outcome, and
+  their wall time from claim to release. A retried build counts each
+  attempt. Each claim is added as it ends, just after its output publishes.
+- `stored`: the artifacts the repo's builds and refs name, and their bytes:
+  `unique_bytes` for those no other repo names, `shared_bytes` for those
+  another repo names too. Purging one of two repos that share artifacts makes
+  them the other's own. `unsized_artifacts` counts artifacts whose size could
+  not be read when they were published; they are in neither byte count.
+
+A repo the server does not know, never added or purged, is `404
+repo_unknown`. A removed repo that was not purged still answers.
 
 ### Admit a build
 
@@ -224,6 +260,7 @@ Repo routes answer errors as `{"error": "<message>", "code": "<code>"}`:
 | 404 | `unknown_provider` | No provider instance has that id. |
 | 404 | `repo_not_added` | The repo was not added. |
 | 404 | `repo_not_found` | The upstream has no such repo, or the server's credential cannot read it. |
+| 404 | `repo_unknown` | The server has no builds or refs of the repo (`.../usage`). |
 | 404 | `ref_not_found` | The upstream has no such branch or tag. |
 | 404 | `build_not_found` | No build was admitted for that commit. |
 | 500 | `credential_unavailable` | The server could not get an upstream credential. |

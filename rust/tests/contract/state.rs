@@ -484,3 +484,77 @@ fn h15_unreadable_refs_leave_ready_builds_cloning() {
     assert_eq!(tag_refs(&full), git_clone_tags(&origin.bare, &[]).0);
     git(&full, &["fsck", "--strict"]);
 }
+
+/// H17: `GET .../usage` counts each repository's commits, build attempts and
+/// time per kind, and stored bytes. A fork that built the same commit
+/// shares its artifacts: both count the same shared bytes, and once the fork
+/// is purged they are the repository's own. Every artifact has a size. An
+/// unknown or purged repository is `404`.
+#[test]
+fn h17_usage_counts_builds_and_stored_bytes() {
+    let world = World::new();
+    let origin = world.origin("acme", "h16");
+    let a = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "A");
+    origin.publish();
+    let fork = world.origin("acme", "h16-fork");
+    git(
+        &origin.work,
+        &["push", "-q", fork.bare.to_str().unwrap(), "main"],
+    );
+    let server = world.server(&[]);
+    let (status, body) = api::usage(&server, "acme/h16");
+    assert_eq!((status, body["code"].as_str()), (404, Some("repo_unknown")));
+    world.cli(&server, &["add", "acme/h16-fork", "--wait"]).ok();
+    world.cli(&server, &["add", "acme/h16", "--wait"]).ok();
+    let b = origin.commit(&[("c.txt", "c\n")], "B");
+    origin.publish();
+    world.cli(&server, &["sync", "acme/h16", "--at", &b]).ok();
+    wait_first_refs(&server, "acme/h16", &b);
+
+    // Each claim's time is added as it ends, just after it publishes.
+    let settled = |repo: &str, commits: u64| {
+        wait_for(&format!("{repo}'s usage"), || {
+            let (status, usage) = api::usage(&server, repo);
+            assert_eq!(status, 200, "{usage}");
+            let builds = &usage["builds"];
+            (["head", "files", "full"].iter())
+                .all(|kind| builds[kind]["attempts"] == commits)
+                .then_some(usage)
+        })
+    };
+    let mine = settled("acme/h16", 2);
+    let forked = settled("acme/h16-fork", 1);
+    for usage in [&mine, &forked] {
+        for kind in ["head", "files", "full"] {
+            assert!(
+                usage["builds"][kind]["build_ms"].as_u64().unwrap() > 0,
+                "{usage}"
+            );
+        }
+        assert_eq!(usage["stored"]["unsized_artifacts"], 0, "{usage}");
+    }
+    assert_eq!(mine["commits_admitted"], 2);
+    assert_eq!(forked["commits_admitted"], 1);
+    let named = commit_artifacts(&server, "acme/h16", &a).len()
+        + commit_artifacts(&server, "acme/h16", &b).len();
+    let stored = |usage: &serde_json::Value, field: &str| usage["stored"][field].as_u64().unwrap();
+    assert!(stored(&mine, "artifacts") >= named as u64, "{mine}");
+    let shared = stored(&mine, "shared_bytes");
+    assert!(shared > 0, "the fork shares A's artifacts: {mine}");
+    assert_eq!(stored(&forked, "shared_bytes"), shared);
+    assert!(
+        stored(&mine, "unique_bytes") > 0,
+        "B is the repo's own: {mine}"
+    );
+
+    world.cli(&server, &["rm", "--purge", "acme/h16-fork"]).ok();
+    let (status, body) = api::usage(&server, "acme/h16-fork");
+    assert_eq!((status, body["code"].as_str()), (404, Some("repo_unknown")));
+    let (_, after) = api::usage(&server, "acme/h16");
+    assert_eq!(stored(&after, "shared_bytes"), 0, "{after}");
+    assert_eq!(
+        stored(&after, "unique_bytes"),
+        stored(&mine, "unique_bytes") + shared
+    );
+    assert_eq!(stored(&after, "artifacts"), stored(&mine, "artifacts"));
+}

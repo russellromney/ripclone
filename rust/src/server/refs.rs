@@ -275,6 +275,7 @@ pub(super) async fn publish_pinned(
         row.branches = Some(branches);
     }
     if stored.as_ref() != Some(&row) {
+        super::usage::record_sizes(state, &Vec::from_iter(row.artifacts())).await;
         if !state.control.set_refs(repo_id, &row).await? {
             return Ok(BTreeSet::new());
         }

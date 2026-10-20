@@ -34,6 +34,7 @@ mod poller;
 mod purge;
 mod refs;
 mod uploads;
+mod usage;
 mod webhooks;
 mod worker;
 

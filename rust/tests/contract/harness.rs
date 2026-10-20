@@ -1477,6 +1477,11 @@ pub mod api {
         body["branches"]["artifact"].as_str().map(str::to_string)
     }
 
+    /// `GET .../usage` of `repo`.
+    pub fn usage(server: &Server, repo: &str) -> (u16, serde_json::Value) {
+        parse(server.get(&format!("{}/usage", repo_path(repo))))
+    }
+
     /// Status and parsed body (Null if not JSON).
     pub fn parse(resp: HttpResponse) -> (u16, serde_json::Value) {
         let body = serde_json::from_str(&resp.body).unwrap_or_default();

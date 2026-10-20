@@ -278,6 +278,7 @@ async fn run_slot(state: ServerState, settings: WorkerSettings, pool: Pool, slot
 /// cancels the build, and the slot waits for it to stop before it claims
 /// again; another process owns the output now.
 async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, claim: Claim) {
+    let started = Instant::now();
     let claim = Arc::new(claim);
     let cancel = Cancel::new();
     let task_state = state.clone();
@@ -322,6 +323,7 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
                     );
                     cancel.cancel();
                     let _ = task.await;
+                    super::usage::record_build_time(state, &claim, started.elapsed()).await;
                     return;
                 }
                 Err(error) => warn!(
@@ -332,6 +334,7 @@ async fn run_claim(state: &ServerState, settings: WorkerSettings, pool: Pool, cl
             },
         }
     }
+    super::usage::record_build_time(state, &claim, started.elapsed()).await;
     release(state, &claim).await;
     // A ready Head makes the row's Full claimable.
     if pool == Pool::Head {
@@ -429,11 +432,14 @@ async fn publish_or_fail(
         return None;
     }
     let published = match built {
-        Ok(output) => state
-            .control
-            .publish(claim, output)
-            .await
-            .with_context(|| format!("publish {kind} result")),
+        Ok(output) => {
+            super::usage::record_sizes(state, &Vec::from_iter(output.artifacts())).await;
+            state
+                .control
+                .publish(claim, output)
+                .await
+                .with_context(|| format!("publish {kind} result"))
+        }
         Err(error) => Err(error),
     };
     match published {
@@ -1243,6 +1249,23 @@ mod tests {
         }
         async fn set_refs(&self, repo: &RepoId, refs: &crate::control::RepoRefs) -> Result<bool> {
             self.inner.set_refs(repo, refs).await
+        }
+        async fn unsized_artifacts(&self, hashes: &[&str]) -> Result<Vec<String>> {
+            self.inner.unsized_artifacts(hashes).await
+        }
+        async fn record_sizes(&self, sizes: &[(String, u64)]) -> Result<()> {
+            self.inner.record_sizes(sizes).await
+        }
+        async fn add_build_time(
+            &self,
+            repo: &RepoId,
+            kind: crate::ExactResultKind,
+            elapsed: Duration,
+        ) -> Result<()> {
+            self.inner.add_build_time(repo, kind, elapsed).await
+        }
+        async fn usage(&self, repo: &RepoId) -> Result<Option<crate::control::RepoUsage>> {
+            self.inner.usage(repo).await
         }
         async fn health(&self) -> Result<()> {
             self.inner.health().await
