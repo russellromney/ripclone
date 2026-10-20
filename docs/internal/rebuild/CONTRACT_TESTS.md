@@ -65,7 +65,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | A6 | Table: repo not added (clone and sync), unknown ref, missing upstream repo. Each gives its own error code and no build. | #186 |
 | A7 | After `add`, the origin is deleted (`repo_not_found`, exit 5) or accepts and never answers (`RIPCLONE_LS_REMOTE_TIMEOUT_SECS=1`: `upstream_unavailable`, exit 6). Clone, sync and the API fail with no build; the built commit still clones by SHA. | #208 |
 | A8 | An upstream with no commits: `add` fails with `ref_not_found` (exit 5), `sync` and `clone` say the repo isn't added, and nothing builds or is installed. After the first push, `add` builds it and a clone is exact. | #234 |
-| A9 | A clone of a ready commit, in each mode, makes one API request, the admission, which answers with the output and its manifest inline; it downloads no manifest. Without them in the answer, the clone reads the commit and downloads the manifest. An inline manifest that does not match its hash fails the clone. | #PR |
+| A9 | A clone of a ready commit, in each mode, makes one API request, the admission, which answers with the output and its manifest inline; it downloads no manifest. Without them in the answer, the clone reads the commit and downloads the manifest. An inline manifest that does not match its hash fails the clone. | #270 |
 
 ### B. Coalescing (3)
 
