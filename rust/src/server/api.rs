@@ -201,6 +201,11 @@ pub struct RefResponse {
     /// clone --branch` downloads every ref before its checkout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refs_base: Option<Box<RefResponse>>,
+    /// With `refs_base`, what the clone installs beyond its history and
+    /// the side pack, when the server built it: then the clone downloads
+    /// none of this Full's history packs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_history: Option<crate::branches::OwnHistoryRef>,
     pub kind: ExactResultKind,
 }
 
@@ -730,6 +735,7 @@ async fn ready_body(
             }
             if let Some(base) = base.filter(|base| base.full.ready().is_some()) {
                 result = respond(row, Some(served));
+                result.own_history = own_history(state, repo_id, row, &base.commit).await;
                 result.refs_base = Some(Box::new(respond(&base, Some(served))));
                 break;
             }
@@ -739,6 +745,35 @@ async fn ready_body(
         state: "ready",
         result,
     }))
+}
+
+/// The own history of `row`'s Full, signed, when a clone that installs
+/// `base`'s history holds every object but these: built against `base` or a
+/// commit in its history.
+async fn own_history(
+    state: &ServerState,
+    repo_id: &RepoId,
+    row: &BuildRow,
+    base: &str,
+) -> Option<crate::branches::OwnHistoryRef> {
+    let own = row.full.ready()?.own_history.as_ref()?;
+    if own.base != base && !in_history(state, repo_id, &own.base, base).await {
+        return None;
+    }
+    let signed = |hash: &str| signed_url(&state.storage, state.signed_url_ttl, hash);
+    Some(crate::branches::OwnHistoryRef {
+        packs: (own.packs.iter())
+            .map(|pack| crate::branches::SidePackRef {
+                pack: pack.pack.clone(),
+                pack_len: pack.pack_len,
+                pack_url: signed(&pack.pack),
+                idx: pack.idx.clone(),
+                idx_len: pack.idx_len,
+                idx_url: signed(&pack.idx),
+            })
+            .collect(),
+        head_packs: own.head_packs.clone(),
+    })
 }
 
 /// Whether `base` is in `commit`'s history in the mirror: then a Full of
@@ -928,11 +963,16 @@ fn ref_response(
     let packs: Vec<String> = pack_artifacts.iter().map(|p| p.pack.clone()).collect();
     // The idx files fetched on their own: a Full's history packs' and a
     // Head's levels'. The Head base's are in the idx bundle.
+    // A Full's Head packs a clone installs with its own history, too.
     let own_idx: std::collections::HashSet<&str> = match kind {
         ExactResultKind::Full => (info.full.as_ref())
             .map(|full| {
+                let installed = (full.own_history.iter())
+                    .flat_map(|own| &own.head_packs)
+                    .filter_map(|&i| full.packs.get(i).map(|p| p.idx.as_str()));
                 (full.history_levels.iter())
                     .flat_map(|level| level.packs.iter().map(|p| p.idx.as_str()))
+                    .chain(installed)
                     .collect()
             })
             .unwrap_or_default(),
@@ -1012,6 +1052,7 @@ fn ref_response(
                     .collect(),
             }),
         refs_base: None,
+        own_history: None,
         kind,
     }
 }

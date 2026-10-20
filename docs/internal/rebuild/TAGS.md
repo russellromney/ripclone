@@ -596,15 +596,25 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   and when none holds the commit, its own history packs download while
   Full(D)'s still do (G27). A commit they hold downloads none of its own
   (G16).
-- **A commit in no ref's history downloads the shared history once.** Its
-  own history packs that Full(D)'s manifest lists too are skipped: both
-  Fulls built on an older Full share its levels by hash (G27). Its own
-  manifest, already read for the working tree, is not fetched again. What they
-  share in levels built apart, a cold Full or a compaction, still comes
-  twice; a pack of only the commit's own objects would need a server
-  build per request. So does a newest level with the same objects as the
-  commit's Head delta pack, as for one commit on a built one: the Head
-  pack only writes the working tree, and the history pack is installed.
+- **A commit in no ref's history downloads its own history once.** A Full
+  of a commit other than the published base packs, at build time, the
+  objects the commit reaches beyond that base (the older of the ready and
+  the newest refs base, which the newer holds), less those of its Head
+  level packs: its `own_history` (schema 9). The response serves it with `refs_base`
+  when the served base is that base or holds it in its history, and the
+  client installs it with those Head packs, kept as history, in place of
+  the commit's Full history packs (G27). A pull request's commit gets one
+  at its first build, so a clone after main moves on downloads only what
+  the pull request adds. After a force push the served base no longer holds
+  the one it was built on, and the clone falls back to the commit's Full
+  history packs less those Full(D) lists too: what they share in levels
+  built apart, and a newest level equal to the Head delta pack, then come
+  twice (G28). A commit Full(D) or the side layers hold downloads none
+  (G16), though the Head packs `own_history` names are still written to
+  the pack directory, undeltified. A tip's Full builds one too, unused
+  once it is the base: one small pack per build, no clone waits on it.
+  Its own manifest, already read for the working tree, is not fetched
+  again.
 - **A commit with D in its history gets no `refs_base`** (a merge-base
   walk of the mirror, in process): its own history holds D's, as for a
   push built before the refresh published it, by branch or by commit

@@ -474,24 +474,8 @@ impl Client {
             .map(|branches| branches.side_packs)
             .filter(|layers| !layers.is_empty())
             .map(|layers| {
-                let total = layers.iter().map(|side| side.pack_len + side.idx_len).sum();
-                self.progress.add_total(total);
                 let (client, urls, dir) = (self.clone(), urls.clone(), root.clone());
-                let packs = (layers.into_iter().enumerate())
-                    .map(|(i, side)| {
-                        let pack = Artifact {
-                            hash: side.pack,
-                            len: Some(side.pack_len),
-                            slot: UrlSlot::SidePack(i),
-                        };
-                        let idx = Artifact {
-                            hash: side.idx,
-                            len: Some(side.idx_len),
-                            slot: UrlSlot::SideIdx(i),
-                        };
-                        (pack, idx)
-                    })
-                    .collect();
+                let packs = self.pack_refs(&layers, UrlSlot::SidePack, UrlSlot::SideIdx);
                 let task_cleanup = cleanup.clone();
                 // Into the staging directory, so each moves into the pack
                 // directory with a rename.
@@ -506,11 +490,27 @@ impl Client {
             });
         let (ident, tree) = match refs_base {
             None => {
-                (self.materialize_git(&urls, &pin.checkout, &root, true, None, cleanup, bench))
-                    .await?
+                let none = HashSet::new();
+                let materialize = self.materialize_git(
+                    &urls,
+                    &pin.checkout,
+                    &root,
+                    true,
+                    &none,
+                    None,
+                    cleanup,
+                    bench,
+                );
+                materialize.await?
             }
             Some(base) => {
                 let base_urls = OutputUrls::new(repo_path, base.clone());
+                // The server's own history, when it built one, holds what
+                // the clone needs beyond the base's history and the side
+                // pack, with the Head packs it names kept.
+                let built = output.own_history.as_ref();
+                let keep: HashSet<usize> =
+                    built.map_or_else(HashSet::new, |own| own.head_packs.iter().copied().collect());
                 let (manifest_tx, manifest) = tokio::sync::oneshot::channel();
                 let side_idx = side_download.as_ref().map(|_| side_idx);
                 let ((ident, tree), (packs, own)) = tokio::try_join!(
@@ -519,14 +519,15 @@ impl Client {
                         &pin.checkout,
                         &root,
                         false,
+                        &keep,
                         Some(manifest_tx),
                         cleanup,
                         bench
                     ),
                     async {
                         let base_manifest = self.fetch_manifest(&base_urls).await?;
-                        let (idx_tx, base_idx) = tokio::sync::oneshot::channel();
                         let none = HashSet::new();
+                        let (idx_tx, base_idx) = tokio::sync::oneshot::channel();
                         tokio::try_join!(
                             self.fetch_history_packs(
                                 &base_urls,
@@ -541,6 +542,7 @@ impl Client {
                                 &base_manifest,
                                 &root,
                                 &pin.commit,
+                                built,
                                 (base_idx, side_idx, manifest),
                                 cleanup
                             ),
@@ -557,7 +559,7 @@ impl Client {
                 tokio::task::spawn_blocking(move || {
                     install_packs(&git_dir, packs, "history pack")?;
                     install_packs(&git_dir, side, "side pack")?;
-                    install_packs(&git_dir, own, "history pack")
+                    install_packs(&git_dir, own, "own history pack")
                 })
                 .await
                 .context("pack install task")??;
@@ -797,7 +799,16 @@ impl Client {
         let root = stage(target, staging)?;
         bench.mark_metadata();
         let (bytes, _) = self
-            .install_editable_packs(urls, &manifest, None, false, &root, &metadata, cleanup)
+            .install_editable_packs(
+                urls,
+                &manifest,
+                None,
+                false,
+                &HashSet::new(),
+                &root,
+                &metadata,
+                cleanup,
+            )
             .await
             .context("write the working tree from Head packs")?;
         bench.mark_write();
@@ -808,15 +819,17 @@ impl Client {
 
     /// Head or Full: `git init`, `.git` from the metadata chunk, then the
     /// packs, whose blobs are written into the working tree as each pack
-    /// lands. Returns the committer for the reflog and the work tree the
-    /// index is written from. `manifest_tx` gets the manifest as soon as it
-    /// is in.
+    /// lands; a Full keeps its Head packs at `keep`. Returns the committer
+    /// for the reflog and the work tree the index is written from.
+    /// `manifest_tx` gets the manifest as soon as it is in.
+    #[allow(clippy::too_many_arguments)]
     async fn materialize_git(
         &self,
         urls: &OutputUrls,
         checkout: &str,
         root: &Path,
         history: bool,
+        keep: &HashSet<usize>,
         manifest_tx: Option<tokio::sync::oneshot::Sender<ClonepackManifest>>,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
@@ -849,6 +862,7 @@ impl Client {
                 &manifest,
                 Some(&git_dir.join("objects").join("pack")),
                 history,
+                keep,
                 root,
                 &metadata,
                 cleanup,
@@ -862,6 +876,30 @@ impl Client {
         );
         bench.mark_archive_download(bytes);
         Ok((ident, tree))
+    }
+
+    /// The download of each of `refs` and its idx, at `pack(i)` and `idx(i)`,
+    /// counted in the progress total.
+    fn pack_refs(
+        &self,
+        refs: &[crate::branches::SidePackRef],
+        pack: fn(usize) -> UrlSlot,
+        idx: fn(usize) -> UrlSlot,
+    ) -> Vec<(Artifact, Artifact)> {
+        (refs.iter().enumerate())
+            .map(|(i, entry)| {
+                self.progress.add_total(entry.pack_len + entry.idx_len);
+                let artifact = |hash: &str, len, slot| Artifact {
+                    hash: hash.to_string(),
+                    len: Some(len),
+                    slot,
+                };
+                (
+                    artifact(&entry.pack, entry.pack_len, pack(i)),
+                    artifact(&entry.idx, entry.idx_len, idx(i)),
+                )
+            })
+            .collect()
     }
 
     /// Download the history packs `manifest`, of `urls`' Full, lists but
@@ -960,15 +998,18 @@ impl Client {
 
     /// A commit on no ref: its own history, which the base's history packs
     /// and the side layers lack. Once their idx files are in, and none
-    /// holds `commit`, its own Full's history packs download while the
-    /// base's still do, but for those `base` lists too (levels both built
-    /// on). Nothing when the base's packs hold the commit.
+    /// holds `commit`, it downloads while the base's history still does:
+    /// the server's `built` own history, or else its own Full's history
+    /// packs but for those `base` lists too (levels both built on). Nothing
+    /// when the base's packs or the side layers hold the commit.
+    #[allow(clippy::too_many_arguments)]
     async fn own_history(
         &self,
         urls: &OutputUrls,
         base: &ClonepackManifest,
         dir: &Path,
         commit: &str,
+        built: Option<&crate::branches::OwnHistoryRef>,
         (base_idx, side_idx, manifest): (
             tokio::sync::oneshot::Receiver<Vec<bytes::Bytes>>,
             Option<tokio::sync::oneshot::Receiver<Vec<bytes::Bytes>>>,
@@ -996,6 +1037,10 @@ impl Client {
             if idx.lookup(oid).is_some() {
                 return Ok(Vec::new());
             }
+        }
+        if let Some(built) = built {
+            let packs = self.pack_refs(&built.packs, UrlSlot::OwnPack, UrlSlot::OwnIdx);
+            return (self.fetch_packs(urls, packs, "own history pack", dir, None, cleanup)).await;
         }
         let Ok(manifest) = manifest.await else {
             return Ok(Vec::new());
@@ -1114,15 +1159,18 @@ impl Client {
     /// only the working tree is written: history packs are not downloaded, and
     /// no pack, idx, index or multi-pack-index is kept. Without `history` a
     /// Full's history packs are not downloaded either, but the index is
-    /// written: the clone's objects come from elsewhere. Downloads run as
+    /// written: the clone's objects come from elsewhere. A Full keeps the
+    /// Head packs at `keep` too, each with its own idx. Downloads run as
     /// their own tasks, so they keep going while every parse slot is busy.
     /// Returns the bytes downloaded.
+    #[allow(clippy::too_many_arguments)]
     async fn install_editable_packs(
         &self,
         urls: &OutputUrls,
         manifest: &ClonepackManifest,
         pack_dir: Option<&Path>,
         history: bool,
+        keep: &HashSet<usize>,
         work_tree: &Path,
         metadata: &MetadataChunk,
         cleanup: &Cleanup,
@@ -1133,17 +1181,19 @@ impl Client {
             anyhow::bail!("clonepack has no packs for editable install");
         }
         let full = manifest.packs.iter().any(|entry| entry.history_only);
-        // Only a Head's `.git` keeps the HEAD packs.
+        // A Head's `.git` keeps the HEAD packs, a Full's those at `keep`.
         let head_pack_dir = pack_dir.filter(|_| !full);
+        let kept = |i: usize| pack_dir.is_some() && (!full || keep.contains(&i));
         // The planned download: the packs fetched, each history pack's and
         // kept level's own idx, and a Head's idx bundle and multi-pack-index.
-        let wanted = |entry: &&PackEntry| !entry.history_only || (pack_dir.is_some() && history);
-        let own_idx = |entry: &PackEntry| {
-            entry.history_only || (head_pack_dir.is_some() && entry.idx_bundle_offset.is_none())
+        let wanted = |entry: &PackEntry| !entry.history_only || (pack_dir.is_some() && history);
+        let own_idx = |i: usize, entry: &PackEntry| {
+            entry.history_only || (kept(i) && entry.idx_bundle_offset.is_none())
         };
-        let pack_bytes: u64 = (manifest.packs.iter().filter(wanted))
-            .flat_map(|entry| {
-                let own = entry.idx.as_ref().filter(|_| own_idx(entry));
+        let pack_bytes: u64 = (manifest.packs.iter().enumerate())
+            .filter(|(_, entry)| wanted(entry))
+            .flat_map(|(i, entry)| {
+                let own = entry.idx.as_ref().filter(|_| own_idx(i, entry));
                 entry.pack.iter().chain(own)
             })
             .map(|chunk| chunk.len)
@@ -1254,7 +1304,7 @@ impl Client {
                 entry.clone(),
             );
             let pack_dir = pack_dir.map(Path::to_path_buf);
-            let own = own_idx(&entry);
+            let (own, keep_pack) = (own_idx(i, &entry), kept(i));
             let task = AbortOnDrop::new(
                 tokio::spawn(async move {
                     let (entry, urls, pack_dir) = (&entry, &urls, pack_dir.as_deref());
@@ -1322,7 +1372,7 @@ impl Client {
                         pack_fetch_start.elapsed(),
                         pack_body.len(),
                     );
-                    anyhow::Ok((i, pack_body, idx_bytes))
+                    anyhow::Ok((i, keep_pack, pack_body, idx_bytes))
                 }),
                 cleanup.clone(),
             );
@@ -1336,11 +1386,10 @@ impl Client {
             .buffer_unordered(download_conc)
             .map(|res| {
                 let pack_dir = pack_dir.map(Path::to_path_buf);
-                let head_pack_dir = head_pack_dir.map(Path::to_path_buf);
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
                 async move {
-                    let (i, pack_body, idx_bytes) = res?;
+                    let (i, keep_pack, pack_body, idx_bytes) = res?;
                     let bytes = pack_body.len() + idx_bytes.as_ref().map_or(0, |b| b.len() as u64);
                     let result = AbortOnDrop::new(
                         tokio::task::spawn_blocking(
@@ -1360,7 +1409,7 @@ impl Client {
                                         // pairs to the pack by basename.
                                         let name =
                                             hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-                                        if let Some(pack_dir) = &head_pack_dir {
+                                        if let (true, Some(pack_dir)) = (keep_pack, &pack_dir) {
                                             std::fs::write(
                                                 pack_dir.join(format!("pack-{name}.pack")),
                                                 &pack_bytes,

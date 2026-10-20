@@ -220,6 +220,25 @@ pub struct FullResult {
     /// past `RIPCLONE_HEAD_REBASE_BYTES`. A child's Head adds its level on
     /// these instead of the parent Head's packs.
     pub head_base: Option<HeadBase>,
+    /// What a full clone needs beyond the history of `base`, a refs base
+    /// the commit is not in, when the Full was built with one.
+    pub own_history: Option<OwnHistory>,
+}
+
+/// A commit's history beyond a refs base's: for a full clone that installs
+/// that base's history and the side pack, as of a commit on no ref.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OwnHistory {
+    /// The refs base built against. Any refs base with it in its history
+    /// holds its objects too.
+    pub base: String,
+    /// The objects of `commit ^base` but those of `head_packs`. Empty when
+    /// the commit is in the base's history.
+    pub packs: Vec<SizedPack>,
+    /// The Full manifest's indices of the Head packs the clone installs as
+    /// they are: the Head levels, which hold the commit's newest objects
+    /// whole.
+    pub head_packs: Vec<usize>,
 }
 
 /// A Head pack set that later Heads add levels on. Lengths are kept so
@@ -304,7 +323,8 @@ impl Artifacts for FullResult {
                         .iter()
                         .flat_map(|level| sized_artifacts(&level.packs)),
                 )
-                .chain(head_base),
+                .chain(head_base)
+                .chain((self.own_history.iter()).flat_map(|own| sized_artifacts(&own.packs))),
         )
     }
 }

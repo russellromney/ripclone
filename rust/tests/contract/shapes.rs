@@ -1973,16 +1973,24 @@ fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
         remote_refs(&at_v1)
     );
 
-    // The side layers hold S: the clone downloads none of S's own history.
+    // The side layers hold S: the clone downloads none of S's own history,
+    // neither its Full's history packs nor the server's own history pack.
     let proxy = FaultProxy::start(&t.server);
     let (side, out) = t.clone_via(&proxy, "side", &["--branch", "side"], &[]);
     out.ok();
     assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    let (_, full_s) = api::read_commit(&t.server, &t.repo, &t.s, Some("full"));
+    let built: Vec<String> = (full_s["own_history"]["packs"].as_array())
+        .into_iter()
+        .flatten()
+        .map(|pack| pack["pack"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!built.is_empty(), "{full_s}");
     let own: Vec<String> = (history_packs(&t.server, &t.repo, &t.s))
         .difference(&history_packs(&t.server, &t.repo, &t.c))
         .cloned()
+        .chain(built)
         .collect();
-    assert!(!own.is_empty(), "S's Full has no history of its own");
     let gets = proxy.artifact_gets();
     assert!(
         !gets
@@ -2252,35 +2260,22 @@ fn g26_with_no_ready_tip_full_a_clone_of_another_commit_falls_back() {
 
 /// The history packs of `commit`'s Full, by hash.
 fn history_packs(server: &Server, repo: &str, commit: &str) -> std::collections::HashSet<String> {
-    manifest_packs(server, repo, commit, true)
-}
-
-/// The packs of `commit`'s Full that write the working tree, by hash.
-fn full_packs(server: &Server, repo: &str, commit: &str) -> std::collections::HashSet<String> {
-    manifest_packs(server, repo, commit, false)
-}
-
-fn manifest_packs(
-    server: &Server,
-    repo: &str,
-    commit: &str,
-    history: bool,
-) -> std::collections::HashSet<String> {
     let (_, body) = api::read_commit(server, repo, commit, Some("full"));
     let hash = body["clonepack_manifest"].as_str().unwrap().to_string();
     let (status, bytes) = server.get_bytes(&format!("/v1/artifacts/{hash}"));
     assert_eq!(status, 200, "Full manifest {hash}");
     let manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice()).unwrap();
     (manifest.packs.iter())
-        .filter(|entry| entry.history_only == history)
+        .filter(|entry| entry.history_only)
         .map(|entry| ripclone::clonepack::hash_to_hex(&entry.pack.as_ref().unwrap().hash))
         .collect()
 }
 
-/// G27: a clone of a commit on no ref, whose Full and the tip's both build
-/// on an older Full, downloads the history they share once: the tip's
-/// history, the side pack and its own commit's other packs, with no
-/// upstream fetch, and has every ref and its own history.
+/// G27: a clone of a pull request's commit on no ref, once main has moved
+/// on, downloads the tip's history, the side pack and the commit's own
+/// history the server packed against the base its Full was built with:
+/// none of the commit's Full history packs, while the tip's still download.
+/// No upstream fetch, every ref and its own history, each artifact once.
 #[test]
 fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     let world = World::new();
@@ -2298,7 +2293,7 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     world.cli(&server, &["add", "acme/g27", "--wait"]).ok();
     wait_first_refs(&server, "acme/g27", &a);
     // A pull request's commit X off A, built from a branch since deleted.
-    // Two commits, so X's history has a pack its working tree's packs do not.
+    // Two commits, so X's own history holds X1 beyond its Head level.
     git(work, &["checkout", "-q", "-b", "pr", &a]);
     origin.commit(&[("x1.txt", "x1\n")], "X1");
     let x = origin.commit(&[("x.txt", "x\n")], "X");
@@ -2325,17 +2320,41 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
         "X's and C's Fulls share no history pack"
     );
 
-    // X's own history downloads while C's does: with a pack only C's Full
-    // has held, the clone already asks for one only X's has.
+    // X's own history, against A: X1, its newest objects being in its Head
+    // level, which the clone keeps. Not the big blob A has.
+    let own = full(&x)["own_history"].clone();
+    let own_packs: Vec<String> = (own["packs"].as_array().unwrap().iter())
+        .map(|pack| pack["pack"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!own_packs.is_empty(), "{own}");
+    assert!(!own["head_packs"].as_array().unwrap().is_empty(), "{own}");
+    let own_bytes: u64 = (own["packs"].as_array().unwrap().iter())
+        .map(|pack| pack["pack_len"].as_u64().unwrap())
+        .sum();
+    assert!(own_bytes < 16 << 10, "{own}");
+    let idx = own["packs"][0]["idx"].as_str().unwrap();
+    let (status, idx) = server.get_bytes(&format!("/v1/artifacts/{idx}"));
+    assert_eq!(status, 200);
+    let mut objects = ripclone::pack::idx_object_ids(&idx).unwrap();
+    objects.sort();
+    let x1 = git(work, &["rev-parse", &format!("{x}~1")]);
+    let mut expected = vec![
+        x1.clone(),
+        git(work, &["rev-parse", &format!("{x1}^{{tree}}")]),
+    ];
+    expected.sort();
+    assert_eq!(
+        objects, expected,
+        "X's own history beyond X1's commit and tree"
+    );
+    // It downloads while C's history does: with a pack only C's Full has
+    // held, the clone already asks for it.
     let only = |a: &str, b: &str| -> Vec<String> {
         let mut only: Vec<String> = history(a).difference(&history(b)).cloned().collect();
         only.sort();
         only
     };
-    let c_only = only(&c, &x);
-    let x_only: Vec<String> = (only(&x, &c).into_iter())
-        .filter(|pack| !full_packs(&server, "acme/g27", &x).contains(pack))
-        .collect();
+    let (c_only, x_only) = (only(&c, &x), only(&x, &c));
     assert!(
         !c_only.is_empty() && !x_only.is_empty(),
         "{c_only:?} {x_only:?}"
@@ -2350,27 +2369,37 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     );
     proxy.wait_held(1);
     proxy.wait_seen("a GET of X's own history while C's is held", |seen| {
-        seen.iter()
-            .any(|get| x_only.iter().any(|pack| get.path.ends_with(pack.as_str())))
+        seen.iter().any(|get| {
+            own_packs
+                .iter()
+                .any(|pack| get.path.ends_with(pack.as_str()))
+        })
     });
     proxy.release();
     let out = cli.wait();
     out.ok();
+    let gets = proxy.artifact_gets();
+    assert!(
+        !gets
+            .iter()
+            .any(|get| x_only.iter().any(|pack| get.path.ends_with(pack.as_str()))),
+        "the clone downloaded X's Full history"
+    );
     assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
     assert_eq!(
         http.fetches(),
         fetches,
         "the clone fetched from the upstream"
     );
-    // Each shared pack, and X's and C's manifests, come down once.
+    // Each shared pack, the own history, and X's and C's manifests come
+    // down once.
     let manifests = [&x, &c].map(|commit| {
         full(commit)["clonepack_manifest"]
             .as_str()
             .unwrap()
             .to_string()
     });
-    let gets = proxy.artifact_gets();
-    for artifact in shared.iter().chain(&manifests) {
+    for artifact in shared.iter().chain(&own_packs).chain(&manifests) {
         let count = gets
             .iter()
             .filter(|get| get.path.ends_with(artifact.as_str()))
@@ -2385,6 +2414,89 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     );
     assert_eq!(remote_refs(&target), git_clone_remotes(&origin.bare, &[]));
     assert_eq!(tag_refs(&target), git_clone_tags(&origin.bare, &[]).0);
+    git(&target, &["fsck", "--full", "--strict"]);
+}
+
+/// G28: once main is force-pushed past the base a pull request's own
+/// history was packed against, a clone of that commit downloads its Full's
+/// history packs instead, while the new tip's still download, and has its
+/// whole history, every ref and no upstream fetch.
+#[test]
+fn g28_after_a_force_push_a_clone_downloads_the_commits_full_history() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let origin = world.origin("acme", "g28");
+    let (work, bare) = (&origin.work, origin.bare.to_str().unwrap());
+    let a0 = origin.commit(&[("a.txt", "a0\n")], "A0");
+    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.publish();
+    let secret = "g28-secret";
+    let server = world.server(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", secret)]);
+    world.cli(&server, &["add", "acme/g28", "--wait"]).ok();
+    wait_first_refs(&server, "acme/g28", &a);
+    git(work, &["checkout", "-q", "-b", "pr", &a]);
+    origin.commit(&[("x1.txt", "x1\n")], "X1");
+    let x = origin.commit(&[("x.txt", "x\n")], "X");
+    git(work, &["checkout", "-q", "main"]);
+    origin.publish_branch("pr");
+    world.cli(&server, &["sync", "acme/g28", "--at", &x]).ok();
+    git(work, &["push", "-q", bare, ":refs/heads/pr"]);
+    let full = |commit: &str| {
+        let (_, body) = api::read_commit(&server, "acme/g28", commit, Some("full"));
+        body
+    };
+    assert_eq!(full(&x)["state"], "ready");
+    // Main is force-pushed to B off A0: A is in no ref's history now.
+    git(work, &["reset", "-q", "--hard", &a0]);
+    let b = origin.commit(&[("b.txt", "b\n")], "B");
+    origin.publish();
+    github_push(&server, secret, "acme/g28", "refs/heads/main", &b);
+    world.cli(&server, &["sync", "acme/g28", "--wait"]).ok();
+    wait_for("the refs at B", || {
+        (full(&x)["refs_base"]["commit"] == b.as_str()).then_some(())
+    });
+    assert!(full(&x)["own_history"].is_null(), "{}", full(&x));
+
+    let history = |commit: &str| history_packs(&server, "acme/g28", commit);
+    let only = |a: &str, b: &str| -> Vec<String> {
+        let mut only: Vec<String> = history(a).difference(&history(b)).cloned().collect();
+        only.sort();
+        only
+    };
+    let (b_only, x_only) = (only(&b, &x), only(&x, &b));
+    assert!(
+        !b_only.is_empty() && !x_only.is_empty(),
+        "{b_only:?} {x_only:?}"
+    );
+    let proxy = FaultProxy::start(&server);
+    proxy.fault_requests(&format!("/v1/artifacts/{}", b_only[0]), Fault::Hold, 1);
+    let fetches = http.fetches();
+    let target = world.target("pr");
+    let cli = world.cli_spawn(
+        &proxy,
+        &["clone", "acme/g28", target.to_str().unwrap(), "--at", &x],
+    );
+    proxy.wait_held(1);
+    proxy.wait_seen("a GET of X's Full history while B's is held", |seen| {
+        seen.iter()
+            .any(|get| x_only.iter().any(|pack| get.path.ends_with(pack.as_str())))
+    });
+    proxy.release();
+    let out = cli.wait();
+    out.ok();
+    assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    assert_eq!(
+        http.fetches(),
+        fetches,
+        "the clone fetched from the upstream"
+    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), x);
+    assert_eq!(listing(&target), origin.tree(&x));
+    assert_eq!(
+        git(&target, &["rev-list", "--count", "HEAD"]),
+        origin.count(&x)
+    );
+    assert_eq!(remote_refs(&target), git_clone_remotes(&origin.bare, &[]));
     git(&target, &["fsck", "--full", "--strict"]);
 }
 

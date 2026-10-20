@@ -361,6 +361,10 @@ pub struct RefResponse {
     /// another commit. Its history and the side pack hold every ref.
     #[serde(default)]
     pub refs_base: Option<Box<RefResponse>>,
+    /// With `refs_base`, all the clone needs beyond its history and the
+    /// side pack, when the server built it.
+    #[serde(default)]
+    pub own_history: Option<crate::branches::OwnHistoryRef>,
     #[serde(rename = "kind")]
     pub result: ExactResultKind,
 }

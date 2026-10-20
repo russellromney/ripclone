@@ -741,6 +741,23 @@ async fn build_full(
             .map(|full| full.history_levels.clone())
             .unwrap_or_default();
         phases.record("base", start);
+        // Against the older published base, which the newer one holds: own
+        // history built on it serves a clone given either.
+        let refs_base = match state.control.get_refs(&claim.repo).await {
+            Ok(refs) => refs.and_then(|refs| {
+                let base = |branches: Option<crate::control::RepoBranches>| {
+                    branches.and_then(|branches| branches.base)
+                };
+                base(refs.ready).or(base(refs.branches))
+            }),
+            Err(error) => {
+                warn!(
+                    "read refs of {} for its Full: {error:#}",
+                    claim.repo.storage_key()
+                );
+                None
+            }
+        };
         Cancel::check_current()?;
         build_full_result(
             &cas,
@@ -749,6 +766,7 @@ async fn build_full(
             &claim.build.commit,
             &head,
             levels,
+            refs_base,
             &state.storage,
             &mut phases,
         )

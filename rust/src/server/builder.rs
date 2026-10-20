@@ -923,7 +923,9 @@ fn manifest_pack_tuples(manifest: &ClonepackManifest) -> Result<Vec<(String, u64
 /// [`PackBuilder::rebase_head_packs`]). Full uses the rebased packs and
 /// records them as `head_base`, so later Heads add levels on it. The published Head result never changes. A cold history build packs
 /// the whole history as level 0: on the first Full, and when the tail from
-/// the sealed tip cannot be listed.
+/// the sealed tip cannot be listed. With `refs_base`, the published refs'
+/// base, it also packs the commit's own history against it (see
+/// [`own_history`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_full_result(
     cas: &Cas,
@@ -932,6 +934,7 @@ pub(super) async fn build_full_result(
     commit: &str,
     head: &crate::HeadResult,
     mut previous_levels: Vec<crate::HistoryLevel>,
+    refs_base: Option<String>,
     storage: &crate::storage::StorageRef,
     phases: &mut BuildPhases,
 ) -> Result<crate::FullResult> {
@@ -1015,6 +1018,7 @@ pub(super) async fn build_full_result(
     let delta_bytes: u64 = head_levels.iter().map(|(_, len, _, _)| *len).sum();
     let rebase_bytes = head_rebase_bytes()?.min(base_bytes / 4);
     let mut head_base = None;
+    let head_base_count = head.base_packs.len().min(head_packs.len());
     Cancel::check_current()?;
     if level_packs > 0 && (delta_bytes >= rebase_bytes || level_packs > MAX_HEAD_LEVEL_PACKS) {
         let start = Instant::now();
@@ -1072,6 +1076,47 @@ pub(super) async fn build_full_result(
         head_packs = compact_packs;
         phases.record("head_rebase", start);
     }
+
+    let own_history = match refs_base.filter(|base| base != commit) {
+        None => None,
+        Some(base) => {
+            let start = Instant::now();
+            // Rebased Head packs are a base, with no levels.
+            let levels = match head_base {
+                Some(_) => Vec::new(),
+                None => head_packs[head_base_count..].to_vec(),
+            };
+            let own = own_history(mirror_dir, cas, storage, commit, &base, &levels).await;
+            Cancel::check_current()?;
+            phases.record("own_history", start);
+            match own {
+                Ok((packs, installed)) => {
+                    for (pack, _, idx, _) in &packs {
+                        uploads.start_all([pack, idx]);
+                    }
+                    let head_packs = match installed {
+                        true => (head_base_count..head_base_count + levels.len()).collect(),
+                        false => Vec::new(),
+                    };
+                    Some(crate::OwnHistory {
+                        base,
+                        packs: packs.iter().map(tuple_to_sized).collect(),
+                        head_packs,
+                    })
+                }
+                Err(error) => {
+                    warn!(
+                        "own history of {}@{} against {}: {error:#}; its clones download it \
+                         from the Full",
+                        repo_id.storage_key(),
+                        &commit[..7.min(commit.len())],
+                        &base[..7.min(base.len())]
+                    );
+                    None
+                }
+            }
+        }
+    };
 
     Cancel::check_current()?;
     let (vc, vcommit, vparent) = (cas.clone(), commit.to_string(), parent.clone());
@@ -1131,7 +1176,40 @@ pub(super) async fn build_full_result(
         packs: pack_artifacts_of(&all_packs),
         history_levels: levels,
         head_base,
+        own_history,
     })
+}
+
+/// `commit`'s history beyond `base`'s, for a full clone that installs the
+/// history of `base` or of a later refs base: the packs of `commit ^base`,
+/// and whether the clone installs the Head `levels` too, whose objects the
+/// packs then leave out. Built when `base` is in `commit`'s history as
+/// well, for a pull request's commit that a later base will not hold. A
+/// commit in `base`'s history needs nothing more.
+async fn own_history(
+    mirror_dir: &std::path::Path,
+    cas: &Cas,
+    storage: &crate::storage::StorageRef,
+    commit: &str,
+    base: &str,
+    levels: &[(String, u64, String, u64)],
+) -> Result<(Vec<(String, u64, String, u64)>, bool)> {
+    let (mirror, cas, storage) = (mirror_dir.to_path_buf(), cas.clone(), storage.clone());
+    let (commit, base, levels) = (commit.to_string(), base.to_string(), levels.to_vec());
+    cancel::spawn_blocking(move || {
+        if crate::gix_util::is_ancestor(&mirror, &commit, &base)? {
+            return Ok((Vec::new(), false));
+        }
+        let idx: Vec<&str> = levels.iter().map(|(_, _, idx, _)| idx.as_str()).collect();
+        let mut have = std::collections::HashSet::new();
+        for idx in get_all_cached(&cas, &storage, &idx)? {
+            have.extend(crate::pack::idx_object_ids(&idx)?);
+        }
+        let packs = PackBuilder::new(&mirror, &cas).build_own_history(&commit, &base, &have)?;
+        Ok((packs, !levels.is_empty()))
+    })
+    .await
+    .context("own history task")?
 }
 
 /// Build and upload the Files result. `parent_files`, a ready Files result of
