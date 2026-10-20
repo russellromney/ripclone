@@ -45,6 +45,7 @@ errors.
 | `RIPCLONE_S3_PREFIX` | Key prefix. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | S3 credentials. |
 | `RIPCLONE_RETENTION_MAX_BYTES` | With S3 storage, the local artifact cache keeps at most this many bytes, dropping the objects least recently written or served first. Default: half the size of the disk that holds the cache. `0` keeps any size. It never deletes S3 objects; only a purge does (see [API](API.md#repositories)). With local storage, nothing is trimmed. |
+| `RIPCLONE_MIRROR_MAX_BYTES` | The most bytes one repository's git mirror may hold. A fetch that would take it past this is stopped and the build fails, naming the limit; a mirror a fetch left over it is removed. Default: a quarter of the size of the disk that holds the mirrors. `0` keeps any size. |
 | `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>` | Webhook secret per provider instance. See [Webhooks](WEBHOOKS.md). |
 | `RIPCLONE_POLL_INTERVAL_SECS` | How often the server checks added repos for new commits, default 300; `0` turns polling off. |
 | `RUST_LOG` | Tracing filter. Default `info`. |

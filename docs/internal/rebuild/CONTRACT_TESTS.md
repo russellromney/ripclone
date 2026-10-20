@@ -139,7 +139,7 @@ Ripclone token reaches the origin.
 | F11 | A proxy that ignores Range: the ranged download falls back to one whole GET of that artifact, and the clone is exact. | |
 | F12 | A flipped byte in one range fails the clone on the hash check and leaves nothing. | |
 
-### G. Clone shapes produce correct trees (29)
+### G. Clone shapes produce correct trees (30)
 
 | # | Test | Added |
 |---|---|---|
@@ -181,7 +181,7 @@ Ripclone token reaches the origin.
 | H1 | Local disk: delete the client cache and restart the server: published artifacts still clone. | #186 |
 | H2 | S3 emulator: same lifecycle; artifacts are in the bucket. | #191 (S3 job) |
 | H3 | A second server on the same control database is rejected before it binds. | #186 |
-| H4 | Table: invalid storage, credential and worker config (an S3 bucket without an endpoint, a malformed config file, a provider `token` in the file, an app key without an `app_id`) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention size, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size), with an error naming it. | #208 |
+| H4 | Table: invalid storage, credential and worker config (an S3 bucket without an endpoint, a malformed config file, a provider `token` in the file, an app key without an `app_id`) is rejected before anything is created in the state dir. So is every numeric server variable that is set and does not parse (poll and retention intervals, retention and mirror sizes, signed-URL TTL, ls-remote and fetch timeouts, LSM levels, Head rebase size), with an error naming it. | #208 |
 | H5 | Local disk with retention every second and a 1-byte limit: the server reports retention off; the artifacts stay and clone. | #208 |
 | H6 | S3 emulator, restarted with a 1-byte limit: retention trims local cache objects, the bucket is unchanged, and published artifacts clone without a rebuild. With no limit, the next push builds. | #208 (S3 job) |
 | H8 | Table: the control database file is deleted, or replaced by another file, under a running server: `/readyz` gives 503 and the log names the case. | #209 |
@@ -236,12 +236,12 @@ origin, and runs `git fsck` and `rev-list --count` on the editable clones.
 | J7 | A rebase keeps the base packs the new commit still uses and repacks the rest. A pack that holds a replaced large file is dropped. | #233 |
 | J8 | A push's Head and Files store their files table as a delta on the cold build's table, at most a quarter of it; Full shares Head's. Rewriting every file stores a whole table again. Response and manifest agree, and every clone shape is exact. | #263 |
 
-### K. Scheduling and the mirror (9)
+### K. Scheduling and the mirror (10)
 
 A repository runs at most one build of each kind at a time, and its Fulls
 build in admission order. One repository's slow upstream never holds
 another's builds or the API, owners take turns for build slots, and the
-mirror stays compact.
+mirror stays compact and within its size limit.
 
 | # | Test | Added |
 |---|---|---|
@@ -254,6 +254,7 @@ mirror stays compact.
 | K7 | The first refresh's fetch is held, a side branch is pushed with its webhook, and the fetch then fails: the log shows the failure once, the server refreshes again, and a full clone has the side branch from the server's refs. | |
 | K8 | While a new repo's first refresh's fetch is held, its Head and Files are ready and its Full is pending; once the fetch runs, the Full is ready with the branches, and a full clone without the upstream gets every branch from the server. | |
 | K9 | An owner over 256 bytes is refused with `400`. One Head slot, held by a fetch of owner `a`'s first repo. `a` adds two more repos, then `b` adds one: once released, `b`'s Head builds next, before `a`'s other two (server log), and every repo clones. | |
+| K10 | `RIPCLONE_MIRROR_MAX_BYTES=1000000`. A repo whose commit holds 3 MB of random bytes fails Head and Files with an error naming the limit, and its mirror ends under the limit. A small repo on the same server then builds and clones. | |
 
 ### L. Any tree git allows (4)
 
@@ -270,7 +271,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 126 tests. Several are table-driven.
+Total: 128 tests. Several are table-driven.
 
 ## Test settings
 
