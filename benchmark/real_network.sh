@@ -26,12 +26,16 @@ set -euo pipefail
 #   SKIP_ADD=1    - read-only on the server: pin upstream's tip and wait for the
 #                   server to have it, without adding the repo or admitting
 #                   builds. The repos must already be added.
+#   MODES         - the modes to time; defaults to all five. To compare two
+#                   server versions, time git once and only ripclone after:
+#                   MODES="full depth1 files".
 
 REPOS="${1:?usage: real_network.sh \"owner/repo ...\" [runs]}"
 RUNS="${2:-3}"
 TARGET="${TARGET:-/data}"
 : "${RIPCLONE_URL:?set RIPCLONE_URL to the server under test}"
 RIPCLONE="${RIPCLONE:-ripclone}"
+MODES="${MODES:-full depth1 files git-full git-depth1}"
 export RIPCLONE_URL RIPCLONE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,6 +59,7 @@ printf 'repo\tcommit\tlabel\trun\tms\n' > "$RESULTS"
   echo "ripclone: $("$RIPCLONE" --version 2>/dev/null || echo unknown)"
   echo "git: $(git --version)"
   echo "runs: $RUNS"
+  echo "modes: $MODES"
 } > "$OUT/header.txt"
 cat "$OUT/header.txt"
 
@@ -65,7 +70,7 @@ for repo in $REPOS; do
   if ! env -u BENCH_REF -u GIT_REF -u SKIP_SYNC -u SKIP_GIT -u SKIP_RIPCLONE \
       -u RIPCLONE_RUNS -u NATIVE_RUNS \
       BENCH_RESULTS="$RESULTS" \
-      BENCH_MODES="full depth1 files git-full git-depth1" \
+      BENCH_MODES="$MODES" \
       RIPCLONE_BENCH_READY_RESULTS="head full files" \
       SHAPED=0 \
       "$BENCH" "$repo" 0 "$RUNS" "$TARGET" 2>&1 | tee -a "$OUT/run.log"; then

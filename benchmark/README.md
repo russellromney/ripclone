@@ -53,7 +53,10 @@ RIPCLONE=/path/to/ripclone ./benchmark/real_network.sh "sharkdp/fd pandas-dev/pa
 It times Ripclone full, depth1 and files clones, `git clone` and
 `git clone --depth 1`, and prints, per repo and mode, the git and Ripclone
 medians, the speedup and every run. Full is compared with `git clone`;
-depth1 and files with `git clone --depth 1`. Results go to
+depth1 and files with `git clone --depth 1`. `MODES` names a subset of
+`full depth1 files git-full git-depth1`: to compare two server versions, time
+git with the first and only `MODES="full depth1 files"` with the second.
+Results go to
 `$TARGET/real_network/<UTC time>/` (`TARGET` defaults to `/data`):
 
 - `summary.txt` - the table above, with the client, CLI and git versions;
