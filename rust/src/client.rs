@@ -367,6 +367,10 @@ pub struct RefResponse {
     pub own_history: Option<crate::branches::OwnHistoryRef>,
     #[serde(rename = "kind")]
     pub result: ExactResultKind,
+    /// Small artifacts of this output, base64 by hash, used in place of a
+    /// download once their bytes match the hash.
+    #[serde(default)]
+    pub inline: std::collections::BTreeMap<String, String>,
 }
 
 /// Wait before the next poll of an output pending since `waited` ago: a
@@ -571,7 +575,10 @@ impl Client {
         selector: &str,
         retry: bool,
     ) -> Result<BuildSummary> {
-        Ok(self.request_build(repo_path, selector, retry).await?.0)
+        Ok(self
+            .request_build(repo_path, selector, retry, None)
+            .await?
+            .0)
     }
 
     /// [`Self::post_build`], plus the hosted server's per-clone id.
@@ -580,13 +587,23 @@ impl Client {
         repo_path: &str,
         selector: &str,
         retry: bool,
-    ) -> Result<(BuildSummary, Option<String>)> {
+        kind: Option<ExactResultKind>,
+    ) -> Result<(BuildSummary, Option<String>, Option<CommitOutput>)> {
+        /// The answer, with the body of the `kind` output asked for.
+        #[derive(Deserialize)]
+        struct Answer {
+            #[serde(flatten)]
+            summary: BuildSummary,
+            #[serde(default)]
+            output: Option<CommitOutput>,
+        }
         crate::validation::Selector::parse(selector)?;
         let url = self.repo_url(repo_path, "/builds");
-        let request = self
-            .http
-            .request(reqwest::Method::POST, &url)
-            .json(&serde_json::json!({"selector": selector, "retry": retry}));
+        let mut body = serde_json::json!({"selector": selector, "retry": retry});
+        if let Some(kind) = kind {
+            body["kind"] = serde_json::json!(kind);
+        }
+        let request = self.http.request(reqwest::Method::POST, &url).json(&body);
         let resp = self.send(request).await?;
         if !resp.status().is_success() {
             return Err(server_error(&self.progress, "build request failed", resp).await);
@@ -596,7 +613,7 @@ impl Client {
             .get("x-ripclone-clone-id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let summary: BuildSummary = resp
+        let Answer { summary, output } = resp
             .json()
             .await
             .with_context(|| format!("invalid build response for {repo_path}"))?;
@@ -608,7 +625,7 @@ impl Client {
                 summary.commit
             );
         }
-        Ok((summary, clone_id))
+        Ok((summary, clone_id, output))
     }
 
     /// `GET .../commits/{sha}`: the state of each output of one build.

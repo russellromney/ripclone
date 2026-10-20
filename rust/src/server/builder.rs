@@ -1146,11 +1146,13 @@ pub(super) async fn build_full_result(
     for (pack, _, idx, _) in &new_history {
         uploads.start_all([pack, idx]);
     }
-    // Later builds read the idx files of the packs this Full references.
+    // Later builds read the idx files of the packs this Full references;
+    // reads of the Full carry its manifest inline.
     let keep_idx = head_packs
         .iter()
         .chain(&new_history)
         .map(|(_, _, idx, _)| idx.clone())
+        .chain([manifest_hash.clone()])
         .collect();
     let start = Instant::now();
     let uploaded = uploads.finish().await?;
@@ -1349,6 +1351,7 @@ pub(super) async fn build_files_result(
         .iter()
         .cloned()
         .chain([table.metadata_chunk.clone(), table.metadata_delta.clone()])
+        .chain([manifest_hash.clone()])
         .collect();
     settle_storage(cas, storage, uploaded, keep).await;
     phases.record("upload", start);

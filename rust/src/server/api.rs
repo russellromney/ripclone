@@ -19,7 +19,7 @@ use axum::{
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 /// `POST .../builds` body.
@@ -31,6 +31,10 @@ pub struct BuildRequest {
     /// Put failed outputs of the commit back to pending.
     #[serde(default)]
     pub retry: bool,
+    /// The output the caller reads next: the answer's `output` is its body,
+    /// as `GET .../commits/{sha}?kind=` answers.
+    #[serde(default)]
+    pub kind: Option<ExactResultKind>,
 }
 
 #[derive(Deserialize)]
@@ -207,6 +211,10 @@ pub struct RefResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub own_history: Option<crate::branches::OwnHistoryRef>,
     pub kind: ExactResultKind,
+    /// The manifest and files table when they are small and the server holds
+    /// them: base64 bytes by hash, used in place of a download.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub inline: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -576,7 +584,8 @@ async fn post_build(
         return Err(repo_not_added());
     }
     let resolved = resolve(state, repo_id, provider, &selector).await?;
-    admit_resolved(state, repo_id, resolved, request.retry, start).await
+    let output = request.kind.map(|kind| (provider, kind));
+    admit_resolved(state, repo_id, resolved, request.retry, start, output).await
 }
 
 /// `POST .../add`: resolve HEAD first, so a repository the upstream does not
@@ -592,7 +601,7 @@ async fn add_repo(
         state.metrics.record_error();
         ApiError::control(error)
     })?;
-    admit_resolved(state, repo_id, resolved, true, start).await
+    admit_resolved(state, repo_id, resolved, true, start, None).await
 }
 
 async fn admit_resolved(
@@ -601,6 +610,7 @@ async fn admit_resolved(
     resolved: Resolved,
     retry: bool,
     start: Instant,
+    output: Option<(&ProviderInstance, ExactResultKind)>,
 ) -> Result<Response, ApiError> {
     let (row, _) = admit_build(
         state,
@@ -621,6 +631,9 @@ async fn admit_resolved(
         (resolved.ref_name.as_deref()).and_then(|name| name.strip_prefix("refs/tags/"))
     {
         body["tag"] = serde_json::json!(tag);
+    }
+    if let Some((provider, kind)) = output {
+        body["output"] = output_body(state, repo_id, provider, &row, kind).await?;
     }
     Ok(Json(body).into_response())
 }
@@ -741,6 +754,10 @@ async fn ready_body(
             }
         }
     }
+    inline_small(&state.cas, &mut result).await;
+    if let Some(base) = result.refs_base.as_deref_mut() {
+        inline_small(&state.cas, base).await;
+    }
     Ok(serde_json::json!(ReadyBody {
         state: "ready",
         result,
@@ -774,6 +791,50 @@ async fn own_history(
             .collect(),
         head_packs: own.head_packs.clone(),
     })
+}
+
+/// The most bytes of one artifact, and of all of a response's, it carries
+/// inline.
+const INLINE_MAX: u64 = 32 << 10;
+const INLINE_TOTAL: u64 = 64 << 10;
+
+/// Put `response`'s manifest and files table in its `inline` while they are
+/// small and in the local store, so a clone starts its pack downloads
+/// without first downloading them. Anything else it downloads as before.
+async fn inline_small(cas: &crate::cas::Cas, response: &mut RefResponse) {
+    let hashes = [
+        &response.clonepack_manifest,
+        &response.metadata_chunk,
+        &response.metadata_delta,
+    ]
+    .into_iter()
+    .filter(|hash| !hash.is_empty())
+    .cloned()
+    .collect::<Vec<_>>();
+    let cas = cas.clone();
+    let Ok(found) = tokio::task::spawn_blocking(move || {
+        let mut total = 0;
+        let mut found = Vec::new();
+        for hash in hashes {
+            let Some(bytes) = cas.get_small(&hash, INLINE_MAX) else {
+                continue;
+            };
+            total += bytes.len() as u64;
+            if total > INLINE_TOTAL {
+                break;
+            }
+            found.push((hash, bytes));
+        }
+        found
+    })
+    .await
+    else {
+        return;
+    };
+    for (hash, bytes) in found {
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        response.inline.insert(hash, encoded);
+    }
 }
 
 /// Whether `base` is in `commit`'s history in the mirror: then a Full of
@@ -840,17 +901,28 @@ async fn get_commit(
     let Some(kind) = kind else {
         return Ok(Json(build_summary_body(&row)).into_response());
     };
-    let body = match kind_state(&row, kind) {
-        Out::Ready(()) => ready_body(state, repo_id, provider, &row, kind).await?,
+    let body = output_body(state, repo_id, provider, &row, kind).await?;
+    Ok(Json(body).into_response())
+}
+
+/// One body per state of `row`'s `kind` output.
+async fn output_body(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    row: &BuildRow,
+    kind: ExactResultKind,
+) -> Result<serde_json::Value, ApiError> {
+    Ok(match kind_state(row, kind) {
+        Out::Ready(()) => ready_body(state, repo_id, provider, row, kind).await?,
         Out::Failed(error) => serde_json::json!({
             "state": "failed",
             "commit": row.commit,
             "kind": kind,
             "error": error,
         }),
-        Out::Pending { error } => pending_body(state, repo_id, provider, &row, kind, error).await?,
-    };
-    Ok(Json(body).into_response())
+        Out::Pending { error } => pending_body(state, repo_id, provider, row, kind, error).await?,
+    })
 }
 
 /// The answer for `row`'s pending `kind` output. A pending Full names its
@@ -1054,6 +1126,7 @@ fn ref_response(
         refs_base: None,
         own_history: None,
         kind,
+        inline: BTreeMap::new(),
     }
 }
 

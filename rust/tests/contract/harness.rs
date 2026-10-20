@@ -1424,7 +1424,7 @@ pub fn push_hook(
 /// selector, `GET .../commits/{sha}[?kind=]` reads one commit's outputs.
 pub mod api {
     use super::{HttpResponse, Server};
-    use crate::net::Seen;
+    use crate::net::{FaultProxy, Seen};
 
     /// The API path of `repo`, as the CLI names it: `owner/name` on the
     /// default `github` provider, or `<provider>:<path>`.
@@ -1457,6 +1457,13 @@ pub mod api {
 
     /// Text in a commit read's URL, for a proxy rule that matches only those.
     pub const COMMIT_READS: &str = "/commits/";
+
+    /// Hide the output an admission answers with, so a clone through `proxy`
+    /// reads it with `GET .../commits/{sha}?kind=`, where rewrites of
+    /// [`COMMIT_READS`] apply.
+    pub fn hide_admitted_output(proxy: &FaultProxy) {
+        proxy.rewrite("/builds", "\"output\":", "\"hidden_output\":");
+    }
 
     /// The tags artifact a read of `commit`'s Full points at.
     pub fn tags_artifact(server: &Server, repo: &str, commit: &str) -> Option<String> {

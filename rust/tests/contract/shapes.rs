@@ -1387,6 +1387,7 @@ fn serve_tags(
     std::fs::write(&path, &bytes).unwrap();
     let (status, served) = server.get_bytes(&format!("/v1/artifacts/{id}"));
     assert_eq!((status, served), (200, bytes));
+    api::hide_admitted_output(proxy);
     proxy.rewrite(api::COMMIT_READS, own, &id);
 }
 
@@ -1744,6 +1745,7 @@ fn g25_a_local_failure_of_the_refs_fetch_fails_the_clone() {
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g25", "--wait"]).ok();
     let proxy = FaultProxy::start(&server);
+    api::hide_admitted_output(&proxy);
     proxy.rewrite(api::COMMIT_READS, "\"branches\":", "\"no_branches\":");
 
     let wrapper = GitWrapper::new(
@@ -2384,20 +2386,29 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
         fetches,
         "the clone fetched from the upstream"
     );
-    // Each shared pack, the own history, and X's and C's manifests come
-    // down once.
+    // Each shared pack and the own history come down once. X's and C's
+    // manifests come inline with the admission.
     let manifests = [&x, &c].map(|commit| {
         full(commit)["clonepack_manifest"]
             .as_str()
             .unwrap()
             .to_string()
     });
-    for artifact in shared.iter().chain(&own_packs).chain(&manifests) {
-        let count = gets
-            .iter()
-            .filter(|get| get.path.ends_with(artifact.as_str()))
-            .count();
-        assert_eq!(count, 1, "{artifact} downloaded {count} times");
+    let count = |artifact: &str| {
+        gets.iter()
+            .filter(|get| get.path.ends_with(artifact))
+            .count()
+    };
+    for artifact in shared.iter().chain(&own_packs) {
+        assert_eq!(
+            count(artifact),
+            1,
+            "{artifact} downloaded {} times",
+            count(artifact)
+        );
+    }
+    for artifact in &manifests {
+        assert_eq!(count(artifact), 0, "the manifest {artifact} was downloaded");
     }
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), x);
     assert_eq!(listing(&target), origin.tree(&x));
@@ -2509,6 +2520,7 @@ fn g18_a_bad_refs_base_or_side_pack_fails_the_clone_cleanly() {
 
     let lying = FaultProxy::start(&t.server);
     let b = git(&t.origin.bare, &["rev-parse", "main~1"]);
+    api::hide_admitted_output(&lying);
     lying.rewrite(
         &format!("/commits/{}", t.a),
         &format!("\"commit\":\"{}\"", t.c),

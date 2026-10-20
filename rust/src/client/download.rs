@@ -546,6 +546,18 @@ impl Client {
         urls: &OutputUrls,
         artifact: &Artifact,
     ) -> Result<bytes::Bytes> {
+        if let Some(encoded) = urls.output().inline.get(&artifact.hash) {
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                .with_context(|| format!("decode inline {}", artifact.slot.label()))?;
+            anyhow::ensure!(
+                crate::cas::hash(&bytes) == artifact.hash
+                    && artifact.len.is_none_or(|len| len == bytes.len() as u64),
+                "inline {} does not match {}",
+                artifact.slot.label(),
+                artifact.hash
+            );
+            return Ok(bytes.into());
+        }
         match self.download(urls, artifact, Sink::Memory).await? {
             Downloaded::Memory(bytes) => Ok(bytes),
             Downloaded::TempFile(..) => unreachable!("memory sink"),

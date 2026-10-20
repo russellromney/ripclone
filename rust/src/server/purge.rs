@@ -199,8 +199,10 @@ async fn sweep_one(state: &ServerState, hash: &str, now: i64) -> Result<Swept> {
     if !state.control.deletable(hash, now).await? {
         return Ok(Swept::Kept);
     }
-    state.storage.delete(hash).await?;
+    // The local copy goes first, so an artifact the bucket no longer has is
+    // never served from the cache. A failed bucket delete stays queued.
     state.cas.remove(hash)?;
+    state.storage.delete(hash).await?;
     state.metrics.record_artifact_deleted();
     Ok(Swept::Deleted)
 }

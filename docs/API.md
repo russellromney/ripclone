@@ -52,7 +52,7 @@ minutes.
 
 ```
 POST /v1/repos/github/acme/app/builds
-{"selector": "main", "retry": false}
+{"selector": "main", "retry": false, "kind": "head"}
 ```
 
 `selector` is `HEAD` (the default branch), a full commit SHA (40 or 64
@@ -62,7 +62,8 @@ connection the server keeps open, or `git ls-remote` when the upstream does
 not answer it. A full SHA is trusted as given and admitted
 without asking the upstream. Anything else, such as `HEAD~1`, is `400
 invalid_selector`. `retry: true` puts failed outputs of the commit back to
-pending.
+pending. `kind` (`head`, `full`, or `files`) is optional and names the output
+the caller reads next.
 
 The answer comes at once and never waits for a build:
 
@@ -75,6 +76,11 @@ The answer comes at once and never waits for a build:
   "head": {"state": "ready"}
 }
 ```
+
+With `kind`, the answer also has `output`: that output's body, as
+`GET .../commits/{sha}?kind=` gives it at that moment (see below). A clone
+names its output here and reads the commit only while it is pending or to
+refresh URLs.
 
 `checkout_name` is the branch a clone checks out. It is `null` for a SHA or a
 tag, which give a detached checkout. `tag` is present when the selector named
@@ -113,6 +119,12 @@ built after it. A ready output never changes. See [Design](DESIGN.md).
   "state": "ready"
 }
 ```
+
+A ready body may also have `inline`: a map from artifact hash to the base64
+bytes of that artifact, for the manifest, the metadata chunk, and the
+metadata delta when each is at most 32 KiB, up to 64 KiB in all, and the
+server holds it on local disk. A client uses those bytes in place of a
+download after checking the hash. A `refs_base` carries its own `inline`.
 
 The `*_url` fields are left out when storage cannot sign URLs (local disk).
 Fetch those artifacts from `GET /v1/artifacts/{hash}` instead. In a Full,

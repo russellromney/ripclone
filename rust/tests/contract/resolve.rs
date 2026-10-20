@@ -345,3 +345,65 @@ fn a8_empty_upstream_is_refused_until_its_first_push() {
     assert_eq!(listing(&target), origin.tree(&tip));
     assert_eq!(server.metric("ripclone_builds_failed_total"), 0);
 }
+
+/// A9: an admission that names an output answers with that output, small
+/// artifacts inline, so a ready clone of each shape reads no commit and
+/// fetches only its packs.
+#[test]
+fn a9_admission_answers_with_the_output() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let world = World::new();
+    let origin = world.origin("acme", "a9");
+    origin.commit(&[("README.md", "one\n")], "A");
+    let b = origin.commit(&[("src/lib.rs", "pub fn b() {}\n")], "B");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/a9", "--wait"]).ok();
+
+    let mut small = Vec::new();
+    for kind in ["head", "full", "files"] {
+        let body = serde_json::json!({ "selector": "main", "kind": kind });
+        let (status, body) = api::parse(server.post_json(&api::builds_path("acme/a9"), &body));
+        assert_eq!(status, 200, "{kind}: {body}");
+        let output = &body["output"];
+        assert_eq!(output["state"], "ready", "{kind}: {body}");
+        let (_, read) = api::read_commit(&server, "acme/a9", &b, Some(kind));
+        assert_eq!(output, &read, "{kind}: the answer is the read's body");
+        for field in ["clonepack_manifest", "metadata_chunk", "metadata_delta"] {
+            let Some(hash) = output[field].as_str() else {
+                continue;
+            };
+            let data = output["inline"][hash].as_str();
+            let data = data.unwrap_or_else(|| panic!("{kind}: {field} is not inline: {output}"));
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap();
+            assert_eq!(hex::encode(Sha256::digest(&data)), hash, "{kind}: {field}");
+            small.push(hash.to_string());
+        }
+    }
+
+    let proxy = FaultProxy::start(&server);
+    let shapes: [&[&str]; 3] = [&["--depth", "1"], &[], &["--mode", "files"]];
+    for (i, flags) in shapes.into_iter().enumerate() {
+        let target = world.target(&format!("a9-{i}"));
+        let mut args = vec!["clone", "acme/a9", target.to_str().unwrap()];
+        args.extend_from_slice(flags);
+        world.cli(&proxy, &args).ok();
+        assert_eq!(listing(&target), origin.tree(&b), "{flags:?}");
+    }
+    let seen = proxy.seen();
+    assert!(
+        !seen.iter().any(|s| s.path.contains(api::COMMIT_READS)),
+        "a ready clone read a commit: {seen:#?}"
+    );
+    let gets = proxy.artifact_gets();
+    assert!(!gets.is_empty(), "no pack was fetched");
+    assert!(
+        !gets
+            .iter()
+            .any(|s| small.iter().any(|h| s.path.ends_with(h))),
+        "an inline artifact was fetched: {gets:#?}"
+    );
+}
