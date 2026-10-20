@@ -229,7 +229,7 @@ origin, and runs `git fsck` and `rev-list --count` on the editable clones.
 | J5 | A branch with no history in common with the built main builds cold, and its full clone lacks main's commit. | #217 |
 | J6 | Each push adds one Head level that holds only objects no earlier pack has. The idx bundle holds only the base's idx files, so every Head on a base shares it, and each level's idx is fetched on its own. Past a quarter of the base, Full packs a new base. A lost parent idx also packs a new base. | #233, #257 |
 | J7 | A rebase keeps the base packs the new commit still uses and repacks the rest. A pack that holds a replaced large file is dropped. | #233 |
-| J8 | A push's Head and Files store their files table as a delta on the cold build's table, at most a quarter of it; Full shares Head's. Rewriting every file stores a whole table again. Response and manifest agree, and every clone shape is exact. | #PR |
+| J8 | A push's Head and Files store their files table as a delta on the cold build's table, at most a quarter of it; Full shares Head's. Rewriting every file stores a whole table again. Response and manifest agree, and every clone shape is exact. | #263 |
 
 ### K. Scheduling and the mirror (7)
 
