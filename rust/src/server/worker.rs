@@ -508,7 +508,24 @@ pub(super) async fn repo_lock(state: &ServerState, repo_id: &RepoId) -> Arc<Repo
 /// and connected. The commit object alone is not enough: it may be in a pack
 /// whose fetch has not finished or failed. Such a commit is fetched again
 /// under the write lock; git skips the transfer when the history is there.
+///
+/// A mirror over its size limit fails the build and is removed once no
+/// build reads it.
 async fn ensure_commit(
+    state: &ServerState,
+    repo_id: &RepoId,
+    commit: &str,
+    mirror_dir: &std::path::Path,
+    lock: &RepoLock,
+) -> Result<()> {
+    let ensured = ensure_commit_within_limit(state, repo_id, commit, mirror_dir, lock).await;
+    if let Err(error) = &ensured {
+        super::purge::remove_mirror_over_limit(state, repo_id, error);
+    }
+    ensured
+}
+
+async fn ensure_commit_within_limit(
     state: &ServerState,
     repo_id: &RepoId,
     commit: &str,
@@ -518,9 +535,9 @@ async fn ensure_commit(
     let has_commit = || {
         let (dir, wanted) = (mirror_dir.to_path_buf(), commit.to_string());
         async move {
-            cancel::spawn_blocking(move || git::mirror_fetched_commit(&dir, &wanted))
+            cancel::spawn_blocking(move || git::mirror_fetched_commit_within_limit(&dir, &wanted))
                 .await
-                .context("mirror check task")
+                .context("mirror check task")?
         }
     };
     if has_commit().await? {
@@ -535,8 +552,9 @@ async fn ensure_commit(
 }
 
 /// Fetch `commit` into the mirror. The caller holds the repo's write lock.
-/// The fetch is bounded by `RIPCLONE_FETCH_TIMEOUT_SECS` and git's low-speed
-/// limit, and stopped if the build is cancelled.
+/// The fetch is bounded by `RIPCLONE_FETCH_TIMEOUT_SECS`, git's low-speed
+/// limit and the mirror's size limit, and stopped if the build is
+/// cancelled.
 async fn fetch_commit(
     state: &ServerState,
     repo_id: &RepoId,
@@ -553,19 +571,13 @@ async fn fetch_commit(
         .get(repo_id)
         .await
         .with_context(|| format!("fetch credential for {}", repo_id.storage_key()))?;
-    let (mirror_dir, repo_id, commit) = (
+    let (dir, repo, commit) = (
         mirror_dir.to_path_buf(),
         repo_id.clone(),
         commit.to_string(),
     );
     cancel::spawn_blocking(move || {
-        git::sync_bare_mirror_admitted(
-            &mirror_dir,
-            &provider,
-            &repo_id,
-            &commit,
-            credential.as_ref(),
-        )
+        git::sync_bare_mirror_admitted(&dir, &provider, &repo, &commit, credential.as_ref())
     })
     .await
     .context("mirror fetch task")?

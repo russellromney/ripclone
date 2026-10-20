@@ -47,14 +47,17 @@ struct Tracked {
 /// block the child). The group is killed when the current build is
 /// cancelled or `timeout` passes.
 fn run_tracked(command: &mut Command, timeout: Option<Duration>) -> std::io::Result<Tracked> {
-    run_tracked_with_input(command, timeout, None)
+    run_tracked_with_input(command, timeout, None, None)
 }
 
-/// [`run_tracked`] with `input`, when given, as the child's stdin.
+/// [`run_tracked`] with `input`, when given, as the child's stdin, and the
+/// group also stopped once `stop` returns true (see
+/// [`crate::cancel::wait_child_watched`]).
 fn run_tracked_with_input(
     command: &mut Command,
     timeout: Option<Duration>,
     input: Option<&[u8]>,
+    stop: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> std::io::Result<Tracked> {
     let stdin = match input {
         Some(input) => {
@@ -76,7 +79,7 @@ fn run_tracked_with_input(
         command.process_group(0);
     }
     let mut child = command.spawn()?;
-    let ended = crate::cancel::wait_child(&mut child, timeout)?;
+    let ended = crate::cancel::wait_child_watched(&mut child, timeout, stop)?;
     stderr.rewind()?;
     let mut bytes = Vec::new();
     stderr.read_to_end(&mut bytes)?;
@@ -913,6 +916,172 @@ pub fn fetch_timeout() -> Result<Duration> {
     crate::env::number("RIPCLONE_FETCH_TIMEOUT_SECS", 3600).map(Duration::from_secs)
 }
 
+const MIRROR_MAX: &str = "RIPCLONE_MIRROR_MAX_BYTES";
+
+/// The most one repository's mirror may hold: `RIPCLONE_MIRROR_MAX_BYTES`,
+/// or by default a quarter of the disk that holds the mirrors. `0` keeps
+/// any size. A fetch that would take a mirror past it is stopped, and the
+/// fetch fails with [`MirrorOverLimit`].
+#[derive(Clone, Debug)]
+pub struct MirrorLimit {
+    bytes: u64,
+    /// Where the limit came from, for the error.
+    from: String,
+}
+
+impl MirrorLimit {
+    /// Check `RIPCLONE_MIRROR_MAX_BYTES` parses, at startup.
+    pub fn check_environment() -> Result<()> {
+        mirror_max_setting().map(drop)
+    }
+
+    /// The limit for the mirror at `mirror_dir`; `None` when it is off.
+    pub fn of(mirror_dir: &Path) -> Result<Option<Self>> {
+        Ok(match mirror_max_setting()? {
+            Some(0) => None,
+            Some(bytes) => Some(Self {
+                bytes,
+                from: format!("{MIRROR_MAX}={bytes}"),
+            }),
+            None => {
+                let root = mirror_dir.parent().unwrap_or(mirror_dir);
+                let disk = crate::capacity::disk_bytes(root)?;
+                Some(Self {
+                    bytes: disk / 4,
+                    from: format!(
+                        "a quarter of the {} GB disk holding {}; set {MIRROR_MAX} to change it",
+                        disk / 1_000_000_000,
+                        root.display()
+                    ),
+                })
+            }
+        })
+    }
+}
+
+impl MirrorLimit {
+    /// The mirror's size, or an error when it is over the limit already.
+    fn check(&self, mirror_dir: &Path) -> Result<u64> {
+        let bytes = dir_bytes(mirror_dir);
+        if bytes > self.bytes {
+            return Err(MirrorOverLimit {
+                limit: self.clone(),
+                bytes,
+                remove: true,
+            }
+            .into());
+        }
+        Ok(bytes)
+    }
+}
+
+fn mirror_max_setting() -> Result<Option<u64>> {
+    (std::env::var_os(MIRROR_MAX).is_some())
+        .then(|| crate::env::number(MIRROR_MAX, 0))
+        .transpose()
+}
+
+/// A fetch stopped, or a mirror found, over its [`MirrorLimit`]. A mirror
+/// left over it (`remove`) must be removed once no build reads it.
+#[derive(Debug)]
+pub struct MirrorOverLimit {
+    pub limit: MirrorLimit,
+    pub bytes: u64,
+    pub remove: bool,
+}
+
+impl std::fmt::Display for MirrorOverLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let holds = if self.remove { "holds" } else { "would hold" };
+        write!(
+            f,
+            "the mirror {holds} {} bytes, over its limit of {} bytes ({})",
+            self.bytes, self.limit.bytes, self.limit.from
+        )
+    }
+}
+
+impl std::error::Error for MirrorOverLimit {}
+
+/// Bytes under `dir`, 0 for a missing one. Files that vanish while it
+/// counts (git renaming a pack in) are skipped.
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dir_bytes(&entry.path()),
+            Ok(_) => entry.metadata().map_or(0, |metadata| metadata.len()),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// Bytes of the packs a running fetch is writing into `mirror_dir`. The
+/// mirror fetches with `fetch.unpackLimit=1`, so every fetch writes one.
+fn incoming_pack_bytes(mirror_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(mirror_dir.join("objects").join("pack")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("tmp_"))
+        .map(|entry| entry.metadata().map_or(0, |metadata| metadata.len()))
+        .sum()
+}
+
+/// Run a fetch into `mirror_dir` within `limit`: refused when the mirror is
+/// already over it, stopped when its incoming pack would take it over, and
+/// failed when it ends over it, the pack finishing between checks.
+fn fetch_within(
+    mirror_dir: &Path,
+    limit: Option<&MirrorLimit>,
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<Tracked> {
+    let Some(limit) = limit else {
+        return Ok(run_tracked(command, Some(timeout))?);
+    };
+    let over = |bytes: u64, remove: bool| MirrorOverLimit {
+        limit: limit.clone(),
+        bytes,
+        remove,
+    };
+    let before = limit.check(mirror_dir)?;
+    let stopped_at = std::sync::atomic::AtomicU64::new(0);
+    let stop = || {
+        let bytes = before + incoming_pack_bytes(mirror_dir);
+        let stop = bytes > limit.bytes;
+        if stop {
+            stopped_at.store(bytes, std::sync::atomic::Ordering::SeqCst);
+        }
+        stop
+    };
+    let run = run_tracked_with_input(command, Some(timeout), None, Some(&stop))?;
+    let stopped = stopped_at.load(std::sync::atomic::Ordering::SeqCst);
+    if stopped > 0 {
+        // git leaves the pack it was writing when stopped.
+        remove_incoming_packs(mirror_dir);
+        return Err(over(stopped, false).into());
+    }
+    let after = dir_bytes(mirror_dir);
+    if after > limit.bytes {
+        return Err(over(after, true).into());
+    }
+    Ok(run)
+}
+
+fn remove_incoming_packs(mirror_dir: &Path) {
+    let pack_dir = mirror_dir.join("objects").join("pack");
+    for entry in std::fs::read_dir(&pack_dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with("tmp_") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn upstream_auth_header(
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
@@ -1509,6 +1678,7 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
         credential,
         origin_base().as_deref(),
         fetch_timeout()?,
+        MirrorLimit::of(mirror_dir.as_ref())?.as_ref(),
     )
 }
 
@@ -1521,6 +1691,7 @@ fn sync_bare_mirror_admitted_from(
     credential: Option<&secrecy::SecretString>,
     origin_base: Option<&str>,
     timeout: Duration,
+    limit: Option<&MirrorLimit>,
 ) -> Result<()> {
     crate::validation::validate_repo_path(provider, repo_id)
         .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
@@ -1539,7 +1710,15 @@ fn sync_bare_mirror_admitted_from(
     }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential, origin_base);
     let auth_header = upstream_auth_header(provider, credential);
-    sync_bare_mirror_rev(mirror_dir, &url, &git_args, auth_header, commit, timeout)
+    sync_bare_mirror_rev(
+        mirror_dir,
+        &url,
+        &git_args,
+        auth_header,
+        commit,
+        timeout,
+        limit,
+    )
 }
 
 /// Bring the mirror's branches and tags to upstream's in one atomic fetch,
@@ -1568,7 +1747,9 @@ pub fn refresh_mirror_refs(
         upstream_url_and_auth(provider, repo_id, credential, origin_base().as_deref());
     ensure_bare_origin(mirror_dir, &url)?;
     let timeout = fetch_timeout()?;
-    let run = run_tracked(
+    let run = fetch_within(
+        mirror_dir,
+        MirrorLimit::of(mirror_dir)?.as_ref(),
         command()
             .args(&git_args)
             .args(LOW_SPEED_ARGS)
@@ -1576,7 +1757,7 @@ pub fn refresh_mirror_refs(
             .arg(mirror_dir.as_os_str())
             .args(["fetch", "--atomic", "--prune", "--no-tags", "origin"])
             .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]),
-        Some(timeout),
+        timeout,
     )
     .context("git fetch refs")?;
     match run.ended {
@@ -1612,6 +1793,20 @@ pub fn refresh_mirror_refs(
 /// it. The commit object alone does not: a fetch still running, or one that
 /// failed after writing its pack, can leave the commit without objects it
 /// reaches.
+/// [`mirror_fetched_commit`] in a mirror within its [`MirrorLimit`]: a
+/// mirror a fetch left over it, waiting to be removed, is not built from.
+/// git writes the fetch's ref after its pack, so a mirror whose ref is seen
+/// is measured with the pack in it.
+pub fn mirror_fetched_commit_within_limit(mirror_dir: &Path, commit: &str) -> Result<bool> {
+    if !mirror_fetched_commit(mirror_dir, commit) {
+        return Ok(false);
+    }
+    if let Some(limit) = MirrorLimit::of(mirror_dir)? {
+        limit.check(mirror_dir)?;
+    }
+    Ok(true)
+}
+
 pub fn mirror_fetched_commit(mirror_dir: &Path, commit: &str) -> bool {
     let fetched = format!(
         "refs/ripclone/revs/{}^{{commit}}",
@@ -1740,6 +1935,7 @@ fn sync_bare_mirror_rev(
     auth_header: Option<(String, String)>,
     rev: &str,
     timeout: Duration,
+    limit: Option<&MirrorLimit>,
 ) -> Result<()> {
     use crate::cancel::Ended;
     ensure_bare_origin(mirror_dir, url)?;
@@ -1747,14 +1943,16 @@ fn sync_bare_mirror_rev(
 
     let refspec = format!("{rev}:refs/ripclone/revs/{}", rev_internal_ref_name(rev));
 
-    let run = run_tracked(
+    let run = fetch_within(
+        mirror_dir,
+        limit,
         command()
             .args(git_args)
             .args(LOW_SPEED_ARGS)
             .arg("-C")
             .arg(mirror_dir.as_os_str())
             .args(["fetch", "--atomic", "origin", &refspec, NO_REFS_REFSPEC]),
-        Some(timeout),
+        timeout,
     )
     .context("git fetch rev")?;
     match run.ended {
@@ -1807,6 +2005,70 @@ mod tests {
     use rayon::scope;
     use std::collections::HashSet;
     use std::io::Read;
+
+    /// A fetch within a 1 MB mirror limit, played by `sh`: one already over
+    /// it does not run, one whose incoming pack grows past it is stopped
+    /// and its pack removed, and one that ends over it says the mirror must
+    /// go. One within it succeeds.
+    #[test]
+    fn fetches_stop_at_the_mirror_limit() {
+        let mirror = tempfile::tempdir().unwrap();
+        let pack_dir = mirror.path().join("objects").join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let limit = MirrorLimit {
+            bytes: 1_000_000,
+            from: "test".into(),
+        };
+        let fetch = |script: &str| {
+            let mut sh = Command::new("sh");
+            sh.args(["-c", script]).current_dir(&pack_dir);
+            let started = std::time::Instant::now();
+            let run = fetch_within(
+                mirror.path(),
+                Some(&limit),
+                &mut sh,
+                Duration::from_secs(60),
+            );
+            (run, started.elapsed())
+        };
+        let over = |run: Result<Tracked>| -> MirrorOverLimit {
+            let error = run.err().expect("over the limit");
+            assert!(
+                error.to_string().contains("limit of 1000000 bytes (test)"),
+                "{error}"
+            );
+            error.downcast().unwrap()
+        };
+
+        let (run, _) = fetch("head -c 400000 /dev/zero > pack-a.pack");
+        assert!(
+            matches!(run.unwrap().ended, crate::cancel::Ended::Exited(status) if status.success())
+        );
+
+        let (run, took) = fetch("head -c 700000 /dev/zero > tmp_pack_x; touch started; sleep 30");
+        let stopped = over(run);
+        assert!(!stopped.remove, "the mirror is as it was");
+        assert!(stopped.bytes > 1_000_000, "{}", stopped.bytes);
+        assert!(took < Duration::from_secs(10), "stopped at once: {took:?}");
+        assert!(pack_dir.join("started").exists());
+        assert!(
+            !pack_dir.join("tmp_pack_x").exists(),
+            "the partial pack is removed"
+        );
+
+        let (run, _) = fetch("head -c 700000 /dev/zero > pack-b.pack");
+        assert!(
+            over(run).remove,
+            "a fetch that ends over it leaves the mirror over it"
+        );
+
+        let (run, _) = fetch("touch ran");
+        assert!(over(run).remove);
+        assert!(
+            !pack_dir.join("ran").exists(),
+            "a mirror over the limit fetches nothing"
+        );
+    }
 
     /// Git's output is captured, not printed, and a failure still carries
     /// git's own error text.
@@ -2303,6 +2565,7 @@ mod tests {
             None,
             base.path().to_str(),
             Duration::from_secs(60),
+            None,
         )
         .unwrap();
 
@@ -2344,6 +2607,7 @@ mod tests {
                 None,
                 base.path().to_str(),
                 Duration::from_secs(60),
+                None,
             )
             .unwrap()
         };
@@ -2452,6 +2716,7 @@ mod tests {
             None,
             base.path().to_str(),
             Duration::from_secs(60),
+            None,
         )
         .unwrap();
 

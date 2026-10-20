@@ -17,10 +17,13 @@ use std::collections::HashSet;
 use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a git process group has to exit after SIGTERM before SIGKILL.
 pub const GRACE: Duration = Duration::from_secs(2);
+
+/// How often [`wait_child_watched`] runs its stop check.
+pub const WATCH_EVERY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Default)]
 pub struct Cancel(Arc<Inner>);
@@ -156,8 +159,19 @@ pub enum Ended {
 /// whole group is stopped when the current build is cancelled or `timeout`
 /// passes, and killed once the child exits, so no helper (an HTTP
 /// transport, `index-pack`) outlives it.
-#[cfg(unix)]
 pub fn wait_child(child: &mut Child, timeout: Option<Duration>) -> std::io::Result<Ended> {
+    wait_child_watched(child, timeout, None)
+}
+
+/// [`wait_child`] that also stops the group, as a timeout does, once `stop`
+/// returns true. `stop` runs every [`WATCH_EVERY`] while the child runs;
+/// the caller learns from its own state that it fired.
+#[cfg(unix)]
+pub fn wait_child_watched(
+    child: &mut Child,
+    timeout: Option<Duration>,
+    stop: Option<&(dyn Fn() -> bool + Sync)>,
+) -> std::io::Result<Ended> {
     use std::sync::mpsc;
     let group = i32::try_from(child.id()).map_err(std::io::Error::other)?;
     let cancel = Cancel::current();
@@ -173,28 +187,20 @@ pub fn wait_child(child: &mut Child, timeout: Option<Duration>) -> std::io::Resu
         }
         groups.insert(group);
     }
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let watchdog = timeout.map(|timeout| {
-        let (done, wait) = mpsc::channel::<()>();
-        let timed_out = timed_out.clone();
-        let thread = std::thread::spawn(move || {
-            if let Err(mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(timeout) {
-                timed_out.store(true, Ordering::SeqCst);
-                signal_group(group, Signal::Term);
-                if let Err(mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(GRACE) {
-                    signal_group(group, Signal::Kill);
-                }
-            }
-        });
-        (done, thread)
-    });
+    let timed_out = AtomicBool::new(false);
     // Wait without reaping: until the zombie is reaped its pid, and so the
     // group id, cannot be reused, so every kill above and below is safe.
-    let exited = wait_without_reaping(group);
-    if let Some((done, thread)) = watchdog {
+    // The watchdog ends inside the scope, before the reap.
+    let exited = std::thread::scope(|scope| {
+        let (done, wait) = mpsc::channel::<()>();
+        if timeout.is_some() || stop.is_some() {
+            let timed_out = &timed_out;
+            scope.spawn(move || watchdog(group, timeout, stop, &wait, timed_out));
+        }
+        let exited = wait_without_reaping(group);
         drop(done);
-        let _ = thread.join();
-    }
+        exited
+    });
     if let Some(cancel) = &cancel {
         let mut groups = cancel
             .0
@@ -215,8 +221,49 @@ pub fn wait_child(child: &mut Child, timeout: Option<Duration>) -> std::io::Resu
     })
 }
 
+/// Stop `group` (SIGTERM, then SIGKILL after [`GRACE`]) once `timeout`
+/// passes or `stop` returns true, unless `wait` disconnects first: the
+/// child exited.
+#[cfg(unix)]
+fn watchdog(
+    group: i32,
+    timeout: Option<Duration>,
+    stop: Option<&(dyn Fn() -> bool + Sync)>,
+    wait: &std::sync::mpsc::Receiver<()>,
+    timed_out: &AtomicBool,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    loop {
+        let mut next = if stop.is_some() {
+            WATCH_EVERY
+        } else {
+            Duration::MAX
+        };
+        if let Some(deadline) = deadline {
+            next = next.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        if !matches!(wait.recv_timeout(next), Err(RecvTimeoutError::Timeout)) {
+            return;
+        }
+        let late = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if late || stop.is_some_and(|stop| stop()) {
+            timed_out.store(late, Ordering::SeqCst);
+            signal_group(group, Signal::Term);
+            if let Err(RecvTimeoutError::Timeout) = wait.recv_timeout(GRACE) {
+                signal_group(group, Signal::Kill);
+            }
+            return;
+        }
+    }
+}
+
 #[cfg(not(unix))]
-pub fn wait_child(child: &mut Child, _timeout: Option<Duration>) -> std::io::Result<Ended> {
+pub fn wait_child_watched(
+    child: &mut Child,
+    _timeout: Option<Duration>,
+    _stop: Option<&(dyn Fn() -> bool + Sync)>,
+) -> std::io::Result<Ended> {
     child.wait().map(Ended::Exited)
 }
 

@@ -156,18 +156,22 @@ async fn refresh_once(state: &ServerState, repo_id: &RepoId) -> Result<()> {
     let _reading = lock.read.read().await;
     let fetched = {
         let _writing = lock.write.lock().await;
-        let (dir, repo_id) = (mirror_dir.clone(), repo_id.clone());
-        cancel::spawn_blocking(move || {
+        let (dir, repo) = (mirror_dir.clone(), repo_id.clone());
+        let refreshed = cancel::spawn_blocking(move || {
             git::refresh_mirror_refs(
                 &dir,
                 &provider,
-                &repo_id,
+                &repo,
                 credential.as_ref(),
                 default_branch.as_deref(),
             )
         })
         .await
-        .context("mirror refs task")??
+        .context("mirror refs task")?;
+        if let Err(error) = &refreshed {
+            super::purge::remove_mirror_over_limit(state, repo_id, error);
+        }
+        refreshed?
     };
     if fetched {
         publish(state, repo_id, Scope::All).await?;

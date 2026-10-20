@@ -108,6 +108,12 @@ fn h4_invalid_config_fails_before_side_effects() {
             "RIPCLONE_RETENTION_MAX_BYTES must be a non-negative integer",
         ),
         (
+            "bad mirror size",
+            "",
+            &[("RIPCLONE_MIRROR_MAX_BYTES", "1GB")],
+            "RIPCLONE_MIRROR_MAX_BYTES must be a non-negative integer",
+        ),
+        (
             "bad signed URL TTL",
             "",
             &[("RIPCLONE_SIGNED_URL_TTL_SECS", "-1")],
