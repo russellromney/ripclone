@@ -652,6 +652,32 @@ pub fn pack_objects_range_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     )
 }
 
+/// The ids of the objects `rev-list --objects tip ^exclude` lists: those of
+/// `tip`'s history that `exclude`'s does not hold, and maybe a few it does.
+pub fn rev_list_objects<P: AsRef<Path>>(repo: P, tip: &str, exclude: &str) -> Result<Vec<String>> {
+    for id in [tip, exclude] {
+        crate::validation::validate_object_id(id)?;
+    }
+    let exclude = format!("^{exclude}");
+    let listing = run_git(repo, &["rev-list", "--objects", tip, &exclude, "--"])?;
+    Ok(listing
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Pack `object_shas` into `<prefix>-<packhash>.pack` and `.idx`, deltified
+/// against each other and never against an object outside them.
+pub fn pack_objects_listed_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    object_shas: &[String],
+    prefix: Q,
+) -> Result<()> {
+    pack_objects_to_prefix_inner(repo, object_shas, prefix, &[])
+}
+
 /// Pack every object reachable from `tips` but not from any of `excluded`
 /// into `<prefix>-<checksum>.pack` and its `.idx`. Both are object ids, so
 /// tag objects come along.

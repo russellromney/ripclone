@@ -24,6 +24,8 @@ pub(super) enum UrlSlot {
     Branches,
     SidePack(usize),
     SideIdx(usize),
+    OwnPack(usize),
+    OwnIdx(usize),
 }
 
 impl UrlSlot {
@@ -51,6 +53,12 @@ impl UrlSlot {
             Self::SideIdx(index) => (info.branches.as_ref()?.side_packs.get(index)?)
                 .idx_url
                 .clone(),
+            Self::OwnPack(index) => (info.own_history.as_ref()?.packs.get(index)?)
+                .pack_url
+                .clone(),
+            Self::OwnIdx(index) => (info.own_history.as_ref()?.packs.get(index)?)
+                .idx_url
+                .clone(),
         }
     }
 
@@ -68,6 +76,8 @@ impl UrlSlot {
             Self::Branches => "branches".to_string(),
             Self::SidePack(index) => format!("side pack {index}"),
             Self::SideIdx(index) => format!("side pack idx {index}"),
+            Self::OwnPack(index) => format!("own history pack {index}"),
+            Self::OwnIdx(index) => format!("own history pack idx {index}"),
         }
     }
 }

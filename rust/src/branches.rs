@@ -21,7 +21,8 @@ pub struct BranchesRef {
     pub side_packs: Vec<SidePackRef>,
 }
 
-/// A side pack layer and its idx, with signed URLs when the backend signs.
+/// A side pack layer, or own history pack, and its idx, with signed URLs
+/// when the backend signs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidePackRef {
     pub pack: String,
@@ -30,6 +31,14 @@ pub struct SidePackRef {
     pub idx: String,
     pub idx_len: u64,
     pub idx_url: Option<String>,
+}
+
+/// A Full's own history beyond its refs base's (`crate::OwnHistory`): its
+/// packs, and the indices of the manifest's Head packs a clone installs too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnHistoryRef {
+    pub packs: Vec<SidePackRef>,
+    pub head_packs: Vec<usize>,
 }
 
 /// The hash of a ref listing: the default branch, then every branch and

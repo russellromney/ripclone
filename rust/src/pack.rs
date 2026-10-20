@@ -149,6 +149,28 @@ impl<'a> PackBuilder<'a> {
         self.build_history_range(commit, sealed_tip)
     }
 
+    /// Pack `commit`'s own history against `base`: the objects of `commit
+    /// ^base` but those in `have`, in one deltified pack. None when nothing
+    /// is left.
+    pub fn build_own_history(
+        &self,
+        commit: &str,
+        base: &str,
+        have: &HashSet<String>,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        crate::cancel::Cancel::check_current()?;
+        let own: Vec<String> = git::rev_list_objects(&self.repo, commit, base)?
+            .into_iter()
+            .filter(|id| !have.contains(id))
+            .collect();
+        if own.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tmp = tempfile::TempDir::new()?;
+        git::pack_objects_listed_to_prefix(&self.repo, &own, tmp.path().join("pack"))?;
+        self.store_packs_from_dir(tmp.path())
+    }
+
     /// Pack the objects of `(exclude, tip]` with git's own walk and delta
     /// reuse (see `git::pack_objects_range_to_prefix`) and store the pack.
     /// `tip`'s whole history is the pack the mirror's first fetch wrote, when

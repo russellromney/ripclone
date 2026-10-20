@@ -150,6 +150,13 @@ place of its own commit's, and writes the working tree from its own
 commit's Head packs. While the newest tip has no ready Full, `tags_artifact`,
 `branches` and `refs_base` are those of the last refresh whose tip has one.
 
+With `refs_base` comes `own_history` when the server packed the commit's own
+history against a base that `refs_base`'s history holds: `packs`, layers as in
+`side_packs`, with the objects the commit reaches beyond that base and its
+Head packs, and `head_packs`, the indices in the manifest of the Head packs
+a clone keeps as history next to them. A clone whose commit is in no ref's
+history installs those in place of its own Full's history packs.
+
 **Pending.** The output is not built yet:
 
 ```
