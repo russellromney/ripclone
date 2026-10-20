@@ -90,6 +90,8 @@ pub mod fsutil;
 pub mod git;
 #[doc(hidden)]
 pub mod gix_util;
+/// Upstream ref reads over HTTP: one `ls-refs` request on a kept-alive connection.
+pub(crate) mod ls_refs;
 pub mod manifest;
 #[doc(hidden)]
 #[doc(hidden)]

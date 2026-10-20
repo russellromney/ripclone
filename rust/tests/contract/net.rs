@@ -85,8 +85,10 @@ struct GitState {
     /// Fetches of these repos wait on `repo_gate`.
     held_repos: Mutex<Vec<String>>,
     repo_gate: Gate,
-    /// Ref advertisements (`GET .../info/refs`) wait on this.
+    /// Ref listings (`GET .../info/refs`, or a v2 `ls-refs` POST) wait on this.
     listing_gate: Gate,
+    /// Speak only protocol v0, as a server that ignores `Git-Protocol`.
+    v0_only: AtomicBool,
 }
 
 /// One request the origin received.
@@ -131,6 +133,7 @@ impl GitHttp {
             held_repos: Mutex::new(Vec::new()),
             repo_gate: Gate::new(),
             listing_gate: Gate::new(),
+            v0_only: AtomicBool::new(false),
         });
         let router = Router::new()
             .fallback(git_backend)
@@ -173,10 +176,17 @@ impl GitHttp {
         self.state.gate.open.send_replace(true);
     }
 
-    /// Park ref advertisements, the first request of every `ls-remote` and
-    /// fetch, until [`GitHttp::release_listings`].
+    /// Park ref listings until [`GitHttp::release_listings`]: the ref
+    /// advertisement that starts every `git ls-remote` and fetch, and the
+    /// single `ls-refs` request of an upstream read over HTTP.
     pub fn hold_listings(&self) {
         self.state.listing_gate.open.send_replace(false);
+    }
+
+    /// Ignore the `Git-Protocol` header from now on, so every request is
+    /// served as protocol v0.
+    pub fn speak_v0_only(&self) {
+        self.state.v0_only.store(true, Ordering::SeqCst);
     }
 
     pub fn release_listings(&self) {
@@ -273,7 +283,11 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
     if !allowed {
         return plain(StatusCode::FORBIDDEN, "missing required header".into());
     }
-    if parts.method == Method::GET && path.ends_with("/info/refs") {
+    let is_listing = (parts.method == Method::GET && path.ends_with("/info/refs"))
+        || (parts.method == Method::POST
+            && path.ends_with("/git-upload-pack")
+            && contains(&body, b"command=ls-refs"));
+    if is_listing {
         state.listing_gate.pass().await;
     }
     if is_fetch {
@@ -307,6 +321,9 @@ async fn git_backend(State(state): State<Arc<GitState>>, req: Request) -> Respon
         ("HTTP_CONTENT_ENCODING", header::CONTENT_ENCODING.as_str()),
         ("HTTP_GIT_PROTOCOL", "git-protocol"),
     ] {
+        if cgi == "HTTP_GIT_PROTOCOL" && state.v0_only.load(Ordering::SeqCst) {
+            continue;
+        }
         if let Some(value) = parts.headers.get(name).and_then(|v| v.to_str().ok()) {
             cmd.env(cgi, value);
         }

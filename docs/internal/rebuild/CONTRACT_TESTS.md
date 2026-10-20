@@ -209,6 +209,7 @@ Ripclone token reaches the origin.
 | I14 | Stderr on a pseudo-terminal: a clone held mid-download draws one line with its phase, bytes of the total and percent, blanks it with spaces (no escape codes) before stdout reports the install. A top-up held at the origin shows `fetching <sha> from upstream (1s)`, with no byte figures. `add --wait` with the build held shows each output's state, every line narrower than the 60-column terminal. `--progress` draws the line on a pipe; with `--quiet` it is rejected. | — |
 | I15 | Poller, with the upstream's `HEAD` detached so its listing names no default branch: a pushed branch still reaches a full clone, whose `origin/HEAD` stays on `main`, and while nothing changes the poller lists again and again without refreshing. | |
 | I16 | `--verify-upstream=always` walks the clone from its commit: a proxy answering a full clone with the Head called a Full gives a clone without the tip's parent and no shallow file, which `always` fails and removes; `auto` keeps it. | |
+| I17 | An upstream read over HTTP is one protocol v2 `ls-refs` POST, for the server's resolve and the CLI's `--verify-upstream`; an upstream that speaks only v0 gets `git ls-remote` and the same clone. | — |
 
 ### J. Builds start from the newest ready ancestor (7)
 

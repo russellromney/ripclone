@@ -42,7 +42,7 @@ hmac = "0.13"
 libc = "0.2.186"
 prost = "0.14"
 rayon = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 s3 = { version = "0.1.36", default-features = false, features = ["async", "rustls", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

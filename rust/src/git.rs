@@ -871,6 +871,10 @@ pub fn origin_base() -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
+/// The most the `ls-refs` request before `git ls-remote` may take. Its answer
+/// is a few lines, so a slower one is a stalled connection.
+const LS_REFS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `RIPCLONE_LS_REMOTE_TIMEOUT_SECS`, default 30 s.
 pub fn ls_remote_timeout() -> Result<Duration> {
     crate::env::number("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", 30).map(Duration::from_secs)
@@ -1064,11 +1068,33 @@ pub async fn ls_remote_tip_async(
         credential,
         origin_base().as_deref(),
         ls_remote_timeout()?,
+        true,
     )
     .await
 }
 
-/// [`ls_remote_tip_async`] with the origin base and timeout given.
+/// [`ls_remote_commit_async`] with `git ls-remote` alone, so the caller's git
+/// config and credentials answer: `ripclone provider test` checks those.
+pub async fn git_ls_remote_commit_async(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+) -> Result<Option<String>> {
+    let tip = ls_remote_tip_async_with(
+        provider,
+        repo_id,
+        ref_name,
+        None,
+        origin_base().as_deref(),
+        ls_remote_timeout()?,
+        false,
+    )
+    .await?;
+    Ok(tip.map(|tip| tip.commit))
+}
+
+/// [`ls_remote_tip_async`] with the origin base and timeout given. With
+/// `ls_refs`, one `ls-refs` request over HTTP comes first.
 async fn ls_remote_tip_async_with(
     provider: &ProviderInstance,
     repo_id: &RepoId,
@@ -1076,13 +1102,25 @@ async fn ls_remote_tip_async_with(
     credential: Option<&secrecy::SecretString>,
     origin_base: Option<&str>,
     timeout: Duration,
+    ls_refs: bool,
 ) -> Result<Option<RemoteTip>> {
     let (url, git_args, auth_header, candidates) =
         prepare_ls_remote(provider, repo_id, ref_name, credential, origin_base)?;
     if url.is_empty() {
         return Ok(None);
     }
-    let stdout = run_ls_remote(&url, &git_args, auth_header, &candidates, timeout).await?;
+    // One request on a kept-alive connection first; `git ls-remote` gets the
+    // rest of the time when that gives no answer.
+    let started = std::time::Instant::now();
+    let ls_refs_timeout = timeout.min(LS_REFS_TIMEOUT);
+    if ls_refs
+        && let Some(lines) =
+            crate::ls_refs::ls_refs(&url, auth_header.as_ref(), &candidates, ls_refs_timeout).await
+    {
+        return parse_ls_remote_output(&lines, &candidates);
+    }
+    let git_timeout = timeout.saturating_sub(started.elapsed());
+    let stdout = run_ls_remote(&url, &git_args, auth_header, &candidates, git_timeout).await?;
     parse_ls_remote_output(&stdout, &candidates)
 }
 
@@ -2065,6 +2103,7 @@ mod tests {
             None,
             Some(base.path().to_str().unwrap()),
             Duration::from_secs(30),
+            true,
         )
         .await
         .unwrap();
@@ -2117,6 +2156,7 @@ mod tests {
                     None,
                     Some(&base),
                     Duration::from_secs(30),
+                    true,
                 )
                 .await
                 .unwrap()
@@ -2173,6 +2213,7 @@ mod tests {
             None,
             Some(&format!("http://{addr}")),
             Duration::from_secs(1),
+            false,
         )
         .await;
 
