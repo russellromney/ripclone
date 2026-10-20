@@ -734,30 +734,13 @@ async fn build_full(
         // Full builds on the history levels of its base. A repo's Fulls are
         // claimed in admission order, so an earlier push's Full has settled.
         let start = Instant::now();
-        let levels = ancestor_base(state, claim, ExactResultKind::Full, &mirror_dir)
-            .await?
-            .as_ref()
-            .and_then(|row| row.full.ready())
-            .map(|full| full.history_levels.clone())
+        let base = ancestor_base(state, claim, ExactResultKind::Full, &mirror_dir).await?;
+        let base = base.and_then(|row| Some((row.full.ready()?.clone(), row.commit)));
+        let levels = (base.as_ref())
+            .map(|(full, _)| full.history_levels.clone())
             .unwrap_or_default();
         phases.record("base", start);
-        // Against the older published base, which the newer one holds: own
-        // history built on it serves a clone given either.
-        let refs_base = match state.control.get_refs(&claim.repo).await {
-            Ok(refs) => refs.and_then(|refs| {
-                let base = |branches: Option<crate::control::RepoBranches>| {
-                    branches.and_then(|branches| branches.base)
-                };
-                base(refs.ready).or(base(refs.branches))
-            }),
-            Err(error) => {
-                warn!(
-                    "read refs of {} for its Full: {error:#}",
-                    claim.repo.storage_key()
-                );
-                None
-            }
-        };
+        let own_base = own_history_base(state, claim, base.map(|(_, commit)| commit)).await;
         Cancel::check_current()?;
         build_full_result(
             &cas,
@@ -766,7 +749,7 @@ async fn build_full(
             &claim.build.commit,
             &head,
             levels,
-            refs_base,
+            own_base,
             &state.storage,
             &mut phases,
         )
@@ -793,6 +776,38 @@ async fn build_full(
     phases.report("full", &claim.repo, &claim.build.commit, ready, started);
     settle(state, settings, claim, built, pins).await;
     compact_mirror(&claim.repo, &mirror_dir, &lock).await;
+}
+
+/// The commit a Full's own history leaves out. It is the older published
+/// refs base, which the newer one holds, so a clone given either can use
+/// it. Before the first publish it is `built_on`, the commit whose Full it
+/// builds on, which a later base holds unless its branch was force-pushed.
+/// None for a commit first admitted on the default branch: a clone of it
+/// gets its history from the base's.
+async fn own_history_base(
+    state: &ServerState,
+    claim: &Claim,
+    built_on: Option<String>,
+) -> Option<String> {
+    let refs = match state.control.get_refs(&claim.repo).await {
+        Ok(refs) => refs.unwrap_or_default(),
+        Err(error) => {
+            warn!(
+                "read refs of {} for its Full: {error:#}",
+                claim.repo.storage_key()
+            );
+            return None;
+        }
+    };
+    let default = (refs.branches.iter().chain(&refs.ready))
+        .find_map(|branches| branches.default_branch.as_deref());
+    if let Some(default) = default
+        && claim.build.ref_name.as_deref() == Some(&format!("refs/heads/{default}"))
+    {
+        return None;
+    }
+    let base = |branches: Option<crate::control::RepoBranches>| branches.and_then(|b| b.base);
+    base(refs.ready).or(base(refs.branches)).or(built_on)
 }
 
 /// The Head result Files and Full build on.

@@ -2272,11 +2272,26 @@ fn history_packs(server: &Server, repo: &str, commit: &str) -> std::collections:
 /// history the server packed against the base its Full was built with:
 /// none of the commit's Full history packs, while the tip's still download.
 /// No upstream fetch, every ref and its own history, each artifact once.
+/// Main's own Full packs no own history.
 #[test]
 fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
+    orphan_clone("g27", false);
+}
+
+/// G29: as G27 for a pull request built before the repository's first refs
+/// publish (its refresh fails until then): its own history is packed
+/// against the commit its Full built on.
+#[test]
+fn g29_a_pull_request_built_before_the_first_refs_has_its_own_history() {
+    orphan_clone("g29", true);
+}
+
+fn orphan_clone(name: &str, before_refs: bool) {
     let world = World::new();
     let http = world.serve_origins_over_http();
-    let origin = world.origin("acme", "g27");
+    let origin = world.origin("acme", name);
+    let repo = format!("acme/{name}");
+    let repo = repo.as_str();
     let (work, bare) = (&origin.work, origin.bare.to_str().unwrap());
     let noise = crate::downloads::noise(27, 256 << 10);
     std::fs::write(work.join("big.bin"), &noise).unwrap();
@@ -2285,8 +2300,22 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     origin.publish();
     git(work, &["push", "-q", bare, "--tags"]);
     let secret = "g27-secret";
-    let server = world.server(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", secret)]);
-    world.cli(&server, &["add", "acme/g27", "--wait"]).ok();
+    // Fails a refs refresh's fetch until `refresh-ok` is marked.
+    let wrapper = GitWrapper::new(
+        &world,
+        "server",
+        r#"case " $* " in *" fetch --atomic --prune "*)
+            if [ ! -e "$MARKS/refresh-ok" ]; then echo "fatal: no refresh yet" >&2; exit 1; fi ;;
+        esac"#,
+    );
+    if !before_refs {
+        wrapper.mark("refresh-ok");
+    }
+    let server = world.server(&[
+        ("RIPCLONE_WEBHOOK_SECRET_GITHUB", secret),
+        ("PATH", &wrapper.path),
+    ]);
+    world.cli(&server, &["add", repo, "--wait"]).ok();
     // A pull request's commit X off A, built from a branch since deleted.
     // Two commits, so X's own history holds X1 beyond its Head level.
     git(work, &["checkout", "-q", "-b", "pr", &a]);
@@ -2294,21 +2323,25 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     let x = origin.commit(&[("x.txt", "x\n")], "X");
     git(work, &["checkout", "-q", "main"]);
     origin.publish_branch("pr");
-    world.cli(&server, &["sync", "acme/g27", "--at", &x]).ok();
+    world.cli(&server, &["sync", repo, "--at", &x]).ok();
     git(work, &["push", "-q", bare, ":refs/heads/pr"]);
+    let full = |commit: &str| {
+        let (_, body) = api::read_commit(&server, repo, commit, Some("full"));
+        body
+    };
+    if before_refs {
+        assert!(full(&x)["branches"].is_null(), "{}", full(&x));
+        wrapper.mark("refresh-ok");
+    }
     // Main moves on to C; its Full builds on A's too.
     let c = origin.commit(&[("c.txt", "c\n")], "C");
     origin.publish();
-    github_push(&server, secret, "acme/g27", "refs/heads/main", &c);
-    world.cli(&server, &["sync", "acme/g27", "--wait"]).ok();
-    let full = |commit: &str| {
-        let (_, body) = api::read_commit(&server, "acme/g27", commit, Some("full"));
-        body
-    };
+    github_push(&server, secret, repo, "refs/heads/main", &c);
+    world.cli(&server, &["sync", repo, "--wait"]).ok();
     wait_for("the refs at C", || {
         (full(&x)["refs_base"]["commit"] == c.as_str()).then_some(())
     });
-    let history = |commit: &str| history_packs(&server, "acme/g27", commit);
+    let history = |commit: &str| history_packs(&server, repo, commit);
     let shared: Vec<String> = (history(&x).intersection(&history(&c))).cloned().collect();
     assert!(
         !shared.is_empty(),
@@ -2360,7 +2393,7 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     let target = world.target("pr");
     let cli = world.cli_spawn(
         &proxy,
-        &["clone", "acme/g27", target.to_str().unwrap(), "--at", &x],
+        &["clone", repo, target.to_str().unwrap(), "--at", &x],
     );
     proxy.wait_held(1);
     proxy.wait_seen("a GET of X's own history while C's is held", |seen| {
@@ -2380,6 +2413,23 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
             .any(|get| x_only.iter().any(|pack| get.path.ends_with(pack.as_str()))),
         "the clone downloaded X's Full history"
     );
+    // X's Full packed its own history. C's, on main, packed none once the
+    // refs named main the default branch, which C's push may beat to the
+    // first publish.
+    let phases = |commit: &str| {
+        let line = format!(
+            "build-phases kind=full repo=github/acme%2F{name} commit={}",
+            &commit[..7]
+        );
+        (server.log().lines())
+            .find(|l| l.contains(&line) && l.contains("outcome=ready"))
+            .unwrap_or_else(|| panic!("no {line}"))
+            .to_string()
+    };
+    assert!(phases(&x).contains(" own_history_ms="), "{}", phases(&x));
+    if !before_refs {
+        assert!(!phases(&c).contains(" own_history_ms="), "{}", phases(&c));
+    }
     assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
     assert_eq!(
         http.fetches(),

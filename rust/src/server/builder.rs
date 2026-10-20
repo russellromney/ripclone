@@ -923,9 +923,8 @@ fn manifest_pack_tuples(manifest: &ClonepackManifest) -> Result<Vec<(String, u64
 /// [`PackBuilder::rebase_head_packs`]). Full uses the rebased packs and
 /// records them as `head_base`, so later Heads add levels on it. The published Head result never changes. A cold history build packs
 /// the whole history as level 0: on the first Full, and when the tail from
-/// the sealed tip cannot be listed. With `refs_base`, the published refs'
-/// base, it also packs the commit's own history against it (see
-/// [`own_history`]).
+/// the sealed tip cannot be listed. With `own_base`, it also packs the
+/// commit's own history against that commit (see [`own_history`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_full_result(
     cas: &Cas,
@@ -934,7 +933,7 @@ pub(super) async fn build_full_result(
     commit: &str,
     head: &crate::HeadResult,
     mut previous_levels: Vec<crate::HistoryLevel>,
-    refs_base: Option<String>,
+    own_base: Option<String>,
     storage: &crate::storage::StorageRef,
     phases: &mut BuildPhases,
 ) -> Result<crate::FullResult> {
@@ -1077,7 +1076,7 @@ pub(super) async fn build_full_result(
         phases.record("head_rebase", start);
     }
 
-    let own_history = match refs_base.filter(|base| base != commit) {
+    let own_history = match own_base.filter(|base| base != commit) {
         None => None,
         Some(base) => {
             let start = Instant::now();
