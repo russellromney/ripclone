@@ -170,7 +170,7 @@ impl Client {
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
-        let mut pin = self.resolve(request).await?;
+        let (mut pin, first) = self.resolve(request).await?;
         // A full clone never waits on the server: while Full(B) builds, it
         // installs the newest ready Full and fetches the rest upstream. A
         // files clone takes B's working tree from Head(B) while Files(B)
@@ -184,7 +184,7 @@ impl Client {
                 ExactResultKind::Head => Fallback::None,
             }
         };
-        let (plan, cold) = self.plan(repo_path, &pin, request.kind, fallback).await?;
+        let (plan, cold) = (self.plan(repo_path, &pin, request.kind, fallback, first)).await?;
         bench.mark_resolve();
         let output = plan.output();
         info!(
@@ -250,8 +250,9 @@ impl Client {
     }
 
     /// Resolve the selector once with `POST .../builds`. `--at` names the
-    /// commit; an explicit `--branch` then names the checkout.
-    async fn resolve(&self, request: &CloneRequest<'_>) -> Result<Pin> {
+    /// commit; an explicit `--branch` then names the checkout. The answer
+    /// also carries the requested output's first state.
+    async fn resolve(&self, request: &CloneRequest<'_>) -> Result<(Pin, Option<CommitOutput>)> {
         let (selector, checkout_override) = match request.at {
             Some(at) => (at, (request.branch != "HEAD").then_some(request.branch)),
             None => (request.branch, None),
@@ -260,15 +261,15 @@ impl Client {
             crate::validation::validate_checkout_name(name)
                 .with_context(|| format!("invalid checkout branch {name}"))?;
         }
-        let (summary, clone_id) = self
-            .request_build(request.repo_path, selector, false)
+        let (summary, clone_id, first) = self
+            .request_build(request.repo_path, selector, false, Some(request.kind))
             .await?;
         let checkout = checkout_override
             .map(str::to_string)
             .or(summary.checkout_name)
             .unwrap_or_default();
         let tracks = checkout_override.is_none() && !checkout.is_empty();
-        Ok(Pin {
+        let pin = Pin {
             commit: summary.commit,
             checkout,
             tracks,
@@ -276,10 +277,12 @@ impl Client {
             tag: summary.tag,
             single_branch: request.single_branch || request.kind == ExactResultKind::Head,
             clone_id,
-        })
+        };
+        Ok((pin, first))
     }
 
-    /// Poll the pinned commit's `kind` output until it is ready or failed.
+    /// Poll the pinned commit's `kind` output until it is ready or failed,
+    /// starting from `first`, the state the build request answered with.
     /// While it is pending, `fallback` may take another ready output instead:
     /// the base a pending answer names, or the same commit's ready Head.
     /// Returns the plan and whether any poll saw it pending.
@@ -289,11 +292,16 @@ impl Client {
         pin: &Pin,
         kind: ExactResultKind,
         fallback: Fallback,
+        mut first: Option<CommitOutput>,
     ) -> Result<(Plan, bool)> {
         let target = &pin.commit;
         let (mut cold, started) = (false, std::time::Instant::now());
         for attempt in 0..MAX_POLLS {
-            match self.commit_output(repo_path, target, kind).await? {
+            let answer = match first.take() {
+                Some(answer) => answer,
+                None => self.commit_output(repo_path, target, kind).await?,
+            };
+            match answer {
                 CommitOutput::Ready(output) => {
                     validate_output(&output, target, kind, repo_path)?;
                     if let Some(base) = &output.refs_base {

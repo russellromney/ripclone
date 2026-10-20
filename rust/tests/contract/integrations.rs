@@ -552,6 +552,7 @@ fn i16_verify_upstream_always_walks_the_clone() {
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/i16", "--wait"]).ok();
     let proxy = FaultProxy::start(&server);
+    api::hide_admitted_output(&proxy);
     proxy.forward_as("kind=full", "kind=head");
     proxy.rewrite(api::COMMIT_READS, "\"kind\":\"head\"", "\"kind\":\"full\"");
 

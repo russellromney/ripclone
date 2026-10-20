@@ -53,7 +53,7 @@ a unit test or it is not needed.
 "Added" names the PR that added the row's test. Each row's test is named
 after the row (`a1_...`, `s3_c2_...`).
 
-### A. Resolve and admit (8)
+### A. Resolve and admit (9)
 
 | # | Test | Added |
 |---|---|---|
@@ -65,6 +65,7 @@ after the row (`a1_...`, `s3_c2_...`).
 | A6 | Table: repo not added (clone and sync), unknown ref, missing upstream repo. Each gives its own error code and no build. | #186 |
 | A7 | After `add`, the origin is deleted (`repo_not_found`, exit 5) or accepts and never answers (`RIPCLONE_LS_REMOTE_TIMEOUT_SECS=1`: `upstream_unavailable`, exit 6). Clone, sync and the API fail with no build; the built commit still clones by SHA. | #208 |
 | A8 | An upstream with no commits: `add` fails with `ref_not_found` (exit 5), `sync` and `clone` say the repo isn't added, and nothing builds or is installed. After the first push, `add` builds it and a clone is exact. | #234 |
+| A9 | `POST .../builds` with `kind` answers with that output's body, equal to the commit read, and its manifest and files table inline (each decodes to bytes of its hash). Ready clones of each shape (through a proxy) make no commit read and download no inline artifact. | |
 
 ### B. Coalescing (3)
 
@@ -131,7 +132,7 @@ Ripclone token reaches the origin.
 | F4 | One 503: retried, clone succeeds. | #188 |
 | F5 | Connection cut after N bytes: resumes with Range from the saved offset (proxy counts Range requests). | #188 |
 | F6 | Proxy without Range support: restarts only that artifact. | #188 |
-| F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs for the same B and completes, with `/v1/artifacts/` refused. | #191 (S3 job) |
+| F7 | S3 emulator: signed URL expires mid-download: the CLI refreshes URLs with a read of the same B and completes, with `/v1/artifacts/` refused. | #191 (S3 job) |
 | F8 | SIGINT during the download: exit 130, no target, staging directory, or marker left; the next clone succeeds. | #188 |
 | F9 | An artifact that answers 503 every time: exactly 3 attempts, then exit 6; no target, no staging. | #208 |
 | F10 | With 256 KiB parts, the 2 MiB history pack downloads as parallel ranges whose 206 answers tile it exactly once; one 503 retries only that range; the clone is exact. | |
@@ -169,7 +170,7 @@ Ripclone token reaches the origin.
 | G24 | A default-branch push publishes new branches and builds no side pack (the server's `pack-objects` of it is counted). A side-branch push adds a layer of only its new objects, and each new annotated tag a layer of its tag object, up to eight; the next change builds the side pack whole as one layer, and so does a force-push of the default branch that leaves a tag on its old commit. Every full clone, one of eight layers too, equals `git clone` from the server's refs. | |
 | G25 | Without the server's branches (stripped by a proxy) a full clone fetches the refs with the user's git: a full disk (a `git` wrapper) fails the clone and leaves nothing; an unreachable upstream warns and keeps the clone's own branch; a reachable one gives `git clone`'s refs. | |
 | G26 | When the first tip's Full fails (a server `git` wrapper fails its history pack), the Full of A carries no `refs_base`: an `--at v1` clone fetches the refs from the upstream and equals `git clone --branch v1`, `origin/main` at C. With no upstream either, it succeeds at A with the tags whose targets it holds, no `origin/side`, a warning, and `fsck` clean. | |
-| G27 | A pull-request commit X1–X on no ref, whose Full and the tip C's both build on A's Full: X's `own_history` holds exactly X1's commit and tree, and names X's Head level packs. The `--at X` clone asks for it while a pack only C's Full has is held, downloads none of X's Full history packs C's lacks, and each shared pack, own pack and manifest once (counted at a proxy), makes no upstream fetch, and has X's history, `git clone`'s remote refs and tags, `fsck` clean. | |
+| G27 | A pull-request commit X1–X on no ref, whose Full and the tip C's both build on A's Full: X's `own_history` holds exactly X1's commit and tree, and names X's Head level packs. The `--at X` clone asks for it while a pack only C's Full has is held, downloads none of X's Full history packs C's lacks, each shared pack and own pack once, and neither manifest, which come inline (counted at a proxy), makes no upstream fetch, and has X's history, `git clone`'s remote refs and tags, `fsck` clean. | |
 | G28 | After main is force-pushed from A to B off A0, a pull-request commit X built on A gets no `own_history` with `refs_base` B: the `--at X` clone asks for X's Full history packs B's lacks while B's are held, makes no upstream fetch, and has X checked out, `git clone`'s remote refs, `fsck` clean. | |
 
 ### H. Storage and server state (15)

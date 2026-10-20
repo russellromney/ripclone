@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::pins::PinSet;
 
@@ -447,6 +447,33 @@ impl Cas {
             }
         }
         Ok(len)
+    }
+
+    /// A local object of at most `max_len` bytes, checked against its hash,
+    /// or `None`. A read marks it used, at most once a day, so local cache
+    /// retention, which trims the oldest first, keeps objects still served.
+    pub fn get_small(&self, hash: &str, max_len: u64) -> Option<Vec<u8>> {
+        const USED: Duration = Duration::from_secs(24 * 60 * 60);
+        let path = self.object_path(hash).ok()?;
+        let file = std::fs::File::open(&path).ok()?;
+        let meta = file.metadata().ok()?;
+        if meta.len() > max_len {
+            return None;
+        }
+        let data = std::fs::read(&path).ok()?;
+        if hash_bytes_for_object_id(hash, &data).ok()? != hash {
+            return None;
+        }
+        let now = std::time::SystemTime::now();
+        if meta
+            .modified()
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            > Some(USED)
+        {
+            let _ = file.set_modified(now);
+        }
+        Some(data)
     }
 
     pub fn has(&self, hash: &str) -> bool {

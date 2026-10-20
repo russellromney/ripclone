@@ -147,13 +147,13 @@ fn f2_truncated_body_fails_without_retry() {
         gets.iter().all(|s| count(&s.path) == 1),
         "an artifact was fetched twice: {gets:#?}"
     );
-    // One read finds the commit ready; any further read is a URL refresh.
+    // The admission answers ready; any read is a URL refresh.
     let reads = proxy
         .seen()
         .into_iter()
         .filter(|s| api::is_commit_read(s, &tip))
         .count();
-    assert_eq!(reads, 1, "a short body must not refresh URLs");
+    assert_eq!(reads, 0, "a short body must not refresh URLs");
     assert_clean_failure(&world, &target);
 }
 
