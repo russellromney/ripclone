@@ -458,7 +458,6 @@ fn i7_verify_upstream_installs_a_force_push_during_the_clone() {
     world
         .cli(&server, &["add", "acme/i7-forced", "--wait"])
         .ok();
-    wait_first_refs(&server, "acme/i7-forced", &b);
     let upstream = GitHttp::start(world.path("origins"));
     let proxy = FaultProxy::start(&server);
     upstream.hold_listings();

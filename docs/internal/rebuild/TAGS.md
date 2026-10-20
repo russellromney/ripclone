@@ -564,7 +564,10 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   so the poller hashes its listing with the last published default branch
   and does not refresh on every pass (I15). Requests that arrive while a
   refresh runs fold into one more pass, which runs after a failed pass
-  too; the failure is logged (K7). The tags-only `fetch --stdin` and
+  too; the failure is logged (K7). A repo's first Full waits for the
+  refresh its Head starts, so a repo whose first build is done serves
+  every ref; a failed refresh leaves the Full ready, with a warning, for
+  the poller to refresh (K8). The tags-only `fetch --stdin` and
   `update-ref` steps and the fetch counter are gone.
 - **Refs the store cannot read** are left out of a ready response, as
   before the first refresh, with a warning in the server log; the clone

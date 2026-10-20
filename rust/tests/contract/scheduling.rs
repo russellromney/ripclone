@@ -375,7 +375,7 @@ fn k6_a_side_pack_build_holds_no_head() {
     let world = World::new();
     let origin = world.origin("acme", "k6");
     let (work, bare) = (&origin.work, origin.bare.to_str().unwrap());
-    let a = origin.commit(&[("a.txt", "a\n")], "A");
+    origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
     let wrapper = GitWrapper::new(
         &world,
@@ -388,7 +388,6 @@ fn k6_a_side_pack_build_holds_no_head() {
         ("PATH", &wrapper.path),
     ]);
     world.cli(&server, &["add", "acme/k6", "--wait"]).ok();
-    wait_first_refs(&server, "acme/k6", &a);
 
     git(work, &["checkout", "-q", "-b", "side"]);
     let s = origin.commit(&[("s.txt", "s\n")], "S");
@@ -493,6 +492,59 @@ fn k7_a_failed_refresh_runs_the_one_asked_for_meanwhile() {
     let out = world.cli_env(
         &server,
         &["clone", "acme/k7", full.to_str().unwrap()],
+        &[NO_UPSTREAM],
+    );
+    out.ok();
+    assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    assert!(
+        remote_refs(&full).contains(&format!("origin/side {s}")),
+        "{}",
+        remote_refs(&full)
+    );
+    assert_eq!(remote_refs(&full), git_clone_remotes(&origin.bare, &[]));
+}
+
+/// K8: a new repo's first Full waits for the first refs. While the first
+/// refresh's fetch is held, Head and Files are ready and Full is pending;
+/// once the fetch runs, Full is ready with the branches, and a full clone
+/// gets every branch from the server without the upstream.
+#[test]
+fn k8_the_first_full_waits_for_the_first_refs() {
+    let world = World::new();
+    let origin = world.origin("acme", "k8");
+    let work = &origin.work;
+    origin.commit(&[("a.txt", "a\n")], "A");
+    git(work, &["checkout", "-q", "-b", "side"]);
+    let s = origin.commit(&[("s.txt", "s\n")], "S");
+    origin.publish_branch("side");
+    git(work, &["checkout", "-q", "main"]);
+    let b = origin.commit(&[("b.txt", "b\n")], "B");
+    origin.publish();
+    let wrapper = GitWrapper::new(
+        &world,
+        "server",
+        r#"case " $* " in *" fetch --atomic --prune "*)
+            mark fetching; await_mark go ;;
+        esac"#,
+    );
+    let server = world.server(&[("PATH", &wrapper.path)]);
+    let (status, body) = api::add(&server, "acme/k8");
+    assert!((200..300).contains(&status), "{status} {body}");
+    wait_for("the first refresh's fetch", || {
+        wrapper.marked("fetching").then_some(())
+    });
+    wait_output(&server, "acme/k8", &b, "head", "ready");
+    wait_output(&server, "acme/k8", &b, "files", "ready");
+    server.wait_log("Full of github/acme%2Fk8 waits for the repo's first refs");
+    assert_eq!(output(&server, "acme/k8", &b, "full")["state"], "pending");
+
+    wrapper.mark("go");
+    wait_output(&server, "acme/k8", &b, "full", "ready");
+    assert!(api::branches_artifact(&server, "acme/k8", &b).is_some());
+    let full = world.target("full");
+    let out = world.cli_env(
+        &server,
+        &["clone", "acme/k8", full.to_str().unwrap()],
         &[NO_UPSTREAM],
     );
     out.ok();

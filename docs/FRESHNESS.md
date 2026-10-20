@@ -82,6 +82,10 @@ The server keeps the repository's refs and publishes them:
 
 - tags, when it fetches a commit, so tags pushed with a commit are there by
   the time the commit's Head is ready;
+- branches and tags, before a new repository's first Full is ready, so a
+  full clone of a repository that has finished being added gets every ref
+  from the server. If that refresh fails, the Full is ready anyway and the
+  next poll publishes them;
 - branches and tags, after any branch or tag push or delete webhook;
 - branches and tags, after a poll that sees the upstream's refs changed
   (every 5 minutes by default).

@@ -183,8 +183,6 @@ fn s3_h2_artifacts_live_in_bucket_and_survive_restart() {
     let env = s3.server_env(&s3.endpoint);
     let mut server = world.server(&env_refs(&env));
     world.cli(&server, &["add", "acme/h2", "--wait"]).ok();
-    // The refs publish uploads after the outputs are ready.
-    wait_first_refs(&server, "acme/h2", &tip);
 
     let objects = s3.objects();
     assert!(!objects.is_empty(), "the build put nothing in the bucket");
@@ -393,8 +391,6 @@ fn s3_h6_retention_trims_only_the_local_cache() {
     let env = s3.server_env(&s3.endpoint);
     let server = world.server(&env_refs(&env));
     world.cli(&server, &["add", "acme/h6", "--wait"]).ok();
-    // The refs publish uploads after the outputs are ready.
-    wait_first_refs(&server, "acme/h6", &a);
     let objects = s3.objects();
     let cached = server.storage_listing();
     assert!(!cached.is_empty(), "the build cached nothing locally");

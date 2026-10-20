@@ -91,6 +91,36 @@ pub(super) fn spawn_refresh(state: &ServerState, repo_id: &RepoId, why: &'static
     });
 }
 
+/// Return once the repo's branches are published: the first build's Full
+/// is ready only with the refs a full clone writes. A refresh that is
+/// running is waited for, since the one a first build's Head starts runs
+/// after its fetch; with none running, this refreshes.
+pub(super) async fn first_branches(state: &ServerState, repo_id: &RepoId) -> Result<()> {
+    let published = || async {
+        let refs = state.control.get_refs(repo_id).await?;
+        anyhow::Ok(refs.is_some_and(|refs| refs.branches.is_some()))
+    };
+    if published().await? {
+        return Ok(());
+    }
+    tracing::info!(
+        "Full of {} waits for the repo's first refs",
+        repo_id.storage_key()
+    );
+    let lock = repo_lock(state, repo_id).await;
+    let idle = lock.refresh.try_lock().is_ok();
+    if idle {
+        refresh(state, repo_id).await?;
+    }
+    drop(lock.refresh.lock().await);
+    anyhow::ensure!(
+        published().await?,
+        "the refs refresh of {} published no branches",
+        repo_id.storage_key()
+    );
+    Ok(())
+}
+
 /// Fetch upstream's branches and tags into the mirror, point its `HEAD` at
 /// upstream's default branch, and publish. A mirror with no fetch yet is
 /// left to its first build, which publishes and then refreshes.

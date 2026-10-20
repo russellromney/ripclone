@@ -135,7 +135,7 @@ does. The artifact can be newer than the output; it changes when tags are
 pushed, moved, or deleted (see [Freshness](FRESHNESS.md#branches-and-tags)).
 
 A Full output also carries `branches` once the repository's refs are
-published: `artifact` and `artifact_url`, the repository's branches and the
+published, which a new repository's first Full waits for: `artifact` and `artifact_url`, the repository's branches and the
 default branch's tip, and `side_packs`, a list of layers (`pack`,
 `pack_len`, `pack_url`, `idx`, `idx_len`, `idx_url`) that together hold the
 objects the other branches and tags reach that the default branch's history

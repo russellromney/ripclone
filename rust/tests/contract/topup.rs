@@ -54,10 +54,6 @@ impl TopUp {
         let repo = format!("gh:acme/{name}");
         let upstream = format!("{}/acme/{name}.git", http.url());
         world.cli(&server, &["add", &repo, "--wait"]).ok();
-        // The first build's refs refresh runs after it, and a restart would
-        // stop it: then no refs name the branches and every clone fetches
-        // them upstream.
-        wait_first_refs(&server, &repo, &a);
         server.restart_with(&[("RIPCLONE_FILES_SLOTS", "0"), ("RIPCLONE_FULL_SLOTS", "0")]);
         if held {
             http.hold_fetches_without("authorization", &user_auth);

@@ -112,7 +112,6 @@ fn i15_poller_with_no_upstream_default_branch_refreshes_once() {
         ("PATH", &wrapper.path),
     ]);
     world.cli(&server, &["add", "acme/i15", "--wait"]).ok();
-    wait_first_refs(&server, "acme/i15", &a);
 
     git(&origin.bare, &["update-ref", "--no-deref", "HEAD", &a]);
     let listed = git(&origin.bare, &["ls-remote", "--symref", ".", "HEAD"]);

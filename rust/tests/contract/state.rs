@@ -365,8 +365,6 @@ fn h13_purge_removes_only_what_no_other_repo_uses() {
     let server = world.server(&[("RIPCLONE_SIGNED_URL_TTL_SECS", "3")]);
     world.cli(&server, &["add", "acme/h13-fork", "--wait"]).ok();
     world.cli(&server, &["add", "acme/h13", "--wait"]).ok();
-    wait_first_refs(&server, "acme/h13-fork", &a);
-    wait_first_refs(&server, "acme/h13", &a);
     let b = origin.commit(&[("c.txt", "c\n")], "B");
     origin.publish();
     world.cli(&server, &["sync", "acme/h13", "--at", &b]).ok();
@@ -470,7 +468,6 @@ fn h15_unreadable_refs_leave_ready_builds_cloning() {
     );
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/h15", "--wait"]).ok();
-    wait_first_refs(&server, "acme/h15", &a);
 
     let db = world.path("server").join("control.db");
     tokio::runtime::Builder::new_current_thread()
