@@ -120,7 +120,10 @@ tree. In a Head, `idx_bundle_url` is one object with the idx files of the
 base packs, which every Head on that base shares. `pack_idx_urls` has the
 idx of each level pack and `null` for the base packs. A Head also has
 `midx_url` when it has a pre-built multi-pack-index. A
-Files output has `archive_chunk_urls` instead of `pack_chunk_urls`. Signed URLs last
+Files output has `archive_chunk_urls` instead of `pack_chunk_urls`. A Head,
+Full or Files output may also have `metadata_delta` and `metadata_delta_url`:
+then its files table is the metadata chunk, an earlier output's table, with
+that delta applied. Signed URLs last
 20 minutes. Read the commit again to get fresh ones.
 
 Head and Full outputs also carry `tags_artifact` and `tags_artifact_url`

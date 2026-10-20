@@ -941,19 +941,34 @@ impl Client {
         Ok(manifest)
     }
 
-    /// The metadata chunk of `urls`' output: index, frame and file tables.
+    /// The files table of `urls`' output: its metadata chunk, with its delta
+    /// applied when it has one. Both download at once.
     async fn fetch_metadata(&self, urls: &OutputUrls) -> Result<MetadataChunk> {
-        let hash = &urls.output().metadata_chunk;
+        let output = urls.output();
+        let base = self.fetch_table_part(urls, &output.metadata_chunk, UrlSlot::Metadata);
+        if output.metadata_delta.is_empty() {
+            return MetadataChunk::decode_and_validate(base.await?.as_ref());
+        }
+        let delta = self.fetch_table_part(urls, &output.metadata_delta, UrlSlot::MetadataDelta);
+        let (base, delta) = tokio::try_join!(base, delta)?;
+        let base = MetadataChunk::decode_and_validate(base.as_ref())?;
+        crate::clonepack::MetadataDelta::decode_stored(delta.as_ref())?.apply(&base)
+    }
+
+    async fn fetch_table_part(
+        &self,
+        urls: &OutputUrls,
+        hash: &str,
+        slot: UrlSlot,
+    ) -> Result<bytes::Bytes> {
         let artifact = Artifact {
-            hash: hash.clone(),
+            hash: hash.to_string(),
             len: None,
-            slot: UrlSlot::Metadata,
+            slot,
         };
-        let data = self
-            .download_bytes(urls, &artifact)
+        self.download_bytes(urls, &artifact)
             .await
-            .with_context(|| format!("fetch metadata chunk {hash}"))?;
-        MetadataChunk::decode_and_validate(data.as_ref())
+            .with_context(|| format!("fetch {} {hash}", slot.label()))
     }
 
     /// Download the archive chunks the manifest lists, a bounded number at a

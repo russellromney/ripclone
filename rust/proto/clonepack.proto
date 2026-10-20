@@ -21,8 +21,11 @@ message ClonepackManifest {
   reserved 3, 6, 7, 8;
 
   // Metadata chunk holds the file and frame tables needed to decode archive
-  // chunks.
+  // chunks. With `metadata_delta`, it is the base table the delta applies to.
   ChunkRef metadata_chunk = 4;
+
+  // A MetadataDelta on `metadata_chunk`, when the table is stored as one.
+  ChunkRef metadata_delta = 14;
 
   // Archive chunks contain working-tree zstd frames. They are shared across
   // commits and immutable.
@@ -90,6 +93,25 @@ message MetadataChunk {
   // Paths of submodule gitlinks (mode 160000). A clone creates each as an
   // empty directory, as `git clone` does for a submodule it does not init.
   repeated bytes gitlinks = 6;
+}
+
+// A metadata chunk as the changes from a base chunk, so a build whose table
+// is close to its base's stores only what changed. The table is the base's
+// entries, less `removed`, with `files` in place of the base's entries of
+// the same paths and after them, and with `frames` and `gitlinks`.
+message MetadataDelta {
+  // The table's frames, all of them.
+  repeated FrameInfo frames = 1;
+  // For each frame of the base, its index in `frames` plus one, or 0 when
+  // the table drops it. A base entry the delta keeps names its frames
+  // through this map.
+  repeated uint32 base_frames = 2;
+  // Entries the base lacks or holds otherwise.
+  repeated FileEntry files = 3;
+  // Paths of the base the table lacks.
+  repeated bytes removed = 4;
+  // The table's gitlinks, all of them.
+  repeated bytes gitlinks = 5;
 }
 
 // One zstd frame inside an archive chunk.

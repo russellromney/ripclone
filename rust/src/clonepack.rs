@@ -3,7 +3,8 @@ pub mod pb {
 }
 
 pub use pb::{
-    ChunkRef, ClonepackManifest, FileEntry, Fragment, FrameInfo, MetadataChunk, PackEntry,
+    ChunkRef, ClonepackManifest, FileEntry, Fragment, FrameInfo, MetadataChunk, MetadataDelta,
+    PackEntry,
 };
 
 use anyhow::{Context, Result};
@@ -36,9 +37,8 @@ pub fn hash_to_hex(bytes: &[u8]) -> String {
 /// omitted from its byte totals.
 pub fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&ChunkRef> {
     let mut refs = Vec::new();
-    if let Some(ref meta) = manifest.metadata_chunk {
-        refs.push(meta);
-    }
+    refs.extend(&manifest.metadata_chunk);
+    refs.extend(&manifest.metadata_delta);
     refs.extend(&manifest.archive_chunks);
     for pack in &manifest.packs {
         if let Some(ref pack_chunk) = pack.pack {

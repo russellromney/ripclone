@@ -327,6 +327,11 @@ pub struct RefResponse {
     pub metadata_chunk: String,
     #[serde(default)]
     pub metadata_chunk_url: Option<String>,
+    /// The delta on `metadata_chunk`, when the files table is stored as one.
+    #[serde(default)]
+    pub metadata_delta: String,
+    #[serde(default)]
+    pub metadata_delta_url: Option<String>,
     #[serde(default)]
     pub archive_chunk_urls: Option<Vec<Option<String>>>,
     /// Signed URL for each editable pack, ordered to match `manifest.packs`.

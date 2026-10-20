@@ -645,6 +645,8 @@ async fn head_output(
             commit,
             parent.clone(),
             base,
+            // Its files table is a delta on the base Head's.
+            base_head.map(|head| head.clonepack.clone()),
             &state.storage,
             phases,
         )

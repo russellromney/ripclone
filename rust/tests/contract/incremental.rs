@@ -581,3 +581,112 @@ fn j7_rebase_keeps_unchanged_base_packs() {
     assert_eq!(kept.len(), 1, "{on_d:?} on {base:?}");
     assert_eq!(on_d.len(), 2, "{on_d:?}");
 }
+
+/// J8: a push stores its files table as a delta on the base table of the
+/// ancestor's output, so it stores bytes for what changed, not for every
+/// file. Head and Files each do; Full shares its Head's table. The base
+/// stays the same while the delta is at most a quarter of it; past that,
+/// the output stores its whole table, the next push's base. The response
+/// and the manifest name the same table, and every clone shape is exact.
+#[test]
+fn j8_files_table_deltas() {
+    let world = World::new();
+    let origin = world.origin("acme", "j8");
+    let files: Vec<(String, String)> = (0..300)
+        .map(|i| (format!("src/m{i:03}.rs"), format!("// module {i}\n")))
+        .collect();
+    let write = |files: &[(String, String)], msg: &str| {
+        let files: Vec<(&str, &str)> = (files.iter())
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        origin.commit(&files, msg)
+    };
+    let a = write(&files, "A");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/j8", "--wait"]).ok();
+    wait_ready(&server, "acme/j8", &a);
+    let len = |hash: &str| {
+        let (status, bytes) = server.get_bytes(&format!("/v1/artifacts/{hash}"));
+        assert_eq!(status, 200, "artifact {hash}");
+        bytes.len()
+    };
+    // An output's (metadata chunk, metadata delta), the same in the
+    // response and the manifest.
+    let table = |commit: &str, kind: &str| {
+        let (status, body) = api::read_commit(&server, "acme/j8", commit, Some(kind));
+        assert_eq!(status, 200, "{kind}: {body}");
+        let field = |name: &str| body[name].as_str().unwrap_or_default().to_string();
+        let manifest = manifest(&server, "acme/j8", commit, kind);
+        let hex = |chunk: Option<ripclone::clonepack::ChunkRef>| {
+            chunk
+                .map(|chunk| hash_to_hex(&chunk.hash))
+                .unwrap_or_default()
+        };
+        let table = (field("metadata_chunk"), field("metadata_delta"));
+        assert_eq!(
+            (hex(manifest.metadata_chunk), hex(manifest.metadata_delta)),
+            table,
+            "{kind} of {commit}"
+        );
+        assert_eq!(
+            table.1.is_empty(),
+            body.get("metadata_delta_url").is_none() && body.get("metadata_delta").is_none(),
+            "{kind}: {body}"
+        );
+        table
+    };
+    let kinds = ["head", "files"];
+    let whole = kinds.map(|kind| table(&a, kind));
+    for (kind, (_, delta)) in kinds.iter().zip(&whole) {
+        assert!(delta.is_empty(), "a cold {kind} stores its whole table");
+    }
+    assert_eq!(table(&a, "full"), whole[0], "Full shares Head's table");
+
+    // An edit, a new file and a removed file, then another edit: each a
+    // small delta on A's table.
+    let on_a = |name: &str, tip: &str| {
+        origin.publish();
+        sync_one(&world, &server, "acme/j8", &[], tip);
+        for (kind, (base, _)) in kinds.iter().zip(&whole) {
+            let (chunk, delta) = table(tip, kind);
+            assert_eq!(&chunk, base, "{kind} of {name} is on A's table");
+            assert!(!delta.is_empty(), "{kind} of {name} stores a delta");
+            assert!(len(&delta) * 4 <= len(base), "{kind} of {name}");
+        }
+        assert_eq!(table(tip, "full"), table(tip, "head"), "{name}");
+        clones_exact(
+            &world,
+            &server,
+            &origin,
+            &format!("j8-{name}"),
+            &[],
+            tip,
+            "main",
+        );
+    };
+    std::fs::remove_file(origin.work.join("src/m007.rs")).unwrap();
+    let b = origin.commit(
+        &[("src/m001.rs", "// b\n"), ("src/new.rs", "// new\n")],
+        "B",
+    );
+    on_a("b", &b);
+    let c = origin.commit(&[("src/m002.rs", "// c\n")], "C");
+    on_a("c", &c);
+
+    // Every file rewritten: the delta would pass a quarter of the base, so
+    // the table is whole again.
+    let rewritten: Vec<(String, String)> = (files.iter())
+        .map(|(path, _)| (path.clone(), format!("// rewritten {path}\n")))
+        .collect();
+    let d = write(&rewritten, "D");
+    origin.publish();
+    sync_one(&world, &server, "acme/j8", &[], &d);
+    for (kind, (base, _)) in kinds.iter().zip(&whole) {
+        let (chunk, delta) = table(&d, kind);
+        assert!(delta.is_empty(), "{kind} of D stores its whole table");
+        assert_ne!(&chunk, base, "{kind} of D");
+    }
+    assert_eq!(table(&d, "full"), table(&d, "head"));
+    clones_exact(&world, &server, &origin, "j8-d", &[], &d, "main");
+}

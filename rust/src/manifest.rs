@@ -1,4 +1,4 @@
-pub use crate::clonepack::{FileEntry, FrameInfo, MetadataChunk};
+pub use crate::clonepack::{FileEntry, FrameInfo, MetadataChunk, MetadataDelta};
 
 use anyhow::{Context, Result};
 use prost::Message;
@@ -233,10 +233,280 @@ impl MetadataChunk {
     }
 }
 
+/// Where each frame of one table is in another: for each frame of `from`,
+/// its index in `to` plus one, or 0 when `to` lacks it. Frames are the same
+/// frame at the same offset of the same bundle; `from_bundles` and
+/// `to_bundles` are the bundle hashes the tables' chunk indexes name.
+pub fn frame_map(
+    from: &[FrameInfo],
+    from_bundles: &[String],
+    to: &[FrameInfo],
+    to_bundles: &[String],
+) -> Result<Vec<u32>> {
+    let bundle = |bundles: &[String], frame: &FrameInfo| -> Result<String> {
+        bundles
+            .get(frame.chunk_index as usize)
+            .cloned()
+            .with_context(|| format!("frame names missing bundle {}", frame.chunk_index))
+    };
+    let mut at = HashMap::with_capacity(to.len());
+    for (index, frame) in to.iter().enumerate() {
+        let slot = u32::try_from(index + 1).context("too many frames")?;
+        at.insert((bundle(to_bundles, frame)?, frame.chunk_offset), slot);
+    }
+    from.iter()
+        .map(|frame| {
+            Ok(at
+                .get(&(bundle(from_bundles, frame)?, frame.chunk_offset))
+                .copied()
+                .unwrap_or(0))
+        })
+        .collect()
+}
+
+/// The frame map of `first` then `second` (see [`frame_map`]).
+pub fn compose_frame_maps(first: &[u32], second: &[u32]) -> Result<Vec<u32>> {
+    first
+        .iter()
+        .map(|&slot| match slot {
+            0 => Ok(0),
+            slot => second
+                .get(slot as usize - 1)
+                .copied()
+                .context("frame map names a missing frame"),
+        })
+        .collect()
+}
+
+impl MetadataDelta {
+    /// The changes from `base` to `table`. `base_frames` is where each base
+    /// frame is in `table` (see [`frame_map`]).
+    pub fn between(
+        base: &MetadataChunk,
+        base_frames: Vec<u32>,
+        table: &MetadataChunk,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            base_frames.len() == base.frames.len(),
+            "frame map has {} frames, the base {}",
+            base_frames.len(),
+            base.frames.len()
+        );
+        let in_table: HashSet<&[u8]> = table.files.iter().map(|f| f.path.as_slice()).collect();
+        let base_files: HashMap<&[u8], &FileEntry> =
+            base.files.iter().map(|f| (f.path.as_slice(), f)).collect();
+        let kept = |entry: &FileEntry| {
+            base_files.get(entry.path.as_slice()).is_some_and(|old| {
+                old.mode == entry.mode
+                    && old.blob_sha1 == entry.blob_sha1
+                    && old.fragments.len() == entry.fragments.len()
+                    && old
+                        .fragments
+                        .iter()
+                        .zip(&entry.fragments)
+                        .all(|(old, new)| {
+                            base_frames.get(old.frame_index as usize)
+                                == Some(&(new.frame_index + 1))
+                                && old.frame_offset == new.frame_offset
+                                && old.raw_len == new.raw_len
+                        })
+            })
+        };
+        Ok(Self {
+            frames: table.frames.clone(),
+            files: table.files.iter().filter(|f| !kept(f)).cloned().collect(),
+            removed: (base.files.iter())
+                .filter(|f| !in_table.contains(f.path.as_slice()))
+                .map(|f| f.path.clone())
+                .collect(),
+            gitlinks: table.gitlinks.clone(),
+            base_frames,
+        })
+    }
+
+    /// The table this delta makes of `base`, validated.
+    pub fn apply(&self, base: &MetadataChunk) -> Result<MetadataChunk> {
+        anyhow::ensure!(
+            self.base_frames.len() == base.frames.len(),
+            "delta maps {} base frames, the base has {}",
+            self.base_frames.len(),
+            base.frames.len()
+        );
+        let changed: HashMap<&[u8], &FileEntry> =
+            self.files.iter().map(|f| (f.path.as_slice(), f)).collect();
+        let removed: HashSet<&[u8]> = self.removed.iter().map(Vec::as_slice).collect();
+        let (mut files, mut placed, mut removed_seen) =
+            (Vec::with_capacity(base.files.len()), HashSet::new(), 0);
+        for entry in &base.files {
+            let path = entry.path.as_slice();
+            if removed.contains(path) {
+                removed_seen += 1;
+            } else if let Some(&new) = changed.get(path) {
+                placed.insert(path);
+                files.push(new.clone());
+            } else {
+                let mut entry = entry.clone();
+                for fragment in &mut entry.fragments {
+                    let slot = (self.base_frames.get(fragment.frame_index as usize).copied())
+                        .context("base fragment names a missing frame")?;
+                    anyhow::ensure!(
+                        slot != 0,
+                        "{} keeps a frame the delta drops",
+                        String::from_utf8_lossy(path)
+                    );
+                    fragment.frame_index = slot - 1;
+                }
+                files.push(entry);
+            }
+        }
+        anyhow::ensure!(
+            removed_seen == removed.len(),
+            "delta removes a path its base lacks"
+        );
+        files.extend(
+            (self.files.iter())
+                .filter(|f| !placed.contains(f.path.as_slice()))
+                .cloned(),
+        );
+        let table = MetadataChunk {
+            frames: self.frames.clone(),
+            files,
+            gitlinks: self.gitlinks.clone(),
+        };
+        table.validate_geometry()?;
+        Ok(table)
+    }
+
+    /// The stored form: the protobuf, zstd-compressed.
+    pub fn encode_stored(&self) -> Result<Vec<u8>> {
+        zstd::encode_all(self.encode_to_vec().as_slice(), METADATA_ZSTD_LEVEL)
+            .context("compress metadata delta")
+    }
+
+    /// Decode the stored form.
+    pub fn decode_stored(bytes: &[u8]) -> Result<Self> {
+        let mut out = Vec::new();
+        zstd::stream::Decoder::new(bytes)
+            .context("open metadata delta")?
+            .take(MAX_METADATA_BYTES + 1)
+            .read_to_end(&mut out)
+            .context("decompress metadata delta")?;
+        anyhow::ensure!(
+            out.len() as u64 <= MAX_METADATA_BYTES,
+            "metadata delta is larger than {MAX_METADATA_BYTES} bytes"
+        );
+        Self::decode(out.as_slice()).context("decode metadata delta")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clonepack::Fragment;
+
+    fn frame(chunk_index: u32, chunk_offset: u64, compressed_len: u32) -> FrameInfo {
+        FrameInfo {
+            chunk_index,
+            chunk_offset,
+            compressed_len,
+            raw_len: 100,
+        }
+    }
+
+    fn file(path: &str, blob: u8, fragments: &[(u32, u32)]) -> FileEntry {
+        FileEntry {
+            path: path.as_bytes().to_vec(),
+            mode: 0o100644,
+            blob_sha1: vec![blob; 20],
+            fragments: (fragments.iter())
+                .map(|&(frame_index, frame_offset)| Fragment {
+                    frame_index,
+                    frame_offset,
+                    raw_len: 10,
+                })
+                .collect(),
+        }
+    }
+
+    /// A delta keeps the base entries whose frames the table keeps, renumbers
+    /// their frames, and carries every other change: an entry changed in
+    /// place, one moved off a dropped frame, one removed, one added.
+    #[test]
+    fn delta_rebuilds_the_table_from_its_base() {
+        let bundles = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let base = MetadataChunk {
+            frames: vec![frame(0, 0, 10), frame(0, 10, 10), frame(1, 0, 10)],
+            files: vec![
+                file("a", 1, &[(0, 0)]),
+                file("b", 2, &[(1, 0)]),
+                file("c", 3, &[(2, 0)]),
+                file("d", 4, &[(0, 10)]),
+            ],
+            gitlinks: vec![b"sub".to_vec()],
+        };
+        let table = MetadataChunk {
+            frames: vec![frame(0, 0, 10), frame(1, 0, 10)],
+            files: vec![
+                file("a", 5, &[(1, 0)]),
+                file("c", 3, &[(0, 0)]),
+                file("d", 4, &[(1, 10)]),
+                file("e", 6, &[(1, 20)]),
+            ],
+            gitlinks: vec![],
+        };
+        let map = frame_map(
+            &base.frames,
+            &bundles(&["A", "B"]),
+            &table.frames,
+            &bundles(&["B", "C"]),
+        )
+        .unwrap();
+        assert_eq!(map, [0, 0, 1]);
+        let delta = MetadataDelta::between(&base, map, &table).unwrap();
+        let paths = |files: &[FileEntry]| files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            paths(&delta.files),
+            [b"a".to_vec(), b"d".to_vec(), b"e".to_vec()]
+        );
+        assert_eq!(delta.removed, [b"b".to_vec()]);
+        let stored = delta.encode_stored().unwrap();
+        let delta = MetadataDelta::decode_stored(&stored).unwrap();
+        assert_eq!(delta.apply(&base).unwrap(), table);
+
+        // A kept entry on a frame the delta drops is an error, not a file
+        // read from the wrong bytes.
+        let mut wrong = delta.clone();
+        wrong.base_frames[2] = 0;
+        assert!(wrong.apply(&base).is_err());
+        let mut wrong = delta.clone();
+        wrong.removed.push(b"zz".to_vec());
+        assert!(wrong.apply(&base).is_err());
+        assert!(delta.apply(&table).is_err(), "applied to another base");
+    }
+
+    /// A Head table has no frames: the delta is its changed entries.
+    #[test]
+    fn delta_of_a_table_without_frames() {
+        let base = MetadataChunk {
+            frames: vec![],
+            files: vec![file("x", 1, &[]), file("y", 2, &[])],
+            gitlinks: vec![],
+        };
+        let table = MetadataChunk {
+            frames: vec![],
+            files: vec![file("x", 1, &[]), file("y", 3, &[]), file("z", 4, &[])],
+            gitlinks: vec![],
+        };
+        let delta = MetadataDelta::between(&base, vec![], &table).unwrap();
+        assert_eq!(delta.files.len(), 2);
+        assert_eq!(delta.apply(&base).unwrap(), table);
+    }
+
+    #[test]
+    fn frame_maps_compose() {
+        assert_eq!(compose_frame_maps(&[2, 0, 1], &[0, 3]).unwrap(), [3, 0, 0]);
+        assert!(compose_frame_maps(&[3], &[1]).is_err());
+    }
 
     #[test]
     fn manifest_roundtrip() {

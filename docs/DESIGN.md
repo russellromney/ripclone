@@ -13,7 +13,7 @@ ripclone moves that work to the server, ahead of time. By the time you clone, th
 On every push, ripclone mirrors the repo and builds a **clonepack** for `HEAD` so the clone is fast. A clonepack has three parts:
 
 - **Manifest.** A small file listing everything else. The client grabs this first to know what to fetch.
-- **Metadata chunk.** A table that says where each file lives, zstd-compressed. The client writes each file as its pack lands, then `git read-tree` writes `.git/index` from the installed packs, and each entry takes its file's stat data, as `git clone` leaves it.
+- **Metadata chunk.** A table that says where each file lives, zstd-compressed. A push usually stores only a delta on the table of the output it built on: the files it added, changed or removed. So a push stores bytes for its change, not for every file. When the delta would pass a quarter of that table, the push stores its whole table, the base for later pushes. The client writes each file as its pack lands, then `git read-tree` writes `.git/index` from the installed packs, and each entry takes its file's stat data, as `git clone` leaves it.
 - **Content.** The objects and file bytes themselves, built three ways (HEAD packs, history packs, archive) so each clone takes only what it needs.
 
 ### The three content artifacts

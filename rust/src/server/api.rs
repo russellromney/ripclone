@@ -158,6 +158,14 @@ pub struct RefResponse {
     /// Signed URL for the metadata chunk, if the backend supports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_chunk_url: Option<String>,
+    /// Hash of the delta on `metadata_chunk`; the files table is the chunk
+    /// with it applied. Absent when the chunk is the whole table.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub metadata_delta: String,
+    /// Signed URL for the metadata delta, if there is one and the backend
+    /// supports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_delta_url: Option<String>,
     /// Signed URL for each archive chunk. `None` entries fall back to the
     /// gateway's `/v1/artifacts/{hash}` endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -969,6 +977,8 @@ fn ref_response(
         clonepack_manifest_url: signed(&artifacts.manifest),
         metadata_chunk: artifacts.metadata_chunk.clone(),
         metadata_chunk_url: signed(&artifacts.metadata_chunk),
+        metadata_delta: artifacts.metadata_delta.clone(),
+        metadata_delta_url: signed(&artifacts.metadata_delta),
         archive_chunk_urls: signed_list(&archive_chunks),
         pack_chunk_urls: signed_list(&packs),
         pack_idx_urls: pack_idx_urls.filter(|urls| urls.iter().any(Option::is_some)),
@@ -1249,7 +1259,7 @@ pub(super) async fn admit_build(
 mod tests {
     use super::*;
     use crate::server::build_app;
-    use crate::server::builder::make_manifest;
+    use crate::server::builder::{chunk_ref, make_manifest};
     use crate::server::tests::{mark_added, request_with_auth, test_request, test_state};
     use crate::storage::StorageRef;
     use axum::Router;
@@ -1322,8 +1332,16 @@ mod tests {
             .cas
             .put(format!("metadata {commit}").as_bytes())
             .unwrap();
-        let manifest =
-            make_manifest(commit, &None, &[], &metadata, 15, Vec::new(), None, None).unwrap();
+        let manifest = make_manifest(
+            commit,
+            &None,
+            &[],
+            &(chunk_ref(&metadata, 15).unwrap(), None),
+            Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
         let manifest = state.cas.put(&manifest.encode_to_vec()).unwrap();
         let artifacts = |label: &str| crate::ClonepackArtifacts {
             manifest: manifest.clone(),
@@ -2023,8 +2041,16 @@ mod tests {
         let repo_id = RepoId::github("acme/status-results");
         let commit = "a".repeat(40);
         let metadata = state.cas.put(b"status metadata").unwrap();
-        let manifest =
-            make_manifest(&commit, &None, &[], &metadata, 15, Vec::new(), None, None).unwrap();
+        let manifest = make_manifest(
+            &commit,
+            &None,
+            &[],
+            &(chunk_ref(&metadata, 15).unwrap(), None),
+            Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
         let manifest = state.cas.put(&manifest.encode_to_vec()).unwrap();
         let mut head_artifacts = ready_artifacts(&commit, "status-head");
         head_artifacts.manifest = manifest.clone();
