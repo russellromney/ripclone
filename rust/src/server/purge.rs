@@ -84,6 +84,37 @@ pub(super) async fn remove_orphan_mirrors(state: &ServerState) -> Result<()> {
     Ok(())
 }
 
+/// When `error` says a fetch left `repo`'s mirror over its size limit,
+/// remove the mirror in the background once no build reads or fetches it.
+/// A later build starts it again, and its fetch is stopped at the limit.
+pub(super) fn remove_mirror_over_limit(state: &ServerState, repo: &RepoId, error: &anyhow::Error) {
+    let left_over = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::git::MirrorOverLimit>()
+            .is_some_and(|over| over.remove)
+    });
+    if !left_over {
+        return;
+    }
+    let (state, repo) = (state.clone(), repo.clone());
+    tokio::spawn(async move {
+        let lock = repo_lock(&state, &repo).await;
+        let _read = lock.read.write().await;
+        let _write = lock.write.lock().await;
+        let dir = state.repo_root.join(repo.mirror_dir_name());
+        match remove_dir(dir).await {
+            Ok(()) => warn!(
+                repo = %repo.storage_key(),
+                "removed the mirror: it was over its size limit"
+            ),
+            Err(error) => warn!(
+                "remove the over-limit mirror of {}: {error:#}",
+                repo.storage_key()
+            ),
+        }
+    });
+}
+
 async fn remove_dir(dir: std::path::PathBuf) -> Result<()> {
     tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {

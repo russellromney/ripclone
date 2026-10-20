@@ -1,6 +1,6 @@
 //! K. Scheduling: one repo's slow upstream never holds another repo, a
-//! stalled fetch ends, a repo's Fulls publish in admission order, and
-//! owners take turns.
+//! stalled fetch ends, a repo's Fulls publish in admission order, owners
+//! take turns, and a mirror stays within its size limit.
 
 use crate::harness::*;
 use std::time::{Duration, Instant};
@@ -624,4 +624,87 @@ fn k9_owners_take_turns_for_build_slots() {
             .ok();
         assert_eq!(git(&target, &["rev-parse", "HEAD"]), *tip);
     }
+}
+
+/// Bytes under `dir`; 0 when it is gone.
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => dir_bytes(&entry.path()),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// K10: a repo whose mirror would pass `RIPCLONE_MIRROR_MAX_BYTES` fails
+/// its builds with the limit named, and its mirror ends under the limit.
+/// A small repo on the same server still builds and clones.
+#[test]
+fn k10_a_mirror_over_its_size_limit_fails_its_builds() {
+    use std::io::Read;
+    const LIMIT: u64 = 1_000_000;
+    let world = World::new();
+    let big = world.origin("acme", "k10big");
+    let mut noise = Vec::new();
+    std::fs::File::open("/dev/urandom")
+        .unwrap()
+        .take(3 * LIMIT)
+        .read_to_end(&mut noise)
+        .unwrap();
+    std::fs::write(big.work.join("noise.bin"), noise).unwrap();
+    let big_tip = big.commit(&[], "big");
+    big.publish();
+    let small = world.origin("acme", "k10small");
+    let small_tip = small.commit(&[("a.txt", "a\n")], "A");
+    small.publish();
+    let server = world.server(&[("RIPCLONE_MIRROR_MAX_BYTES", &LIMIT.to_string())]);
+
+    world.cli(&server, &["add", "acme/k10big"]).ok();
+    for kind in ["head", "files"] {
+        wait_output(&server, "acme/k10big", &big_tip, kind, "failed");
+        let out = output(&server, "acme/k10big", &big_tip, kind);
+        let error = out["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("over its limit of 1000000 bytes (RIPCLONE_MIRROR_MAX_BYTES=1000000)"),
+            "{out}"
+        );
+    }
+    let mirrors = world.path("server").join("repos");
+    wait_for("the big mirror under its limit", || {
+        let mut dirs = vec![mirrors.clone()];
+        let mut bytes = 0;
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.contains("k10big") {
+                    bytes += dir_bytes(&entry.path());
+                } else if entry.path().is_dir() {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        (bytes < LIMIT).then_some(())
+    });
+
+    world.cli(&server, &["add", "acme/k10small"]).ok();
+    wait_output(&server, "acme/k10small", &small_tip, "head", "ready");
+    let target = world.target("small");
+    world
+        .cli(
+            &server,
+            &[
+                "clone",
+                "acme/k10small",
+                target.to_str().unwrap(),
+                "--depth",
+                "1",
+            ],
+        )
+        .ok();
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), small_tip);
 }

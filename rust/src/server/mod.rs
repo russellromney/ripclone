@@ -354,6 +354,7 @@ pub async fn run_server(data_dir: &std::path::Path, host: &str, port: u16) -> Re
     // Read where they are used; checked here so a bad value stops startup.
     crate::git::ls_remote_timeout()?;
     crate::git::fetch_timeout()?;
+    crate::git::MirrorLimit::check_environment()?;
     builder::check_environment()?;
 
     let metrics = Metrics::new();
