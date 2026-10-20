@@ -28,7 +28,7 @@ example `github/oven-sh/bun` or `gitlab/group/sub/project`.
 
 | Route | Does |
 |---|---|
-| `POST /v1/repos/{provider}/{path}/add` | Resolve the default branch, add the repo, and admit a build of its tip. Answers with a build summary. |
+| `POST /v1/repos/{provider}/{path}/add` | Resolve the default branch, add the repo, and admit a build of its tip. Answers with a build summary. The body may be empty, or `{"owner": "..."}` (see below). |
 | `DELETE /v1/repos/{provider}/{path}/add` | Remove the repo from the added set: `204`. Published artifacts stay. |
 | `DELETE /v1/repos/{provider}/{path}` | Purge the repo: `204`, also for a repo the server does not know. |
 | `GET /v1/repos` | The added repos, as `[{"provider": "github", "path": "acme/app"}]`. |
@@ -38,6 +38,14 @@ example `github/oven-sh/bun` or `gitlab/group/sub/project`.
 
 Only added repos build: `POST .../builds` for a repo that was not added
 answers `404 repo_not_added`.
+
+`owner` is an opaque string of at most 256 bytes. The server only uses it to
+share build slots: each kind of build (Head, Files, Full) serves owners in
+turn, the one it served longest ago first, and each owner's builds in
+admission order. So one owner that adds many repos cannot keep another
+owner's build waiting. Repos added without an owner share one turn. A
+repo's owner is set by its first add; a later add with an owner fills a
+missing one and never replaces one.
 
 A purge removes the repo from the added set and deletes its builds and
 published refs at once, so its commits read `404` and its running builds and

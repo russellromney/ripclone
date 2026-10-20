@@ -248,7 +248,7 @@ mod tests {
         let state = test_state(&tmp).await;
         let added = RepoId::github("acme/widget");
         let gone = RepoId::github("acme/gone");
-        state.control.add_repo(&added).await.unwrap();
+        state.control.add_repo(&added, None).await.unwrap();
         for repo in [&added, &gone] {
             std::fs::create_dir_all(state.repo_root.join(repo.mirror_dir_name()).join("objects"))
                 .unwrap();
