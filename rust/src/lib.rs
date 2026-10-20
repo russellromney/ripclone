@@ -73,6 +73,7 @@ pub mod bench;
 pub mod branches;
 #[doc(hidden)]
 pub mod cancel;
+pub mod capacity;
 pub mod cas;
 pub mod client;
 #[doc(hidden)]

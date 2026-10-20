@@ -375,8 +375,8 @@ fn s3_c3_retry_rebuilds_only_failed_outputs() {
     assert_eq!(listing(&target), origin.tree(&tip));
 }
 
-/// H6: with S3 storage the server's local cache is disposable. Retention
-/// trims cache objects older than its limit once their bucket copy is
+/// H6: with S3 storage the server's local cache is disposable. Past its size
+/// limit, retention trims cache objects once their bucket copy is
 /// confirmed; the bucket is untouched, published artifacts still clone
 /// without a rebuild, and the next push still builds.
 #[test]
@@ -389,13 +389,14 @@ fn s3_h6_retention_trims_only_the_local_cache() {
     origin.publish();
     // Retention runs every second, the harness default.
     let env = s3.server_env(&s3.endpoint);
-    let server = world.server(&env_refs(&env));
+    let mut server = world.server(&env_refs(&env));
     world.cli(&server, &["add", "acme/h6", "--wait"]).ok();
     let objects = s3.objects();
     let cached = server.storage_listing();
     assert!(!cached.is_empty(), "the build cached nothing locally");
 
-    crate::state::backdate(&world.path("server").join("cache"), 30);
+    // A cache bound of 1 byte trims every object S3 holds.
+    server.restart_with(&[("RIPCLONE_RETENTION_MAX_BYTES", "1")]);
     wait_for("retention to trim the local cache", || {
         (server.metric("ripclone_local_cache_removed_objects_total") > 0).then_some(())
     });
@@ -411,6 +412,7 @@ fn s3_h6_retention_trims_only_the_local_cache() {
     assert_eq!(listing(&target), origin.tree(&a));
     assert_eq!(server.metric("ripclone_builds_queued_total"), queued);
 
+    server.restart_with(&[("RIPCLONE_RETENTION_MAX_BYTES", "0")]);
     let b = origin.commit(&[("a.txt", "b\n")], "B");
     origin.publish();
     world.cli(&server, &["sync", "acme/h6", "--wait"]).ok();
