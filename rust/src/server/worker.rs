@@ -774,6 +774,21 @@ async fn build_full(
         .map(Output::Full)
     }
     .await;
+    // The first build's Full waits for the refresh its Head started, so
+    // a full clone of a new repo gets every branch and tag from the server.
+    // A failed refresh does not throw the Full away: the poller refreshes
+    // a repo with no branches, and until then clones fetch them upstream.
+    if built.is_ok() {
+        let start = Instant::now();
+        if let Err(error) = super::refs::first_branches(state, &claim.repo).await {
+            warn!(
+                "Full of {}@{} is ready without the repo's branches: {error:#}",
+                claim.repo.storage_key(),
+                short(&claim.build.commit)
+            );
+        }
+        phases.record("refs", start);
+    }
     let ready = built.is_ok();
     phases.report("full", &claim.repo, &claim.build.commit, ready, started);
     settle(state, settings, claim, built, pins).await;

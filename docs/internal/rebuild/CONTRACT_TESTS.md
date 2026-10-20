@@ -248,6 +248,7 @@ another's builds or the API, and the mirror stays compact.
 | K5 | `RIPCLONE_BUILD_LEASE_SECS=3`. The origin holds the first fetch while the server is stopped (SIGSTOP) for 4 s, then resumed. No lease is lost, Head starts once, the origin sees one fetch, nothing fails, and full and Files clones are exact. | #234 |
 | K6 | While a server `git` wrapper holds the side pack's `pack-objects`, a default-branch push with a tag builds Head, and its depth-1 clone has the tag; once released, a full clone has the side branch and the tag. | |
 | K7 | The first refresh's fetch is held, a side branch is pushed with its webhook, and the fetch then fails: the log shows the failure once, the server refreshes again, and a full clone has the side branch from the server's refs. | |
+| K8 | While a new repo's first refresh's fetch is held, its Head and Files are ready and its Full is pending; once the fetch runs, the Full is ready with the branches, and a full clone without the upstream gets every branch from the server. | |
 
 ### L. Any tree git allows (4)
 

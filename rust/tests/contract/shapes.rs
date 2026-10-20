@@ -597,11 +597,10 @@ fn g9_concurrent_branch_builds_do_not_mix() {
     let world = World::new();
     let http = world.serve_origins_over_http();
     let origin = world.origin("acme", "g9");
-    let a = origin.commit(&[("shared.txt", "base\n")], "A");
+    origin.commit(&[("shared.txt", "base\n")], "A");
     origin.publish();
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g9", "--wait"]).ok();
-    wait_first_refs(&server, "acme/g9", &a);
 
     git(&origin.work, &["checkout", "-q", "-b", "feature"]);
     let feature = origin.commit(&[("shared.txt", "feature\n"), ("feature.txt", "f\n")], "F");
@@ -1041,7 +1040,8 @@ fn g14_clones_have_the_refs_git_clone_gets() {
         let branches = api::branches_artifact(&server, "acme/g14", &c)?;
         Some((api::tags_artifact(&server, "acme/g14", &c), branches))
     };
-    wait_for("the first refs publish", published);
+    // Every output ready means the first refs are published too.
+    assert!(published().is_some());
 
     // The clone cannot reach the upstream, so its refs are the server's.
     let clone = |name: &str, args: &[&str]| {
@@ -1271,9 +1271,7 @@ fn g15_tags_on_trees_and_blobs_match_git_clone() {
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g15", "--wait"]).ok();
     let tip = git(&origin.bare, &["rev-parse", "main"]);
-    wait_for("the refs publish", || {
-        api::branches_artifact(&server, "acme/g15", &tip)
-    });
+    assert!(api::branches_artifact(&server, "acme/g15", &tip).is_some());
     for (name, args) in [("full", vec![]), ("shallow", vec!["--depth", "1"])] {
         let target = world.target(name);
         let mut argv = vec!["clone", "acme/g15", target.to_str().unwrap()];
@@ -1341,7 +1339,6 @@ fn g21_tag_chains_past_32_deep_are_left_out() {
     );
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g21", "--wait"]).ok();
-    wait_first_refs(&server, "acme/g21", &a);
 
     let full = server_refs_clone(&world, &server, "acme/g21", "full");
     let (refs, _, _) = git_clone_tags(&origin.bare, &[]);
@@ -1410,7 +1407,6 @@ fn g22_a_tag_listed_twice_fails_the_clone() {
     );
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g22", "--wait"]).ok();
-    wait_first_refs(&server, "acme/g22", &b);
     let own = api::tags_artifact(&server, "acme/g22", &b).expect("a tags artifact");
 
     let proxy = FaultProxy::start(&server);
@@ -1615,7 +1611,6 @@ fn g24_the_side_pack_is_kept_while_only_the_default_branch_moves_on() {
         ("PATH", &wrapper.path),
     ]);
     world.cli(&server, &["add", "acme/g24", "--wait"]).ok();
-    wait_first_refs(&server, "acme/g24", &a);
     let repo = "acme/g24";
     let first = side_packs(&server, repo, &a);
     assert_eq!(first.len(), 1);
@@ -1748,7 +1743,6 @@ fn g25_a_local_failure_of_the_refs_fetch_fails_the_clone() {
     );
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g25", "--wait"]).ok();
-    wait_first_refs(&server, "acme/g25", &a);
     let proxy = FaultProxy::start(&server);
     proxy.rewrite(api::COMMIT_READS, "\"branches\":", "\"no_branches\":");
 
@@ -2291,7 +2285,6 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     let secret = "g27-secret";
     let server = world.server(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", secret)]);
     world.cli(&server, &["add", "acme/g27", "--wait"]).ok();
-    wait_first_refs(&server, "acme/g27", &a);
     // A pull request's commit X off A, built from a branch since deleted.
     // Two commits, so X's own history holds X1 beyond its Head level.
     git(work, &["checkout", "-q", "-b", "pr", &a]);
@@ -2433,7 +2426,6 @@ fn g28_after_a_force_push_a_clone_downloads_the_commits_full_history() {
     let secret = "g28-secret";
     let server = world.server(&[("RIPCLONE_WEBHOOK_SECRET_GITHUB", secret)]);
     world.cli(&server, &["add", "acme/g28", "--wait"]).ok();
-    wait_first_refs(&server, "acme/g28", &a);
     git(work, &["checkout", "-q", "-b", "pr", &a]);
     origin.commit(&[("x1.txt", "x1\n")], "X1");
     let x = origin.commit(&[("x.txt", "x\n")], "X");
