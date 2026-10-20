@@ -150,19 +150,17 @@ pub fn parent_commit<P: AsRef<Path>>(repo_path: P, commit: &str) -> Result<Optio
 
 /// Run `f` with an ancestry question for the repository at `repo_path`:
 /// whether `ancestor` is an ancestor of (or equal to) `commit`. The questions
-/// share one commit graph, so many of them cost one repository open and the
-/// commits walked once. An error means the repository could not answer, for
-/// example because a commit is not in it.
+/// share one repository open and commit-graph. An error means the
+/// repository could not answer, for example because a commit is not in it.
 pub fn with_ancestry<P: AsRef<Path>, R>(
     repo_path: P,
     f: impl FnOnce(&mut dyn FnMut(&str, &str) -> Result<bool>) -> R,
 ) -> Result<R> {
     let mut repo = open_repo(repo_path)?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
-    let cache = repo
+    let graph = repo
         .commit_graph_if_enabled()
         .context("open commit-graph")?;
-    let mut graph = repo.revision_graph(cache.as_ref());
     let mut is_ancestor = |ancestor: &str, commit: &str| -> Result<bool> {
         let (one, two) = (parse_oid(ancestor)?, parse_oid(commit)?);
         // The walk answers no for a commit it cannot find; git errors.
@@ -171,13 +169,58 @@ pub fn with_ancestry<P: AsRef<Path>, R>(
                 anyhow::bail!("commit {name} is not in the repository");
             }
         }
-        match repo.merge_base_with_graph(one, two, &mut graph) {
-            Ok(base) => Ok(base.detach() == one),
-            Err(gix::repository::merge_base_with_graph::Error::NotFound { .. }) => Ok(false),
-            Err(error) => Err(error).with_context(|| format!("merge-base {ancestor} {commit}")),
-        }
+        reaches(&repo, graph.as_ref(), two, one)
+            .with_context(|| format!("is {ancestor} an ancestor of {commit}"))
     };
     Ok(f(&mut is_ancestor))
+}
+
+/// Whether `ancestor` is `commit` or in its history. The walk stops, as
+/// `git merge-base --is-ancestor` does, at each commit-graph commit that
+/// cannot reach `ancestor`: one whose generation is not above `ancestor`'s,
+/// or any when `ancestor` is not in the graph, which holds every ancestor
+/// of its commits. Commits newer than the graph are read from the
+/// repository. A merge-base walk instead goes on until the two histories
+/// meet, which took 0.5 s on rust-lang/rust for a commit 128 behind.
+fn reaches(
+    repo: &gix::Repository,
+    graph: Option<&gix::commitgraph::Graph>,
+    commit: gix::ObjectId,
+    ancestor: gix::ObjectId,
+) -> Result<bool> {
+    let floor = graph.map(|graph| graph.commit_by_id(ancestor).map(|c| c.generation()));
+    let mut seen = HashSet::new();
+    let mut todo = vec![commit];
+    while let Some(id) = todo.pop() {
+        if id == ancestor {
+            return Ok(true);
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        match graph.and_then(|graph| Some((graph, graph.commit_by_id(id)?))) {
+            Some((graph, found)) => {
+                let floor = floor.flatten();
+                if floor.is_none_or(|floor| found.generation() <= floor) {
+                    continue;
+                }
+                for parent in found.iter_parents() {
+                    todo.push(
+                        graph
+                            .id_at(parent.context("read commit-graph parents")?)
+                            .to_owned(),
+                    );
+                }
+            }
+            None => {
+                let found = repo
+                    .find_commit(id)
+                    .with_context(|| format!("find commit {id}"))?;
+                todo.extend(found.parent_ids().map(gix::Id::detach));
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `ancestor` is an ancestor of (or equal to) `commit`. See
@@ -417,9 +460,11 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
-    /// Ancestry answers as `git merge-base --is-ancestor` gives them: a
-    /// commit is its own ancestor, a side branch is not, unrelated history is
-    /// not, and a commit the repo lacks is an error.
+    /// Ancestry answers as `git merge-base --is-ancestor` gives them, for
+    /// every pair of commits of a history with a side branch, a merge and
+    /// unrelated history: with no commit-graph, one that misses the newest
+    /// commits, and one that holds them all. A commit the repo lacks is an
+    /// error.
     #[test]
     fn ancestry_matches_git() {
         let dir = tempfile::tempdir().unwrap();
@@ -447,13 +492,50 @@ mod tests {
         let s = commit("s");
         git(&["-C", w, "checkout", "-q", "--orphan", "other"]);
         let o = commit("o");
+        let mut commits = vec![a, b.clone(), s.clone(), o];
+        let check = |commits: &[String], graph: &str| {
+            let mut asked = 0;
+            super::with_ancestry(w, |is_ancestor| {
+                for x in commits {
+                    for y in commits {
+                        asked += 1;
+                        let ours = is_ancestor(x, y).unwrap();
+                        let theirs = std::process::Command::new("git")
+                            .args(["-C", w, "merge-base", "--is-ancestor", x, y])
+                            .status()
+                            .unwrap()
+                            .success();
+                        assert_eq!(ours, theirs, "{graph}: is {x} an ancestor of {y}");
+                    }
+                }
+            })
+            .unwrap();
+            assert_eq!(asked, commits.len() * commits.len());
+        };
+        check(&commits, "no graph");
+        // A graph of the first four, then a merge and a commit after it.
+        git(&["-C", w, "commit-graph", "write", "--reachable"]);
+        git(&["-C", w, "checkout", "-q", "-B", "main", &b]);
+        git(&[
+            "-C",
+            w,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "m",
+            &s,
+        ]);
+        commits.push(git(&["-C", w, "rev-parse", "HEAD"]));
+        commits.push(commit("c"));
+        check(&commits, "partial graph");
+        git(&["-C", w, "commit-graph", "write", "--reachable"]);
+        check(&commits, "full graph");
         let missing = "1".repeat(40);
-        let answers = super::with_ancestry(w, |is_ancestor| {
-            [(&a, &b), (&b, &b), (&b, &a), (&s, &b), (&a, &s), (&o, &b)]
-                .map(|(x, y)| is_ancestor(x, y).unwrap())
-        })
-        .unwrap();
-        assert_eq!(answers, [true, true, false, false, true, false]);
         assert!(super::is_ancestor(w, &missing, &b).is_err());
     }
 
