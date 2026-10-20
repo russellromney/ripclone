@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod put_limit;
 pub mod s3_storage;
 pub use s3_storage::S3Storage;
 

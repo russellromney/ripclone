@@ -500,10 +500,10 @@ impl FaultProxy {
         self.add_rule(None, prefix, fault, 0, times);
     }
 
-    /// Apply `fault` to the responses of every `PUT` whose path starts with
-    /// `prefix`, as a store that rejects writes.
-    pub fn fail_puts(&self, prefix: &str, fault: Fault) {
-        self.add_rule(Some(Method::PUT), prefix, fault, 0, usize::MAX);
+    /// Apply `fault` to the responses of the next `times` `PUT`s whose path
+    /// starts with `prefix`: with `usize::MAX`, a store that rejects writes.
+    pub fn fault_puts(&self, prefix: &str, fault: Fault, times: usize) {
+        self.add_rule(Some(Method::PUT), prefix, fault, 0, times);
     }
 
     /// Hold the responses to the next `times` `PUT`s whose path starts with

@@ -43,4 +43,9 @@ so end the prefix with `/` to keep artifacts in a folder. With S3, clients
 download through signed URLs, and the local cache and git mirrors are
 disposable. S3 holds artifacts only, never control state.
 
+The server sends at most 32 uploads to the bucket at once. When the bucket
+throttles (503 SlowDown or 429), it halves that limit, waits, and retries,
+up to 8 times per upload; uploads that succeed raise the limit back. A
+throttled build is slower, not failed.
+
 Published artifacts never expire. See [Artifact lifecycle](ARTIFACT_LIFECYCLE.md).
