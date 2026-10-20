@@ -530,7 +530,7 @@ mod tests {
     }
 
     pub(super) async fn mark_added(state: &ServerState, repo_id: RepoId) {
-        state.control.add_repo(&repo_id).await.unwrap();
+        state.control.add_repo(&repo_id, None).await.unwrap();
     }
 
     #[tokio::test]

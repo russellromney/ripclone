@@ -37,6 +37,18 @@ pub struct BuildRequest {
     pub kind: Option<ExactResultKind>,
 }
 
+/// `POST .../add` body, which may be empty.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddRequest {
+    /// Opaque. The build pools serve owners in turn.
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+/// Longest `owner` accepted, in bytes.
+const OWNER_MAX: usize = 256;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommitQuery {
@@ -328,7 +340,26 @@ pub(super) async fn dispatch_repos_post(
             Ok((repo_id, provider)) => (repo_id, provider.clone()),
             Err(error) => return error.into_response(),
         };
-        return add_repo(&state, &repo_id, &provider)
+        let request: AddRequest = if body.is_empty() {
+            AddRequest::default()
+        } else {
+            match serde_json::from_slice(&body) {
+                Ok(request) => request,
+                Err(error) => {
+                    return ApiError::invalid_request(format!("invalid add request: {error}"))
+                        .into_response();
+                }
+            }
+        };
+        if let Some(owner) = &request.owner
+            && (owner.len() > OWNER_MAX || owner.chars().any(char::is_control))
+        {
+            return ApiError::invalid_request(format!(
+                "owner must be at most {OWNER_MAX} bytes with no control characters"
+            ))
+            .into_response();
+        }
+        return add_repo(&state, &repo_id, &provider, request.owner.as_deref())
             .await
             .unwrap_or_else(IntoResponse::into_response);
     }
@@ -594,13 +625,18 @@ async fn add_repo(
     state: &ServerState,
     repo_id: &RepoId,
     provider: &ProviderInstance,
+    owner: Option<&str>,
 ) -> Result<Response, ApiError> {
     let start = Instant::now();
     let resolved = resolve(state, repo_id, provider, &Selector::Head).await?;
-    state.control.add_repo(repo_id).await.map_err(|error| {
-        state.metrics.record_error();
-        ApiError::control(error)
-    })?;
+    state
+        .control
+        .add_repo(repo_id, owner)
+        .await
+        .map_err(|error| {
+            state.metrics.record_error();
+            ApiError::control(error)
+        })?;
     admit_resolved(state, repo_id, resolved, true, start, None).await
 }
 
@@ -1732,7 +1768,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "repo_not_added");
-        control.add_repo(&repo_id).await.unwrap();
+        control.add_repo(&repo_id, None).await.unwrap();
 
         // A short SHA is a valid branch name, so it is not tested here: it
         // would ask the upstream.

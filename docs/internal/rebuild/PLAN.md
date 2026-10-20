@@ -84,8 +84,9 @@ replaced, so several half-models now run at once:
    credentials.
 5. **Bounded sequencing.** Each commit's Head and Files build at the same
    time, and Full starts once Head is ready. Three process-wide caps: Head, Files and Full slots, one pool each, so
-   a long Full never holds back another commit's Files. Each pool claims in
-   admission order, and a repo holds at most one lease per pool.
+   a long Full never holds back another commit's Files. Each pool serves
+   repo owners in turn, each owner's rows in admission order, and a repo
+   holds at most one lease per pool.
 6. **Published outputs are immutable.** Head compaction, if kept, applies to the
    next commit's Head, never by republishing this one.
 7. **Credentials come from the server's environment at build time** (GitHub

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema/sqlite.sql");
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const COLUMNS: &str = "repo, commit_id, ref_name, parent, created_at, seq, \
     head_state, head_output, head_error, files_state, files_output, files_error, \
@@ -422,11 +422,16 @@ impl ControlStore for SqliteControlStore {
         };
         let held = self.lease_held("", k);
         let busy_held = self.lease_held("busy.", k);
-        // The oldest claimable row. A repo that already holds a lease of
-        // this kind is skipped, so one repo cannot take every slot of a
-        // pool. `$1` is now, `$2` the attempt limit.
+        // A claimable row of the owner this pool served longest ago, then
+        // the oldest, so one owner's many repos cannot keep another owner
+        // waiting. A repo that already holds a lease of this kind is
+        // skipped, so one repo cannot take every slot of a pool. `$1` is
+        // now, `$2` the attempt limit.
         let candidate = format!(
-            "SELECT repo, commit_id FROM builds AS b
+            "SELECT b.repo, b.commit_id FROM builds AS b
+             LEFT JOIN added_repos AS added ON added.repo = b.repo
+             LEFT JOIN owner_turns AS turns
+               ON turns.pool = '{k}' AND turns.owner = COALESCE(added.owner, '')
              WHERE {k}_state = 'pending' {needs}
                AND NOT {held}
                AND {k}_retry_after <= $1
@@ -434,7 +439,7 @@ impl ControlStore for SqliteControlStore {
                AND NOT EXISTS (
                  SELECT 1 FROM builds AS busy
                  WHERE busy.repo = b.repo AND {busy_held})
-             ORDER BY seq
+             ORDER BY COALESCE(turns.turn, 0), b.seq
              LIMIT 1"
         );
         // Outputs of this kind whose last allowed attempt ended without a
@@ -495,12 +500,25 @@ impl ControlStore for SqliteControlStore {
         .fetch_optional(&mut *tx)
         .await
         .context("claim build")?;
-        tx.commit().await.context("commit claim")?;
         let Some(row) = row else {
+            tx.commit().await.context("commit claim")?;
             return Ok(None);
         };
+        let repo: String = row.try_get("repo")?;
+        sqlx::query(
+            "INSERT INTO owner_turns (pool, owner, turn)
+             VALUES ($1, COALESCE((SELECT owner FROM added_repos WHERE repo = $2), ''),
+               (SELECT COALESCE(MAX(turn), 0) + 1 FROM owner_turns))
+             ON CONFLICT (pool, owner) DO UPDATE SET turn = excluded.turn",
+        )
+        .bind(k)
+        .bind(&repo)
+        .execute(&mut *tx)
+        .await
+        .context("record the owner's turn")?;
+        tx.commit().await.context("commit claim")?;
         Ok(Some(Claim {
-            repo: RepoId::from_storage_key(&row.try_get::<String, _>("repo")?)?,
+            repo: RepoId::from_storage_key(&repo)?,
             owner,
             pool,
             build: decode_build(&row)?,
@@ -739,19 +757,36 @@ impl ControlStore for SqliteControlStore {
         .with_context(|| format!("read ready {kind} commits"))
     }
 
-    async fn add_repo(&self, repo: &RepoId) -> Result<bool> {
+    async fn add_repo(&self, repo: &RepoId, owner: Option<&str>) -> Result<bool> {
         let added_at = self.clock.now();
-        Ok(sqlx::query(
-            "INSERT INTO added_repos (repo, added_at) VALUES ($1, $2)
+        let key = repo.storage_key();
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("begin add")?;
+        let added = sqlx::query(
+            "INSERT INTO added_repos (repo, added_at, owner) VALUES ($1, $2, $3)
              ON CONFLICT (repo) DO NOTHING",
         )
-        .bind(repo.storage_key())
+        .bind(&key)
         .bind(added_at)
-        .execute(&self.pool)
+        .bind(owner.unwrap_or(""))
+        .execute(&mut *tx)
         .await
         .context("add repository")?
         .rows_affected()
-            == 1)
+            == 1;
+        if !added && let Some(owner) = owner {
+            sqlx::query("UPDATE added_repos SET owner = $1 WHERE repo = $2 AND owner = ''")
+                .bind(owner)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await
+                .context("fill repository owner")?;
+        }
+        tx.commit().await.context("commit add")?;
+        Ok(added)
     }
 
     async fn remove_repo(&self, repo: &RepoId) -> Result<bool> {

@@ -9,8 +9,19 @@ CREATE TABLE schema_version (
 
 CREATE TABLE added_repos (
   repo     TEXT PRIMARY KEY,           -- RepoId::storage_key()
-  added_at INTEGER NOT NULL            -- epoch seconds
+  added_at INTEGER NOT NULL,           -- epoch seconds
+  owner    TEXT NOT NULL DEFAULT ''    -- opaque, from /add; '' when none
 );
+
+-- Each pool serves owners in turn: a claim takes the pending row of the
+-- owner it served longest ago (never first), then the oldest admission.
+-- turn is a counter shared by every pool, raised at each claim.
+CREATE TABLE owner_turns (
+  pool  TEXT NOT NULL,                 -- head | files | full
+  owner TEXT NOT NULL,                 -- added_repos.owner
+  turn  INTEGER NOT NULL,
+  PRIMARY KEY (pool, owner)
+) WITHOUT ROWID;
 
 -- The repository's published refs (see docs/internal/rebuild/TAGS.md): the
 -- newest tags artifact, and the branches, side pack and tags of the last

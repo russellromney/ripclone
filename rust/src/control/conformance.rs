@@ -55,6 +55,7 @@ pub async fn run_all<B: Backend>(new_backend: impl Fn() -> B) {
         ref_name_is_filled_never_replaced,
         pools_offer_head_and_files_then_full,
         claims_take_the_oldest_row,
+        owners_take_turns_in_each_pool,
         a_repo_holds_one_lease_per_pool,
         files_does_not_wait_for_another_rows_full,
         full_claims_follow_admission_order,
@@ -506,6 +507,56 @@ async fn claims_take_the_oldest_row(backend: &dyn Backend) {
         publish_head(store.as_ref(), &expected).await;
     }
     assert!(store.claim("h", Pool::Head, LEASE).await.unwrap().is_none());
+}
+
+/// Each pool serves the owner it served longest ago, then the oldest row:
+/// owner `a`'s three repos admitted first do not keep `b`'s or the unowned
+/// repo's build waiting. Turns are per pool. A later add fills a missing
+/// owner and never replaces one.
+async fn owners_take_turns_in_each_pool(backend: &dyn Backend) {
+    let (_, store) = open(backend).await;
+    let repos: Vec<(RepoId, Option<&str>)> = [
+        ("acme/a1", Some("a")),
+        ("acme/a2", Some("a")),
+        ("acme/a3", Some("a")),
+        ("acme/b1", Some("b")),
+        ("acme/n1", None),
+    ]
+    .into_iter()
+    .map(|(path, owner)| (RepoId::github(path), owner))
+    .collect();
+    for (n, (repo, owner)) in (1..).zip(&repos) {
+        assert!(store.add_repo(repo, *owner).await.unwrap());
+        store.admit(repo, &sha(n), None).await.unwrap();
+    }
+    assert!(!store.add_repo(&repos[0].0, Some("b")).await.unwrap());
+
+    let mut order = Vec::new();
+    while let Some(claim) = store.claim("h", Pool::Head, LEASE).await.unwrap() {
+        order.push(claim.build.commit);
+    }
+    assert_eq!(order, [1, 4, 5, 2, 3].map(sha), "a, b, none, then a's rest");
+    let files = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
+    assert_eq!(
+        files.build.commit,
+        sha(1),
+        "the Files pool's turns are its own"
+    );
+
+    // The unowned repo gets an owner of its own; `a1` stays `a`'s.
+    let (n1, b2) = (&repos[4].0, RepoId::github("acme/b2"));
+    assert!(!store.add_repo(n1, Some("n")).await.unwrap());
+    assert!(store.add_repo(&b2, Some("b")).await.unwrap());
+    store.admit(n1, &sha(6), None).await.unwrap();
+    store.admit(&b2, &sha(7), None).await.unwrap();
+    store.admit(&repos[0].0, &sha(8), None).await.unwrap();
+    let mut order = Vec::new();
+    while let Some(claim) = store.claim("f", Pool::Files, LEASE).await.unwrap() {
+        order.push(claim.build.commit);
+    }
+    // Files served only `a`: b and the new owner n first, then each in
+    // turn. A repo holding a Files lease (a1, then n1) is skipped.
+    assert_eq!(order, [4, 5, 2, 7, 3].map(sha));
 }
 
 /// A repo with a live lease in a pool is skipped by that pool's claims, so
@@ -1276,7 +1327,7 @@ async fn concurrent_claims_never_share_a_row(backend: &dyn Backend) {
 async fn state_survives_restart(backend: &dyn Backend) {
     let (clock, store) = open(backend).await;
     let commit = sha(1);
-    store.add_repo(&repo()).await.unwrap();
+    store.add_repo(&repo(), None).await.unwrap();
     store.admit(&repo(), &commit, Some(MAIN)).await.unwrap();
     publish_head(store.as_ref(), &commit).await;
     let claim = store.claim("f", Pool::Files, LEASE).await.unwrap().unwrap();
@@ -1341,10 +1392,10 @@ async fn repos_are_added_listed_and_removed(backend: &dyn Backend) {
     };
     assert!(store.get_repo(&repo()).await.unwrap().is_none());
     assert!(store.list_repos().await.unwrap().is_empty());
-    assert!(store.add_repo(&repo()).await.unwrap());
+    assert!(store.add_repo(&repo(), None).await.unwrap());
     clock.advance(10);
-    assert!(!store.add_repo(&repo()).await.unwrap());
-    assert!(store.add_repo(&nested).await.unwrap());
+    assert!(!store.add_repo(&repo(), None).await.unwrap());
+    assert!(store.add_repo(&nested, None).await.unwrap());
 
     let added = store.get_repo(&repo()).await.unwrap().unwrap();
     assert_eq!(added.repo_id, repo());
@@ -1394,8 +1445,8 @@ fn completed_artifacts(commit: &str) -> Vec<String> {
 async fn purge_queues_only_artifacts_no_other_repo_references(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     let other = RepoId::github("acme/fork");
-    store.add_repo(&repo()).await.unwrap();
-    store.add_repo(&other).await.unwrap();
+    store.add_repo(&repo(), None).await.unwrap();
+    store.add_repo(&other, None).await.unwrap();
     // The same commit in both repos builds the same artifacts.
     complete(store.as_ref(), &repo(), &sha(1), Some(MAIN)).await;
     complete(store.as_ref(), &other, &sha(1), Some(MAIN)).await;
@@ -1490,7 +1541,7 @@ async fn a_queued_artifact_keeps_its_later_due_time(backend: &dyn Backend) {
     );
 
     // A purge that queues it later still moves it later.
-    store.add_repo(&repo()).await.unwrap();
+    store.add_repo(&repo(), None).await.unwrap();
     complete(store.as_ref(), &repo(), &sha(1), Some(MAIN)).await;
     let shared = completed_artifacts(&sha(1));
     store.queue_deletions(&shared, START).await.unwrap();
@@ -1590,7 +1641,7 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
         "the repo is not added"
     );
     assert_eq!(store.get_refs(&repo()).await.unwrap(), None);
-    store.add_repo(&repo()).await.unwrap();
+    store.add_repo(&repo(), None).await.unwrap();
     assert!(store.set_refs(&repo(), &first).await.unwrap());
     assert_eq!(store.get_refs(&repo()).await.unwrap(), Some(first.clone()));
     let with_side = RepoRefs {
@@ -1649,8 +1700,8 @@ async fn refs_are_absent_until_written_and_replaced(backend: &dyn Backend) {
 async fn refs_name_their_artifacts_until_purged(backend: &dyn Backend) {
     let (_, store) = open(backend).await;
     let other = RepoId::github("acme/fork");
-    store.add_repo(&repo()).await.unwrap();
-    store.add_repo(&other).await.unwrap();
+    store.add_repo(&repo(), None).await.unwrap();
+    store.add_repo(&other, None).await.unwrap();
     let mine = RepoRefs {
         tags_artifact: crate::cas::hash(b"shared tags"),
         tags_len: 10,

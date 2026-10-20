@@ -139,7 +139,7 @@ Ripclone token reaches the origin.
 | F11 | A proxy that ignores Range: the ranged download falls back to one whole GET of that artifact, and the clone is exact. | |
 | F12 | A flipped byte in one range fails the clone on the hash check and leaves nothing. | |
 
-### G. Clone shapes produce correct trees (28)
+### G. Clone shapes produce correct trees (29)
 
 | # | Test | Added |
 |---|---|---|
@@ -194,7 +194,7 @@ Ripclone token reaches the origin.
 | H15 | The refs table is renamed under a running server: a ready Full still answers, without refs, the log names the read, and a full clone fetches the refs from the upstream, equal to `git clone`'s. | |
 | H16 | S3 emulator behind a proxy that answers 503 to the first 12 PUTs: the server logs the throttling and retries, no build fails, and depth-1, full and files clones are exact. | |
 
-### I. Auth, integrations, CLI (15)
+### I. Auth, integrations, CLI (16)
 
 | # | Test | Added |
 |---|---|---|
@@ -215,7 +215,7 @@ Ripclone token reaches the origin.
 | I16 | `--verify-upstream=always` walks the clone from its commit: a proxy answering a full clone with the Head called a Full gives a clone without the tip's parent and no shallow file, which `always` fails and removes; `auto` keeps it. | |
 | I17 | An upstream read over HTTP is one protocol v2 `ls-refs` POST, for the server's resolve and the CLI's `--verify-upstream`; an upstream that speaks only v0 gets `git ls-remote` and the same clone. | — |
 
-### J. Builds start from the newest ready ancestor (7)
+### J. Builds start from the newest ready ancestor (8)
 
 Each output of C builds on the same output of its base: the newest built
 commit that is an ancestor of C. Tests read the published Head and Full
@@ -236,11 +236,12 @@ origin, and runs `git fsck` and `rev-list --count` on the editable clones.
 | J7 | A rebase keeps the base packs the new commit still uses and repacks the rest. A pack that holds a replaced large file is dropped. | #233 |
 | J8 | A push's Head and Files store their files table as a delta on the cold build's table, at most a quarter of it; Full shares Head's. Rewriting every file stores a whole table again. Response and manifest agree, and every clone shape is exact. | #263 |
 
-### K. Scheduling and the mirror (7)
+### K. Scheduling and the mirror (9)
 
 A repository runs at most one build of each kind at a time, and its Fulls
 build in admission order. One repository's slow upstream never holds
-another's builds or the API, and the mirror stays compact.
+another's builds or the API, owners take turns for build slots, and the
+mirror stays compact.
 
 | # | Test | Added |
 |---|---|---|
@@ -252,6 +253,7 @@ another's builds or the API, and the mirror stays compact.
 | K6 | While a server `git` wrapper holds the side pack's `pack-objects`, a default-branch push with a tag builds Head, and its depth-1 clone has the tag; once released, a full clone has the side branch and the tag. | |
 | K7 | The first refresh's fetch is held, a side branch is pushed with its webhook, and the fetch then fails: the log shows the failure once, the server refreshes again, and a full clone has the side branch from the server's refs. | |
 | K8 | While a new repo's first refresh's fetch is held, its Head and Files are ready and its Full is pending; once the fetch runs, the Full is ready with the branches, and a full clone without the upstream gets every branch from the server. | |
+| K9 | An owner over 256 bytes is refused with `400`. One Head slot, held by a fetch of owner `a`'s first repo. `a` adds two more repos, then `b` adds one: once released, `b`'s Head builds next, before `a`'s other two (server log), and every repo clones. | |
 
 ### L. Any tree git allows (4)
 
@@ -268,7 +270,7 @@ so L1 checks clones only on Linux and the builds everywhere.
 | L3 | A cold Full leaves no `.bitmap` in the mirror and its full clone equals the origin; with Full paused, a full clone of a push tops up from it. Then three pushes (one commit, three commits, a merge) each build Full from the tail since the last Full: a new level each, never a cold rebuild, and one `build-phases kind=full` log line per Full with `history_ms`. Each full clone equals the origin (`rev-list --count`, `fsck --strict`). With Full paused, a full clone of a new push tops up from the last one and is exact. | #219, #221 |
 | L4 | A blob new in B is corrupted in the mirror after Head(B) and Files(B) were built. Full(B) fails naming the blob and publishes nothing; a full clone of B fails and leaves no target or staging; Full(A) and depth-1 B clone exactly. | #219 |
 
-Total: 115 tests. Several are table-driven.
+Total: 126 tests. Several are table-driven.
 
 ## Test settings
 

@@ -294,9 +294,11 @@ pub trait ControlStore: Send + Sync {
     /// cleared. Ready and pending outputs are untouched. `None` if the row
     /// is unknown.
     async fn retry(&self, repo: &RepoId, commit: &str) -> Result<Option<BuildRow>>;
-    /// Lease `pool`'s output of the oldest claimable row, by admission
-    /// order (a strictly increasing sequence, so same-second admits keep
-    /// their order). Head and Files are claimable while pending, Full once
+    /// Lease `pool`'s output of a claimable row: of the repository owner
+    /// (see [`Self::add_repo`]) the pool served longest ago or never, so
+    /// owners take turns, then the oldest by admission order (a strictly
+    /// increasing sequence, so same-second admits keep their order).
+    /// Repositories with no owner share one turn. Head and Files are claimable while pending, Full once
     /// Head is ready. The kind must have no
     /// held lease, no retry time in the future and attempts left. A lease is
     /// held until it expires, and a lease this store claimed is held until
@@ -349,8 +351,10 @@ pub trait ControlStore: Send + Sync {
         except: &str,
         limit: usize,
     ) -> Result<Vec<String>>;
-    /// False when the repository was already added.
-    async fn add_repo(&self, repo: &RepoId) -> Result<bool>;
+    /// False when the repository was already added. `owner` is opaque: it
+    /// only groups repositories for [`Self::claim`]'s turns. A later add with
+    /// an owner fills a missing one and never replaces one.
+    async fn add_repo(&self, repo: &RepoId, owner: Option<&str>) -> Result<bool>;
     /// False when the repository was not added.
     async fn remove_repo(&self, repo: &RepoId) -> Result<bool>;
     async fn get_repo(&self, repo: &RepoId) -> Result<Option<AddedRepo>>;

@@ -13,7 +13,9 @@
 //! process took it; that cancels the build: its git children are stopped,
 //! it stops at its next step, and it never publishes. Failures record a retry
 //! time instead of sleeping, so no slot waits while holding a lease. A repo
-//! holds at most one lease per pool, so one repo's builds never fill a pool.
+//! holds at most one lease per pool, so one repo's builds never fill a pool,
+//! and each pool serves repo owners in turn, so one owner's many repos never
+//! hold up another owner's.
 //!
 //! The mirror is shared by every build of a repo (see [`super::RepoLock`]).
 //! Builds read it under a shared lock. A build fetches its commit only when
@@ -1191,8 +1193,8 @@ mod tests {
                 .ready_commits(repo, kind, prefer_ref, except, limit)
                 .await
         }
-        async fn add_repo(&self, repo: &RepoId) -> Result<bool> {
-            self.inner.add_repo(repo).await
+        async fn add_repo(&self, repo: &RepoId, owner: Option<&str>) -> Result<bool> {
+            self.inner.add_repo(repo, owner).await
         }
         async fn remove_repo(&self, repo: &RepoId) -> Result<bool> {
             self.inner.remove_repo(repo).await

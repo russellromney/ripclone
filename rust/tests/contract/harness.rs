@@ -1504,6 +1504,15 @@ pub mod api {
         ))
     }
 
+    /// `POST .../add` with an `owner`, whose repos the build pools serve in
+    /// turn with other owners'.
+    pub fn add_as(server: &Server, repo: &str, owner: &str) -> (u16, serde_json::Value) {
+        parse(server.post_json(
+            &format!("{}/add", repo_path(repo)),
+            &serde_json::json!({ "owner": owner }),
+        ))
+    }
+
     pub fn read_commit(
         server: &Server,
         repo: &str,

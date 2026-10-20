@@ -1,5 +1,6 @@
 //! K. Scheduling: one repo's slow upstream never holds another repo, a
-//! stalled fetch ends, and a repo's Fulls publish in admission order.
+//! stalled fetch ends, a repo's Fulls publish in admission order, and
+//! owners take turns.
 
 use crate::harness::*;
 use std::time::{Duration, Instant};
@@ -555,4 +556,72 @@ fn k8_the_first_full_waits_for_the_first_refs() {
         remote_refs(&full)
     );
     assert_eq!(remote_refs(&full), git_clone_remotes(&origin.bare, &[]));
+}
+
+/// K9: one Head slot, held by owner `a`'s first repo's fetch. `a` adds two
+/// more repos, then `b` adds one. Once the fetch is released, `b`'s Head
+/// builds next, before `a`'s other two, and every repo clones.
+#[test]
+fn k9_owners_take_turns_for_build_slots() {
+    let world = World::new();
+    let http = world.serve_origins_over_http();
+    let repos = [("k9a1", "a"), ("k9a2", "a"), ("k9a3", "a"), ("k9b1", "b")];
+    let tips: Vec<String> = repos
+        .iter()
+        .map(|(name, _)| {
+            let origin = world.origin("acme", name);
+            let tip = origin.commit(&[("a.txt", &format!("{name}\n"))], name);
+            origin.publish();
+            tip
+        })
+        .collect();
+    let server = world.server(&[
+        ("RIPCLONE_HEAD_SLOTS", "1"),
+        ("RIPCLONE_FILES_SLOTS", "0"),
+        ("RIPCLONE_FULL_SLOTS", "0"),
+    ]);
+
+    let (status, body) = api::add_as(&server, "acme/k9a1", &"x".repeat(257));
+    assert_eq!(status, 400, "an owner over 256 bytes: {body}");
+    http.hold_fetches_of("acme/k9a1");
+    for (n, (name, owner)) in repos.iter().enumerate() {
+        let (status, body) = api::add_as(&server, &format!("acme/{name}"), owner);
+        assert!((200..300).contains(&status), "{status} {body}");
+        if n == 0 {
+            http.wait_held(1);
+        }
+    }
+    http.release_fetches();
+    for ((name, _), tip) in repos.iter().zip(&tips) {
+        wait_output(&server, &format!("acme/{name}"), tip, "head", "ready");
+    }
+
+    let published: Vec<String> = server
+        .log()
+        .lines()
+        .filter_map(|line| line.split("published head result for ").nth(1))
+        .filter_map(|rest| rest.split('@').next()?.rsplit("%2F").next())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        published,
+        ["k9a1", "k9b1", "k9a2", "k9a3"],
+        "Head build order"
+    );
+    for ((name, _), tip) in repos.iter().zip(&tips) {
+        let target = world.target(name);
+        world
+            .cli(
+                &server,
+                &[
+                    "clone",
+                    &format!("acme/{name}"),
+                    target.to_str().unwrap(),
+                    "--depth",
+                    "1",
+                ],
+            )
+            .ok();
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]), *tip);
+    }
 }
