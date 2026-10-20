@@ -591,14 +591,20 @@ The trial scripts compare `git branch -r` with `git clone`'s.
   branches, schema 7). The client writes the working tree and index from
   its own Full's Head packs and metadata, installs Full(D)'s history packs
   and the side pack in place of its own history, and adds its own history
-  only when its commit is on no ref, which the objects show.
+  only when its commit is on no ref. The idx files show that: every idx of
+  Full(D)'s history packs and the side layers downloads first, together,
+  and when none holds the commit, its own history packs download while
+  Full(D)'s still do (G27). A commit they hold downloads none of its own
+  (G16).
 - **A commit in no ref's history downloads the shared history once.** Its
   own history packs that Full(D)'s manifest lists too are skipped: both
   Fulls built on an older Full share its levels by hash (G27). Its own
   manifest, already read for the working tree, is not fetched again. What they
   share in levels built apart, a cold Full or a compaction, still comes
   twice; a pack of only the commit's own objects would need a server
-  build per request.
+  build per request. So does a newest level with the same objects as the
+  commit's Head delta pack, as for one commit on a built one: the Head
+  pack only writes the working tree, and the history pack is installed.
 - **A commit with D in its history gets no `refs_base`** (a merge-base
   walk of the mirror, in process): its own history holds D's, as for a
   push built before the refresh published it, by branch or by commit

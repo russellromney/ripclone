@@ -469,67 +469,82 @@ impl Client {
                 cleanup.clone(),
             )
         });
-        let side_download = branches
+        let (side_idx_tx, side_idx) = tokio::sync::oneshot::channel();
+        let mut side_download = branches
             .map(|branches| branches.side_packs)
             .filter(|layers| !layers.is_empty())
             .map(|layers| {
                 let total = layers.iter().map(|side| side.pack_len + side.idx_len).sum();
                 self.progress.add_total(total);
                 let (client, urls, dir) = (self.clone(), urls.clone(), root.clone());
+                let packs = (layers.into_iter().enumerate())
+                    .map(|(i, side)| {
+                        let pack = Artifact {
+                            hash: side.pack,
+                            len: Some(side.pack_len),
+                            slot: UrlSlot::SidePack(i),
+                        };
+                        let idx = Artifact {
+                            hash: side.idx,
+                            len: Some(side.idx_len),
+                            slot: UrlSlot::SideIdx(i),
+                        };
+                        (pack, idx)
+                    })
+                    .collect();
+                let task_cleanup = cleanup.clone();
+                // Into the staging directory, so each moves into the pack
+                // directory with a rename.
                 AbortOnDrop::new(
                     tokio::spawn(async move {
-                        let downloads = layers.into_iter().enumerate().map(|(i, side)| {
-                            let (client, urls, dir) = (&client, &urls, &dir);
-                            async move {
-                                let pack = Artifact {
-                                    hash: side.pack.clone(),
-                                    len: Some(side.pack_len),
-                                    slot: UrlSlot::SidePack(i),
-                                };
-                                let idx = Artifact {
-                                    hash: side.idx.clone(),
-                                    len: Some(side.idx_len),
-                                    slot: UrlSlot::SideIdx(i),
-                                };
-                                // Into the staging directory, so it moves into
-                                // the pack directory with a rename.
-                                let (pack, idx) = tokio::join!(
-                                    client.download(urls, &pack, Sink::TempFile(dir)),
-                                    client.download_bytes(urls, &idx)
-                                );
-                                let Downloaded::TempFile(pack, _) =
-                                    pack.with_context(|| format!("fetch side pack {i}"))?
-                                else {
-                                    unreachable!("temp file sink");
-                                };
-                                anyhow::Ok(PackFiles {
-                                    pack,
-                                    idx: idx.with_context(|| format!("fetch side pack idx {i}"))?,
-                                })
-                            }
-                        });
-                        futures::future::try_join_all(downloads).await
+                        let idx_tx = Some(side_idx_tx);
+                        (client.fetch_packs(&urls, packs, "side pack", &dir, idx_tx, &task_cleanup))
+                            .await
                     }),
                     cleanup.clone(),
                 )
             });
-        let mut side_download = side_download;
         let (ident, tree) = match refs_base {
             None => {
-                let (ident, _, tree) =
-                    (self.materialize_git(&urls, &pin.checkout, &root, true, cleanup, bench))
-                        .await?;
-                (ident, tree)
+                (self.materialize_git(&urls, &pin.checkout, &root, true, None, cleanup, bench))
+                    .await?
             }
             Some(base) => {
                 let base_urls = OutputUrls::new(repo_path, base.clone());
-                let none = HashSet::new();
-                let ((ident, manifest, tree), (packs, base_packs)) = tokio::try_join!(
-                    self.materialize_git(&urls, &pin.checkout, &root, false, cleanup, bench),
+                let (manifest_tx, manifest) = tokio::sync::oneshot::channel();
+                let side_idx = side_download.as_ref().map(|_| side_idx);
+                let ((ident, tree), (packs, own)) = tokio::try_join!(
+                    self.materialize_git(
+                        &urls,
+                        &pin.checkout,
+                        &root,
+                        false,
+                        Some(manifest_tx),
+                        cleanup,
+                        bench
+                    ),
                     async {
-                        let manifest = self.fetch_manifest(&base_urls).await?;
-                        let urls = &base_urls;
-                        (self.fetch_history_packs(urls, &manifest, &root, &none, cleanup)).await
+                        let base_manifest = self.fetch_manifest(&base_urls).await?;
+                        let (idx_tx, base_idx) = tokio::sync::oneshot::channel();
+                        let none = HashSet::new();
+                        tokio::try_join!(
+                            self.fetch_history_packs(
+                                &base_urls,
+                                &base_manifest,
+                                &root,
+                                &none,
+                                Some(idx_tx),
+                                cleanup
+                            ),
+                            self.own_history(
+                                &urls,
+                                &base_manifest,
+                                &root,
+                                &pin.commit,
+                                (base_idx, side_idx, manifest),
+                                cleanup
+                            ),
+                        )
                     },
                 )?;
                 let side = match side_download.take() {
@@ -538,28 +553,14 @@ impl Client {
                     }
                     None => Vec::new(),
                 };
-                let commit = pin.commit.clone();
                 let git_dir = root.join(".git");
-                let held = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     install_packs(&git_dir, packs, "history pack")?;
                     install_packs(&git_dir, side, "side pack")?;
-                    anyhow::Ok(crate::tags::Present::scan(&git_dir)?.contains_hex(&commit))
+                    install_packs(&git_dir, own, "history pack")
                 })
                 .await
                 .context("pack install task")??;
-                // A commit on no ref: its own history too, but for the packs
-                // its Full shares with the base's (levels both built on).
-                if !held {
-                    let (packs, _) =
-                        (self.fetch_history_packs(&urls, &manifest, &root, &base_packs, cleanup))
-                            .await?;
-                    let git_dir = root.join(".git");
-                    tokio::task::spawn_blocking(move || {
-                        install_packs(&git_dir, packs, "history pack")
-                    })
-                    .await
-                    .context("pack install task")??;
-                }
                 (ident, tree)
             }
         };
@@ -807,20 +808,29 @@ impl Client {
 
     /// Head or Full: `git init`, `.git` from the metadata chunk, then the
     /// packs, whose blobs are written into the working tree as each pack
-    /// lands. Returns the committer for the reflog, the manifest, and the
-    /// work tree the index is written from.
+    /// lands. Returns the committer for the reflog and the work tree the
+    /// index is written from. `manifest_tx` gets the manifest as soon as it
+    /// is in.
     async fn materialize_git(
         &self,
         urls: &OutputUrls,
         checkout: &str,
         root: &Path,
         history: bool,
+        manifest_tx: Option<tokio::sync::oneshot::Sender<ClonepackManifest>>,
         cleanup: &Cleanup,
         bench: &mut Benchmark,
-    ) -> Result<(Option<String>, ClonepackManifest, WorkTree)> {
+    ) -> Result<(Option<String>, WorkTree)> {
+        let manifest = async {
+            let manifest = self.fetch_manifest(urls).await?;
+            if let Some(tx) = manifest_tx {
+                let _ = tx.send(manifest.clone());
+            }
+            anyhow::Ok(manifest)
+        };
         let (manifest, metadata, ident) = tokio::try_join!(
             async {
-                tokio::try_join!(self.fetch_manifest(urls), self.fetch_metadata(urls))
+                tokio::try_join!(manifest, self.fetch_metadata(urls))
                     .context("fetch manifest/metadata")
             },
             init_git_dir(root, cleanup),
@@ -851,23 +861,21 @@ impl Client {
             manifest.packs.len()
         );
         bench.mark_archive_download(bytes);
-        Ok((ident, manifest, tree))
+        Ok((ident, tree))
     }
 
     /// Download the history packs `manifest`, of `urls`' Full, lists but
-    /// `held` does, each with its own idx, into files in `dir` for
-    /// [`install_pack`]. Returns them and every listed history pack hash.
+    /// `held` does, with [`Client::fetch_packs`].
     async fn fetch_history_packs(
         &self,
         urls: &OutputUrls,
         manifest: &ClonepackManifest,
         dir: &Path,
         held: &HashSet<Vec<u8>>,
+        idx_tx: Option<tokio::sync::oneshot::Sender<Vec<bytes::Bytes>>>,
         cleanup: &Cleanup,
-    ) -> Result<(Vec<PackFiles>, HashSet<Vec<u8>>)> {
-        use futures::stream::{self, StreamExt, TryStreamExt};
-
-        let history: Vec<(usize, PackEntry)> = (manifest.packs.iter().cloned().enumerate())
+    ) -> Result<Vec<PackFiles>> {
+        let history: Vec<(usize, &PackEntry)> = (manifest.packs.iter().enumerate())
             .filter(|(_, entry)| entry.history_only)
             .collect();
         anyhow::ensure!(
@@ -875,52 +883,129 @@ impl Client {
             "the Full of {} has no history packs",
             urls.output().commit
         );
-        let listed: HashSet<Vec<u8>> = (history.iter())
-            .filter_map(|(_, entry)| Some(entry.pack.as_ref()?.hash.clone()))
-            .collect();
-        let history: Vec<(usize, PackEntry)> = (history.into_iter())
-            .filter(|(_, entry)| {
-                (entry.pack.as_ref()).is_none_or(|pack| !held.contains(&pack.hash))
-            })
-            .collect();
-        self.progress.add_total(
-            (history.iter())
-                .flat_map(|(_, entry)| entry.pack.iter().chain(entry.idx.iter()))
-                .map(|chunk| chunk.len)
-                .sum(),
-        );
+        let mut packs = Vec::new();
+        for (i, entry) in history {
+            let pack =
+                (entry.pack.as_ref()).with_context(|| format!("pack {i} missing pack ref"))?;
+            if held.contains(&pack.hash) {
+                continue;
+            }
+            let idx = (entry.idx.as_ref()).with_context(|| format!("pack {i} missing idx ref"))?;
+            self.progress.add_total(pack.len + idx.len);
+            let pack = Artifact::chunk(pack, UrlSlot::PackChunk(i));
+            packs.push((pack, Artifact::chunk(idx, UrlSlot::PackIdx(i))));
+        }
+        self.fetch_packs(urls, packs, "history pack", dir, idx_tx, cleanup)
+            .await
+    }
+
+    /// Download each pack of `packs` with its idx: the packs into files in
+    /// `dir` for [`install_pack`], `editable_download_concurrency` at a
+    /// time; every idx at once, ahead of them, sent to `idx_tx` once all
+    /// are in.
+    async fn fetch_packs(
+        &self,
+        urls: &OutputUrls,
+        packs: Vec<(Artifact, Artifact)>,
+        what: &'static str,
+        dir: &Path,
+        idx_tx: Option<tokio::sync::oneshot::Sender<Vec<bytes::Bytes>>>,
+        cleanup: &Cleanup,
+    ) -> Result<Vec<PackFiles>> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let (packs, idxs): (Vec<Artifact>, Vec<Artifact>) = packs.into_iter().unzip();
+        let idxs = async {
+            let idxs =
+                futures::future::try_join_all(idxs.iter().enumerate().map(|(i, idx)| async move {
+                    (self.download_bytes(urls, idx).await)
+                        .with_context(|| format!("fetch {what} idx {i}"))
+                }))
+                .await?;
+            if let Some(tx) = idx_tx {
+                let _ = tx.send(idxs.clone());
+            }
+            anyhow::Ok(idxs)
+        };
         let conc = ClientTuning::load().editable_download_concurrency;
-        stream::iter(history)
-            .map(|(i, entry)| {
+        let files = stream::iter(packs.into_iter().enumerate())
+            .map(|(i, pack)| {
                 let (client, urls, dir) = (self.clone(), urls.clone(), dir.to_path_buf());
                 let task = AbortOnDrop::new(
                     tokio::spawn(async move {
-                        let pack = (entry.pack.as_ref())
-                            .with_context(|| format!("pack {i} missing pack ref"))?;
-                        let idx = (entry.idx.as_ref())
-                            .with_context(|| format!("pack {i} missing idx ref"))?;
-                        let pack = Artifact::chunk(pack, UrlSlot::PackChunk(i));
-                        let idx = Artifact::chunk(idx, UrlSlot::PackIdx(i));
-                        let (pack, idx) = tokio::join!(
-                            client.download(&urls, &pack, Sink::TempFile(&dir)),
-                            client.download_bytes(&urls, &idx)
-                        );
                         let Downloaded::TempFile(pack, _) =
-                            pack.with_context(|| format!("stream history pack {i}"))?
+                            (client.download(&urls, &pack, Sink::TempFile(&dir)).await)
+                                .with_context(|| format!("fetch {what} {i}"))?
                         else {
                             unreachable!("temp file sink");
                         };
-                        let idx = idx.with_context(|| format!("fetch history pack idx {i}"))?;
-                        anyhow::Ok(PackFiles { pack, idx })
+                        anyhow::Ok((i, pack))
                     }),
                     cleanup.clone(),
                 );
-                async move { task.join().await.context("history pack download task")? }
+                async move {
+                    task.join()
+                        .await
+                        .with_context(|| format!("{what} download task"))?
+                }
             })
             .buffer_unordered(conc)
-            .try_collect()
+            .try_collect::<Vec<_>>();
+        let (idxs, mut files) = tokio::try_join!(idxs, files)?;
+        files.sort_unstable_by_key(|(i, _)| *i);
+        Ok((files.into_iter().zip(idxs))
+            .map(|((_, pack), idx)| PackFiles { pack, idx })
+            .collect())
+    }
+
+    /// A commit on no ref: its own history, which the base's history packs
+    /// and the side layers lack. Once their idx files are in, and none
+    /// holds `commit`, its own Full's history packs download while the
+    /// base's still do, but for those `base` lists too (levels both built
+    /// on). Nothing when the base's packs hold the commit.
+    async fn own_history(
+        &self,
+        urls: &OutputUrls,
+        base: &ClonepackManifest,
+        dir: &Path,
+        commit: &str,
+        (base_idx, side_idx, manifest): (
+            tokio::sync::oneshot::Receiver<Vec<bytes::Bytes>>,
+            Option<tokio::sync::oneshot::Receiver<Vec<bytes::Bytes>>>,
+            tokio::sync::oneshot::Receiver<ClonepackManifest>,
+        ),
+        cleanup: &Cleanup,
+    ) -> Result<Vec<PackFiles>> {
+        // A sender dropped unsent is a download that failed, and fails the
+        // clone with its own error.
+        let Ok(mut idxs) = base_idx.await else {
+            return Ok(Vec::new());
+        };
+        if let Some(side_idx) = side_idx {
+            let Ok(side) = side_idx.await else {
+                return Ok(Vec::new());
+            };
+            idxs.extend(side);
+        }
+        let id = crate::tags::parse_id(commit)?;
+        let oid = gix::oid::from_bytes_unchecked(&id);
+        for idx in idxs {
+            let idx =
+                gix::odb::pack::index::File::from_data(idx, PathBuf::new(), gix::hash::Kind::Sha1)
+                    .context("read pack idx")?;
+            if idx.lookup(oid).is_some() {
+                return Ok(Vec::new());
+            }
+        }
+        let Ok(manifest) = manifest.await else {
+            return Ok(Vec::new());
+        };
+        let listed: HashSet<Vec<u8>> = (base.packs.iter())
+            .filter(|entry| entry.history_only)
+            .filter_map(|entry| Some(entry.pack.as_ref()?.hash.clone()))
+            .collect();
+        self.fetch_history_packs(urls, &manifest, dir, &listed, None, cleanup)
             .await
-            .map(|packs| (packs, listed))
     }
 
     /// The clonepack manifest of `urls`' output, checked against its commit.

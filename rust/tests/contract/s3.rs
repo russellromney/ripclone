@@ -308,6 +308,7 @@ fn s3_c7_new_push_files_skip_a_running_full() {
 
     // Head(B) starts a refs refresh, which writes too. Once it has published,
     // nothing else writes while Full(B) starts, so the held PUT is Full's.
+    // Not `wait_first_refs`: it reads the refs through Full(B), pending here.
     server.wait_log("published refs of github/acme%2Fc7");
     s3_proxy.hold_puts(&format!("/{}/", s3.bucket), 1);
     server.restart_with(&[("RIPCLONE_FULL_SLOTS", "1")]);

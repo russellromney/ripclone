@@ -1973,7 +1973,23 @@ fn g16_a_clone_of_another_commit_gets_every_ref_without_the_upstream() {
         remote_refs(&at_v1)
     );
 
-    let side = t.clone("side", &["--branch", "side"]);
+    // The side layers hold S: the clone downloads none of S's own history.
+    let proxy = FaultProxy::start(&t.server);
+    let (side, out) = t.clone_via(&proxy, "side", &["--branch", "side"], &[]);
+    out.ok();
+    assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
+    let own: Vec<String> = (history_packs(&t.server, &t.repo, &t.s))
+        .difference(&history_packs(&t.server, &t.repo, &t.c))
+        .cloned()
+        .collect();
+    assert!(!own.is_empty(), "S's Full has no history of its own");
+    let gets = proxy.artifact_gets();
+    assert!(
+        !gets
+            .iter()
+            .any(|get| own.iter().any(|pack| get.path.ends_with(pack.as_str()))),
+        "the side clone downloaded its own history"
+    );
     assert_eq!(git(&side, &["symbolic-ref", "HEAD"]), "refs/heads/side");
     assert_eq!(git(&side, &["rev-parse", "@{upstream}"]), t.s);
     assert_eq!(listing(&side), t.origin.tree(&t.s));
@@ -2234,6 +2250,33 @@ fn g26_with_no_ready_tip_full_a_clone_of_another_commit_falls_back() {
     git(&alone, &["fsck", "--full", "--strict"]);
 }
 
+/// The history packs of `commit`'s Full, by hash.
+fn history_packs(server: &Server, repo: &str, commit: &str) -> std::collections::HashSet<String> {
+    manifest_packs(server, repo, commit, true)
+}
+
+/// The packs of `commit`'s Full that write the working tree, by hash.
+fn full_packs(server: &Server, repo: &str, commit: &str) -> std::collections::HashSet<String> {
+    manifest_packs(server, repo, commit, false)
+}
+
+fn manifest_packs(
+    server: &Server,
+    repo: &str,
+    commit: &str,
+    history: bool,
+) -> std::collections::HashSet<String> {
+    let (_, body) = api::read_commit(server, repo, commit, Some("full"));
+    let hash = body["clonepack_manifest"].as_str().unwrap().to_string();
+    let (status, bytes) = server.get_bytes(&format!("/v1/artifacts/{hash}"));
+    assert_eq!(status, 200, "Full manifest {hash}");
+    let manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice()).unwrap();
+    (manifest.packs.iter())
+        .filter(|entry| entry.history_only == history)
+        .map(|entry| ripclone::clonepack::hash_to_hex(&entry.pack.as_ref().unwrap().hash))
+        .collect()
+}
+
 /// G27: a clone of a commit on no ref, whose Full and the tip's both build
 /// on an older Full, downloads the history they share once: the tip's
 /// history, the side pack and its own commit's other packs, with no
@@ -2255,7 +2298,9 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     world.cli(&server, &["add", "acme/g27", "--wait"]).ok();
     wait_first_refs(&server, "acme/g27", &a);
     // A pull request's commit X off A, built from a branch since deleted.
+    // Two commits, so X's history has a pack its working tree's packs do not.
     git(work, &["checkout", "-q", "-b", "pr", &a]);
+    origin.commit(&[("x1.txt", "x1\n")], "X1");
     let x = origin.commit(&[("x.txt", "x\n")], "X");
     git(work, &["checkout", "-q", "main"]);
     origin.publish_branch("pr");
@@ -2273,33 +2318,43 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
     wait_for("the refs at C", || {
         (full(&x)["refs_base"]["commit"] == c.as_str()).then_some(())
     });
-    // The history packs of a Full, by hash.
-    let history = |commit: &str| -> std::collections::HashSet<String> {
-        let hash = full(commit)["clonepack_manifest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let (status, bytes) = server.get_bytes(&format!("/v1/artifacts/{hash}"));
-        assert_eq!(status, 200, "Full manifest {hash}");
-        let manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice()).unwrap();
-        (manifest.packs.iter())
-            .filter(|entry| entry.history_only)
-            .map(|entry| ripclone::clonepack::hash_to_hex(&entry.pack.as_ref().unwrap().hash))
-            .collect()
-    };
+    let history = |commit: &str| history_packs(&server, "acme/g27", commit);
     let shared: Vec<String> = (history(&x).intersection(&history(&c))).cloned().collect();
     assert!(
         !shared.is_empty(),
         "X's and C's Fulls share no history pack"
     );
 
+    // X's own history downloads while C's does: with a pack only C's Full
+    // has held, the clone already asks for one only X's has.
+    let only = |a: &str, b: &str| -> Vec<String> {
+        let mut only: Vec<String> = history(a).difference(&history(b)).cloned().collect();
+        only.sort();
+        only
+    };
+    let c_only = only(&c, &x);
+    let x_only: Vec<String> = (only(&x, &c).into_iter())
+        .filter(|pack| !full_packs(&server, "acme/g27", &x).contains(pack))
+        .collect();
+    assert!(
+        !c_only.is_empty() && !x_only.is_empty(),
+        "{c_only:?} {x_only:?}"
+    );
     let proxy = FaultProxy::start(&server);
+    proxy.fault_requests(&format!("/v1/artifacts/{}", c_only[0]), Fault::Hold, 1);
     let fetches = http.fetches();
     let target = world.target("pr");
-    let out = world.cli(
+    let cli = world.cli_spawn(
         &proxy,
         &["clone", "acme/g27", target.to_str().unwrap(), "--at", &x],
     );
+    proxy.wait_held(1);
+    proxy.wait_seen("a GET of X's own history while C's is held", |seen| {
+        seen.iter()
+            .any(|get| x_only.iter().any(|pack| get.path.ends_with(pack.as_str())))
+    });
+    proxy.release();
+    let out = cli.wait();
     out.ok();
     assert!(!out.stderr().contains(NO_REFS), "{}", out.stderr());
     assert_eq!(
