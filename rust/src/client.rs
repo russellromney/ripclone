@@ -97,6 +97,20 @@ impl BuildSummary {
     }
 }
 
+/// A `POST .../builds` answer.
+#[derive(Debug, Deserialize)]
+struct BuildAnswer {
+    #[serde(flatten)]
+    summary: BuildSummary,
+    /// The output the request named, as `GET .../commits/{sha}?kind=`
+    /// answers.
+    #[serde(default)]
+    output: Option<CommitOutput>,
+    /// The hosted server's per-clone id, from a header.
+    #[serde(skip)]
+    clone_id: Option<String>,
+}
+
 /// `GET .../commits/{sha}?kind=`: one body per state of that output.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
@@ -324,6 +338,9 @@ pub struct RefResponse {
     pub clonepack_manifest: String,
     #[serde(default)]
     pub clonepack_manifest_url: Option<String>,
+    /// The manifest itself, base64, when the server sends it.
+    #[serde(default)]
+    pub clonepack_manifest_data: Option<String>,
     pub metadata_chunk: String,
     #[serde(default)]
     pub metadata_chunk_url: Option<String>,
@@ -571,22 +588,28 @@ impl Client {
         selector: &str,
         retry: bool,
     ) -> Result<BuildSummary> {
-        Ok(self.request_build(repo_path, selector, retry).await?.0)
+        Ok(self
+            .request_build(repo_path, selector, retry, None)
+            .await?
+            .summary)
     }
 
-    /// [`Self::post_build`], plus the hosted server's per-clone id.
+    /// [`Self::post_build`], plus the hosted server's per-clone id and, with
+    /// `kind`, that output of the build.
     async fn request_build(
         &self,
         repo_path: &str,
         selector: &str,
         retry: bool,
-    ) -> Result<(BuildSummary, Option<String>)> {
+        kind: Option<ExactResultKind>,
+    ) -> Result<BuildAnswer> {
         crate::validation::Selector::parse(selector)?;
         let url = self.repo_url(repo_path, "/builds");
-        let request = self
-            .http
-            .request(reqwest::Method::POST, &url)
-            .json(&serde_json::json!({"selector": selector, "retry": retry}));
+        let mut body = serde_json::json!({"selector": selector, "retry": retry});
+        if let Some(kind) = kind {
+            body["kind"] = serde_json::json!(kind);
+        }
+        let request = self.http.request(reqwest::Method::POST, &url).json(&body);
         let resp = self.send(request).await?;
         if !resp.status().is_success() {
             return Err(server_error(&self.progress, "build request failed", resp).await);
@@ -596,11 +619,12 @@ impl Client {
             .get("x-ripclone-clone-id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let summary: BuildSummary = resp
+        let mut answer: BuildAnswer = resp
             .json()
             .await
             .with_context(|| format!("invalid build response for {repo_path}"))?;
-        validate_summary(&summary, repo_path)?;
+        let summary = &answer.summary;
+        validate_summary(summary, repo_path)?;
         if crate::validation::validate_object_id(selector).is_ok() {
             anyhow::ensure!(
                 summary.commit == selector,
@@ -608,7 +632,8 @@ impl Client {
                 summary.commit
             );
         }
-        Ok((summary, clone_id))
+        answer.clone_id = clone_id;
+        Ok(answer)
     }
 
     /// `GET .../commits/{sha}`: the state of each output of one build.

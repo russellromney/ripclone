@@ -47,6 +47,7 @@ fn d2_changed_commit_in_later_poll_fails() {
 
     // The admission names B; every commit read after it says A.
     let proxy = FaultProxy::start(&server);
+    api::without_admission_output(&proxy);
     proxy.rewrite(api::COMMIT_READS, &b, &a);
     let target = world.target("d2");
     let out = world.cli(

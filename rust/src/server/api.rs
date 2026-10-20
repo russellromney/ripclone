@@ -31,6 +31,10 @@ pub struct BuildRequest {
     /// Put failed outputs of the commit back to pending.
     #[serde(default)]
     pub retry: bool,
+    /// Answer with this output of the commit too, as `GET
+    /// .../commits/{sha}?kind=` would, so a clone needs no second request.
+    #[serde(default)]
+    pub kind: Option<ExactResultKind>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +156,11 @@ pub struct RefResponse {
     /// Signed URL for the clonepack manifest itself, if the backend supports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clonepack_manifest_url: Option<String>,
+    /// The manifest itself, base64, so the clone need not download it.
+    /// Absent when the server cannot read it or it is over
+    /// [`MAX_INLINE_MANIFEST`] bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clonepack_manifest_data: Option<String>,
     /// Metadata chunk hash (protobuf). The client uses this to verify the
     /// metadata bytes it downloads concurrently with the manifest.
     pub metadata_chunk: String,
@@ -576,7 +585,11 @@ async fn post_build(
         return Err(repo_not_added());
     }
     let resolved = resolve(state, repo_id, provider, &selector).await?;
-    admit_resolved(state, repo_id, resolved, request.retry, start).await
+    let (row, mut body) = admit_resolved(state, repo_id, resolved, request.retry, start).await?;
+    if let Some(kind) = request.kind {
+        body["output"] = output_body(state, repo_id, provider, &row, kind).await?;
+    }
+    Ok(Json(body).into_response())
 }
 
 /// `POST .../add`: resolve HEAD first, so a repository the upstream does not
@@ -592,7 +605,8 @@ async fn add_repo(
         state.metrics.record_error();
         ApiError::control(error)
     })?;
-    admit_resolved(state, repo_id, resolved, true, start).await
+    let (_, body) = admit_resolved(state, repo_id, resolved, true, start).await?;
+    Ok(Json(body).into_response())
 }
 
 async fn admit_resolved(
@@ -601,7 +615,7 @@ async fn admit_resolved(
     resolved: Resolved,
     retry: bool,
     start: Instant,
-) -> Result<Response, ApiError> {
+) -> Result<(BuildRow, serde_json::Value), ApiError> {
     let (row, _) = admit_build(
         state,
         repo_id,
@@ -622,7 +636,7 @@ async fn admit_resolved(
     {
         body["tag"] = serde_json::json!(tag);
     }
-    Ok(Json(body).into_response())
+    Ok((row, body))
 }
 
 fn output_state(out: Out<()>) -> serde_json::Value {
@@ -741,10 +755,54 @@ async fn ready_body(
             }
         }
     }
+    result.clonepack_manifest_data = manifest_data(state, &result.clonepack_manifest).await;
+    if let Some(base) = result.refs_base.as_mut() {
+        base.clonepack_manifest_data = manifest_data(state, &base.clonepack_manifest).await;
+    }
     Ok(serde_json::json!(ReadyBody {
         state: "ready",
         result,
     }))
+}
+
+/// The largest manifest a ready body carries. A larger one, a Full of a
+/// repository with very many packs, the clone downloads.
+pub(super) const MAX_INLINE_MANIFEST: u64 = 256 * 1024;
+
+/// The manifest `hash`, base64, for a ready body: from the local cache, else
+/// from storage, kept in the cache after. `None` when neither has it or it
+/// is over [`MAX_INLINE_MANIFEST`]; the clone then downloads it.
+async fn manifest_data(state: &ServerState, hash: &str) -> Option<String> {
+    use base64::Engine;
+    let (cas, storage, key) = (
+        state.cas.detached(),
+        state.storage.clone(),
+        hash.to_string(),
+    );
+    let read = crate::cancel::spawn_blocking(move || {
+        if let Ok(meta) = std::fs::metadata(cas.path(&key)) {
+            if meta.len() > MAX_INLINE_MANIFEST {
+                return anyhow::Ok(None);
+            }
+            if let Ok(bytes) = cas.get(&key) {
+                return Ok(Some(bytes));
+            }
+        }
+        let bytes = storage.get(&key)?;
+        // Caching is not storing: no upload hook.
+        cas.put_with_hash(&key, &bytes)?;
+        Ok((bytes.len() as u64 <= MAX_INLINE_MANIFEST).then_some(bytes))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|read| read);
+    match read {
+        Ok(bytes) => bytes.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+        Err(error) => {
+            tracing::debug!("inline manifest {hash}: {error:#}; the clone downloads it");
+            None
+        }
+    }
 }
 
 /// The own history of `row`'s Full, signed, when a clone that installs
@@ -840,17 +898,28 @@ async fn get_commit(
     let Some(kind) = kind else {
         return Ok(Json(build_summary_body(&row)).into_response());
     };
-    let body = match kind_state(&row, kind) {
-        Out::Ready(()) => ready_body(state, repo_id, provider, &row, kind).await?,
+    let body = output_body(state, repo_id, provider, &row, kind).await?;
+    Ok(Json(body).into_response())
+}
+
+/// The answer for `row`'s `kind` output: ready, failed or pending.
+async fn output_body(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    row: &BuildRow,
+    kind: ExactResultKind,
+) -> Result<serde_json::Value, ApiError> {
+    Ok(match kind_state(row, kind) {
+        Out::Ready(()) => ready_body(state, repo_id, provider, row, kind).await?,
         Out::Failed(error) => serde_json::json!({
             "state": "failed",
             "commit": row.commit,
             "kind": kind,
             "error": error,
         }),
-        Out::Pending { error } => pending_body(state, repo_id, provider, &row, kind, error).await?,
-    };
-    Ok(Json(body).into_response())
+        Out::Pending { error } => pending_body(state, repo_id, provider, row, kind, error).await?,
+    })
 }
 
 /// The answer for `row`'s pending `kind` output. A pending Full names its
@@ -1015,6 +1084,7 @@ fn ref_response(
         parent_commit: row.parent.clone(),
         clonepack_manifest: artifacts.manifest.clone(),
         clonepack_manifest_url: signed(&artifacts.manifest),
+        clonepack_manifest_data: None,
         metadata_chunk: artifacts.metadata_chunk.clone(),
         metadata_chunk_url: signed(&artifacts.metadata_chunk),
         metadata_delta: artifacts.metadata_delta.clone(),

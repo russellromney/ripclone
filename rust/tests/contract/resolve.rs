@@ -345,3 +345,87 @@ fn a8_empty_upstream_is_refused_until_its_first_push() {
     assert_eq!(listing(&target), origin.tree(&tip));
     assert_eq!(server.metric("ripclone_builds_failed_total"), 0);
 }
+
+/// A9: a clone of a ready commit asks the server once. The admission answers
+/// with the output, its manifest inline, so the clone makes no commit read
+/// and downloads no manifest. From an answer without the output or the
+/// manifest, the clone reads and downloads them; an inline manifest that
+/// does not match its hash fails the clone.
+#[test]
+fn a9_a_ready_clone_asks_the_server_once() {
+    let world = World::new();
+    let origin = world.origin("acme", "a9");
+    origin.commit(&[("a.txt", "a\n")], "A");
+    let tip = origin.commit(&[("b.txt", "b\n")], "B");
+    origin.publish();
+    let server = world.server(&[]);
+    world.cli(&server, &["add", "acme/a9", "--wait"]).ok();
+    let manifest = |kind: &str| {
+        let (_, body) = api::parse(server.get(&api::commit_path("acme/a9", &tip, Some(kind))));
+        body["clonepack_manifest"].as_str().unwrap().to_string()
+    };
+
+    for (kind, args) in [
+        ("full", &[][..]),
+        ("head", &["--depth", "1"][..]),
+        ("files", &["--mode", "files"][..]),
+    ] {
+        let proxy = FaultProxy::start(&server);
+        let target = world.target(&format!("once-{kind}"));
+        let mut clone = vec!["clone", "acme/a9", target.to_str().unwrap()];
+        clone.extend(args);
+        world.cli(&proxy, &clone).ok();
+        assert_eq!(listing(&target), origin.tree(&tip), "{kind}");
+        let seen = proxy.seen();
+        let api: Vec<&Seen> = seen
+            .iter()
+            .filter(|s| s.path.starts_with("/v1/repos/"))
+            .collect();
+        assert!(
+            api.len() == 1 && api::is_build_post(api[0]),
+            "{kind}: {api:#?}"
+        );
+        let manifest = format!("/v1/artifacts/{}", manifest(kind));
+        assert!(
+            !proxy.artifact_gets().iter().any(|s| s.path == manifest),
+            "{kind}: the clone downloaded its manifest"
+        );
+
+        let hidden = FaultProxy::start(&server);
+        api::without_admission_output(&hidden);
+        api::rewrite_outputs(&hidden, "\"clonepack_manifest_data\":", "\"hidden_data\":");
+        let target = world.target(&format!("hidden-{kind}"));
+        let mut clone = vec!["clone", "acme/a9", target.to_str().unwrap()];
+        clone.extend(args);
+        world.cli(&hidden, &clone).ok();
+        assert_eq!(listing(&target), origin.tree(&tip), "{kind}");
+        assert!(
+            hidden.seen().iter().any(|s| api::is_commit_read(s, &tip)),
+            "{kind}: the clone never read the output"
+        );
+        assert!(
+            hidden.artifact_gets().iter().any(|s| s.path == manifest),
+            "{kind}: the clone never downloaded its manifest"
+        );
+    }
+
+    // A base64 manifest with its first character changed decodes to other
+    // bytes.
+    let (_, body) = api::parse(server.get(&api::commit_path("acme/a9", &tip, Some("head"))));
+    let data = body["clonepack_manifest_data"].as_str().unwrap();
+    let swapped = if data.starts_with('A') { "B" } else { "A" };
+    let lying = FaultProxy::start(&server);
+    api::rewrite_outputs(&lying, data, &format!("{swapped}{}", &data[1..]));
+    let target = world.target("lying");
+    let out = world.cli(
+        &lying,
+        &["clone", "acme/a9", target.to_str().unwrap(), "--depth", "1"],
+    );
+    assert!(
+        out.err().contains("inline manifest hashes to"),
+        "{}",
+        out.err()
+    );
+    assert!(!target.exists(), "failed clone left {}", target.display());
+    assert!(world.staging_leftovers().is_empty());
+}

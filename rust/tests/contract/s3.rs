@@ -64,7 +64,7 @@ fn s3_f7_expired_url_refreshes_and_resumes() {
         "the resume reused the expired URL"
     );
 
-    // The first read of the commit finds it ready; later reads refresh URLs.
+    // The admission finds the commit ready; each read refreshes URLs.
     // Every read names the same commit.
     let reads: Vec<Seen> = server_proxy
         .seen()
@@ -72,7 +72,7 @@ fn s3_f7_expired_url_refreshes_and_resumes() {
         .filter(|s| s.path.contains(api::COMMIT_READS))
         .collect();
     assert!(
-        reads.len() >= 2 && reads.iter().all(|s| api::is_commit_read(s, &tip)),
+        !reads.is_empty() && reads.iter().all(|s| api::is_commit_read(s, &tip)),
         "the CLI never refreshed URLs for {tip}: {reads:#?}"
     );
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), tip);

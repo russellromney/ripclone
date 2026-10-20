@@ -123,6 +123,20 @@ fn validate_manifest_commit(manifest: &ClonepackManifest, commit: &str) -> Resul
     Ok(())
 }
 
+/// The manifest a ready body carries, base64: its bytes, checked against
+/// its hash as a downloaded one is.
+fn inline_manifest(data: &str, hash: &str) -> Result<bytes::Bytes> {
+    use base64::Engine;
+    let bytes = (base64::engine::general_purpose::STANDARD.decode(data))
+        .context("decode inline clonepack manifest")?;
+    let actual = crate::cas::hash(&bytes);
+    anyhow::ensure!(
+        actual == hash,
+        "clonepack integrity error: inline manifest hashes to {actual}, not {hash}"
+    );
+    Ok(bytes.into())
+}
+
 impl Client {
     /// Clone `request` into `target`, which must be missing or an empty
     /// directory. Downloads the
@@ -170,7 +184,7 @@ impl Client {
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
-        let mut pin = self.resolve(request).await?;
+        let (mut pin, first) = self.resolve(request).await?;
         // A full clone never waits on the server: while Full(B) builds, it
         // installs the newest ready Full and fetches the rest upstream. A
         // files clone takes B's working tree from Head(B) while Files(B)
@@ -184,7 +198,7 @@ impl Client {
                 ExactResultKind::Head => Fallback::None,
             }
         };
-        let (plan, cold) = self.plan(repo_path, &pin, request.kind, fallback).await?;
+        let (plan, cold) = (self.plan(repo_path, &pin, request.kind, fallback, first)).await?;
         bench.mark_resolve();
         let output = plan.output();
         info!(
@@ -250,8 +264,9 @@ impl Client {
     }
 
     /// Resolve the selector once with `POST .../builds`. `--at` names the
-    /// commit; an explicit `--branch` then names the checkout.
-    async fn resolve(&self, request: &CloneRequest<'_>) -> Result<Pin> {
+    /// commit; an explicit `--branch` then names the checkout. The answer
+    /// carries the commit's `request.kind` output, the plan's first poll.
+    async fn resolve(&self, request: &CloneRequest<'_>) -> Result<(Pin, Option<CommitOutput>)> {
         let (selector, checkout_override) = match request.at {
             Some(at) => (at, (request.branch != "HEAD").then_some(request.branch)),
             None => (request.branch, None),
@@ -260,15 +275,15 @@ impl Client {
             crate::validation::validate_checkout_name(name)
                 .with_context(|| format!("invalid checkout branch {name}"))?;
         }
-        let (summary, clone_id) = self
-            .request_build(request.repo_path, selector, false)
-            .await?;
+        let answer =
+            (self.request_build(request.repo_path, selector, false, Some(request.kind))).await?;
+        let (summary, clone_id) = (answer.summary, answer.clone_id);
         let checkout = checkout_override
             .map(str::to_string)
             .or(summary.checkout_name)
             .unwrap_or_default();
         let tracks = checkout_override.is_none() && !checkout.is_empty();
-        Ok(Pin {
+        let pin = Pin {
             commit: summary.commit,
             checkout,
             tracks,
@@ -276,12 +291,14 @@ impl Client {
             tag: summary.tag,
             single_branch: request.single_branch || request.kind == ExactResultKind::Head,
             clone_id,
-        })
+        };
+        Ok((pin, answer.output))
     }
 
     /// Poll the pinned commit's `kind` output until it is ready or failed.
     /// While it is pending, `fallback` may take another ready output instead:
     /// the base a pending answer names, or the same commit's ready Head.
+    /// `first`, the resolve's answer, is the first poll when it has one.
     /// Returns the plan and whether any poll saw it pending.
     async fn plan(
         &self,
@@ -289,11 +306,16 @@ impl Client {
         pin: &Pin,
         kind: ExactResultKind,
         fallback: Fallback,
+        mut first: Option<CommitOutput>,
     ) -> Result<(Plan, bool)> {
         let target = &pin.commit;
         let (mut cold, started) = (false, std::time::Instant::now());
         for attempt in 0..MAX_POLLS {
-            match self.commit_output(repo_path, target, kind).await? {
+            let answer = match first.take() {
+                Some(answer) => answer,
+                None => self.commit_output(repo_path, target, kind).await?,
+            };
+            match answer {
                 CommitOutput::Ready(output) => {
                     validate_output(&output, target, kind, repo_path)?;
                     if let Some(base) = &output.refs_base {
@@ -1061,10 +1083,12 @@ impl Client {
             len: None,
             slot: UrlSlot::Manifest,
         };
-        let data = self
-            .download_bytes(urls, &artifact)
-            .await
-            .context("fetch clonepack manifest")?;
+        let data = match output.clonepack_manifest_data.as_deref() {
+            Some(data) => inline_manifest(data, &output.clonepack_manifest)?,
+            None => (self.download_bytes(urls, &artifact))
+                .await
+                .context("fetch clonepack manifest")?,
+        };
         let manifest =
             ClonepackManifest::decode(data.as_ref()).context("decode clonepack manifest")?;
         validate_manifest_commit(&manifest, &output.commit)?;

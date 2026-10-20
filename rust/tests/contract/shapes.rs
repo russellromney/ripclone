@@ -1359,7 +1359,7 @@ fn g21_tag_chains_past_32_deep_are_left_out() {
     git(&full, &["fsck", "--strict"]);
 }
 
-/// The commit reads through `proxy` name a tags artifact of `tags`,
+/// The outputs served through `proxy` name a tags artifact of `tags`,
 /// `(name, object)` lightweight tags, stored in the server's cache, in
 /// place of the server's own.
 fn serve_tags(
@@ -1387,7 +1387,7 @@ fn serve_tags(
     std::fs::write(&path, &bytes).unwrap();
     let (status, served) = server.get_bytes(&format!("/v1/artifacts/{id}"));
     assert_eq!((status, served), (200, bytes));
-    proxy.rewrite(api::COMMIT_READS, own, &id);
+    api::rewrite_outputs(proxy, own, &id);
 }
 
 /// G22: a tags artifact that lists one name twice fails the clone, which
@@ -1744,7 +1744,7 @@ fn g25_a_local_failure_of_the_refs_fetch_fails_the_clone() {
     let server = world.server(&[]);
     world.cli(&server, &["add", "acme/g25", "--wait"]).ok();
     let proxy = FaultProxy::start(&server);
-    proxy.rewrite(api::COMMIT_READS, "\"branches\":", "\"no_branches\":");
+    api::rewrite_outputs(&proxy, "\"branches\":", "\"no_branches\":");
 
     let wrapper = GitWrapper::new(
         &world,
@@ -2384,20 +2384,27 @@ fn g27_a_clone_of_a_commit_on_no_ref_downloads_shared_history_once() {
         fetches,
         "the clone fetched from the upstream"
     );
-    // Each shared pack, the own history, and X's and C's manifests come
-    // down once.
-    let manifests = [&x, &c].map(|commit| {
-        full(commit)["clonepack_manifest"]
+    // Each shared pack and the own history come down once. X's and C's
+    // manifests come inline, so neither does.
+    let count = |artifact: &str| {
+        (gets.iter())
+            .filter(|get| get.path.ends_with(artifact))
+            .count()
+    };
+    for artifact in shared.iter().chain(&own_packs) {
+        assert_eq!(
+            count(artifact),
+            1,
+            "{artifact} downloaded {} times",
+            count(artifact)
+        );
+    }
+    for commit in [&x, &c] {
+        let manifest = full(commit)["clonepack_manifest"]
             .as_str()
             .unwrap()
-            .to_string()
-    });
-    for artifact in shared.iter().chain(&own_packs).chain(&manifests) {
-        let count = gets
-            .iter()
-            .filter(|get| get.path.ends_with(artifact.as_str()))
-            .count();
-        assert_eq!(count, 1, "{artifact} downloaded {count} times");
+            .to_string();
+        assert_eq!(count(&manifest), 0, "{commit}'s manifest was downloaded");
     }
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), x);
     assert_eq!(listing(&target), origin.tree(&x));
@@ -2509,8 +2516,8 @@ fn g18_a_bad_refs_base_or_side_pack_fails_the_clone_cleanly() {
 
     let lying = FaultProxy::start(&t.server);
     let b = git(&t.origin.bare, &["rev-parse", "main~1"]);
-    lying.rewrite(
-        &format!("/commits/{}", t.a),
+    api::rewrite_outputs(
+        &lying,
         &format!("\"commit\":\"{}\"", t.c),
         &format!("\"commit\":\"{b}\""),
     );

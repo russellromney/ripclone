@@ -49,8 +49,10 @@ commit and admits a build of it. `GET /v1/repos/{provider}/{path}/commits/{sha}?
 reads one result: ready with its artifacts, pending, or failed. The GET never
 builds.
 
-A clone POSTs once, then polls the GET for the commit it was given, so a
-branch moving mid-clone cannot change what it installs. It uses the same GET
+A clone POSTs once, naming the result it needs, and the answer carries that
+result as the GET would, with its manifest inline. While the result is
+pending, the clone polls the GET for the commit it was given, so a branch
+moving mid-clone cannot change what it installs. It uses the same GET
 to refresh expired URLs. While Full is pending, the GET offers a ready Full of
 an earlier commit (the branch's latest, or the parent's) as `top_up`. A full
 clone installs that and fetches the rest with the user's own git from the URL

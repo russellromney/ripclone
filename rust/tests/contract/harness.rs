@@ -1421,10 +1421,11 @@ pub fn push_hook(
 }
 
 /// The build API's wire format, kept in one place: `POST .../builds` admits a
-/// selector, `GET .../commits/{sha}[?kind=]` reads one commit's outputs.
+/// selector, and with a `kind` answers that output too; `GET
+/// .../commits/{sha}[?kind=]` reads one commit's outputs.
 pub mod api {
     use super::{HttpResponse, Server};
-    use crate::net::Seen;
+    use crate::net::{FaultProxy, Seen};
 
     /// The API path of `repo`, as the CLI names it: `owner/name` on the
     /// default `github` provider, or `<provider>:<path>`.
@@ -1457,6 +1458,22 @@ pub mod api {
 
     /// Text in a commit read's URL, for a proxy rule that matches only those.
     pub const COMMIT_READS: &str = "/commits/";
+
+    /// Text in a build admission's URL.
+    pub const BUILDS: &str = "/builds";
+
+    /// Replace `from` with `to` in every answer that carries an output: the
+    /// clone's admission and each commit read.
+    pub fn rewrite_outputs(proxy: &FaultProxy, from: &str, to: &str) {
+        proxy.rewrite(BUILDS, from, to);
+        proxy.rewrite(COMMIT_READS, from, to);
+    }
+
+    /// Hide the output in each admission's answer, so the clone reads it
+    /// with `GET .../commits/{sha}?kind=`, as from a server without it.
+    pub fn without_admission_output(proxy: &FaultProxy) {
+        proxy.rewrite(BUILDS, "\"output\":", "\"hidden_output\":");
+    }
 
     /// The tags artifact a read of `commit`'s Full points at.
     pub fn tags_artifact(server: &Server, repo: &str, commit: &str) -> Option<String> {

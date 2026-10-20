@@ -62,7 +62,10 @@ connection the server keeps open, or `git ls-remote` when the upstream does
 not answer it. A full SHA is trusted as given and admitted
 without asking the upstream. Anything else, such as `HEAD~1`, is `400
 invalid_selector`. `retry: true` puts failed outputs of the commit back to
-pending.
+pending. `"kind": "head"`, `"full"` or `"files"` also asks for that output
+of the commit, which the answer carries as `output`, the body
+`GET .../commits/{sha}?kind=` gives (below). A clone sends it, so a clone of
+a ready commit makes one request before it downloads.
 
 The answer comes at once and never waits for a build:
 
@@ -97,6 +100,7 @@ built after it. A ready output never changes. See [Design](DESIGN.md).
 ```json
 {
   "clonepack_manifest": "<sha256>",
+  "clonepack_manifest_data": "<base64>",
   "clonepack_manifest_url": "https://s3.example.com/ripclone/<key>?X-Amz-...",
   "commit": "9f2c1e4b7a0d3c5e8f1a2b4c6d8e0f1a3b5c7d9e",
   "host": "github.com",
@@ -113,6 +117,10 @@ built after it. A ready output never changes. See [Design](DESIGN.md).
   "state": "ready"
 }
 ```
+
+`clonepack_manifest_data` is the manifest itself, base64, so a clone does
+not download it. It is left out when the manifest is over 256 KiB or the
+server cannot read it. The client checks it against `clonepack_manifest`.
 
 The `*_url` fields are left out when storage cannot sign URLs (local disk).
 Fetch those artifacts from `GET /v1/artifacts/{hash}` instead. In a Full,
