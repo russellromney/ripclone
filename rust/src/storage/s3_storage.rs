@@ -1,3 +1,4 @@
+use super::put_limit::PutLimit;
 use crate::storage::StorageBackend;
 use anyhow::{Context, Result};
 use futures::{StreamExt, TryStreamExt};
@@ -17,7 +18,12 @@ const MULTIPART_UPLOAD_PART_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(test)]
 const MULTIPART_UPLOAD_PART_BYTES: u64 = 8 * 1024 * 1024;
 const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = MULTIPART_UPLOAD_PART_BYTES;
+/// Parts of one object in flight at once, within [`PUT_SLOTS`].
 const MULTIPART_UPLOAD_MAX_CONCURRENCY: usize = 16;
+/// Streamed PUTs (whole objects and parts) in flight at once across the
+/// server while the bucket does not throttle. Parts stream from disk, so
+/// this bounds connections, not memory.
+const PUT_SLOTS: usize = 32;
 /// Tries per streamed PUT. The client cannot replay a streamed body, so a
 /// failed part is sent again from the file here; without this, one slow part
 /// fails the whole upload and the build that made it.
@@ -27,6 +33,16 @@ const STREAM_PUT_ATTEMPTS: u32 = 3;
 const STREAM_PUT_RETRY_DELAY: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const STREAM_PUT_RETRY_DELAY: Duration = Duration::ZERO;
+/// Tries per streamed PUT the bucket throttles. Throttling asks for fewer
+/// requests, not a different one, so it gets more tries and longer waits
+/// than a failure; the wait doubles from [`THROTTLE_DELAY`] up to
+/// [`THROTTLE_MAX_DELAY`], or is what the bucket asked for.
+const THROTTLED_PUT_ATTEMPTS: u32 = 8;
+#[cfg(not(test))]
+const THROTTLE_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const THROTTLE_DELAY: Duration = Duration::ZERO;
+const THROTTLE_MAX_DELAY: Duration = Duration::from_secs(10);
 const MULTIPART_UPLOAD_MAX_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MULTIPART_UPLOAD_MAX_PARTS: u64 = 10_000;
 const MULTIPART_UPLOAD_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
@@ -35,19 +51,6 @@ const MULTIPART_UPLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// skipped when the bucket has them. A smaller PUT costs about what the HEAD
 /// would.
 const EXISTS_CHECK_BYTES: u64 = 1024 * 1024;
-
-fn multipart_upload_concurrency_for_cores(cores: usize) -> usize {
-    cores
-        .max(1)
-        .saturating_mul(2)
-        .min(MULTIPART_UPLOAD_MAX_CONCURRENCY)
-}
-
-fn multipart_upload_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|cores| multipart_upload_concurrency_for_cores(cores.get()))
-        .unwrap_or(4)
-}
 
 fn multipart_upload_part_bytes(len: u64) -> Result<u64> {
     if len > MULTIPART_UPLOAD_MAX_OBJECT_BYTES {
@@ -75,24 +78,70 @@ async fn file_range_stream(
     Ok(ReaderStream::new(file.take(len)))
 }
 
-/// Run a streamed PUT up to [`STREAM_PUT_ATTEMPTS`] times.
-async fn with_stream_retries<T, F, Fut>(key: &str, mut send: F) -> Result<T>
+/// Run a streamed PUT within `limit`: up to [`STREAM_PUT_ATTEMPTS`] times
+/// when it fails, and up to [`THROTTLED_PUT_ATTEMPTS`] times when the
+/// bucket throttles it, which also lowers the limit.
+async fn send_put<T, F, Fut>(limit: &PutLimit, key: &str, mut send: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let mut attempt = 1;
+    let (mut failures, mut throttles) = (0, 0);
     loop {
-        match send().await {
-            Ok(value) => return Ok(value),
-            Err(error) if attempt < STREAM_PUT_ATTEMPTS => {
-                tracing::warn!("S3 upload of {key}, attempt {attempt} failed, retrying: {error:#}");
-                tokio::time::sleep(STREAM_PUT_RETRY_DELAY * (1 << (attempt - 1))).await;
-                attempt += 1;
+        let permit = limit.acquire().await;
+        let error = match send().await {
+            Ok(value) => {
+                permit.succeeded();
+                return Ok(value);
             }
-            Err(error) => return Err(error),
-        }
+            Err(error) => error,
+        };
+        let wait = if let Some(asked) = throttle_wait(&error) {
+            let now = permit.throttled();
+            throttles += 1;
+            if throttles >= THROTTLED_PUT_ATTEMPTS {
+                return Err(error);
+            }
+            let wait = asked.unwrap_or(THROTTLE_DELAY * (1 << (throttles - 1)));
+            let wait = spread(wait.min(THROTTLE_MAX_DELAY));
+            tracing::warn!(
+                "S3 throttled the upload of {key} (try {throttles}): upload limit now {now}, retrying in {wait:?}"
+            );
+            wait
+        } else {
+            drop(permit);
+            failures += 1;
+            if failures >= STREAM_PUT_ATTEMPTS {
+                return Err(error);
+            }
+            tracing::warn!("S3 upload of {key}, attempt {failures} failed, retrying: {error:#}");
+            STREAM_PUT_RETRY_DELAY * (1 << (failures - 1))
+        };
+        tokio::time::sleep(wait).await;
     }
+}
+
+/// When `error` is the bucket throttling a request: the wait it asked for,
+/// if any. S3 throttles with 503 SlowDown, others with 429.
+fn throttle_wait(error: &anyhow::Error) -> Option<Option<Duration>> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<s3::Error>()? {
+            s3::Error::RateLimited { retry_after, .. } => Some(*retry_after),
+            s3::Error::Api { status, .. } if status.as_u16() == 503 => Some(None),
+            _ => None,
+        })
+}
+
+/// `wait` plus up to half again, so throttled uploads do not all retry at
+/// the same moment.
+fn spread(wait: Duration) -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    // Each RandomState has fresh random keys, so this is a random number.
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    wait + wait.mul_f64((random % 1000) as f64 / 2000.0)
 }
 
 /// S3-compatible durable artifact storage.
@@ -101,7 +150,7 @@ pub struct S3Storage {
     region: String,
     bucket: String,
     prefix: String,
-    multipart_upload_slots: tokio::sync::Semaphore,
+    put_limit: PutLimit,
 }
 
 impl S3Storage {
@@ -144,18 +193,12 @@ impl S3Storage {
             .max_retry_delay(max_retry_delay)
             .build()
             .context("create S3 client")?;
-        // The server also uploads distinct artifacts concurrently. Keep one
-        // backend-wide multipart budget so those outer tasks cannot each open
-        // an independent window. Parts stream from disk, so this bounds live
-        // transport buffers/connections rather than coupling Git pack size to
-        // machine memory.
-        let multipart_upload_concurrency = multipart_upload_concurrency();
         Ok(Self {
             client,
             region: region.to_string(),
             bucket: bucket.to_string(),
             prefix: prefix.unwrap_or("").to_string(),
-            multipart_upload_slots: tokio::sync::Semaphore::new(multipart_upload_concurrency),
+            put_limit: PutLimit::new(PUT_SLOTS),
         })
     }
 
@@ -221,17 +264,13 @@ impl S3Storage {
                     let key = key.to_string();
                     let upload_id = upload_id.clone();
                     let path = path.to_path_buf();
-                    let multipart_upload_slots = &self.multipart_upload_slots;
+                    let put_limit = &self.put_limit;
                     async move {
-                        let _slot = multipart_upload_slots
-                            .acquire()
-                            .await
-                            .expect("S3 multipart upload semaphore is never closed");
                         let offset = part_index * part_bytes;
                         let part_len = (len - offset).min(part_bytes);
                         let part_number = u32::try_from(part_index + 1)
                             .context("S3 multipart part number overflow")?;
-                        let uploaded = with_stream_retries(&key, || async {
+                        let uploaded = send_put(put_limit, &key, || async {
                             let stream = file_range_stream(&path, offset, part_len).await?;
                             client
                                 .objects()
@@ -250,9 +289,8 @@ impl S3Storage {
                         Ok::<_, anyhow::Error>((part_number, etag))
                     }
                 })
-                // This local window limits bookkeeping for one file; the
-                // backend-wide semaphore above is the authoritative shared
-                // limit across all concurrent artifact uploads.
+                // This window bounds one file's parts; the server-wide PUT
+                // limit bounds all of them.
                 .buffer_unordered(MULTIPART_UPLOAD_MAX_CONCURRENCY)
                 // Stop scheduling parts as soon as one upload exhausts its
                 // retry budget. The outer error path aborts the multipart
@@ -517,7 +555,7 @@ impl StorageBackend for S3Storage {
         if len >= MULTIPART_UPLOAD_THRESHOLD_BYTES {
             self.multipart_put_file(&key, path, len).await?;
         } else {
-            with_stream_retries(&key, || async {
+            send_put(&self.put_limit, &key, || async {
                 let stream = file_range_stream(path, 0, len).await?;
                 self.client
                     .objects()
@@ -593,21 +631,11 @@ impl StorageBackend for S3Storage {
 mod tests {
     use super::{
         MULTIPART_UPLOAD_MAX_OBJECT_BYTES, MULTIPART_UPLOAD_MAX_PART_BYTES,
-        MULTIPART_UPLOAD_PART_BYTES, S3Storage, STREAM_PUT_ATTEMPTS,
-        multipart_upload_concurrency_for_cores, multipart_upload_part_bytes,
+        MULTIPART_UPLOAD_PART_BYTES, PutLimit, S3Storage, STREAM_PUT_ATTEMPTS,
+        THROTTLED_PUT_ATTEMPTS, multipart_upload_part_bytes, send_put,
     };
     use crate::storage::StorageBackend;
     use std::io::Write;
-
-    #[test]
-    fn multipart_budget_scales_with_machine_and_stays_bounded() {
-        assert_eq!(multipart_upload_concurrency_for_cores(0), 2);
-        assert_eq!(multipart_upload_concurrency_for_cores(1), 2);
-        assert_eq!(multipart_upload_concurrency_for_cores(2), 4);
-        assert_eq!(multipart_upload_concurrency_for_cores(4), 8);
-        assert_eq!(multipart_upload_concurrency_for_cores(8), 16);
-        assert_eq!(multipart_upload_concurrency_for_cores(128), 16);
-    }
 
     #[tokio::test]
     async fn streamed_puts_are_resent_a_bounded_number_of_times() {
@@ -619,8 +647,9 @@ mod tests {
             }
             Ok(n)
         };
+        let limit = PutLimit::new(4);
         assert_eq!(
-            super::with_stream_retries("k", flaky).await.unwrap(),
+            send_put(&limit, "k", flaky).await.unwrap(),
             STREAM_PUT_ATTEMPTS
         );
 
@@ -629,14 +658,82 @@ mod tests {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             anyhow::bail!("timeout")
         };
-        let error = super::with_stream_retries::<(), _, _>("k", dead)
-            .await
-            .unwrap_err();
+        let error = send_put::<(), _, _>(&limit, "k", dead).await.unwrap_err();
         assert_eq!(format!("{error}"), "timeout");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             STREAM_PUT_ATTEMPTS
         );
+        assert_eq!(limit.current(), 4, "a failure is not throttling");
+    }
+
+    /// The error the bucket answers a throttled request with.
+    fn slow_down(status: u16) -> anyhow::Error {
+        let error = s3::Error::RateLimited {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            retry_after: None,
+            request_id: None,
+            code: Some("SlowDown".into()),
+            message: None,
+            host_id: None,
+            body_snippet: None,
+        };
+        anyhow::Error::new(error).context("S3 put_object k")
+    }
+
+    #[tokio::test]
+    async fn throttled_puts_lower_the_limit_and_retry_longer() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let limit = PutLimit::new(32);
+        let throttled = || async {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n < THROTTLED_PUT_ATTEMPTS {
+                return Err(slow_down(503));
+            }
+            Ok(n)
+        };
+        assert_eq!(
+            send_put(&limit, "k", throttled).await.unwrap(),
+            THROTTLED_PUT_ATTEMPTS
+        );
+        // Each retry was sent at the new limit, so each halved it again,
+        // 32 down to 1; the success at 1 raised it to 2.
+        assert_eq!(limit.current(), 2);
+
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let always = || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<(), _>(slow_down(429))
+        };
+        send_put(&limit, "k", always).await.unwrap_err();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            THROTTLED_PUT_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn spread_adds_up_to_half() {
+        let wait = std::time::Duration::from_secs(1);
+        let spread: Vec<std::time::Duration> = (0..20).map(|_| super::spread(wait)).collect();
+        assert!(spread.iter().all(|s| (wait..=wait * 3 / 2).contains(s)));
+        assert!(spread.iter().any(|s| *s != spread[0]), "{spread:?}");
+    }
+
+    #[test]
+    fn only_throttling_is_throttling() {
+        assert_eq!(super::throttle_wait(&slow_down(503)), Some(None));
+        let unavailable = s3::Error::Api {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        };
+        let unavailable = anyhow::Error::new(unavailable);
+        assert_eq!(super::throttle_wait(&unavailable), Some(None));
+        assert_eq!(super::throttle_wait(&anyhow::anyhow!("timeout")), None);
     }
 
     #[test]

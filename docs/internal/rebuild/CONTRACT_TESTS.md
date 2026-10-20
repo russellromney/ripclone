@@ -172,7 +172,7 @@ Ripclone token reaches the origin.
 | G27 | A pull-request commit X1–X on no ref, whose Full and the tip C's both build on A's Full: X's `own_history` holds exactly X1's commit and tree, and names X's Head level packs. The `--at X` clone asks for it while a pack only C's Full has is held, downloads none of X's Full history packs C's lacks, and each shared pack, own pack and manifest once (counted at a proxy), makes no upstream fetch, and has X's history, `git clone`'s remote refs and tags, `fsck` clean. | |
 | G28 | After main is force-pushed from A to B off A0, a pull-request commit X built on A gets no `own_history` with `refs_base` B: the `--at X` clone asks for X's Full history packs B's lacks while B's are held, makes no upstream fetch, and has X checked out, `git clone`'s remote refs, `fsck` clean. | |
 
-### H. Storage and server state (14)
+### H. Storage and server state (15)
 
 | # | Test | Added |
 |---|---|---|
@@ -190,6 +190,7 @@ Ripclone token reaches the origin.
 | H13 | Local disk, signed-URL TTL 3 s, deletion every second. A fork builds the same commit A as the repo, which also builds B and has a tag the fork lacks: the same output artifacts for A, and the repo's own tags artifact. A clone of B is held at its first download while `rm --purge` runs: B's commit reads `404`, `list` drops the repo, a new clone (plain or `--at B`) exits 5 with `repo not added` and leaves no target, and 2 s of sweeps delete nothing. Released, the clone is exact. Then the artifacts only the repo named, its refs' included, are deleted, the fork's stay, only the fork's mirror is left, and its depth-1, full and Files clones are exact. A second purge succeeds, and the repo added again builds and clones. |  |
 | H14 | S3 emulator, same settings, the bucket's downloads held while the purge runs: the clone holding signed URLs from before it is exact; then the purged repo's own artifacts leave the bucket and the local cache, the fork's stay, and its full and Files clones are exact. | (S3 job) |
 | H15 | The refs table is renamed under a running server: a ready Full still answers, without refs, the log names the read, and a full clone fetches the refs from the upstream, equal to `git clone`'s. | |
+| H16 | S3 emulator behind a proxy that answers 503 to the first 12 PUTs: the server logs the throttling and retries, no build fails, and depth-1, full and files clones are exact. | |
 
 ### I. Auth, integrations, CLI (15)
 

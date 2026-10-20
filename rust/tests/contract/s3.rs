@@ -224,7 +224,7 @@ fn background_failed(world: &World, s3: &S3, name: &str) -> (Origin, Server, Fau
     });
 
     // A 403 is permanent, so each output fails on its first attempt.
-    s3_proxy.fail_puts(&format!("/{}/", s3.bucket), Fault::Status(403));
+    s3_proxy.fault_puts(&format!("/{}/", s3.bucket), Fault::Status(403), usize::MAX);
     server.restart_with(&[("RIPCLONE_FILES_SLOTS", "1"), ("RIPCLONE_FULL_SLOTS", "1")]);
     wait_for("Full and Files failed", || {
         (output_states(&server, &repo, &tip) == ["ready", "failed", "failed"]).then_some(())
@@ -450,7 +450,7 @@ fn s3_c8_failed_upload_publishes_nothing() {
     let bucket = format!("/{}/", s3.bucket);
     s3_proxy.hold_puts(&bucket, 1);
     // A 403 is permanent, so Head fails on its first attempt.
-    s3_proxy.fail_puts(&bucket, Fault::Status(403));
+    s3_proxy.fault_puts(&bucket, Fault::Status(403), usize::MAX);
     world.cli(&server, &["add", "acme/c8"]).ok();
     s3_proxy.wait_held(1);
     assert!(!s3.objects().is_empty(), "the held write is in the bucket");
@@ -744,5 +744,46 @@ fn s3_h14_purge_deletes_from_the_bucket() {
         argv.extend_from_slice(args);
         world.cli(&server, &argv).ok();
         assert_eq!(listing(&target), origin.tree(&a), "{name}");
+    }
+}
+
+/// H16: a bucket that throttles uploads, answering 503 to the first PUTs,
+/// slows the build down but does not fail it: the server lowers its upload
+/// concurrency, retries, and every output is ready and clones exactly.
+#[test]
+#[ignore = "needs the S3 emulator; run by the s3 CI job"]
+fn s3_h16_throttled_uploads_slow_the_build_without_failing_it() {
+    let world = World::new();
+    let s3 = S3::start(&world);
+    let s3_proxy = FaultProxy::start(&s3);
+    s3_proxy.preserve_host();
+    let origin = world.origin("acme", "h16");
+    let a = origin.commit(&[("a.txt", "a\n"), ("dir/b.txt", "b\n")], "A");
+    origin.publish();
+    let bucket = format!("/{}/", s3.bucket);
+    s3_proxy.fault_puts(&bucket, Fault::Status(503), 12);
+    let env = s3.server_env(&s3_proxy.url());
+    let server = world.server(&env_refs(&env));
+
+    world.cli(&server, &["add", "acme/h16", "--wait"]).ok();
+
+    let throttled = (s3_proxy.seen().iter())
+        .filter(|s| s.method == "PUT" && s.status == 503)
+        .count();
+    assert_eq!(throttled, 12, "the bucket throttled {throttled} PUTs");
+    let log = server.log();
+    // The first throttled PUT halves the limit of 32.
+    assert!(log.contains("upload limit now 16"), "{log}");
+    assert_eq!(server.metric("ripclone_builds_failed_total"), 0);
+    for (shape, args) in [
+        ("depth1", &["--depth", "1"][..]),
+        ("full", &[][..]),
+        ("files", &["--mode", "files"][..]),
+    ] {
+        let target = world.target(&format!("h16-{shape}"));
+        let mut argv = vec!["clone", "acme/h16", target.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        world.cli(&server, &argv).ok();
+        assert_eq!(listing(&target), origin.tree(&a), "{shape}");
     }
 }
