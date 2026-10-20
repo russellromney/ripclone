@@ -46,7 +46,7 @@ impl Backends {
             (Cas::new(cas_dir)?, local(cas_dir)?)
         };
         let cache_retention =
-            LocalCacheRetention::new(cas.clone(), metrics.clone(), storage.clone(), retention);
+            LocalCacheRetention::new(cas.clone(), metrics.clone(), storage.clone(), retention)?;
         Ok(Self {
             cas,
             storage,

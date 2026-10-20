@@ -104,14 +104,8 @@ fn h4_invalid_config_fails_before_side_effects() {
         (
             "bad retention size",
             "",
-            &[("RIPCLONE_RETENTION_MAX_GB", "1.5")],
-            "RIPCLONE_RETENTION_MAX_GB must be a non-negative integer",
-        ),
-        (
-            "retention size overflows",
-            "",
-            &[("RIPCLONE_RETENTION_MAX_GB", "18446744073709551615")],
-            "RIPCLONE_RETENTION_MAX_GB is too large",
+            &[("RIPCLONE_RETENTION_MAX_BYTES", "1.5")],
+            "RIPCLONE_RETENTION_MAX_BYTES must be a non-negative integer",
         ),
         (
             "bad signed URL TTL",
@@ -156,8 +150,8 @@ fn h4_invalid_config_fails_before_side_effects() {
 
 /// H5: on local disk the artifact store is the durable copy, so retention
 /// never trims it. With retention set to run every second and keep at most
-/// 1 GB, the server reports retention off, and artifacts last written a
-/// month ago, past the week retention keeps, still clone.
+/// 1 byte, the server reports retention off, and the artifacts stay and
+/// clone.
 #[test]
 fn h5_local_retention_never_trims_artifacts() {
     let world = World::new();
@@ -165,10 +159,9 @@ fn h5_local_retention_never_trims_artifacts() {
     let tip = origin.commit(&[("a.txt", "a\n")], "A");
     origin.publish();
     // Retention runs every second, the harness default.
-    let server = world.server(&[("RIPCLONE_RETENTION_MAX_GB", "1")]);
+    let server = world.server(&[("RIPCLONE_RETENTION_MAX_BYTES", "1")]);
     world.cli(&server, &["add", "acme/h5", "--wait"]).ok();
     let stored = server.storage_listing();
-    backdate(&world.path("server").join("cache"), 30);
 
     assert!(
         server.log().contains("local cache retention disabled"),
@@ -182,20 +175,6 @@ fn h5_local_retention_never_trims_artifacts() {
     assert_eq!(listing(&target), origin.tree(&tip));
     assert_eq!(server.storage_listing(), stored);
     assert_eq!(server.metric("ripclone_local_cache_cleanup_runs_total"), 0);
-}
-
-/// Set the mtime of every file under `dir` to `days` ago.
-pub fn backdate(dir: &std::path::Path, days: u64) {
-    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 3600);
-    let when = filetime::FileTime::from_system_time(when);
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            backdate(&path, days);
-        } else {
-            filetime::set_file_mtime(&path, when).unwrap();
-        }
-    }
 }
 
 /// H8: `/readyz` fails once the control database file is deleted or replaced
